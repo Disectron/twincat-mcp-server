@@ -136,7 +136,7 @@ class XaeBackend:
         rot = pythoncom.GetRunningObjectTable()
         ctx = pythoncom.CreateBindCtx(0)
         out = []
-        for moniker in rot:
+        for moniker in rot.EnumRunning():
             try:
                 name = moniker.GetDisplayName(ctx, None)
             except Exception:  # noqa: BLE001
@@ -305,7 +305,7 @@ class XaeBackend:
         deadline = time.time() + (timeout_s or self.cfg.build_timeout_s)
         while time.time() < deadline:
             try:
-                if int(sb.BuildState) != 1:  # vsBuildStateInProgress == 1
+                if int(sb.BuildState) != 2:  # vsBuildStateInProgress == 2 (NotStarted=1, Done=3)
                     break
             except Exception:  # noqa: BLE001
                 break
@@ -559,14 +559,21 @@ class XaeBackend:
         self.tree_consume_xml(path, new_xml)
         return {"path": path, "changed": changed}
 
+    def _create_child(self, parent: Any, name: str, subtype: int, before: str, info: Any) -> Any:
+        if info is None:
+            return self._retry(lambda: parent.CreateChild(name, subtype, before), "CreateChild")
+        try:
+            return self._retry(lambda: parent.CreateChild(name, subtype, before, info), "CreateChild")
+        except XaeError:
+            if isinstance(info, list) and IS_WIN:  # pragma: no cover - retry as SAFEARRAY of BSTR
+                variant = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_BSTR, [str(x) for x in info])
+                return self._retry(lambda: parent.CreateChild(name, subtype, before, variant), "CreateChild(BSTR[])")
+            raise
+
     def tree_create_child(self, parent_path: str, name: str, subtype: int, before: str = "",
                           info: Any = None) -> dict[str, Any]:
         parent = self._item(parent_path)
-        if info is None:
-            child = self._retry(lambda: parent.CreateChild(name, subtype, before), "CreateChild")
-        else:
-            child = self._retry(lambda: parent.CreateChild(name, subtype, before, info), "CreateChild")
-        return self._item_dict(child)
+        return self._item_dict(self._create_child(parent, name, subtype, before, info))
 
     def tree_delete_child(self, parent_path: str, name: str) -> dict[str, Any]:
         parent = self._item(parent_path)
@@ -649,10 +656,7 @@ class XaeBackend:
         else:
             info = None
         parent = self._item(parent_path)
-        if info is None:
-            child = self._retry(lambda: parent.CreateChild(name, sub, ""), "CreateChild")
-        else:
-            child = self._retry(lambda: parent.CreateChild(name, sub, "", info), "CreateChild")
+        child = self._create_child(parent, name, sub, "", info)
         created = self._item_dict(child)
         path = created.get("PathName") or f"{parent_path}^{name}"
         if declaration is not None and kind_l not in ("enum", "struct", "union", "alias", "gvl", "parameter_list"):

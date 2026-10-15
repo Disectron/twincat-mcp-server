@@ -69,6 +69,7 @@ class _Token:
     token: str
     action: str
     target: str
+    scope: str
     expires: float
     used: bool = False
 
@@ -108,37 +109,40 @@ class Guard:
             "confirm_ttl_s": self.cfg.confirm_ttl_s,
             "write_allowlist": self.cfg.write_allowlist,
             "write_denylist": self.cfg.write_denylist,
-            "pending_tokens": [{"action": t.action, "target": t.target,
+            "pending_tokens": [{"action": t.action, "target": t.target, "scope": t.scope,
                                 "expires_in_s": round(t.expires - time.time(), 1)} for t in live],
             "audit_log": str(self._audit_path) if self._audit_path else None,
         }
 
     # ------------------------------------------------------------ tokens
-    def request_token(self, action: str, target: str) -> dict[str, Any]:
+    def request_token(self, action: str, target: str, scope: str = "") -> dict[str, Any]:
+        """``scope`` names the machine the token is valid for (e.g. '5.1.2.3.1.1:851');
+        it is captured at issue time so a token cannot be carried to another target."""
         nonce = secrets.token_hex(4)
-        raw = f"{action}|{target}|{nonce}".encode()
+        raw = f"{action}|{target}|{scope}|{nonce}".encode()
         token = hashlib.sha256(raw).hexdigest()[:12].upper()
         exp = time.time() + self.cfg.confirm_ttl_s
         with self._lock:
             # purge expired
             for k in [k for k, t in self._tokens.items() if t.expires < time.time()]:
                 self._tokens.pop(k, None)
-            self._tokens[token] = _Token(token, action, target, exp)
-        self.audit("tc_request_confirmation", {"action": action, "target": target},
+            self._tokens[token] = _Token(token, action, target, scope, exp)
+        self.audit("tc_request_confirmation", {"action": action, "target": target, "scope": scope},
                    OpClass.READ, "issued")
         return {
             "confirm_token": token,
             "action": action,
             "target": target,
+            "scope": scope,
             "expires_in_s": self.cfg.confirm_ttl_s,
-            "note": f"Pass confirm_token={token!r} to the tool performing {action!r} on {target!r}. "
-                    "Single use. Re-read the target before you use it.",
+            "note": f"Pass confirm_token={token!r} to the tool performing {action!r} on {target!r} "
+                    f"(machine {scope or 'n/a'}). Single use. Re-read the target before you use it.",
         }
 
-    def _consume_token(self, token: str | None, action: str, target: str) -> None:
+    def _consume_token(self, token: str | None, action: str, target: str, scope: str = "") -> None:
         if not token:
             raise SafetyError(
-                f"{action} on {target!r} needs a confirm_token. Call "
+                f"{action} on {target!r} (machine {scope or 'n/a'}) needs a confirm_token. Call "
                 f"tc_request_confirmation(action={action!r}, target={target!r}) first."
             )
         with self._lock:
@@ -154,6 +158,11 @@ class Guard:
                     f"confirm_token was issued for {t.action!r} on {t.target!r}, "
                     f"not {action!r} on {target!r}."
                 )
+            if t.scope != scope:
+                raise SafetyError(
+                    f"confirm_token was issued while connected to {t.scope or 'n/a'}, but the server now "
+                    f"targets {scope or 'n/a'}. Request a new one for this machine."
+                )
             t.used = True
 
     # ------------------------------------------------------------ checks
@@ -165,7 +174,7 @@ class Guard:
         return None
 
     def check(self, op: OpClass, *, action: str, target: str = "",
-              confirm_token: str | None = None) -> None:
+              confirm_token: str | None = None, scope: str = "") -> None:
         """Raise SafetyError if ``op`` is not permitted right now."""
         mode = self.mode
         if op is OpClass.READ:
@@ -195,11 +204,11 @@ class Guard:
             return
         if op is OpClass.CONTROL:
             if mode == "guarded":
-                self._consume_token(confirm_token, action, target)
+                self._consume_token(confirm_token, action, target, scope)
             return
         if op is OpClass.DESTRUCTIVE:
             if mode == "guarded" or self.cfg.confirm_destructive:
-                self._consume_token(confirm_token, action, target)
+                self._consume_token(confirm_token, action, target, scope)
             return
         raise SafetyError(f"unknown op class {op!r}")  # pragma: no cover
 

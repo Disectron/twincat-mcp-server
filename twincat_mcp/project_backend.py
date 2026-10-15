@@ -89,6 +89,7 @@ class ProjectIndex:
         self.cfg = cfg
         self.root: Path | None = Path(cfg.root) if cfg.root else None
         self.units: dict[str, CodeUnit] = {}      # lower-case name -> unit
+        self.duplicates: dict[str, list[str]] = {}  # lower-case name -> files when the same name exists twice
         self.files: dict[str, float] = {}         # path -> mtime
         self.solutions: list[str] = []
         self.tsproj: list[str] = []
@@ -103,7 +104,7 @@ class ProjectIndex:
             raise ProjectError(f"project root not set or not a directory: {self.root}. "
                                "Pass root= or set TCMCP_PROJECT_ROOT / TCMCP_SOLUTION.")
         t0 = time.time()
-        self.units.clear(); self.files.clear(); self.plcproj.clear()
+        self.units.clear(); self.files.clear(); self.plcproj.clear(); self.duplicates.clear()
         self.solutions = [str(p) for p in self.root.rglob("*.sln")]
         self.tsproj = [str(p) for p in self.root.rglob("*.tsproj")]
         for pp in self.root.rglob("*.plcproj"):
@@ -124,6 +125,7 @@ class ProjectIndex:
         for u in self.units.values():
             kinds[u.kind] = kinds.get(u.kind, 0) + 1
         return {"root": str(self.root), "files": n_files, "units": len(self.units), "by_kind": kinds,
+                "duplicate_names": self.duplicates,
                 "solutions": self.solutions, "tsproj": self.tsproj,
                 "plcproj": [{"file": p["file"], "name": p["name"], "compile_items": len(p["compile"])} for p in self.plcproj],
                 "duration_s": round(time.time() - t0, 2)}
@@ -171,6 +173,9 @@ class ProjectIndex:
         unit = CodeUnit(name, kind, str(p), kind_tag, decl, impl, dl, il)
         self._fill_header(unit)
         unit.vars = parse_vars(decl, unit.decl_line0)
+        prev = self.units.get(name.lower())
+        if prev is not None and prev.file != str(p):
+            self.duplicates.setdefault(name.lower(), [prev.file]).append(str(p))
         self.units[name.lower()] = unit
         # sub-items
         for tag, k in (("Method", "METHOD"), ("Property", "PROPERTY"), ("Action", "ACTION"), ("Transition", "TRANSITION")):
@@ -219,14 +224,35 @@ class ProjectIndex:
         sel.sort(key=lambda u: u.name.lower())
         return {"total": len(sel), "units": [u.summary() for u in sel[:limit]]}
 
-    def get_unit(self, name: str) -> CodeUnit:
+    def get_unit(self, name: str, exact: bool = False) -> CodeUnit:
+        """Look up by name; ``file@Name`` pins a unit when the same name exists in
+        two PLC projects. ``exact`` disables the suffix match (used for writes)."""
         self._ensure()
-        u = self.units.get(name.lower())
-        if u is None:
-            # allow file-stem lookups and case-insensitive partials
-            cands = [x for x in self.units.values() if x.name.lower().endswith("." + name.lower()) or x.name.lower() == name.lower()]
+        pin = None
+        if "@" in name:
+            pin, name = name.split("@", 1)
+        key = name.lower()
+        if key in self.duplicates and pin is None:
+            raise ProjectError(f"{name!r} exists in several files {self.duplicates[key]}; "
+                               f"qualify it as '<file-substring>@{name}'")
+        if pin is not None:
+            cands = [x for x in self.units.values() if x.name.lower() == key and pin.lower() in x.file.lower()]
+            # duplicates overwrite each other in self.units; re-index the pinned file on demand
+            if not cands and key in self.duplicates:
+                for f in self.duplicates[key]:
+                    if pin.lower() in f.lower():
+                        self._index_file(Path(f))
+                        cands = [x for x in self.units.values() if x.name.lower() == key and pin.lower() in x.file.lower()]
+            if len(cands) != 1:
+                raise ProjectError(f"'{pin}@{name}' matches {len(cands)} units")
+            return cands[0]
+        u = self.units.get(key)
+        if u is None and not exact:
+            # allow Method-name lookups ("Open" -> "FB_Valve.Open") when unique
+            cands = [x for x in self.units.values() if x.name.lower().endswith("." + key)]
             if len(cands) == 1:
                 return cands[0]
+        if u is None:
             raise ProjectError(f"object {name!r} not found in index ({len(self.units)} units). proj_list to browse.")
         return u
 
@@ -358,13 +384,24 @@ class ProjectIndex:
     # ------------------------------------------------------------ write back
     def set_code(self, name: str, declaration: str | None, implementation: str | None,
                  strip_lineids: bool = True) -> dict[str, Any]:
-        u = self.get_unit(name)
+        u = self.get_unit(name, exact=True)
+        if u.kind == "PROPERTY" and implementation is not None:
+            raise ProjectError(f"{u.name} is a PROPERTY; edit {u.name}.Get / {u.name}.Set implementations instead")
         p = Path(u.file)
-        text = p.read_text(encoding="utf-8-sig", errors="replace")
+        raw = p.read_bytes()
+        bom = raw.startswith(b"\xef\xbb\xbf")
+        text = raw[3:].decode("utf-8", errors="replace") if bom else raw.decode("utf-8", errors="replace")
+        eol = "\r\n" if "\r\n" in text else "\n"
+        if declaration is not None:
+            declaration = declaration.replace("\r\n", "\n").replace("\n", eol)
+        if implementation is not None:
+            implementation = implementation.replace("\r\n", "\n").replace("\n", eol)
         new = text
         changed = []
         # Locate the element block for this unit in the raw text (keep formatting of the rest).
         elem_start, elem_end = _locate_element(text, u)
+        if elem_start < 0 or elem_end <= elem_start:
+            raise ProjectError(f"could not locate the XML element of {u.name} in {u.file}; run proj_scan (file changed on disk?)")
         block = text[elem_start:elem_end]
         if declaration is not None:
             block, ok = _replace_cdata(block, "Declaration", declaration)
@@ -383,15 +420,16 @@ class ProjectIndex:
         if new == text:
             return {"file": u.file, "changed": [], "note": "no change"}
         bak = p.with_suffix(p.suffix + ".bak")
-        bak.write_text(text, encoding="utf-8")
-        p.write_text(new, encoding="utf-8")
+        bak.write_bytes(raw)
+        out = (b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8")
+        p.write_bytes(out)
         # re-index this file
         try:
             self._index_file(p)
         except ET.ParseError as exc:
-            p.write_text(text, encoding="utf-8")
+            p.write_bytes(raw)
             raise ProjectError(f"edit produced invalid XML, reverted: {exc}") from exc
-        return {"file": u.file, "changed": changed, "backup": str(bak)}
+        return {"file": u.file, "changed": changed, "backup": str(bak), "eol": "CRLF" if eol == "\r\n" else "LF", "bom": bom}
 
     def read_file(self, rel_or_abs: str, max_chars: int = 200_000) -> dict[str, Any]:
         p = Path(rel_or_abs)
@@ -493,12 +531,16 @@ def _locate_element(text: str, u: CodeUnit) -> tuple[int, int]:
             return s, e
         sub_name = u.name.split(".")[-1]
         s = text.find(f'<{tag} Name="{sub_name}"')
+        if s < 0:
+            return -1, -1
         e = text.find(f"</{tag}>", s) + len(f"</{tag}>")
         return s, e
     tag = u.xml_path
     s = text.find(f"<{tag} ")
     if s < 0:
         s = text.find(f"<{tag}>")
+    if s < 0:
+        return -1, -1
     # top-level: declaration/implementation come before any Method/Property elements
     first_sub = min([i for i in (text.find("<Method", s), text.find("<Property", s), text.find("<Action", s),
                                  text.find("<Transition", s), text.find("<LineIds", s)) if i > 0] or [len(text)])

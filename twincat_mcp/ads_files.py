@@ -213,7 +213,7 @@ class SystemServiceFiles:
     def wait_for_file(self, path: str, timeout_s: float, poll_s: float = 2.0) -> dict[str, Any]:
         t0 = time.time()
         last_err = ""
-        while time.time() - t0 < timeout_s:
+        while time.time() - t0 < timeout_s and not self.ads.cancel.is_set():
             try:
                 h = self.fopen(path, MODE_READ | MODE_BINARY)
                 self.fclose(h)

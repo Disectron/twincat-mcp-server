@@ -15,7 +15,9 @@ from typing import Any, Callable
 
 class SerialWorker:
     def __init__(self, name: str, init: Callable[[], None] | None = None,
-                 teardown: Callable[[], None] | None = None):
+                 teardown: Callable[[], None] | None = None,
+                 cancel_event: threading.Event | None = None):
+        self.cancel_event = cancel_event or threading.Event()
         self._q: "queue.Queue[tuple[cf.Future, Callable, tuple, dict] | None]" = queue.Queue()
         self._init = init
         self._teardown = teardown
@@ -39,6 +41,7 @@ class SerialWorker:
                 break
             fut, fn, args, kwargs = item
             if fut.set_running_or_notify_cancel():
+                self.cancel_event.clear()  # a stale cancel from a timed-out job must not hit this one
                 try:
                     fut.set_result(fn(*args, **kwargs))
                 except BaseException as exc:  # noqa: BLE001
@@ -61,7 +64,13 @@ class SerialWorker:
     async def run(self, fn: Callable[..., Any], *args: Any, timeout: float | None = None,
                   **kwargs: Any) -> Any:
         fut = self.submit(fn, *args, **kwargs)
-        return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # the job keeps the thread; ask cooperative loops (watch/wait/poll) to stop
+            if not fut.done():
+                self.cancel_event.set()
+            raise
 
     def call(self, fn: Callable[..., Any], *args: Any, timeout: float | None = None,
              **kwargs: Any) -> Any:

@@ -22,6 +22,7 @@ import ctypes
 import fnmatch
 import re
 import struct
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
@@ -79,6 +80,7 @@ class AdsBackend:
         self.net_id: str | None = cfg.ams_net_id
         self.ip: str | None = cfg.ip_address
         self.port: int = cfg.ams_port
+        self.cancel = threading.Event()   # set by the worker when a tool call times out / is cancelled
 
     # ------------------------------------------------------------ connections
     def _key(self, port: int | None, net_id: str | None) -> tuple[str | None, int]:
@@ -105,7 +107,10 @@ class AdsBackend:
 
     def connect(self, net_id: str | None, port: int | None, ip: str | None) -> dict[str, Any]:
         self.disconnect()
-        if net_id:
+        if net_id and net_id.lower() in ("local", "localhost", "none"):
+            self.net_id = None
+            self.ip = None
+        elif net_id:
             self.net_id = net_id
         if port:
             self.port = port
@@ -133,8 +138,20 @@ class AdsBackend:
     def connection_status(self) -> dict[str, Any]:
         return {
             "configured_net_id": self.net_id, "port": self.port, "ip": self.ip,
-            "open": [{"net_id": k[0], "port": k[1]} for k, c in self._conns.items() if c.is_open],
+            "open": [{"net_id": k[0], "port": k[1]} for k, c in list(self._conns.items()) if c.is_open],
         }
+
+    def target_label(self) -> str:
+        return f"{self.net_id or 'local'}:{self.port}"
+
+    def symbols_overlapping(self, index_group: int, index_offset: int, size: int, port: int | None = None) -> list[str]:
+        """Names of symbols whose memory overlaps [index_offset, index_offset+size) in index_group."""
+        try:
+            lst, _ = self.symbols_cached(False, port)
+        except AdsError:
+            return []
+        lo, hi = index_offset, index_offset + max(size, 1)
+        return [s.name for s in lst if s.index_group == index_group and s.index_offset < hi and (s.index_offset + max(s.size, 1)) > lo]
 
     # ------------------------------------------------------------ state
     def _state_dict(self, c: pyads.Connection) -> dict[str, Any]:
@@ -423,7 +440,7 @@ class AdsBackend:
                 if last is not None and vals != last:
                     changes += 1
             last = vals
-            if len(samples) >= self.cfg.max_watch_points or now >= deadline:
+            if len(samples) >= self.cfg.max_watch_points or now >= deadline or self.cancel.is_set():
                 break
             time.sleep(max(0.0, interval_ms / 1000 - (time.perf_counter() - now)))
         return {"symbols": keys, "interval_ms": interval_ms, "duration_ms": duration_ms,
@@ -450,8 +467,9 @@ class AdsBackend:
             polls += 1
             if ops[op](cur, target):
                 return {"met": True, "value": T.decode(tt, cur), "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1), "polls": polls}
-            if time.perf_counter() >= deadline:
-                return {"met": False, "value": T.decode(tt, cur), "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1), "polls": polls}
+            if time.perf_counter() >= deadline or self.cancel.is_set():
+                return {"met": False, "value": T.decode(tt, cur), "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1), "polls": polls,
+                        "cancelled": self.cancel.is_set()}
             time.sleep(max(interval_ms, self.cfg.min_watch_interval_ms) / 1000)
 
     # ------------------------------------------------------------ EtherCAT

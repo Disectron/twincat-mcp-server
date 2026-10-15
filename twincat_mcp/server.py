@@ -14,9 +14,11 @@ two-step confirm_token flow applies (``tc_request_confirmation``).
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import platform
+import re
 import sys
 import time
 from typing import Any
@@ -35,6 +37,10 @@ from .ads_backend import AdsBackend, AdsError
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeBackend, XaeError, sta_init, sta_teardown
 from .project_backend import ProjectIndex, ProjectError, parse_tcunit_xml
+from .recorder import Recorder, RecorderError
+from .testing import TestBench, TestError
+from . import codecheck
+from pathlib import Path
 
 INSTRUCTIONS = """\
 twincat-mcp: control of a Beckhoff TwinCAT 3 engineering PC and its target IPC.
@@ -44,7 +50,11 @@ Workflow for debugging a running machine:
   2. ads_status → PLC state, TwinCAT run/config mode, device info.
   3. ads_list_symbols / ads_read / ads_read_many → inspect live values
      (structs and arrays are expanded, TIME/DATE decoded).
-  4. ads_watch / ads_wait_until → capture timing, catch transient states.
+  4. ads_watch / ads_wait_until → short timing captures (≤60 s, inline).
+     rec_start → continuous real-time capture while the program runs (PLC-time-
+     stamped notifications, hours long, file-backed); rec_snapshot / rec_stats /
+     rec_read while it runs; rec_stop; rec_export to CSV. Use stop_when /
+     start_when + pre_trigger_ms as a software scope.
   5. proj_resolve_symbol → jump from a live symbol to file:line in the source.
   6. proj_get_code / proj_search / proj_references → read the logic.
   7. Edit (proj_set_code or xae_pou_set), xae_build → errors with file:line.
@@ -80,14 +90,16 @@ class App:
         self.xae = XaeBackend(cfg.xae)
         self.xae_worker = SerialWorker("tcmcp-xae-sta", init=sta_init, teardown=sta_teardown)
         self.proj = ProjectIndex(cfg.project)
+        self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
+        self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
 
     # --- runners -----------------------------------------------------------
     async def ads_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
         try:
             return await self.ads_worker.run(fn, *a, timeout=timeout or (self.cfg.ads.max_watch_duration_ms / 1000 + 30), **kw)
-        except AdsError as exc:
+        except (AdsError, RecorderError, TestError) as exc:
             raise ToolError(str(exc)) from exc
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError("ADS call timed out (router/route/firewall? run tc_doctor)") from exc
 
     async def xae_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
@@ -95,31 +107,54 @@ class App:
             return await self.xae_worker.run(fn, *a, timeout=timeout or self.cfg.xae.build_timeout_s + 60, **kw)
         except XaeError as exc:
             raise ToolError(str(exc)) from exc
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError("XAE call timed out; a modal dialog in the shell is the usual cause") from exc
 
-    def proj_call(self, fn, *a, **kw) -> Any:
+    async def proj_call(self, fn, *a, **kw) -> Any:
         try:
-            return fn(*a, **kw)
+            return await asyncio.to_thread(fn, *a, **kw)
         except ProjectError as exc:
             raise ToolError(str(exc)) from exc
+
+    async def rec_call(self, fn, *a, timeout: float = 60, **kw) -> Any:
+        return await self.ads_call(fn, *a, timeout=timeout, **kw)
+
+    def scope(self) -> str:
+        return self.ads.target_label()
+
+    async def check_targets(self, xae_target: str, allow_mismatch: bool) -> None:
+        """Refuse deploy/tcunit when XAE targets one machine and ADS another."""
+        ads_t = self.ads.net_id
+        if ads_t is None:
+            try:
+                ads_t = await self.ads_call(self.ads.local_net_id, timeout=10)
+            except ToolError:
+                ads_t = None
+        local = {None, "127.0.0.1.1.1", ads_t}
+        if xae_target and xae_target not in local and not allow_mismatch:
+            raise ToolError(
+                f"XAE targets {xae_target} but the ADS side of this server targets {ads_t or 'local'}. "
+                f"ads_connect(ams_net_id={xae_target!r}) first, or pass allow_target_mismatch=true if that is intended.")
 
     # --- safety ------------------------------------------------------------
     async def permit(self, ctx: Context | None, op: OpClass, action: str, target: str = "",
                      confirm_token: str | None = None) -> None:
         """Check the guard; for CONTROL/DESTRUCTIVE without a token, try to
         ask the human through elicitation before failing."""
+        scope = self.scope()
         try:
-            self.guard.check(op, action=action, target=target, confirm_token=confirm_token)
+            self.guard.check(op, action=action, target=target, confirm_token=confirm_token, scope=scope)
             return
         except SafetyError as exc:
-            needs_token = "confirm_token" in str(exc) and op in (OpClass.CONTROL, OpClass.DESTRUCTIVE)
+            # elicitation only replaces a *missing* token; a wrong/stale/foreign token is a hard error
+            needs_token = confirm_token is None and "needs a confirm_token" in str(exc) \
+                and op in (OpClass.CONTROL, OpClass.DESTRUCTIVE)
             if not needs_token or ctx is None:
                 raise ToolError(str(exc)) from exc
         # elicitation path
         try:
             res = await ctx.elicit(
-                f"twincat-mcp wants to run {action} on {target or 'the target'} "
+                f"twincat-mcp wants to run {action} on {target or 'the target'} — machine {scope} "
                 f"(mode={self.guard.mode}). Allow?", ConfirmSchema)
         except Exception as exc:  # noqa: BLE001 — client has no elicitation support
             raise ToolError(
@@ -128,7 +163,7 @@ class App:
                 f"target={target!r}) and pass the confirm_token."
             ) from exc
         if res.action == "accept" and res.data is not None and res.data.confirm:
-            self.guard.audit(action, {"target": target}, op, "human-confirmed-elicitation")
+            self.guard.audit(action, {"target": target, "scope": scope}, op, "human-confirmed-elicitation")
             return
         raise ToolError(f"{action} on {target!r} was declined by the user ({res.action}).")
 
@@ -208,7 +243,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def tc_request_confirmation(action: str, target: str = "") -> dict[str, Any]:
         """Issue a single-use confirm_token for a control/destructive tool. Use the exact
         action name of the tool (e.g. 'xae_activate_configuration') and its target."""
-        return app.guard.request_token(action, target)
+        return app.guard.request_token(action, target, app.scope())
 
     @mcp.tool(annotations=READ)
     async def tc_audit_tail(n: int = 50) -> list[dict[str, Any]]:
@@ -218,12 +253,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # ======================================================================
     # ads_* runtime
     # ======================================================================
-    @mcp.tool(annotations=EDIT)
+    @mcp.tool(annotations=DESTR)
     async def ads_connect(ams_net_id: str | None = None, ams_port: int | None = None,
-                          ip_address: str | None = None) -> dict[str, Any]:
-        """(Re)connect to a target. ams_net_id like '5.12.34.56.1.1' (None = local), port 851
-        = PLC runtime 1. The route must already exist (ads_routes)."""
-        return await app.ads_call(app.ads.connect, ams_net_id, ams_port, ip_address, timeout=20)
+                          ip_address: str | None = None, confirm_token: str | None = None,
+                          ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """(Re)connect to a target. ams_net_id like '5.12.34.56.1.1', 'local' for this PC, None =
+        keep current; port 851 = PLC runtime 1. Re-targeting to a NetId other than the configured
+        one is control-class (it changes which machine every later write hits)."""
+        configured = {cfg.ads.ams_net_id, None, "local"}
+        if ams_net_id not in configured and ams_net_id != app.ads.net_id:
+            await app.permit(ctx, OpClass.CONTROL, "ads_connect", ams_net_id or "local", confirm_token)
+        res = await app.ads_call(app.ads.connect, ams_net_id, ams_port, ip_address, timeout=20)
+        app.audit("ads_connect", {"ams_net_id": ams_net_id, "port": ams_port}, OpClass.CONTROL, "ok")
+        return res
 
     @mcp.tool(annotations=READ)
     async def ads_status(port: int | None = None) -> dict[str, Any]:
@@ -242,10 +284,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def ads_list_symbols(pattern: str = "*", type_filter: str | None = None, limit: int = 200,
-                               offset: int = 0, refresh: bool = False) -> dict[str, Any]:
+                               offset: int = 0, refresh: bool = False, flag: str | None = None) -> dict[str, Any]:
         """Browse the runtime symbol table. pattern is fnmatch ('MAIN.*', '*valve*'; bare text
-        is wrapped in '*'). type_filter substring-matches the type ('ST_', 'BOOL', 'FB_')."""
-        return await app.ads_call(app.ads.list_symbols, pattern, min(limit, 2000), offset, refresh, type_filter, timeout=60)
+        is wrapped in '*'). type_filter substring-matches the type ('ST_', 'BOOL', 'FB_').
+        flag filters by symbol flag: PERSISTENT, READONLY, STATIC, ATTRIBUTES …"""
+        res = await app.ads_call(app.ads.list_symbols, pattern, 100_000 if flag else min(limit, 2000), 0 if flag else offset, refresh, type_filter, timeout=60)
+        if flag:
+            fl = flag.upper()
+            sel = [x for x in res["symbols"] if fl in x["flags"]]
+            res = {"total": len(sel), "offset": offset, "returned": len(sel[offset:offset + limit]), "symbols": sel[offset:offset + limit]}
+        return res
 
     @mcp.tool(annotations=READ)
     async def ads_symbol_info(name: str) -> dict[str, Any]:
@@ -272,6 +320,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         literals like 'T#1s500ms', 'D#2026-10-15', '16#FF'. Returns before/after.
         Gated: readonly=never; guarded=write_allowlist; full=denylist only."""
         await app.permit(ctx, OpClass.WRITE, "ads_write", name)
+        for member in await app.ads_call(app.ads.members, name, timeout=30):  # opaque hex write touches every member
+            await app.permit(ctx, OpClass.WRITE, "ads_write", member.name)
         try:
             res = await app.ads_call(app.ads.write, name, value, timeout=30)
         except ToolError as exc:
@@ -304,11 +354,21 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=WRITE)
     async def ads_write_raw(index_group: int, index_offset: int, hex_data: str, port: int = 851,
                             ams_net_id: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Raw ADS write by index group/offset. Target string for the allowlist is
-        'raw:<port>/<igrp hex>/<ioffs hex>'."""
+        """Raw ADS write by index group/offset — PLC runtime ports (851-859) only. Every symbol whose
+        memory overlaps the written range is checked against the write allow/deny lists; the raw
+        target itself is 'raw:<port>/<igrp hex>/<ioffs hex>'."""
+        if not (851 <= port <= 859):
+            raise ToolError("raw writes are limited to PLC runtime ports 851-859; use ipc_*/ads_* tools for the system service")
+        if ams_net_id and ams_net_id != app.ads.net_id:
+            raise ToolError("raw writes go to the connected target only; ads_connect first")
+        size = len(bytes.fromhex(hex_data))
         tgt = f"raw:{port}/0x{index_group:X}/0x{index_offset:X}"
         await app.permit(ctx, OpClass.WRITE, "ads_write_raw", tgt)
+        overlapped = await app.ads_call(app.ads.symbols_overlapping, index_group, index_offset, size, port, timeout=60)
+        for nm in overlapped:
+            await app.permit(ctx, OpClass.WRITE, "ads_write_raw", nm)
         res = await app.ads_call(app.ads.write_raw, index_group, index_offset, hex_data, port, ams_net_id, timeout=30)
+        res["overlapping_symbols"] = overlapped
         app.audit("ads_write_raw", {"target": tgt, "hex": hex_data[:64]}, OpClass.WRITE, "ok", res)
         return res
 
@@ -368,6 +428,232 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         await app.permit(ctx, OpClass.CONTROL, "ads_add_route_to_plc", plc_ip, confirm_token)
         res = await app.ads_call(app.ads.add_route_to_plc, plc_ip, plc_username, plc_password, route_name, local_net_id, hostname, timeout=30)
         app.audit("ads_add_route_to_plc", {"plc_ip": plc_ip, "route_name": route_name}, OpClass.CONTROL, "ok", res)
+        return res
+
+
+    # ======================================================================
+    # rec_* real-time recorder
+    # ======================================================================
+    @mcp.tool(annotations=EDIT)
+    async def rec_start(symbols: list[str] | None = None, prefix: str | None = None, pattern: str | None = None,
+                        mode: str = "change", cycle_ms: float = 10, duration_s: float | None = None,
+                        max_events: int | None = 5_000_000, start_when: str | None = None,
+                        stop_when: str | None = None, pre_trigger_ms: float = 0, name: str | None = None,
+                        max_symbols: int = 500) -> dict[str, Any]:
+        """Start a continuous real-time recording of online PLC variables (runs in the background
+        until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or
+        struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it)
+        or fnmatch pattern. mode: 'cycle' = one PLC-timestamped sample per symbol per cycle_ms
+        (ADS notification, cycle-accurate); 'change' = PLC-timestamped sample only when the value
+        changes (checked every cycle_ms); 'poll' = sum-read every cycle_ms from this PC.
+        Triggers: start_when='MAIN.bStart == TRUE' with pre_trigger_ms keeps the events before the
+        trigger (scope-style); stop_when='MAIN.fbFill.bDone == TRUE'. Events stream to a JSONL file."""
+        res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
+                                 cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
+                                 start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
+                                 name=name, max_symbols=max_symbols, timeout=120)
+        app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode}, OpClass.EDIT, "ok")
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def rec_list() -> dict[str, Any]:
+        """Recordings of this session (live status) and recording files on disk."""
+        return await app.rec_call(app.rec.list)
+
+    @mcp.tool(annotations=READ)
+    async def rec_status(id: str) -> dict[str, Any]:
+        """Live status of one recording: events, rate, drops, armed/triggered, last value per symbol."""
+        return await app.rec_call(app.rec.status, id)
+
+    @mcp.tool(annotations=READ)
+    async def rec_snapshot(id: str, last_n: int = 100, symbols: list[str] | None = None) -> dict[str, Any]:
+        """Most recent events of a running (or finished) recording — the live tail."""
+        return await app.rec_call(app.rec.snapshot, id, min(last_n, 5000), symbols)
+
+    @mcp.tool(annotations=READ)
+    async def rec_stats(id: str, symbols: list[str] | None = None, include_runs: bool = True,
+                        max_runs: int = 200) -> dict[str, Any]:
+        """Per-symbol statistics over the whole recording so far: count, first/last, min/max/mean,
+        change count, BOOL rising/falling edges with timestamps, and value runs (state timeline
+        with dwell times) — computed incrementally, no re-read of the file."""
+        return await app.rec_call(app.rec.stats, id, symbols, include_runs, min(max_runs, 5000))
+
+    @mcp.tool(annotations=READ)
+    async def rec_read(id: str, t_from_ms: float | None = None, t_to_ms: float | None = None,
+                       symbols: list[str] | None = None, max_rows: int = 2000, wide: bool = False) -> dict[str, Any]:
+        """Read a time window of a recording from its file. wide=true pivots to one row per event
+        with all selected symbols forward-filled (what you want for 'what else was true when X
+        happened'). Works on finished recordings from earlier sessions too."""
+        return await app.rec_call(app.rec.read, id, t_from_ms, t_to_ms, symbols, min(max_rows, 50_000), wide, timeout=300)
+
+    @mcp.tool(annotations=EDIT)
+    async def rec_stop(id: str) -> dict[str, Any]:
+        """Stop a recording, release the ADS notifications, finalize the file; returns status + stats."""
+        res = await app.rec_call(app.rec.stop, id, timeout=60)
+        app.audit("rec_stop", {"id": id, "events": res.get("events")}, OpClass.EDIT, "ok")
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def rec_export(id: str, fmt: str = "csv_wide", out_path: str | None = None,
+                         symbols: list[str] | None = None) -> dict[str, Any]:
+        """Export a recording to CSV: csv_wide (t_ms + one column per symbol, forward-filled) or
+        csv_long (t_ms,symbol,value). Default path next to the JSONL."""
+        return await app.rec_call(app.rec.export, id, fmt, out_path, symbols, timeout=600)
+
+    @mcp.tool(annotations=DESTR)
+    async def rec_delete(id: str) -> dict[str, Any]:
+        """Stop (if running) and delete a recording and its exports from disk."""
+        res = await app.rec_call(app.rec.delete, id)
+        app.audit("rec_delete", {"id": id}, OpClass.EDIT, "ok", res)
+        return res
+
+
+    # ======================================================================
+    # test_* bench: stimulus / expectations against the running PLC
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def test_expect(checks: list[dict[str, Any]], within_ms: int = 0, interval_ms: int = 20) -> dict[str, Any]:
+        """Assert conditions on live values. checks: [{symbol, op, value, tolerance?}], op ∈
+        == != > >= < <= ~= (relative/abs tolerance) in between. within_ms>0 waits until all hold.
+        Returns pass/fail per check with the time each one was met."""
+        return await app.ads_call(app.bench.expect, checks, within_ms, interval_ms, timeout=within_ms / 1000 + 30)
+
+    @mcp.tool(annotations=READ)
+    async def test_stable(symbol: str, duration_ms: int = 1000, tolerance: float = 0.0,
+                          interval_ms: int = 20) -> dict[str, Any]:
+        """Assert a value does not move more than tolerance for duration_ms (settle check for a
+        weight, pressure, PID output, state)."""
+        return await app.ads_call(app.bench.assert_stable, symbol, duration_ms, tolerance, interval_ms, timeout=duration_ms / 1000 + 30)
+
+    @mcp.tool(annotations=WRITE)
+    async def test_response(stimulus: dict[str, Any], response: str, timeout_ms: int = 5000,
+                            restore: bool = True, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Write a stimulus ({symbol: value}) and measure the PLC-timestamped latency until
+        `response` ('MAIN.fbValve.bOpen == TRUE') holds — how fast does the FB react? Writes are
+        gated per symbol; originals are restored afterwards unless restore=false."""
+        for k in stimulus:
+            await app.permit(ctx, OpClass.WRITE, "ads_write", k)
+        res = await app.ads_call(app.bench.measure_response, stimulus, response, timeout_ms, restore, timeout=timeout_ms / 1000 + 60)
+        app.audit("test_response", {"stimulus": stimulus, "response": response}, OpClass.WRITE, "ok", {"latency_ms": res.get("latency_ms")})
+        return res
+
+    @mcp.tool(annotations=WRITE)
+    async def test_scenario(spec: dict[str, Any], ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Scripted FB test against the live PLC with a recording in parallel. spec = {name,
+        record:{symbols|prefix|pattern, mode, cycle_ms}, steps:[{at_ms?, write:{sym:val}} |
+        {expect:[checks], within_ms} | {wait_ms} | {wait_until:{symbol,op,value,timeout_ms}} |
+        {stable:{symbol,duration_ms,tolerance}}], final_expect:[checks], timeout_ms, restore,
+        stop_on_fail}. Every written symbol is gated before the run starts; written values are
+        restored at the end. Returns per-step results, overall pass, and the recording id."""
+        syms: list[str] = []
+        for stp in spec.get("steps") or []:
+            syms += list((stp.get("write") or {}).keys())
+        for k in dict.fromkeys(syms):
+            await app.permit(ctx, OpClass.WRITE, "ads_write", k)
+        timeout = float(spec.get("timeout_ms", 120_000)) / 1000 + 120
+        res = await app.ads_call(app.bench.scenario, spec, timeout=timeout)
+        app.audit("test_scenario", {"name": res.get("name"), "writes": syms}, OpClass.WRITE,
+                  "pass" if res.get("pass") else "fail", {"recording": (res.get("recording") or {}).get("id")})
+        return res
+
+    # ======================================================================
+    # diagnostics / snapshots / RPC
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def ads_app_info() -> dict[str, Any]:
+        """PLC application info (TwinCAT_SystemInfoVarList._AppInfo): project/app name, online
+        change count, boot data loaded, task count, logged-in flag, app timestamp."""
+        return await app.ads_call(app.bench.app_info, timeout=30)
+
+    @mcp.tool(annotations=READ)
+    async def ads_task_stats(task_index: int = 1, samples: int = 20, interval_ms: int = 50) -> dict[str, Any]:
+        """PLC task timing (TwinCAT_SystemInfoVarList._TaskInfo[n]): cycle time, last/min/max/mean
+        execution time over `samples`, load %, cycle-time-exceeded counter delta — the FB's cost
+        on the real-time task."""
+        return await app.ads_call(app.bench.task_stats, task_index, min(samples, 1000), interval_ms, timeout=samples * interval_ms / 1000 + 30)
+
+    @mcp.tool(annotations=READ)
+    async def ads_ping(count: int = 10, port: int | None = None) -> dict[str, Any]:
+        """ADS round-trip time statistics to the target (router/route/network health)."""
+        return await app.ads_call(app.bench.ping, count, port, timeout=60)
+
+    @mcp.tool(annotations=WRITE)
+    async def ads_call_method(instance: str, method: str, inputs: list[dict[str, Any]] | None = None,
+                              return_type: str | None = None, outputs: list[str] | None = None,
+                              ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Invoke an FB method on the running PLC via ADS RPC. The method must carry
+        {attribute 'TcRpcEnable'}. inputs: [{type:'LREAL', value: 12.5}, …] in VAR_INPUT order
+        (use base types: INT not E_Enum); outputs: ['BOOL', …] in VAR_OUTPUT order. Write-class."""
+        await app.permit(ctx, OpClass.WRITE, "ads_call_method", f"{instance}#{method}")
+        res = await app.ads_call(app.bench.call_method, instance, method, inputs, return_type, outputs, timeout=60)
+        app.audit("ads_call_method", {"instance": instance, "method": method, "inputs": inputs}, OpClass.WRITE, "ok", res)
+        return res
+
+    @mcp.tool(annotations=EDIT)
+    async def snap_save(name: str, symbols: list[str] | None = None, prefix: str | None = None,
+                        pattern: str | None = None, max_symbols: int = 2000) -> dict[str, Any]:
+        """Save a named snapshot of live values (expanded like rec_start) for regression
+        comparison — parameters, recipes, whole FB instances before/after a change."""
+        return await app.ads_call(app.bench.snapshot_save, name, symbols, prefix, pattern, max_symbols, timeout=120)
+
+    @mcp.tool(annotations=READ)
+    async def snap_compare(a: str, b: str = "live", tolerance: float = 0.0, symbols: list[str] | None = None) -> dict[str, Any]:
+        """Diff snapshot `a` against `b` (another snapshot or 'live'), numeric tolerance applies."""
+        return await app.ads_call(app.bench.snapshot_compare, a, b, tolerance, symbols, timeout=120)
+
+    @mcp.tool(annotations=READ)
+    async def snap_list() -> list[dict[str, Any]]:
+        """Saved snapshots."""
+        return await asyncio.to_thread(app.bench.snapshot_list)
+
+    @mcp.tool(annotations=READ)
+    async def rec_pulses(id: str, symbol: str, max_list: int = 200) -> dict[str, Any]:
+        """Pulse / dwell analysis of one recorded symbol: for BOOL → pulse count, high/low widths,
+        period, frequency, duty (fine-dosing valve pulses); for other types → state timeline with
+        dwell times."""
+        return await app.rec_call(app.rec.pulses, id, symbol, max_list, timeout=300)
+
+    @mcp.tool(annotations=READ)
+    async def rec_latency(id: str, from_symbol: str, from_op: str, from_value: Any, to_symbol: str,
+                          to_op: str, to_value: Any, max_pairs: int = 500) -> dict[str, Any]:
+        """Edge-to-edge latency in a recording: from each time `from_symbol from_op from_value`
+        becomes true to the next time `to_symbol to_op to_value` becomes true (PLC timestamps).
+        E.g. bOpenCmd == TRUE → rFlow > 0.5."""
+        return await app.rec_call(app.rec.latency, id, from_symbol, from_op, from_value, to_symbol, to_op, to_value, max_pairs, timeout=300)
+
+    # ======================================================================
+    # static checks
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def proj_interface(name: str) -> dict[str, Any]:
+        """Public interface of an FB/program: inputs/outputs/in-out with types and comments,
+        methods (access, signature), properties (get/set), actions, extends/implements."""
+        return await app.proj_call(codecheck.fb_interface, app.proj, name)
+
+    @mcp.tool(annotations=READ)
+    async def proj_lint(name: str | None = None, rules: list[str] | None = None,
+                        prefixes: dict[str, list[str]] | None = None) -> dict[str, Any]:
+        """Static checks over one object or the whole project: unused locals, naming prefixes
+        (override map via `prefixes`), undocumented VAR_INPUT/OUTPUT, TODO markers, REAL
+        compared with =, VAR_INPUT assigned inside an FB, empty methods, GVL/ENUM without
+        qualified_only, magic numbers, FB_init/FB_exit without SUPER^. rules= subset to run."""
+        return await app.proj_call(codecheck.lint, app.proj, name, rules, prefixes)
+
+    @mcp.tool(annotations=READ)
+    async def proj_call_graph(root: str, depth: int = 4) -> dict[str, Any]:
+        """Call graph from a program/FB: FB instances it invokes, functions and methods it calls,
+        recursively to `depth` (what runs when this POU runs)."""
+        return await app.proj_call(codecheck.call_graph, app.proj, root, min(depth, 10))
+
+    @mcp.tool(annotations=EDIT)
+    async def tcunit_scaffold(fb_name: str, out_dir: str | None = None, add_to_plcproj: bool = True,
+                              overwrite: bool = False) -> dict[str, Any]:
+        """Generate <FB>_Tests.TcPOU (TcUnit.FB_TestSuite) with Test_InitialState and one test
+        method per public method, arranged from the FB interface, and register it in the
+        .plcproj. Assertions are left as TODO stubs."""
+        await app.permit(None, OpClass.EDIT, "tcunit_scaffold", fb_name)
+        res = await app.proj_call(codecheck.tcunit_scaffold, app.proj, fb_name, out_dir, add_to_plcproj, overwrite)
+        app.audit("tcunit_scaffold", {"fb": fb_name, "file": res.get("file")}, OpClass.EDIT, "ok")
         return res
 
     # ======================================================================
@@ -477,18 +763,20 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=DESTR)
     async def xae_command(name: str, args: str = "", confirm_token: str | None = None,
                           ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Execute an arbitrary DTE command (e.g. 'PLC.Login'). Control-class."""
-        await app.permit(ctx, OpClass.CONTROL, "xae_command", name, confirm_token)
+        """Execute an arbitrary DTE command (e.g. 'PLC.Login'). Control-class; commands whose name
+        contains download/reset/activate/restart/delete/remove/shutdown are destructive-class."""
+        op = OpClass.DESTRUCTIVE if re.search(r"download|reset|activate|restart|delete|remove|shutdown|clean", name, re.I) else OpClass.CONTROL
+        await app.permit(ctx, op, "xae_command", name, confirm_token)
         res = await app.xae_call(app.xae.command, name, args, timeout=120)
-        app.audit("xae_command", {"name": name, "args": args}, OpClass.CONTROL, "ok")
+        app.audit("xae_command", {"name": name, "args": args}, op, "ok")
         return res
 
     @mcp.tool(annotations=DESTR)
     async def xae_plc(action: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """PLC online actions through the shell: login | logout | start | stop | reset_cold |
         reset_origin | download. Command names vary by shell version; all candidates are tried.
-        download/reset_origin are destructive-class, the rest control-class."""
-        op = OpClass.DESTRUCTIVE if action in ("download", "reset_origin") else OpClass.CONTROL
+        download/reset_cold/reset_origin are destructive-class, the rest control-class."""
+        op = OpClass.DESTRUCTIVE if action in ("download", "reset_origin", "reset_cold") else OpClass.CONTROL
         await app.permit(ctx, op, "xae_plc", action, confirm_token)
         res = await app.xae_call(app.xae.plc_action, action, timeout=300)
         app.audit("xae_plc", {"action": action}, op, "ok", res)
@@ -513,6 +801,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_activate_configuration", tgt, confirm_token)
         res = await app.xae_call(app.xae.activate_configuration, timeout=600)
+        await app.ads_call(app.ads.disconnect, timeout=10)
         app.audit("xae_activate_configuration", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", res)
         return res
 
@@ -522,15 +811,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_restart_twincat", tgt, confirm_token)
         res = await app.xae_call(app.xae.restart_twincat, timeout=300)
+        await app.ads_call(app.ads.disconnect, timeout=10)
         app.audit("xae_restart_twincat", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", res)
         return res
 
     @mcp.tool(annotations=DESTR)
     async def xae_deploy(skip_build: bool = False, plc_project_path: str | None = None,
-                         confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+                         allow_target_mismatch: bool = False, confirm_token: str | None = None,
+                         ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Save → build → (boot project autostart on) → activate → restart, in one call.
-        Stops at the first build error. Destructive-class (one confirmation covers all steps)."""
+        Stops at the first build error. Destructive-class (one confirmation covers all steps).
+        Refuses when the XAE target and the ADS target of this server differ."""
         tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
+        await app.check_targets(tgt, allow_target_mismatch)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_deploy", tgt, confirm_token)
         steps: dict[str, Any] = {}
         steps["save"] = await app.xae_call(app.xae.save_all, timeout=60)
@@ -545,7 +838,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             steps["boot_project"] = await app.xae_call(app.xae.boot_project, plc_project_path, True, True, False, timeout=300)
         steps["activate"] = await app.xae_call(app.xae.activate_configuration, timeout=600)
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
-        app.ads.disconnect()
+        await app.ads_call(app.ads.disconnect, timeout=10)
         app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", steps)
         return {"deployed": True, "target": tgt, "steps": steps}
 
@@ -644,9 +937,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         app.audit("xae_plcopen_import", {"project": plc_project_path, "file": xml_file, "option": option}, OpClass.EDIT, "ok", res)
         return res
 
-    @mcp.tool(annotations=READ)
+    @mcp.tool(annotations=EDIT)
     async def xae_plcopen_export(plc_project_path: str, items: list[str], xml_file: str) -> dict[str, Any]:
         """Export PLC objects ('POUs.FB_X', 'DUTs.ST_Y' — folder.object) to a PLCopen XML file."""
+        await app.permit(None, OpClass.EDIT, "xae_plcopen_export", xml_file)
         return await app.xae_call(app.xae.plcopen_export, plc_project_path, items, xml_file, timeout=300)
 
     @mcp.tool(annotations=EDIT)
@@ -668,41 +962,41 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def proj_scan(root: str | None = None) -> dict[str, Any]:
         """Index the project tree (.sln/.tsproj/.plcproj/.TcPOU/.TcDUT/.TcGVL/.TcIO). Re-run
         after external edits."""
-        return app.proj_call(app.proj.scan, root)
+        return await app.proj_call(app.proj.scan, root)
 
     @mcp.tool(annotations=READ)
     async def proj_list(kind: str | None = None, pattern: str | None = None, limit: int = 500) -> dict[str, Any]:
         """List indexed objects. kind: PROGRAM | FUNCTION_BLOCK | FUNCTION | STRUCT | ENUM |
         UNION | ALIAS | GVL | INTERFACE | METHOD | PROPERTY | ACTION (case-insensitive)."""
-        return app.proj_call(app.proj.list_units, kind, pattern, limit)
+        return await app.proj_call(app.proj.list_units, kind, pattern, limit)
 
     @mcp.tool(annotations=READ)
     async def proj_get_code(name: str, part: str = "both", with_line_numbers: bool = True) -> dict[str, Any]:
         """Source of an object ('FB_Valve', 'FB_Valve.Open', 'MAIN'): declaration/implementation
         with file line numbers, parsed VAR declarations, sub-items."""
-        return app.proj_call(app.proj.get_code, name, part, with_line_numbers)
+        return await app.proj_call(app.proj.get_code, name, part, with_line_numbers)
 
     @mcp.tool(annotations=READ)
     async def proj_resolve_symbol(symbol: str) -> dict[str, Any]:
         """Map an ADS symbol path (MAIN.fbFill.fbValve.bOpen) to the file:line where each hop is
         declared, following variable types through FB/STRUCT definitions."""
-        return app.proj_call(app.proj.resolve_symbol, symbol)
+        return await app.proj_call(app.proj.resolve_symbol, symbol)
 
     @mcp.tool(annotations=READ)
     async def proj_search(regex: str, kinds: list[str] | None = None, max_hits: int = 200,
                           ignore_case: bool = True) -> dict[str, Any]:
         """Regex search over all declarations/implementations → unit, file, line, text."""
-        return app.proj_call(app.proj.search, regex, kinds, max_hits, ignore_case)
+        return await app.proj_call(app.proj.search, regex, kinds, max_hits, ignore_case)
 
     @mcp.tool(annotations=READ)
     async def proj_references(name: str, max_hits: int = 200) -> dict[str, Any]:
         """Where a type/object is instantiated (variables of that type) and mentioned."""
-        return app.proj_call(app.proj.references, name, max_hits)
+        return await app.proj_call(app.proj.references, name, max_hits)
 
     @mcp.tool(annotations=READ)
     async def proj_read_file(path: str, max_chars: int = 200000) -> dict[str, Any]:
         """Raw text of a project file (relative to project root or absolute)."""
-        return app.proj_call(app.proj.read_file, path, max_chars)
+        return await app.proj_call(app.proj.read_file, path, max_chars)
 
     @mcp.tool(annotations=EDIT)
     async def proj_set_code(name: str, declaration: str | None = None, implementation: str | None = None,
@@ -711,7 +1005,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         rest of the XML byte-identical, writes a .bak, drops the object's stale <LineIds>).
         Use when XAE is closed or for batch edits; otherwise prefer xae_pou_set."""
         await app.permit(None, OpClass.EDIT, "proj_set_code", name)
-        res = app.proj_call(app.proj.set_code, name, declaration, implementation, strip_lineids)
+        res = await app.proj_call(app.proj.set_code, name, declaration, implementation, strip_lineids)
         app.audit("proj_set_code", {"name": name, "changed": res.get("changed")}, OpClass.EDIT, "ok", res)
         return res
 
@@ -724,27 +1018,30 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Parse a TcUnit xUnit result into a pass/fail summary. Source: the file on the target
         over ADS (default: configured remote path), a local file, or raw XML text."""
         if local_path:
-            txt = app.proj_call(app.proj.read_file, local_path)["text"]
+            txt = (await app.proj_call(app.proj.read_file, local_path))["text"]
             src = local_path
         elif xml_text:
             txt, src = xml_text, "<text>"
         else:
             src = remote_path or cfg.project.tcunit_remote_result
             txt = (await app.ads_call(app.files.read_file, src, None, True, "utf-8", timeout=120))["text"]
-        res = app.proj_call(parse_tcunit_xml, txt)
+        res = await app.proj_call(parse_tcunit_xml, txt)
         res["source"] = src
         return res
 
     @mcp.tool(annotations=DESTR)
     async def tcunit_run(plc_project_path: str, timeout_s: int = 600, skip_build: bool = False,
-                         remote_result_path: str | None = None, confirm_token: str | None = None,
-                         ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+                         remote_result_path: str | None = None, allow_target_mismatch: bool = False,
+                         confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Full TcUnit cycle: build → boot project autostart+generate → activate → restart →
         delete old result → wait for the xUnit file on the target → parse. Destructive-class
         (it activates a configuration on the target). plc_project_path from xae_plc_projects."""
         tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
-        await app.permit(ctx, OpClass.DESTRUCTIVE, "tcunit_run", tgt, confirm_token)
         rp = remote_result_path or cfg.project.tcunit_remote_result
+        if not rp.lower().endswith(".xml"):
+            raise ToolError("remote_result_path must be the TcUnit xUnit .xml file")
+        await app.check_targets(tgt, allow_target_mismatch)
+        await app.permit(ctx, OpClass.DESTRUCTIVE, "tcunit_run", f"{tgt} {rp}", confirm_token)
         steps: dict[str, Any] = {"target": tgt}
         if not skip_build:
             b = await app.xae_call(app.xae.build, False, False, timeout=cfg.xae.build_timeout_s + 60)
@@ -761,7 +1058,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         steps["boot_project"] = await app.xae_call(app.xae.boot_project, plc_project_path, True, True, False, timeout=300)
         steps["activate"] = await app.xae_call(app.xae.activate_configuration, timeout=600)
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
-        app.ads.disconnect()
+        await app.ads_call(app.ads.disconnect, timeout=10)
         t0 = time.time()
         waited = await app.ads_call(app.files.wait_for_file, rp, timeout_s, 3.0, timeout=timeout_s + 30)
         steps["wait"] = waited
@@ -771,9 +1068,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                     "note": "result file never appeared — is the TcUnit task running and the "
                             "result path right? (default C:\\TwinCAT\\3.1\\Boot\\TcUnit_xUnit_testresults.xml)"}
         # TcUnit writes the file incrementally; give it a moment to finish
-        time.sleep(2.0)
+        await asyncio.sleep(2.0)
         f = await app.ads_call(app.files.read_file, rp, None, True, "utf-8", timeout=120)
-        res = app.proj_call(parse_tcunit_xml, f["text"])
+        res = await app.proj_call(parse_tcunit_xml, f["text"])
         steps["elapsed_s"] = round(time.time() - t0, 1)
         app.audit("tcunit_run", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", res["summary"])
         return {"ran": True, "result": res, "steps": steps}
@@ -793,5 +1090,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     def res_safety() -> str:
         return json.dumps(app.guard.status(), indent=2, default=str)
 
+    import atexit
+    atexit.register(app.rec.stop_all)
     mcp._tcmcp_app = app  # type: ignore[attr-defined]  (tests)
     return mcp

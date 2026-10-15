@@ -141,3 +141,57 @@ async def test_xae_tools_report_platform_cleanly(monkeypatch, project_dir):
         res = await s.call_tool("tc_doctor", {})
         d = payload(res)
         assert d["router"] == "ok" and d["local_ams_net_id"] == "192.168.0.10.1.1"
+
+
+@pytest.mark.anyio
+async def test_recorder_and_bench_tools(monkeypatch, project_dir):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", write_allowlist=["MAIN.n*"]))
+    async with client_for(srv) as s:
+        st = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle", "MAIN.sLabel"], "mode": "poll", "cycle_ms": 5}))
+        rid = st["id"]
+        import anyio as _anyio
+        await _anyio.sleep(0.15)
+        st2 = payload(await s.call_tool("rec_status", {"id": rid}))
+        assert st2["events"] >= 4 and st2["active"]
+        snap = payload(await s.call_tool("rec_snapshot", {"id": rid, "last_n": 3}))
+        assert len(snap["rows"]) == 3
+        out = payload(await s.call_tool("rec_stop", {"id": rid}))
+        assert not out["active"] and out["stats"]["MAIN.nCycle"]["last"] == 42
+        exp = payload(await s.call_tool("rec_export", {"id": rid, "fmt": "csv_long"}))
+        assert exp["rows"] > 0
+        pl = payload(await s.call_tool("rec_pulses", {"id": rid, "symbol": "MAIN.nCycle"}))
+        assert pl["runs"] == 1
+        # bench: expect works read-only; scenario writes gated per symbol
+        e = payload(await s.call_tool("test_expect", {"checks": [{"symbol": "MAIN.nCycle", "op": "==", "value": 42}]}))
+        assert e["pass"]
+        res = await s.call_tool("test_scenario", {"spec": {"steps": [{"write": {"MAIN.bStart": True}}]}})
+        assert res.is_error and "not in write_allowlist" in text(res)
+        res = await s.call_tool("test_scenario", {"spec": {"steps": [{"write": {"MAIN.nCycle": 7}}, {"expect": [{"symbol": "MAIN.nCycle", "op": "==", "value": 7}]}]}})
+        assert not res.is_error and payload(res)["pass"]
+        d = payload(await s.call_tool("ads_task_stats", {"task_index": 1, "samples": 2, "interval_ms": 1}))
+        assert d["task_name"] == "PlcTask"
+        lint = payload(await s.call_tool("proj_lint", {"rules": ["unused"]}))
+        assert lint["by_rule"]["unused"] >= 1
+        iface = payload(await s.call_tool("proj_interface", {"name": "FB_Valve"}))
+        assert iface["properties"][0]["name"] == "IsOpen"
+
+
+@pytest.mark.anyio
+async def test_token_bound_to_target_and_raw_write_denylist(monkeypatch, project_dir):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="full", write_denylist=["MAIN.bStart"]))
+    async with client_for(srv) as s:
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "ads_plc_state", "target": "reset"}))
+        assert tok["scope"] == "5.1.2.3.1.1:851"
+        # re-target (full mode: free) then try to spend the old token → refused
+        await s.call_tool("ads_connect", {"ams_net_id": "5.9.9.9.1.1"})
+        res = await s.call_tool("ads_plc_state", {"action": "reset", "confirm_token": tok["confirm_token"]})
+        assert res.is_error and "issued while connected to 5.1.2.3.1.1:851" in text(res)
+        # raw write overlapping a denylisted symbol is refused even in full mode
+        info = payload(await s.call_tool("ads_symbol_info", {"name": "MAIN.bStart"}))
+        ig, io = int(info["index_group"], 16), int(info["index_offset"], 16)
+        res = await s.call_tool("ads_write_raw", {"index_group": ig, "index_offset": io, "hex_data": "01"})
+        assert res.is_error and "denylist" in text(res)
+        res = await s.call_tool("ads_write_raw", {"index_group": ig, "index_offset": io, "hex_data": "01", "port": 10000})
+        assert res.is_error and "851-859" in text(res)
