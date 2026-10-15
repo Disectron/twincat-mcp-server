@@ -83,7 +83,7 @@ It reports router/local NetId, target state, registered XAE ProgIDs, running XAE
 project root and the safety mode. Then:
 
 ```
-> /mcp                      # shows the server, its 113 tools and 5 prompts
+> /mcp                      # shows the server, its 120 tools and 5 prompts
 > /twincat:onboard_project  # a prompt = a workflow recipe (also: debug_symbol, fb_validation,
                             #   deploy_safely, performance_audit)
 ```

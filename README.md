@@ -11,6 +11,7 @@ One MCP server, one Python process, full reach into a Beckhoff TwinCAT 3 setup:
 | **Test bench** | scripted scenarios (writes + expectations + parallel recording), assertions with wait, settle checks, stimulus→response latency, RPC method calls, task timing/load, snapshots for regression | ADS |
 | **Project files (offline)** | index .TcPOU/.TcDUT/.TcGVL/.TcIO, code with line numbers, **ADS symbol → file:line resolution**, regex search, references, call graph, FB interface summary, lint, write-back with LineIds hygiene, TcUnit suite scaffold | XML + regex, no XAE needed |
 | **TcUnit** | build → boot → activate → restart → fetch xUnit XML from the target → pass/fail summary | all three |
+| **Reference (Infosys)** | TwinCAT 3 documentation lookup that cannot be incomplete: books and pages from infosys.beckhoff.com's own sitemap, per-library local index (FTS5), symbol search, **FB/struct/enum declarations as data** with the page's descriptions, code-example search, any page as Markdown; web fallback verified against the sitemap | urllib + SQLite, no index to ship |
 
 Runs **on the engineering PC** (Windows, TwinCAT XAE installed) and talks to the IPC through the TwinCAT router. No C# helper, no daemon, no PowerShell, no vector DB.
 
@@ -28,6 +29,7 @@ Existing servers each cover a slice; this one was built after reading all of the
 | [Auda29/twincat-mcp-mono](https://github.com/Auda29/twincat-mcp-mono) (TypeScript ADS) | three-gate write model kept (mode + runtime + allowlist); XAE/files added. |
 | [agenticcontrolio/twincat-validator-mcp](https://github.com/agenticcontrolio/twincat-validator-mcp) | offline XML lint/auto-fix. Complementary; run both. |
 | [idomp/twincat-index-mcp](https://github.com/idomp/twincat-index-mcp) | semantic search needs Qdrant + embeddings. Here: deterministic symbol-to-source resolution instead. |
+| Infosys documentation servers (`infosys_search` / `infosys_get_page` style, pre-built index) | the shipped index is whatever the author crawled: tested one has no Tc2_System at all (`ADSREAD` → nothing, `get_page` → "not found" for a live page), duplicate `?id=` URLs, BA2 functions ranked above `TON`. Here the page list comes from the site's sitemap and pages are fetched live, so an existing page can never be "not found"; TwinCAT 2 books are filtered out. |
 
 Extra: human-in-the-loop via **MCP elicitation** — when the client supports it (Claude Code does) the destructive tools ask *you* in the client UI; the token flow is only the fallback.
 
@@ -79,7 +81,7 @@ safety modes. Windows only (the bundle runs `cmd /d /c server\launch.cmd`, which
 git clone <this repo> C:\tools\twincat-mcp
 cd C:\tools\twincat-mcp
 scripts\install.cmd            :: venv + pip install -e .[dev] + prints effective config
-.venv\Scripts\python -m pytest :: 116 tests, all mocked, run anywhere
+.venv\Scripts\python -m pytest :: 140 tests, all mocked, run anywhere
 cd C:\Projects\DrumFilling
 claude mcp add twincat -e TCMCP_SOLUTION=%CD%\DrumFilling.sln -e TCMCP_AMS_NET_ID=5.12.34.56.1.1 -e TCMCP_MODE=guarded -e TCMCP_MAX_MODE=full -- C:\tools\twincat-mcp\.venv\Scripts\python.exe -m twincat_mcp
 ```
@@ -107,6 +109,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 | `TCMCP_XAE_ATTACH_ONLY` | `0` → `xae_attach` may launch a shell | `1` |
 | `TCMCP_TCUNIT_RESULT` | result path on the target | `C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml` |
 | `TCMCP_AUDIT_LOG`, `TCMCP_AUDIT_READS` | JSONL audit file; also log reads | `~/.twincat_mcp/audit.jsonl`, `0` |
+| `TCMCP_DOCS`, `TCMCP_DOCS_BOOKS`, `TCMCP_DOCS_EXCLUDE`, `TCMCP_DOCS_WEB_FALLBACK`, `TCMCP_DOCS_CACHE` | Infosys lookup on/off; `;`-separated default books; exclude regexes; web fallback; cache dir | `1`, 8 core PLC libraries, —, `1`, `~/.twincat_mcp/infosys` |
 
 ## Safety model
 
@@ -124,7 +127,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **"Absolute control" setting:** `TCMCP_MODE=full TCMCP_MAX_MODE=full TCMCP_CONFIRM=0`. In that configuration a single mis-aimed tool call can stop the PLC, activate a half-built configuration or reboot the IPC. The server will do exactly what it is told; the only remaining gate is the MCP client's own tool-permission prompt. Keep a denylist for E-stop/safety symbols regardless.
 
-## Tools (113) + 5 prompts
+## Tools (120) + 5 prompts
 
 **Workflows (one call = a whole chain)** `wf_debug_symbol` · `wf_fb_profile` · `wf_release_check` · `wf_project_overview`
 
@@ -147,6 +150,8 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 **HMI (TE2000 / TcVIS)** `hmi_scan` · `hmi_bindings` · `hmi_vs_runtime`
 
 **TcUnit** `tcunit_results` · `tcunit_run[disable_io]` · `tcunit_scaffold`
+
+**Infosys reference (TwinCAT 3)** `infosys_books` · `infosys_index` · `infosys_search_symbols` · `infosys_declaration` · `infosys_search` · `infosys_search_code` · `infosys_get_page`
 
 **Meta** also `tc_session_report` (markdown handover of everything this session changed/produced)
 
@@ -246,6 +251,41 @@ Modes: `cycle` = one sample per symbol per `cycle_ms` (set it to the task cycle 
 
 Writes in scenarios go through the same allow/deny lists as `ads_write`; nothing is written until every symbol in the script has been permitted. Writing to an `AT %I*` input does nothing useful (the I/O task overwrites it each cycle) — stimulate through unmapped inputs or a simulation GVL.
 
+## Looking up Beckhoff documentation
+
+The `infosys_*` tools exist because the documentation MCP servers available for TwinCAT ship a
+pre-built index, and an index is only as complete as the crawl that made it. Against the one tested
+here, `infosys_search_symbols("ADSREAD")` returned nothing, `infosys_get_page` reported a live
+Tc2_System page as not found, and `TON` ranked BA2 helper functions first. This server does not ship
+an index:
+
+* **What exists** comes from `infosys.beckhoff.com/sitemap.xml` (every English page URL with its
+  `lastmod`), cached a week. `infosys_books` groups it by book (`tcplclib_tc2_system`, `tf6100_tc3_opcua`,
+  `el3xxx`…) with page counts; TwinCAT 2 books are dropped (`tcplclib<name>` without underscore,
+  `twincat2/`). `Tc2_System`, `Tc2_Standard`, `Tc2_Utilities` are TwinCAT 3 libraries and stay.
+* **What is indexed** is per book, on demand: `infosys_index tcplclib_tc2_system` fetches its pages
+  (≈300, parallel, ~30–60 s), converts each to Markdown with our own HTML walker, classifies the page
+  (FunctionBlock / Function / Struct / Enum / Alias / Interface / GVL / Library / Page), extracts the
+  declaration from the `VAR_INPUT`/`VAR_OUTPUT` code blocks and attaches the description tables, and
+  stores it in SQLite with FTS5. A later run refetches only pages whose `lastmod` changed. The first
+  `infosys_search_symbols` / `infosys_declaration` indexes the default libraries (`docs.books`) if
+  nothing is indexed yet.
+* **`infosys_declaration ADSREAD`** → `{kind, inputs:[{name,type,default,description}], outputs,
+  in_out, members, enum_values, return_type, extends, implements, declaration, url}` — call it before
+  writing code against a library FB you have not used. `infosys_search_code "IDXGRP:=16#F005"` finds the
+  example that uses a constant; `infosys_search "rising edge"` is bm25-ranked full text with excerpts.
+* **`infosys_get_page`** takes a URL, `book/pageid`, a bare page id, or a symbol name, fetches live
+  (cached by `lastmod`) and returns Markdown — for any page the site has, indexed or not. Host-locked
+  to infosys.beckhoff.com; the server is not a general web fetcher.
+* **Web fallback**: when the local index has no hit, `infosys_search` asks DuckDuckGo for
+  `site:infosys.beckhoff.com <query>`, keeps only URLs that are in the sitemap and in TwinCAT 3 books,
+  fetches them for title/excerpt and caches them. `backend` in the result says which path answered.
+  `docs.web_fallback=false` turns it off.
+
+Config (`[docs]` in the TOML / `TCMCP_DOCS*`): `enabled`, `books` (indexed on first use), `exclude_books`
+(regexes), `tc3_only`, `max_workers` (≤16; be polite), `max_index_pages`, `sitemap_ttl_days`,
+`web_fallback`, `cache_dir`. Nothing here touches a PLC; all seven tools are read-only class.
+
 ## A debugging session
 
 ```
@@ -282,13 +322,14 @@ The XAE and System-Service paths are written against Beckhoff's Infosys document
 13. `ads_call_method` on a method marked `{attribute 'TcRpcEnable'}` → check the `instance#method` handle name and the packed parameter layout against the result.
 14. `ads_types ST_<something>` then `ads_read` of an `ARRAY OF STRUCT` variable → datatype-table parsing (`AdsDatatypeEntry` incl. the optional GUID/attribute/enum tails) against a real table; compare offsets with the TMC. On failure the server falls back to published members and reports `decoder: none` for arrays of structs.
 
-15. `scripts\launch.cmd` (used by the `.mcpb`) → Python discovery order `TCMCP_PYTHON` → `py -3` → `python` → `%LOCALAPPDATA%\Programs\Python\Python3*`; the Microsoft-Store `python.exe` stub fails the version probe and is skipped. Run it once by hand with `--no-run` and watch stderr.
+15. `infosys_get_page ADSREAD` and `infosys_index tcplclib_tc2_system` → the HTML walker was written against the page *shape* reported through a Markdown converter, not the raw HTML (this repo was built on a host that cannot reach infosys.beckhoff.com). Check: title = symbol name, `kinds` in the index result mostly FunctionBlock/Function/Struct, `infosys_declaration ADSREAD` lists NETID…TMOUT with descriptions. If titles come back as "Beckhoff Information System" or kinds are all `Page`, the H1/`<pre>` selectors in `infosys.py::_MdWalker` need the real markup — one page's HTML pasted back is enough.
+16. `scripts\launch.cmd` (used by the `.mcpb`) → Python discovery order `TCMCP_PYTHON` → `py -3` → `python` → `%LOCALAPPDATA%\Programs\Python\Python3*`; the Microsoft-Store `python.exe` stub fails the version probe and is skipped. Run it once by hand with `--no-run` and watch stderr.
 
 Anything that fails: the tool error text contains the ADS/HRESULT code; paste it back and the fix is usually one constant.
 
 ## Changelog
 
-**0.6.0** — packaging: Claude Code plugin + marketplace in `.claude-plugin/` (`/plugin install twincat-mcp@twincat-mcp`, `userConfig` for Python/AmsNetId/modes), Claude Desktop `.mcpb` bundle (`packaging/mcpb/build.py`, manifest 0.3, tool list generated from the server, passes `mcpb validate`), self-bootstrapping launcher `scripts/launch.py` (+ `launch.cmd`) that creates the venv on first start and reinstalls only when the shipped sources change; skill moved to `skills/twincat-mcp/`; HTTP mode bearer-token gate for claude.ai remote connectors. Plugin path verified end-to-end on Linux (install → venv → `tc_doctor` via `mcp__plugin_twincat-mcp_twincat__tc_doctor`); `launch.cmd` Python discovery is untested on Windows.
+**0.6.0** — `infosys_*` reference lookup (7 tools): sitemap-driven book list, per-library local index with FTS5, symbol search, declarations as data, code-example search, live page → Markdown, sitemap-verified web fallback, TwinCAT 2 filtered out; `scripts/gen_tools_md.py`. Packaging: Claude Code plugin + marketplace in `.claude-plugin/` (`/plugin install twincat-mcp@twincat-mcp`, `userConfig` for Python/AmsNetId/modes), Claude Desktop `.mcpb` bundle (`packaging/mcpb/build.py`, manifest 0.3, tool list generated from the server, passes `mcpb validate`), self-bootstrapping launcher `scripts/launch.py` (+ `launch.cmd`) that creates the venv on first start and reinstalls only when the shipped sources change; skill moved to `skills/twincat-mcp/`; HTTP mode bearer-token gate for claude.ai remote connectors. Plugin path verified end-to-end on Linux (install → venv → `tc_doctor` via `mcp__plugin_twincat-mcp_twincat__tc_doctor`); `launch.cmd` Python discovery is untested on Windows.
 
 **0.5.0** — dialog watchdog, TwinSAFE guard, XML validation/fixes + LineIds regeneration, TE2000/TcVIS HMI binding index with runtime/source cross-check, I/O disable, variable links, UDP discovery, Windows event log, C#/TypeScript/JSON exporters, snapshot apply, session report, `naming_prefixes` config.
 
@@ -307,7 +348,7 @@ Scope/TE13xx recording, TE1200 static analysis, NC axis commissioning, Safety (T
 ## Development
 
 ```
-python -m pytest            # 116 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation, packaging)
+python -m pytest            # 140 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation, packaging)
 python packaging/mcpb/build.py      # dist/twincat-mcp-<version>.mcpb; npx @anthropic-ai/mcpb validate runs if Node is present
 claude plugin validate .            # plugin + marketplace manifests
 python -m twincat_mcp --print-config

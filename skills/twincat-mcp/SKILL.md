@@ -40,6 +40,12 @@ with numbers → `tcunit_scaffold` + `tcunit_run` to make it permanent.
 ## When XAE stalls
 `xae_dialogs` → read title/buttons → `xae_dialog_resolve button=...` (machine-affecting prompts need confirmation).
 
+## Library FB / type you have not used
+`infosys_declaration <FB|ST_|E_>` (inputs/outputs with descriptions, struct members, enum values) →
+`infosys_search_code "<call pattern>"` for a working example → `infosys_get_page <symbol>` only when
+the prose matters. Unknown library: `infosys_books pattern=tcplclib_*` → `infosys_index <book>`.
+Never invent a library FB's pins; if `infosys_declaration` has no page, say so.
+
 ## MES / C# side
 `ads_export types=[ST_Recipe,...] fmt=csharp` and `ads_export prefix=MAIN fmt=csharp_symbols` after every datatype change.
 

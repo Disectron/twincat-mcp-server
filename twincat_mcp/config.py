@@ -90,12 +90,36 @@ class SafetyConfig:
     audit_reads: bool = False
 
 
+# Infosys books indexed on the first symbol lookup when nothing else is configured. Slugs are
+# the path segment after /content/1033/ on infosys.beckhoff.com; unknown slugs are reported, not fatal.
+DEFAULT_DOCS_BOOKS = (
+    "tcplclib_tc2_system", "tcplclib_tc2_standard", "tcplclib_tc2_utilities", "tcplclib_tc3_module",
+    "tcplclib_tc2_math", "tcplclib_tc2_iofunctions", "tcplclib_tc3_eventlogger", "tcplclib_tc3_jsonxml",
+)
+
+
+@dataclass
+class DocsConfig:
+    """Beckhoff Infosys reference lookup (infosys_* tools)."""
+    enabled: bool = True
+    cache_dir: str | None = None           # None -> ~/.twincat_mcp/infosys
+    books: list[str] = field(default_factory=lambda: list(DEFAULT_DOCS_BOOKS))
+    exclude_books: list[str] = field(default_factory=list)   # extra regexes on the book slug
+    tc3_only: bool = True                  # drop TwinCAT 2 books (tcplclib<name> without underscore, twincat2/)
+    max_workers: int = 6                   # parallel page fetches while indexing a book
+    max_index_pages: int = 4000            # hard cap per infosys_index call
+    sitemap_ttl_days: int = 7
+    web_fallback: bool = True              # DuckDuckGo site: search when the local index has no hit
+    fetch_timeout_s: float = 20.0
+
+
 @dataclass
 class Config:
     ads: AdsConfig = field(default_factory=AdsConfig)
     xae: XaeConfig = field(default_factory=XaeConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    docs: DocsConfig = field(default_factory=DocsConfig)
     config_file: str | None = None
 
     # ------------------------------------------------------------------ dump
@@ -121,7 +145,7 @@ def _find_config_file() -> Path | None:
 
 
 def _apply_toml(cfg: Config, data: dict[str, Any]) -> None:
-    for section in ("ads", "xae", "project", "safety"):
+    for section in ("ads", "xae", "project", "safety", "docs"):
         sub = data.get(section) or {}
         target = getattr(cfg, section)
         for k, v in sub.items():
@@ -193,6 +217,17 @@ def _apply_env(cfg: Config) -> None:
     # project
     if v := _env("TCMCP_PROJECT_ROOT"):
         cfg.project.root = v
+    # docs
+    if (b := _env_bool("TCMCP_DOCS")) is not None:
+        cfg.docs.enabled = b
+    if (lst := _env_list("TCMCP_DOCS_BOOKS")) is not None:
+        cfg.docs.books = lst
+    if (lst := _env_list("TCMCP_DOCS_EXCLUDE")) is not None:
+        cfg.docs.exclude_books = lst
+    if (b := _env_bool("TCMCP_DOCS_WEB_FALLBACK")) is not None:
+        cfg.docs.web_fallback = b
+    if v := _env("TCMCP_DOCS_CACHE"):
+        cfg.docs.cache_dir = v
     if v := _env("TCMCP_TCUNIT_RESULT"):
         cfg.project.tcunit_remote_result = v
 
@@ -214,6 +249,10 @@ def validate(cfg: Config) -> list[str]:
         problems.append("ads.ams_port out of range")
     if cfg.project.root is None and cfg.xae.solution_path:
         cfg.project.root = str(Path(cfg.xae.solution_path).parent)
+    if cfg.docs.cache_dir is None:
+        cfg.docs.cache_dir = str(_home() / "infosys")
+    if cfg.docs.max_workers < 1 or cfg.docs.max_workers > 16:
+        problems.append("docs.max_workers must be 1..16 (be polite to infosys.beckhoff.com)")
     return problems
 
 

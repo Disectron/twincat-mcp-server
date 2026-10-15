@@ -36,3 +36,15 @@ write_allowlist = ["MAIN.fb*", "GVL_Test.*", "GVL_Hmi.*"]   # guarded mode: writ
 write_denylist  = ["*.bEStop*", "GVL_Safety.*"]            # never writable, any mode
 audit_reads = false
 # audit_log = 'C:\Users\ryan\.twincat_mcp\audit.jsonl'
+
+[docs]                             # Beckhoff Infosys reference (infosys_* tools), TwinCAT 3 only
+enabled = true
+books = ["tcplclib_tc2_system", "tcplclib_tc2_standard", "tcplclib_tc2_utilities", "tcplclib_tc3_module",
+         "tcplclib_tc2_math", "tcplclib_tc2_iofunctions", "tcplclib_tc3_eventlogger", "tcplclib_tc3_jsonxml"]
+# exclude_books = ["^tf5", "^el\\d"]  # regexes on the book slug, on top of the TwinCAT 2 filter
+tc3_only = true
+max_workers = 6                    # parallel page fetches while indexing (keep ≤ 8)
+max_index_pages = 4000             # cap per infosys_index call
+sitemap_ttl_days = 7
+web_fallback = true                # DuckDuckGo site: search when the local index has no hit
+# cache_dir = 'C:\Users\ryan\.twincat_mcp\infosys'

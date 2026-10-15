@@ -13,4 +13,6 @@
   `xae_build` and read the error items. Deliver code as .TcPOU/.TcDUT/.TcGVL or PLCopen XML.
 - Deploy only via `xae_deploy` after `wf_release_check`; then `proj_vs_runtime` must be clean.
 - Writes go through the allow/deny lists; do not write to `AT %I*` inputs or safety symbols.
+- Library FBs/types: `infosys_declaration <name>` before using one; `infosys_search_code` for a
+  known-good call pattern. TwinCAT 3 docs only; do not quote TwinCAT 2 material.
 - Every mutating call is audited (`tc_audit_tail`). Say which recording/snapshot ids you produced.
