@@ -49,7 +49,11 @@ Workflow for debugging a running machine:
   1. tc_doctor → confirms ADS router, XAE shell, project root, safety mode.
   2. ads_status → PLC state, TwinCAT run/config mode, device info.
   3. ads_list_symbols / ads_read / ads_read_many → inspect live values
-     (structs and arrays are expanded, TIME/DATE decoded).
+     (structs, FB instances and arrays of structs decode fully via the datatype
+     table; TIME/DATE decoded; enums named). ads_leaves 'MAIN' lists every
+     variable under a program; ads_dump reads every variable on the PLC to
+     JSON+CSV; proj_variables lists what the source declares; proj_vs_runtime
+     proves the target runs this source.
   4. ads_watch / ads_wait_until → short timing captures (≤60 s, inline).
      rec_start → continuous real-time capture while the program runs (PLC-time-
      stamped notifications, hours long, file-backed); rec_snapshot / rec_stats /
@@ -655,6 +659,98 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         res = await app.proj_call(codecheck.tcunit_scaffold, app.proj, fb_name, out_dir, add_to_plcproj, overwrite)
         app.audit("tcunit_scaffold", {"fb": fb_name, "file": res.get("file")}, OpClass.EDIT, "ok")
         return res
+
+
+    # ======================================================================
+    # whole-project variable access
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def ads_dump(pattern: str | None = None, include_system: bool = False, out_dir: str | None = None,
+                       max_total_mb: int = 64, max_leaves: int = 500_000) -> dict[str, Any]:
+        """Read EVERY variable on the PLC (all top-level symbols, fully expanded through the
+        datatype table — structs, FB instances, arrays of structs) in one pass and write a nested
+        JSON tree plus a flat CSV (path,type,value). pattern limits the roots ('MAIN.*', 'GVL_*');
+        system/library symbols excluded unless include_system. Returns counts, file paths and a
+        50-leaf preview; use proj_read_file / rec-style tooling on the files for detail."""
+        od = out_dir or str(Path(cfg.safety.audit_log).parent / "dumps")
+        return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * 1024 * 1024, max_leaves, timeout=900)
+
+    @mcp.tool(annotations=READ)
+    async def ads_leaves(name: str, max_leaves: int = 5000, with_values: bool = False) -> dict[str, Any]:
+        """Enumerate every scalar leaf under a symbol with byte offsets (datatype table):
+        'MAIN' → all program variables, 'MAIN.arrSteps' → arrSteps[1].nId … With values=true
+        each leaf is decoded from one read of the whole symbol."""
+        groups = await app.ads_call(app.ads.leaves_under, name, max_leaves, timeout=120)
+        out: list[dict[str, Any]] = []
+        for root, leaves in groups:
+            vals: dict[str, Any] = {}
+            if with_values:
+                try:
+                    vals = await app.ads_call(app.ads.leaf_values, root, leaves, timeout=120)
+                except ToolError as exc:
+                    vals = {"__error__": str(exc)}
+            for lf in leaves:
+                d = {"path": lf.path, "type": lf.type, "offset": lf.offset, "size": lf.size, "root": root.name}
+                if lf.enum:
+                    d["enum"] = lf.enum
+                if lf.note:
+                    d["note"] = lf.note
+                if with_values:
+                    d["value"] = vals.get(lf.path, vals.get("__error__"))
+                out.append(d)
+        return {"name": name, "roots": [g[0].name for g in groups], "count": len(out), "leaves": out[:max_leaves],
+                "truncated": len(out) > max_leaves}
+
+    @mcp.tool(annotations=READ)
+    async def ads_types(type_name: str | None = None, pattern: str | None = None, limit: int = 200) -> dict[str, Any]:
+        """Runtime datatype table: describe one type (members with offsets/sizes, array bounds,
+        enum literals, attributes) or list types matching a pattern."""
+        if type_name:
+            return await app.ads_call(app.ads.type_info, type_name, timeout=60)
+        return await app.ads_call(app.ads.list_types, pattern, min(limit, 5000), timeout=60)
+
+    @mcp.tool(annotations=READ)
+    async def proj_variables(scope: str | None = None, max_array: int = 64, max_items: int = 200_000,
+                             include_temp: bool = False) -> dict[str, Any]:
+        """Every variable the project source declares, flattened to runtime instance paths by
+        walking programs and GVLs through FB/STRUCT definitions (MAIN.fbFill.fbValve.bOpen …).
+        scope = one program/GVL/FB to walk instead of all. Library-typed variables stay as one
+        item with their type."""
+        return await app.proj_call(app.proj.variables, scope, max_array, max_items, include_temp)
+
+    @mcp.tool(annotations=READ)
+    async def proj_vs_runtime(scope: str | None = None, max_items: int = 200_000) -> dict[str, Any]:
+        """Cross-check the source against the running PLC: variables declared in the project but
+        not present online (not compiled / not activated / optimised away) and online variables
+        under the same programs/GVLs that the source does not declare (stale boot project, library
+        internals). Use after a deploy to prove the target runs this source."""
+        proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False)
+        declared = {it["path"].lower(): it for it in proj["items"] if "[*]" not in it["path"]}
+        roots = {p.split(".")[0] for p in declared}
+        online: set[str] = set()
+        online_types: dict[str, str] = {}
+        for r in roots:
+            try:
+                groups = await app.ads_call(app.ads.leaves_under, r, max_items, timeout=300)
+            except ToolError:
+                continue
+            for root, leaves in groups:
+                for lf in leaves:
+                    online.add(lf.path.lower())
+                    online_types[lf.path.lower()] = lf.type
+        missing = [declared[k] for k in sorted(set(declared) - online)]
+        extra = sorted(online - set(declared))
+        # declared composite (library type) items match if any online leaf starts with them
+        missing_final = []
+        for it in missing:
+            pre = it["path"].lower() + "."
+            if any(o.startswith(pre) or o.startswith(it["path"].lower() + "[") for o in online):
+                continue
+            missing_final.append(it)
+        return {"declared": len(declared), "online_under_same_roots": len(online),
+                "matched": len(declared) - len(missing_final), "missing_online": missing_final[:500],
+                "extra_online": [{"path": e, "type": online_types.get(e)} for e in extra[:500]],
+                "roots": sorted(roots)}
 
     # ======================================================================
     # ipc_* target OS via System Service

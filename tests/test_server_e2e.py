@@ -1,5 +1,6 @@
 """End-to-end through a real MCP client session on in-memory streams."""
 import json
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 import anyio
@@ -195,3 +196,29 @@ async def test_token_bound_to_target_and_raw_write_denylist(monkeypatch, project
         assert res.is_error and "denylist" in text(res)
         res = await s.call_tool("ads_write_raw", {"index_group": ig, "index_offset": io, "hex_data": "01", "port": 10000})
         assert res.is_error and "851-859" in text(res)
+
+
+@pytest.mark.anyio
+async def test_whole_project_variable_tools(monkeypatch, project_dir, tmp_path):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        d = payload(await s.call_tool("ads_dump", {"out_dir": str(tmp_path / "dumps")}))
+        assert d["leaves"] >= 25 and d["datatype_table"] and Path(d["csv"]).exists()
+        lv = payload(await s.call_tool("ads_leaves", {"name": "MAIN.arrSteps", "with_values": True}))
+        assert lv["count"] == 8 and lv["leaves"][1]["value"]["text"] == "T#1s500ms" and lv["leaves"][3]["value"]["name"] == "Bulk"
+        allm = payload(await s.call_tool("ads_leaves", {"name": "MAIN"}))
+        assert allm["count"] == 25
+        t = payload(await s.call_tool("ads_types", {"type_name": "ST_Step"}))
+        assert t["members"][1]["name"] == "tDwell"
+        r = payload(await s.call_tool("ads_read", {"name": "MAIN.arrSteps"}))
+        assert r["value"][1]["nId"] == 2
+        pv = payload(await s.call_tool("proj_variables", {}))
+        assert pv["count"] > 20
+        cmp_ = payload(await s.call_tool("proj_vs_runtime", {}))
+        missing = {m["path"] for m in cmp_["missing_online"]}
+        extra = {e["path"] for e in cmp_["extra_online"]}
+        assert "MAIN.fbFill.fbValve.bOpen" in missing and "GVL_Machine.bEStop" in missing and "MAIN.fbFill.arrWeights[7]" in missing
+        assert "MAIN.fbFill.arrWeights[2]" not in missing and "MAIN.nCycle" not in missing
+        assert "main.slabel" in extra and "main.arrsteps[1].nid" in extra and "main.fbvalve2.bopen" in extra
+        assert cmp_["matched"] >= 10

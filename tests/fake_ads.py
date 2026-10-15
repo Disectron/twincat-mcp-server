@@ -8,6 +8,8 @@ from typing import Any
 import pyads
 from pyads import constants as C
 
+from twincat_mcp.ads_types import DtEntry, encode_entry
+
 
 def _entry(name: str, typ: str, size: int, igrp: int, ioffs: int, flags: int = 0, comment: str = "") -> bytes:
     n, t, c = name.encode(), typ.encode(), comment.encode()
@@ -34,7 +36,37 @@ SYMBOLS: list[tuple[str, str, int, Any, int]] = [
     ("GVL_Machine.nDrumsFilled", "UDINT", 4, 7, 0),
     ("Constants.CompilerVersion", "VERSION", 8, None, 0x20),
     ("MAIN.sLabel", "STRING(10)", 11, "hello", 0),
+    ("MAIN.arrSteps", "ARRAY [1..2] OF ST_Step", 32, None, 0),
+    ("MAIN.fbValve2", "FB_Valve", 16, None, 0),
 ]
+
+
+def _dt(name, typ, size, offs=0, dtype=0, dims=(), subs=(), enum=None, flags=0):
+    return DtEntry(name, typ, size, offs, dtype, flags, "", list(dims), list(subs), dict(enum or {}))
+
+
+# datatype table of the fake runtime
+DATATYPES = [
+    _dt("BOOL", "", 1, dtype=33), _dt("INT", "", 2, dtype=2), _dt("UDINT", "", 4, dtype=19), _dt("LREAL", "", 8, dtype=5),
+    _dt("TIME", "", 4, dtype=19), _dt("STRING(40)", "", 41, dtype=30), _dt("STRING(10)", "", 11, dtype=30),
+    _dt("E_FillState", "INT", 2, dtype=2, enum={0: "Idle", 1: "Bulk", 2: "Fine", 3: "Done"}),
+    _dt("ST_Recipe", "", 57, subs=[_dt("rTargetKg", "LREAL", 8, 0, 5), _dt("rBulkCutoff", "LREAL", 8, 8, 5), _dt("sName", "STRING(40)", 41, 16, 30)]),
+    _dt("ST_Step", "", 16, subs=[_dt("nId", "INT", 2, 0, 2), _dt("tDwell", "TIME", 4, 4, 19), _dt("bDone", "BOOL", 1, 8, 33),
+                                  _dt("eState", "E_FillState", 2, 10, 2)]),
+    _dt("ARRAY [1..2] OF ST_Step", "ST_Step", 32, dims=[(1, 2)]),
+    _dt("ARRAY [0..3] OF LREAL", "LREAL", 32, dtype=5, dims=[(0, 4)]),
+    _dt("FB_Valve", "", 16, subs=[_dt("bOpen", "BOOL", 1, 0, 33), _dt("tOpened", "TIME", 4, 4, 19),
+                                   _dt("arrHist", "ARRAY [0..1] OF INT", 4, 8, 2, dims=[(0, 2)])]),
+    _dt("ARRAY [0..1] OF INT", "INT", 4, dtype=2, dims=[(0, 2)]),
+]
+DATATYPE_BLOB = b"".join(encode_entry(e) for e in DATATYPES)
+
+# raw memory images for composite symbols (little endian)
+RAW_IMAGES = {
+    "MAIN.stRecipe": struct.pack("<dd", 180.5, 0.9) + b"Vanilla".ljust(41, b"\x00"),
+    "MAIN.arrSteps": struct.pack("<hxxIB?h", 1, 1500, 1, 0, 1).ljust(16, b"\x00") + struct.pack("<hxxIB?h", 2, 250, 0, 0, 3).ljust(16, b"\x00"),
+    "MAIN.fbValve2": struct.pack("<B3xIhh", 1, 42, 7, -3).ljust(16, b"\x00"),
+}
 
 
 # symbols that exist on the runtime but are not in the uploaded table (resolved by name)
@@ -102,17 +134,26 @@ class FakeConnection:
         if index_group == C.ADSIGRP_SYM_UPLOADINFO2:
             blob = b"".join(_entry(n, t, s, 0x4040, i * 64, f) for i, (n, t, s, v, f) in enumerate(SYMBOLS))
             self._blob = blob
-            buf = struct.pack("<II", len(SYMBOLS), len(blob)).ljust(64, b"\x00")
+            buf = struct.pack("<IIII", len(SYMBOLS), len(blob), len(DATATYPES), len(DATATYPE_BLOB)).ljust(64, b"\x00")
             return (ctypes.c_ubyte * 64)(*buf)
         if index_group == C.ADSIGRP_SYM_UPLOAD:
             return (ctypes.c_ubyte * len(self._blob))(*self._blob)
+        if index_group == C.ADSIGRP_SYM_DT_UPLOAD:
+            if getattr(FakeConnection, "no_datatypes", False):
+                raise pyads.ADSError(1793)
+            return (ctypes.c_ubyte * len(DATATYPE_BLOB))(*DATATYPE_BLOB)
         if index_group == 0x4040:
             # raw read of a symbol by offset -> find by ioffs
             i = index_offset // 64
             name = SYMBOLS[i][0]
             size = SYMBOLS[i][2]
-            raw = (b"\x11" * size)
-            return (ctypes.c_ubyte * size)(*raw)
+            want = ctypes.sizeof(plc_datatype)
+            raw = RAW_IMAGES.get(name)
+            if raw is None:
+                v = self.values.get(name)
+                raw = _scalar_bytes(SYMBOLS[i][1], size, v)
+            raw = raw[:want].ljust(want, b"\x00")
+            return (ctypes.c_ubyte * want)(*raw)
         if index_group == 0x3 and index_offset == 0x100:
             return (ctypes.c_ubyte * 2)(*struct.pack("<H", 8))
         if index_group == 0x6:
@@ -190,10 +231,32 @@ class FakeConnection:
                 cb(type("N", (), {"h": h, "ts": ts_filetime, "value": value})(), name)
 
 
+def _scalar_bytes(typ, size, v):
+    t = typ.upper()
+    if v is None:
+        return b"\x11" * size
+    if t == "BOOL":
+        return bytes([1 if v else 0])
+    if t in ("INT",):
+        return struct.pack("<h", v)
+    if t in ("UDINT", "TIME"):
+        return struct.pack("<I", v)
+    if t == "LREAL":
+        return struct.pack("<d", v)
+    if t.startswith("STRING"):
+        return str(v).encode().ljust(size, b"\x00")
+    if t.startswith("ARRAY") and isinstance(v, list):
+        return b"".join(struct.pack("<d", x) for x in v)
+    if t == "E_FillState":
+        return struct.pack("<h", v)
+    return b"\x11" * size
+
+
 def install(monkeypatch):
     """Patch pyads so AdsBackend uses FakeConnection and a fake local NetId."""
     FakeConnection.instances.clear()
     FakeConnection.reset_values()
+    FakeConnection.no_datatypes = False
 
     def fake_symbol_info(port, adr, name):
         if name in EXTRA_SYMBOLS:

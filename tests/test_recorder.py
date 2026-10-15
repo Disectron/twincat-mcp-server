@@ -41,9 +41,16 @@ def _conn():
 
 def test_expand_symbols(rec):
     s = rec.expand_symbols(None, "MAIN.fbFill", None, 500)
-    assert [x.name for x in s] == ["MAIN.fbFill.tSettle", "MAIN.fbFill.eState", "MAIN.fbFill.arrWeights", "MAIN.fbFill.bDone"]
+    assert [x.name for x in s] == ["MAIN.fbFill.arrWeights[0]", "MAIN.fbFill.arrWeights[1]", "MAIN.fbFill.arrWeights[2]",
+                                   "MAIN.fbFill.arrWeights[3]", "MAIN.fbFill.bDone", "MAIN.fbFill.eState", "MAIN.fbFill.tSettle"]
     s = rec.expand_symbols(["MAIN.stRecipe", "MAIN.nCycle"], None, None, 500)
     assert {x.name for x in s} == {"MAIN.stRecipe.rTargetKg", "MAIN.stRecipe.rBulkCutoff", "MAIN.stRecipe.sName", "MAIN.nCycle"}
+    # arrays of structs come from the datatype table, with offsets for raw access
+    s = rec.expand_symbols(["MAIN.arrSteps"], None, None, 500)
+    assert [x.name for x in s][:3] == ["MAIN.arrSteps[1].nId", "MAIN.arrSteps[1].tDwell", "MAIN.arrSteps[1].bDone"]
+    assert s[4].index_offset - s[0].index_offset == 16
+    everything = rec.expand_symbols(None, "MAIN", None, 500)
+    assert len(everything) == 25
     s = rec.expand_symbols(None, None, "GVL_*", 500)
     assert [x.name for x in s] == ["GVL_Machine.nDrumsFilled"]
     with pytest.raises(AdsError, match="limit"):

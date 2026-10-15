@@ -381,6 +381,85 @@ class ProjectIndex:
                     instances.append({"unit": u.name, "var": v.name, "type": v.type, "file": u.file, "line": v.line})
         return {"name": name, "instances": instances, "mentions": decl_hits, "truncated": res["truncated"]}
 
+    # ------------------------------------------------------------ instances
+    def variables(self, scope: str | None = None, max_array: int = 64, max_items: int = 200_000,
+                  include_temp: bool = False) -> dict[str, Any]:
+        """Every variable the project declares, flattened to the instance paths the runtime
+        will publish (MAIN.fbFill.fbValve.bOpen, GVL_X.arr[3].nId …), by walking programs and
+        GVLs through FB/STRUCT definitions. Arrays longer than max_array are shown as [*]."""
+        self._ensure()
+        roots: list[CodeUnit]
+        if scope:
+            roots = [self.get_unit(scope)]
+        else:
+            roots = [u for u in self.units.values() if u.kind in ("PROGRAM", "GVL") and not u.parent]
+        items: list[dict[str, Any]] = []
+        truncated = False
+
+        def walk(path: str, u: CodeUnit, depth: int, seen: tuple[str, ...]) -> None:
+            nonlocal truncated
+            for v in u.vars:
+                if len(items) >= max_items:
+                    truncated = True
+                    return
+                if v.section == "VAR_TEMP" and not include_temp:
+                    continue
+                if v.section == "VAR_EXTERNAL":
+                    continue
+                self._emit(f"{path}.{v.name}", v.type, u, v, depth, seen, items, max_array, walk)
+            for e in u.extends:
+                eu = self.units.get(e.lower())
+                if eu and eu.name.lower() not in seen:
+                    walk(path, eu, depth, seen + (eu.name.lower(),))
+
+        for r in roots:
+            walk(r.name, r, 0, (r.name.lower(),))
+        kinds: dict[str, int] = {}
+        for it in items:
+            kinds[it["type"]] = kinds.get(it["type"], 0) + 1
+        return {"scope": scope or "all programs + GVLs", "count": len(items), "truncated": truncated,
+                "roots": [r.name for r in roots], "items": items}
+
+    def _emit(self, path: str, type_str: str, u: CodeUnit, v: VarDecl, depth: int, seen: tuple[str, ...],
+              items: list[dict[str, Any]], max_array: int, walk) -> None:
+        if depth > 24:
+            return
+        t = type_str.strip()
+        m = _RE_ARRAY_OF.match(t)
+        if m:
+            bounds = re.search(r"\[(.+?)\]", t)
+            dims = []
+            if bounds:
+                for part in bounds.group(1).split(","):
+                    if ".." in part:
+                        lo, hi = part.split("..")
+                        try:
+                            dims.append((int(lo.strip()), int(hi.strip())))
+                        except ValueError:
+                            dims = []
+                            break
+            elem = m.group(1).strip()
+            count = 1
+            for lo, hi in dims:
+                count *= (hi - lo + 1)
+            if dims and count <= max_array:
+                # row-major enumeration
+                import itertools
+                for coords in itertools.product(*[range(lo, hi + 1) for lo, hi in dims]):
+                    self._emit(f"{path}[{','.join(map(str, coords))}]", elem, u, v, depth + 1, seen, items, max_array, walk)
+            else:
+                self._emit(f"{path}[*]", elem, u, v, depth + 1, seen, items, max_array, walk)
+            return
+        if _RE_PTR.match(t):
+            items.append({"path": path, "type": t, "declared_in": u.name, "section": v.section, "line": v.line})
+            return
+        tu = self._unit_for_type(t)
+        if tu and tu.kind in ("FUNCTION_BLOCK", "STRUCT", "UNION", "PROGRAM") and tu.name.lower() not in seen:
+            walk(path, tu, depth + 1, seen + (tu.name.lower(),))
+            return
+        items.append({"path": path, "type": t, "declared_in": u.name, "section": v.section, "line": v.line,
+                      **({"at": v.at} if v.at else {})})
+
     # ------------------------------------------------------------ write back
     def set_code(self, name: str, declaration: str | None, implementation: str | None,
                  strip_lineids: bool = True) -> dict[str, Any]:

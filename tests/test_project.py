@@ -129,3 +129,19 @@ def test_unknown_root(tmp_path):
     p = ProjectIndex(ProjectConfig(root=str(tmp_path / "nope")))
     with pytest.raises(ProjectError):
         p.scan()
+
+
+def test_variables_flatten(project_dir):
+    p = idx(project_dir)
+    r = p.variables()
+    paths = {it["path"]: it for it in r["items"]}
+    assert "MAIN.fbFill.fbValve.bOpen" in paths and paths["MAIN.fbFill.fbValve.bOpen"]["declared_in"] == "FB_Valve"
+    assert "MAIN.fbFill.stRecipe.rBulkCutoff" in paths and "MAIN.stRecipe.sName" in paths
+    assert "MAIN.fbFill.arrWeights[9]" in paths and "MAIN.fbFill.arrWeights[10]" not in paths
+    assert paths["GVL_Machine.bEStop"]["at"] == "%I*"
+    assert "MAIN.fbFill.eState" in paths and paths["MAIN.fbFill.eState"]["type"] == "E_FillState"  # unknown type stays scalar
+    assert set(r["roots"]) == {"MAIN", "GVL_Machine"}
+    small = p.variables(max_array=4)
+    assert any(it["path"] == "MAIN.fbFill.arrWeights[*]" for it in small["items"])
+    one = p.variables("FB_Valve")
+    assert [it["path"] for it in one["items"]] == ["FB_Valve.bOpen", "FB_Valve.tOpened"]

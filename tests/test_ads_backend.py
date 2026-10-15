@@ -49,13 +49,52 @@ def test_read_decodes_types(ads):
     assert ads.read("MAIN.sLabel")["value"] == "hello"
 
 
-def test_read_struct_expands_members(ads):
+def test_read_struct_via_datatype_table(ads):
     r = ads.read("MAIN.stRecipe")
-    assert r["type"] == "ST_Recipe" and r["members"] == 3
+    assert r["type"] == "ST_Recipe" and r["decoder"] == "datatype-table"
     assert r["value"] == {"rTargetKg": 180.5, "rBulkCutoff": 0.9, "sName": "Vanilla"}
-    assert r["raw_hex"].startswith("1111")
+    arr = ads.read("MAIN.arrSteps")["value"]
+    assert arr[0]["nId"] == 1 and arr[0]["tDwell"]["text"] == "T#1s500ms" and arr[0]["eState"] == {"value": 1, "name": "Bulk"}
+    assert arr[1]["bDone"] is False and arr[1]["eState"]["name"] == "Done"
+    fb = ads.read("MAIN.fbValve2")["value"]
+    assert fb == {"bOpen": True, "tOpened": {"raw_ms": 42, "text": "T#42ms"}, "arrHist": [7, -3]}
     r2 = ads.read("MAIN.stRecipe", expand_struct=False)
     assert r2["value"] is None and "raw_hex" in r2
+
+
+def test_read_struct_fallback_without_datatype_table(ads, monkeypatch):
+    from tests.fake_ads import FakeConnection
+    FakeConnection.no_datatypes = True
+    assert ads.typesystem(refresh=True) is None
+    r = ads.read("MAIN.stRecipe")
+    assert r["members"] == 3 and r["value"]["sName"] == "Vanilla"   # published member symbols
+    r = ads.read("MAIN.arrSteps")
+    assert r["value"] is None and "raw_hex" in r                   # nothing published beneath it
+    FakeConnection.no_datatypes = False
+    assert ads.typesystem(refresh=True) is not None
+
+
+def test_leaves_roots_and_dump(ads, tmp_path):
+    s, lv = ads.leaves("MAIN.arrSteps")
+    assert [(l.path, l.offset) for l in lv][:5] == [("MAIN.arrSteps[1].nId", 0), ("MAIN.arrSteps[1].tDwell", 4), ("MAIN.arrSteps[1].bDone", 8),
+                                                   ("MAIN.arrSteps[1].eState", 10), ("MAIN.arrSteps[2].nId", 16)]
+    assert lv[3].enum == {0: "Idle", 1: "Bulk", 2: "Fine", 3: "Done"}
+    roots = [r.name for r in ads.roots()]
+    assert "MAIN.stRecipe" in roots and "MAIN.stRecipe.sName" not in roots and "Constants.CompilerVersion" not in roots
+    assert "Constants.CompilerVersion" in [r.name for r in ads.roots(include_system=True)]
+    assert [r.name for r in ads.roots("GVL_*")] == ["GVL_Machine.nDrumsFilled"]
+    d = ads.dump(None, False, str(tmp_path / "dumps"))
+    assert d["roots"] == len(roots) and d["leaves"] >= 25 and not d["errors"]
+    import json, csv
+    tree = json.loads((tmp_path / "dumps" / d["json"].split("/")[-1]).read_text())["values"]
+    assert tree["MAIN.arrSteps"][1]["eState"]["name"] == "Done" and tree["MAIN.nCycle"] == 42
+    rows = list(csv.DictReader(open(d["csv"], encoding="utf-8")))
+    paths = {r["path"]: r["value"] for r in rows}
+    assert paths["MAIN.arrSteps[2].tDwell"] == "250" and paths["MAIN.arrSteps[1].eState"] == "1 (Bulk)" and paths["MAIN.sLabel"] == "hello"
+    assert ads.type_info("ST_Step")["members"][3]["name"] == "eState"
+    assert ads.list_types("ST_*", 10)["total"] == 2
+    with pytest.raises(AdsError, match="not in datatype table"):
+        ads.type_info("ST_Nope")
 
 
 def test_read_many_mixed(ads):

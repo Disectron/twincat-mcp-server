@@ -35,6 +35,7 @@ from pyads.structs import AmsAddr
 
 from .config import AdsConfig
 from . import types_tc as T
+from .ads_types import TypeSystem, Leaf, parse_table
 
 SYSTEM_SERVICE_PORT = 10000
 ROUTER_PORT = 1
@@ -77,6 +78,7 @@ class AdsBackend:
         self.cfg = cfg
         self._conns: dict[tuple[str | None, int], pyads.Connection] = {}
         self._symcache: dict[tuple[str | None, int], tuple[float, list[SymbolEntry], dict[str, SymbolEntry]]] = {}
+        self._dtcache: dict[tuple[str | None, int], tuple[float, TypeSystem | None, str]] = {}
         self.net_id: str | None = cfg.ams_net_id
         self.ip: str | None = cfg.ip_address
         self.port: int = cfg.ams_port
@@ -134,6 +136,7 @@ class AdsBackend:
                 pass
         self._conns.clear()
         self._symcache.clear()
+        self._dtcache.clear()
 
     def connection_status(self) -> dict[str, Any]:
         return {
@@ -290,6 +293,206 @@ class AdsBackend:
                 out.append(s)
         return out
 
+    # ------------------------------------------------------------ datatype table
+    def _load_datatypes(self, c: pyads.Connection) -> TypeSystem:
+        info = c.read(C.ADSIGRP_SYM_UPLOADINFO2, 0, ctypes.c_ubyte * 64, return_ctypes=True, check_length=False)
+        n_syms, n_bytes, n_dt, dt_bytes = struct.unpack_from("<IIII", bytes(info), 0)
+        if dt_bytes == 0:
+            raise AdsError("runtime reports an empty datatype table")
+        buf = c.read(C.ADSIGRP_SYM_DT_UPLOAD, 0, ctypes.c_ubyte * dt_bytes, return_ctypes=True, check_length=False)
+        return TypeSystem(parse_table(bytes(buf), n_dt or None))
+
+    def typesystem(self, refresh: bool = False, port: int | None = None) -> TypeSystem | None:
+        """Parsed datatype table for the connected runtime, or None if the upload fails
+        (then struct reads fall back to published member symbols)."""
+        c = self.conn(port)
+        key = (c.ams_net_id, c.ams_net_port)
+        hit = self._dtcache.get(key)
+        if hit and not refresh and time.time() - hit[0] < self.cfg.symbol_cache_ttl_s:
+            return hit[1]
+        try:
+            ts = self._load_datatypes(c)
+            err = ""
+        except Exception as exc:  # noqa: BLE001
+            ts, err = None, _fmt_exc(exc)
+        self._dtcache[key] = (time.time(), ts, err)
+        return ts
+
+    def type_info(self, type_name: str, port: int | None = None) -> dict[str, Any]:
+        ts = self.typesystem(False, port)
+        if ts is None:
+            raise AdsError(f"datatype table unavailable: {self._dtcache.get(self._key(port, None), (0, None, '?'))[2]}")
+        e = ts.get(type_name)
+        if e is None:
+            cands = [k for k in ts.table if type_name.lower() in k][:20]
+            raise AdsError(f"type {type_name!r} not in datatype table; similar: {cands}")
+        return e.summary()
+
+    def list_types(self, pattern: str | None, limit: int, port: int | None = None) -> dict[str, Any]:
+        ts = self.typesystem(False, port)
+        if ts is None:
+            raise AdsError("datatype table unavailable")
+        pat = (pattern or "*").lower()
+        if "*" not in pat and "?" not in pat:
+            pat = f"*{pat}*"
+        sel = [e for k, e in ts.table.items() if fnmatch.fnmatchcase(k, pat)]
+        sel.sort(key=lambda e: e.name.lower())
+        return {"total": len(sel), "types": [{"name": e.name, "size": e.size, "members": len(e.subitems),
+                                             "array": bool(e.dims), "enum": bool(e.enum), "base": e.type} for e in sel[:limit]]}
+
+    def leaves(self, name: str, max_leaves: int = 200_000, port: int | None = None) -> tuple[SymbolEntry, list[Leaf]]:
+        """Every scalar leaf of a symbol with byte offsets (datatype table)."""
+        s = self.symbol_info(name, port)
+        ts = self.typesystem(False, port)
+        if ts is None or ts.get(s.type) is None:
+            tt = T.parse_type(s.type, s.size)
+            if tt.ctype is not None and not tt.opaque:
+                return s, [Leaf(s.name, s.type, 0, s.size, 0)]
+            # fallback: published member symbols
+            mem = self.members(s.name, port)
+            return s, [Leaf(m.name, m.type, m.index_offset - s.index_offset, m.size, 0, None, "from symbol table") for m in mem]
+        return s, ts.leaves(s.name, s.type, max_leaves)
+
+    def roots(self, pattern: str | None = None, include_system: bool = False, port: int | None = None) -> list[SymbolEntry]:
+        """Top-level symbols: those not nested under another symbol in the table."""
+        lst, _ = self.symbols_cached(False, port)
+        names = sorted(lst, key=lambda s: s.name.lower())
+        out: list[SymbolEntry] = []
+        last: str | None = None
+        for s in names:
+            low = s.name.lower()
+            if last and (low.startswith(last + ".") or low.startswith(last + "[")):
+                continue
+            out.append(s)
+            last = low
+        if not include_system:
+            out = [s for s in out if not _is_system_symbol(s.name)]
+        if pattern:
+            pat = pattern.lower()
+            if "*" not in pat and "?" not in pat:
+                pat = f"{pat}*"
+            out = [s for s in out if fnmatch.fnmatchcase(s.name.lower(), pat)]
+        return out
+
+    def leaves_under(self, prefix: str, max_leaves: int = 200_000, port: int | None = None) -> list[tuple[SymbolEntry, list[Leaf]]]:
+        """Leaves of every root symbol equal to / below ``prefix`` ('MAIN', 'MAIN.fbFill', 'GVL_X')."""
+        pre = prefix.rstrip(".").lower()
+        _, idx = self.symbols_cached(False, port)
+        if pre in idx:
+            s, lv = self.leaves(idx[pre].name, max_leaves, port)
+            return [(s, lv)]
+        out = []
+        budget = max_leaves
+        for r in self.roots(None, True, port):
+            low = r.name.lower()
+            if low == pre or low.startswith(pre + ".") or low.startswith(pre + "["):
+                s, lv = self.leaves(r.name, budget, port)
+                out.append((s, lv))
+                budget -= len(lv)
+                if budget <= 0:
+                    break
+        return out
+
+    def leaf_values(self, root: SymbolEntry, leaves: list[Leaf], port: int | None = None) -> dict[str, Any]:
+        """Decode every leaf from one raw read of the root symbol → {path: value}."""
+        c = self.conn(port)
+        ts = self.typesystem(False, port)
+        try:
+            raw = bytes(c.read(root.index_group, root.index_offset, ctypes.c_ubyte * max(root.size, 1), return_ctypes=True, check_length=False))
+        except Exception as exc:  # noqa: BLE001
+            raise AdsError(f"read {root.name!r}: {_fmt_exc(exc)}") from exc
+        out: dict[str, Any] = {}
+        for lf in leaves:
+            if lf.size <= 0 or lf.offset + lf.size > len(raw):
+                continue
+            if ts is not None:
+                out[lf.path] = ts.decode_leaf(raw, lf)
+            else:
+                out[lf.path] = TypeSystem._decode_scalar(raw, lf.offset, lf.type, None, None)
+        return out
+
+    def read_full(self, name: str, max_bytes: int | None = None, port: int | None = None) -> dict[str, Any]:
+        """One ADS read of the whole variable, decoded into a nested tree via the datatype table."""
+        c = self.conn(port)
+        s = self.symbol_info(name, port)
+        limit = max_bytes or self.cfg.max_file_bytes
+        if s.size > limit:
+            raise AdsError(f"{s.name} is {s.size} bytes; raise max_bytes or read members individually")
+        try:
+            raw = bytes(c.read(s.index_group, s.index_offset, ctypes.c_ubyte * max(s.size, 1), return_ctypes=True, check_length=False))
+        except Exception as exc:  # noqa: BLE001
+            raise AdsError(f"read {s.name!r} ({s.size} B): {_fmt_exc(exc)}") from exc
+        ts = self.typesystem(False, port)
+        out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
+        if ts is not None and ts.get(s.type) is not None:
+            out["value"] = ts.decode_tree(raw, s.type)
+            out["decoder"] = "datatype-table"
+        else:
+            tt = T.parse_type(s.type, s.size)
+            if tt.ctype is not None and not tt.opaque:
+                out["value"] = TypeSystem._decode_scalar(raw, 0, s.type, None, None)
+                out["decoder"] = "scalar"
+            else:
+                out["value"] = None
+                out["raw_hex"] = raw.hex()
+                out["decoder"] = "none"
+        if s.comment:
+            out["comment"] = s.comment
+        return out
+
+    def dump(self, pattern: str | None, include_system: bool, out_dir: str, max_total_bytes: int = 64 * 1024 * 1024,
+             max_leaves: int = 500_000, port: int | None = None) -> dict[str, Any]:
+        """Read every variable (every root symbol, fully expanded) and write JSON + CSV."""
+        import csv, json, os
+        from pathlib import Path
+        c = self.conn(port)
+        ts = self.typesystem(False, port)
+        roots = self.roots(pattern, include_system, port)
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        jpath = Path(out_dir) / f"dump-{stamp}.json"
+        cpath = Path(out_dir) / f"dump-{stamp}.csv"
+        tree: dict[str, Any] = {}
+        n_leaves = 0
+        n_bytes = 0
+        errors: list[dict[str, str]] = []
+        preview: list[dict[str, Any]] = []
+        t0 = time.time()
+        with open(cpath, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["path", "type", "value"])
+            for r in roots:
+                if n_bytes + r.size > max_total_bytes or n_leaves >= max_leaves:
+                    errors.append({"symbol": r.name, "error": "skipped: dump size/leaf limit reached"})
+                    continue
+                try:
+                    raw = bytes(c.read(r.index_group, r.index_offset, ctypes.c_ubyte * max(r.size, 1), return_ctypes=True, check_length=False))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"symbol": r.name, "error": _fmt_exc(exc)})
+                    continue
+                n_bytes += len(raw)
+                if ts is not None and ts.get(r.type) is not None:
+                    tree[r.name] = ts.decode_tree(raw, r.type)
+                    lv = ts.leaves(r.name, r.type, max_leaves - n_leaves)
+                    for leaf in lv:
+                        val = ts.decode_leaf(raw, leaf) if leaf.size else None
+                        w.writerow([leaf.path, leaf.type, _csv_val(val)])
+                        if len(preview) < 50:
+                            preview.append({"path": leaf.path, "type": leaf.type, "value": val})
+                    n_leaves += len(lv)
+                else:
+                    val = TypeSystem._decode_scalar(raw, 0, r.type, None, None)
+                    tree[r.name] = val
+                    w.writerow([r.name, r.type, _csv_val(val)])
+                    n_leaves += 1
+                    if len(preview) < 50:
+                        preview.append({"path": r.name, "type": r.type, "value": val})
+        jpath.write_text(json.dumps({"target": self.target_label(), "taken": stamp, "roots": len(roots), "leaves": n_leaves,
+                                     "values": tree}, indent=1, default=str), encoding="utf-8")
+        return {"roots": len(roots), "leaves": n_leaves, "bytes_read": n_bytes, "duration_s": round(time.time() - t0, 2),
+                "json": str(jpath), "csv": str(cpath), "datatype_table": ts is not None, "errors": errors[:50],
+                "preview": preview}
+
     # ------------------------------------------------------------ read / write
     def _typed_read(self, c: pyads.Connection, s: SymbolEntry) -> tuple[T.TcType, Any]:
         tt = T.parse_type(s.type, s.size)
@@ -306,6 +509,11 @@ class AdsBackend:
              port: int | None = None) -> dict[str, Any]:
         c = self.conn(port)
         s = self.symbol_info(name, port)
+        tt0 = T.parse_type(s.type, s.size)
+        if expand_struct and (tt0.ctype is None or tt0.opaque):
+            ts = self.typesystem(False, port)
+            if ts is not None and ts.get(s.type) is not None:
+                return self.read_full(s.name, None, port)
         tt, val = self._typed_read(c, s)
         out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
         if isinstance(val, (bytes, bytearray)):
@@ -550,6 +758,25 @@ def _split_string_array(raw: bytes, tt: T.TcType) -> list[str]:
         else:
             out.append(chunk.decode("latin-1", "replace").split("\x00", 1)[0])
     return out
+
+
+def _is_system_symbol(name: str) -> bool:
+    low = name.lower()
+    return (low.startswith("twincat_systeminfovarlist") or low.startswith("constants.") or low.startswith("__")
+            or ".__" in low or low.startswith("global_version.") or low.startswith("tcunit.") or low.startswith("tc2_") or low.startswith("tc3_"))
+
+
+def _csv_val(v: Any) -> Any:
+    if isinstance(v, dict):
+        for k in ("raw_ms", "raw", "raw_ns", "name"):
+            if k in v:
+                return v[k] if k != "name" else f"{v.get('value')} ({v['name']})"
+        import json as _j
+        return _j.dumps(v)
+    if isinstance(v, list):
+        import json as _j
+        return _j.dumps(v)
+    return v
 
 
 def _fmt_exc(exc: BaseException) -> str:

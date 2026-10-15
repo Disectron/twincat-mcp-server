@@ -368,25 +368,42 @@ class Recorder:
     # ------------------------------------------------------------ symbol selection
     def expand_symbols(self, symbols: list[str] | None, prefix: str | None, pattern: str | None,
                        max_symbols: int, port: int | None = None) -> list[SymbolEntry]:
+        """Resolve a selection to scalar leaves. Composite symbols (FB/struct instances,
+        arrays of structs) are expanded through the datatype table, so 'MAIN' or
+        'MAIN.fbFill' really means every variable beneath it."""
         lst, idx = self.ads.symbols_cached(False, port)
         chosen: dict[str, SymbolEntry] = {}
+
+        def add_leaves(root: SymbolEntry, leaves) -> None:
+            for leaf in leaves:
+                if leaf.size <= 0 or leaf.note in ("reference/pointer",) or leaf.note and "not expanded" in leaf.note:
+                    continue
+                tt = T.parse_type(leaf.type, leaf.size)
+                if tt.ctype is None or tt.opaque:
+                    continue
+                chosen[leaf.path] = SymbolEntry(leaf.path, leaf.type, leaf.size, root.index_group,
+                                                root.index_offset + leaf.offset, 0, "")
+
         for n in symbols or []:
             s = idx.get(n.lower())
             if s is None:
-                raise AdsError(f"symbol {n!r} not found in the runtime symbol table")
+                # nested element not in the table (e.g. MAIN.arr[2].x) → ask the runtime
+                try:
+                    s = self.ads.symbol_info(n, port)
+                except AdsError:
+                    raise AdsError(f"symbol {n!r} not found in the runtime symbol table")
             tt = T.parse_type(s.type, s.size)
             if tt.ctype is None or tt.opaque:
-                # expand composite into leaves
-                for leaf in self._leaves(s.name, lst):
-                    chosen[leaf.name] = leaf
+                root, leaves = self.ads.leaves(s.name, max_symbols + 1, port)
+                add_leaves(root, leaves)
             else:
                 chosen[s.name] = s
         if prefix:
-            leaves = self._leaves(prefix.rstrip("."), lst)
-            if not leaves:
-                raise AdsError(f"prefix {prefix!r} has no scalar/array symbols beneath it")
-            for leaf in leaves:
-                chosen[leaf.name] = leaf
+            groups = self.ads.leaves_under(prefix, max_symbols + 1, port)
+            if not groups:
+                raise AdsError(f"prefix {prefix!r} matches no symbol")
+            for root, leaves in groups:
+                add_leaves(root, leaves)
         if pattern:
             import fnmatch
             pat = pattern.lower()
@@ -400,17 +417,6 @@ class Recorder:
             raise AdsError("no recordable (scalar/array) symbols selected")
         if len(out) > max_symbols:
             raise AdsError(f"{len(out)} symbols selected, limit {max_symbols}; narrow the selection or raise max_symbols")
-        return out
-
-    @staticmethod
-    def _leaves(root: str, lst: list[SymbolEntry]) -> list[SymbolEntry]:
-        pre = root.lower() + "."
-        out = []
-        for s in lst:
-            if s.name.lower().startswith(pre):
-                tt = T.parse_type(s.type, s.size)
-                if tt.ctype is not None and not tt.opaque:
-                    out.append(s)
         return out
 
     # ------------------------------------------------------------ start / stop
