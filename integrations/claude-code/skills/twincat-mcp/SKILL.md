@@ -34,6 +34,15 @@ with numbers → `tcunit_scaffold` + `tcunit_run` to make it permanent.
 ## Project orientation
 `wf_project_overview` → `proj_call_graph` per program → `ads_leaves <program> with_values=true`.
 
+## HMI
+`hmi_scan` → `hmi_vs_runtime` (broken bindings) → `hmi_bindings <symbol>` before renaming a PLC variable.
+
+## When XAE stalls
+`xae_dialogs` → read title/buttons → `xae_dialog_resolve button=...` (machine-affecting prompts need confirmation).
+
+## MES / C# side
+`ads_export types=[ST_Recipe,...] fmt=csharp` and `ads_export prefix=MAIN fmt=csharp_symbols` after every datatype change.
+
 ## Prompts (slash)
 `/twincat:debug_symbol`, `/twincat:fb_validation`, `/twincat:deploy_safely`,
 `/twincat:performance_audit`, `/twincat:onboard_project`.

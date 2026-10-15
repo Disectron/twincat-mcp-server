@@ -41,6 +41,8 @@ from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
 from . import codecheck
 from . import workflows
+from . import exporters
+from .hmi import HmiIndex
 from pathlib import Path
 
 INSTRUCTIONS = """\
@@ -99,6 +101,8 @@ class App:
         self.proj = ProjectIndex(cfg.project)
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
+        self.hmi = HmiIndex()
+        self.started = time.time()
 
     # --- runners -----------------------------------------------------------
     async def ads_call(self, fn, *a, timeout: float | None = None, slow: bool = False, **kw) -> Any:
@@ -118,7 +122,17 @@ class App:
         except XaeError as exc:
             raise ToolError(str(exc)) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise ToolError("XAE call timed out; a modal dialog in the shell is the usual cause") from exc
+            pend = self.xae.watchdog.status().get("pending") or []
+            hint = (" Open dialog(s): " + "; ".join(f"'{d['title']}' buttons {d['buttons']}" for d in pend[:3])
+                    + " — xae_dialog_resolve(button=...)") if pend else " (xae_dialogs shows open prompts)"
+            raise ToolError("XAE call timed out; a modal dialog in the shell is the usual cause." + hint) from exc
+
+    def guard_safety_path(self, path: str, action: str) -> None:
+        """TwinSAFE (TISC / Safety) projects are never edited unless explicitly enabled."""
+        low = (path or "").lower()
+        if (low.startswith("tisc") or "^safety" in low or "twinsafe" in low or low.endswith(".sal")) and not self.cfg.xae.allow_safety:
+            raise ToolError(f"{action}: {path!r} is under the TwinSAFE/safety project; refused "
+                            "(set TCMCP_ALLOW_SAFETY=1 to permit, and know what you are doing)")
 
     async def proj_call(self, fn, *a, **kw) -> Any:
         try:
@@ -703,7 +717,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (override map via `prefixes`), undocumented VAR_INPUT/OUTPUT, TODO markers, REAL
         compared with =, VAR_INPUT assigned inside an FB, empty methods, GVL/ENUM without
         qualified_only, magic numbers, FB_init/FB_exit without SUPER^. rules= subset to run."""
-        return await app.proj_call(codecheck.lint, app.proj, name, rules, prefixes)
+        return await app.proj_call(codecheck.lint, app.proj, name, rules, prefixes or cfg.project.naming_prefixes or None)
 
     @mcp.tool(annotations=READ)
     async def proj_call_graph(root: str, depth: int = 4) -> dict[str, Any]:
@@ -825,6 +839,219 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         mean, changes, edges) and pulse width/period deltas for BOOLs — timing regression after a
         code change."""
         return await app.mem_call(app.rec.compare, id_a, id_b, symbols)
+
+
+    # ======================================================================
+    # XAE dialogs / I/O / links / discovery
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def xae_dialogs() -> dict[str, Any]:
+        """Modal dialogs currently open in the attached XAE shell (title, text, buttons), the
+        watchdog's auto-answer rules and its recent log. A pending dialog blocks every COM call."""
+        return await asyncio.to_thread(lambda: {**app.xae.watchdog.status(), "live": [d.to_dict() for d in __import__("twincat_mcp.dialogs", fromlist=["list_dialogs"]).list_dialogs(app.xae.pid)]})
+
+    @mcp.tool(annotations=DESTR)
+    async def xae_dialog_resolve(button: str, hwnd: int | None = None, remember: bool = False,
+                                 confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Click a button on an open XAE dialog ('OK', 'Yes', 'No', 'Cancel'…). remember=true adds an
+        auto-answer rule for that title (never for machine-affecting prompts). Control-class;
+        machine-affecting prompts (activate/run/download/login/delete/safety) are destructive-class."""
+        pend = await asyncio.to_thread(lambda: __import__("twincat_mcp.dialogs", fromlist=["list_dialogs"]).list_dialogs(app.xae.pid))
+        target = next((d for d in pend if hwnd is None or d.hwnd == hwnd), None)
+        op = OpClass.DESTRUCTIVE if (target and target.machine_affecting()) else OpClass.CONTROL
+        await app.permit(ctx, op, "xae_dialog_resolve", f"{(target.title if target else '?')}:{button}", confirm_token)
+        res = await asyncio.to_thread(app.xae.watchdog.resolve, button, hwnd, remember)
+        app.audit("xae_dialog_resolve", {"button": button, "dialog": target.title if target else None}, op, "ok" if res.get("resolved") else "not-found", res)
+        return res
+
+    @mcp.tool(annotations=EDIT)
+    async def xae_io_disable(disable: bool = True, only: list[str] | None = None) -> dict[str, Any]:
+        """Set/clear the Disabled flag on I/O devices under TIID (all, or the named ones) so a
+        configuration activates without the hardware present — TcUnit on a PC, dry runs."""
+        await app.permit(None, OpClass.EDIT, "xae_io_disable", "TIID")
+        res = await app.xae_call(app.xae.io_disable, disable, only, timeout=120)
+        app.audit("xae_io_disable", {"disable": disable, "only": only}, OpClass.EDIT, "ok", res)
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def xae_links(plc_project_path: str) -> dict[str, Any]:
+        """Variable links of the PLC instance: every AT %I*/%Q* variable with its link target;
+        lists the unlinked ones (the usual reason an output never moves)."""
+        return await app.xae_call(app.xae.links, plc_project_path, timeout=300)
+
+    @mcp.tool(annotations=READ)
+    async def ads_discover(timeout_s: float = 2.0, broadcast: str = "255.255.255.255") -> dict[str, Any]:
+        """Broadcast search for TwinCAT targets on the local network (UDP 48899): NetId, host
+        name, TwinCAT version, IP — the same thing XAE's 'Broadcast Search' does."""
+        return await app.ads_call(app.ads.discover, min(timeout_s, 10), broadcast, timeout=20, slow=True)
+
+    # ======================================================================
+    # HMI (TE2000 / TcVIS) bindings
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def hmi_scan(root: str | None = None) -> dict[str, Any]:
+        """Index HMI symbol bindings: TE2000 .view/.content/.usercontrol/.json (%s%PLC1.X%/s%) and
+        TcVIS files. root defaults to project.hmi_root, else the project root."""
+        r = root or cfg.project.hmi_root or cfg.project.root
+        if not r:
+            raise ToolError("no HMI root: pass root= or set TCMCP_HMI_ROOT")
+        try:
+            return await asyncio.to_thread(app.hmi.scan, r)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool(annotations=READ)
+    async def hmi_bindings(pattern: str | None = None, kind: str | None = None, limit: int = 500) -> dict[str, Any]:
+        """Which HMI files/controls bind a PLC symbol (fnmatch on the symbol path)."""
+        try:
+            return await asyncio.to_thread(app.hmi.find, pattern, kind, limit)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool(annotations=READ)
+    async def hmi_vs_runtime(check_source: bool = True) -> dict[str, Any]:
+        """Broken HMI bindings: symbols bound in the HMI that do not exist on the running PLC (and,
+        with check_source, whether the source declares them), plus declared variables with no HMI."""
+        try:
+            syms = await asyncio.to_thread(app.hmi.symbols)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        roots = {s.split(".")[0] for s in syms}
+        online: set[str] = set()
+        for r in roots:
+            try:
+                for root, leaves in await app.ads_call(app.ads.leaves_under, r, 200_000, timeout=300):
+                    online.update(lf.path.lower() for lf in leaves)
+            except ToolError:
+                continue
+        declared = None
+        if check_source:
+            try:
+                pv = await app.proj_call(app.proj.variables, None, 64, 200_000, False)
+                declared = {it["path"].lower() for it in pv["items"] if "[*]" not in it["path"]}
+            except ToolError:
+                declared = None
+        return await asyncio.to_thread(app.hmi.compare, online, declared)
+
+    # ======================================================================
+    # exports for MES / HMI code, snapshots apply, XML validation, reports
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def ads_export(types: list[str] | None = None, prefix: str | None = None, fmt: str = "csharp",
+                         namespace: str = "Transflo.Plc", out_path: str | None = None) -> dict[str, Any]:
+        """Generate code from the runtime: fmt=csharp (explicit-offset structs + enums for
+        Beckhoff.TwinCAT.Ads ReadAny/WriteAny), typescript (interfaces), json (type descriptions),
+        or csharp_symbols (const symbol paths under prefix). types = struct/enum names; prefix =
+        take the types of every symbol under it."""
+        ts = await app.ads_call(app.ads.typesystem, timeout=60)
+        if ts is None and fmt != "csharp_symbols":
+            raise ToolError("datatype table unavailable on this target")
+        names = list(types or [])
+        syms: list[dict[str, Any]] = []
+        if prefix:
+            groups = await app.ads_call(app.ads.leaves_under, prefix, 200_000, timeout=300)
+            for root, leaves in groups:
+                if root.type not in names:
+                    names.append(root.type)
+                syms += [{"name": lf.path, "type": lf.type} for lf in leaves]
+        if fmt == "csharp":
+            text = exporters.to_csharp(ts, names, namespace)
+        elif fmt == "typescript":
+            text = exporters.to_typescript(ts, names)
+        elif fmt == "json":
+            text = exporters.to_json(ts, names)
+        elif fmt == "csharp_symbols":
+            if not syms:
+                raise ToolError("csharp_symbols needs prefix=")
+            text = exporters.symbols_to_csharp(syms, namespace=namespace)
+        else:
+            raise ToolError("fmt must be csharp | typescript | json | csharp_symbols")
+        res: dict[str, Any] = {"fmt": fmt, "types": names, "chars": len(text)}
+        if out_path:
+            Path(out_path).write_text(text, encoding="utf-8")
+            res["file"] = out_path
+        else:
+            res["text"] = text
+        return res
+
+    @mcp.tool(annotations=WRITE)
+    async def snap_apply(name: str, symbols: list[str] | None = None, dry_run: bool = False,
+                         ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Write a saved snapshot back to the PLC (recipe / parameter restore). dry_run lists the
+        differences only. Every differing symbol is gated like ads_write."""
+        plan = await app.ads_call(app.bench.snapshot_apply, name, symbols, True, timeout=120)
+        if dry_run:
+            return plan
+        for d in plan["differences"]:
+            await app.permit(ctx, OpClass.WRITE, "ads_write", d["symbol"])
+        res = await app.ads_call(app.bench.snapshot_apply, name, symbols, False, timeout=300, slow=True)
+        app.audit("snap_apply", {"snapshot": name, "written": res["written"]}, OpClass.WRITE, "ok" if not res["errors"] else "partial", res["errors"])
+        return res
+
+    @mcp.tool(annotations=EDIT)
+    async def proj_validate_xml(name: str | None = None, fix: bool = False, regenerate_lineids: bool = False) -> dict[str, Any]:
+        """Structural validation of .TcPOU/.TcDUT/.TcGVL files: XML well-formedness, Name/Id,
+        GUID format + project-wide uniqueness, Declaration/Implementation presence, property
+        accessor VAR blocks, LineIds vs implementation line counts, EOF newline. fix=true applies
+        safe fixes (.bak written); regenerate_lineids rebuilds LineIds blocks."""
+        if fix:
+            await app.permit(None, OpClass.EDIT, "proj_validate_xml", name or "*")
+        res = await app.proj_call(codecheck.validate_xml, app.proj, name, fix, regenerate_lineids)
+        if fix and res.get("fixed"):
+            app.audit("proj_validate_xml", {"name": name, "fixed": res["fixed"]}, OpClass.EDIT, "ok")
+        return res
+
+    @mcp.tool(annotations=DESTR)
+    async def ipc_eventlog(provider: str = "TwinCAT System Service", count: int = 50, log: str = "Application",
+                           confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Windows event log of the target (Windows 7/10/11 IPCs): runs wevtutil on the IPC via
+        the System Service, then reads the result file back. Not available on Windows CE / TC-BSD
+        targets (use the XAE error list for ADS logger messages there). Destructive-class because
+        it starts a process on the IPC."""
+        await app.permit(ctx, OpClass.DESTRUCTIVE, "ipc_start_process", "wevtutil", confirm_token)
+        out = r"C:\TwinCAT\3.1\Boot\tcmcp_eventlog.txt"
+        q = f"*[System[Provider[@Name='{provider}']]]"
+        cmd = f'/c wevtutil qe {log} /q:"{q}" /c:{int(count)} /rd:true /f:text > "{out}" 2>&1'
+        await app.ads_call(app.files.start_process, r"C:\Windows\System32\cmd.exe", r"C:\Windows\System32", cmd, timeout=30)
+        waited = await app.ads_call(app.files.wait_for_file, out, 20, 1.0, timeout=40, slow=True)
+        if not waited.get("exists"):
+            raise ToolError("wevtutil produced no output file (Windows CE/TC-BSD target, or no permission)")
+        await asyncio.sleep(1.0)
+        txt = await app.ads_call(app.files.read_file, out, 2_000_000, True, "utf-8", timeout=120, slow=True)
+        app.audit("ipc_eventlog", {"provider": provider, "count": count}, OpClass.DESTRUCTIVE, "ok")
+        return {"provider": provider, "log": log, "entries_text": txt["text"], "bytes": txt["bytes"], "file_on_target": out}
+
+    @mcp.tool(annotations=READ)
+    async def tc_session_report(out_path: str | None = None) -> dict[str, Any]:
+        """Markdown handover of this session: mode changes, writes, deploys and other mutating
+        calls from the audit log, recordings, snapshots and dumps produced. Written to
+        ~/.twincat_mcp/reports/<ts>.md (or out_path)."""
+        recs = app.guard.tail_audit(1000)
+        since = time.strftime("%Y-%m-%dT%H:%M", time.localtime(app.started))
+        mine = [r for r in recs if r.get("ts", "") >= since]
+        lines = [f"# twincat-mcp session report", f"- started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(app.started))}",
+                 f"- target: {app.scope()}", f"- mode now: {app.guard.mode}", "", "## Mutating calls"]
+        for r in mine:
+            if r.get("op") in ("write", "control", "destructive", "edit"):
+                lines.append(f"- {r['ts']} `{r['tool']}` {json.dumps(r.get('args'), default=str)[:160]} → {r.get('outcome')}")
+        lines += ["", "## Recordings"]
+        try:
+            rl = await app.mem_call(app.rec.list)
+            for r in rl["session"]:
+                lines.append(f"- `{r['id']}` {r.get('name')} — {r['events']} events, {r['symbols']} symbols, {r.get('stop_reason') or 'running'} — {r['file']}")
+        except ToolError:
+            pass
+        lines += ["", "## Snapshots"]
+        for sn in await asyncio.to_thread(app.bench.snapshot_list):
+            lines.append(f"- {sn['name']} ({sn['symbols']} symbols, {sn['taken']}) — {sn['file']}")
+        dumps = sorted((Path(cfg.safety.audit_log).parent / "dumps").glob("dump-*.json")) if (Path(cfg.safety.audit_log).parent / "dumps").is_dir() else []
+        if dumps:
+            lines += ["", "## Dumps"] + [f"- {d}" for d in dumps[-10:]]
+        text = "\n".join(lines) + "\n"
+        p = Path(out_path) if out_path else Path(cfg.safety.audit_log).parent / "reports" / f"{time.strftime('%Y%m%d-%H%M%S')}.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return {"file": str(p), "mutating_calls": sum(1 for r in mine if r.get("op") != "read"), "markdown": text[:8000]}
 
     # ======================================================================
     # ipc_* target OS via System Service
@@ -1029,6 +1256,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_tree_consume_xml(path: str, xml: str) -> dict[str, Any]:
         """ConsumeXml on a tree item — the generic write path for any configuration
         (add I/O boxes, link variables, set task cycle time, add project routes on TIRR …)."""
+        app.guard_safety_path(path, "xae_tree_consume_xml")
         await app.permit(None, OpClass.EDIT, "xae_tree_consume_xml", path)
         res = await app.xae_call(app.xae.tree_consume_xml, path, xml, timeout=300)
         app.audit("xae_tree_consume_xml", {"path": path, "xml_bytes": len(xml)}, OpClass.EDIT, "ok")
@@ -1038,6 +1266,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_tree_set_values(path: str, assignments: dict[str, str]) -> dict[str, Any]:
         """Set element texts in a tree item's XML by relative XPath, e.g.
         {'TaskDef/CycleTime': '10000'} (unit 100 ns)."""
+        app.guard_safety_path(path, "xae_tree_set_values")
         await app.permit(None, OpClass.EDIT, "xae_tree_set_values", path)
         res = await app.xae_call(app.xae.tree_set_values, path, assignments, timeout=300)
         app.audit("xae_tree_set_values", {"path": path, "assignments": assignments}, OpClass.EDIT, "ok", res)
@@ -1048,6 +1277,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                     info: Any = None) -> dict[str, Any]:
         """Generic CreateChild (tree item types/subtypes per Infosys). For PLC objects prefer
         xae_pou_create."""
+        app.guard_safety_path(parent_path, "xae_tree_create_child")
         await app.permit(None, OpClass.EDIT, "xae_tree_create_child", f"{parent_path}^{name}")
         res = await app.xae_call(app.xae.tree_create_child, parent_path, name, subtype, before, info, timeout=120)
         app.audit("xae_tree_create_child", {"parent": parent_path, "name": name, "subtype": subtype}, OpClass.EDIT, "ok", res)
@@ -1058,6 +1288,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                               ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Delete a tree item (POU, box, task …). Destructive-class."""
         tgt = f"{parent_path}^{name}"
+        app.guard_safety_path(parent_path, "xae_tree_delete")
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_tree_delete", tgt, confirm_token)
         res = await app.xae_call(app.xae.tree_delete_child, parent_path, name, timeout=120)
         app.audit("xae_tree_delete", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", res)
@@ -1079,6 +1310,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_pou_set(path: str, declaration: str | None = None, implementation: str | None = None) -> dict[str, Any]:
         """Replace declaration and/or implementation text of a POU item inside the live shell
         (no file round-trip, XAE keeps LineIds consistent). Build afterwards."""
+        app.guard_safety_path(path, "xae_pou_set")
         await app.permit(None, OpClass.EDIT, "xae_pou_set", path)
         res = await app.xae_call(app.xae.pou_set, path, declaration, implementation, timeout=120)
         app.audit("xae_pou_set", {"path": path, "decl": declaration is not None, "impl": implementation is not None}, OpClass.EDIT, "ok", res)
@@ -1092,6 +1324,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Create a PLC object under a folder/POU: kind = program | fb | function | method |
         property | action | transition | struct | enum | union | alias | gvl | interface |
         itf_method | itf_property | folder | parameter_list. Optional code is set after creation."""
+        app.guard_safety_path(parent_path, "xae_pou_create")
         await app.permit(None, OpClass.EDIT, "xae_pou_create", f"{parent_path}^{name}")
         res = await app.xae_call(app.xae.pou_create, parent_path, name, kind, language, return_type,
                                  extends, implements, access, declaration, implementation, timeout=120)
@@ -1102,6 +1335,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_plcopen_import(plc_project_path: str, xml_file: str, option: str = "none") -> dict[str, Any]:
         """Import a PLCopen XML file into a PLC project (path from xae_plc_projects).
         option: none | rename | replace | skip (conflict handling)."""
+        app.guard_safety_path(plc_project_path, "xae_plcopen_import")
         await app.permit(None, OpClass.EDIT, "xae_plcopen_import", xml_file)
         res = await app.xae_call(app.xae.plcopen_import, plc_project_path, xml_file, option, timeout=300)
         app.audit("xae_plcopen_import", {"project": plc_project_path, "file": xml_file, "option": option}, OpClass.EDIT, "ok", res)
@@ -1120,6 +1354,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Boot project settings: set Autostart and/or GenerateBootProject (local, no activate
         unless activate_after_generate=true, which is then destructive-class)."""
         op = OpClass.DESTRUCTIVE if activate_after_generate else OpClass.EDIT
+        app.guard_safety_path(plc_project_path, "xae_boot_project")
         await app.permit(ctx, op, "xae_boot_project", plc_project_path, confirm_token)
         res = await app.xae_call(app.xae.boot_project, plc_project_path, autostart, generate, activate_after_generate, timeout=300)
         app.audit("xae_boot_project", {"project": plc_project_path, "autostart": autostart, "generate": generate}, op, "ok", res)
@@ -1178,12 +1413,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=EDIT)
     async def proj_set_code(name: str, declaration: str | None = None, implementation: str | None = None,
-                            strip_lineids: bool = True) -> dict[str, Any]:
+                            strip_lineids: bool = True, regenerate_lineids: bool = False) -> dict[str, Any]:
         """Write declaration/implementation back into the .TcPOU/.TcDUT/.TcGVL file (keeps the
         rest of the XML byte-identical, writes a .bak, drops the object's stale <LineIds>).
         Use when XAE is closed or for batch edits; otherwise prefer xae_pou_set."""
         await app.permit(None, OpClass.EDIT, "proj_set_code", name)
-        res = await app.proj_call(app.proj.set_code, name, declaration, implementation, strip_lineids)
+        res = await app.proj_call(app.proj.set_code, name, declaration, implementation, strip_lineids, regenerate_lineids)
         app.audit("proj_set_code", {"name": name, "changed": res.get("changed")}, OpClass.EDIT, "ok", res)
         return res
 
@@ -1210,7 +1445,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=DESTR)
     async def tcunit_run(plc_project_path: str, timeout_s: int = 600, skip_build: bool = False,
                          remote_result_path: str | None = None, allow_target_mismatch: bool = False,
-                         confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+                         disable_io: bool = False, confirm_token: str | None = None,
+                         ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Full TcUnit cycle: build → boot project autostart+generate → activate → restart →
         delete old result → wait for the xUnit file on the target → parse. Destructive-class
         (it activates a configuration on the target). plc_project_path from xae_plc_projects."""
@@ -1233,6 +1469,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             steps["old_result_deleted"] = True
         except ToolError:
             steps["old_result_deleted"] = False
+        if disable_io:
+            steps["io_disabled"] = await app.xae_call(app.xae.io_disable, True, None, timeout=120)
         steps["boot_project"] = await app.xae_call(app.xae.boot_project, plc_project_path, True, True, False, timeout=300)
         steps["activate"] = await app.xae_call(app.xae.activate_configuration, timeout=600)
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)

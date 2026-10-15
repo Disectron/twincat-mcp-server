@@ -48,7 +48,7 @@ Linux/macOS: only `proj_*`, `tcunit_results(local_path/xml_text)` and the safety
 git clone <this repo> C:\tools\twincat-mcp
 cd C:\tools\twincat-mcp
 scripts\install.cmd            :: venv + pip install -e .[dev] + prints effective config
-.venv\Scripts\python -m pytest :: 93 tests, all mocked, run anywhere
+.venv\Scripts\python -m pytest :: 102 tests, all mocked, run anywhere
 ```
 
 ### Claude Code
@@ -96,7 +96,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **"Absolute control" setting:** `TCMCP_MODE=full TCMCP_MAX_MODE=full TCMCP_CONFIRM=0`. In that configuration a single mis-aimed tool call can stop the PLC, activate a half-built configuration or reboot the IPC. The server will do exactly what it is told; the only remaining gate is the MCP client's own tool-permission prompt. Keep a denylist for E-stop/safety symbols regardless.
 
-## Tools (100) + 5 prompts
+## Tools (113) + 5 prompts
 
 **Workflows (one call = a whole chain)** `wf_debug_symbol` · `wf_fb_profile` · `wf_release_check` · `wf_project_overview`
 
@@ -104,19 +104,23 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **Meta** `tc_doctor` · `tc_safety_status` · `tc_set_mode` · `tc_request_confirmation` · `tc_audit_tail`
 
-**Runtime (ADS)** `ads_connect` · `ads_status[port]` · `ads_list_symbols[flag]` · `ads_symbol_info` · `ads_read` · `ads_read_many` · `ads_leaves` · `ads_dump` · `ads_types` · `ads_io_read` · `ads_write` · `ads_write_many` · `ads_read_raw` · `ads_write_raw` · `ads_watch` · `ads_wait_until` · `ads_plc_state` · `ads_system_mode` · `ads_ethercat` · `ads_routes` · `ads_add_route_to_plc` · `ads_app_info` · `ads_task_stats` · `ads_ping` · `ads_call_method`
+**Runtime (ADS)** `ads_discover` · `ads_connect` · `ads_status[port]` · `ads_list_symbols[flag]` · `ads_symbol_info` · `ads_read` · `ads_read_many` · `ads_leaves` · `ads_dump` · `ads_types` · `ads_io_read` · `ads_write` · `ads_write_many` · `ads_read_raw` · `ads_write_raw` · `ads_watch` · `ads_wait_until` · `ads_plc_state` · `ads_system_mode` · `ads_ethercat` · `ads_routes` · `ads_add_route_to_plc` · `ads_app_info` · `ads_task_stats` · `ads_ping` · `ads_call_method` · `ads_export` (C#/TS/JSON from the datatype table)
 
 **Recorder** `rec_start` · `rec_list` · `rec_status` · `rec_snapshot` · `rec_stats` · `rec_read` · `rec_stop` · `rec_export` · `rec_delete` · `rec_pulses` · `rec_latency` · `rec_compare`
 
-**Test bench** `test_expect` · `test_stable` · `test_response` · `test_scenario` · `snap_save` · `snap_compare` · `snap_list`
+**Test bench** `test_expect` · `test_stable` · `test_response` · `test_scenario` · `snap_save` · `snap_compare` · `snap_apply` · `snap_list`
 
-**Target OS (System Service)** `ipc_read_file` · `ipc_list_dir` · `ipc_write_file` · `ipc_delete_file` · `ipc_start_process` · `ipc_reboot`
+**Target OS (System Service)** `ipc_read_file` · `ipc_list_dir` · `ipc_write_file` · `ipc_delete_file` · `ipc_start_process` · `ipc_reboot` · `ipc_eventlog` (Windows targets)
 
-**XAE** `xae_attach` · `xae_status` · `xae_open_solution` · `xae_build` · `xae_diagnostics` · `xae_list_commands` · `xae_command` · `xae_plc` · `xae_target` · `xae_activate_configuration` · `xae_restart_twincat` · `xae_deploy` · `xae_tree_get` · `xae_tree_consume_xml` · `xae_tree_set_values` · `xae_tree_create_child` · `xae_tree_delete` · `xae_plc_projects` · `xae_pou_get` · `xae_pou_set` · `xae_pou_create` · `xae_plcopen_import` · `xae_plcopen_export` · `xae_boot_project`
+**XAE** `xae_attach` · `xae_status` · `xae_open_solution` · `xae_build` · `xae_diagnostics` · `xae_list_commands` · `xae_command` · `xae_plc` · `xae_target` · `xae_activate_configuration` · `xae_restart_twincat` · `xae_deploy` · `xae_tree_get` · `xae_tree_consume_xml` · `xae_tree_set_values` · `xae_tree_create_child` · `xae_tree_delete` · `xae_plc_projects` · `xae_pou_get` · `xae_pou_set` · `xae_pou_create` · `xae_plcopen_import` · `xae_plcopen_export` · `xae_boot_project` · `xae_dialogs` · `xae_dialog_resolve` · `xae_io_disable` · `xae_links`
 
-**Project files** `proj_scan` · `proj_list` · `proj_get_code` · `proj_resolve_symbol` · `proj_search` · `proj_references` · `proj_read_file` · `proj_set_code` · `proj_interface` · `proj_lint` · `proj_call_graph` · `proj_variables` · `proj_vs_runtime` · `proj_changed`
+**Project files** `proj_scan` · `proj_list` · `proj_get_code` · `proj_resolve_symbol` · `proj_search` · `proj_references` · `proj_read_file` · `proj_set_code` · `proj_interface` · `proj_lint` · `proj_call_graph` · `proj_variables` · `proj_vs_runtime` · `proj_changed` · `proj_validate_xml`
 
-**TcUnit** `tcunit_results` · `tcunit_run` · `tcunit_scaffold`
+**HMI (TE2000 / TcVIS)** `hmi_scan` · `hmi_bindings` · `hmi_vs_runtime`
+
+**TcUnit** `tcunit_results` · `tcunit_run[disable_io]` · `tcunit_scaffold`
+
+**Meta** also `tc_session_report` (markdown handover of everything this session changed/produced)
 
 Resources: `twincat://config`, `twincat://safety`, `twincat://audit/recent`.
 
@@ -133,6 +137,24 @@ claude                   :: > run tc_doctor
 ```
 
 Also in `integrations/claude-code/`: `.mcp.json` template, `CLAUDE.md.snippet` (conventions for every session), `skills/twincat-mcp/SKILL.md` (drop into `.claude/skills/` so the agent picks the right chain unprompted), and `scripts\register-claude-code.cmd`.
+
+## What 0.5.0 closes from the gap list
+
+| gap | tool | status |
+|---|---|---|
+| modal dialogs stall COM | `xae_dialogs`, `xae_dialog_resolve`, watchdog with `xae.dialog_rules` (never auto-answers activate/run/download/login/delete/safety prompts) | written against win32gui, untested on hardware |
+| TwinSAFE guard | every XAE edit refuses `TISC`/`^Safety` paths unless `TCMCP_ALLOW_SAFETY=1` | done |
+| XML structure + LineIds | `proj_validate_xml` (GUID format/uniqueness, property VAR blocks, LineIds counts, EOF); `fix=true`, `regenerate_lineids`; `proj_set_code regenerate_lineids=true` | done |
+| HMI files | `hmi_scan` / `hmi_bindings` / `hmi_vs_runtime` for TE2000 `%s%PLC1.X%/s%` bindings and TcVIS — broken bindings vs the live PLC and vs source | done |
+| TcUnit without hardware | `xae_io_disable`, `tcunit_run disable_io=true` | ITcSmTreeItem.Disabled, untested |
+| PLC discovery | `ads_discover` (UDP 48899 broadcast) | protocol per XAE broadcast search, untested |
+| variable links | `xae_links` — link target per AT %I*/%Q* variable, unlinked list | instance-tree XML, untested |
+| event log | `ipc_eventlog` via wevtutil on Windows targets; CE7/TC-BSD: use the XAE error list | partial |
+| MES glue | `ads_export csharp` — explicit-offset structs/enums from the datatype table, `csharp_symbols` constants, TypeScript, JSON | done |
+| recipes | `snap_apply` — write a snapshot back, gated per symbol, dry-run first | done |
+| handover | `tc_session_report` | done |
+
+Still deliberately absent: Scope/TE13xx, NC, non-EtherCAT fieldbuses, library binary introspection, semantic search, ESI-based box creation.
 
 ## Reading every variable
 
@@ -240,6 +262,8 @@ Anything that fails: the tool error text contains the ADS/HRESULT code; paste it
 
 ## Changelog
 
+**0.5.0** — dialog watchdog, TwinSAFE guard, XML validation/fixes + LineIds regeneration, TE2000/TcVIS HMI binding index with runtime/source cross-check, I/O disable, variable links, UDP discovery, Windows event log, C#/TypeScript/JSON exporters, snapshot apply, session report, `naming_prefixes` config.
+
 **0.4.0** — composite workflows (`wf_debug_symbol`, `wf_fb_profile`, `wf_release_check`, `wf_project_overview`), MCP prompts as workflow recipes, `rec_compare`, `proj_changed` (git), `proj_scan incremental`, `ads_io_read` (process image), compact symbol listing, size-guarded `ads_read`, separate ADS workers for quick vs long calls, Claude Code integration kit (`integrations/claude-code/`).
 
 **0.3.0** — datatype-table upload and parsing: full nested decode of any variable in one read (`ads_read`), `ads_leaves`, `ads_dump` (every variable on the PLC → JSON + CSV), `ads_types`; recorder prefixes expand through the table (arrays of structs included); `proj_variables` (source-declared variables flattened to instance paths) and `proj_vs_runtime` (source vs online cross-check).
@@ -255,7 +279,7 @@ Scope/TE13xx recording, TE1200 static analysis, NC axis commissioning, Safety (T
 ## Development
 
 ```
-python -m pytest            # 93 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation)
+python -m pytest            # 102 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation)
 python -m twincat_mcp --print-config
 python -m twincat_mcp --http 8765   # streamable-http on loopback only
 ```

@@ -287,3 +287,23 @@ def test_parse_build_output_formats():
     assert len(items) == 3
     assert items[0]["line"] == 12 and items[0]["level"] == "error"
     assert items[2]["level"] == "warning"
+
+
+def test_io_disable_and_links(xae):
+    be, dte, sm = xae
+    dev1 = FakeItem("Device 1 (EtherCAT)", "TIID^Device 1 (EtherCAT)")
+    dev2 = FakeItem("Device 2 (USB)", "TIID^Device 2 (USB)")
+    tiid = FakeItem("TIID", "TIID", [dev1, dev2])
+    sm.items["TIID"] = tiid
+    r = be.io_disable(True, only=["Device 1 (EtherCAT)"])
+    assert r["devices"] == [{"device": "Device 1 (EtherCAT)", "disabled": True}] and dev1.Disabled == 1
+    r = be.io_disable(False)
+    assert all(d["disabled"] is False for d in r["devices"]) and dev2.Disabled == 0
+    inputs = FakeItem("PlcTask Inputs", "TIPC^Plc^Plc Instance^PlcTask Inputs", xml=
+        '<TreeItem><VarGrp><Var><Name>MAIN.bStart</Name><Type>BOOL</Type><LinkedTo>TIID^Device 1 (EtherCAT)^Term 2 (EL1008)^Channel 1^Input</LinkedTo></Var>'
+        '<Var><Name>GVL_Machine.bEStop</Name><Type>BOOL</Type></Var></VarGrp></TreeItem>')
+    outputs = FakeItem("PlcTask Outputs", "TIPC^Plc^Plc Instance^PlcTask Outputs", xml='<TreeItem><VarGrp><Var><Name>MAIN.fbFill.fbValve.bOpen</Name><Type>BOOL</Type><LinkedTo>TIID^X^Y</LinkedTo></Var></VarGrp></TreeItem>')
+    sm.items["TIPC^Plc^Plc Instance"] = FakeItem("Plc Instance", "TIPC^Plc^Plc Instance", [inputs, outputs])
+    r = be.links("TIPC^Plc^Plc Project")
+    assert r["unlinked"] == [{"group": "PlcTask Inputs", "name": "GVL_Machine.bEStop", "type": "BOOL"}]
+    assert r["groups"][1]["variables"][0]["linked_to"] == "TIID^X^Y"

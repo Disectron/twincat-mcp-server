@@ -401,6 +401,31 @@ class TestBench:
         return {"a": da["name"], "b": db["name"], "compared": same + len(diffs), "same": same, "different": len(diffs),
                 "diffs": diffs[:500], "missing_in_b": missing[:200], "tolerance": tolerance}
 
+    def snapshot_apply(self, name: str, symbols: list[str] | None = None, dry_run: bool = False) -> dict[str, Any]:
+        """Write a snapshot's values back (recipe/parameter restore). The server gates each
+        symbol before calling this; dry_run lists the differences only."""
+        d = self._load_snapshot(name)
+        want = {s.lower() for s in symbols} if symbols else None
+        live = self.ads.read_many(list(d["values"].keys()))
+        plan, done, errors = [], [], []
+        for n, ent in d["values"].items():
+            if want and n.lower() not in want:
+                continue
+            tv = _raw(ent["value"])
+            lv = _raw(live.get(n))
+            if isinstance(tv, dict) or tv is None:
+                continue
+            if lv == tv:
+                continue
+            plan.append({"symbol": n, "from": lv, "to": tv})
+            if not dry_run:
+                try:
+                    self.ads.write(n, tv)
+                    done.append(n)
+                except AdsError as exc:
+                    errors.append({"symbol": n, "error": str(exc)})
+        return {"snapshot": name, "differences": plan, "written": done, "errors": errors, "dry_run": dry_run}
+
     def snapshot_list(self) -> list[dict[str, Any]]:
         if not self.snapshot_dir.is_dir():
             return []

@@ -14,10 +14,18 @@ solution_path = 'C:\Projects\DrumFilling\DrumFilling.sln'   # picks the right XA
 attach_only = true                 # never launch a shell unless xae_attach(launch=true)
 # progids = ["TcXaeShell.DTE.15.0"]  # 4024 32-bit shell first, if that is what you run
 build_timeout_s = 900
+dialog_watchdog = true             # poll XAE modal dialogs; auto-answer only by the rules below
+dialog_rules = [                   # never applied to activate/run/download/login/delete/safety prompts
+  { title_contains = "Microsoft Visual Studio", text_contains = "save changes", button = "No" },
+]
+allow_safety = false               # TwinSAFE (TISC) edits refused unless true
 
 [project]
 # root = 'C:\Projects\DrumFilling'  # defaults to the solution folder
 tcunit_remote_result = 'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml'
+# hmi_root = 'C:\Projects\DrumFilling\Hmi'   # TE2000 project folder for hmi_scan
+[project.naming_prefixes]          # overrides for proj_lint's naming rule
+LREAL = ["r", "lr", "f"]
 
 [safety]
 mode = "guarded"                   # readonly | guarded | full  (start mode)

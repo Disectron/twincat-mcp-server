@@ -31,6 +31,7 @@ import xml.etree.ElementTree as ET
 from typing import Any, Callable
 
 from .config import XaeConfig
+from .dialogs import DialogWatchdog
 
 IS_WIN = sys.platform == "win32"
 
@@ -95,6 +96,8 @@ class XaeBackend:
         self.progid: str | None = None
         self.attached_at: float | None = None
         self._sysman_project_name: str | None = None
+        self.pid: int | None = None
+        self.watchdog = DialogWatchdog(cfg.dialog_rules)
 
     # ------------------------------------------------------------ helpers
     def _require_win(self) -> None:
@@ -199,6 +202,14 @@ class XaeBackend:
         self.dte, self.progid = pick["dte"], pick["progid"]
         self.sysman = None
         self.attached_at = time.time()
+        self.pid = None
+        if pick.get("moniker") and ":" in pick["moniker"]:
+            try:
+                self.pid = int(pick["moniker"].rsplit(":", 1)[1])
+            except ValueError:
+                self.pid = None
+        if self.cfg.dialog_watchdog:
+            self.watchdog.start(self.pid)
         if launched:
             try:
                 self.dte.SuppressUI = False
@@ -706,6 +717,52 @@ class XaeBackend:
             res["boot_project_generated"] = True
         res["current_autostart"] = _try(lambda: bool(it.BootProjectAutostart))
         return res
+
+    def io_disable(self, disable: bool = True, only: list[str] | None = None) -> dict[str, Any]:
+        """Set the Disabled flag on every I/O device under TIID (or the named ones) —
+        lets a configuration activate on a PC/target without the hardware (TcUnit runs)."""
+        root = self._item("TIID")
+        changed = []
+        n = int(root.ChildCount)
+        for i in range(1, n + 1):
+            dev = root.Child(i)
+            name = _try(lambda: dev.Name) or f"device {i}"
+            if only and name not in only:
+                continue
+            try:
+                dev.Disabled = 1 if disable else 0   # SMDS_DISABLED / SMDS_NOT_DISABLED
+                changed.append({"device": name, "disabled": bool(disable)})
+            except Exception as exc:  # noqa: BLE001
+                changed.append({"device": name, "error": _com_msg(exc)})
+        return {"devices": changed, "note": "takes effect on the next ActivateConfiguration"}
+
+    def links(self, plc_project_path: str) -> dict[str, Any]:
+        """Variable links of the PLC instance (inputs/outputs groups) from their XML:
+        name, type, link target; lists unlinked AT %I*/%Q* variables."""
+        inst_path = plc_project_path.replace(" Project", " Instance")
+        inst = self._item(inst_path)
+        groups = []
+        unlinked = []
+        n = int(inst.ChildCount)
+        for i in range(1, n + 1):
+            grp = inst.Child(i)
+            gname = _try(lambda: grp.Name) or f"group {i}"
+            try:
+                xml = grp.ProduceXml(False)
+                root = ET.fromstring(xml)
+            except Exception as exc:  # noqa: BLE001
+                groups.append({"group": gname, "error": _com_msg(exc)})
+                continue
+            vars_ = []
+            for v in root.iter("Var"):
+                name = (v.findtext("Name") or "").strip()
+                vtype = (v.findtext("Type") or "").strip()
+                linked = (v.findtext("LinkedTo") or "").strip()
+                vars_.append({"name": name, "type": vtype, "linked_to": linked or None})
+                if not linked:
+                    unlinked.append({"group": gname, "name": name, "type": vtype})
+            groups.append({"group": gname, "variables": vars_, "count": len(vars_)})
+        return {"instance": inst_path, "groups": groups, "unlinked": unlinked, "unlinked_count": len(unlinked)}
 
     def check_all_objects(self) -> dict[str, Any]:
         """PLC 'Check all objects' (compile every POU incl. unused) via command."""

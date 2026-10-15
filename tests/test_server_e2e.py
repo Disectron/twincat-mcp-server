@@ -249,3 +249,30 @@ async def test_workflows_and_prompts(monkeypatch, project_dir):
         rc = payload(await s.call_tool("wf_release_check", {"run_build": False}))
         assert rc["verdict"].startswith("GO") or rc["verdict"] == "NO-GO"
         assert "source_vs_runtime" in rc["checks"] and rc["checks"]["tcunit"].get("skipped") or rc["checks"]["tcunit"]
+
+
+@pytest.mark.anyio
+async def test_safety_guard_hmi_export_report(monkeypatch, project_dir, tmp_path):
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="full", confirm_destructive=False)
+    cfg.project.hmi_root = str(Path(__file__).parent / "fixtures" / "sample_hmi")
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        res = await s.call_tool("xae_tree_consume_xml", {"path": "TISC^Safety^Group1", "xml": "<x/>"})
+        assert res.is_error and "TwinSAFE" in text(res)
+        h = payload(await s.call_tool("hmi_scan", {}))
+        assert h["bindings"] == 5
+        v = payload(await s.call_tool("hmi_vs_runtime", {}))
+        assert v["broken"] == 1 and v["broken_bindings"][0]["symbol"] == "MAIN.fbFill.rGhostValue"
+        e = payload(await s.call_tool("ads_export", {"types": ["ST_Step"], "fmt": "csharp"}))
+        assert "public struct ST_Step" in e["text"]
+        e2 = payload(await s.call_tool("ads_export", {"prefix": "MAIN.arrSteps", "fmt": "csharp_symbols"}))
+        assert "MAIN_arrSteps_2_eState" in e2["text"]
+        d = payload(await s.call_tool("xae_dialogs", {}))
+        assert d["pending"] == [] and d["live"] == []
+        val = payload(await s.call_tool("proj_validate_xml", {}))
+        assert val["files"] == 5
+        rep = payload(await s.call_tool("tc_session_report", {"out_path": str(tmp_path / "r.md")}))
+        assert Path(rep["file"]).exists() and "# twincat-mcp session report" in rep["markdown"]
+        disc = await s.call_tool("ads_discover", {"timeout_s": 0.2})
+        assert not disc.is_error  # no targets on this network, but the call must work

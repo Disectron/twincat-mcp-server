@@ -217,6 +217,142 @@ def call_graph(idx: ProjectIndex, root: str, depth: int = 4) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------------------
+_RE_GUID = re.compile(r"^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$")
+_RE_LINEIDS = re.compile(r"<LineIds Name=\"([^\"]+)\">(.*?)</LineIds>", re.S)
+_RE_LINEID = re.compile(r"<LineId Id=\"(\d+)\" Count=\"(\d+)\"\s*/>")
+
+
+def validate_xml(idx: ProjectIndex, name: str | None = None, fix: bool = False,
+                 regenerate_lineids: bool = False) -> dict[str, Any]:
+    """Structural checks of TwinCAT source files: well-formed XML, root/Name/Id, GUID format and
+    project-wide uniqueness, Declaration/Implementation presence, property accessor VAR blocks,
+    LineIds ↔ implementation line counts, file ending. fix=true applies safe fixes (missing final
+    newline, GUID case, duplicate GUID → new GUID, and — only with regenerate_lineids — rebuilt
+    LineIds); writes a .bak first."""
+    import xml.etree.ElementTree as ET
+    idx._ensure()
+    files = sorted({u.file for u in idx.units.values() if u.kind != "PARSE_ERROR" and (not name or u.name.lower() == name.lower() or (u.parent or "").lower() == name.lower())})
+    if name and not files:
+        files = [idx.get_unit(name).file]
+    guids: dict[str, list[str]] = {}
+    for f in sorted({u.file for u in idx.units.values()}):
+        try:
+            txt = Path(f).read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        for g in re.findall(r'Id="(\{[^"]+\})"', txt):
+            guids.setdefault(g.upper(), []).append(f)
+    findings: list[dict[str, Any]] = []
+    fixed: list[dict[str, Any]] = []
+    for f in files:
+        p = Path(f)
+        raw = p.read_bytes()
+        bom = raw.startswith(b"\xef\xbb\xbf")
+        txt = raw[3:].decode("utf-8", "replace") if bom else raw.decode("utf-8", "replace")
+        new = txt
+        try:
+            root = ET.fromstring(txt)
+        except ET.ParseError as exc:
+            findings.append({"file": f, "rule": "xml", "severity": "error", "message": f"not well-formed: {exc}"})
+            continue
+        if root.tag != "TcPlcObject":
+            findings.append({"file": f, "rule": "root", "severity": "error", "message": f"root is <{root.tag}>, expected <TcPlcObject>"})
+        obj = next((c for c in root), None)
+        if obj is None or obj.tag not in ("POU", "DUT", "GVL", "Itf", "Task", "Visu"):
+            findings.append({"file": f, "rule": "object", "severity": "error", "message": "no POU/DUT/GVL/Itf element"})
+            continue
+        if obj.get("Name") != p.stem:
+            findings.append({"file": f, "rule": "name", "severity": "warning", "message": f"object Name '{obj.get('Name')}' differs from file name '{p.stem}'"})
+        for el in root.iter():
+            g = el.get("Id")
+            if g is None or el.tag == "LineId":   # LineId Id="12" is a line number, not a GUID
+                continue
+            if not _RE_GUID.match(g):
+                findings.append({"file": f, "rule": "guid", "severity": "error", "message": f"bad GUID {g!r} on <{el.tag} Name={el.get('Name')}>"})
+            else:
+                if g != g.upper() and g != g.lower():
+                    findings.append({"file": f, "rule": "guid_case", "severity": "info", "message": f"mixed-case GUID {g}"})
+                owners = set(guids.get(g.upper(), []))
+                if len(owners) > 1 or guids.get(g.upper(), []).count(f) > 1:
+                    findings.append({"file": f, "rule": "guid_duplicate", "severity": "error", "message": f"GUID {g} also used in {sorted(owners - {f}) or 'this file (twice)'}"})
+                    if fix:
+                        new = new.replace(g, "{" + str(uuid.uuid4()).upper() + "}", 1)
+                        fixed.append({"file": f, "fix": "new GUID", "for": el.get("Name")})
+        # declaration / implementation presence
+        kind = obj.tag
+        if kind in ("POU", "DUT", "GVL", "Itf") and obj.find("Declaration") is None:
+            findings.append({"file": f, "rule": "declaration", "severity": "error", "message": "missing <Declaration>"})
+        if kind == "POU" and obj.find("Implementation") is None:
+            findings.append({"file": f, "rule": "implementation", "severity": "warning", "message": "POU without <Implementation>"})
+        for prop in obj.findall("Property"):
+            for acc in ("Get", "Set"):
+                a = prop.find(acc)
+                if a is not None:
+                    d = a.find("Declaration")
+                    if d is None or "VAR" not in (d.text or "").upper():
+                        findings.append({"file": f, "rule": "property_var", "severity": "warning",
+                                         "message": f"{prop.get('Name')}.{acc} declaration lacks a VAR…END_VAR block (XAE import rejects it)"})
+        # LineIds vs implementation lines
+        impl_lines: dict[str, int] = {}
+        pou_name = obj.get("Name") or p.stem
+        st = obj.find("Implementation/ST")
+        if st is not None:
+            impl_lines[pou_name] = len((st.text or "").split("\n"))
+        for tag in ("Method", "Action", "Transition"):
+            for m in obj.findall(tag):
+                st2 = m.find("Implementation/ST")
+                if st2 is not None:
+                    impl_lines[f"{pou_name}.{m.get('Name')}"] = len((st2.text or "").split("\n"))
+        for prop in obj.findall("Property"):
+            for acc in ("Get", "Set"):
+                a = prop.find(acc)
+                if a is not None and a.find("Implementation/ST") is not None:
+                    impl_lines[f"{pou_name}.{prop.get('Name')}.{acc}"] = len((a.find("Implementation/ST").text or "").split("\n"))
+        for m in _RE_LINEIDS.finditer(txt):
+            lname, body = m.group(1), m.group(2)
+            have = sum(1 + int(c) for _i, c in _RE_LINEID.findall(body))
+            want = impl_lines.get(lname)
+            if want is None:
+                findings.append({"file": f, "rule": "lineids_orphan", "severity": "info", "message": f"<LineIds Name=\"{lname}\"> has no implementation"})
+            elif have != want:
+                findings.append({"file": f, "rule": "lineids_count", "severity": "warning",
+                                 "message": f"LineIds for {lname}: {have} ids vs {want} implementation lines (online-change line mapping will be off)"})
+                if fix and regenerate_lineids:
+                    new = new.replace(m.group(0), _lineids_block(lname, want), 1)
+                    fixed.append({"file": f, "fix": "regenerated LineIds", "for": lname})
+        missing_lineids = [k for k in impl_lines if f'<LineIds Name="{k}">' not in txt]
+        for k in missing_lineids:
+            findings.append({"file": f, "rule": "lineids_missing", "severity": "info", "message": f"no <LineIds> for {k} (XAE regenerates them)"})
+        if fix and regenerate_lineids and missing_lineids:
+            close = f"  </{kind}>"
+            blocks = "".join("    " + _lineids_block(k, impl_lines[k]) + "\n" for k in missing_lineids)
+            if close in new:
+                new = new.replace(close, blocks + close, 1)
+                fixed.append({"file": f, "fix": "added LineIds", "for": missing_lineids})
+        if not txt.endswith("\n"):
+            findings.append({"file": f, "rule": "eof_newline", "severity": "info", "message": "file does not end with a newline"})
+            if fix:
+                new += "\n"
+                fixed.append({"file": f, "fix": "eof newline"})
+        if fix and new != txt:
+            p.with_suffix(p.suffix + ".bak").write_bytes(raw)
+            p.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
+            try:
+                idx._index_file(p)
+            except Exception:  # noqa: BLE001
+                p.write_bytes(raw)
+                fixed.append({"file": f, "fix": "REVERTED (result not parseable)"})
+    by_rule: dict[str, int] = {}
+    for fi in findings:
+        by_rule[fi["rule"]] = by_rule.get(fi["rule"], 0) + 1
+    return {"files": len(files), "findings": len(findings), "by_rule": by_rule, "items": findings[:1000], "fixed": fixed}
+
+
+def _lineids_block(name: str, lines: int) -> str:
+    inner = "\n".join(f'      <LineId Id="{i + 1}" Count="0" />' for i in range(max(lines, 1)))
+    return f'<LineIds Name="{name}">\n{inner}\n    </LineIds>'
+
+
 _TCPOU_TMPL = """<?xml version="1.0" encoding="utf-8"?>
 <TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
   <POU Name="{name}" Id="{{{guid}}}" SpecialFunc="None">

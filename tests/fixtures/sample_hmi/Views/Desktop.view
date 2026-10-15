@@ -1,0 +1,10 @@
+<div id="Desktop" data-tchmi-type="TcHmi.Controls.System.TcHmiView">
+  <div id="TcHmiToggleButton_Start" data-tchmi-type="TcHmi.Controls.Beckhoff.TcHmiToggleButton"
+       data-tchmi-state-symbol="%s%PLC1.MAIN.bStart%/s%" data-tchmi-text="Start"></div>
+  <div id="TcHmiTextblock_Weight" data-tchmi-type="TcHmi.Controls.Beckhoff.TcHmiTextblock"
+       data-tchmi-text="%s%PLC1.MAIN.stRecipe.rTargetKg%/s%"></div>
+  <div id="TcHmiTextblock_Ghost" data-tchmi-type="TcHmi.Controls.Beckhoff.TcHmiTextblock"
+       data-tchmi-text="%s%PLC1.MAIN.fbFill.rGhostValue%/s%"></div>
+  <div id="TcHmiState" data-tchmi-type="TcHmi.Controls.Beckhoff.TcHmiTextblock"
+       data-tchmi-text="%i%Internal.State%/i%"></div>
+</div>

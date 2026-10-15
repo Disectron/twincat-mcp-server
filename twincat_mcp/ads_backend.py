@@ -751,6 +751,42 @@ class AdsBackend:
                 "note": "This created the PLC-side route. The local (PC-side) route is in StaticRoutes.xml / "
                         "the XAE route dialog; use xae_tree_consume_xml on 'TIRR' for a project route."}
 
+    def discover(self, timeout_s: float = 2.0, broadcast: str = "255.255.255.255") -> dict[str, Any]:
+        """UDP broadcast discovery (port 48899) of TwinCAT targets on the local networks:
+        NetId, hostname, TwinCAT version, IP. Same protocol the XAE 'Broadcast Search' uses."""
+        import socket
+        try:
+            local = self.local_net_id()
+        except Exception:  # noqa: BLE001
+            local = "1.1.1.1.1.1"
+        req = b"\x03\x66\x14\x71\x00\x00\x00\x00\x01\x00\x00\x00" + bytes(int(x) for x in local.split(".")) \
+            + struct.pack("<H", 10000) + b"\x00\x00\x00\x00"
+        found: dict[str, dict[str, Any]] = {}
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(0.3)
+        try:
+            try:
+                sock.bind(("", 0))
+            except OSError:
+                pass
+            sock.sendto(req, (broadcast, 48899))
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                try:
+                    data, addr = sock.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                d = _parse_discovery(data)
+                if d:
+                    d["ip"] = addr[0]
+                    found[d.get("ams_net_id", addr[0])] = d
+        finally:
+            sock.close()
+        return {"count": len(found), "targets": list(found.values()), "broadcast": broadcast, "timeout_s": timeout_s}
+
     def local_net_id(self) -> str:
         pyads.open_port()
         try:
@@ -770,6 +806,35 @@ def _split_string_array(raw: bytes, tt: T.TcType) -> list[str]:
             out.append(chunk.decode("utf-16-le", "replace").split("\x00", 1)[0])
         else:
             out.append(chunk.decode("latin-1", "replace").split("\x00", 1)[0])
+    return out
+
+
+def _parse_discovery(data: bytes) -> dict[str, Any] | None:
+    if len(data) < 24 or data[:4] != b"\x03\x66\x14\x71" or data[8:12] != b"\x01\x00\x00\x80":
+        return None
+    out: dict[str, Any] = {"ams_net_id": ".".join(str(b) for b in data[12:18]), "ams_port": struct.unpack_from("<H", data, 18)[0]}
+    n_items = struct.unpack_from("<I", data, 20)[0]
+    pos = 24
+    raw_tags = {}
+    for _ in range(n_items):
+        if pos + 4 > len(data):
+            break
+        tag, ln = struct.unpack_from("<HH", data, pos)
+        pos += 4
+        val = data[pos:pos + ln]
+        pos += ln
+        if tag == 5:
+            out["hostname"] = val.split(b"\x00", 1)[0].decode("latin-1", "replace")
+        elif tag == 3 and ln >= 4:
+            out["twincat_version"] = f"{val[0]}.{val[1]}.{struct.unpack_from('<H', val, 2)[0]}"
+        elif tag == 18 and ln >= 12:
+            maj, mi, bld = struct.unpack_from("<III", val, 4) if ln >= 16 else (0, 0, 0)
+            out["os_version"] = f"{maj}.{mi}.{bld}"
+            raw_tags[tag] = val.hex()
+        else:
+            raw_tags[tag] = val.hex()[:64]
+    if raw_tags:
+        out["raw_tags"] = raw_tags
     return out
 
 

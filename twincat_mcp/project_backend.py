@@ -533,7 +533,7 @@ class ProjectIndex:
 
     # ------------------------------------------------------------ write back
     def set_code(self, name: str, declaration: str | None, implementation: str | None,
-                 strip_lineids: bool = True) -> dict[str, Any]:
+                 strip_lineids: bool = True, regenerate_lineids: bool = False) -> dict[str, Any]:
         u = self.get_unit(name, exact=True)
         if u.kind == "PROPERTY" and implementation is not None:
             raise ProjectError(f"{u.name} is a PROPERTY; edit {u.name}.Get / {u.name}.Set implementations instead")
@@ -560,7 +560,19 @@ class ProjectIndex:
             block, ok = _replace_cdata(block, "ST", implementation)
             changed.append("implementation" if ok else "implementation(NOT FOUND)")
         new = text[:elem_start] + block + text[elem_end:]
-        if strip_lineids:
+        if implementation is not None and regenerate_lineids:
+            lines = max(1, len(implementation.split(eol)))
+            inner = eol.join(f'      <LineId Id="{i + 1}" Count="0" />' for i in range(lines))
+            block = f'<LineIds Name="{u.name}">{eol}{inner}{eol}    </LineIds>'
+            new, n = re.subn(rf'<LineIds Name="{re.escape(u.name)}">.*?</LineIds>', lambda _m: block, new, flags=re.S)
+            if n:
+                changed.append("lineids_regenerated")
+            else:
+                close = f"  </{u.xml_path.split('/')[0]}>"
+                if close in new:
+                    new = new.replace(close, "    " + block + eol + close, 1)
+                    changed.append("lineids_added")
+        elif strip_lineids:
             # remove the LineIds entry for this object so XAE regenerates it
             new, n = re.subn(rf'\s*<LineIds Name="{re.escape(u.name)}">.*?</LineIds>', "", new, flags=re.S)
             if not n and u.parent:  # some versions name sub-item LineIds by the short name

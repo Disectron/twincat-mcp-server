@@ -65,12 +65,17 @@ class XaeConfig:
     visible: bool = True
     com_retry_s: float = 60.0              # retry window for RPC_E_CALL_REJECTED
     build_timeout_s: float = 900.0
+    dialog_watchdog: bool = True           # poll XAE modal dialogs while attached
+    dialog_rules: list[dict] = field(default_factory=list)   # [{title_contains|text_contains, button, force?}]
+    allow_safety: bool = False             # permit edits under TwinSAFE (TISC) paths
 
 
 @dataclass
 class ProjectConfig:
     root: str | None = None                # folder to scan for .tsproj/.plcproj
     tcunit_remote_result: str = r"C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml"
+    hmi_root: str | None = None            # TE2000 project folder (defaults to project root)
+    naming_prefixes: dict = field(default_factory=dict)      # overrides for proj_lint naming rule
 
 
 @dataclass
@@ -179,6 +184,12 @@ def _apply_env(cfg: Config) -> None:
         cfg.xae.solution_path = v
     if (b := _env_bool("TCMCP_XAE_ATTACH_ONLY")) is not None:
         cfg.xae.attach_only = b
+    if (b := _env_bool("TCMCP_DIALOG_WATCHDOG")) is not None:
+        cfg.xae.dialog_watchdog = b
+    if (b := _env_bool("TCMCP_ALLOW_SAFETY")) is not None:
+        cfg.xae.allow_safety = b
+    if v := _env("TCMCP_HMI_ROOT"):
+        cfg.project.hmi_root = v
     # project
     if v := _env("TCMCP_PROJECT_ROOT"):
         cfg.project.root = v
