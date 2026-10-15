@@ -6,3 +6,6 @@ __pycache__/
 twincat_mcp.toml
 .mcp.json
 *.bak
+dist/
+packaging/mcpb/.build-home/
+build/

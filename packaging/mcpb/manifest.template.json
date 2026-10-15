@@ -1,0 +1,83 @@
+{
+  "manifest_version": "0.3",
+  "name": "twincat-mcp",
+  "display_name": "TwinCAT MCP",
+  "version": "@VERSION@",
+  "description": "Beckhoff TwinCAT 3: live PLC variables over ADS, real-time recording, XAE build/activate/deploy, .TcPOU editing, TcUnit, HMI bindings — 113 audited tools.",
+  "long_description": "Gives Claude audited control of a TwinCAT 3 engineering PC and its target IPC. Read and write every PLC variable (nested structs, arrays, enums) over ADS, record symbols at PLC cycle resolution, run test scenarios against function blocks, build and activate from the open XAE shell, edit POUs, run TcUnit, cross-check HMI bindings. Writes are gated by a safety mode (readonly / guarded / full), allow/deny lists and per-machine confirmation tokens; every mutating call is written to a JSONL audit log.\n\nRequires: Windows engineering PC with TwinCAT XAE (or XAR) and a 64-bit Python 3.10+. First start creates a private virtualenv under %LOCALAPPDATA%\\twincat-mcp and installs the Python dependencies (needs PyPI access once, about a minute).",
+  "author": { "name": "Ryan Harris / Transflo Pumps" },
+  "license": "MIT",
+  "keywords": ["twincat", "beckhoff", "plc", "ads", "iec-61131-3", "structured-text", "tcunit", "industrial-automation"],
+  "server": {
+    "type": "python",
+    "entry_point": "server/launch.py",
+    "mcp_config": {
+      "command": "cmd",
+      "args": ["/d", "/c", "${__dirname}${/}server${/}launch.cmd", "--src", "${__dirname}${/}server${/}src"],
+      "env": {
+        "TCMCP_PYTHON": "${user_config.python_exe}",
+        "TCMCP_SOLUTION": "${user_config.solution}",
+        "TCMCP_PROJECT_ROOT": "${user_config.project_root}",
+        "TCMCP_AMS_NET_ID": "${user_config.ams_net_id}",
+        "TCMCP_MODE": "${user_config.mode}",
+        "TCMCP_MAX_MODE": "${user_config.max_mode}",
+        "TCMCP_CONFIG": "${user_config.config_file}"
+      }
+    }
+  },
+  "tools_generated": true,
+  "tools": "@TOOLS@",
+  "prompts_generated": true,
+  "prompts": "@PROMPTS@",
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["win32"],
+    "runtimes": { "python": ">=3.10" }
+  },
+  "user_config": {
+    "solution": {
+      "type": "file",
+      "title": "TwinCAT solution (.sln)",
+      "description": "The solution the server should attach to in the open XAE shell. Also sets the project root for offline file tools unless overridden below.",
+      "required": false
+    },
+    "project_root": {
+      "type": "directory",
+      "title": "Project folder (optional)",
+      "description": "Folder scanned for .tsproj/.plcproj/.TcPOU files. Defaults to the solution's folder.",
+      "required": false
+    },
+    "ams_net_id": {
+      "type": "string",
+      "title": "Default target AmsNetId",
+      "description": "AmsNetId of the IPC, e.g. 5.12.34.56.1.1 (XAE → Choose Target). Empty = local runtime on this PC.",
+      "required": false
+    },
+    "mode": {
+      "type": "string",
+      "title": "Safety mode at start",
+      "description": "readonly | guarded | full. guarded: writes only to the allow-list, destructive actions need confirmation.",
+      "default": "guarded",
+      "required": false
+    },
+    "max_mode": {
+      "type": "string",
+      "title": "Safety mode ceiling",
+      "description": "Highest mode a session may escalate to: readonly | guarded | full.",
+      "default": "full",
+      "required": false
+    },
+    "config_file": {
+      "type": "file",
+      "title": "Config TOML (optional)",
+      "description": "twincat_mcp.toml with allow/deny lists, HMI root, dialog rules. See twincat_mcp.toml.example in the bundle.",
+      "required": false
+    },
+    "python_exe": {
+      "type": "string",
+      "title": "Python executable (optional)",
+      "description": "Full path to a 64-bit python.exe 3.10+. Leave empty to auto-detect (py -3, python on PATH, %LOCALAPPDATA%\\Programs\\Python).",
+      "required": false
+    }
+  }
+}

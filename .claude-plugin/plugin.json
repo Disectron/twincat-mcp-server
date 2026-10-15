@@ -1,0 +1,66 @@
+{
+  "name": "twincat-mcp",
+  "displayName": "TwinCAT MCP",
+  "version": "0.6.0",
+  "description": "Beckhoff TwinCAT 3 for Claude Code: live PLC variables over ADS, real-time recording, XAE build/activate/deploy, .TcPOU editing, TcUnit, HMI bindings — 113 audited tools, 5 workflow prompts, one skill.",
+  "author": {
+    "name": "Ryan Harris / Transflo Pumps"
+  },
+  "license": "MIT",
+  "keywords": [
+    "twincat",
+    "beckhoff",
+    "plc",
+    "ads",
+    "iec-61131-3",
+    "structured-text",
+    "tcunit",
+    "automation"
+  ],
+  "mcpServers": {
+    "twincat": {
+      "command": "${user_config.python_exe}",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/launch.py",
+        "--src",
+        "${CLAUDE_PLUGIN_ROOT}"
+      ],
+      "env": {
+        "TCMCP_AMS_NET_ID": "${user_config.ams_net_id}",
+        "TCMCP_MODE": "${user_config.mode}",
+        "TCMCP_MAX_MODE": "${user_config.max_mode}",
+        "TCMCP_CONFIG": "${user_config.config_file}"
+      }
+    }
+  },
+  "userConfig": {
+    "python_exe": {
+      "type": "string",
+      "title": "Python executable",
+      "description": "64-bit Python 3.10+ used to bootstrap the server's private venv. 'python' if it is on PATH; otherwise the full path, e.g. C:\\Users\\me\\AppData\\Local\\Programs\\Python\\Python312\\python.exe. 'py' does not work here (it needs the -3 switch).",
+      "default": "python"
+    },
+    "ams_net_id": {
+      "type": "string",
+      "title": "Default target AmsNetId",
+      "description": "AmsNetId of the IPC to connect to when a tool call does not name one, e.g. 5.12.34.56.1.1. Leave empty to use the local runtime / per-project twincat_mcp.toml."
+    },
+    "mode": {
+      "type": "string",
+      "title": "Safety mode at start",
+      "description": "readonly | guarded | full. guarded = writes only to the allow-list and every destructive action needs confirmation.",
+      "default": "guarded"
+    },
+    "max_mode": {
+      "type": "string",
+      "title": "Safety mode ceiling",
+      "description": "Highest mode tc_set_mode may switch to in a session: readonly | guarded | full.",
+      "default": "full"
+    },
+    "config_file": {
+      "type": "string",
+      "title": "Config TOML (optional)",
+      "description": "Full path to a twincat_mcp.toml with solution path, allow/deny lists, HMI root. Leave empty: the server then looks for ./twincat_mcp.toml in the folder Claude Code was started in, then %USERPROFILE%\\.twincat_mcp\\config.toml."
+    }
+  }
+}

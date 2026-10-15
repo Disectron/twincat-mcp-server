@@ -44,23 +44,51 @@ Linux/macOS: only `proj_*`, `tcunit_results(local_path/xml_text)` and the safety
 
 ## Install
 
+Three ways. All need a 64-bit Python 3.10+ on the engineering PC; nothing else is installed by hand — the
+launcher (`scripts/launch.py`) creates a private venv on first start and reinstalls only when the shipped
+sources change.
+
+### A. Claude Code plugin (recommended)
+
+The repo is its own plugin marketplace (`.claude-plugin/`). Inside Claude Code:
+
+```
+/plugin marketplace add <owner>/<repo>        :: GitHub; or a local clone: /plugin marketplace add C:\tools\twincat-mcp
+/plugin install twincat-mcp@twincat-mcp
+```
+
+One step on Claude Code ≥ 2.1.275: `/plugin install twincat-mcp --marketplace <owner>/<repo>`. The plugin brings
+the MCP server (named `twincat`, tools appear as `mcp__plugin_twincat-mcp_twincat__<tool>`), the `twincat-mcp`
+skill and the 5 prompts. `/plugin configure twincat-mcp@twincat-mcp` sets the Python executable (default
+`python`), default AmsNetId, start/ceiling safety mode and an optional config TOML; everything project-specific
+(solution path, allow/deny lists, HMI root) comes from `twincat_mcp.toml` in the folder you start `claude` in.
+First start takes about a minute (venv + pip); if that first session reports the server as failed, the venv is
+already there — start a new session. The venv lives in `~/.claude/plugins/data/twincat-mcp-twincat-mcp/venv`
+and survives plugin updates.
+
+### B. Claude Desktop bundle
+
+`scripts\build-mcpb.cmd` produces `dist\twincat-mcp-<version>.mcpb` (or take the one from a release). Claude
+Desktop → Settings → Extensions → drag the file in. The install dialog asks for the solution, AmsNetId and
+safety modes. Windows only (the bundle runs `cmd /d /c server\launch.cmd`, which finds `py -3`, `python` or
+`%LOCALAPPDATA%\Programs\Python`). Logs: `%APPDATA%\Claude\logs\mcp-server-twincat-mcp.log`.
+
+### C. By hand (any MCP client, development)
+
 ```bat
 git clone <this repo> C:\tools\twincat-mcp
 cd C:\tools\twincat-mcp
 scripts\install.cmd            :: venv + pip install -e .[dev] + prints effective config
-.venv\Scripts\python -m pytest :: 102 tests, all mocked, run anywhere
-```
-
-### Claude Code
-
-```bat
+.venv\Scripts\python -m pytest :: 116 tests, all mocked, run anywhere
 cd C:\Projects\DrumFilling
 claude mcp add twincat -e TCMCP_SOLUTION=%CD%\DrumFilling.sln -e TCMCP_AMS_NET_ID=5.12.34.56.1.1 -e TCMCP_MODE=guarded -e TCMCP_MAX_MODE=full -- C:\tools\twincat-mcp\.venv\Scripts\python.exe -m twincat_mcp
 ```
 
-or copy `.mcp.json.example` → `.mcp.json` in the solution folder. Claude Desktop / Cursor use the same JSON shape.
+or copy `.mcp.json.example` → `.mcp.json` in the solution folder. Cursor / Windsurf / Claude Desktop's
+`claude_desktop_config.json` use the same JSON shape.
 
-First prompt: *"run tc_doctor"*. It reports router, local NetId, target state, registered ProgIDs, running shells, project root and the safety mode. Fix what it flags before anything else.
+First prompt in any client: *"run tc_doctor"*. It reports router, local NetId, target state, registered
+ProgIDs, running shells, project root and the safety mode. Fix what it flags before anything else.
 
 ## Configuration
 
@@ -128,15 +156,11 @@ Claude Code loads MCP tool schemas lazily when a server exposes many tools, so t
 
 ## Connecting Claude Code
 
-Claude Code starts the server itself over stdio — no port, nothing on the network, runs as your Windows user next to the TwinCAT router and the open XAE shell. Step by step, with scopes, permissions and troubleshooting: **`integrations/claude-code/README.md`**. Short version, from the solution folder:
+Claude Code starts the server itself over stdio — no port, nothing on the network, runs as your Windows user next to the TwinCAT router and the open XAE shell. Plugin install (section A above) is the short path; the manual `claude mcp add` route, scopes, permissions and troubleshooting are in **`integrations/claude-code/README.md`**.
 
-```bat
-claude mcp add twincat --scope project -e TCMCP_SOLUTION=%CD%\DrumFilling.sln -e TCMCP_AMS_NET_ID=5.12.34.56.1.1 -e TCMCP_MODE=guarded -e TCMCP_MAX_MODE=full -- C:\tools\twincat-mcp\.venv\Scripts\python.exe -m twincat_mcp
-claude mcp list          :: twincat ✓ Connected
-claude                   :: > run tc_doctor
-```
+Tool results reach Claude Code as the SDK's indented JSON text plus structured content; Claude Code shows them as collapsible tool-result blocks and the model summarises. For a human-readable handover use `tc_session_report` (markdown).
 
-Also in `integrations/claude-code/`: `.mcp.json` template, `CLAUDE.md.snippet` (conventions for every session), `skills/twincat-mcp/SKILL.md` (drop into `.claude/skills/` so the agent picks the right chain unprompted), and `scripts\register-claude-code.cmd`.
+Also in the repo: `skills/twincat-mcp/SKILL.md` (loaded by the plugin; or drop into `.claude/skills/`), `integrations/claude-code/CLAUDE.md.snippet` (conventions for every session), `integrations/claude-code/.mcp.json` template, `scripts\register-claude-code.cmd`.
 
 ## What 0.5.0 closes from the gap list
 
@@ -258,9 +282,13 @@ The XAE and System-Service paths are written against Beckhoff's Infosys document
 13. `ads_call_method` on a method marked `{attribute 'TcRpcEnable'}` → check the `instance#method` handle name and the packed parameter layout against the result.
 14. `ads_types ST_<something>` then `ads_read` of an `ARRAY OF STRUCT` variable → datatype-table parsing (`AdsDatatypeEntry` incl. the optional GUID/attribute/enum tails) against a real table; compare offsets with the TMC. On failure the server falls back to published members and reports `decoder: none` for arrays of structs.
 
+15. `scripts\launch.cmd` (used by the `.mcpb`) → Python discovery order `TCMCP_PYTHON` → `py -3` → `python` → `%LOCALAPPDATA%\Programs\Python\Python3*`; the Microsoft-Store `python.exe` stub fails the version probe and is skipped. Run it once by hand with `--no-run` and watch stderr.
+
 Anything that fails: the tool error text contains the ADS/HRESULT code; paste it back and the fix is usually one constant.
 
 ## Changelog
+
+**0.6.0** — packaging: Claude Code plugin + marketplace in `.claude-plugin/` (`/plugin install twincat-mcp@twincat-mcp`, `userConfig` for Python/AmsNetId/modes), Claude Desktop `.mcpb` bundle (`packaging/mcpb/build.py`, manifest 0.3, tool list generated from the server, passes `mcpb validate`), self-bootstrapping launcher `scripts/launch.py` (+ `launch.cmd`) that creates the venv on first start and reinstalls only when the shipped sources change; skill moved to `skills/twincat-mcp/`; HTTP mode bearer-token gate for claude.ai remote connectors. Plugin path verified end-to-end on Linux (install → venv → `tc_doctor` via `mcp__plugin_twincat-mcp_twincat__tc_doctor`); `launch.cmd` Python discovery is untested on Windows.
 
 **0.5.0** — dialog watchdog, TwinSAFE guard, XML validation/fixes + LineIds regeneration, TE2000/TcVIS HMI binding index with runtime/source cross-check, I/O disable, variable links, UDP discovery, Windows event log, C#/TypeScript/JSON exporters, snapshot apply, session report, `naming_prefixes` config.
 
@@ -279,7 +307,9 @@ Scope/TE13xx recording, TE1200 static analysis, NC axis commissioning, Safety (T
 ## Development
 
 ```
-python -m pytest            # 102 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation)
+python -m pytest            # 116 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation, packaging)
+python packaging/mcpb/build.py      # dist/twincat-mcp-<version>.mcpb; npx @anthropic-ai/mcpb validate runs if Node is present
+claude plugin validate .            # plugin + marketplace manifests
 python -m twincat_mcp --print-config
 python -m twincat_mcp --http 8765   # streamable-http on loopback; --token / TCMCP_HTTP_TOKEN adds a bearer gate for tunnels
 ```
