@@ -281,7 +281,7 @@ Scope/TE13xx recording, TE1200 static analysis, NC axis commissioning, Safety (T
 ```
 python -m pytest            # 102 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation)
 python -m twincat_mcp --print-config
-python -m twincat_mcp --http 8765   # streamable-http on loopback only
+python -m twincat_mcp --http 8765   # streamable-http on loopback; --token / TCMCP_HTTP_TOKEN adds a bearer gate for tunnels
 ```
 
 MIT.

@@ -76,13 +76,47 @@ project root and the safety mode. Then:
 * Several solutions: one `.mcp.json` per solution folder, each with its own `TCMCP_SOLUTION`
   and `TCMCP_AMS_NET_ID`. The server attaches to the XAE instance holding that solution.
 
-## 4. What about this phone / claude.ai?
+## 4. Claude Desktop app (same PC)
 
-claude.ai connectors need an HTTP endpoint reachable from Anthropic's side. The server can
-serve `streamable-http` on loopback (`python -m twincat_mcp --http 8765`), but exposing a
-process that holds ADS routes to live machines through a tunnel is a decision to make
-deliberately, with auth in front of it; it is not configured here. Claude Code on the
-engineering PC is the intended client.
+Same server, same stdio command, different config file. Claude Desktop → Claude menu →
+Settings… → **Developer** → **Edit Config** opens `%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "twincat": {
+      "command": "C:\\tools\\twincat-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "twincat_mcp"],
+      "env": { "TCMCP_SOLUTION": "C:\\Projects\\DrumFilling\\DrumFilling.sln",
+               "TCMCP_AMS_NET_ID": "5.12.34.56.1.1", "TCMCP_MODE": "guarded", "TCMCP_MAX_MODE": "full" }
+    }
+  }
+}
+```
+
+Quit and restart Claude Desktop. Verify: the "+" (Add files, connectors, and more) button at the
+bottom-left of the chat box → Connectors → Manage connectors → `twincat` lists the tools. Logs:
+`%APPDATA%\Claude\logs\mcp-server-twincat.log` (the server's stderr) and `mcp.log`.
+Local servers configured this way are **not** visible from claude.ai web or the mobile app.
+
+## 5. Phone / claude.ai web (remote custom connector)
+
+Custom connectors must be reachable from Anthropic's cloud, support OAuth or **fixed request
+headers** (a bearer token), and are not verified by Anthropic. The server supports exactly that:
+
+```bat
+set TCMCP_HTTP_TOKEN=<long random secret>
+.venv\Scripts\python.exe -m twincat_mcp --http 8765            :: loopback only
+cloudflared tunnel --url http://127.0.0.1:8765                      :: or Tailscale Funnel
+```
+
+Then in the Claude app: Customize → Connectors → + Add → Add custom connector → URL
+`https://<your-tunnel>/mcp`, Authentication "No sign in", Request headers
+`Authorization: Bearer <secret>`. The server refuses to bind a non-loopback address without a
+token. Treat the token like the key to the machine room: this process holds ADS routes to live
+hardware. Keep `TCMCP_MODE=guarded` with a tight allowlist for anything reachable from the
+internet, and disable the destructive tools in the connector's tool settings. "Allow always"
+on a write tool from a phone is the fastest way to open a valve you cannot see.
 
 ## 5. Troubleshooting
 
