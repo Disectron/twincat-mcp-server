@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="FB_Fill" Id="{aaaaaaaa-0000-0000-0000-000000000002}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_Fill EXTENDS FB_Base
+VAR_INPUT
+	bEnable   : BOOL;
+	stRecipe  : ST_Recipe;
+END_VAR
+VAR_OUTPUT
+	bDone     : BOOL;
+	bError    : BOOL;
+END_VAR
+VAR
+	fbValve   : FB_Valve;         (* bulk valve *)
+	fbFine    : FB_Valve;         (* fine valve *)
+	eState    : E_FillState;
+	tSettle   : TIME := T#500MS;
+	arrWeights : ARRAY[0..9] OF LREAL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[CASE eState OF
+	E_FillState.Idle:
+		IF bEnable THEN eState := E_FillState.Bulk; END_IF
+	E_FillState.Bulk:
+		fbValve.Open();
+END_CASE]]></ST>
+    </Implementation>
+    <Method Name="Start" Id="{aaaaaaaa-0000-0000-0000-000000000003}">
+      <Declaration><![CDATA[METHOD Start : BOOL
+VAR_INPUT
+	rTarget : LREAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[eState := E_FillState.Bulk;
+Start := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <LineIds Name="FB_Fill">
+      <LineId Id="10" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Fill.Start">
+      <LineId Id="11" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

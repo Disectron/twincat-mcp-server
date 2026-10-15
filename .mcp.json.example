@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "twincat": {
+      "command": "C:\\tools\\twincat-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "twincat_mcp"],
+      "env": {
+        "TCMCP_MODE": "guarded",
+        "TCMCP_MAX_MODE": "full",
+        "TCMCP_AMS_NET_ID": "5.12.34.56.1.1",
+        "TCMCP_SOLUTION": "C:\\Projects\\DrumFilling\\DrumFilling.sln",
+        "TCMCP_WRITE_ALLOW": "MAIN.fb*;GVL_Test.*",
+        "TCMCP_WRITE_DENY": "*.bEStop*;GVL_Safety.*"
+      }
+    }
+  }
+}

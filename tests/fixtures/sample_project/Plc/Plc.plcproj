@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectGuid>{11111111-2222-3333-4444-555555555555}</ProjectGuid>
+    <Name>Plc</Name>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="POUs\MAIN.TcPOU"><SubType>Code</SubType></Compile>
+    <Compile Include="POUs\FB_Fill.TcPOU"><SubType>Code</SubType></Compile>
+    <Compile Include="POUs\FB_Valve.TcPOU"><SubType>Code</SubType></Compile>
+    <Compile Include="DUTs\ST_Recipe.TcDUT"><SubType>Code</SubType></Compile>
+    <Compile Include="GVLs\GVL_Machine.TcGVL"><SubType>Code</SubType></Compile>
+  </ItemGroup>
+  <ItemGroup>
+    <PlaceholderReference Include="Tc2_Standard"><DefaultResolution>Tc2_Standard, * (Beckhoff Automation GmbH)</DefaultResolution></PlaceholderReference>
+  </ItemGroup>
+</Project>

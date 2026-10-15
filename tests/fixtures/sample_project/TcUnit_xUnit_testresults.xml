@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites disabled="0" failures="1" tests="3" time="0">
+  <testsuite id="0" name="FB_Fill_Test" tests="2" failures="1">
+    <testcase name="Test_StartGoesBulk" classname="FB_Fill_Test" status="PASS"/>
+    <testcase name="Test_CutoffApplied" classname="FB_Fill_Test" status="FAIL">
+      <failure message="EXP: 0.9, ACT: 0.85" type="LREAL"/>
+    </testcase>
+  </testsuite>
+  <testsuite id="1" name="FB_Valve_Test" tests="1" failures="0">
+    <testcase name="Test_Open" classname="FB_Valve_Test" status="PASS"/>
+  </testsuite>
+</testsuites>

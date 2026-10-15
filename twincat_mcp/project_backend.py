@@ -1,0 +1,547 @@
+"""Offline project backend.
+
+Parses the TwinCAT source tree (.tsproj / .plcproj / .TcPOU / .TcDUT /
+.TcGVL / .TcIO) into an index the agent can query without XAE running:
+
+* list objects (programs, FBs, functions, DUTs, GVLs, interfaces, methods,
+  properties, actions), with file + declared variables;
+* get code with line numbers (declaration / implementation / method …);
+* resolve an ADS symbol path (``MAIN.fbFill.fbValve.bOpen``) to the file
+  and line where each hop is declared, following variable types;
+* regex search across all ST with file:line hits;
+* references: where is ``FB_X`` instantiated / called;
+* write back declaration/implementation of an object (dropping the stale
+  ``<LineIds>`` for that object so XAE regenerates them cleanly).
+
+No tree-sitter, no vector DB: TwinCAT files are XML + ST text, and a
+regex-based structural pass is sufficient for navigation and the LineIds
+discipline. (Semantic search à la twincat-index-mcp is a different tool.)
+"""
+from __future__ import annotations
+
+import re
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Iterable
+
+from .config import ProjectConfig
+
+SRC_EXT = {".tcpou": "POU", ".tcdut": "DUT", ".tcgvl": "GVL", ".tcio": "Itf"}
+
+_RE_VAR_BLOCK = re.compile(
+    r"^[ \t]*(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_STAT|VAR_TEMP|VAR_INST|VAR_EXTERNAL|VAR|STRUCT|UNION)\b"
+    r"(?:[ \t]+(?:CONSTANT|RETAIN|PERSISTENT|NON_RETAIN))*[ \t]*$(.*?)^[ \t]*END_(?:VAR|STRUCT|UNION)",
+    re.M | re.S | re.I)
+_RE_VAR_DECL = re.compile(
+    r"^[ \t]*(?P<names>[A-Za-z_][\w]*(?:[ \t]*,[ \t]*[A-Za-z_][\w]*)*)[ \t]*(?:AT[ \t]+(?P<at>%[IQM][XBWDL]?[\d\.\*]+))?[ \t]*:[ \t]*"
+    r"(?P<type>[^:;=\n]+?)(?:[ \t]*:=[ \t]*(?P<init>[^;]*))?[ \t]*;[ \t]*(?:\(\*(?P<cmt>.*?)\*\)|//(?P<cmt2>.*))?",
+    re.M)
+_RE_HEADER = re.compile(
+    r"^\s*(?P<kind>FUNCTION_BLOCK|PROGRAM|FUNCTION|INTERFACE|METHOD|PROPERTY|TYPE)\s+(?:(?:PUBLIC|PRIVATE|PROTECTED|INTERNAL|ABSTRACT|FINAL)\s+)*(?P<name>[A-Za-z_]\w*)"
+    r"(?:\s*:\s*(?P<ret>[\w\.\(\)\[\] ]+?))?(?:\s+EXTENDS\s+(?P<ext>[\w\., ]+?))?(?:\s+IMPLEMENTS\s+(?P<impl>[\w\., ]+?))?\s*$",
+    re.M | re.I)
+_RE_ARRAY_OF = re.compile(r"^ARRAY\s*\[.*?\]\s*OF\s+(.+)$", re.I)
+_RE_PTR = re.compile(r"^(?:POINTER|REFERENCE)\s+TO\s+(.+)$", re.I)
+
+
+@dataclass
+class VarDecl:
+    name: str
+    type: str
+    section: str
+    line: int
+    init: str | None = None
+    at: str | None = None
+    comment: str | None = None
+
+
+@dataclass
+class CodeUnit:
+    """A POU / DUT / GVL / interface or one of its sub-items."""
+    name: str                  # e.g. FB_Valve or FB_Valve.Open
+    kind: str                  # PROGRAM/FUNCTION_BLOCK/FUNCTION/DUT/GVL/INTERFACE/METHOD/PROPERTY/ACTION/GET/SET
+    file: str
+    xml_path: str              # element path inside the file, e.g. POU or POU/Method[@Name='Open']
+    declaration: str = ""
+    implementation: str = ""
+    decl_line0: int = 0        # 1-based file line of the first declaration text line (0 = unknown)
+    impl_line0: int = 0        # 1-based file line of the first implementation (ST) text line
+    vars: list[VarDecl] = field(default_factory=list)
+    extends: list[str] = field(default_factory=list)
+    implements: list[str] = field(default_factory=list)
+    return_type: str | None = None
+    parent: str | None = None
+
+    def summary(self) -> dict[str, Any]:
+        return {"name": self.name, "kind": self.kind, "file": self.file,
+                "vars": len(self.vars), "extends": self.extends, "implements": self.implements,
+                "return_type": self.return_type, "impl_lines": self.implementation.count("\n") + (1 if self.implementation else 0)}
+
+
+class ProjectError(RuntimeError):
+    pass
+
+
+class ProjectIndex:
+    def __init__(self, cfg: ProjectConfig):
+        self.cfg = cfg
+        self.root: Path | None = Path(cfg.root) if cfg.root else None
+        self.units: dict[str, CodeUnit] = {}      # lower-case name -> unit
+        self.files: dict[str, float] = {}         # path -> mtime
+        self.solutions: list[str] = []
+        self.tsproj: list[str] = []
+        self.plcproj: list[dict[str, Any]] = []
+        self.scanned_at: float | None = None
+
+    # ------------------------------------------------------------ scan
+    def scan(self, root: str | None = None) -> dict[str, Any]:
+        if root:
+            self.root = Path(root)
+        if self.root is None or not self.root.is_dir():
+            raise ProjectError(f"project root not set or not a directory: {self.root}. "
+                               "Pass root= or set TCMCP_PROJECT_ROOT / TCMCP_SOLUTION.")
+        t0 = time.time()
+        self.units.clear(); self.files.clear(); self.plcproj.clear()
+        self.solutions = [str(p) for p in self.root.rglob("*.sln")]
+        self.tsproj = [str(p) for p in self.root.rglob("*.tsproj")]
+        for pp in self.root.rglob("*.plcproj"):
+            self.plcproj.append(self._parse_plcproj(pp))
+        n_files = 0
+        for p in self.root.rglob("*"):
+            if p.suffix.lower() in SRC_EXT and p.is_file():
+                if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
+                    continue
+                try:
+                    self._index_file(p)
+                    n_files += 1
+                except ET.ParseError as exc:
+                    self.files[str(p)] = -1
+                    self.units[f"__parse_error__{p.name}".lower()] = CodeUnit(p.name, "PARSE_ERROR", str(p), "", str(exc))
+        self.scanned_at = time.time()
+        kinds: dict[str, int] = {}
+        for u in self.units.values():
+            kinds[u.kind] = kinds.get(u.kind, 0) + 1
+        return {"root": str(self.root), "files": n_files, "units": len(self.units), "by_kind": kinds,
+                "solutions": self.solutions, "tsproj": self.tsproj,
+                "plcproj": [{"file": p["file"], "name": p["name"], "compile_items": len(p["compile"])} for p in self.plcproj],
+                "duration_s": round(time.time() - t0, 2)}
+
+    def _ensure(self) -> None:
+        if self.scanned_at is None:
+            self.scan()
+
+    @staticmethod
+    def _parse_plcproj(p: Path) -> dict[str, Any]:
+        d: dict[str, Any] = {"file": str(p), "name": p.stem, "compile": [], "libraries": [], "project_guid": None}
+        try:
+            root = ET.parse(p).getroot()
+        except ET.ParseError as exc:
+            d["error"] = str(exc)
+            return d
+        ns = root.tag.split("}")[0] + "}" if root.tag.startswith("{") else ""
+        for el in root.iter(f"{ns}Compile"):
+            inc = el.get("Include")
+            if inc:
+                d["compile"].append(inc)
+        for el in root.iter(f"{ns}PlaceholderReference"):
+            d["libraries"].append(el.get("Include"))
+        for el in root.iter(f"{ns}LibraryReference"):
+            d["libraries"].append(el.get("Include"))
+        g = root.find(f".//{ns}ProjectGuid")
+        if g is not None:
+            d["project_guid"] = g.text
+        return d
+
+    def _index_file(self, p: Path) -> None:
+        text = p.read_text(encoding="utf-8-sig", errors="replace")
+        self.files[str(p)] = p.stat().st_mtime
+        root = ET.fromstring(text)
+        kind_tag = SRC_EXT[p.suffix.lower()]
+        obj = root.find(kind_tag)
+        if obj is None:
+            return
+        name = obj.get("Name") or p.stem
+        decl = _cdata(obj, "Declaration")
+        impl = _cdata_impl(obj)
+        kind = _kind_from_decl(decl, kind_tag)
+        top_off = text.find(f"<{kind_tag} ")
+        dl, il = _code_lines(text, top_off)
+        unit = CodeUnit(name, kind, str(p), kind_tag, decl, impl, dl, il)
+        self._fill_header(unit)
+        unit.vars = parse_vars(decl, unit.decl_line0)
+        self.units[name.lower()] = unit
+        # sub-items
+        for tag, k in (("Method", "METHOD"), ("Property", "PROPERTY"), ("Action", "ACTION"), ("Transition", "TRANSITION")):
+            for i, sub in enumerate(obj.findall(tag)):
+                sname = sub.get("Name") or f"{tag}{i}"
+                full = f"{name}.{sname}"
+                sdecl = _cdata(sub, "Declaration")
+                simpl = _cdata_impl(sub)
+                sdl, sil = _code_lines(text, text.find(f'<{tag} Name="{sname}"'))
+                su = CodeUnit(full, k, str(p), f"{kind_tag}/{tag}[@Name='{sname}']", sdecl, simpl,
+                              sdl, sil, parent=name)
+                self._fill_header(su)
+                su.vars = parse_vars(sdecl, su.decl_line0)
+                self.units[full.lower()] = su
+                if tag == "Property":
+                    for acc in ("Get", "Set"):
+                        a = sub.find(acc)
+                        if a is not None:
+                            prop_off = text.find(f'<{tag} Name="{sname}"')
+                            adl, ail = _code_lines(text, text.find(f"<{acc}", prop_off))
+                            au = CodeUnit(f"{full}.{acc}", acc.upper(), str(p),
+                                          f"{kind_tag}/{tag}[@Name='{sname}']/{acc}",
+                                          _cdata(a, "Declaration"), _cdata_impl(a), adl, ail, parent=full)
+                            self.units[au.name.lower()] = au
+
+    def _fill_header(self, u: CodeUnit) -> None:
+        m = _RE_HEADER.search(u.declaration or "")
+        if not m:
+            return
+        if m.group("ext"):
+            u.extends = [x.strip() for x in m.group("ext").split(",") if x.strip()]
+        if m.group("impl"):
+            u.implements = [x.strip() for x in m.group("impl").split(",") if x.strip()]
+        if m.group("ret"):
+            u.return_type = m.group("ret").strip()
+
+    # ------------------------------------------------------------ queries
+    def list_units(self, kind: str | None = None, pattern: str | None = None, limit: int = 500) -> dict[str, Any]:
+        self._ensure()
+        import fnmatch
+        pat = (pattern or "*").lower()
+        if "*" not in pat and "?" not in pat:
+            pat = f"*{pat}*"
+        sel = [u for u in self.units.values()
+               if (not kind or u.kind.lower() == kind.lower()) and fnmatch.fnmatchcase(u.name.lower(), pat)]
+        sel.sort(key=lambda u: u.name.lower())
+        return {"total": len(sel), "units": [u.summary() for u in sel[:limit]]}
+
+    def get_unit(self, name: str) -> CodeUnit:
+        self._ensure()
+        u = self.units.get(name.lower())
+        if u is None:
+            # allow file-stem lookups and case-insensitive partials
+            cands = [x for x in self.units.values() if x.name.lower().endswith("." + name.lower()) or x.name.lower() == name.lower()]
+            if len(cands) == 1:
+                return cands[0]
+            raise ProjectError(f"object {name!r} not found in index ({len(self.units)} units). proj_list to browse.")
+        return u
+
+    def get_code(self, name: str, part: str = "both", with_line_numbers: bool = True) -> dict[str, Any]:
+        u = self.get_unit(name)
+        out: dict[str, Any] = {"name": u.name, "kind": u.kind, "file": u.file, "xml_path": u.xml_path}
+        if part in ("both", "declaration"):
+            out["declaration"] = _numbered(u.declaration, u.decl_line0) if with_line_numbers else u.declaration
+        if part in ("both", "implementation"):
+            out["implementation"] = _numbered(u.implementation, u.impl_line0) if with_line_numbers else u.implementation
+        out["vars"] = [asdict(v) for v in u.vars]
+        subs = [x.summary() for x in self.units.values() if x.parent == u.name]
+        if subs:
+            out["subitems"] = subs
+        return out
+
+    def resolve_symbol(self, symbol: str) -> dict[str, Any]:
+        """MAIN.fbFill.fbValve.bOpen → hop list with declaring unit/file/line/type."""
+        self._ensure()
+        parts = [p for p in re.split(r"\.(?![^\[]*\])", symbol.strip()) if p]
+        if not parts:
+            raise ProjectError("empty symbol")
+        hops: list[dict[str, Any]] = []
+        # first hop: program / GVL / FB name
+        cur = self.units.get(parts[0].lower())
+        if cur is None:
+            # maybe GVL without prefix: search all GVLs for the var
+            hit = self._find_var_anywhere(parts[0], kinds=("GVL",))
+            if hit:
+                unit, var = hit
+                hops.append({"segment": parts[0], "declared_in": unit.name, "file": unit.file, "line": var.line, "type": var.type, "section": var.section})
+                cur = self._unit_for_type(var.type)
+                parts = parts[1:]
+            else:
+                raise ProjectError(f"no program/GVL/FB named {parts[0]!r}; try proj_search")
+        else:
+            hops.append({"segment": parts[0], "declared_in": cur.name, "file": cur.file, "line": cur.decl_line0, "type": cur.kind})
+            parts = parts[1:]
+        for seg in parts:
+            if cur is None:
+                hops.append({"segment": seg, "error": "previous hop type is not in the project (library type or basic type)"})
+                break
+            base = re.sub(r"\[.*\]$", "", seg)
+            var = self._find_var(cur, base)
+            if var is None:
+                # method/property/action?
+                sub = self.units.get(f"{cur.name}.{base}".lower())
+                if sub:
+                    hops.append({"segment": seg, "declared_in": sub.name, "file": sub.file, "line": sub.decl_line0, "type": sub.kind})
+                    cur = None
+                    continue
+                hops.append({"segment": seg, "error": f"{base!r} not declared in {cur.name} (or its EXTENDS chain)"})
+                break
+            unit_of_var, v = var
+            hops.append({"segment": seg, "declared_in": unit_of_var.name, "file": unit_of_var.file, "line": v.line,
+                         "type": v.type, "section": v.section, "comment": v.comment})
+            cur = self._unit_for_type(v.type)
+        return {"symbol": symbol, "hops": hops, "resolved": all("error" not in h for h in hops)}
+
+    def _find_var(self, u: CodeUnit, name: str) -> tuple[CodeUnit, VarDecl] | None:
+        seen = set()
+        stack = [u]
+        while stack:
+            cur = stack.pop(0)
+            if cur.name.lower() in seen:
+                continue
+            seen.add(cur.name.lower())
+            for v in cur.vars:
+                if v.name.lower() == name.lower():
+                    return cur, v
+            for e in cur.extends:
+                eu = self.units.get(e.lower())
+                if eu:
+                    stack.append(eu)
+        return None
+
+    def _find_var_anywhere(self, name: str, kinds: Iterable[str]) -> tuple[CodeUnit, VarDecl] | None:
+        ks = {k.upper() for k in kinds}
+        for u in self.units.values():
+            if u.kind.upper() in ks:
+                for v in u.vars:
+                    if v.name.lower() == name.lower():
+                        return u, v
+        return None
+
+    def _unit_for_type(self, type_str: str) -> CodeUnit | None:
+        t = type_str.strip()
+        if m := _RE_ARRAY_OF.match(t):
+            t = m.group(1).strip()
+        if m := _RE_PTR.match(t):
+            t = m.group(1).strip()
+        t = t.split("(")[0].strip()
+        if "." in t:  # library-qualified
+            t = t.split(".")[-1]
+        return self.units.get(t.lower())
+
+    def search(self, regex: str, kinds: list[str] | None = None, max_hits: int = 200,
+               ignore_case: bool = True) -> dict[str, Any]:
+        self._ensure()
+        try:
+            rx = re.compile(regex, re.I if ignore_case else 0)
+        except re.error as exc:
+            raise ProjectError(f"bad regex: {exc}") from exc
+        hits: list[dict[str, Any]] = []
+        ks = {k.upper() for k in kinds} if kinds else None
+        for u in self.units.values():
+            if ks and u.kind.upper() not in ks:
+                continue
+            for part, text, base in (("declaration", u.declaration, u.decl_line0), ("implementation", u.implementation, u.impl_line0)):
+                for i, ln in enumerate(text.splitlines(), start=1):
+                    if rx.search(ln):
+                        hits.append({"unit": u.name, "part": part, "file": u.file, "line": base + i - 1, "text": ln.strip()[:200]})
+                        if len(hits) >= max_hits:
+                            return {"regex": regex, "hits": hits, "truncated": True}
+        return {"regex": regex, "hits": hits, "truncated": False}
+
+    def references(self, name: str, max_hits: int = 200) -> dict[str, Any]:
+        self._ensure()
+        rx = re.compile(rf"\b{re.escape(name)}\b", re.I)
+        res = self.search(rx.pattern, None, max_hits, True)
+        decl_hits = [h for h in res["hits"] if h["unit"].lower() != name.lower()]
+        instances = []
+        for u in self.units.values():
+            for v in u.vars:
+                if self._unit_for_type(v.type) and self._unit_for_type(v.type).name.lower() == name.lower():  # type: ignore[union-attr]
+                    instances.append({"unit": u.name, "var": v.name, "type": v.type, "file": u.file, "line": v.line})
+        return {"name": name, "instances": instances, "mentions": decl_hits, "truncated": res["truncated"]}
+
+    # ------------------------------------------------------------ write back
+    def set_code(self, name: str, declaration: str | None, implementation: str | None,
+                 strip_lineids: bool = True) -> dict[str, Any]:
+        u = self.get_unit(name)
+        p = Path(u.file)
+        text = p.read_text(encoding="utf-8-sig", errors="replace")
+        new = text
+        changed = []
+        # Locate the element block for this unit in the raw text (keep formatting of the rest).
+        elem_start, elem_end = _locate_element(text, u)
+        block = text[elem_start:elem_end]
+        if declaration is not None:
+            block, ok = _replace_cdata(block, "Declaration", declaration)
+            changed.append("declaration" if ok else "declaration(NOT FOUND)")
+        if implementation is not None:
+            block, ok = _replace_cdata(block, "ST", implementation)
+            changed.append("implementation" if ok else "implementation(NOT FOUND)")
+        new = text[:elem_start] + block + text[elem_end:]
+        if strip_lineids:
+            # remove the LineIds entry for this object so XAE regenerates it
+            new, n = re.subn(rf'\s*<LineIds Name="{re.escape(u.name)}">.*?</LineIds>', "", new, flags=re.S)
+            if not n and u.parent:  # some versions name sub-item LineIds by the short name
+                new, n = re.subn(rf'\s*<LineIds Name="{re.escape(u.name.split(".")[-1])}">.*?</LineIds>', "", new, flags=re.S)
+            if n:
+                changed.append(f"lineids_removed({n})")
+        if new == text:
+            return {"file": u.file, "changed": [], "note": "no change"}
+        bak = p.with_suffix(p.suffix + ".bak")
+        bak.write_text(text, encoding="utf-8")
+        p.write_text(new, encoding="utf-8")
+        # re-index this file
+        try:
+            self._index_file(p)
+        except ET.ParseError as exc:
+            p.write_text(text, encoding="utf-8")
+            raise ProjectError(f"edit produced invalid XML, reverted: {exc}") from exc
+        return {"file": u.file, "changed": changed, "backup": str(bak)}
+
+    def read_file(self, rel_or_abs: str, max_chars: int = 200_000) -> dict[str, Any]:
+        p = Path(rel_or_abs)
+        if not p.is_absolute() and self.root:
+            p = self.root / p
+        if not p.is_file():
+            raise ProjectError(f"file not found: {p}")
+        txt = p.read_text(encoding="utf-8-sig", errors="replace")
+        return {"file": str(p), "chars": len(txt), "text": txt[:max_chars], "truncated": len(txt) > max_chars}
+
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+def parse_vars(decl: str, base_line: int = 0) -> list[VarDecl]:
+    out: list[VarDecl] = []
+    if not decl:
+        return out
+    for m in _RE_VAR_BLOCK.finditer(decl):
+        section = m.group(1).upper()
+        body = m.group(2)
+        body_start_line = decl[:m.start(2)].count("\n")
+        for d in _RE_VAR_DECL.finditer(body):
+            line = base_line + body_start_line + body[:d.start()].count("\n")
+            cmt = (d.group("cmt") or d.group("cmt2") or "").strip() or None
+            for nm in d.group("names").split(","):
+                out.append(VarDecl(nm.strip(), d.group("type").strip(), section, line,
+                                   (d.group("init") or "").strip() or None, d.group("at"), cmt))
+    return out
+
+
+def _cdata(el: ET.Element, tag: str) -> str:
+    d = el.find(tag)
+    return (d.text or "") if d is not None else ""
+
+
+def _cdata_impl(el: ET.Element) -> str:
+    impl = el.find("Implementation")
+    if impl is None:
+        return ""
+    st = impl.find("ST")
+    if st is not None:
+        return st.text or ""
+    # non-ST languages: return the raw XML so the agent sees something
+    return "".join(ET.tostring(c, encoding="unicode") for c in impl)
+
+
+def _kind_from_decl(decl: str, tag: str) -> str:
+    m = _RE_HEADER.search(decl or "")
+    if m:
+        k = m.group("kind").upper()
+        if k == "TYPE":
+            low = decl.upper()
+            if "STRUCT" in low:
+                return "STRUCT"
+            if "UNION" in low:
+                return "UNION"
+            if re.search(r":\s*\(", decl):
+                return "ENUM"
+            return "ALIAS"
+        return k
+    return {"POU": "POU", "DUT": "DUT", "GVL": "GVL", "Itf": "INTERFACE"}[tag]
+
+
+def _code_lines(text: str, elem_off: int) -> tuple[int, int]:
+    """1-based file lines where the Declaration and ST CDATA text of the element
+    starting at ``elem_off`` begin. TwinCAT writes ``<Declaration><![CDATA[`` and
+    ``<ST><![CDATA[`` with the first code line on the tag line itself."""
+    if elem_off < 0:
+        return 0, 0
+    sub_end = min([i for i in (text.find("<Method", elem_off + 1), text.find("<Property", elem_off + 1),
+                               text.find("<Action", elem_off + 1), text.find("<Transition", elem_off + 1),
+                               text.find("<LineIds", elem_off + 1)) if i > 0] or [len(text)])
+    d = text.find("<Declaration>", elem_off, sub_end)
+    st = text.find("<ST>", elem_off, sub_end)
+    return (text[:d].count("\n") + 1 if d >= 0 else 0, text[:st].count("\n") + 1 if st >= 0 else 0)
+
+
+def _numbered(text: str, start: int) -> str:
+    if not text:
+        return ""
+    lines = text.split("\n")
+    w = len(str(start + len(lines)))
+    return "\n".join(f"{start + i:>{w}}| {ln}" for i, ln in enumerate(lines))
+
+
+def _locate_element(text: str, u: CodeUnit) -> tuple[int, int]:
+    """Find the raw text span of the XML element this unit lives in."""
+    if u.parent:
+        tag = {"METHOD": "Method", "PROPERTY": "Property", "ACTION": "Action", "TRANSITION": "Transition",
+               "GET": "Get", "SET": "Set"}.get(u.kind, "Method")
+        if u.kind in ("GET", "SET"):
+            # locate the parent property first then the accessor within it
+            prop_name = u.name.split(".")[-2]
+            ps = text.find(f'<Property Name="{prop_name}"')
+            pe = text.find("</Property>", ps)
+            s = text.find(f"<{tag}", ps, pe)
+            e = text.find(f"</{tag}>", s) + len(f"</{tag}>")
+            return s, e
+        sub_name = u.name.split(".")[-1]
+        s = text.find(f'<{tag} Name="{sub_name}"')
+        e = text.find(f"</{tag}>", s) + len(f"</{tag}>")
+        return s, e
+    tag = u.xml_path
+    s = text.find(f"<{tag} ")
+    if s < 0:
+        s = text.find(f"<{tag}>")
+    # top-level: declaration/implementation come before any Method/Property elements
+    first_sub = min([i for i in (text.find("<Method", s), text.find("<Property", s), text.find("<Action", s),
+                                 text.find("<Transition", s), text.find("<LineIds", s)) if i > 0] or [len(text)])
+    return s, first_sub
+
+
+def _replace_cdata(block: str, tag: str, new_text: str) -> tuple[str, bool]:
+    rx = re.compile(rf"(<{tag}>\s*<!\[CDATA\[)(.*?)(\]\]>\s*</{tag}>)", re.S)
+    m = rx.search(block)
+    if not m:
+        return block, False
+    safe = new_text.replace("]]>", "]]]]><![CDATA[>")
+    return block[:m.start(2)] + safe + block[m.end(2):], True
+
+
+# ----------------------------------------------------------------------------
+# TcUnit xUnit parsing
+# ----------------------------------------------------------------------------
+def parse_tcunit_xml(xml_text: str) -> dict[str, Any]:
+    try:
+        root = ET.fromstring(xml_text.strip())
+    except ET.ParseError as exc:
+        raise ProjectError(f"TcUnit result is not valid XML: {exc}") from exc
+    suites = []
+    tot = {"tests": 0, "failures": 0, "skipped": 0}
+    for ts in root.iter("testsuite"):
+        s = {"name": ts.get("name"), "tests": int(ts.get("tests", 0)), "failures": int(ts.get("failures", 0)),
+             "skipped": int(ts.get("skipped", 0) or 0), "cases": []}
+        for tc in ts.findall("testcase"):
+            c: dict[str, Any] = {"name": tc.get("name"), "class": tc.get("classname"), "status": tc.get("status") or "PASS"}
+            f = tc.find("failure")
+            if f is not None:
+                c["status"] = "FAIL"
+                c["message"] = f.get("message")
+                c["type"] = f.get("type")
+                if f.text:
+                    c["detail"] = f.text.strip()[:500]
+            if tc.find("skipped") is not None:
+                c["status"] = "SKIPPED"
+            s["cases"].append(c)
+        suites.append(s)
+        for k in tot:
+            tot[k] += s[k]
+    failed = [f"{s['name']}::{c['name']}: {c.get('message','')}" for s in suites for c in s["cases"] if c["status"] == "FAIL"]
+    return {"summary": tot, "passed": tot["tests"] - tot["failures"] - tot["skipped"],
+            "all_passed": tot["failures"] == 0 and tot["tests"] > 0, "failed_tests": failed, "suites": suites}

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="FB_Valve" Id="{aaaaaaaa-0000-0000-0000-000000000004}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_Valve
+VAR_OUTPUT
+	bOpen AT %Q* : BOOL;   // solenoid
+END_VAR
+VAR
+	tOpened : TIME;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[;]]></ST>
+    </Implementation>
+    <Method Name="Open" Id="{aaaaaaaa-0000-0000-0000-000000000005}">
+      <Declaration><![CDATA[METHOD Open
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[bOpen := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="IsOpen" Id="{aaaaaaaa-0000-0000-0000-000000000006}">
+      <Declaration><![CDATA[PROPERTY IsOpen : BOOL]]></Declaration>
+      <Get Name="Get" Id="{aaaaaaaa-0000-0000-0000-000000000007}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IsOpen := bOpen;]]></ST>
+        </Implementation>
+      </Get>
+    </Property>
+    <LineIds Name="FB_Valve">
+      <LineId Id="1" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

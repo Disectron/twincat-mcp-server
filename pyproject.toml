@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twincat-mcp"
+version = "0.1.0"
+description = "MCP server giving an AI agent full, audited control of a Beckhoff TwinCAT 3 engineering PC and its target IPC: ADS runtime, XAE Automation Interface, project files, TcUnit."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Harris / Transflo Pumps" }]
+dependencies = [
+    "mcp>=2.0,<3",
+    "pyads>=3.4,<4",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+twincat-mcp = "twincat_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["twincat_mcp*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

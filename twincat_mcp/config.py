@@ -1,0 +1,226 @@
+"""Configuration for twincat-mcp.
+
+Precedence (highest first):
+  1. Environment variables ``TCMCP_*``
+  2. TOML file given by ``TCMCP_CONFIG`` or ``./twincat_mcp.toml`` or
+     ``~/.twincat_mcp/config.toml``
+  3. Built-in defaults below
+
+Everything is plain dataclasses so the config can be printed back to the
+agent by ``tc_config`` without surprises.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any
+
+try:  # Python 3.11+
+    import tomllib  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - 3.10 fallback
+    tomllib = None  # type: ignore
+
+MODES = ("readonly", "guarded", "full")
+MODE_RANK = {m: i for i, m in enumerate(MODES)}
+
+# Default ProgIDs, most recent first. Beckhoff:
+#   TwinCAT XAE Shell (4024, 32-bit)   -> TcXaeShell.DTE.15.0
+#   TwinCAT XAE Shell 64-bit (4026)    -> TcXaeShell.DTE.17.0
+#   Visual Studio 2019 / 2022 / 2026   -> VisualStudio.DTE.16.0 / 17.0 / 18.0
+DEFAULT_PROGIDS = (
+    "TcXaeShell.DTE.17.0",
+    "TcXaeShell.DTE.15.0",
+    "VisualStudio.DTE.18.0",
+    "VisualStudio.DTE.17.0",
+    "VisualStudio.DTE.16.0",
+)
+
+
+def _home() -> Path:
+    return Path(os.environ.get("TCMCP_HOME") or (Path.home() / ".twincat_mcp"))
+
+
+@dataclass
+class AdsConfig:
+    ams_net_id: str | None = None          # e.g. "5.12.34.56.1.1"; None = local
+    ams_port: int = 851                    # PLC runtime 1
+    ip_address: str | None = None          # only needed for pyads on Linux / direct
+    timeout_ms: int = 5000
+    symbol_cache_ttl_s: int = 300
+    static_routes_xml: str = r"C:\TwinCAT\3.1\Target\StaticRoutes.xml"
+    ethercat_master_port: int = 0xFFFF     # ADS port of first EtherCAT master
+    max_watch_duration_ms: int = 60_000
+    min_watch_interval_ms: int = 10
+    max_watch_points: int = 5000
+    max_file_bytes: int = 4 * 1024 * 1024
+
+
+@dataclass
+class XaeConfig:
+    progids: tuple[str, ...] = DEFAULT_PROGIDS
+    attach_only: bool = True               # never launch a new shell unless told
+    solution_path: str | None = None       # pick ROT instance holding this .sln
+    visible: bool = True
+    com_retry_s: float = 60.0              # retry window for RPC_E_CALL_REJECTED
+    build_timeout_s: float = 900.0
+
+
+@dataclass
+class ProjectConfig:
+    root: str | None = None                # folder to scan for .tsproj/.plcproj
+    tcunit_remote_result: str = r"C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml"
+
+
+@dataclass
+class SafetyConfig:
+    mode: str = "guarded"
+    max_mode: str | None = None            # ceiling for runtime escalation; None = mode
+    confirm_destructive: bool = True       # confirm token for activate/restart/exec/...
+    confirm_ttl_s: int = 180
+    write_allowlist: list[str] = field(default_factory=list)   # fnmatch, case-insens.
+    write_denylist: list[str] = field(default_factory=list)    # always wins
+    audit_log: str | None = None           # None -> ~/.twincat_mcp/audit.jsonl
+    audit_reads: bool = False
+
+
+@dataclass
+class Config:
+    ads: AdsConfig = field(default_factory=AdsConfig)
+    xae: XaeConfig = field(default_factory=XaeConfig)
+    project: ProjectConfig = field(default_factory=ProjectConfig)
+    safety: SafetyConfig = field(default_factory=SafetyConfig)
+    config_file: str | None = None
+
+    # ------------------------------------------------------------------ dump
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["xae"]["progids"] = list(self.xae.progids)
+        return d
+
+
+# ---------------------------------------------------------------------------
+# loading
+# ---------------------------------------------------------------------------
+def _find_config_file() -> Path | None:
+    cands = []
+    if os.environ.get("TCMCP_CONFIG"):
+        cands.append(Path(os.environ["TCMCP_CONFIG"]))
+    cands.append(Path.cwd() / "twincat_mcp.toml")
+    cands.append(_home() / "config.toml")
+    for c in cands:
+        if c.is_file():
+            return c
+    return None
+
+
+def _apply_toml(cfg: Config, data: dict[str, Any]) -> None:
+    for section in ("ads", "xae", "project", "safety"):
+        sub = data.get(section) or {}
+        target = getattr(cfg, section)
+        for k, v in sub.items():
+            if hasattr(target, k):
+                if k == "progids":
+                    v = tuple(v)
+                setattr(target, k, v)
+
+
+def _env(name: str) -> str | None:
+    v = os.environ.get(name)
+    return v if v not in (None, "") else None
+
+
+def _env_bool(name: str) -> bool | None:
+    v = _env(name)
+    if v is None:
+        return None
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_list(name: str) -> list[str] | None:
+    v = _env(name)
+    if v is None:
+        return None
+    return [p.strip() for p in v.split(";") if p.strip()]
+
+
+def _apply_env(cfg: Config) -> None:
+    # safety
+    if m := _env("TCMCP_MODE"):
+        cfg.safety.mode = m.lower()
+    if m := _env("TCMCP_MAX_MODE"):
+        cfg.safety.max_mode = m.lower()
+    if (b := _env_bool("TCMCP_CONFIRM")) is not None:
+        cfg.safety.confirm_destructive = b
+    if (lst := _env_list("TCMCP_WRITE_ALLOW")) is not None:
+        cfg.safety.write_allowlist = lst
+    if (lst := _env_list("TCMCP_WRITE_DENY")) is not None:
+        cfg.safety.write_denylist = lst
+    if v := _env("TCMCP_AUDIT_LOG"):
+        cfg.safety.audit_log = v
+    if (b := _env_bool("TCMCP_AUDIT_READS")) is not None:
+        cfg.safety.audit_reads = b
+    # ads
+    if v := _env("TCMCP_AMS_NET_ID"):
+        cfg.ads.ams_net_id = v
+    if v := _env("TCMCP_AMS_PORT"):
+        cfg.ads.ams_port = int(v)
+    if v := _env("TCMCP_IP"):
+        cfg.ads.ip_address = v
+    if v := _env("TCMCP_ADS_TIMEOUT_MS"):
+        cfg.ads.timeout_ms = int(v)
+    if v := _env("TCMCP_STATIC_ROUTES_XML"):
+        cfg.ads.static_routes_xml = v
+    # xae
+    if v := _env("TCMCP_PROGIDS"):
+        cfg.xae.progids = tuple(p.strip() for p in v.split(";") if p.strip())
+    if v := _env("TCMCP_SOLUTION"):
+        cfg.xae.solution_path = v
+    if (b := _env_bool("TCMCP_XAE_ATTACH_ONLY")) is not None:
+        cfg.xae.attach_only = b
+    # project
+    if v := _env("TCMCP_PROJECT_ROOT"):
+        cfg.project.root = v
+    if v := _env("TCMCP_TCUNIT_RESULT"):
+        cfg.project.tcunit_remote_result = v
+
+
+def validate(cfg: Config) -> list[str]:
+    """Return a list of human-readable problems (empty = fine)."""
+    problems: list[str] = []
+    if cfg.safety.mode not in MODES:
+        problems.append(f"safety.mode must be one of {MODES}, got {cfg.safety.mode!r}")
+    if cfg.safety.max_mode is None:
+        cfg.safety.max_mode = cfg.safety.mode
+    elif cfg.safety.max_mode not in MODES:
+        problems.append(f"safety.max_mode must be one of {MODES}, got {cfg.safety.max_mode!r}")
+    elif MODE_RANK[cfg.safety.max_mode] < MODE_RANK.get(cfg.safety.mode, 0):
+        problems.append("safety.max_mode is lower than safety.mode")
+    if cfg.safety.audit_log is None:
+        cfg.safety.audit_log = str(_home() / "audit.jsonl")
+    if not (1 <= cfg.ads.ams_port <= 65535):
+        problems.append("ads.ams_port out of range")
+    if cfg.project.root is None and cfg.xae.solution_path:
+        cfg.project.root = str(Path(cfg.xae.solution_path).parent)
+    return problems
+
+
+def load(path: str | os.PathLike | None = None) -> Config:
+    cfg = Config()
+    p = Path(path) if path else _find_config_file()
+    if p and p.is_file():
+        if tomllib is None:
+            raise RuntimeError("TOML config needs Python 3.11+ (tomllib); use env vars on 3.10")
+        with open(p, "rb") as fh:
+            _apply_toml(cfg, tomllib.load(fh))
+        cfg.config_file = str(p)
+    _apply_env(cfg)
+    problems = validate(cfg)
+    if problems:
+        raise ValueError("twincat-mcp config invalid: " + "; ".join(problems))
+    return cfg
+
+
+def is_windows() -> bool:
+    return sys.platform == "win32"

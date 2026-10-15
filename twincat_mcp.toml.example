@@ -1,0 +1,30 @@
+# twincat-mcp configuration. Copy to ./twincat_mcp.toml (next to where the
+# server is started), or to %USERPROFILE%\.twincat_mcp\config.toml, or point
+# TCMCP_CONFIG at it. Environment variables TCMCP_* override these values.
+
+[ads]
+ams_net_id = "5.12.34.56.1.1"      # target IPC; omit for the local runtime
+ams_port = 851                     # PLC runtime 1
+timeout_ms = 5000
+# static_routes_xml = 'C:\TwinCAT\3.1\Target\StaticRoutes.xml'
+# ethercat_master_port = 65535
+
+[xae]
+solution_path = 'C:\Projects\DrumFilling\DrumFilling.sln'   # picks the right XAE instance
+attach_only = true                 # never launch a shell unless xae_attach(launch=true)
+# progids = ["TcXaeShell.DTE.15.0"]  # 4024 32-bit shell first, if that is what you run
+build_timeout_s = 900
+
+[project]
+# root = 'C:\Projects\DrumFilling'  # defaults to the solution folder
+tcunit_remote_result = 'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml'
+
+[safety]
+mode = "guarded"                   # readonly | guarded | full  (start mode)
+max_mode = "full"                  # ceiling for tc_set_mode at runtime
+confirm_destructive = true         # false = activate/restart/reboot in one call (full mode)
+confirm_ttl_s = 180
+write_allowlist = ["MAIN.fb*", "GVL_Test.*", "GVL_Hmi.*"]   # guarded mode: writable symbols
+write_denylist  = ["*.bEStop*", "GVL_Safety.*"]            # never writable, any mode
+audit_reads = false
+# audit_log = 'C:\Users\ryan\.twincat_mcp\audit.jsonl'
