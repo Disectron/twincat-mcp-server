@@ -122,7 +122,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **Meta** also `tc_session_report` (markdown handover of everything this session changed/produced)
 
-Resources: `twincat://config`, `twincat://safety`, `twincat://audit/recent`.
+Resources: `twincat://config`, `twincat://safety`, `twincat://audit/recent`. Full one-line-per-tool reference with safety classes: **`TOOLS.md`** (generated from the server).
 
 Claude Code loads MCP tool schemas lazily when a server exposes many tools, so the count costs little context until a tool is used. Performance: quick reads and long operations (watch, scenarios, dumps) run on separate ADS workers, so a 60 s watch never stalls an `ads_read`; recorder queries touch memory/files only; the datatype table and symbol table are cached (TTL 300 s, `refresh=true` to force).
 
