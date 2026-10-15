@@ -48,7 +48,7 @@ Linux/macOS: only `proj_*`, `tcunit_results(local_path/xml_text)` and the safety
 git clone <this repo> C:\tools\twincat-mcp
 cd C:\tools\twincat-mcp
 scripts\install.cmd            :: venv + pip install -e .[dev] + prints effective config
-.venv\Scripts\python -m pytest :: 90 tests, all mocked, run anywhere
+.venv\Scripts\python -m pytest :: 93 tests, all mocked, run anywhere
 ```
 
 ### Claude Code
@@ -96,13 +96,17 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **"Absolute control" setting:** `TCMCP_MODE=full TCMCP_MAX_MODE=full TCMCP_CONFIRM=0`. In that configuration a single mis-aimed tool call can stop the PLC, activate a half-built configuration or reboot the IPC. The server will do exactly what it is told; the only remaining gate is the MCP client's own tool-permission prompt. Keep a denylist for E-stop/safety symbols regardless.
 
-## Tools (93)
+## Tools (100) + 5 prompts
+
+**Workflows (one call = a whole chain)** `wf_debug_symbol` · `wf_fb_profile` · `wf_release_check` · `wf_project_overview`
+
+**Prompts (recipes the agent follows)** `debug_symbol` · `fb_validation` · `deploy_safely` · `performance_audit` · `onboard_project`
 
 **Meta** `tc_doctor` · `tc_safety_status` · `tc_set_mode` · `tc_request_confirmation` · `tc_audit_tail`
 
-**Runtime (ADS)** `ads_connect` · `ads_status[port]` · `ads_list_symbols[flag]` · `ads_symbol_info` · `ads_read` · `ads_read_many` · `ads_leaves` · `ads_dump` · `ads_types` · `ads_write` · `ads_write_many` · `ads_read_raw` · `ads_write_raw` · `ads_watch` · `ads_wait_until` · `ads_plc_state` · `ads_system_mode` · `ads_ethercat` · `ads_routes` · `ads_add_route_to_plc` · `ads_app_info` · `ads_task_stats` · `ads_ping` · `ads_call_method`
+**Runtime (ADS)** `ads_connect` · `ads_status[port]` · `ads_list_symbols[flag]` · `ads_symbol_info` · `ads_read` · `ads_read_many` · `ads_leaves` · `ads_dump` · `ads_types` · `ads_io_read` · `ads_write` · `ads_write_many` · `ads_read_raw` · `ads_write_raw` · `ads_watch` · `ads_wait_until` · `ads_plc_state` · `ads_system_mode` · `ads_ethercat` · `ads_routes` · `ads_add_route_to_plc` · `ads_app_info` · `ads_task_stats` · `ads_ping` · `ads_call_method`
 
-**Recorder** `rec_start` · `rec_list` · `rec_status` · `rec_snapshot` · `rec_stats` · `rec_read` · `rec_stop` · `rec_export` · `rec_delete` · `rec_pulses` · `rec_latency`
+**Recorder** `rec_start` · `rec_list` · `rec_status` · `rec_snapshot` · `rec_stats` · `rec_read` · `rec_stop` · `rec_export` · `rec_delete` · `rec_pulses` · `rec_latency` · `rec_compare`
 
 **Test bench** `test_expect` · `test_stable` · `test_response` · `test_scenario` · `snap_save` · `snap_compare` · `snap_list`
 
@@ -110,13 +114,25 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **XAE** `xae_attach` · `xae_status` · `xae_open_solution` · `xae_build` · `xae_diagnostics` · `xae_list_commands` · `xae_command` · `xae_plc` · `xae_target` · `xae_activate_configuration` · `xae_restart_twincat` · `xae_deploy` · `xae_tree_get` · `xae_tree_consume_xml` · `xae_tree_set_values` · `xae_tree_create_child` · `xae_tree_delete` · `xae_plc_projects` · `xae_pou_get` · `xae_pou_set` · `xae_pou_create` · `xae_plcopen_import` · `xae_plcopen_export` · `xae_boot_project`
 
-**Project files** `proj_scan` · `proj_list` · `proj_get_code` · `proj_resolve_symbol` · `proj_search` · `proj_references` · `proj_read_file` · `proj_set_code` · `proj_interface` · `proj_lint` · `proj_call_graph` · `proj_variables` · `proj_vs_runtime`
+**Project files** `proj_scan` · `proj_list` · `proj_get_code` · `proj_resolve_symbol` · `proj_search` · `proj_references` · `proj_read_file` · `proj_set_code` · `proj_interface` · `proj_lint` · `proj_call_graph` · `proj_variables` · `proj_vs_runtime` · `proj_changed`
 
 **TcUnit** `tcunit_results` · `tcunit_run` · `tcunit_scaffold`
 
 Resources: `twincat://config`, `twincat://safety`, `twincat://audit/recent`.
 
-Claude Code loads MCP tool schemas lazily when a server exposes many tools, so the count costs little context until a tool is used.
+Claude Code loads MCP tool schemas lazily when a server exposes many tools, so the count costs little context until a tool is used. Performance: quick reads and long operations (watch, scenarios, dumps) run on separate ADS workers, so a 60 s watch never stalls an `ads_read`; recorder queries touch memory/files only; the datatype table and symbol table are cached (TTL 300 s, `refresh=true` to force).
+
+## Connecting Claude Code
+
+Claude Code starts the server itself over stdio — no port, nothing on the network, runs as your Windows user next to the TwinCAT router and the open XAE shell. Step by step, with scopes, permissions and troubleshooting: **`integrations/claude-code/README.md`**. Short version, from the solution folder:
+
+```bat
+claude mcp add twincat --scope project -e TCMCP_SOLUTION=%CD%\DrumFilling.sln -e TCMCP_AMS_NET_ID=5.12.34.56.1.1 -e TCMCP_MODE=guarded -e TCMCP_MAX_MODE=full -- C:\tools\twincat-mcp\.venv\Scripts\python.exe -m twincat_mcp
+claude mcp list          :: twincat ✓ Connected
+claude                   :: > run tc_doctor
+```
+
+Also in `integrations/claude-code/`: `.mcp.json` template, `CLAUDE.md.snippet` (conventions for every session), `skills/twincat-mcp/SKILL.md` (drop into `.claude/skills/` so the agent picks the right chain unprompted), and `scripts\register-claude-code.cmd`.
 
 ## Reading every variable
 
@@ -224,6 +240,8 @@ Anything that fails: the tool error text contains the ADS/HRESULT code; paste it
 
 ## Changelog
 
+**0.4.0** — composite workflows (`wf_debug_symbol`, `wf_fb_profile`, `wf_release_check`, `wf_project_overview`), MCP prompts as workflow recipes, `rec_compare`, `proj_changed` (git), `proj_scan incremental`, `ads_io_read` (process image), compact symbol listing, size-guarded `ads_read`, separate ADS workers for quick vs long calls, Claude Code integration kit (`integrations/claude-code/`).
+
 **0.3.0** — datatype-table upload and parsing: full nested decode of any variable in one read (`ads_read`), `ads_leaves`, `ads_dump` (every variable on the PLC → JSON + CSV), `ads_types`; recorder prefixes expand through the table (arrays of structs included); `proj_variables` (source-declared variables flattened to instance paths) and `proj_vs_runtime` (source vs online cross-check).
 
 **0.2.0** — real-time recorder (`rec_*`), test bench (`test_*`, `snap_*`), runtime diagnostics (`ads_app_info`, `ads_task_stats`, `ads_ping`), ADS RPC (`ads_call_method`), static checks (`proj_interface`, `proj_lint`, `proj_call_graph`), `tcunit_scaffold`. Review fixes: ROT enumeration (`EnumRunning`), `vsBuildState` constant, raw writes limited to PLC ports with symbol-overlap deny checks, tokens bound to the connected machine, `ads_connect` re-targeting gated, destructive DTE commands classified, project write-back byte-exact (BOM/EOL preserved) and duplicate-name aware, cooperative cancellation of long ADS loops, blocking calls moved off the event loop.
@@ -237,7 +255,7 @@ Scope/TE13xx recording, TE1200 static analysis, NC axis commissioning, Safety (T
 ## Development
 
 ```
-python -m pytest            # 90 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation)
+python -m pytest            # 93 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation)
 python -m twincat_mcp --print-config
 python -m twincat_mcp --http 8765   # streamable-http on loopback only
 ```

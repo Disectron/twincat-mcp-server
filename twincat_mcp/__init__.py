@@ -16,4 +16,4 @@ All mutating operations pass through ``safety.Guard`` (mode, allow/deny
 lists, confirmation tokens) and are appended to a JSONL audit log.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

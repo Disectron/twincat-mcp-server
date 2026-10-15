@@ -1,0 +1,16 @@
+## TwinCAT MCP (server `twincat`)
+
+- Start every session with `tc_doctor`; if `xae_running` is empty, open the solution in XAE first.
+- Live values: `ads_read` (whole FB/struct trees), `ads_leaves <program>` for everything under a program,
+  `ads_dump` for a full snapshot to file. Never guess a value — read it.
+- Code questions: `proj_resolve_symbol` → `proj_get_code` → `proj_references` / `proj_call_graph`;
+  `wf_debug_symbol` does the whole chain in one call.
+- Timing questions: `rec_start` (change mode, 1 ms) while the machine runs, then `rec_stats`,
+  `rec_pulses`, `rec_latency`; `ads_watch` only for ≤ 60 s one-offs.
+- FB validation: `test_scenario` with a parallel recording; port stable scenarios to TcUnit via
+  `tcunit_scaffold`.
+- Edits: prefer `xae_pou_set` when XAE is open (keeps LineIds), `proj_set_code` otherwise; then
+  `xae_build` and read the error items. Deliver code as .TcPOU/.TcDUT/.TcGVL or PLCopen XML.
+- Deploy only via `xae_deploy` after `wf_release_check`; then `proj_vs_runtime` must be clean.
+- Writes go through the allow/deny lists; do not write to `AT %I*` inputs or safety symbols.
+- Every mutating call is audited (`tc_audit_tail`). Say which recording/snapshot ids you produced.

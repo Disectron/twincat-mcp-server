@@ -593,6 +593,19 @@ class AdsBackend:
         after = self.read(name, expand_struct=False, port=port).get("value")
         return {"name": s.name, "type": s.type, "before": before, "after": after}
 
+    def io_read(self, area: str, offset: int, size: int, port: int | None = None) -> dict[str, Any]:
+        """Read the raw process image: area 'I' (inputs, ADSIGRP_IOIMAGE_RWIB) or 'Q' (outputs,
+        ADSIGRP_IOIMAGE_RWOB) at byte offset — what the PLC task actually sees/wrote, independent
+        of symbol names."""
+        igrp = {"I": C.ADSIGRP_IOIMAGE_RWIB, "Q": C.ADSIGRP_IOIMAGE_RWOB}.get(area.upper())
+        if igrp is None:
+            raise AdsError("area must be 'I' or 'Q'")
+        r = self.read_raw(igrp, offset, size, port)
+        raw = bytes.fromhex(r["hex"])
+        bits = " ".join(f"{b:08b}" for b in raw[:64])
+        return {"area": area.upper(), "offset": offset, "size": len(raw), "hex": r["hex"], "bits_msb_first": bits,
+                "note": "offset/size are bytes of the PLC process image (%IB/%QB); map via the TMC or xae_tree_get on TIID"}
+
     def read_raw(self, index_group: int, index_offset: int, size: int, port: int | None = None,
                  net_id: str | None = None) -> dict[str, Any]:
         c = self.conn(port, net_id)

@@ -40,6 +40,7 @@ from .project_backend import ProjectIndex, ProjectError, parse_tcunit_xml
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
 from . import codecheck
+from . import workflows
 from pathlib import Path
 
 INSTRUCTIONS = """\
@@ -90,7 +91,9 @@ class App:
         self.guard = Guard(cfg.safety)
         self.ads = AdsBackend(cfg.ads)
         self.files = SystemServiceFiles(self.ads)
-        self.ads_worker = SerialWorker("tcmcp-ads")
+        import threading
+        self.ads_worker = SerialWorker("tcmcp-ads", cancel_event=threading.Event())       # quick calls
+        self.ads_slow_worker = SerialWorker("tcmcp-ads-slow", cancel_event=self.ads.cancel)  # watch/wait/scenario/dump
         self.xae = XaeBackend(cfg.xae)
         self.xae_worker = SerialWorker("tcmcp-xae-sta", init=sta_init, teardown=sta_teardown)
         self.proj = ProjectIndex(cfg.project)
@@ -98,9 +101,12 @@ class App:
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
 
     # --- runners -----------------------------------------------------------
-    async def ads_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
+    async def ads_call(self, fn, *a, timeout: float | None = None, slow: bool = False, **kw) -> Any:
+        """Run on the quick ADS worker, or on the slow one (``slow=True``) for anything that
+        blocks for seconds — so a long watch never stalls an ads_read."""
+        worker = self.ads_slow_worker if slow else self.ads_worker
         try:
-            return await self.ads_worker.run(fn, *a, timeout=timeout or (self.cfg.ads.max_watch_duration_ms / 1000 + 30), **kw)
+            return await worker.run(fn, *a, timeout=timeout or (self.cfg.ads.max_watch_duration_ms / 1000 + 30), **kw)
         except (AdsError, RecorderError, TestError) as exc:
             raise ToolError(str(exc)) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
@@ -121,7 +127,14 @@ class App:
             raise ToolError(str(exc)) from exc
 
     async def rec_call(self, fn, *a, timeout: float = 60, **kw) -> Any:
-        return await self.ads_call(fn, *a, timeout=timeout, **kw)
+        return await self.ads_call(fn, *a, timeout=timeout, slow=True, **kw)
+
+    async def mem_call(self, fn, *a, **kw) -> Any:
+        """Recorder queries that touch only memory/files — no ADS worker needed."""
+        try:
+            return await asyncio.to_thread(fn, *a, **kw)
+        except (RecorderError, AdsError, TestError) as exc:
+            raise ToolError(str(exc)) from exc
 
     def scope(self) -> str:
         return self.ads.target_label()
@@ -173,6 +186,37 @@ class App:
 
     def audit(self, tool: str, args: dict[str, Any], op: OpClass, outcome: str, detail: Any = None) -> None:
         self.guard.audit(tool, args, op, outcome, detail)
+
+
+async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str, Any]:
+    proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False)
+    declared = {it["path"].lower(): it for it in proj["items"] if "[*]" not in it["path"]}
+    roots = {p.split(".")[0] for p in declared}
+    online: set[str] = set()
+    online_types: dict[str, str] = {}
+    for r in roots:
+        try:
+            groups = await app.ads_call(app.ads.leaves_under, r, max_items, timeout=300)
+        except ToolError:
+            continue
+        for root, leaves in groups:
+            for lf in leaves:
+                online.add(lf.path.lower())
+                online_types[lf.path.lower()] = lf.type
+    missing = [declared[k] for k in sorted(set(declared) - online)]
+    extra = sorted(online - set(declared))
+    # declared composite (library type) items match if any online leaf starts with them
+    missing_final = []
+    for it in missing:
+        pre = it["path"].lower() + "."
+        if any(o.startswith(pre) or o.startswith(it["path"].lower() + "[") for o in online):
+            continue
+        missing_final.append(it)
+    return {"declared": len(declared), "online_under_same_roots": len(online),
+            "matched": len(declared) - len(missing_final), "missing_online": missing_final[:500],
+            "extra_online": [{"path": e, "type": online_types.get(e)} for e in extra[:500]],
+            "roots": sorted(roots)}
+
 
 
 def build_server(cfg: Config | None = None) -> MCPServer:
@@ -288,15 +332,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def ads_list_symbols(pattern: str = "*", type_filter: str | None = None, limit: int = 200,
-                               offset: int = 0, refresh: bool = False, flag: str | None = None) -> dict[str, Any]:
+                               offset: int = 0, refresh: bool = False, flag: str | None = None,
+                               compact: bool = False) -> dict[str, Any]:
         """Browse the runtime symbol table. pattern is fnmatch ('MAIN.*', '*valve*'; bare text
         is wrapped in '*'). type_filter substring-matches the type ('ST_', 'BOOL', 'FB_').
-        flag filters by symbol flag: PERSISTENT, READONLY, STATIC, ATTRIBUTES …"""
+        flag filters by symbol flag: PERSISTENT, READONLY, STATIC, ATTRIBUTES … compact=true returns
+        'name : type' strings only (one fifth of the tokens)."""
         res = await app.ads_call(app.ads.list_symbols, pattern, 100_000 if flag else min(limit, 2000), 0 if flag else offset, refresh, type_filter, timeout=60)
         if flag:
             fl = flag.upper()
             sel = [x for x in res["symbols"] if fl in x["flags"]]
             res = {"total": len(sel), "offset": offset, "returned": len(sel[offset:offset + limit]), "symbols": sel[offset:offset + limit]}
+        if compact:
+            res["symbols"] = [f"{x['name']} : {x['type']}" for x in res["symbols"]]
         return res
 
     @mcp.tool(annotations=READ)
@@ -306,10 +354,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return s.to_dict()
 
     @mcp.tool(annotations=READ)
-    async def ads_read(name: str, expand_struct: bool = True, max_members: int = 200) -> dict[str, Any]:
-        """Read one symbol with type-aware decoding. Structs/FB instances are expanded into
-        their members; arrays are nested lists; TIME/DATE/DT/TOD get readable text."""
-        return await app.ads_call(app.ads.read, name, expand_struct, max_members, timeout=60)
+    async def ads_read(name: str, expand_struct: bool = True, max_members: int = 200, max_chars: int = 60_000) -> dict[str, Any]:
+        """Read one symbol with type-aware decoding. Structs/FB instances/arrays of structs decode
+        into a nested tree (datatype table); TIME/DATE/DT/TOD get readable text; enums get names.
+        Trees larger than max_chars are summarised (member names + sizes) — use ads_leaves or
+        ads_dump for the full content."""
+        res = await app.ads_call(app.ads.read, name, expand_struct, max_members, timeout=60)
+        if len(json.dumps(res, default=str)) > max_chars and isinstance(res.get("value"), (dict, list)):
+            v = res["value"]
+            res["value_summary"] = {"members": list(v.keys())[:200] if isinstance(v, dict) else f"list[{len(v)}]",
+                                    "note": f"tree exceeds {max_chars} chars; call ads_leaves / ads_dump, or ads_read on a member"}
+            res["value"] = None
+        return res
 
     @mcp.tool(annotations=READ)
     async def ads_read_many(names: list[str]) -> dict[str, Any]:
@@ -350,6 +406,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return out
 
     @mcp.tool(annotations=READ)
+    async def ads_io_read(area: str, offset: int, size: int = 1, port: int = 851) -> dict[str, Any]:
+        """Raw process image of the PLC: area 'I' (%IB inputs) or 'Q' (%QB outputs) at a byte
+        offset — what the task actually sees/wrote, independent of symbol names (link checks)."""
+        return await app.ads_call(app.ads.io_read, area, offset, min(size, 4096), port, timeout=30)
+
+    @mcp.tool(annotations=READ)
     async def ads_read_raw(index_group: int, index_offset: int, size: int, port: int = 851,
                            ams_net_id: str | None = None) -> dict[str, Any]:
         """Raw ADS read by index group/offset on any port (hex + little-endian uint)."""
@@ -383,14 +445,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         only rows where a value changed. Caps: 60 s, ≥10 ms, 5000 rows. Use for timing
         questions: 'does bDone pulse?', 'how long is the valve open?'."""
         return await app.ads_call(app.ads.watch, names, duration_ms, interval_ms, change_only,
-                                  timeout=cfg.ads.max_watch_duration_ms / 1000 + 30)
+                                  timeout=cfg.ads.max_watch_duration_ms / 1000 + 30, slow=True)
 
     @mcp.tool(annotations=READ)
     async def ads_wait_until(name: str, op: str, value: Any, timeout_ms: int = 10000,
                              interval_ms: int = 50) -> dict[str, Any]:
         """Block until symbol <op> value (==, !=, >, >=, <, <=) or timeout. Returns met/elapsed."""
         return await app.ads_call(app.ads.wait_until, name, op, value, timeout_ms, interval_ms,
-                                  timeout=min(timeout_ms, 600_000) / 1000 + 10)
+                                  timeout=min(timeout_ms, 600_000) / 1000 + 10, slow=True)
 
     @mcp.tool(annotations=DESTR)
     async def ads_plc_state(action: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -462,17 +524,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def rec_list() -> dict[str, Any]:
         """Recordings of this session (live status) and recording files on disk."""
-        return await app.rec_call(app.rec.list)
+        return await app.mem_call(app.rec.list)
 
     @mcp.tool(annotations=READ)
     async def rec_status(id: str) -> dict[str, Any]:
         """Live status of one recording: events, rate, drops, armed/triggered, last value per symbol."""
-        return await app.rec_call(app.rec.status, id)
+        return await app.mem_call(app.rec.status, id)
 
     @mcp.tool(annotations=READ)
     async def rec_snapshot(id: str, last_n: int = 100, symbols: list[str] | None = None) -> dict[str, Any]:
         """Most recent events of a running (or finished) recording — the live tail."""
-        return await app.rec_call(app.rec.snapshot, id, min(last_n, 5000), symbols)
+        return await app.mem_call(app.rec.snapshot, id, min(last_n, 5000), symbols)
 
     @mcp.tool(annotations=READ)
     async def rec_stats(id: str, symbols: list[str] | None = None, include_runs: bool = True,
@@ -480,7 +542,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Per-symbol statistics over the whole recording so far: count, first/last, min/max/mean,
         change count, BOOL rising/falling edges with timestamps, and value runs (state timeline
         with dwell times) — computed incrementally, no re-read of the file."""
-        return await app.rec_call(app.rec.stats, id, symbols, include_runs, min(max_runs, 5000))
+        return await app.mem_call(app.rec.stats, id, symbols, include_runs, min(max_runs, 5000))
 
     @mcp.tool(annotations=READ)
     async def rec_read(id: str, t_from_ms: float | None = None, t_to_ms: float | None = None,
@@ -488,7 +550,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Read a time window of a recording from its file. wide=true pivots to one row per event
         with all selected symbols forward-filled (what you want for 'what else was true when X
         happened'). Works on finished recordings from earlier sessions too."""
-        return await app.rec_call(app.rec.read, id, t_from_ms, t_to_ms, symbols, min(max_rows, 50_000), wide, timeout=300)
+        return await app.mem_call(app.rec.read, id, t_from_ms, t_to_ms, symbols, min(max_rows, 50_000), wide)
 
     @mcp.tool(annotations=EDIT)
     async def rec_stop(id: str) -> dict[str, Any]:
@@ -502,7 +564,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                          symbols: list[str] | None = None) -> dict[str, Any]:
         """Export a recording to CSV: csv_wide (t_ms + one column per symbol, forward-filled) or
         csv_long (t_ms,symbol,value). Default path next to the JSONL."""
-        return await app.rec_call(app.rec.export, id, fmt, out_path, symbols, timeout=600)
+        return await app.mem_call(app.rec.export, id, fmt, out_path, symbols)
 
     @mcp.tool(annotations=DESTR)
     async def rec_delete(id: str) -> dict[str, Any]:
@@ -520,14 +582,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Assert conditions on live values. checks: [{symbol, op, value, tolerance?}], op ∈
         == != > >= < <= ~= (relative/abs tolerance) in between. within_ms>0 waits until all hold.
         Returns pass/fail per check with the time each one was met."""
-        return await app.ads_call(app.bench.expect, checks, within_ms, interval_ms, timeout=within_ms / 1000 + 30)
+        return await app.ads_call(app.bench.expect, checks, within_ms, interval_ms, timeout=within_ms / 1000 + 30, slow=True)
 
     @mcp.tool(annotations=READ)
     async def test_stable(symbol: str, duration_ms: int = 1000, tolerance: float = 0.0,
                           interval_ms: int = 20) -> dict[str, Any]:
         """Assert a value does not move more than tolerance for duration_ms (settle check for a
         weight, pressure, PID output, state)."""
-        return await app.ads_call(app.bench.assert_stable, symbol, duration_ms, tolerance, interval_ms, timeout=duration_ms / 1000 + 30)
+        return await app.ads_call(app.bench.assert_stable, symbol, duration_ms, tolerance, interval_ms, timeout=duration_ms / 1000 + 30, slow=True)
 
     @mcp.tool(annotations=WRITE)
     async def test_response(stimulus: dict[str, Any], response: str, timeout_ms: int = 5000,
@@ -537,7 +599,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         gated per symbol; originals are restored afterwards unless restore=false."""
         for k in stimulus:
             await app.permit(ctx, OpClass.WRITE, "ads_write", k)
-        res = await app.ads_call(app.bench.measure_response, stimulus, response, timeout_ms, restore, timeout=timeout_ms / 1000 + 60)
+        res = await app.ads_call(app.bench.measure_response, stimulus, response, timeout_ms, restore, timeout=timeout_ms / 1000 + 60, slow=True)
         app.audit("test_response", {"stimulus": stimulus, "response": response}, OpClass.WRITE, "ok", {"latency_ms": res.get("latency_ms")})
         return res
 
@@ -555,7 +617,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         for k in dict.fromkeys(syms):
             await app.permit(ctx, OpClass.WRITE, "ads_write", k)
         timeout = float(spec.get("timeout_ms", 120_000)) / 1000 + 120
-        res = await app.ads_call(app.bench.scenario, spec, timeout=timeout)
+        res = await app.ads_call(app.bench.scenario, spec, timeout=timeout, slow=True)
         app.audit("test_scenario", {"name": res.get("name"), "writes": syms}, OpClass.WRITE,
                   "pass" if res.get("pass") else "fail", {"recording": (res.get("recording") or {}).get("id")})
         return res
@@ -574,7 +636,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """PLC task timing (TwinCAT_SystemInfoVarList._TaskInfo[n]): cycle time, last/min/max/mean
         execution time over `samples`, load %, cycle-time-exceeded counter delta — the FB's cost
         on the real-time task."""
-        return await app.ads_call(app.bench.task_stats, task_index, min(samples, 1000), interval_ms, timeout=samples * interval_ms / 1000 + 30)
+        return await app.ads_call(app.bench.task_stats, task_index, min(samples, 1000), interval_ms, timeout=samples * interval_ms / 1000 + 30, slow=True)
 
     @mcp.tool(annotations=READ)
     async def ads_ping(count: int = 10, port: int | None = None) -> dict[str, Any]:
@@ -615,7 +677,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Pulse / dwell analysis of one recorded symbol: for BOOL → pulse count, high/low widths,
         period, frequency, duty (fine-dosing valve pulses); for other types → state timeline with
         dwell times."""
-        return await app.rec_call(app.rec.pulses, id, symbol, max_list, timeout=300)
+        return await app.mem_call(app.rec.pulses, id, symbol, max_list)
 
     @mcp.tool(annotations=READ)
     async def rec_latency(id: str, from_symbol: str, from_op: str, from_value: Any, to_symbol: str,
@@ -623,7 +685,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Edge-to-edge latency in a recording: from each time `from_symbol from_op from_value`
         becomes true to the next time `to_symbol to_op to_value` becomes true (PLC timestamps).
         E.g. bOpenCmd == TRUE → rFlow > 0.5."""
-        return await app.rec_call(app.rec.latency, id, from_symbol, from_op, from_value, to_symbol, to_op, to_value, max_pairs, timeout=300)
+        return await app.mem_call(app.rec.latency, id, from_symbol, from_op, from_value, to_symbol, to_op, to_value, max_pairs)
 
     # ======================================================================
     # static checks
@@ -673,7 +735,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         system/library symbols excluded unless include_system. Returns counts, file paths and a
         50-leaf preview; use proj_read_file / rec-style tooling on the files for detail."""
         od = out_dir or str(Path(cfg.safety.audit_log).parent / "dumps")
-        return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * 1024 * 1024, max_leaves, timeout=900)
+        return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * 1024 * 1024, max_leaves, timeout=900, slow=True)
 
     @mcp.tool(annotations=READ)
     async def ads_leaves(name: str, max_leaves: int = 5000, with_values: bool = False) -> dict[str, Any]:
@@ -724,33 +786,45 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         not present online (not compiled / not activated / optimised away) and online variables
         under the same programs/GVLs that the source does not declare (stale boot project, library
         internals). Use after a deploy to prove the target runs this source."""
-        proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False)
-        declared = {it["path"].lower(): it for it in proj["items"] if "[*]" not in it["path"]}
-        roots = {p.split(".")[0] for p in declared}
-        online: set[str] = set()
-        online_types: dict[str, str] = {}
-        for r in roots:
-            try:
-                groups = await app.ads_call(app.ads.leaves_under, r, max_items, timeout=300)
-            except ToolError:
-                continue
-            for root, leaves in groups:
-                for lf in leaves:
-                    online.add(lf.path.lower())
-                    online_types[lf.path.lower()] = lf.type
-        missing = [declared[k] for k in sorted(set(declared) - online)]
-        extra = sorted(online - set(declared))
-        # declared composite (library type) items match if any online leaf starts with them
-        missing_final = []
-        for it in missing:
-            pre = it["path"].lower() + "."
-            if any(o.startswith(pre) or o.startswith(it["path"].lower() + "[") for o in online):
-                continue
-            missing_final.append(it)
-        return {"declared": len(declared), "online_under_same_roots": len(online),
-                "matched": len(declared) - len(missing_final), "missing_online": missing_final[:500],
-                "extra_online": [{"path": e, "type": online_types.get(e)} for e in extra[:500]],
-                "roots": sorted(roots)}
+        return await _vs_runtime(app, scope, max_items)
+
+    # ======================================================================
+    # wf_* composite workflows
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def wf_debug_symbol(symbol: str, watch_ms: int = 1500, context_lines: int = 12) -> dict[str, Any]:
+        """One-call debugging dossier for a variable: live value, declaring file:line chain, the
+        statements that write it, code excerpts around them, and a short change watch."""
+        return await workflows.debug_symbol(app, symbol, watch_ms, context_lines)
+
+    @mcp.tool(annotations=EDIT)
+    async def wf_fb_profile(instance: str, duration_s: float = 10.0, cycle_ms: float = 1.0, task_index: int = 1) -> dict[str, Any]:
+        """Profile an FB instance for duration_s: records every leaf (change mode), samples task
+        timing in parallel, then reports most-active symbols, boolean pulse rates, state dwell
+        timelines, silent symbols and the FB's cost on the task. Read-only on the PLC."""
+        return await workflows.fb_profile(app, instance, min(duration_s, 300), cycle_ms, task_index)
+
+    @mcp.tool(annotations=EDIT)
+    async def wf_release_check(plc_project_path: str | None = None, run_build: bool = True,
+                               lint_rules: list[str] | None = None) -> dict[str, Any]:
+        """Go/no-go before a deploy: git changes, build result, lint, source-vs-runtime, TcUnit
+        result on the target, task health. Writes nothing to the PLC."""
+        if run_build:
+            await app.permit(None, OpClass.EDIT, "xae_build")
+        return await workflows.release_check(app, plc_project_path, run_build, lint_rules)
+
+    @mcp.tool(annotations=READ)
+    async def wf_project_overview() -> dict[str, Any]:
+        """Orientation in one call: index summary, programs with call trees, FBs with interfaces,
+        GVLs/DUTs, lint summary, git state."""
+        return await workflows.project_overview(app)
+
+    @mcp.tool(annotations=READ)
+    async def rec_compare(id_a: str, id_b: str, symbols: list[str] | None = None) -> dict[str, Any]:
+        """Before/after comparison of two recordings: per-symbol stat deltas (count, min, max,
+        mean, changes, edges) and pulse width/period deltas for BOOLs — timing regression after a
+        code change."""
+        return await app.mem_call(app.rec.compare, id_a, id_b, symbols)
 
     # ======================================================================
     # ipc_* target OS via System Service
@@ -760,7 +834,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                             encoding: str = "utf-8") -> dict[str, Any]:
         r"""Read a file from the target IPC's file system over ADS (no share needed), e.g.
         'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml' or a log. Binary → base64."""
-        return await app.ads_call(app.files.read_file, path, max_bytes, as_text, encoding, timeout=120)
+        return await app.ads_call(app.files.read_file, path, max_bytes, as_text, encoding, timeout=120, slow=True)
 
     @mcp.tool(annotations=READ)
     async def ipc_list_dir(pattern: str, max_entries: int = 500) -> dict[str, Any]:
@@ -1055,10 +1129,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # proj_* offline files
     # ======================================================================
     @mcp.tool(annotations=READ)
-    async def proj_scan(root: str | None = None) -> dict[str, Any]:
-        """Index the project tree (.sln/.tsproj/.plcproj/.TcPOU/.TcDUT/.TcGVL/.TcIO). Re-run
-        after external edits."""
+    async def proj_scan(root: str | None = None, incremental: bool = False) -> dict[str, Any]:
+        """Index the project tree (.sln/.tsproj/.plcproj/.TcPOU/.TcDUT/.TcGVL/.TcIO).
+        incremental=true re-indexes only files whose mtime changed (fast after XAE saves)."""
+        if incremental and root is None:
+            return await app.proj_call(app.proj.refresh)
         return await app.proj_call(app.proj.scan, root)
+
+    @mcp.tool(annotations=READ)
+    async def proj_changed(since: str = "HEAD") -> dict[str, Any]:
+        """Units whose source differs from a git revision (default: uncommitted work) plus
+        untracked files — 'what did I change?'; pair with proj_vs_runtime for 'is it deployed?'."""
+        return await app.proj_call(app.proj.changed_units, since)
 
     @mcp.tool(annotations=READ)
     async def proj_list(kind: str | None = None, pattern: str | None = None, limit: int = 500) -> dict[str, Any]:
@@ -1156,7 +1238,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
         t0 = time.time()
-        waited = await app.ads_call(app.files.wait_for_file, rp, timeout_s, 3.0, timeout=timeout_s + 30)
+        waited = await app.ads_call(app.files.wait_for_file, rp, timeout_s, 3.0, timeout=timeout_s + 30, slow=True)
         steps["wait"] = waited
         if not waited.get("exists"):
             app.audit("tcunit_run", {"target": tgt}, OpClass.DESTRUCTIVE, "timeout", steps)
@@ -1170,6 +1252,31 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         steps["elapsed_s"] = round(time.time() - t0, 1)
         app.audit("tcunit_run", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", res["summary"])
         return {"ran": True, "result": res, "steps": steps}
+
+    # ======================================================================
+    # prompts (workflow recipes)
+    # ======================================================================
+    P = workflows.PROMPTS
+
+    @mcp.prompt(name="debug_symbol", description=P["debug_symbol"][0])
+    async def prompt_debug_symbol(symbol: str) -> str:
+        return P["debug_symbol"][1].format(symbol=symbol)
+
+    @mcp.prompt(name="fb_validation", description=P["fb_validation"][0])
+    async def prompt_fb_validation(instance: str, criteria: str = "see spec") -> str:
+        return P["fb_validation"][1].format(instance=instance, criteria=criteria)
+
+    @mcp.prompt(name="deploy_safely", description=P["deploy_safely"][0])
+    async def prompt_deploy_safely(change: str = "current working tree") -> str:
+        return P["deploy_safely"][1].format(change=change)
+
+    @mcp.prompt(name="performance_audit", description=P["performance_audit"][0])
+    async def prompt_performance_audit(scope: str = "MAIN") -> str:
+        return P["performance_audit"][1].format(scope=scope)
+
+    @mcp.prompt(name="onboard_project", description=P["onboard_project"][0])
+    async def prompt_onboard_project() -> str:
+        return P["onboard_project"][1]
 
     # ======================================================================
     # resources

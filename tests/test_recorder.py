@@ -172,3 +172,22 @@ def test_duration_limit(rec):
                    max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10)
     assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=3)
     assert rec.status(st["id"])["stop_reason"].startswith("duration")
+
+
+def test_compare_recordings(rec):
+    def record(values):
+        st = rec.start(symbols=["MAIN.fbFill.bDone", "MAIN.nCycle"], prefix=None, pattern=None, mode="change", cycle_ms=10,
+                       duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10)
+        c = _conn()
+        for ms, n, v in values:
+            c.fire(n, v, ft(ms))
+        assert wait_until(lambda: rec.status(st["id"])["events"] == len(values))
+        rec.stop(st["id"])
+        return st["id"]
+    a = record([(0, "MAIN.fbFill.bDone", False), (0, "MAIN.nCycle", 1), (100, "MAIN.fbFill.bDone", True), (150, "MAIN.fbFill.bDone", False), (300, "MAIN.nCycle", 5)])
+    b = record([(0, "MAIN.fbFill.bDone", False), (0, "MAIN.nCycle", 1), (100, "MAIN.fbFill.bDone", True), (180, "MAIN.fbFill.bDone", False), (300, "MAIN.nCycle", 9)])
+    c = rec.compare(a, b)
+    rows = {r["symbol"]: r for r in c["rows"]}
+    assert c["common_symbols"] == 2
+    assert rows["MAIN.nCycle"]["delta"]["max"] == 4
+    assert rows["MAIN.fbFill.bDone"]["pulses"]["a"]["high_ms"]["mean"] == 50 and rows["MAIN.fbFill.bDone"]["pulses"]["b"]["high_ms"]["mean"] == 80

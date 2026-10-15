@@ -145,3 +145,32 @@ def test_variables_flatten(project_dir):
     assert any(it["path"] == "MAIN.fbFill.arrWeights[*]" for it in small["items"])
     one = p.variables("FB_Valve")
     assert [it["path"] for it in one["items"]] == ["FB_Valve.bOpen", "FB_Valve.tOpened"]
+
+
+def test_incremental_refresh_and_git_changes(project_dir):
+    import subprocess, time as _t
+    p = idx(project_dir)
+    f = project_dir / "Plc" / "POUs" / "FB_Valve.TcPOU"
+    # incremental: touch one file, add one, remove one
+    _t.sleep(0.01)
+    f.write_text(f.read_text().replace("tOpened : TIME;", "tOpened : TIME;\n\ttClosed : TIME;"))
+    new = project_dir / "Plc" / "POUs" / "FB_New.TcPOU"
+    new.write_text((project_dir / "Plc" / "POUs" / "FB_Valve.TcPOU").read_text().replace('Name="FB_Valve"', 'Name="FB_New"').replace("FUNCTION_BLOCK FB_Valve", "FUNCTION_BLOCK FB_New"))
+    (project_dir / "Plc" / "DUTs" / "ST_Recipe.TcDUT").unlink()
+    r = p.refresh()
+    assert f.as_posix() in [Path(x).as_posix() for x in r["changed"]] and len(r["added"]) == 1 and len(r["removed"]) == 1
+    assert any(v.name == "tClosed" for v in p.get_unit("FB_Valve").vars)
+    assert p.get_unit("FB_New").kind == "FUNCTION_BLOCK"
+    with pytest.raises(ProjectError):
+        p.get_unit("ST_Recipe")
+    # git: init, commit, modify → changed_units
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], cwd=project_dir, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"], cwd=project_dir, check=True)
+    assert p.changed_units()["units"] == []
+    (project_dir / "Plc" / "POUs" / "MAIN.TcPOU").write_text((project_dir / "Plc" / "POUs" / "MAIN.TcPOU").read_text().replace("nCycle + 1", "nCycle + 2"))
+    (project_dir / "Plc" / "POUs" / "FB_Extra.TcPOU").write_text(new.read_text().replace("FB_New", "FB_Extra"))
+    p.refresh()
+    ch = p.changed_units()
+    st = {u["name"]: u["status"] for u in ch["units"]}
+    assert st == {"MAIN": "modified", "FB_Extra": "untracked"}

@@ -222,3 +222,30 @@ async def test_whole_project_variable_tools(monkeypatch, project_dir, tmp_path):
         assert "MAIN.fbFill.arrWeights[2]" not in missing and "MAIN.nCycle" not in missing
         assert "main.slabel" in extra and "main.arrsteps[1].nid" in extra and "main.fbvalve2.bopen" in extra
         assert cmp_["matched"] >= 10
+
+
+@pytest.mark.anyio
+async def test_workflows_and_prompts(monkeypatch, project_dir):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        prompts = (await s.list_prompts()).prompts
+        assert {p.name for p in prompts} == {"debug_symbol", "fb_validation", "deploy_safely", "performance_audit", "onboard_project"}
+        pr = await s.get_prompt("fb_validation", {"instance": "MAIN.fbFill", "criteria": "bDone within 3 s"})
+        assert "MAIN.fbFill" in pr.messages[0].content.text and "bDone within 3 s" in pr.messages[0].content.text
+        d = payload(await s.call_tool("wf_debug_symbol", {"symbol": "MAIN.fbFill.bDone", "watch_ms": 50}))
+        assert d["live"]["value"] is False and d["resolution"]["resolved"]
+        assert any(m["unit"] == "MAIN" for m in d["mentions"]) and d["code_excerpts"][0]["unit"] == "MAIN"
+        assert "fbFill.bDone" in d["code_excerpts"][0]["text"]
+        ov = payload(await s.call_tool("wf_project_overview", {}))
+        assert [p["name"] for p in ov["programs"]] == ["MAIN"] and "FB_Fill" in ov["programs"][0]["calls"]
+        assert any(fb["name"] == "FB_Valve" and fb["methods"] == ["Open"] for fb in ov["function_blocks"])
+        io = payload(await s.call_tool("ads_io_read", {"area": "I", "offset": 0, "size": 1}))
+        assert io["area"] == "I" and io["hex"] == "a5" and io["bits_msb_first"] == "10100101"
+        sym = payload(await s.call_tool("ads_list_symbols", {"pattern": "MAIN.fbFill.*", "compact": True}))
+        assert sym["symbols"][0].startswith("MAIN.fbFill.tSettle : TIME")
+        prof = payload(await s.call_tool("wf_fb_profile", {"instance": "MAIN.stRecipe", "duration_s": 0.3}))
+        assert prof["symbols_total"] == 3 and prof["task"]["task_name"] == "PlcTask"
+        rc = payload(await s.call_tool("wf_release_check", {"run_build": False}))
+        assert rc["verdict"].startswith("GO") or rc["verdict"] == "NO-GO"
+        assert "source_vs_runtime" in rc["checks"] and rc["checks"]["tcunit"].get("skipped") or rc["checks"]["tcunit"]

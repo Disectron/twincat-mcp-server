@@ -794,6 +794,47 @@ class Recorder:
         return {"id": rid, "from": f"{from_symbol} {from_op} {from_value}", "to": f"{to_symbol} {to_op} {to_value}",
                 "pairs": len(pairs), "unmatched_from_edges": len(pending), "latency_ms": _stat(lat), "samples": pairs[:100]}
 
+    def compare(self, rid_a: str, rid_b: str, symbols: list[str] | None = None) -> dict[str, Any]:
+        """Before/after comparison of two recordings over their common symbols: stats deltas
+        (count, min, max, mean, changes) and, for BOOL symbols, pulse width/period deltas."""
+        def stats_from_file(rid: str) -> tuple[dict[str, SymStats], dict[str, str]]:
+            st: dict[str, SymStats] = {}
+            types: dict[str, str] = {}
+            for e in self.read(rid, None, None, None, 50_000_000, False)["rows"]:
+                n = e["symbol"]
+                v = _raw_val(e["value"])
+                st.setdefault(n, SymStats()).ingest(e["t_ms"], v, _numeric_dec(v), 100_000)
+            return st, types
+        if rid_a in self.recs and not self.recs[rid_a].active:
+            sa = self.recs[rid_a].stats
+        else:
+            sa, _ = stats_from_file(rid_a)
+        if rid_b in self.recs and not self.recs[rid_b].active:
+            sb = self.recs[rid_b].stats
+        else:
+            sb, _ = stats_from_file(rid_b)
+        common = sorted(set(sa) & set(sb), key=str.lower)
+        if symbols:
+            want = {s.lower() for s in symbols}
+            common = [c for c in common if c.lower() in want]
+        out = []
+        for n in common:
+            a, b = sa[n].to_dict(), sb[n].to_dict()
+            row: dict[str, Any] = {"symbol": n, "a": a, "b": b, "delta": {}}
+            for k in ("count", "changes", "min", "max", "mean", "rising_edges", "falling_edges"):
+                if isinstance(a.get(k), (int, float)) and isinstance(b.get(k), (int, float)):
+                    row["delta"][k] = round(b[k] - a[k], 6)
+            if isinstance(a.get("last"), bool) and isinstance(b.get("last"), bool):
+                try:
+                    pa, pb = self.pulses(rid_a, n), self.pulses(rid_b, n)
+                    row["pulses"] = {"a": {k: pa.get(k) for k in ("pulses", "high_ms", "period_ms", "duty_percent")},
+                                     "b": {k: pb.get(k) for k in ("pulses", "high_ms", "period_ms", "duty_percent")}}
+                except RecorderError:
+                    pass
+            out.append(row)
+        return {"a": rid_a, "b": rid_b, "common_symbols": len(common), "only_in_a": sorted(set(sa) - set(sb))[:50],
+                "only_in_b": sorted(set(sb) - set(sa))[:50], "rows": out}
+
     def _path_for(self, rid: str) -> Path:
         rec = self.recs.get(rid)
         if rec:

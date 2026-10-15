@@ -134,6 +134,77 @@ class ProjectIndex:
         if self.scanned_at is None:
             self.scan()
 
+    def refresh(self) -> dict[str, Any]:
+        """Incremental rescan: re-index files whose mtime changed, pick up new files, drop deleted ones."""
+        if self.scanned_at is None or self.root is None:
+            return self.scan()
+        changed, added, removed = [], [], []
+        seen: set[str] = set()
+        for p in self.root.rglob("*"):
+            if p.suffix.lower() in SRC_EXT and p.is_file():
+                if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
+                    continue
+                sp = str(p)
+                seen.add(sp)
+                mt = p.stat().st_mtime
+                if sp not in self.files:
+                    added.append(sp)
+                elif self.files[sp] != mt:
+                    changed.append(sp)
+                else:
+                    continue
+                try:
+                    self._drop_file(sp)
+                    self._index_file(p)
+                except ET.ParseError as exc:
+                    self.files[sp] = -1
+                    self.units[f"__parse_error__{p.name}".lower()] = CodeUnit(p.name, "PARSE_ERROR", sp, "", str(exc))
+        for sp in list(self.files):
+            if sp not in seen:
+                removed.append(sp)
+                self._drop_file(sp)
+                self.files.pop(sp, None)
+        self.scanned_at = time.time()
+        return {"changed": changed, "added": added, "removed": removed, "units": len(self.units)}
+
+    def _drop_file(self, path: str) -> None:
+        for k in [k for k, u in self.units.items() if u.file == path]:
+            self.units.pop(k, None)
+
+    def changed_units(self, since: str = "HEAD") -> dict[str, Any]:
+        """Units whose files differ from a git revision (default: uncommitted changes), plus
+        untracked source files. Pairs with proj_vs_runtime: 'what did I change, is it deployed?'"""
+        import subprocess
+        self._ensure()
+        if self.root is None:
+            raise ProjectError("project root not set")
+        try:
+            top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=self.root, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProjectError(f"git not available: {exc}") from exc
+        if top.returncode != 0:
+            raise ProjectError(f"{self.root} is not inside a git repository")
+        repo = Path(top.stdout.strip())
+        diff = subprocess.run(["git", "diff", "--name-status", since, "--", "."], cwd=self.root, capture_output=True, text=True, timeout=60)
+        if diff.returncode != 0:
+            raise ProjectError(f"git diff failed: {diff.stderr.strip()}")
+        untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "--", "."], cwd=self.root, capture_output=True, text=True, timeout=60)
+        files: dict[str, str] = {}
+        for ln in diff.stdout.splitlines():
+            parts = ln.split("\t")
+            if len(parts) >= 2:
+                files[str((repo / parts[-1]).resolve())] = parts[0][:1]
+        for ln in untracked.stdout.splitlines():
+            if ln.strip():
+                files[str((repo / ln.strip()).resolve())] = "?"
+        units = []
+        for u in self.units.values():
+            st = files.get(str(Path(u.file).resolve()))
+            if st and not u.parent:
+                units.append({"name": u.name, "kind": u.kind, "file": u.file, "status": {"M": "modified", "A": "added", "D": "deleted", "?": "untracked", "R": "renamed"}.get(st, st)})
+        other = [f for f in files if f.lower().endswith((".tsproj", ".plcproj", ".xti", ".tmc", ".sln"))]
+        return {"since": since, "repo": str(repo), "units": units, "project_files": other, "all_changed_files": len(files)}
+
     @staticmethod
     def _parse_plcproj(p: Path) -> dict[str, Any]:
         d: dict[str, Any] = {"file": str(p), "name": p.stem, "compile": [], "libraries": [], "project_guid": None}

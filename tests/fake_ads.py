@@ -154,6 +154,9 @@ class FakeConnection:
                 raw = _scalar_bytes(SYMBOLS[i][1], size, v)
             raw = raw[:want].ljust(want, b"\x00")
             return (ctypes.c_ubyte * want)(*raw)
+        if index_group in (C.ADSIGRP_IOIMAGE_RWIB, C.ADSIGRP_IOIMAGE_RWOB):
+            n = ctypes.sizeof(plc_datatype)
+            return (ctypes.c_ubyte * n)(*([0xA5] * n))
         if index_group == 0x3 and index_offset == 0x100:
             return (ctypes.c_ubyte * 2)(*struct.pack("<H", 8))
         if index_group == 0x6:
