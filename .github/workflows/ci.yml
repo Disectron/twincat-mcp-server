@@ -30,8 +30,11 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP "tc"
           New-Item -ItemType Directory -Force (Join-Path $root "Common64") | Out-Null
           Copy-Item "$env:SystemRoot\System32\version.dll" (Join-Path $root "Common64\TcAdsDll.dll")
-          "TWINCAT3DIR=$(Join-Path $root '3.1')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $tcdir = Join-Path $root "3.1"
+          "TWINCAT3DIR=$tcdir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8   # later steps
+          $env:TWINCAT3DIR = $tcdir                                                             # this step
           python -c "import pyads, pyads.pyads_ex as x; print('pyads import ok via', x._adsDLL)"
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error title=stand-in DLL::pyads still cannot import with TWINCAT3DIR=$tcdir"; exit 1 }
       - name: Test
         shell: bash
         run: |
@@ -42,6 +45,9 @@ jobs:
         shell: python
         run: |
           import os, re
+          if not os.path.exists("pytest-output.txt"):
+              print("::error title=ci::pytest did not run (an earlier step failed); see that step")
+              raise SystemExit(0)
           text = open("pytest-output.txt", encoding="utf-8", errors="replace").read()
           summ = open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8")
           summ.write("## pytest (" + os.environ.get("RUNNER_OS", "?") + ")\n\n```\n" + text[-60000:] + "\n```\n")
