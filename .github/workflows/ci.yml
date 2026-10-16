@@ -21,8 +21,33 @@ jobs:
       - name: Install
         run: python -m pip install --quiet -e ".[dev]"
       - name: Test
-        run: python -m pytest -q -p anyio
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -p anyio -rfE --tb=short --durations=10 2>&1 | tee pytest-output.txt
+      - name: Report failures as annotations (log hosts are not reachable everywhere)
+        if: failure()
+        shell: python
+        run: |
+          import os, re
+          text = open("pytest-output.txt", encoding="utf-8", errors="replace").read()
+          summ = open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8")
+          summ.write("## pytest (" + os.environ.get("RUNNER_OS", "?") + ")\n\n```\n" + text[-60000:] + "\n```\n")
+          def ann(title, msg):
+              msg = msg[:3800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title={title}::{msg}")
+          m = re.search(r"=+ short test summary info =+\n(.*?)(?:\n=+ .* in [\d.]+s)", text, re.S)
+          lines = [l for l in (m.group(1).splitlines() if m else []) if l.startswith(("FAILED", "ERROR"))]
+          for l in lines[:8]:
+              ann("pytest", l)
+          # first two failure sections, verbatim, for a traceback
+          secs = re.split(r"\n_{5,} (.*?) _{5,}\n", text)
+          for name, body in list(zip(secs[1::2], secs[2::2]))[:2]:
+              ann(f"traceback {name}", body)
+          if not lines:
+              ann("pytest", text[-3800:])
       - name: Launcher dry run (no server start)
+        if: ${{ !cancelled() }}
         run: python scripts/launch.py --src . --venv ${{ runner.temp }}/tcmcp-venv --no-run
 
   plugin:
