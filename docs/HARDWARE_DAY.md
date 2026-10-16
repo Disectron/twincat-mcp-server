@@ -4,18 +4,39 @@ Everything in this repository was built and tested against fakes on Linux. This 
 exercise it on hardware so that each failure is isolated to one layer, with what to paste back when
 something breaks. Use a **non-production target** for anything from step 6 on.
 
-## 0. Install (10 min)
+## 0. Prerequisites and install (20 min)
+
+On the engineering PC, before anything else:
+
+| need | check | why |
+|---|---|---|
+| TwinCAT XAE 4024+ with the solution open, PLC project activated on the CX | shell up, target RUN | every ADS and XAE tool assumes it |
+| ADS route PC → CX9020 | XAE System → Routes shows the CX, or `tc_doctor` `target_state` later | no route = every ADS call fails with 0x6 / 0x7 |
+| 64-bit Python 3.10+ | `python -c "import struct,sys;print(struct.calcsize('P')*8, sys.version)"` → `64 3.1x` | pyads loads the 64-bit `TcAdsDll.dll`; a 32-bit Python fails at import |
+| Claude Code ≥ 2.1, logged in, GitHub account able to read the repo | `claude --version` | plugin install pulls from GitHub |
+| XAE and Claude Code at the same elevation level (both normal, or both admin) | — | COM ROT does not cross the elevation boundary; `xae_attach` would not see the shell |
+
+Install, in a terminal opened **in the solution folder** (the server looks for `twincat_mcp.toml` there):
 
 ```
-/plugin marketplace add C:\tools\twincat-mcp        (or <owner>/<repo>)
+claude
+/plugin marketplace add Disectron/twincat-mcp-server
 /plugin install twincat-mcp@twincat-mcp
-/plugin configure twincat-mcp@twincat-mcp           python_exe if "python" is not on PATH; ams_net_id of the CX
+/plugin configure twincat-mcp@twincat-mcp      python_exe if "python" is not on PATH; ams_net_id = the CX's NetId (x.x.x.x.1.1)
+/mcp                                           ← plugin servers show here, not in `claude mcp list`
 ```
 
-First session start builds the venv (about a minute). If the server shows as failed, start a new
-session — the venv is already there. `claude --mcp-debug` shows the launcher's stderr.
-Put a `twincat_mcp.toml` in the solution folder (copy `twincat_mcp.toml.example`): solution path,
-allow/deny lists, `[docs]`, and set `TCMCP_MODE=guarded` for the whole day.
+The first start builds a private venv under `%LOCALAPPDATA%` (about a minute); `/mcp` shows the server as
+failed until it finishes — run `/mcp` again or start a new session. `claude --mcp-debug` prints the
+launcher's stderr; a missing-DLL start prints its own three-line remedy.
+
+Config: copy `twincat_mcp.toml.example` to `twincat_mcp.toml` in the solution folder and set the solution
+path, `tcunit_remote_result = 'boot:TcUnit_xUnit_testresults.xml'` (already the default; CE7's boot folder
+is `\Hard Disk\TwinCAT\3.1\Boot`), the allow list for step 7, and `[docs]`. Keep `mode = guarded` all day:
+every write needs the allow list, every destructive action needs a confirmation.
+
+Driving it: just ask Claude Code in plain words ("run tc_doctor", "read MAIN.fbDispense"); the
+`twincat-mcp` skill picks the tool chain. Tool names appear as `mcp__plugin_twincat-mcp_twincat__<tool>`.
 
 ## 1. tc_doctor — the router and the shell (5 min)
 
@@ -25,7 +46,7 @@ with the solution path, `infosys.fts5: true`.
 
 | symptom | layer | paste back |
 |---|---|---|
-| `router: FAIL` | pyads / TcAdsDll | Python bitness (`python -c "import struct;print(struct.calcsize('P')*8)"`) |
+| `router: FAIL … local AMS router not reachable` | TwinCAT System Service not running (tray icon red), or wrong-bitness Python | tray icon colour; Python bitness (`python -c "import struct;print(struct.calcsize('P')*8)"`) |
 | `target_state: FAIL … 0x6` | no route / target CONFIG | `ads_routes` output |
 | `xae_running: []` with the shell open | elevation mismatch or ProgID | whether XAE runs as admin; `xae_list_commands` error text |
 
@@ -64,9 +85,14 @@ descriptions. If titles read "Beckhoff Information System" or everything is `Pag
 proj_scan
 proj_variables scope=MAIN           ← compare count with ads_leaves MAIN
 proj_vs_runtime                      ← should be clean on a freshly activated project
-proj_lint
+proj_validate_xml                    ← on XAE-written files expect LineIds info/warnings at most, no error
+proj_lint                            ← read the error-severity items only
 rec_scan prefix=MAIN.fbDispense source=project checklist=dispense
 ```
+
+Rule for this step: the project builds clean in XAE, so any `error` from `proj_validate_xml` or
+`proj_lint` on it is a false positive in this repo — paste the finding and the POU. Warnings and
+info are advisory and may be argued with later.
 
 ## 5. XAE, read-only (10 min) — verify items 2–4
 
@@ -134,8 +160,16 @@ ipc_read_file boot:CurrentConfig.xml    ← FOPEN with path id 4 (the TcUnit res
 ads_ethercat
 wf_release_check → xae_deploy            ← confirmation dialog expected
 tcunit_run
-ipc_start_process notepad.exe  ·  ipc_reboot   (test box only)
+ipc_start_process <an exe that exists on the target>  ·  ipc_reboot   (test box only; CE7 has no notepad.exe —
+                                          use \Windows\cmd.exe or skip; ipc_eventlog is Windows-only, not CE7)
 ```
+
+## Stop conditions
+
+Stop and report, do not work around: a write to a symbol not on the allow list going through; any tool
+changing the machine without a confirmation prompt in guarded mode; `rec_status.dropped` > 0 at a
+profile you need; `exp_run` leaving a factor at its last level after abort (`snap_compare` shows it);
+an `error` from an offline check on code XAE accepts.
 
 ## What to send back for anything that fails
 
