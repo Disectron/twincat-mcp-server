@@ -30,6 +30,11 @@ _RE_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 _RE_METHOD_CALL = re.compile(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(")
 _RE_COMMENT = re.compile(r"\(\*.*?\*\)|//[^\n]*", re.S)
 _RE_STRING = re.compile(r"'[^']*'")
+_RE_FOR = re.compile(r"\bFOR\s+(?P<var>[A-Za-z_]\w*)\s*:=\s*(?P<start>.+?)\s+TO\s+(?P<end>.+?)(?:\s+BY\s+(?P<step>.+?))?\s+DO\b", re.I | re.S)
+_RE_NEW = re.compile(r"__NEW\s*\(\s*([A-Za-z_]\w*)", re.I)
+_RE_DELETE = re.compile(r"__DELETE\s*\(", re.I)
+_RE_ABSTRACT = re.compile(r"^\s*(?:FUNCTION_BLOCK|METHOD|PROPERTY)\s+(?:(?:PUBLIC|PRIVATE|PROTECTED|INTERNAL|FINAL)\s+)*ABSTRACT\b", re.I | re.M)
+UNSIGNED_TYPES = {"USINT", "UINT", "UDINT", "ULINT", "BYTE", "WORD", "DWORD", "LWORD"}
 
 
 def strip_comments(code: str) -> str:
@@ -77,7 +82,9 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
     idx._ensure()
     pref = {**DEFAULT_PREFIXES, **(prefixes or {})}
     enabled = set(rules) if rules else {"unused", "naming", "undocumented_io", "todo", "real_eq", "assign_input",
-                                        "empty_method", "qualified_only", "magic_numbers", "missing_super"}
+                                        "empty_method", "qualified_only", "magic_numbers", "missing_super",
+                                        "interface_contract", "extends_cycle", "abstract_instantiation",
+                                        "shadowed_member", "unsigned_loop", "new_delete"}
     units = [idx.get_unit(name)] if name else [u for u in idx.units.values() if u.kind != "PARSE_ERROR"]
     if name:
         units += [u for u in idx.units.values() if u.parent == units[0].name]
@@ -85,6 +92,35 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
 
     def add(rule: str, u: CodeUnit, line: int, msg: str, sev: str = "warning") -> None:
         findings.append({"rule": rule, "severity": sev, "unit": u.name, "file": u.file, "line": line, "message": msg})
+
+    # -- project-level OOP rules (need the whole index, not just the unit in hand) --
+    abstract_fbs = {u.name.lower() for u in idx.units.values()
+                    if u.kind == "FUNCTION_BLOCK" and _RE_ABSTRACT.search(u.declaration or "")}
+    for u in units:
+        if u.kind != "FUNCTION_BLOCK":
+            continue
+        if "extends_cycle" in enabled and u.extends:
+            cyc = _extends_cycle(idx, u)
+            if cyc:
+                add("extends_cycle", u, u.decl_line0, "EXTENDS chain is circular: " + " -> ".join(cyc), "error")
+        if "interface_contract" in enabled and u.implements:
+            for msg, sev in _interface_contract(idx, u):
+                add("interface_contract", u, u.decl_line0, msg, sev)
+        if "abstract_instantiation" in enabled and abstract_fbs:
+            for v in u.vars:
+                if _base_type(v.type).lower() in abstract_fbs and v.section != "VAR_IN_OUT" \
+                        and not re.match(r"^(POINTER|REFERENCE)\s+TO\b", v.type.strip(), re.I):
+                    add("abstract_instantiation", u, v.line,
+                        f"{v.name} : {v.type} instantiates an ABSTRACT function block (compiler error C0372-style); "
+                        f"use a POINTER TO / REFERENCE TO or a concrete subclass", "error")
+    if "abstract_instantiation" in enabled and abstract_fbs:
+        for u in units:
+            if u.kind in ("PROGRAM", "GVL", "FUNCTION", "METHOD", "ACTION", "DUT"):
+                for v in u.vars:
+                    if _base_type(v.type).lower() in abstract_fbs and v.section != "VAR_IN_OUT" \
+                            and not re.match(r"^(POINTER|REFERENCE)\s+TO\b", v.type.strip(), re.I):
+                        add("abstract_instantiation", u, v.line,
+                            f"{v.name} : {v.type} instantiates an ABSTRACT function block", "error")
 
     for u in units:
         impl = strip_comments(u.implementation)
@@ -142,12 +178,191 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
             mname = u.name.split(".")[-1]
             if parent and parent.extends and mname.lower() in ("fb_init", "fb_exit", "fb_reinit") and "SUPER^" not in impl.upper():
                 add("missing_super", u, u.impl_line0, f"{mname} in a derived FB does not call SUPER^.{mname}", "warning")
+        if "shadowed_member" in enabled and u.kind in ("METHOD", "PROPERTY", "GET", "SET", "ACTION") and u.parent:
+            owner = idx.units.get(_fb_owner(u).lower()) if _fb_owner(u) else None
+            if owner is not None:
+                for v in u.vars:
+                    if v.section in ("VAR_INPUT", "VAR", "VAR_TEMP", "VAR_OUTPUT", "VAR_IN_OUT"):
+                        hit = _member_lookup(idx, owner, v.name)
+                        if hit is not None:
+                            where = "" if hit.name.lower() == owner.name.lower() else f" (inherited from {hit.name})"
+                            add("shadowed_member", u, v.line,
+                                f"{v.section} {v.name} shadows member {owner.name}.{v.name}{where}; inside this body the bare "
+                                f"name is the local — use THIS^.{v.name} for the member or rename", "warning")
+        if "unsigned_loop" in enabled and u.kind in ("FUNCTION_BLOCK", "PROGRAM", "FUNCTION", "METHOD", "ACTION", "GET", "SET"):
+            for m in _RE_FOR.finditer(impl):
+                var = m.group("var")
+                vt = _var_type_in_scope(idx, u, var)
+                line = u.impl_line0 + impl[:m.start()].count("\n")
+                if vt is None or vt.upper() not in UNSIGNED_TYPES:
+                    continue
+                step = (m.group("step") or "").strip()
+                end = m.group("end").strip()
+                if step.startswith("-"):
+                    add("unsigned_loop", u, line,
+                        f"FOR {var} ({vt}) counts down with BY {step}: an unsigned loop variable never goes below 0, "
+                        f"so the loop wraps and runs ~{2 ** (8 * _type_bytes(vt))} times", "error")
+                elif re.search(r"-\s*1\s*$", end) and not re.search(r"\d\s*-\s*1\s*$", end):
+                    add("unsigned_loop", u, line,
+                        f"FOR {var} ({vt}) TO {end}: when the bound is 0 the unsigned '-1' wraps to {2 ** (8 * _type_bytes(vt)) - 1} "
+                        f"and the loop runs that many times — guard with IF n > 0 or use a signed loop variable", "warning")
+        if "new_delete" in enabled and u.kind in ("FUNCTION_BLOCK", "PROGRAM"):
+            tree_code = impl + " " + " ".join(strip_comments(x.implementation) for x in idx.units.values() if x.parent == u.name)
+            news = _RE_NEW.findall(tree_code)
+            if news and not _RE_DELETE.search(tree_code):
+                add("new_delete", u, u.impl_line0,
+                    f"__NEW({', '.join(sorted(set(news)))}) without any __DELETE in {u.name} or its methods — heap leak "
+                    f"on every re-init unless ownership is handed elsewhere", "warning")
+            for tname in set(news):
+                tu = idx.units.get(tname.lower())
+                if tu is not None and tu.kind == "FUNCTION_BLOCK" and "enable_dynamic_creation" not in (tu.declaration or ""):
+                    add("new_delete", u, u.impl_line0,
+                        f"__NEW({tname}): {tname} lacks {{attribute 'enable_dynamic_creation'}} — compiler rejects the allocation", "error")
     sev_rank = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: (sev_rank[f["severity"]], f["file"], f["line"]))
     counts: dict[str, int] = {}
     for f in findings:
         counts[f["rule"]] = counts.get(f["rule"], 0) + 1
     return {"units": len(units), "findings": len(findings), "by_rule": counts, "items": findings[:1000]}
+
+
+def _base_type(type_str: str) -> str:
+    """Element type behind ARRAY[..] OF / POINTER TO / REFERENCE TO wrappers (one level each)."""
+    t = (type_str or "").strip()
+    m = re.match(r"^ARRAY\s*\[.*?\]\s*OF\s+(.+)$", t, re.I)
+    if m:
+        t = m.group(1).strip()
+    return t
+
+
+def _type_bytes(t: str) -> int:
+    return {"USINT": 1, "BYTE": 1, "UINT": 2, "WORD": 2, "UDINT": 4, "DWORD": 4, "ULINT": 8, "LWORD": 8}.get(t.upper(), 2)
+
+
+def _fb_owner(u: CodeUnit) -> str | None:
+    """Name of the POU that owns a method / property accessor (GET/SET hang off PROPERTY, which hangs off the FB)."""
+    return u.parent.split(".")[0] if u.parent else None
+
+
+def _member_lookup(idx: ProjectIndex, owner: CodeUnit, name: str) -> CodeUnit | None:
+    """Unit (owner or an ancestor within the project) that declares a member variable ``name``."""
+    seen: set[str] = set()
+    stack = [owner]
+    while stack:
+        cur = stack.pop()
+        if cur.name.lower() in seen:
+            continue
+        seen.add(cur.name.lower())
+        if any(v.name.lower() == name.lower() and v.section != "VAR_TEMP" for v in cur.vars):
+            return cur
+        for e in cur.extends:
+            eu = idx.units.get(e.lower())
+            if eu:
+                stack.append(eu)
+    return None
+
+
+def _var_type_in_scope(idx: ProjectIndex, u: CodeUnit, name: str) -> str | None:
+    """Declared type of ``name`` as seen from inside ``u``: own vars first, then the owning FB and its bases."""
+    for v in u.vars:
+        if v.name.lower() == name.lower():
+            return v.type
+    owner_name = _fb_owner(u)
+    owner = idx.units.get(owner_name.lower()) if owner_name else None
+    if owner is not None:
+        hit = _member_lookup(idx, owner, name)
+        if hit is not None:
+            for v in hit.vars:
+                if v.name.lower() == name.lower():
+                    return v.type
+    return None
+
+
+def _extends_cycle(idx: ProjectIndex, u: CodeUnit) -> list[str] | None:
+    path = [u.name]
+    seen = {u.name.lower()}
+    cur = u
+    while cur.extends:
+        nxt = idx.units.get(cur.extends[0].lower())
+        if nxt is None:
+            return None
+        if nxt.name.lower() in seen:
+            return path + [nxt.name]
+        seen.add(nxt.name.lower())
+        path.append(nxt.name)
+        cur = nxt
+    return None
+
+
+def _sig(u: CodeUnit) -> dict[str, Any]:
+    ins = [(v.name.lower(), re.sub(r"\s+", "", v.type).lower()) for v in u.vars if v.section == "VAR_INPUT"]
+    outs = [(v.name.lower(), re.sub(r"\s+", "", v.type).lower()) for v in u.vars if v.section in ("VAR_OUTPUT", "VAR_IN_OUT")]
+    return {"ret": re.sub(r"\s+", "", u.return_type or "").lower(), "in": ins, "out": outs}
+
+
+def _members_of(idx: ProjectIndex, root: CodeUnit, follow_extends: bool = True) -> dict[str, CodeUnit]:
+    """METHOD / PROPERTY sub-units reachable from ``root`` (own first, then bases), keyed by lower-case short name."""
+    out: dict[str, CodeUnit] = {}
+    seen: set[str] = set()
+    stack = [root]
+    while stack:
+        cur = stack.pop(0)
+        if cur.name.lower() in seen:
+            continue
+        seen.add(cur.name.lower())
+        for x in idx.units.values():
+            if x.parent == cur.name and x.kind in ("METHOD", "PROPERTY"):
+                out.setdefault(x.name.split(".")[-1].lower(), x)
+        if follow_extends:
+            for e in cur.extends:
+                eu = idx.units.get(e.lower())
+                if eu:
+                    stack.append(eu)
+    return out
+
+
+def _interface_contract(idx: ProjectIndex, fb: CodeUnit) -> list[tuple[str, str]]:
+    """Every method/property of each implemented interface (and the interfaces it extends) must exist on the FB
+    or one of its bases, with the same return type and VAR_INPUT list. Unresolvable interface or base → info only:
+    the project index cannot see into libraries, so it does not claim a violation."""
+    msgs: list[tuple[str, str]] = []
+    # can we see the whole FB side?  (an unresolved base might supply the method)
+    bases_complete = True
+    cur = fb
+    seen: set[str] = set()
+    while cur.extends and cur.name.lower() not in seen:
+        seen.add(cur.name.lower())
+        nxt = idx.units.get(cur.extends[0].lower())
+        if nxt is None:
+            bases_complete = False
+            break
+        cur = nxt
+    have = _members_of(idx, fb)
+    for iname in fb.implements:
+        itf = idx.units.get(iname.lower())
+        if itf is None or itf.kind != "INTERFACE":
+            msgs.append((f"IMPLEMENTS {iname}: interface not in the project (library?) — contract not checked", "info"))
+            continue
+        need = _members_of(idx, itf)
+        for short, im in need.items():
+            mine = have.get(short)
+            if mine is None:
+                if bases_complete:
+                    msgs.append((f"IMPLEMENTS {itf.name}: {im.kind} {im.name.split('.')[-1]} is missing on {fb.name} "
+                                 f"(compiler error; the FB must provide every interface member)", "error"))
+                else:
+                    msgs.append((f"IMPLEMENTS {itf.name}: {im.kind} {im.name.split('.')[-1]} not found on {fb.name} or its "
+                                 f"in-project bases; base {cur.extends[0]} is outside the project so it may supply it", "info"))
+                continue
+            if mine.kind != im.kind:
+                msgs.append((f"IMPLEMENTS {itf.name}: {short} is a {im.kind} on the interface but a {mine.kind} on {fb.name}", "error"))
+                continue
+            a, b = _sig(im), _sig(mine)
+            if a["ret"] != b["ret"] or a["in"] != b["in"]:
+                msgs.append((f"IMPLEMENTS {itf.name}: {im.kind} {short} signature differs — interface "
+                             f"({', '.join(f'{n}:{t}' for n, t in a['in'])}) : {a['ret'] or '-'} vs FB "
+                             f"({', '.join(f'{n}:{t}' for n, t in b['in'])}) : {b['ret'] or '-'}", "error"))
+    return msgs
 
 
 def _expected_prefixes(type_str: str, pref: dict[str, list[str]]) -> list[str]:

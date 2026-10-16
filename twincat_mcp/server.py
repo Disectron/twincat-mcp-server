@@ -1007,7 +1007,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Static checks over one object or the whole project: unused locals, naming prefixes
         (override map via `prefixes`), undocumented VAR_INPUT/OUTPUT, TODO markers, REAL
         compared with =, VAR_INPUT assigned inside an FB, empty methods, GVL/ENUM without
-        qualified_only, magic numbers, FB_init/FB_exit without SUPER^. rules= subset to run."""
+        qualified_only, magic numbers, FB_init/FB_exit without SUPER^; OOP/safety: interface_contract
+        (every member of each IMPLEMENTS interface present with matching signature — info, not error,
+        when the interface or a base lives in a library), extends_cycle, abstract_instantiation,
+        shadowed_member (method input/local hides an FB member), unsigned_loop (BY -1 or TO n-1 on an
+        unsigned counter), new_delete (__NEW without __DELETE, target lacking enable_dynamic_creation).
+        Deterministic and offline; the compiler (xae_build + xae_diagnostics) stays the authority.
+        rules= subset to run."""
         return await app.proj_call(codecheck.lint, app.proj, name, rules, prefixes or cfg.project.naming_prefixes or None)
 
     @mcp.tool(annotations=READ)
