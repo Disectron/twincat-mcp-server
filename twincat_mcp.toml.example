@@ -22,7 +22,7 @@ allow_safety = false               # TwinSAFE (TISC) edits refused unless true
 
 [project]
 # root = 'C:\Projects\DrumFilling'  # defaults to the solution folder
-tcunit_remote_result = 'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml'
+tcunit_remote_result = 'boot:TcUnit_xUnit_testresults.xml'   # 'boot:' = the target's boot folder whatever the OS (C:\TwinCAT\3.1\Boot, \Hard Disk\TwinCAT\3.1\Boot on CE7); an absolute path still works
 # hmi_root = 'C:\Projects\DrumFilling\Hmi'   # TE2000 project folder for hmi_scan
 [project.naming_prefixes]          # overrides for proj_lint's naming rule
 LREAL = ["r", "lr", "f"]

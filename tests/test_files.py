@@ -14,6 +14,9 @@ class FakeFS:
 
     def __init__(self):
         self.files = {r"C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml": b"<testsuites/>" * 10000}
+        # the target resolves path-id relative names itself; the fake models a CE7 box
+        self.boot_dir = r"\Hard Disk\TwinCAT\3.1\Boot"
+        self.files[self.boot_dir + r"\TcUnit_xUnit_testresults.xml"] = b"<testsuites ce7='1'/>"
         self.handles = {}
         self.next = 1
         self.calls = []
@@ -24,7 +27,11 @@ class FakeFS:
         if igrp == F.IG_FOPEN:
             path = write_bytes.rstrip(b"\x00").decode()
             mode = ioffs & 0xFFFF
-            assert ioffs >> 16 == F.PATH_GENERIC
+            pid = ioffs >> 16
+            assert pid in (F.PATH_GENERIC, F.PATH_IDS["boot"]), pid
+            if pid == F.PATH_IDS["boot"]:
+                assert not path.startswith(("\\", "/")) and ":" not in path, "boot-relative names carry no drive or leading separator"
+                path = self.boot_dir + "\\" + path
             if mode & F.MODE_READ and path not in self.files:
                 raise pyads.ADSError(1804)
             if mode & (F.MODE_WRITE | F.MODE_APPEND):
@@ -53,9 +60,10 @@ class FakeFS:
             del self.files[path]
             return b""
         if igrp == F.IG_FFIND:
-            if ioffs == 0:
+            if ioffs & 0xFFFF == 0:                     # first call: path id in the high word, no handle yet
                 self._iter = iter(self.find_entries)
                 handle = 77
+                self.last_find_pid = ioffs >> 16
             else:
                 handle = ioffs
             try:
@@ -127,3 +135,35 @@ def test_wait_for_file(files):
     svc, fs = files
     assert svc.wait_for_file(r"C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml", 1, 0.01)["exists"]
     assert not svc.wait_for_file(r"C:\never.xml", 0.05, 0.01)["exists"]
+
+
+def test_boot_relative_path_resolves_on_target(files):
+    sf, fs = files
+    r = sf.read_file("boot:TcUnit_xUnit_testresults.xml")
+    assert r["text"] == "<testsuites ce7='1'/>"
+    assert fs.calls[0][0] == F.IG_FOPEN and fs.calls[0][1] >> 16 == F.PATH_IDS["boot"]
+    # absolute Windows path untouched (a drive letter is not a path id)
+    n = len(fs.calls)
+    r2 = sf.read_file(r"C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml", max_bytes=100)
+    assert fs.calls[n][0] == F.IG_FOPEN and fs.calls[n][1] >> 16 == F.PATH_GENERIC
+    assert r2["truncated"]
+
+
+def test_split_path():
+    assert F.split_path("boot:x.xml") == (4, "x.xml")
+    assert F.split_path("Boot:sub\\x.xml") == (4, "sub\\x.xml")
+    assert F.split_path(r"C:\TwinCAT\x.xml") == (1, r"C:\TwinCAT\x.xml")
+    assert F.split_path("/usr/local/etc/TwinCAT/3.1/Boot/x.xml") == (1, "/usr/local/etc/TwinCAT/3.1/Boot/x.xml")
+    assert F.split_path("user3:log.csv") == (13, "log.csv")
+    assert F.split_path("nosuch:thing") == (1, "nosuch:thing")
+
+
+def test_list_dir_boot_relative(files):
+    svc, fs = files
+    fs.find_entries = [("TcUnit_xUnit_testresults.xml", 10, False)]
+    r = svc.list_dir("boot:*")
+    assert [e["name"] for e in r["entries"]] == ["TcUnit_xUnit_testresults.xml"]
+    assert fs.last_find_pid == F.PATH_IDS["boot"]
+    fs.find_entries = [("x", 1, False)]
+    svc.list_dir(r"C:\TwinCAT\3.1\*")
+    assert fs.last_find_pid == 0                      # generic keeps the pre-4022 offset 0

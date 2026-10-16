@@ -73,7 +73,7 @@ class XaeConfig:
 @dataclass
 class ProjectConfig:
     root: str | None = None                # folder to scan for .tsproj/.plcproj
-    tcunit_remote_result: str = r"C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml"
+    tcunit_remote_result: str = "boot:TcUnit_xUnit_testresults.xml"   # PATH_BOOTPATH-relative: Windows, CE7 and TC/BSD alike
     hmi_root: str | None = None            # TE2000 project folder (defaults to project root)
     naming_prefixes: dict = field(default_factory=dict)      # overrides for proj_lint naming rule
     experiments_dir: str | None = None     # exp_* specs/runs/reports; None -> <root>/experiments or ~/.twincat_mcp/experiments

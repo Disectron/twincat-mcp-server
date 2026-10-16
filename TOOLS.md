@@ -87,8 +87,8 @@
 ## Target OS — System Service (7)
 
 - `ipc_eventlog` [D] — Windows event log of the target (Windows 7/10/11 IPCs): runs wevtutil on the IPC via the System Service, then reads the result file back. Not available on Windows CE / TC-BSD targets (use the XAE error list for ADS logger messages there). Destructive-class because it starts a process on the IPC.
-- `ipc_read_file` [R] — Read a file from the target IPC's file system over ADS (no share needed), e.g. 'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml' or a log. Binary → base64.
-- `ipc_list_dir` [R] — List files on the target matching a Win32 pattern, e.g. 'C:\TwinCAT\3.1\Boot\*'.
+- `ipc_read_file` [R] — Read a file from the target IPC's file system over ADS (no share needed), e.g. 'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml' or a log. Binary → base64. OS-independent prefixes resolve on the target: 'boot:<name>' (TwinCAT boot folder — \Hard Disk\TwinCAT\3.1\Boot on CE7), 'bootprj:', 'bootdata:', 'target:',…
+- `ipc_list_dir` [R] — List files on the target matching a Win32 pattern, e.g. 'C:\TwinCAT\3.1\Boot\*' or 'boot:*' (boot folder on any target OS; see ipc_read_file for the other prefixes).
 - `ipc_write_file` [C] — Write a file on the target IPC (text or base64). Control-class.
 - `ipc_delete_file` [D] — Delete a file on the target IPC. Destructive-class.
 - `ipc_start_process` [D] — Start a process on the target IPC (NT_StartProcess equivalent). Destructive-class.

@@ -23,6 +23,7 @@ target — the directory listing is the least battle-tested function here.
 from __future__ import annotations
 
 import ctypes
+import re
 import struct
 import time
 from typing import Any
@@ -37,6 +38,20 @@ IG_FOPEN, IG_FCLOSE, IG_FREAD, IG_FWRITE = 120, 121, 122, 123
 IG_FSEEK, IG_FTELL, IG_FDELETE, IG_FRENAME, IG_FFIND = 124, 125, 131, 132, 133
 IG_MKDIR, IG_RMDIR, IG_STARTPROCESS = 138, 139, 500
 PATH_GENERIC = 1
+# ADS System Service path IDs (indexOffset high word of FOPEN/FFIND/FDELETE/FRENAME): a file name is then
+# relative to a folder the target resolves itself, which is what makes one config work on Windows
+# (C:\TwinCAT\3.1\Boot), CE7 (\Hard Disk\TwinCAT\3.1\Boot) and TC/BSD (/usr/local/etc/TwinCAT/3.1/Boot).
+PATH_IDS = {"generic": 1, "bootprj": 2, "bootdata": 3, "boot": 4, "target": 5, "config": 6, "install": 7,
+            **{f"user{i}": 10 + i for i in range(1, 10)}}
+
+
+def split_path(path: str) -> tuple[int, str]:
+    """``'boot:TcUnit_xUnit_testresults.xml'`` -> (PATH_BOOTPATH, 'TcUnit_xUnit_testresults.xml');
+    anything without a known ``<id>:`` prefix (incl. ``C:\...``) is PATH_GENERIC with the string as given."""
+    m = re.match(r"^([A-Za-z][A-Za-z0-9]*):(?![\\/])(.*)$", path or "")
+    if m and m.group(1).lower() in PATH_IDS:
+        return PATH_IDS[m.group(1).lower()], m.group(2)
+    return PATH_GENERIC, path
 MODE_READ, MODE_WRITE, MODE_APPEND, MODE_PLUS, MODE_BINARY, MODE_TEXT = 0x1, 0x2, 0x4, 0x8, 0x10, 0x20
 
 _CHUNK = 64 * 1024
@@ -69,8 +84,9 @@ class SystemServiceFiles:
     # ------------------------------------------------------------ primitives
     def fopen(self, path: str, mode: int) -> int:
         c = self._c()
+        pid, name = split_path(path)
         try:
-            data = _raw_rw(c, IG_FOPEN, mode | (PATH_GENERIC << 16), 4, path.encode("latin-1") + b"\x00")
+            data = _raw_rw(c, IG_FOPEN, mode | (pid << 16), 4, name.encode("latin-1") + b"\x00")
         except pyads.ADSError as exc:
             raise AdsError(f"FOPEN {path!r}: {_fmt_exc(exc)}") from exc
         return struct.unpack("<I", data[:4])[0]
@@ -147,18 +163,23 @@ class SystemServiceFiles:
     def delete_file(self, path: str) -> dict[str, Any]:
         c = self._c()
         try:
-            _raw_rw(c, IG_FDELETE, PATH_GENERIC << 16, 0, path.encode("latin-1") + b"\x00")
+            pid, name = split_path(path)
+            _raw_rw(c, IG_FDELETE, pid << 16, 0, name.encode("latin-1") + b"\x00")
         except pyads.ADSError as exc:
             raise AdsError(f"FDELETE {path!r}: {_fmt_exc(exc)}") from exc
         return {"deleted": path}
 
     def list_dir(self, pattern: str, max_entries: int = 500) -> dict[str, Any]:
-        """Directory listing via FFILEFIND. ``pattern`` like ``C:\\TwinCAT\\3.1\\Boot\\*``."""
+        """Directory listing via FFILEFIND. ``pattern`` like ``C:\\TwinCAT\\3.1\\Boot\\*`` or, OS-independent,
+        ``boot:*`` (see PATH_IDS)."""
         c = self._c()
         entries = []
         handle = 0
+        pid, name = split_path(pattern)
+        # first FFIND call: handle 0 in the low word, path id in the high word (0 for generic — the pre-4022
+        # protocol — so absolute paths behave exactly as before); later calls pass the handle
         try:
-            data = _raw_rw(c, IG_FFIND, 0, 4 + 320, pattern.encode("latin-1") + b"\x00")
+            data = _raw_rw(c, IG_FFIND, 0 if pid == PATH_GENERIC else pid << 16, 4 + 320, name.encode("latin-1") + b"\x00")
         except pyads.ADSError as exc:
             if exc.err_code in (1804, 0x70C):  # ERR_... no more files / not found
                 return {"pattern": pattern, "entries": []}

@@ -127,8 +127,10 @@ cut latency vs what the HMI shows, pulse count vs the valve counter.
 
 ```
 xae_plc login                           ← if "no working DTE command", paste xae_list_commands PLC
-ipc_read_file C:\TwinCAT\3.1\TwinCAT.xml
-ipc_list_dir C:\TwinCAT\3.1\Boot\*       ← FFILEFIND layout (item 7)
+ipc_list_dir boot:*                     ← FFILEFIND layout (item 7) AND the path-id protocol: on the CX9020 (CE7) the
+                                          boot folder is \Hard Disk\TwinCAT\3.1\Boot, which 'boot:' must resolve to.
+                                          If it errors, retry ipc_list_dir '\Hard Disk\TwinCAT\3.1\Boot\*' and report both.
+ipc_read_file boot:CurrentConfig.xml    ← FOPEN with path id 4 (the TcUnit result path uses the same route)
 ads_ethercat
 wf_release_check → xae_deploy            ← confirmation dialog expected
 tcunit_run

@@ -67,6 +67,16 @@ jobs:
       - name: Launcher dry run (no server start)
         if: ${{ !cancelled() }}
         run: python scripts/launch.py --src . --venv ${{ runner.temp }}/tcmcp-venv --no-run
+      - name: launch.cmd Python discovery (the .mcpb entry point)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: cmd
+        run: |
+          set TCMCP_PYTHON=
+          scripts\launch.cmd --src . --venv %RUNNER_TEMP%\tcmcp-venv-cmd --no-run
+          if errorlevel 1 exit /b 1
+          echo --- and via TCMCP_PYTHON pointing at a bogus interpreter (must fall back, not die)
+          set TCMCP_PYTHON=C:\nonexistent\python.exe
+          scripts\launch.cmd --src . --venv %RUNNER_TEMP%\tcmcp-venv-cmd --no-run
 
   plugin:
     runs-on: ubuntu-latest

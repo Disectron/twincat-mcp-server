@@ -1631,12 +1631,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def ipc_read_file(path: str, max_bytes: int | None = None, as_text: bool = True,
                             encoding: str = "utf-8") -> dict[str, Any]:
         r"""Read a file from the target IPC's file system over ADS (no share needed), e.g.
-        'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml' or a log. Binary → base64."""
+        'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml' or a log. Binary → base64. OS-independent
+        prefixes resolve on the target: 'boot:<name>' (TwinCAT boot folder — \Hard Disk\TwinCAT\3.1\Boot on
+        CE7), 'bootprj:', 'bootdata:', 'target:', 'config:', 'install:', 'user1:'..'user9:'."""
         return await app.ads_call(app.files.read_file, path, max_bytes, as_text, encoding, timeout=120, slow=True)
 
     @mcp.tool(annotations=READ)
     async def ipc_list_dir(pattern: str, max_entries: int = 500) -> dict[str, Any]:
-        r"""List files on the target matching a Win32 pattern, e.g. 'C:\TwinCAT\3.1\Boot\*'."""
+        r"""List files on the target matching a Win32 pattern, e.g. 'C:\TwinCAT\3.1\Boot\*' or 'boot:*'
+        (boot folder on any target OS; see ipc_read_file for the other prefixes)."""
         return await app.ads_call(app.files.list_dir, pattern, max_entries, timeout=60)
 
     @mcp.tool(annotations=WRITE)
