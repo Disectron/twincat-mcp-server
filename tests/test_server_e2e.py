@@ -276,3 +276,27 @@ async def test_safety_guard_hmi_export_report(monkeypatch, project_dir, tmp_path
         assert Path(rep["file"]).exists() and "# twincat-mcp session report" in rep["markdown"]
         disc = await s.call_tool("ads_discover", {"timeout_s": 0.2})
         assert not disc.is_error  # no targets on this network, but the call must work
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("boom", [
+    AttributeError("function 'AdsPortOpenEx' not found"),          # wrong / stand-in TcAdsDll.dll
+    OSError("[WinError 126] The specified module could not be found"),
+])
+async def test_tc_doctor_survives_router_failure(monkeypatch, project_dir, boom):
+    """tc_doctor exists to diagnose a dead router; a raw pyads/ctypes error there must become a
+    'router: FAIL …' field, never an unexpected-exception tool result (seen on Windows CI)."""
+    import pyads
+    install(monkeypatch)
+
+    def dead_open_port(*a, **k):
+        raise boom
+    monkeypatch.setattr(pyads, "open_port", dead_open_port)
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        res = await s.call_tool("tc_doctor", {})
+        assert not res.is_error, text(res)
+        doc = payload(res)
+        assert str(doc["router"]).startswith("FAIL"), doc["router"]
+        assert "router" in str(doc["router"]).lower()
+        assert "local_ams_net_id" not in doc

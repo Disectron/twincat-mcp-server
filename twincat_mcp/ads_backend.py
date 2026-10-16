@@ -788,11 +788,23 @@ class AdsBackend:
         return {"count": len(found), "targets": list(found.values()), "broadcast": broadcast, "timeout_s": timeout_s}
 
     def local_net_id(self) -> str:
-        pyads.open_port()
+        """AmsNetId of the local TwinCAT router. Raises AdsError (never a raw pyads/ctypes error) when the
+        router is not running or TcAdsDll.dll is unusable — tc_doctor reports that instead of crashing."""
+        try:
+            pyads.open_port()
+        except (pyads.ADSError, OSError, AttributeError) as exc:
+            raise AdsError(f"local AMS router not reachable: {_fmt_exc(exc)} — is the TwinCAT System Service "
+                           f"running (TwinCAT icon in the tray, blue or green), and is TcAdsDll.dll the real Beckhoff "
+                           f"library?") from exc
         try:
             return pyads.get_local_address().netid  # type: ignore[union-attr]
+        except (pyads.ADSError, OSError, AttributeError) as exc:
+            raise AdsError(f"get_local_address failed: {_fmt_exc(exc)}") from exc
         finally:
-            pyads.close_port()
+            try:
+                pyads.close_port()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ----------------------------------------------------------------------------

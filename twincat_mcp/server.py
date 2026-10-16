@@ -38,7 +38,9 @@ from . import __version__
 from .config import Config, load as load_config, is_windows
 from .safety import Guard, OpClass, SafetyError
 from .worker import SerialWorker
-from .ads_backend import AdsBackend, AdsError
+import pyads
+
+from .ads_backend import AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeBackend, XaeError, sta_init, sta_teardown
 from .project_backend import ProjectIndex, ProjectError, parse_tcunit_xml
@@ -145,6 +147,9 @@ class App:
             raise ToolError(str(exc)) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError("ADS call timed out (router/route/firewall? run tc_doctor)") from exc
+        except (pyads.ADSError, OSError) as exc:
+            # safety net for a backend path that did not translate the pyads/socket error itself
+            raise ToolError(f"ADS error: {_fmt_ads_exc(exc)}") from exc
 
     async def xae_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
         try:
