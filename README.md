@@ -11,6 +11,7 @@ One MCP server, one Python process, full reach into a Beckhoff TwinCAT 3 setup:
 | **Test bench** | scripted scenarios (writes + expectations + parallel recording), assertions with wait, settle checks, stimulus→response latency, RPC method calls, task timing/load, snapshots for regression | ADS |
 | **Project files (offline)** | index .TcPOU/.TcDUT/.TcGVL/.TcIO, code with line numbers, **ADS symbol → file:line resolution**, regex search, references, call graph, FB interface summary, lint, write-back with LineIds hygiene, TcUnit suite scaffold | XML + regex, no XAE needed |
 | **TcUnit** | build → boot → activate → restart → fetch xUnit XML from the target → pass/fail summary | all three |
+| **Experiments** | spec (factors × levels, runs, preconditions, stimulus, done condition, measures, metrics, criteria, allowed writes) → background runner with snapshot + capture profile per run, factor restore, abort → metrics with 95 % CIs (t / χ²), Cpk → pass / fail / **inconclusive** with the n that would settle it → Markdown + HTML report with identity, charts, audit trail and a separately-labelled interpretation; compare two experiments with error bars | recorder + bench + SQLite-free JSONL |
 | **Reference (Infosys)** | TwinCAT 3 documentation lookup that cannot be incomplete: books and pages from infosys.beckhoff.com's own sitemap, per-library local index (FTS5), symbol search, **FB/struct/enum declarations as data** with the page's descriptions, code-example search, any page as Markdown; web fallback verified against the sitemap | urllib + SQLite, no index to ship |
 
 Runs **on the engineering PC** (Windows, TwinCAT XAE installed) and talks to the IPC through the TwinCAT router. No C# helper, no daemon, no PowerShell, no vector DB.
@@ -81,7 +82,7 @@ safety modes. Windows only (the bundle runs `cmd /d /c server\launch.cmd`, which
 git clone <this repo> C:\tools\twincat-mcp
 cd C:\tools\twincat-mcp
 scripts\install.cmd            :: venv + pip install -e .[dev] + prints effective config
-.venv\Scripts\python -m pytest :: 146 tests, all mocked, run anywhere
+.venv\Scripts\python -m pytest :: 159 tests, all mocked, run anywhere
 cd C:\Projects\DrumFilling
 claude mcp add twincat -e TCMCP_SOLUTION=%CD%\DrumFilling.sln -e TCMCP_AMS_NET_ID=5.12.34.56.1.1 -e TCMCP_MODE=guarded -e TCMCP_MAX_MODE=full -- C:\tools\twincat-mcp\.venv\Scripts\python.exe -m twincat_mcp
 ```
@@ -127,7 +128,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **"Absolute control" setting:** `TCMCP_MODE=full TCMCP_MAX_MODE=full TCMCP_CONFIRM=0`. In that configuration a single mis-aimed tool call can stop the PLC, activate a half-built configuration or reboot the IPC. The server will do exactly what it is told; the only remaining gate is the MCP client's own tool-permission prompt. Keep a denylist for E-stop/safety symbols regardless.
 
-## Tools (127) + 5 prompts
+## Tools (139) + 5 prompts
 
 **Workflows (one call = a whole chain)** `wf_debug_symbol` · `wf_fb_profile` · `wf_release_check` · `wf_project_overview`
 
@@ -150,6 +151,8 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 **HMI (TE2000 / TcVIS)** `hmi_scan` · `hmi_bindings` · `hmi_vs_runtime`
 
 **TcUnit** `tcunit_results` · `tcunit_run[disable_io]` · `tcunit_scaffold`
+
+**Experiments** `exp_template` · `exp_validate` · `exp_save` · `exp_list` · `exp_get` · `exp_runs` · `exp_run[dry_run]` · `exp_status` · `exp_abort` · `exp_evaluate` · `exp_report` · `exp_compare`
 
 **Capture profiles** `rec_scan` · `rec_profile_save` · `rec_profile_list` · `rec_profile_get` · `rec_profile_delete` · `rec_profile_start` · `rec_profile_stop`
 
@@ -280,6 +283,70 @@ suggested modes are heuristics shown next to the choice, not applied behind it.
 
 Writes in scenarios go through the same allow/deny lists as `ads_write`; nothing is written until every symbol in the script has been permitted. Writing to an `AT %I*` input does nothing useful (the I/O task overwrites it each cycle) — stimulate through unmapped inputs or a simulation GVL.
 
+## Experiments: from runs to a report someone can sign
+
+`rec_*` captures and `test_*` stimulates; `exp_*` turns repeated runs into conclusions. The spec is
+YAML (or JSON) in `<project>/experiments/<name>/spec.yaml` — versioned with the code:
+
+```yaml
+name: preact-fill-validation
+hypothesis: With lambda=0.95 the preact controller holds |bias| <= 2 g and sigma <= 3 g at 1000 g.
+profile: preact-fill                      # capture profile started for every run
+preconditions: [{symbol: MAIN.fbScale.bStable, op: "==", value: true, timeout_ms: 30000}]
+factors:
+  - {name: target_g, symbol: GVL_Recipe.rTarget_g, levels: [500, 1000]}
+  - {name: lambda,   symbol: MAIN.fbDispense.fbPreact.rLambda, levels: [0.95]}
+runs_per_level: 5
+run:
+  start:     {symbol: MAIN.bStartFill, value: true, reset_value: false, reset_after_ms: 200}
+  done_when: {symbol: MAIN.fbDispense.ePhase, op: "==", value: IDLE, timeout_ms: 180000}
+  settle_ms: 2000
+measures:
+  final_weight_g: {kind: last, symbol: MAIN.fbScale.rNet_g}
+  final_error_g:  {kind: expr, expr: final_weight_g - target_g}
+  cut_latency_ms: {kind: latency, from: {symbol: MAIN.fbDispense.bCut, op: "==", value: true},
+                                  to:   {symbol: MAIN.fbFlow.rFlow_gps, op: "<", value: 5.0}}
+  fine_pulses:    {kind: pulses, symbol: MAIN.fbFine.bPulse}
+metrics:
+  bias_g:  {measure: final_error_g, stat: mean}
+  sigma_g: {measure: final_error_g, stat: std}
+  cpk:     {measure: final_error_g, stat: cpk, tolerance: 5.0}
+criteria:
+  - {metric: bias_g,  op: abs_le, value: 2.0}
+  - {metric: sigma_g, op: le,     value: 3.0}
+  - {metric: cpk,     op: ge,     value: 1.33}
+writes_allowed: [GVL_Recipe.rTarget_g, MAIN.fbDispense.fbPreact.rLambda, MAIN.bStartFill]
+```
+
+`exp_template` returns a complete one for a dosing machine; `exp_validate` checks structure, resolves
+every symbol on the connected PLC, and asks the server guard whether each write would be allowed;
+`exp_run dry_run=true` prints the plan and writes nothing. `exp_run` then executes in the background —
+per run: preconditions (`wait_until`) → factor values written → `snap_save` → capture profile started
+→ stimulus → `done_when` → settle → stop → measures from the PLC-timestamped recording → append to
+`runs.jsonl`. Factor symbols are read first and restored at the end or on `exp_abort`; two consecutive
+failed runs stop the experiment. Resume continues where runs.jsonl stopped.
+
+`exp_evaluate` is deterministic from `runs.jsonl`: per level the metrics with 95 % CIs (t for the
+mean, χ² for σ, propagated for Cpk) and each criterion as **pass / fail / inconclusive** — inconclusive
+when the limit lies inside the CI, with the run count that would (roughly) settle it. Five fills give
+σ a ±40 % standard error; the report says so instead of rounding it away. `exp_report` writes
+`report.md` + `report.html`: machine serial, device/TwinCAT version, project + git state, safety mode,
+criteria table, metrics per level, charts (primary measure per run with limit lines; per-level mean/CI),
+run table with recording ids, the spec as run, the audit log of every write during the experiment,
+and an **Interpretation** section stored separately and labelled "not computed". `exp_compare a b`
+puts two experiments side by side with "separated" where the CIs do not overlap.
+
+Safety: every written symbol must be in `writes_allowed` *and* pass the guard — checked before anything
+moves **and again before every single write**, so `tc_set_mode readonly` is a working kill switch; each
+write is pinned to the machine the experiment started on (an `ads_connect` elsewhere makes the next
+write fatal) and audited with symbol, value and run. Writes are scalars only (a struct write would bypass
+the member deny-list). A run counts as started only when the machine leaves the done state within
+`start_timeout_ms`; a rejected start is a failed run, not an instant pass. Factor originals are read and
+checked for writability before the first run, restored and read back afterwards (or on abort, after any
+`run.on_abort` safe-state writes); an abort interrupts a wait within a second; a timed-out write ends the
+experiment because the PLC state is unknown. One experiment per target at a time; starting is
+control-class (confirmation in guarded mode). The physical safeguards stay yours.
+
 ## Looking up Beckhoff documentation
 
 The `infosys_*` tools exist because the documentation MCP servers available for TwinCAT ship a
@@ -334,6 +401,8 @@ Config (`[docs]` in the TOML / `TCMCP_DOCS*`): `enabled`, `books` (indexed on fi
 
 ## Verify-on-hardware list
 
+Ordered first-day script with expected outputs and what to paste back per failure: **`docs/HARDWARE_DAY.md`**.
+
 The XAE and System-Service paths are written against Beckhoff's Infosys documentation and tested against fake COM/ADS objects; this repo was built on Linux, so the following have **not** been executed against a real XAE shell or IPC yet. Check them in this order on the engineering PC, with a non-production target:
 
 1. `tc_doctor` → router ok, ProgIDs registered, running shell listed.
@@ -351,14 +420,15 @@ The XAE and System-Service paths are written against Beckhoff's Infosys document
 13. `ads_call_method` on a method marked `{attribute 'TcRpcEnable'}` → check the `instance#method` handle name and the packed parameter layout against the result.
 14. `ads_types ST_<something>` then `ads_read` of an `ARRAY OF STRUCT` variable → datatype-table parsing (`AdsDatatypeEntry` incl. the optional GUID/attribute/enum tails) against a real table; compare offsets with the TMC. On failure the server falls back to published members and reports `decoder: none` for arrays of structs.
 
-15. `infosys_get_page ADSREAD` and `infosys_index tcplclib_tc2_system` → the HTML walker was written against the page *shape* reported through a Markdown converter, not the raw HTML (this repo was built on a host that cannot reach infosys.beckhoff.com). Check: title = symbol name, `kinds` in the index result mostly FunctionBlock/Function/Struct, `infosys_declaration ADSREAD` lists NETID…TMOUT with descriptions. If titles come back as "Beckhoff Information System" or kinds are all `Page`, the H1/`<pre>` selectors in `infosys.py::_MdWalker` need the real markup — one page's HTML pasted back is enough.
-16. `scripts\launch.cmd` (used by the `.mcpb`) → Python discovery order `TCMCP_PYTHON` → `py -3` → `python` → `%LOCALAPPDATA%\Programs\Python\Python3*`; the Microsoft-Store `python.exe` stub fails the version probe and is skipped. Run it once by hand with `--no-run` and watch stderr.
+15. `exp_run <name> max_runs=1` on a harmless spec → the stimulus write, the start acknowledgement, the done condition and the restore appear in `tc_audit_tail` as `exp_write` rows; then `exp_abort` during a run → factor restored, no recording left in `rec_list`.
+16. `infosys_get_page ADSREAD` and `infosys_index tcplclib_tc2_system` → the HTML walker was written against the page *shape* reported through a Markdown converter, not the raw HTML (this repo was built on a host that cannot reach infosys.beckhoff.com). Check: title = symbol name, `kinds` in the index result mostly FunctionBlock/Function/Struct, `infosys_declaration ADSREAD` lists NETID…TMOUT with descriptions. If titles come back as "Beckhoff Information System" or kinds are all `Page`, the H1/`<pre>` selectors in `infosys.py::_MdWalker` need the real markup — one page's HTML pasted back is enough.
+17. `scripts\launch.cmd` (used by the `.mcpb`) → Python discovery order `TCMCP_PYTHON` → `py -3` → `python` → `%LOCALAPPDATA%\Programs\Python\Python3*`; the Microsoft-Store `python.exe` stub fails the version probe and is skipped. Run it once by hand with `--no-run` and watch stderr.
 
 Anything that fails: the tool error text contains the ADS/HRESULT code; paste it back and the fix is usually one constant.
 
 ## Changelog
 
-**0.6.0** — capture profiles (7 tools): `rec_scan` of runtime or source with cost estimates and a markable checklist, `{attribute 'tcmcp.record'}` pragmas collected through `proj_variables` (pragmas now parsed and inherited down instance trees), named profiles replayed as one recording per mode group. `infosys_*` reference lookup (7 tools): sitemap-driven book list, per-library local index with FTS5, symbol search, declarations as data, code-example search, live page → Markdown, sitemap-verified web fallback, TwinCAT 2 filtered out; `scripts/gen_tools_md.py`. Packaging: Claude Code plugin + marketplace in `.claude-plugin/` (`/plugin install twincat-mcp@twincat-mcp`, `userConfig` for Python/AmsNetId/modes), Claude Desktop `.mcpb` bundle (`packaging/mcpb/build.py`, manifest 0.3, tool list generated from the server, passes `mcpb validate`), self-bootstrapping launcher `scripts/launch.py` (+ `launch.cmd`) that creates the venv on first start and reinstalls only when the shipped sources change; skill moved to `skills/twincat-mcp/`; HTTP mode bearer-token gate for claude.ai remote connectors. Plugin path verified end-to-end on Linux (install → venv → `tc_doctor` via `mcp__plugin_twincat-mcp_twincat__tc_doctor`); `launch.cmd` Python discovery is untested on Windows.
+**0.6.0** — experiments (12 tools): YAML spec, background runner with snapshot/profile per run and factor restore, measures from recordings (last/latency/pulses/settle/dwell/edges/expr…), metrics with t/χ² CIs and Cpk, pass/fail/inconclusive verdicts with n-to-settle, Markdown+HTML report with identity/charts/audit/interpretation, compare. Capture profiles (7 tools): `rec_scan` of runtime or source with cost estimates and a markable checklist, `{attribute 'tcmcp.record'}` pragmas collected through `proj_variables` (pragmas now parsed and inherited down instance trees), named profiles replayed as one recording per mode group. `infosys_*` reference lookup (7 tools): sitemap-driven book list, per-library local index with FTS5, symbol search, declarations as data, code-example search, live page → Markdown, sitemap-verified web fallback, TwinCAT 2 filtered out; `scripts/gen_tools_md.py`. Packaging: Claude Code plugin + marketplace in `.claude-plugin/` (`/plugin install twincat-mcp@twincat-mcp`, `userConfig` for Python/AmsNetId/modes), Claude Desktop `.mcpb` bundle (`packaging/mcpb/build.py`, manifest 0.3, tool list generated from the server, passes `mcpb validate`), self-bootstrapping launcher `scripts/launch.py` (+ `launch.cmd`) that creates the venv on first start and reinstalls only when the shipped sources change; skill moved to `skills/twincat-mcp/`; HTTP mode bearer-token gate for claude.ai remote connectors. Plugin path verified end-to-end on Linux (install → venv → `tc_doctor` via `mcp__plugin_twincat-mcp_twincat__tc_doctor`); `launch.cmd` Python discovery is untested on Windows.
 
 **0.5.0** — dialog watchdog, TwinSAFE guard, XML validation/fixes + LineIds regeneration, TE2000/TcVIS HMI binding index with runtime/source cross-check, I/O disable, variable links, UDP discovery, Windows event log, C#/TypeScript/JSON exporters, snapshot apply, session report, `naming_prefixes` config.
 
@@ -377,7 +447,7 @@ Scope/TE13xx recording, TE1200 static analysis, NC axis commissioning, Safety (T
 ## Development
 
 ```
-python -m pytest            # 146 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation, packaging)
+python -m pytest            # 159 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation, packaging)
 python packaging/mcpb/build.py      # dist/twincat-mcp-<version>.mcpb; npx @anthropic-ai/mcpb validate runs if Node is present
 claude plugin validate .            # plugin + marketplace manifests
 python -m twincat_mcp --print-config

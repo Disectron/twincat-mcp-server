@@ -76,6 +76,7 @@ class ProjectConfig:
     tcunit_remote_result: str = r"C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml"
     hmi_root: str | None = None            # TE2000 project folder (defaults to project root)
     naming_prefixes: dict = field(default_factory=dict)      # overrides for proj_lint naming rule
+    experiments_dir: str | None = None     # exp_* specs/runs/reports; None -> <root>/experiments or ~/.twincat_mcp/experiments
 
 
 @dataclass
@@ -228,6 +229,8 @@ def _apply_env(cfg: Config) -> None:
         cfg.docs.web_fallback = b
     if v := _env("TCMCP_DOCS_CACHE"):
         cfg.docs.cache_dir = v
+    if v := _env("TCMCP_EXPERIMENTS"):
+        cfg.project.experiments_dir = v
     if v := _env("TCMCP_TCUNIT_RESULT"):
         cfg.project.tcunit_remote_result = v
 
@@ -251,6 +254,8 @@ def validate(cfg: Config) -> list[str]:
         cfg.project.root = str(Path(cfg.xae.solution_path).parent)
     if cfg.docs.cache_dir is None:
         cfg.docs.cache_dir = str(_home() / "infosys")
+    if cfg.project.experiments_dir is None:
+        cfg.project.experiments_dir = str(Path(cfg.project.root) / "experiments") if cfg.project.root else str(_home() / "experiments")
     if cfg.docs.max_workers < 1 or cfg.docs.max_workers > 16:
         problems.append("docs.max_workers must be 1..16 (be polite to infosys.beckhoff.com)")
     return problems

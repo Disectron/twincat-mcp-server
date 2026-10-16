@@ -18,6 +18,12 @@ bypass by raw address. State the recording / snapshot ids you create.
 → `rec_pulses` / `rec_latency` on the recording → `ads_task_stats` for cost → report pass/fail
 with numbers → `tcunit_scaffold` + `tcunit_run` to make it permanent.
 
+## Did the change help? → run an experiment, not two fills by eye
+`exp_template` → edit factors/measures/criteria → `exp_validate` (resolves symbols, guard view) →
+`exp_save` → `exp_run dry_run=true` → `exp_run` → `exp_status` until done → `exp_evaluate` →
+`exp_report interpretation="..."`. Compare firmware versions with `exp_compare a b`. State "inconclusive"
+as inconclusive; quote the n-to-settle. Never raise `runs_per_level` below 5 for sigma/Cpk criteria.
+
 ## Batch-after-batch capture
 `rec_scan prefix=<chain> checklist=<name>` → user marks the CSV (or `{attribute 'tcmcp.record'}` in
 source) → `rec_profile_save <name> from_checklist=<name> stop_when=...` → per batch:

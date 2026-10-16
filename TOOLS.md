@@ -1,6 +1,6 @@
 # twincat-mcp 0.6.0 — tool reference
 
-127 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
+139 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
 ## Meta & safety (6)
 
@@ -124,6 +124,21 @@
 - `xae_plcopen_import` [E] — Import a PLCopen XML file into a PLC project (path from xae_plc_projects). option: none | rename | replace | skip (conflict handling).
 - `xae_plcopen_export` [E] — Export PLC objects ('POUs.FB_X', 'DUTs.ST_Y' — folder.object) to a PLCopen XML file.
 - `xae_boot_project` [E/D] — Boot project settings: set Autostart and/or GenerateBootProject (local, no activate unless activate_after_generate=true, which is then destructive-class).
+
+## Experiments (define → run → evaluate → report) (12)
+
+- `exp_template` [R] — A complete example experiment spec to edit (YAML text + the same as JSON): factors × levels, runs per level, preconditions, start/done conditions, measures (last/latency/pulses/settle/ dwell/edges/expr…), metrics (mean/std/cpk/p95), criteria, writes_allowed. kind: dosing_fill.
+- `exp_validate` [R] — Validate a spec (YAML/JSON text, a dict, or a saved experiment by name): structure, measures, metrics, criteria, writes_allowed vs what the spec writes, the server guard's view of each write, symbol resolution on the connected PLC, planned run count and a duration estimate.
+- `exp_save` [E] — Save an experiment spec (YAML or JSON) under <experiments_dir>/<name>/spec.yaml. Runs already recorded for that name are kept; resume picks up where they stopped.
+- `exp_list` [R] — Experiments on disk with run counts, state and whether a report exists.
+- `exp_get` [R] — Spec, status and run summary of one experiment.
+- `exp_runs` [R] — Run records: level, status, measures, recording ids, duration, error.
+- `exp_run` [C] — Run an experiment in the background: per level × repetition → preconditions → factor values written → snapshot → capture profile started → stimulus → start acknowledged (done_when must go false) → done_when → settle → stop → measures → runs.jsonl. Factor values are read first and restored at the end or on abort (read…
+- `exp_status` [R] — Live state of a running experiment: planned/done/failed, current level, ETA, last error, live recording ids. For an experiment from an earlier session, the persisted status.
+- `exp_abort` [E] — Stop a running experiment after the current step; recordings are closed, factor values restored.
+- `exp_evaluate` [R] — Metrics per level with 95 % CIs and the criteria verdicts (pass / fail / inconclusive with the run count that would settle it). Deterministic from runs.jsonl; rerunnable by anyone.
+- `exp_report` [E] — Write <experiments_dir>/<name>/report.md and report.html: identity (machine, TwinCAT version, project, git state, safety mode), criteria table, metrics per level, charts (primary measure per run; per-level mean/CI), run table, the spec, the audit log of writes during the run, and the interpretation — stored…
+- `exp_compare` [R] — Two experiments with the same levels side by side: metric deltas and whether their 95 % CIs separate (the before/after question with error bars).
 
 ## Project files (offline) (15)
 

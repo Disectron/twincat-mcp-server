@@ -7,6 +7,7 @@ Tool prefixes
   xae_*    TwinCAT XAE Automation Interface (engineering PC)
   proj_*   offline project files
   tcunit_* TcUnit orchestration + result parsing
+  exp_*    experiments: spec → runs → metrics with CIs → verdict → report
   infosys_* Beckhoff Infosys reference (TwinCAT 3 docs, locally indexed)
 
 Confirmation for destructive operations: if the MCP client supports
@@ -49,6 +50,7 @@ from . import exporters
 from .hmi import HmiIndex
 from .infosys import InfosysIndex, InfosysError
 from . import profiles as capture
+from . import experiments as X
 from pathlib import Path
 
 INSTRUCTIONS = """\
@@ -74,6 +76,11 @@ Workflow for debugging a running machine:
   8. xae_activate_configuration + xae_restart_twincat (or xae_deploy) → deploy.
      These need a confirmation (elicitation, or tc_request_confirmation token).
   9. tcunit_run → build, boot, activate, wait for xUnit result, parse.
+
+Experiments: exp_template → edit → exp_save → exp_run (dry_run first) → exp_status → exp_evaluate →
+exp_report. Runs are repeatable, metrics carry 95 % CIs, verdicts are pass/fail/inconclusive; the
+report separates computed sections from interpretation. Use it for every "did the change help?"
+question instead of comparing two fills by eye.
 
 Reference: infosys_declaration <FB|struct|enum> gives the library symbol's declaration with
 descriptions; infosys_search_symbols / infosys_search / infosys_search_code / infosys_get_page
@@ -114,6 +121,8 @@ class App:
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
         self.profiles = capture.ProfileStore(Path(cfg.safety.audit_log).parent / "profiles")
+        self.exp_store = X.ExperimentStore(cfg.project.experiments_dir)
+        self.runners: dict[str, X.Runner] = {}
         self.docs: InfosysIndex | None = None
         if cfg.docs.enabled:
             try:
@@ -184,6 +193,31 @@ class App:
 
     def scope(self) -> str:
         return self.ads.target_label()
+
+    def write_check(self, symbol: str) -> str | None:
+        """Would ads_write to this symbol be allowed right now, without a confirmation? Reason or None."""
+        try:
+            self.guard.check(OpClass.WRITE, action="exp_run", target=symbol, confirm_token=None, scope=self.scope())
+            return None
+        except SafetyError as exc:
+            return str(exc)
+
+    def exp_deps(self) -> "X.RunnerDeps":
+        return X.RunnerDeps(
+            call=lambda fn, *a, timeout=None, **kw: self.ads_worker.call(fn, *a, timeout=timeout, **kw),
+            slow_call=lambda fn, *a, timeout=None, **kw: self.ads_slow_worker.call(fn, *a, timeout=timeout, **kw),
+            ads=self.ads, rec=self.rec, bench=self.bench, profiles=self.profiles, write_check=self.write_check,
+            audit=lambda tool, args, outcome: self.guard.audit(tool, args, OpClass.WRITE, outcome),
+            scope=self.scope, log=log.warning)
+
+    def stop_experiments(self, reason: str = "server shutdown", join_s: float = 20.0) -> None:
+        """Abort every live runner and wait (bounded) for its restore path — registered with atexit so a
+        client disconnect does not leave factors at the last level."""
+        live = [r for r in self.runners.values() if r.status().get("alive")]
+        for r in live:
+            r.abort(reason)
+        for r in live:
+            r.join(join_s)
 
     async def check_targets(self, xae_target: str, allow_mismatch: bool) -> None:
         """Refuse deploy/tcunit when XAE targets one machine and ADS another."""
@@ -1186,6 +1220,217 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await asyncio.to_thread(app.hmi.compare, online, declared)
 
 
+
+    # ======================================================================
+    # Experiments: define → run → measure → evaluate → report
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def exp_template(kind: str = "dosing_fill") -> dict[str, Any]:
+        """A complete example experiment spec to edit (YAML text + the same as JSON): factors × levels,
+        runs per level, preconditions, start/done conditions, measures (last/latency/pulses/settle/
+        dwell/edges/expr…), metrics (mean/std/cpk/p95), criteria, writes_allowed. kind: dosing_fill."""
+        if kind != "dosing_fill":
+            raise ToolError("kinds: dosing_fill")
+        return {"yaml": X.dump_spec(X.DOSING_TEMPLATE), "spec": X.DOSING_TEMPLATE,
+                "measure_kinds": X.MEASURE_KINDS, "stats": X.STATS, "criterion_ops": X.CRIT_OPS}
+
+    @mcp.tool(annotations=READ)
+    async def exp_validate(spec: str | dict[str, Any] | None = None, name: str | None = None,
+                           resolve_symbols: bool = True) -> dict[str, Any]:
+        """Validate a spec (YAML/JSON text, a dict, or a saved experiment by name): structure, measures,
+        metrics, criteria, writes_allowed vs what the spec writes, the server guard's view of each
+        write, symbol resolution on the connected PLC, planned run count and a duration estimate."""
+        try:
+            sp = X.load_spec(spec) if spec is not None else app.exp_store.spec(name or "")
+        except X.ExperimentError as exc:
+            raise ToolError(str(exc)) from exc
+        types: dict[str, str] = {}
+        if resolve_symbols:
+            for sym in X.writes_in_spec(sp) + X.reads_in_spec(sp):
+                try:
+                    types[sym] = (await app.ads_call(app.ads.symbol_info, sym, timeout=20)).type
+                except ToolError:
+                    pass
+        prof_syms = None
+        try:
+            prof_syms = [i.symbol for i in app.profiles.get(sp.get("profile", "")).items]
+        except Exception:  # noqa: BLE001
+            pass
+        res = await asyncio.to_thread(
+            X.validate_spec, sp, (lambda s: types.get(s)) if resolve_symbols else None, app.write_check,
+            lambda n: any(p["name"] == n for p in app.profiles.list()), prof_syms)
+        return res
+
+    @mcp.tool(annotations=EDIT)
+    async def exp_save(spec: str | dict[str, Any], replace: bool = True) -> dict[str, Any]:
+        """Save an experiment spec (YAML or JSON) under <experiments_dir>/<name>/spec.yaml. Runs already
+        recorded for that name are kept; resume picks up where they stopped."""
+        try:
+            sp = X.load_spec(spec)
+            v = X.validate_spec(sp, profile_exists=lambda n: any(p["name"] == n for p in app.profiles.list()))
+            if v["problems"]:
+                raise ToolError("spec invalid: " + "; ".join(v["problems"]))
+            if not replace and (app.exp_store.dir(sp["name"]) / "spec.yaml").exists():
+                raise ToolError(f"experiment {sp['name']!r} exists; replace=true to overwrite the spec")
+            path = await asyncio.to_thread(app.exp_store.save_spec, sp)
+        except X.ExperimentError as exc:
+            raise ToolError(str(exc)) from exc
+        app.audit("exp_save", {"name": sp["name"]}, OpClass.EDIT, "ok")
+        return {"saved": str(path), "name": sp["name"], "warnings": v["warnings"], "planned_runs": v["planned_runs"],
+                "levels": v["levels"]}
+
+    @mcp.tool(annotations=READ)
+    async def exp_list() -> dict[str, Any]:
+        """Experiments on disk with run counts, state and whether a report exists."""
+        return {"dir": str(app.exp_store.root), "experiments": await asyncio.to_thread(app.exp_store.list)}
+
+    @mcp.tool(annotations=READ)
+    async def exp_get(name: str) -> dict[str, Any]:
+        """Spec, status and run summary of one experiment."""
+        try:
+            sp = await asyncio.to_thread(app.exp_store.spec, name)
+        except X.ExperimentError as exc:
+            raise ToolError(str(exc)) from exc
+        runs = app.exp_store.runs(name)
+        return {"name": name, "spec": sp, "status": app.exp_store.status(name), "runs": len(runs),
+                "runs_ok": len([r for r in runs if r.get("status") == "ok"]),
+                "levels": X.levels_of(sp), "has_report": (app.exp_store.dir(name) / "report.md").exists()}
+
+    @mcp.tool(annotations=READ)
+    async def exp_runs(name: str, last_n: int = 100) -> dict[str, Any]:
+        """Run records: level, status, measures, recording ids, duration, error."""
+        runs = await asyncio.to_thread(app.exp_store.runs, name)
+        return {"name": name, "count": len(runs), "runs": runs[-last_n:]}
+
+    @mcp.tool(annotations=WRITE)
+    async def exp_run(name: str, max_runs: int | None = None, resume: bool = True, dry_run: bool = False,
+                      confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:
+        """Run an experiment in the background: per level × repetition → preconditions → factor values
+        written → snapshot → capture profile started → stimulus → start acknowledged (done_when must go
+        false) → done_when → settle → stop → measures → runs.jsonl. Factor values are read first and
+        restored at the end or on abort (read back and checked). Every write is re-checked against the
+        server guard, pinned to the machine the experiment started on, and audited with symbol and value;
+        a refusal, a target change or a timed-out write stops the experiment. dry_run resolves every
+        symbol, coerces condition values (enum names → ints) and prints the plan without writing.
+        Starting is control-class: in guarded mode it asks once (elicitation / confirm_token); in full
+        mode it does not. Only one experiment may run at a time."""
+        if not dry_run:
+            await app.permit(ctx, OpClass.CONTROL, "exp_run", target=name, confirm_token=confirm_token)
+            live = [n for n, r in app.runners.items() if r.status().get("alive")]
+            if live:
+                raise ToolError(f"experiment {live[0]!r} is running on this target; exp_abort it or wait")
+        try:
+            runner = app.runners.get(name)
+            if runner is None or runner.store is not app.exp_store:
+                runner = X.Runner(app.exp_store, name, app.exp_deps())
+                app.runners[name] = runner
+            res = await asyncio.to_thread(runner.start, max_runs, resume, dry_run)
+        except X.ExperimentError as exc:
+            raise ToolError(str(exc)) from exc
+        app.audit("exp_run", {"name": name, "dry_run": dry_run, "max_runs": max_runs}, OpClass.CONTROL, "started" if not dry_run else "dry_run")
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def exp_status(name: str) -> dict[str, Any]:
+        """Live state of a running experiment: planned/done/failed, current level, ETA, last error,
+        live recording ids. For an experiment from an earlier session, the persisted status."""
+        r = app.runners.get(name)
+        if r is not None:
+            return r.status()
+        st = app.exp_store.status(name)
+        if not st:
+            raise ToolError(f"no experiment {name!r} or it never ran")
+        st["alive"] = False
+        return st
+
+    @mcp.tool(annotations=EDIT)
+    async def exp_abort(name: str, reason: str = "requested") -> dict[str, Any]:
+        """Stop a running experiment after the current step; recordings are closed, factor values restored."""
+        r = app.runners.get(name)
+        if r is None or not r.status().get("alive"):
+            raise ToolError(f"experiment {name!r} is not running")
+        app.audit("exp_abort", {"name": name, "reason": reason}, OpClass.EDIT, "ok")
+        return r.abort(reason)
+
+    @mcp.tool(annotations=READ)
+    async def exp_evaluate(name: str) -> dict[str, Any]:
+        """Metrics per level with 95 % CIs and the criteria verdicts (pass / fail / inconclusive with the
+        run count that would settle it). Deterministic from runs.jsonl; rerunnable by anyone."""
+        try:
+            sp = app.exp_store.spec(name)
+        except X.ExperimentError as exc:
+            raise ToolError(str(exc)) from exc
+        return await asyncio.to_thread(X.evaluate, sp, app.exp_store.runs(name))
+
+    @mcp.tool(annotations=EDIT)
+    async def exp_report(name: str, interpretation: str | None = None, author: str = "agent",
+                         firmware_check: bool = False, fmt: str = "both") -> dict[str, Any]:
+        """Write <experiments_dir>/<name>/report.md and report.html: identity (machine, TwinCAT version,
+        project, git state, safety mode), criteria table, metrics per level, charts (primary measure
+        per run; per-level mean/CI), run table, the spec, the audit log of writes during the run, and
+        the interpretation — stored separately and labelled as not computed. interpretation= saves a
+        new one (author=agent|operator|<name>). firmware_check=true runs proj_vs_runtime first."""
+        try:
+            sp = app.exp_store.spec(name)
+        except X.ExperimentError as exc:
+            raise ToolError(str(exc)) from exc
+        runs = app.exp_store.runs(name)
+        ev = X.evaluate(sp, runs)
+        if interpretation:
+            await asyncio.to_thread(app.exp_store.write_interpretation, name, interpretation, author)
+        meta: dict[str, Any] = {"machine_serial": (sp.get("machine") or {}).get("serial"), "target": app.scope(),
+                                "server_version": __version__, "safety_mode": app.guard.mode,
+                                "operator": (sp.get("report") or {}).get("operator") or None,
+                                "generated": time.strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            di = await app.ads_call(app.ads.device_info, timeout=10)
+            meta["device"] = f"{di.get('name')} {di.get('version')}"
+        except ToolError:
+            pass
+        try:
+            meta["project"] = cfg.xae.solution_path or cfg.project.root
+            ch = await app.proj_call(app.proj.changed_units)
+            meta["git"] = f"{ch.get('head', '')[:12]} {'dirty' if ch.get('files') or ch.get('units') else 'clean'}".strip()
+        except ToolError:
+            pass
+        if firmware_check:
+            try:
+                vr = await _vs_runtime(app, None, 50_000)
+                meta["firmware_match"] = f"{vr['matched']}/{vr['declared']} declared symbols online, {len(vr['missing_online'])} missing"
+            except ToolError as exc:
+                meta["firmware_match"] = f"check failed: {exc}"
+        st = app.exp_store.status(name)
+        windows = [(se.get("started"), se.get("finished") or time.time()) for se in (st.get("sessions") or []) if se.get("started")]
+        if windows:
+            def inside(ts: str) -> bool:
+                return any(time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(lo - 1)) <= ts[:19]
+                           <= time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(hi + 1)) for lo, hi in windows)
+            meta["audit"] = [a for a in app.guard.tail_audit(20000)
+                             if inside(str(a.get("ts", ""))) and a.get("tool") in ("exp_run", "exp_write", "ads_write", "ads_write_many", "snap_apply", "test_scenario")]
+        md, html = await asyncio.to_thread(X.render_report, sp, runs, ev, meta, app.exp_store.interpretation(name))
+        d = app.exp_store.dir(name)
+        out = {"name": name, "verdict": ev["verdict"], "runs": len(runs)}
+        if fmt in ("md", "both"):
+            (d / "report.md").write_text(md, encoding="utf-8")
+            out["markdown"] = str(d / "report.md")
+        if fmt in ("html", "both"):
+            (d / "report.html").write_text(html, encoding="utf-8")
+            out["html"] = str(d / "report.html")
+        app.audit("exp_report", {"name": name, "fmt": fmt, "interpretation": bool(interpretation)}, OpClass.EDIT, "ok")
+        out["preview"] = md[:3000]
+        return out
+
+    @mcp.tool(annotations=READ)
+    async def exp_compare(a: str, b: str) -> dict[str, Any]:
+        """Two experiments with the same levels side by side: metric deltas and whether their 95 % CIs
+        separate (the before/after question with error bars)."""
+        try:
+            ea = X.evaluate(app.exp_store.spec(a), app.exp_store.runs(a))
+            eb = X.evaluate(app.exp_store.spec(b), app.exp_store.runs(b))
+        except X.ExperimentError as exc:
+            raise ToolError(str(exc)) from exc
+        return X.compare(ea, eb)
+
     # ======================================================================
     # Beckhoff Infosys reference (TwinCAT 3 documentation)
     # ======================================================================
@@ -1848,5 +2093,6 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     import atexit
     atexit.register(app.rec.stop_all)
+    atexit.register(app.stop_experiments)   # registered after → runs first: restore factors, then close recordings
     mcp._tcmcp_app = app  # type: ignore[attr-defined]  (tests)
     return mcp

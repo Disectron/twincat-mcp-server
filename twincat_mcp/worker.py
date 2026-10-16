@@ -74,8 +74,16 @@ class SerialWorker:
 
     def call(self, fn: Callable[..., Any], *args: Any, timeout: float | None = None,
              **kwargs: Any) -> Any:
-        """Blocking variant for use from other worker threads / tests."""
-        return self.submit(fn, *args, **kwargs).result(timeout=timeout)
+        """Blocking variant for use from other worker threads / tests. On timeout the job is
+        cancelled if it has not started (so it cannot run later, unobserved) and cooperative
+        loops are asked to stop if it has."""
+        fut = self.submit(fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout)
+        except cf.TimeoutError:
+            if not fut.cancel():
+                self.cancel_event.set()
+            raise TimeoutError(f"{getattr(fn, '__name__', 'job')} on {self.name} exceeded {timeout} s") from None
 
     def close(self) -> None:
         self._q.put(None)

@@ -22,6 +22,7 @@ SECTIONS = [
     ("tc_", "Meta & safety"), ("wf_", "Workflows (one call, whole chain)"), ("ads_", "Runtime — ADS"),
     ("rec_", "Real-time recorder"), ("test_", "Test bench"), ("snap_", "Snapshots"),
     ("ipc_", "Target OS — System Service"), ("xae_", "XAE Automation Interface"),
+    ("exp_", "Experiments (define → run → evaluate → report)"),
     ("proj_", "Project files (offline)"), ("hmi_", "HMI bindings"), ("tcunit_", "TcUnit"),
     ("infosys_", "Beckhoff Infosys reference (TwinCAT 3 docs)"),
 ]
