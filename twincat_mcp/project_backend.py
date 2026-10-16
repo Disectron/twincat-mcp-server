@@ -55,6 +55,10 @@ class VarDecl:
     init: str | None = None
     at: str | None = None
     comment: str | None = None
+    attrs: dict[str, str] = field(default_factory=dict)   # {attribute 'name' := 'value'} pragmas above the line
+
+
+_RE_ATTR = re.compile(r"\{\s*attribute\s+'([^']+)'\s*(?::=\s*'([^']*)')?\s*\}", re.I)
 
 
 @dataclass
@@ -467,7 +471,7 @@ class ProjectIndex:
         items: list[dict[str, Any]] = []
         truncated = False
 
-        def walk(path: str, u: CodeUnit, depth: int, seen: tuple[str, ...]) -> None:
+        def walk(path: str, u: CodeUnit, depth: int, seen: tuple[str, ...], inherited: dict[str, str] | None = None) -> None:
             nonlocal truncated
             for v in u.vars:
                 if len(items) >= max_items:
@@ -477,14 +481,15 @@ class ProjectIndex:
                     continue
                 if v.section == "VAR_EXTERNAL":
                     continue
-                self._emit(f"{path}.{v.name}", v.type, u, v, depth, seen, items, max_array, walk)
+                attrs = {**(inherited or {}), **v.attrs}   # an instance's pragma applies to its whole subtree
+                self._emit(f"{path}.{v.name}", v.type, u, v, depth, seen, items, max_array, walk, attrs)
             for e in u.extends:
                 eu = self.units.get(e.lower())
                 if eu and eu.name.lower() not in seen:
-                    walk(path, eu, depth, seen + (eu.name.lower(),))
+                    walk(path, eu, depth, seen + (eu.name.lower(),), inherited)
 
         for r in roots:
-            walk(r.name, r, 0, (r.name.lower(),))
+            walk(r.name, r, 0, (r.name.lower(),), dict(r.attrs) if hasattr(r, "attrs") else None)
         kinds: dict[str, int] = {}
         for it in items:
             kinds[it["type"]] = kinds.get(it["type"], 0) + 1
@@ -492,9 +497,10 @@ class ProjectIndex:
                 "roots": [r.name for r in roots], "items": items}
 
     def _emit(self, path: str, type_str: str, u: CodeUnit, v: VarDecl, depth: int, seen: tuple[str, ...],
-              items: list[dict[str, Any]], max_array: int, walk) -> None:
+              items: list[dict[str, Any]], max_array: int, walk, attrs: dict[str, str] | None = None) -> None:
         if depth > 24:
             return
+        extra = {"attrs": attrs} if attrs else {}
         t = type_str.strip()
         m = _RE_ARRAY_OF.match(t)
         if m:
@@ -517,19 +523,19 @@ class ProjectIndex:
                 # row-major enumeration
                 import itertools
                 for coords in itertools.product(*[range(lo, hi + 1) for lo, hi in dims]):
-                    self._emit(f"{path}[{','.join(map(str, coords))}]", elem, u, v, depth + 1, seen, items, max_array, walk)
+                    self._emit(f"{path}[{','.join(map(str, coords))}]", elem, u, v, depth + 1, seen, items, max_array, walk, attrs)
             else:
-                self._emit(f"{path}[*]", elem, u, v, depth + 1, seen, items, max_array, walk)
+                self._emit(f"{path}[*]", elem, u, v, depth + 1, seen, items, max_array, walk, attrs)
             return
         if _RE_PTR.match(t):
-            items.append({"path": path, "type": t, "declared_in": u.name, "section": v.section, "line": v.line})
+            items.append({"path": path, "type": t, "declared_in": u.name, "section": v.section, "line": v.line, **extra})
             return
         tu = self._unit_for_type(t)
         if tu and tu.kind in ("FUNCTION_BLOCK", "STRUCT", "UNION", "PROGRAM") and tu.name.lower() not in seen:
-            walk(path, tu, depth + 1, seen + (tu.name.lower(),))
+            walk(path, tu, depth + 1, seen + (tu.name.lower(),), attrs or None)
             return
         items.append({"path": path, "type": t, "declared_in": u.name, "section": v.section, "line": v.line,
-                      **({"at": v.at} if v.at else {})})
+                      **({"at": v.at} if v.at else {}), **extra})
 
     # ------------------------------------------------------------ write back
     def set_code(self, name: str, declaration: str | None, implementation: str | None,
@@ -614,12 +620,16 @@ def parse_vars(decl: str, base_line: int = 0) -> list[VarDecl]:
         section = m.group(1).upper()
         body = m.group(2)
         body_start_line = decl[:m.start(2)].count("\n")
+        prev_end = 0
         for d in _RE_VAR_DECL.finditer(body):
             line = base_line + body_start_line + body[:d.start()].count("\n")
             cmt = (d.group("cmt") or d.group("cmt2") or "").strip() or None
+            attrs = {a.group(1): (a.group(2) if a.group(2) is not None else "")
+                     for a in _RE_ATTR.finditer(body, prev_end, d.start())}
+            prev_end = d.end()
             for nm in d.group("names").split(","):
                 out.append(VarDecl(nm.strip(), d.group("type").strip(), section, line,
-                                   (d.group("init") or "").strip() or None, d.group("at"), cmt))
+                                   (d.group("init") or "").strip() or None, d.group("at"), cmt, dict(attrs)))
     return out
 
 

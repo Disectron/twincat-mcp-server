@@ -1,6 +1,6 @@
 # twincat-mcp 0.6.0 — tool reference
 
-120 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
+127 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
 ## Meta & safety (6)
 
@@ -48,9 +48,16 @@
 - `ads_discover` [R] — Broadcast search for TwinCAT targets on the local network (UDP 48899): NetId, host name, TwinCAT version, IP — the same thing XAE's 'Broadcast Search' does.
 - `ads_export` [R] — Generate code from the runtime: fmt=csharp (explicit-offset structs + enums for Beckhoff.TwinCAT.Ads ReadAny/WriteAny), typescript (interfaces), json (type descriptions), or csharp_symbols (const symbol paths under prefix). types = struct/enum names; prefix = take the types of every symbol under it.
 
-## Real-time recorder (12)
+## Real-time recorder (19)
 
 - `rec_start` [E] — Start a continuous real-time recording of online PLC variables (runs in the background until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it) or fnmatch pattern. mode: 'cycle' = one…
+- `rec_scan` [R] — Enumerate the variables that could be recorded and what each would cost. source='runtime' walks the live symbol/datatype tables (every scalar leaf under prefix, or all programs/GVLs); source='project' walks the source declarations (works offline). pattern = fnmatch filter on the full path. Returns counts by type and…
+- `rec_profile_save` [E] — Save a named capture profile. Sources combine: explicit symbols (mode='auto' picks cycle for REAL/TIME, change for BOOL/INT/enum, poll for strings — or give cycle|change|poll), a marked checklist (path, or the name given to rec_scan), and/or {attribute 'tcmcp.record' := 'cycle'} pragmas in the source…
+- `rec_profile_list` [R] — Saved capture profiles (name, symbol count, modes, source).
+- `rec_profile_get` [R] — One profile in full: every symbol with its mode and cycle, triggers, per-group cost estimate.
+- `rec_profile_delete` [E] — Delete a profile and its checklist file.
+- `rec_profile_start` [E] — Start recording a saved profile: one recording per (mode, cycle_ms) group, all named '<profile>/<mode>@<cycle>'. Triggers given here override the profile's. Returns the recording ids; rec_profile_stop(name) stops them together, rec_stats/rec_export work per id.
+- `rec_profile_stop` [E] — Stop every live recording started from this profile; returns per-recording status + stats.
 - `rec_list` [R] — Recordings of this session (live status) and recording files on disk.
 - `rec_status` [R] — Live status of one recording: events, rate, drops, armed/triggered, last value per symbol.
 - `rec_snapshot` [R] — Most recent events of a running (or finished) recording — the live tail.

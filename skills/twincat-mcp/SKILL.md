@@ -18,6 +18,12 @@ bypass by raw address. State the recording / snapshot ids you create.
 → `rec_pulses` / `rec_latency` on the recording → `ads_task_stats` for cost → report pass/fail
 with numbers → `tcunit_scaffold` + `tcunit_run` to make it permanent.
 
+## Batch-after-batch capture
+`rec_scan prefix=<chain> checklist=<name>` → user marks the CSV (or `{attribute 'tcmcp.record'}` in
+source) → `rec_profile_save <name> from_checklist=<name> stop_when=...` → per batch:
+`rec_profile_start <name>` → run → `rec_profile_stop <name>` → `rec_stats` / `rec_compare` against the
+previous batch's ids. Check `ads_task_stats` once with the profile live; thin it if exceed counts move.
+
 ## Capture everything while the machine runs
 `rec_start prefix=MAIN mode=change cycle_ms=<task cycle>` (or `pattern`) → work → `rec_stop` →
 `rec_export csv_wide` for spreadsheets; `ads_dump` for a one-shot full snapshot; `snap_save` /

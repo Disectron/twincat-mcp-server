@@ -48,6 +48,7 @@ from . import workflows
 from . import exporters
 from .hmi import HmiIndex
 from .infosys import InfosysIndex, InfosysError
+from . import profiles as capture
 from pathlib import Path
 
 INSTRUCTIONS = """\
@@ -112,6 +113,7 @@ class App:
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
+        self.profiles = capture.ProfileStore(Path(cfg.safety.audit_log).parent / "profiles")
         self.docs: InfosysIndex | None = None
         if cfg.docs.enabled:
             try:
@@ -573,6 +575,217 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                  name=name, max_symbols=max_symbols, timeout=120)
         app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode}, OpClass.EDIT, "ok")
         return res
+
+
+    # ======================================================================
+    # Capture profiles: scan → choose → save → start
+    # ======================================================================
+    def _scan_runtime(prefix: str | None, pattern: str | None, max_items: int) -> list[dict[str, Any]]:
+        import fnmatch
+        out: list[dict[str, Any]] = []
+        if prefix:
+            groups = app.ads.leaves_under(prefix, max_items)
+        else:
+            groups = []
+            budget = max_items
+            for r in app.ads.roots(None, False):
+                s, lv = app.ads.leaves(r.name, budget)
+                groups.append((s, lv))
+                budget -= len(lv)
+                if budget <= 0:
+                    break
+        pat = pattern.lower() if pattern else None
+        for _root, leaves in groups:
+            for lf in leaves:
+                if pat and not fnmatch.fnmatchcase(lf.path.lower(), pat):
+                    continue
+                out.append({"path": lf.path, "type": lf.type, "size": lf.size})
+                if len(out) >= max_items:
+                    return out
+        return out
+
+    @mcp.tool(annotations=READ)
+    async def rec_scan(prefix: str | None = None, pattern: str | None = None, source: str = "runtime",
+                       checklist: str | None = None, preselect: list[str] | None = None, cycle_ms: float = 10,
+                       max_items: int = 5000, show: int = 100) -> dict[str, Any]:
+        """Enumerate the variables that could be recorded and what each would cost. source='runtime'
+        walks the live symbol/datatype tables (every scalar leaf under prefix, or all programs/GVLs);
+        source='project' walks the source declarations (works offline). pattern = fnmatch filter on the
+        full path. Returns counts by type and by group (program.instance) with bytes/s estimates at
+        cycle_ms, a suggested mode per leaf, and — when checklist='<name>' — writes
+        ~/.twincat_mcp/profiles/<name>.checklist.csv with a 'select' column to mark (preselect =
+        patterns already marked). Then rec_profile_save(name, from_checklist=name)."""
+        if source == "runtime":
+            leaves = await app.ads_call(_scan_runtime, prefix, pattern, max_items, timeout=300, slow=True)
+        elif source == "project":
+            import fnmatch
+            pv = await app.proj_call(app.proj.variables, prefix, 64, max_items * 4, False)
+            leaves = [{"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")}
+                      for it in pv["items"] if "[*]" not in it["path"]
+                      and (not pattern or fnmatch.fnmatchcase(it["path"].lower(), pattern.lower()))][:max_items]
+        else:
+            raise ToolError("source must be runtime | project")
+        if not leaves:
+            raise ToolError("scan found no variables (prefix/pattern wrong, or not connected / not scanned)")
+        by_type: dict[str, int] = {}
+        by_group: dict[str, dict[str, Any]] = {}
+        modes: dict[str, int] = {}
+        for lf in leaves:
+            by_type[lf["type"]] = by_type.get(lf["type"], 0) + 1
+            sm = capture.suggest_mode(lf["type"])
+            modes[sm] = modes.get(sm, 0) + 1
+            g = by_group.setdefault(capture.group_of(lf["path"]), {"leaves": 0, "bytes_per_s_at_cycle": 0.0})
+            g["leaves"] += 1
+            g["bytes_per_s_at_cycle"] += capture.estimate_bytes_per_s(lf.get("size") or 8, sm, cycle_ms)
+        for g in by_group.values():
+            g["bytes_per_s_at_cycle"] = round(g["bytes_per_s_at_cycle"])
+        res: dict[str, Any] = {"source": source, "count": len(leaves), "by_type": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
+                               "suggested_modes": modes, "groups": by_group,
+                               "items": [{"path": lf["path"], "type": lf["type"], "size": lf.get("size"), "suggested_mode": capture.suggest_mode(lf["type"]),
+                                          **({"attrs": lf["attrs"]} if lf.get("attrs") else {})} for lf in leaves[:show]],
+                               "truncated_items": len(leaves) > show}
+        if checklist:
+            path = app.profiles.checklist_path(checklist)
+            await asyncio.to_thread(path.write_text, capture.build_checklist(leaves, cycle_ms, preselect), "utf-8")
+            res["checklist"] = str(path)
+            res["next"] = f"mark 'x' in the select column, then rec_profile_save(name={checklist!r}, from_checklist={checklist!r})"
+        return res
+
+    @mcp.tool(annotations=EDIT)
+    async def rec_profile_save(name: str, symbols: list[str] | None = None, from_checklist: str | None = None,
+                               from_attributes: bool = False, scope: str | None = None, mode: str = "auto",
+                               cycle_ms: float = 10, start_when: str | None = None, stop_when: str | None = None,
+                               pre_trigger_ms: float = 0, duration_s: float | None = None,
+                               description: str | None = None, replace: bool = True) -> dict[str, Any]:
+        """Save a named capture profile. Sources combine: explicit symbols (mode='auto' picks cycle for
+        REAL/TIME, change for BOOL/INT/enum, poll for strings — or give cycle|change|poll), a marked
+        checklist (path, or the name given to rec_scan), and/or {attribute 'tcmcp.record' := 'cycle'}
+        pragmas in the source (from_attributes=true; scope limits to one program). Triggers and the
+        default cycle are stored with the profile. rec_profile_start(name) replays it."""
+        items: list[capture.ProfileItem] = []
+        src = []
+        if symbols:
+            for sym in symbols:
+                m = mode
+                typ = None
+                if mode == "auto":
+                    try:
+                        info = await app.ads_call(app.ads.symbol_info, sym, timeout=15)
+                        typ, m = info.type, capture.suggest_mode(info.type)
+                    except ToolError:
+                        m = "change"
+                if m not in capture.MODES:
+                    raise ToolError("mode must be auto | cycle | change | poll")
+                items.append(capture.ProfileItem(sym, m, None, typ))
+            src.append("explicit")
+        if from_checklist:
+            pth = Path(from_checklist)
+            if not pth.is_file():
+                pth = app.profiles.checklist_path(from_checklist)
+            if not pth.is_file():
+                raise ToolError(f"checklist not found: {from_checklist} (rec_scan checklist=... writes it)")
+            try:
+                items += capture.parse_checklist(pth.read_text(encoding="utf-8-sig"), cycle_ms)
+            except capture.ProfileError as exc:
+                raise ToolError(str(exc)) from exc
+            src.append("checklist")
+        if from_attributes:
+            pv = await app.proj_call(app.proj.variables, scope, 64, 200_000, False)
+            try:
+                found = capture.items_from_attributes(pv["items"], cycle_ms)
+            except capture.ProfileError as exc:
+                raise ToolError(str(exc)) from exc
+            if not found:
+                raise ToolError(f"no declaration carries {{attribute '{capture.ATTR_RECORD}' := ...}} in {scope or 'the project'}")
+            items += found
+            src.append("attributes")
+        if not items:
+            raise ToolError("give symbols, from_checklist or from_attributes")
+        dedup: dict[str, capture.ProfileItem] = {}
+        for it in items:
+            dedup[it.symbol.lower()] = it     # later sources override earlier ones
+        prof = capture.CaptureProfile(name=name, items=list(dedup.values()), description=description, cycle_ms=cycle_ms,
+                                start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
+                                duration_s=duration_s, source="+".join(src))
+        try:
+            path = await asyncio.to_thread(app.profiles.save, prof, replace)
+        except capture.ProfileError as exc:
+            raise ToolError(str(exc)) from exc
+        app.audit("rec_profile_save", {"name": name, "count": len(prof.items), "source": prof.source}, OpClass.EDIT, "ok")
+        return {"saved": str(path), **prof.to_dict()}
+
+    @mcp.tool(annotations=READ)
+    async def rec_profile_list() -> dict[str, Any]:
+        """Saved capture profiles (name, symbol count, modes, source)."""
+        return {"profiles": await asyncio.to_thread(app.profiles.list), "dir": str(app.profiles.root)}
+
+    @mcp.tool(annotations=READ)
+    async def rec_profile_get(name: str) -> dict[str, Any]:
+        """One profile in full: every symbol with its mode and cycle, triggers, per-group cost estimate."""
+        try:
+            return (await asyncio.to_thread(app.profiles.get, name)).to_dict()
+        except capture.ProfileError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool(annotations=EDIT)
+    async def rec_profile_delete(name: str) -> dict[str, Any]:
+        """Delete a profile and its checklist file."""
+        try:
+            ok = await asyncio.to_thread(app.profiles.delete, name)
+        except capture.ProfileError as exc:
+            raise ToolError(str(exc)) from exc
+        app.audit("rec_profile_delete", {"name": name}, OpClass.EDIT, "ok" if ok else "absent")
+        return {"deleted": ok}
+
+    @mcp.tool(annotations=EDIT)
+    async def rec_profile_start(name: str, start_when: str | None = None, stop_when: str | None = None,
+                                duration_s: float | None = None, max_events: int | None = 5_000_000) -> dict[str, Any]:
+        """Start recording a saved profile: one recording per (mode, cycle_ms) group, all named
+        '<profile>/<mode>@<cycle>'. Triggers given here override the profile's. Returns the recording
+        ids; rec_profile_stop(name) stops them together, rec_stats/rec_export work per id."""
+        try:
+            prof = await asyncio.to_thread(app.profiles.get, name)
+        except capture.ProfileError as exc:
+            raise ToolError(str(exc)) from exc
+        started: list[dict[str, Any]] = []
+        # a trigger's symbol must be inside each recording that uses the trigger
+        cond_syms = [m.group(1) for c in (start_when or prof.start_when, stop_when or prof.stop_when) if c
+                     for m in [re.match(r"\s*([A-Za-z_][\w\.\[\]]*)", c)] if m]
+        try:
+            for (mode, cyc), its in prof.groups().items():
+                syms = [i.symbol for i in its]
+                low = {x.lower() for x in syms}
+                syms += [c for c in cond_syms if c.lower() not in low]
+                res = await app.rec_call(app.rec.start, symbols=syms, prefix=None, pattern=None,
+                                         mode=mode, cycle_ms=cyc, duration_s=duration_s or prof.duration_s,
+                                         max_events=max_events, start_when=start_when or prof.start_when,
+                                         stop_when=stop_when or prof.stop_when, pre_trigger_ms=prof.pre_trigger_ms,
+                                         name=f"{name}/{mode}@{cyc:g}", max_symbols=max(len(its), 1) + 50, timeout=180)
+                nsym = res.get("symbols")
+                started.append({"id": res["id"], "mode": mode, "cycle_ms": cyc,
+                                "symbols": nsym if isinstance(nsym, int) else len(nsym or []),
+                                "armed": res.get("armed"), "file": res.get("file")})
+        except ToolError:
+            for s0 in started:
+                try:
+                    await app.rec_call(app.rec.stop, s0["id"], "profile start failed", timeout=30)
+                except ToolError:
+                    pass
+            raise
+        app.audit("rec_profile_start", {"profile": name, "recordings": [s0["id"] for s0 in started]}, OpClass.EDIT, "ok")
+        return {"profile": name, "recordings": started, "groups": len(started)}
+
+    @mcp.tool(annotations=EDIT)
+    async def rec_profile_stop(name: str) -> dict[str, Any]:
+        """Stop every live recording started from this profile; returns per-recording status + stats."""
+        out = []
+        for rid, rec in list(app.rec.recs.items()):
+            if rec.active and (rec.name or "").startswith(f"{name}/"):
+                out.append(await app.rec_call(app.rec.stop, rid, timeout=60))
+        if not out:
+            raise ToolError(f"no live recording of profile {name!r} (rec_list shows what is running)")
+        app.audit("rec_profile_stop", {"profile": name, "recordings": [o["id"] for o in out]}, OpClass.EDIT, "ok")
+        return {"profile": name, "stopped": out}
 
     @mcp.tool(annotations=READ)
     async def rec_list() -> dict[str, Any]:

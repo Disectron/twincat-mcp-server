@@ -81,7 +81,7 @@ safety modes. Windows only (the bundle runs `cmd /d /c server\launch.cmd`, which
 git clone <this repo> C:\tools\twincat-mcp
 cd C:\tools\twincat-mcp
 scripts\install.cmd            :: venv + pip install -e .[dev] + prints effective config
-.venv\Scripts\python -m pytest :: 140 tests, all mocked, run anywhere
+.venv\Scripts\python -m pytest :: 146 tests, all mocked, run anywhere
 cd C:\Projects\DrumFilling
 claude mcp add twincat -e TCMCP_SOLUTION=%CD%\DrumFilling.sln -e TCMCP_AMS_NET_ID=5.12.34.56.1.1 -e TCMCP_MODE=guarded -e TCMCP_MAX_MODE=full -- C:\tools\twincat-mcp\.venv\Scripts\python.exe -m twincat_mcp
 ```
@@ -127,7 +127,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **"Absolute control" setting:** `TCMCP_MODE=full TCMCP_MAX_MODE=full TCMCP_CONFIRM=0`. In that configuration a single mis-aimed tool call can stop the PLC, activate a half-built configuration or reboot the IPC. The server will do exactly what it is told; the only remaining gate is the MCP client's own tool-permission prompt. Keep a denylist for E-stop/safety symbols regardless.
 
-## Tools (120) + 5 prompts
+## Tools (127) + 5 prompts
 
 **Workflows (one call = a whole chain)** `wf_debug_symbol` · `wf_fb_profile` · `wf_release_check` · `wf_project_overview`
 
@@ -150,6 +150,8 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 **HMI (TE2000 / TcVIS)** `hmi_scan` · `hmi_bindings` · `hmi_vs_runtime`
 
 **TcUnit** `tcunit_results` · `tcunit_run[disable_io]` · `tcunit_scaffold`
+
+**Capture profiles** `rec_scan` · `rec_profile_save` · `rec_profile_list` · `rec_profile_get` · `rec_profile_delete` · `rec_profile_start` · `rec_profile_stop`
 
 **Infosys reference (TwinCAT 3)** `infosys_books` · `infosys_index` · `infosys_search_symbols` · `infosys_declaration` · `infosys_search` · `infosys_search_code` · `infosys_get_page`
 
@@ -223,6 +225,33 @@ If the datatype upload fails on a target, every tool falls back to the member sy
 ```
 
 Modes: `cycle` = one sample per symbol per `cycle_ms` (set it to the task cycle for a complete trace; expensive), `change` = only when the value changes (cheap, exact edge times), `poll` = sum-read from the PC (any port, no notifications). Triggers: `start_when='MAIN.bStart == TRUE' pre_trigger_ms=500` keeps the half second before the trigger; `stop_when`, `duration_s`, `max_events` end it. Events stream to `~/.twincat_mcp/recordings/<id>.jsonl`; stats are incremental, so a two-hour recording costs no RAM. Recordings from earlier sessions stay readable (`rec_list`, `rec_read`, `rec_pulses`, `rec_export`).
+
+## Choosing what to record: capture profiles
+
+`rec_start` decides the symbol set per call. For batch-after-batch work the set should be decided
+once, from a scan of what exists, and replayed. Three ways to choose, all ending in a named profile:
+
+1. **Checklist.** `rec_scan prefix=MAIN.fbDispense checklist=batch` (or `source=project` offline) lists
+   every scalar leaf with type, size, a suggested mode (BOOL/INT/enum → `change`, REAL/TIME → `cycle`,
+   strings/arrays → `poll`) and the bytes/s it would cost, grouped by `program.instance`, and writes
+   `~/.twincat_mcp/profiles/batch.checklist.csv`. Put an `x` in `select`, optionally override `mode` /
+   `cycle_ms` per row, then `rec_profile_save name=batch from_checklist=batch`. `preselect=["*.bDone"]`
+   pre-marks patterns.
+2. **In the source.** `{attribute 'tcmcp.record' := 'cycle'}` above a declaration selects it; on an
+   FB/STRUCT instance it selects the whole subtree, an inner `'off'` carves holes,
+   `{attribute 'tcmcp.cycle_ms' := '1'}` pins the rate. `rec_profile_save name=batch from_attributes=true`
+   collects them through the project index — the selection is versioned with the code and survives
+   renames the way nothing in a chat does. TwinCAT ignores unknown attributes.
+3. **Explicit.** `rec_profile_save name=x symbols=[...] mode=auto` — `auto` reads the runtime type.
+
+`rec_profile_start batch` starts one recording per (mode, cycle) group, named `batch/cycle@1`,
+`batch/change@10`…, with the profile's `start_when` / `stop_when` / `pre_trigger_ms` (trigger symbols
+are added to every group automatically); `rec_profile_stop batch` ends them together; `rec_stats`,
+`rec_export`, `rec_compare` work per recording as before. Sources combine and later ones override
+earlier ones, so a checklist can narrow what the attributes selected.
+
+"By standard" there is no default selection: nothing is recorded that was not chosen, and the
+suggested modes are heuristics shown next to the choice, not applied behind it.
 
 ## Testing an FB on the live machine
 
@@ -329,7 +358,7 @@ Anything that fails: the tool error text contains the ADS/HRESULT code; paste it
 
 ## Changelog
 
-**0.6.0** — `infosys_*` reference lookup (7 tools): sitemap-driven book list, per-library local index with FTS5, symbol search, declarations as data, code-example search, live page → Markdown, sitemap-verified web fallback, TwinCAT 2 filtered out; `scripts/gen_tools_md.py`. Packaging: Claude Code plugin + marketplace in `.claude-plugin/` (`/plugin install twincat-mcp@twincat-mcp`, `userConfig` for Python/AmsNetId/modes), Claude Desktop `.mcpb` bundle (`packaging/mcpb/build.py`, manifest 0.3, tool list generated from the server, passes `mcpb validate`), self-bootstrapping launcher `scripts/launch.py` (+ `launch.cmd`) that creates the venv on first start and reinstalls only when the shipped sources change; skill moved to `skills/twincat-mcp/`; HTTP mode bearer-token gate for claude.ai remote connectors. Plugin path verified end-to-end on Linux (install → venv → `tc_doctor` via `mcp__plugin_twincat-mcp_twincat__tc_doctor`); `launch.cmd` Python discovery is untested on Windows.
+**0.6.0** — capture profiles (7 tools): `rec_scan` of runtime or source with cost estimates and a markable checklist, `{attribute 'tcmcp.record'}` pragmas collected through `proj_variables` (pragmas now parsed and inherited down instance trees), named profiles replayed as one recording per mode group. `infosys_*` reference lookup (7 tools): sitemap-driven book list, per-library local index with FTS5, symbol search, declarations as data, code-example search, live page → Markdown, sitemap-verified web fallback, TwinCAT 2 filtered out; `scripts/gen_tools_md.py`. Packaging: Claude Code plugin + marketplace in `.claude-plugin/` (`/plugin install twincat-mcp@twincat-mcp`, `userConfig` for Python/AmsNetId/modes), Claude Desktop `.mcpb` bundle (`packaging/mcpb/build.py`, manifest 0.3, tool list generated from the server, passes `mcpb validate`), self-bootstrapping launcher `scripts/launch.py` (+ `launch.cmd`) that creates the venv on first start and reinstalls only when the shipped sources change; skill moved to `skills/twincat-mcp/`; HTTP mode bearer-token gate for claude.ai remote connectors. Plugin path verified end-to-end on Linux (install → venv → `tc_doctor` via `mcp__plugin_twincat-mcp_twincat__tc_doctor`); `launch.cmd` Python discovery is untested on Windows.
 
 **0.5.0** — dialog watchdog, TwinSAFE guard, XML validation/fixes + LineIds regeneration, TE2000/TcVIS HMI binding index with runtime/source cross-check, I/O disable, variable links, UDP discovery, Windows event log, C#/TypeScript/JSON exporters, snapshot apply, session report, `naming_prefixes` config.
 
@@ -348,7 +377,7 @@ Scope/TE13xx recording, TE1200 static analysis, NC axis commissioning, Safety (T
 ## Development
 
 ```
-python -m pytest            # 140 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation, packaging)
+python -m pytest            # 146 tests (safety matrix, type codec, project parser, fake ADS incl. notifications/RPC, fake COM, recorder, bench, lint, MCP e2e incl. elicitation, packaging)
 python packaging/mcpb/build.py      # dist/twincat-mcp-<version>.mcpb; npx @anthropic-ai/mcpb validate runs if Node is present
 claude plugin validate .            # plugin + marketplace manifests
 python -m twincat_mcp --print-config
