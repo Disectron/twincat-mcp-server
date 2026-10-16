@@ -58,7 +58,10 @@ def _clean(caption: str) -> str:
 
 
 def list_dialogs(pid: int | None) -> list[Dialog]:  # pragma: no cover - needs Windows
-    if not IS_WIN:
+    """Dialogs (#32770) owned by the XAE process ``pid``. With ``pid`` None the answer is empty on
+    purpose: without a known shell process the scan would list — and ``xae_dialog_resolve`` could
+    click — any program's dialog on the desktop (Windows CI surfaced a 'System Properties' prompt)."""
+    if not IS_WIN or pid is None:
         return []
     found: list[Dialog] = []
 
@@ -67,7 +70,7 @@ def list_dialogs(pid: int | None) -> list[Dialog]:  # pragma: no cover - needs W
             if not win32gui.IsWindowVisible(hwnd) or win32gui.GetClassName(hwnd) != DIALOG_CLASS:
                 return True
             _tid, wpid = win32process.GetWindowThreadProcessId(hwnd)
-            if pid is not None and wpid != pid:
+            if wpid != pid:
                 return True
             title = win32gui.GetWindowText(hwnd)
             texts: list[str] = []
@@ -197,5 +200,6 @@ class DialogWatchdog:
     def status(self) -> dict[str, Any]:
         with self._lock:
             pend = [d.to_dict() for d in self.pending]
-        return {"running": bool(self._thread and self._thread.is_alive()), "pid": self.pid, "rules": self.rules,
-                "pending": pend, "recent": self.log[-20:]}
+        return {"running": bool(self._thread and self._thread.is_alive()), "pid": self.pid,
+                "scope": f"XAE process {self.pid}" if self.pid else "none — no XAE process known; dialogs of other programs are never listed",
+                "rules": self.rules, "pending": pend, "recent": self.log[-20:]}

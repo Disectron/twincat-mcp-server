@@ -23,6 +23,7 @@ TINC (NC), TIRS (safety), TIRT (tasks under TIRC^Tasks).
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
@@ -32,6 +33,8 @@ from typing import Any, Callable
 
 from .config import XaeConfig
 from .dialogs import DialogWatchdog
+
+log = logging.getLogger(__name__)
 
 IS_WIN = sys.platform == "win32"
 
@@ -208,6 +211,15 @@ class XaeBackend:
                 self.pid = int(pick["moniker"].rsplit(":", 1)[1])
             except ValueError:
                 self.pid = None
+        if self.pid is None and sys.platform == "win32":
+            # launched via Dispatch (no ROT moniker): take the pid from the shell's main window, so the
+            # dialog watchdog has a process scope — without one it deliberately watches nothing
+            try:
+                import win32process  # type: ignore
+                hwnd = int(self.dte.MainWindow.HWnd)
+                self.pid = int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
+            except Exception as exc:  # noqa: BLE001
+                log.warning("XAE pid unknown (%s); dialog watchdog disabled until re-attach", exc)
         if self.cfg.dialog_watchdog:
             self.watchdog.start(self.pid)
         if launched:
