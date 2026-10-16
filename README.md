@@ -56,11 +56,11 @@ sources change.
 The repo is its own plugin marketplace (`.claude-plugin/`). Inside Claude Code:
 
 ```
-/plugin marketplace add <owner>/<repo>        :: GitHub; or a local clone: /plugin marketplace add C:\tools\twincat-mcp
+/plugin marketplace add Disectron/twincat-mcp-server        :: GitHub; or a local clone: /plugin marketplace add C:\tools\twincat-mcp
 /plugin install twincat-mcp@twincat-mcp
 ```
 
-One step on Claude Code ≥ 2.1.275: `/plugin install twincat-mcp --marketplace <owner>/<repo>`. The plugin brings
+One step on Claude Code ≥ 2.1.275: `/plugin install twincat-mcp --marketplace Disectron/twincat-mcp-server`. The plugin brings
 the MCP server (named `twincat`, tools appear as `mcp__plugin_twincat-mcp_twincat__<tool>`), the `twincat-mcp`
 skill and the 5 prompts. `/plugin configure twincat-mcp@twincat-mcp` sets the Python executable (default
 `python`), default AmsNetId, start/ceiling safety mode and an optional config TOML; everything project-specific

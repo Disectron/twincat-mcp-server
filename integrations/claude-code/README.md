@@ -18,8 +18,8 @@ The repo is its own marketplace: `.claude-plugin/marketplace.json` lists one plu
 `.claude-plugin/plugin.json` declares the `twincat` MCP server, `skills/twincat-mcp/` is the skill.
 
 ```
-/plugin marketplace add <owner>/<repo>          :: or a local clone: /plugin marketplace add C:\tools\twincat-mcp
-/plugin install twincat-mcp@twincat-mcp         :: one step on 2.1.275+: /plugin install twincat-mcp --marketplace <owner>/<repo>
+/plugin marketplace add Disectron/twincat-mcp-server          :: or a local clone: /plugin marketplace add C:\tools\twincat-mcp
+/plugin install twincat-mcp@twincat-mcp         :: one step on 2.1.275+: /plugin install twincat-mcp --marketplace Disectron/twincat-mcp-server
 /plugin configure twincat-mcp@twincat-mcp       :: python_exe, ams_net_id, mode, max_mode, config_file (all have defaults / may stay empty)
 ```
 

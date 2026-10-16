@@ -18,6 +18,11 @@ dependencies = [
     "pyyaml>=6",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Disectron/twincat-mcp-server"
+Repository = "https://github.com/Disectron/twincat-mcp-server"
+Issues = "https://github.com/Disectron/twincat-mcp-server/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 

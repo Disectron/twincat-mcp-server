@@ -3,17 +3,34 @@
   "name": "twincat-mcp",
   "display_name": "TwinCAT MCP",
   "version": "@VERSION@",
-  "description": "Beckhoff TwinCAT 3: live PLC variables over ADS, real-time recording, XAE build/activate/deploy, .TcPOU editing, TcUnit, HMI bindings — 139 audited tools.",
+  "description": "Beckhoff TwinCAT 3: live PLC variables over ADS, real-time recording, XAE build/activate/deploy, .TcPOU editing, TcUnit, HMI bindings \u2014 139 audited tools.",
   "long_description": "Gives Claude audited control of a TwinCAT 3 engineering PC and its target IPC. Read and write every PLC variable (nested structs, arrays, enums) over ADS, record symbols at PLC cycle resolution, run test scenarios against function blocks, build and activate from the open XAE shell, edit POUs, run TcUnit, cross-check HMI bindings. Writes are gated by a safety mode (readonly / guarded / full), allow/deny lists and per-machine confirmation tokens; every mutating call is written to a JSONL audit log.\n\nRequires: Windows engineering PC with TwinCAT XAE (or XAR) and a 64-bit Python 3.10+. First start creates a private virtualenv under %LOCALAPPDATA%\\twincat-mcp and installs the Python dependencies (needs PyPI access once, about a minute).",
-  "author": { "name": "Ryan Harris / Transflo Pumps" },
+  "author": {
+    "name": "Ryan Harris / Transflo Pumps"
+  },
   "license": "MIT",
-  "keywords": ["twincat", "beckhoff", "plc", "ads", "iec-61131-3", "structured-text", "tcunit", "industrial-automation"],
+  "keywords": [
+    "twincat",
+    "beckhoff",
+    "plc",
+    "ads",
+    "iec-61131-3",
+    "structured-text",
+    "tcunit",
+    "industrial-automation"
+  ],
   "server": {
     "type": "python",
     "entry_point": "server/launch.py",
     "mcp_config": {
       "command": "cmd",
-      "args": ["/d", "/c", "${__dirname}${/}server${/}launch.cmd", "--src", "${__dirname}${/}server${/}src"],
+      "args": [
+        "/d",
+        "/c",
+        "${__dirname}${/}server${/}launch.cmd",
+        "--src",
+        "${__dirname}${/}server${/}src"
+      ],
       "env": {
         "TCMCP_PYTHON": "${user_config.python_exe}",
         "TCMCP_SOLUTION": "${user_config.solution}",
@@ -31,8 +48,12 @@
   "prompts": "@PROMPTS@",
   "compatibility": {
     "claude_desktop": ">=0.10.0",
-    "platforms": ["win32"],
-    "runtimes": { "python": ">=3.10" }
+    "platforms": [
+      "win32"
+    ],
+    "runtimes": {
+      "python": ">=3.10"
+    }
   },
   "user_config": {
     "solution": {
@@ -50,7 +71,7 @@
     "ams_net_id": {
       "type": "string",
       "title": "Default target AmsNetId",
-      "description": "AmsNetId of the IPC, e.g. 5.12.34.56.1.1 (XAE → Choose Target). Empty = local runtime on this PC.",
+      "description": "AmsNetId of the IPC, e.g. 5.12.34.56.1.1 (XAE \u2192 Choose Target). Empty = local runtime on this PC.",
       "required": false
     },
     "mode": {
@@ -79,5 +100,10 @@
       "description": "Full path to a 64-bit python.exe 3.10+. Leave empty to auto-detect (py -3, python on PATH, %LOCALAPPDATA%\\Programs\\Python).",
       "required": false
     }
+  },
+  "homepage": "https://github.com/Disectron/twincat-mcp-server",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Disectron/twincat-mcp-server"
   }
 }
