@@ -20,6 +20,18 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install
         run: python -m pip install --quiet -e ".[dev]"
+      - name: Stand-in TcAdsDll.dll (Windows runner has no TwinCAT)
+        if: runner.os == 'Windows'
+        # pyads loads TcAdsDll.dll at import time and resolves it via <TWINCAT3DIR>\..\Common64. Any loadable
+        # 64-bit DLL under that name lets the import succeed; the tests only use fake connections, and a real
+        # ADS call against this stand-in fails with AttributeError (no such export) rather than reaching hardware.
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "tc"
+          New-Item -ItemType Directory -Force (Join-Path $root "Common64") | Out-Null
+          Copy-Item "$env:SystemRoot\System32\version.dll" (Join-Path $root "Common64\TcAdsDll.dll")
+          "TWINCAT3DIR=$(Join-Path $root '3.1')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          python -c "import pyads, pyads.pyads_ex as x; print('pyads import ok via', x._adsDLL)"
       - name: Test
         shell: bash
         run: |
