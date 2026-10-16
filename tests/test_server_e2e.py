@@ -88,7 +88,11 @@ async def test_ads_read_and_guarded_write(monkeypatch, project_dir):
         res = await s.call_tool("ads_plc_state", {"action": "stop", "confirm_token": tok})
         assert not res.is_error and payload(res)["after"]["ads_state_name"] == "STOP"
         audit = payload(await s.call_tool("tc_audit_tail", {"n": 10}))
-        assert [a["tool"] for a in audit][-3:] == ["ads_write", "tc_request_confirmation", "ads_plc_state"]
+        # refusals are evidence: the denied write and the token-less control attempt are logged as 'refused'
+        assert [(a["tool"], a["outcome"]) for a in audit][-5:] == [
+            ("ads_write", "refused"), ("ads_write", "ok"), ("ads_plc_state", "refused"),
+            ("tc_request_confirmation", "issued"), ("ads_plc_state", "ok")]
+        assert "not in write_allowlist" in str(audit[-5]["detail"])
 
 
 @pytest.mark.anyio

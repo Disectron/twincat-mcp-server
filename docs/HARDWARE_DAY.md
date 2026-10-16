@@ -4,7 +4,7 @@ Everything in this repository was built and tested against fakes on Linux. This 
 exercise it on hardware so that each failure is isolated to one layer, with what to paste back when
 something breaks. Use a **non-production target** for anything from step 6 on.
 
-## 0. Prerequisites and install (20 min)
+## 0. Prerequisites and install (20 min) — `INSTALL.md` has the long form and the smoke test; do that first
 
 On the engineering PC, before anything else:
 

@@ -252,6 +252,8 @@ class App:
             needs_token = confirm_token is None and "needs a confirm_token" in str(exc) \
                 and op in (OpClass.CONTROL, OpClass.DESTRUCTIVE)
             if not needs_token or ctx is None:
+                # a refusal is evidence too: who tried what, and why it did not happen
+                self.guard.audit(action, {"target": target, "scope": scope}, op, "refused", str(exc))
                 raise ToolError(str(exc)) from exc
         # elicitation path
         try:
@@ -259,6 +261,8 @@ class App:
                 f"twincat-mcp wants to run {action} on {target or 'the target'} — machine {scope} "
                 f"(mode={self.guard.mode}). Allow?", ConfirmSchema)
         except Exception as exc:  # noqa: BLE001 — client has no elicitation support
+            self.guard.audit(action, {"target": target, "scope": scope}, op, "refused",
+                             f"needs confirm_token; client has no elicitation ({type(exc).__name__})")
             raise ToolError(
                 f"{action} on {target!r} needs confirmation and this client does not support "
                 f"elicitation ({type(exc).__name__}). Call tc_request_confirmation(action={action!r}, "
@@ -267,6 +271,7 @@ class App:
         if res.action == "accept" and res.data is not None and res.data.confirm:
             self.guard.audit(action, {"target": target, "scope": scope}, op, "human-confirmed-elicitation")
             return
+        self.guard.audit(action, {"target": target, "scope": scope}, op, f"declined-elicitation:{res.action}")
         raise ToolError(f"{action} on {target!r} was declined by the user ({res.action}).")
 
     def audit(self, tool: str, args: dict[str, Any], op: OpClass, outcome: str, detail: Any = None) -> None:
