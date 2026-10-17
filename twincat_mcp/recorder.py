@@ -423,6 +423,7 @@ class Recording:
         self.meta = meta
         self.key = key
         self.manifest: dict[str, Any] | None = None
+        self.type_info: dict[str, dict[str, Any]] = {}   # R3: datatype GUID / layout per symbol
         self.q: "queue.Queue[Any]" = queue.Queue(maxsize=200_000)
         self.events = 0             # leaf values represented in the file
         self.samples = 0            # rows written (block samples / poll cycles)
@@ -507,7 +508,8 @@ class Recording:
         return {"_header": True, "format": 2, "id": self.id, "name": self.name, "mode": self.mode,
                 "cycle_ms": self.cycle_ms, "time_source": self.time_source,
                 "symbols": [{"id": self.sids[s.name], "name": s.name, "type": s.type, "size": s.size,
-                             "igrp": s.index_group, "ioffs": s.index_offset} for s in self.symbols],
+                             "igrp": s.index_group, "ioffs": s.index_offset, **self.type_info.get(s.name, {})}
+                            for s in self.symbols],
                 "blocks": [b.header() for b in self.blocks],
                 "created": dt.datetime.fromtimestamp(self.created, dt.timezone.utc).isoformat(), **self.meta, **extra}
 
@@ -1014,6 +1016,26 @@ def manifest_path(path: Path) -> Path:
     return path.with_suffix(MANIFEST_SUFFIX)
 
 
+def provenance_path(export: Path) -> Path:
+    """<export>.provenance.json next to an exported file (x.wide.csv → x.wide.csv.provenance.json)."""
+    return export.with_name(export.name + ".provenance.json")
+
+
+_FT_EPOCH = dt.datetime(1601, 1, 1, tzinfo=dt.timezone.utc)
+_FT_SEC_CACHE: dict[int, str] = {}
+
+
+def _ft_cols(ft: int) -> list[Any]:
+    """[plc_filetime, time_utc] — time_utc is exact: whole seconds + the 7-digit 100 ns remainder, no float."""
+    sec, frac = divmod(ft, 10_000_000)
+    base = _FT_SEC_CACHE.get(sec)
+    if base is None:
+        if len(_FT_SEC_CACHE) > 4096:
+            _FT_SEC_CACHE.clear()
+        base = _FT_SEC_CACHE[sec] = (_FT_EPOCH + dt.timedelta(seconds=sec)).strftime("%Y-%m-%dT%H:%M:%S")
+    return [ft, f"{base}.{frac:07d}Z"]
+
+
 def _manifest_sig(key: bytes, m: dict[str, Any]) -> str:
     body = json.dumps({k: v for k, v in m.items() if k != "hmac"}, sort_keys=True, separators=(",", ":"), default=str)
     return _hmac.new(key, body.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -1221,6 +1243,40 @@ class Recorder:
         return s
 
     # ------------------------------------------------------------ start / stop
+    def _type_info(self, syms: list[SymbolEntry], port: int | None) -> dict[str, dict[str, Any]]:
+        """R3: what the PLC's datatype table says about each recorded symbol's type — its GUID (identifies the
+        exact type version) and, for structs/FBs, the member layout (offset/size/type), so the raw bytes in the
+        file can be decoded later without the PLC. Best effort: empty when the table can't be read."""
+        try:
+            ts = self.ads.typesystem(False, port)
+        except Exception:  # noqa: BLE001
+            ts = None
+        if ts is None:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for s in syms:
+            e = ts.get(s.type)
+            if e is None:
+                continue
+            d: dict[str, Any] = {}
+            if e.guid:
+                d["type_guid"] = e.guid
+            if e.type and e.type != s.type and not e.dims:
+                d["base_type"] = e.type
+            el = ts.get(e.type) if e.dims and e.type else None
+            if el is not None and el.guid:
+                d["element_type_guid"] = el.guid
+            comp = e if e.subitems else el if (el is not None and el.subitems) else None
+            if comp is not None:
+                d["layout"] = [{"name": m.name, "type": m.type, "offset": m.offs, "size": m.size,
+                                **({"array": [[lb, n] for lb, n in m.dims]} if m.dims else {})}
+                               for m in comp.subitems[:256]]
+                if len(comp.subitems) > 256:
+                    d["layout_truncated"] = len(comp.subitems)
+            if d:
+                out[s.name] = d
+        return out
+
     def start(self, *, symbols: list[str] | None, prefix: str | None, pattern: str | None, mode: str,
               cycle_ms: float, duration_s: float | None, max_events: int | None, start_when: str | None,
               stop_when: str | None, pre_trigger_ms: float, name: str | None, max_symbols: int,
@@ -1256,6 +1312,7 @@ class Recorder:
                 "manifest": manifest, "recorder": f"twincat-mcp {_pkg_version()}"}
         rec = Recording(rid, name or rid, syms, mode, cycle_ms, path, self.ring_events, self.max_runs,
                         duration_s, max_events, sw, ew, pre_trigger_ms, meta, post_trigger_s, self.key)
+        rec.type_info = self._type_info(syms, port)
         if mode != "poll":
             rec.set_blocks(build_blocks(syms, rec.sids, rec.types))
         chosen, engine_note = self._choose_engine(want, mode, allow_partial)
@@ -1656,7 +1713,7 @@ class Recorder:
         rows_written = 0
         with open(out, "w", newline="", encoding="utf-8") as fo:
             w = csv.writer(fo)
-            plc_col = ["plc_filetime"] if t0 is not None else []
+            plc_col = ["plc_filetime", "time_utc"] if t0 is not None else []
             w.writerow(["t_ms", *plc_col, *cols] if fmt == "csv_wide" else ["t_ms", *plc_col, "symbol", "value"])
             cur: dict[str, Any] = {}
             row_t: float | None = None
@@ -1665,7 +1722,7 @@ class Recorder:
                 nonlocal rows_written
                 if row_t is None:
                     return
-                ft = [t0 + int(round(row_t * 1e4))] if t0 is not None else []
+                ft = _ft_cols(t0 + int(round(row_t * 1e4))) if t0 is not None else []
                 w.writerow([row_t, *ft, *[cur.get(c, "") for c in cols]])
                 rows_written += 1
 
@@ -1683,7 +1740,7 @@ class Recorder:
                     else:
                         cur[nme] = _flat(v)
                 else:
-                    ft = [t0 + int(round(t * 1e4))] if t0 is not None else []
+                    ft = _ft_cols(t0 + int(round(t * 1e4))) if t0 is not None else []
                     w.writerow([t, *ft, nme, _flat(v)])
                     rows_written += 1
                 n += 1
@@ -1697,7 +1754,8 @@ class Recorder:
                                           "one row per sample time; empty cells forward-filled from the last sample"
                                           if fmt == "csv_wide" else "one row per value")}
         if t0 is not None:
-            out_d["note"] += "; plc_filetime = the PLC's own timestamp of the sample (100 ns since 1601-01-01 UTC)"
+            out_d["note"] += ("; plc_filetime = the PLC's own timestamp of the sample (100 ns since 1601-01-01 UTC), "
+                              "time_utc = the same instant as ISO-8601 UTC, all 7 decimals (no rounding)")
         if footer is not None:
             for k in ("events", "samples", "missing_samples", "dropped", "dropped_on_stop", "stop_reason"):
                 if k in footer:
@@ -1705,7 +1763,34 @@ class Recorder:
         else:
             out_d["complete"] = False
             out_d["note"] += "; no footer: the recording is still running or the process died before it ended"
+        # R10: the export is a derived file — record exactly what it was derived from and how
+        prov = self._provenance(path, out, footer, {"fmt": fmt, "symbols": symbols, "fill": fill},
+                                {"rows": rows_written, "values": n, "columns": len(cols) if fmt == "csv_wide" else 4})
+        out_d["provenance"] = {k: prov[k] for k in ("file", "source_sha256", "source_label", "export_sha256")}
+        if fill:
+            out_d["note"] += "; fill=true: cells were forward-filled (recorded in the provenance file)"
         return out_d
+
+    def _provenance(self, src: Path, out: Path, footer: dict[str, Any] | None, params: dict[str, Any],
+                    counts: dict[str, Any]) -> dict[str, Any]:
+        pp = provenance_path(out)
+        ssha, ssize = file_sha256(src)
+        esha, esize = file_sha256(out)
+        f = footer or {}
+        p: dict[str, Any] = {"_provenance": 1, "export_file": out.name, "export_sha256": esha, "export_bytes": esize,
+                             "source_file": str(src), "source_sha256": ssha, "source_bytes": ssize,
+                             "source_footer_sha256": f.get("sha256"), "source_footer_hmac": f.get("hmac"),
+                             "source_label": f.get("label"), "source_complete": bool(footer),
+                             "source_seal": self._check_seal(src), "params": params, **counts,
+                             "exporter": f"twincat-mcp {_pkg_version()}",
+                             "created": dt.datetime.now(dt.timezone.utc).isoformat()}
+        if self.key:
+            p["hmac"] = _manifest_sig(self.key, p)
+        make_writable(pp)
+        with open(pp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(p, indent=1, default=str) + "\n")
+        p["file"] = str(pp)
+        return p
 
     def delete(self, rid: str) -> dict[str, Any]:
         rec = self.recs.get(rid)
@@ -1713,7 +1798,8 @@ class Recorder:
             self.stop(rid, "deleted")
         path = self._path_for(rid)
         removed = []
-        for p in (path, manifest_path(path), path.with_suffix(".wide.csv"), path.with_suffix(".long.csv")):
+        for p in (path, manifest_path(path), path.with_suffix(".wide.csv"), path.with_suffix(".long.csv"),
+                  provenance_path(path.with_suffix(".wide.csv")), provenance_path(path.with_suffix(".long.csv"))):
             if p.exists():
                 make_writable(p)                       # sealed recordings are read-only (R9)
                 p.unlink()

@@ -50,18 +50,19 @@ SYMBOLS: list[tuple[str, str, int, Any, int]] = [
 ]
 
 
-def _dt(name, typ, size, offs=0, dtype=0, dims=(), subs=(), enum=None, flags=0):
-    return DtEntry(name, typ, size, offs, dtype, flags, "", list(dims), list(subs), dict(enum or {}))
+def _dt(name, typ, size, offs=0, dtype=0, dims=(), subs=(), enum=None, flags=0, guid=""):
+    return DtEntry(name, typ, size, offs, dtype, flags, "", list(dims), list(subs), dict(enum or {}), guid=guid)
 
 
 # datatype table of the fake runtime
 DATATYPES = [
     _dt("BOOL", "", 1, dtype=33), _dt("INT", "", 2, dtype=2), _dt("UDINT", "", 4, dtype=19), _dt("LREAL", "", 8, dtype=5),
     _dt("TIME", "", 4, dtype=19), _dt("STRING(40)", "", 41, dtype=30), _dt("STRING(10)", "", 11, dtype=30),
-    _dt("E_FillState", "INT", 2, dtype=2, enum={0: "Idle", 1: "Bulk", 2: "Fine", 3: "Done"}),
+    _dt("E_FillState", "INT", 2, dtype=2, enum={0: "Idle", 1: "Bulk", 2: "Fine", 3: "Done"},
+        guid="{0E7A1C5D-3B2F-4C10-9A8B-1F2E3D4C5B6A}"),
     _dt("ST_Recipe", "", 57, subs=[_dt("rTargetKg", "LREAL", 8, 0, 5), _dt("rBulkCutoff", "LREAL", 8, 8, 5), _dt("sName", "STRING(40)", 41, 16, 30)]),
     _dt("ST_Step", "", 16, subs=[_dt("nId", "INT", 2, 0, 2), _dt("tDwell", "TIME", 4, 4, 19), _dt("bDone", "BOOL", 1, 8, 33),
-                                  _dt("eState", "E_FillState", 2, 10, 2)]),
+                                  _dt("eState", "E_FillState", 2, 10, 2)], guid="{51E9D2A4-77C0-4E1B-8F3A-0C9B8A7D6E5F}"),
     _dt("ARRAY [1..2] OF ST_Step", "ST_Step", 32, dims=[(1, 2)]),
     _dt("ARRAY [0..3] OF LREAL", "LREAL", 32, dtype=5, dims=[(0, 4)]),
     _dt("FB_Valve", "", 16, subs=[_dt("bOpen", "BOOL", 1, 0, 33), _dt("tOpened", "TIME", 4, 4, 19),

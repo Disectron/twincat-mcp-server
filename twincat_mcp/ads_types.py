@@ -71,6 +71,7 @@ class DtEntry:
     subitems: list["DtEntry"] = field(default_factory=list)
     enum: dict[int, str] = field(default_factory=dict)
     attributes: dict[str, str] = field(default_factory=dict)
+    guid: str = ""       # datatype GUID (F_TYPEGUID), registry format {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
 
     @property
     def is_array(self) -> bool:
@@ -106,7 +107,20 @@ class DtEntry:
         fl = self.flag_names()
         if fl:
             d["flags"] = fl
+        if self.guid:
+            d["guid"] = self.guid
         return d
+
+
+def guid_str(b: bytes) -> str:
+    """16 raw GUID bytes (Windows layout: Data1..3 little-endian) → {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}."""
+    d1, d2, d3 = struct.unpack_from("<IHH", b, 0)
+    return "{%08X-%04X-%04X-%s-%s}" % (d1, d2, d3, b[8:10].hex().upper(), b[10:16].hex().upper())
+
+
+def guid_bytes(g: str) -> bytes:
+    h = g.strip("{}").replace("-", "")
+    return struct.pack("<IHH", int(h[0:8], 16), int(h[8:12], 16), int(h[12:16], 16)) + bytes.fromhex(h[16:32])
 
 
 def _cstr(buf: bytes, pos: int, n: int) -> tuple[str, int]:
@@ -140,6 +154,8 @@ def parse_entry(buf: bytes, pos: int) -> tuple[DtEntry, int]:
     # optional trailing sections (best effort; bounded by entry_len)
     try:
         if flags & F_TYPEGUID:
+            if p + 16 <= end:
+                e.guid = guid_str(buf[p:p + 16])
             p += 16
         if flags & F_COPYMASK:
             p += size
@@ -383,6 +399,9 @@ def encode_entry(e: DtEntry) -> bytes:
         body += encode_entry(s)
     flags = e.flags
     tail = b""
+    if e.guid:
+        flags |= F_TYPEGUID
+        tail += guid_bytes(e.guid)
     if flags & F_METHODINFOS:           # method table: count only (parse_entry skips the entries by length)
         tail += struct.pack("<H", 0)
     if e.attributes:

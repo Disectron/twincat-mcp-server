@@ -105,19 +105,25 @@ def test_change_mode_capture_stats_export_read(rec, tmp_path):
     # export
     e = rec.export(rid, "csv_wide", None, None)
     csv_lines = Path(e["file"]).read_text().splitlines()
-    assert csv_lines[0] == "t_ms,plc_filetime,MAIN.fbFill.eState,MAIN.fbFill.bDone,MAIN.fbFill.tSettle"
+    assert csv_lines[0] == "t_ms,plc_filetime,time_utc,MAIN.fbFill.eState,MAIN.fbFill.bDone,MAIN.fbFill.tSettle"
     # one row per sample time; only what was sampled then (the PLC's own FILETIME per row)
-    assert csv_lines[-1] == f"1200.0,{ft(1200)},,False,"
-    assert f"900.0,{ft(900)},3,True," in csv_lines                # two changes at the same PLC time → one row
+    tu = lambda t: ",".join(map(str, R._ft_cols(ft(t))))          # plc_filetime,time_utc
+    assert csv_lines[-1] == f"1200.0,{tu(1200)},,False,"
+    assert f"900.0,{tu(900)},3,True," in csv_lines                # two changes at the same PLC time → one row
     ef = rec.export(rid, "csv_wide", str(tmp_path / "filled.csv"), None, fill=True)
-    assert (tmp_path / "filled.csv").read_text().splitlines()[-1] == f"1200.0,{ft(1200)},3,False,750"
+    assert (tmp_path / "filled.csv").read_text().splitlines()[-1] == f"1200.0,{tu(1200)},3,False,750"
+    # R10: every export carries a signed provenance file linking it to the exact source bytes and parameters
+    pv = json.loads(R.provenance_path(tmp_path / "filled.csv").read_text(encoding="utf-8"))
+    assert pv["source_sha256"] == R.file_sha256(Path(out["file"]))[0] and pv["params"]["fill"] is True
+    assert pv["export_sha256"] == R.file_sha256(tmp_path / "filled.csv")[0] and pv["hmac"] and pv["rows"] == 6
+    assert e["provenance"]["source_sha256"] == pv["source_sha256"] and e["provenance"]["file"].endswith(".wide.csv.provenance.json")
     assert e["rows"] == 6 and ef["rows"] == 6               # sample times 0, 100, 350, 350.5, 900, 1200
     e2 = rec.export(rid, "csv_long", None, ["MAIN.fbFill.eState"])
     assert e2["rows"] == 4
     lst = rec.list()
     assert lst["session"][0]["id"] == rid
     d = rec.delete(rid)
-    assert len(d["removed"]) == 4 and not Path(out["file"]).exists()
+    assert len(d["removed"]) == 6 and not Path(out["file"]).exists()
 
 
 def test_triggers_pre_and_stop(rec):
@@ -267,6 +273,19 @@ def test_post_trigger_window(rec):
 
 
 # ---------------------------------------------------------------- recording accuracy (field report A1–A7)
+def test_r3_header_carries_datatype_guid_and_layout(rec):
+    """R3: the header records each symbol's datatype GUID and enum base type from the PLC's datatype table (struct
+    member layout too when a struct is recorded whole), so the raw bytes can be decoded later without the PLC."""
+    st = _cycle_rec(rec, symbols=["MAIN.nCycle", "MAIN.fbFill.eState", "MAIN.arrSteps"])
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    head = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[0])
+    sy = {x["name"]: x for x in head["symbols"]}
+    g = "{0E7A1C5D-3B2F-4C10-9A8B-1F2E3D4C5B6A}"
+    for n in ("MAIN.fbFill.eState", "MAIN.arrSteps[2].eState"):        # struct members are recorded as leaves
+        assert sy[n]["type_guid"] == g and sy[n]["base_type"] == "INT", sy[n]
+    assert "type_guid" not in sy["MAIN.nCycle"]
+
+
 def _cycle_rec(rec, **kw):
     args = dict(symbols=["MAIN.nCycle", "MAIN.bStart", "MAIN.fbFill.bDone"], prefix=None, pattern=None, mode="cycle",
                 cycle_ms=1, duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0,
