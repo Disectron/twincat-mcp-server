@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Any, Callable
 
@@ -988,6 +989,91 @@ class XaeBackend:
                        + "In the IDE: right-click the PLC project → Check all objects; xae_build still compiles everything referenced.")
 
 
+    # ------------------------------------------------------------ TwinCAT Scope (Measurement projects)
+    # Automation Interface for TwinCAT Measurement (TwinCAT.Measurement.AutomationInterface.dll, TE130x): a Scope
+    # configuration is a ProjectItem of a Measurement project (.tcmproj) whose .Object implements IMeasurementScope —
+    # StartRecord / StopRecord / SaveSVD(path) / ExportCSV(path), each returning int. Reached here by late binding.
+    def _scope_objects(self) -> list[dict[str, Any]]:
+        self._require_win()
+        dte = self._need()
+        found: list[dict[str, Any]] = []
+
+        def visit(p: Any, depth: int) -> None:
+            if depth > 3:
+                return
+            fn = str(_try(lambda: p.FullName) or "")
+            items = _try(lambda: p.ProjectItems)
+            if items is None:
+                return
+            for j in range(1, (_try(lambda: items.Count) or 0) + 1):
+                it = _try(lambda: items.Item(j))
+                if it is None:
+                    continue
+                sub = _try(lambda: it.SubProject)          # projects inside solution folders
+                if sub is not None:
+                    visit(sub, depth + 1)
+                    continue
+                obj = _try(lambda: it.Object)
+                if fn.lower().endswith(".tcmproj") and obj is not None and _has_member(obj, "StartRecord"):
+                    found.append({"name": str(it.Name), "project": str(_try(lambda: p.Name) or ""), "file": fn,
+                                  "_obj": obj})
+
+        projs = self._retry(lambda: dte.Solution.Projects, "Solution.Projects")
+        for i in range(1, projs.Count + 1):
+            visit(projs.Item(i), 0)
+        return found
+
+    def scope_list(self) -> dict[str, Any]:
+        sc = self._scope_objects()
+        return {"count": len(sc), "scopes": [{k: v for k, v in d.items() if not k.startswith("_")} for d in sc],
+                "note": ("TwinCAT Scope configurations in the open solution (Measurement projects, .tcmproj). What is "
+                         "recorded — channels, sample time, record time, trigger — is set in that configuration.")
+                if sc else "no Scope configuration in the open solution (add a TwinCAT Measurement project → Scope)"}
+
+    def _scope_pick(self, name: str | None) -> dict[str, Any]:
+        sc = self._scope_objects()
+        if not sc:
+            raise XaeError("no TwinCAT Scope configuration in the open solution (TwinCAT Measurement project → Scope)")
+        if name:
+            low = name.lower()
+            hit = [d for d in sc if low in (d["name"].lower(), f"{d['project']}\\{d['name']}".lower(), d["project"].lower())]
+            if len(hit) != 1:
+                raise XaeError(f"Scope {name!r} {'is ambiguous' if hit else 'not found'}; open: "
+                               f"{[d['project'] + chr(92) + d['name'] for d in sc]}")
+            return hit[0]
+        if len(sc) > 1:
+            raise XaeError(f"{len(sc)} Scope configurations are open — name one: {[d['project'] + chr(92) + d['name'] for d in sc]}")
+        return sc[0]
+
+    def scope_action(self, action: str, name: str | None = None, path: str | None = None) -> dict[str, Any]:
+        """start | stop | save_svd(path) | export_csv(path) on one Scope configuration."""
+        d = self._scope_pick(name)
+        obj = d["_obj"]
+        calls = {"start": ("StartRecord", ()), "stop": ("StopRecord", ()), "save_svd": ("SaveSVD", (path,)),
+                 "export_csv": ("ExportCSV", (path,))}
+        if action not in calls:
+            raise XaeError(f"scope action must be one of {list(calls)}")
+        meth, args = calls[action]
+        if args and not path:
+            raise XaeError(f"{action} needs a path")
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        t0 = time.monotonic()
+        rc = self._retry(lambda: getattr(obj, meth)(*args), f"Scope {meth}")
+        out: dict[str, Any] = {"scope": f"{d['project']}\\{d['name']}", "action": action, "method": meth,
+                               "result_code": rc, "elapsed_s": round(time.monotonic() - t0, 3)}
+        if path:
+            p = Path(path)
+            out["path"] = str(p)
+            out["written"] = p.is_file() and p.stat().st_size > 0
+            if not out["written"]:
+                raise XaeError(f"Scope {meth}({path!r}) returned {rc} but no file was written — is there recorded data "
+                               "(stop the recording first)?")
+        if rc not in (0, None):
+            out["warning"] = f"{meth} returned {rc} (0 = success in the Automation Interface examples)"
+        return out
+
+
 # ----------------------------------------------------------------------------
 _RE_OUT_ERR = re.compile(
     r"(?:^|[\s:>\]\)])(?P<level>error|warning)(?!\(s\))\s*(?P<code>[A-Z]{1,2}\d{1,5}|\d{1,5})?\s*:?\s+(?P<msg>\S.*)$", re.I)
@@ -1011,6 +1097,15 @@ def _parse_build_output(text: str) -> list[dict[str, Any]]:
             "raw": ln.strip(),
         })
     return items
+
+
+def _has_member(obj: Any, name: str) -> bool:
+    """Late-bound COM object exposes ``name`` (IDispatch::GetIDsOfNames)."""
+    try:
+        obj._oleobj_.GetIDsOfNames(name)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _try(fn: Callable[[], Any]) -> Any:

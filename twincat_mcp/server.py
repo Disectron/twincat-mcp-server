@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import fnmatch
+import datetime as dt
 import json
 import logging
 import os
@@ -114,6 +115,10 @@ class ConfirmSchema(BaseModel):
     confirm: bool = Field(description="Set true to allow this operation on the target")
 
 
+class AlsoScopeSchema(BaseModel):
+    also_scope: bool = Field(description="Also record with the TwinCAT Scope configuration open in XAE")
+
+
 _LICENSE_CODES = {
     "0x98110724": "no valid TwinCAT license for the target (2551252772 / 0x98110724).",
     "2551252772": "no valid TwinCAT license for the target (2551252772 / 0x98110724).",
@@ -149,6 +154,7 @@ class App:
         from .config import _home
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
+        self.scope_runs: dict[str, dict[str, Any]] = {}     # recording id → Scope recording started with it
         self.rec.rcfg = cfg.recorder
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
@@ -1262,7 +1268,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         stop_when: str | None = None, pre_trigger_ms: float = 0, name: str | None = None,
                         max_symbols: int = 500, post_trigger_s: float | None = None, allow_partial: bool = False,
                         max_delay_ms: float = 0, cycle_counter: str | None = "auto", edge_triggers: bool = False,
-                        engine: str | None = None) -> dict[str, Any]:
+                        engine: str | None = None, also_scope: bool | None = None, scope: str | None = None,
+                        ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Start a continuous real-time recording of online PLC variables (runs in the background
         until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or
         struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it)
@@ -1285,7 +1292,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         element of an array recorded as a whole (GVL_Test.aCounter[1] when GVL_Test.aCounter is recorded).
         engine (cycle mode): 'native' = the C++ capture service (Beckhoff AdsLib on TcAdsDll: ADS callback → ring →
         file, no Python on the data path), 'python' = the in-process recorder, None = recorder.engine from the config
-        (default 'auto': native when installed). The response says which engine ran and why. After stopping: rec_verify."""
+        (default 'auto': native when installed). The response says which engine ran and why. After stopping: rec_verify.
+        also_scope: also run the TwinCAT Scope configuration open in XAE (scope = its name when several are open) —
+        StartRecord now; at rec_stop StopRecord, SaveSVD and ExportCSV into <recordings>/scope/<id>.svdx / .scope.csv
+        with a signed link file. What Scope records (channels, sample time) is set in that configuration. With
+        recorder.also_scope = 'ask' (default) and a Scope configuration open, leaving also_scope unset asks the user
+        (prompt, or an error that tells you to ask and call again with true/false)."""
+        want_scope = await _scope_decide(also_scope, scope, ctx)
         res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
                                  cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
                                  start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
@@ -1294,7 +1307,112 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                  edge_triggers=edge_triggers, engine=engine, timeout=120)
         app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode, "engine": res.get("engine")},
                   OpClass.EDIT, "ok")
+        if want_scope is not None:
+            res["scope"] = await _scope_start(res["id"], want_scope)
         return res
+
+    async def _scope_decide(also_scope: bool | None, scope: str | None, ctx: Context | None) -> str | None:
+        """None = no Scope recording; otherwise the Scope name to use ('' = the only one open)."""
+        pol = str(app.cfg.recorder.also_scope or "ask").lower()
+        if also_scope is False:
+            return None
+        if pol == "never":
+            if also_scope:
+                raise ToolError("recorder.also_scope = 'never' in the config: Scope recordings alongside rec_start are off")
+            return None
+        name = scope or app.cfg.scope.project or ""
+        if also_scope or pol == "always":
+            return name
+        # 'ask': only when XAE is attached and has a Scope configuration open — nothing to offer otherwise
+        if app.xae.dte is None:
+            return None
+        try:
+            lst = await app.xae_call(app.xae.scope_list, timeout=20)
+        except ToolError:
+            return None
+        if not lst.get("count"):
+            return None
+        names = [d["project"] + "\\" + d["name"] for d in lst["scopes"]]
+        q = (f"TwinCAT Scope configuration(s) open in XAE: {', '.join(names)}. Also record with Scope while this "
+             f"recording runs (saved as .svdx + CSV next to the recording)?")
+        if ctx is not None and app.cfg.safety.allow_elicitation:
+            try:
+                ans = await ctx.elicit(q, AlsoScopeSchema)
+                if ans.action == "accept" and ans.data is not None:
+                    return name if ans.data.also_scope else None
+            except Exception:  # noqa: BLE001 — no elicitation in this client: fall through to asking via the agent
+                pass
+        raise ToolError(f"recorder.also_scope = 'ask': {q} Ask the user, then call rec_start again with also_scope=true "
+                        f"(scope=<name> if several) or also_scope=false. Nothing was started. "
+                        f"([recorder] also_scope = 'always' / 'never' makes this permanent.)")
+
+    async def _scope_start(rid: str, name: str) -> dict[str, Any]:
+        try:
+            r = await app.xae_call(app.xae.scope_action, "start", name or None, timeout=60)
+        except ToolError as exc:
+            return {"error": f"Scope recording NOT started: {exc}. The ADS recording {rid} runs regardless."}
+        app.scope_runs[rid] = {"scope": r["scope"], "name": name or None, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
+                               "start_result": r.get("result_code")}
+        app.audit("scope_start", {"id": rid, "scope": r["scope"]}, OpClass.EDIT, "ok")
+        return {"started": True, **r, "note": "Scope records independently (its own ADS acquisition and timestamps); "
+                                              "it is stopped, saved and exported at rec_stop"}
+
+    async def _scope_finish(rid: str) -> dict[str, Any] | None:
+        run = app.scope_runs.pop(rid, None)
+        if run is None:
+            return None
+        d = _scope_dir()
+        svdx, csv = d / f"{rid}.svdx", d / f"{rid}.scope.csv"
+        out: dict[str, Any] = {"scope": run["scope"]}
+        steps = (("stop", None), ("save_svd", str(svdx)), ("export_csv", str(csv)))
+        for action, path in steps:
+            try:
+                r = await app.xae_call(app.xae.scope_action, action, run["name"], path, timeout=600)
+                out[action] = {k: r[k] for k in ("result_code", "path", "warning") if k in r}
+            except ToolError as exc:
+                out[action] = {"error": str(exc)}
+                if action == "stop":
+                    out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
+                    return out
+        if svdx.is_file() and not csv.is_file():
+            # the export tool from the saved file instead (same CSV writer, no XAE needed)
+            from . import scope as S
+            tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
+            if tool is not None:
+                try:
+                    await asyncio.to_thread(S.export, svdx, csv, tool=tool, key=app.rec.key, version=__version__)
+                    out["export_csv"] = {"path": str(csv), "via": "TC3ScopeExportTool.exe"}
+                except S.ScopeError as exc:
+                    out["export_csv"] = {"error": str(exc)}
+        out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv)
+        app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")}, OpClass.EDIT, "ok")
+        return out
+
+    def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path) -> dict[str, Any]:
+        """Signed <id>.scope.json tying the ADS recording to the Scope files (SHA-256 each); the files are set
+        read-only like the recording (R9)."""
+        from .recorder import _manifest_sig, file_sha256
+        import os as _os
+        import stat as _stat
+        files = {}
+        for p in (svdx, csv):
+            if p.is_file():
+                sha, n = file_sha256(p)
+                files[p.name] = {"sha256": sha, "bytes": n}
+        link: dict[str, Any] = {"_scope_link": 1, "recording": rid, "scope": run["scope"], "started": run["started"],
+                                "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "files": files,
+                                "recorder": f"twincat-mcp {__version__}"}
+        if app.rec.key:
+            link["hmac"] = _manifest_sig(app.rec.key, link)
+        lp = svdx.with_name(f"{rid}.scope.json")
+        lp.write_text(json.dumps(link, indent=1) + "\n", encoding="utf-8")
+        for p in (svdx, csv, lp):
+            if p.is_file():
+                try:
+                    _os.chmod(p, p.stat().st_mode & ~(_stat.S_IWUSR | _stat.S_IWGRP | _stat.S_IWOTH))
+                except OSError:
+                    pass
+        return {"file": str(lp), "files": files}
 
 
     # ======================================================================
@@ -1602,7 +1720,69 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Stop a recording, release the ADS notifications, finalize the file; returns status + stats."""
         res = await app.rec_call(app.rec.stop, id, "manual (rec_stop)", timeout=60)
         app.audit("rec_stop", {"id": id, "events": res.get("events")}, OpClass.EDIT, "ok")
+        sc = await _scope_finish(id)
+        if sc is not None:
+            res["scope"] = sc
         return res
+
+    @mcp.tool(annotations=READ)
+    async def scope_status() -> dict[str, Any]:
+        """TwinCAT Scope on this PC: where TC3ScopeExportTool.exe is (TE130x Scope View / TF3300 Scope Server) and
+        the default export folder."""
+        from . import scope as S
+        d = await asyncio.to_thread(S.status, app.cfg.scope.export_tool)
+        d["export_dir"] = str(_scope_dir())
+        return d
+
+    def _scope_dir() -> Path:
+        return Path(app.cfg.scope.export_dir) if app.cfg.scope.export_dir else app.rec.root / "scope"
+
+    @mcp.tool(annotations=EDIT)
+    async def scope_export(svd: str, target: str | None = None, overwrite: bool = False) -> dict[str, Any]:
+        """Export a saved TwinCAT Scope recording (.svdx / .svd) to CSV with Beckhoff's TC3ScopeExportTool.exe
+        (command line `"svd=<file>" target=<csv> silent`; CSV needs no extra licence). Default target:
+        <recordings>/scope/<name>.csv ([scope] export_dir). The CSV is Beckhoff's output, unchanged — channels, time
+        column and alignment of channels with different sample times follow the Scope project's export settings. A
+        signed <csv>.provenance.json records the source file and SHA-256, the tool and its SHA-256, and the command."""
+        from . import scope as S
+        tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
+        if tool is None:
+            raise ToolError(S.status(app.cfg.scope.export_tool)["note"])
+        src = Path(svd)
+        out = Path(target) if target else _scope_dir() / (src.stem + ".csv")
+        try:
+            res = await asyncio.to_thread(S.export, src, out, tool=tool, overwrite=overwrite, key=app.rec.key,
+                                          version=__version__)
+        except S.ScopeError as exc:
+            raise ToolError(str(exc)) from exc
+        app.audit("scope_export", {"svd": str(src), "target": str(out), "sha256": res["export_sha256"]}, OpClass.EDIT, "ok")
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def scope_list() -> dict[str, Any]:
+        """TwinCAT Scope configurations in the solution open in XAE (TwinCAT Measurement projects). Their channels,
+        sample time and record time are what scope_record / rec_start(also_scope=true) record."""
+        return await app.xae_call(app.xae.scope_list, timeout=60)
+
+    @mcp.tool(annotations=EDIT)
+    async def scope_record(action: str, scope: str | None = None, path: str | None = None) -> dict[str, Any]:
+        """Drive a Scope configuration open in XAE (Automation Interface IMeasurementScope): action = start | stop |
+        save (SaveSVD + ExportCSV → <recordings>/scope/<scope>-<time>.svdx/.csv, or path=<file>.svdx). scope = its
+        name when several are open. Affects only the Scope recording, not the PLC."""
+        if action in ("start", "stop"):
+            r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
+        elif action == "save":
+            base = Path(path).with_suffix("") if path else _scope_dir() / (
+                re.sub(r"[^\w.-]+", "_", scope or "scope") + "-" + time.strftime("%Y%m%d-%H%M%S"))
+            r = {"save_svd": await app.xae_call(app.xae.scope_action, "save_svd", scope, str(base) + ".svdx", timeout=600)}
+            try:
+                r["export_csv"] = await app.xae_call(app.xae.scope_action, "export_csv", scope, str(base) + ".csv", timeout=600)
+            except ToolError as exc:
+                r["export_csv"] = {"error": str(exc), "hint": "scope_export(svd=…) runs Beckhoff's export tool on the saved file"}
+        else:
+            raise ToolError("action must be start | stop | save")
+        app.audit("scope_record", {"action": action, "scope": scope, "path": path}, OpClass.EDIT, "ok")
+        return r
 
     @mcp.tool(annotations=READ)
     async def rec_export(id: str, fmt: str = "csv_wide", out_path: str | None = None,

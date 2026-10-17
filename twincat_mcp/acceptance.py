@@ -67,6 +67,10 @@ MANUAL: dict[str, str] = {
     "kb_remove_project": "remove the folder you added; kb_search no longer finds it",
     "kb_reindex": "after editing a POU in an added folder",
     "kb_search": "an FB name from an added folder, and an error text (e.g. 'ADSError 1861') → known_error",
+    "scope_record": "with a Scope configuration in the solution: scope_record start, wait, stop, save → .svdx + .csv in "
+                    "<recordings>/scope; then rec_start(..., also_scope=true) + rec_stop → <id>.svdx/.scope.csv/.scope.json",
+    "scope_export": "save a Scope View recording as .svdx, then scope_export svd=<file> → CSV in <recordings>/scope "
+                    "plus <csv>.provenance.json; open the CSV next to the Scope View chart",
     "hw_lookup": "'EL2008' (or a terminal you use) → PDOs and CoE objects from the installed ESI files",
     "ads_connect": "re-target to a second PLC port: ads_connect ams_port=852 on a box that has one",
     "ads_write_raw": "raw write by index group/offset — only with a known address on the test box",
@@ -291,6 +295,9 @@ class Acceptance:
         await self.check(ph, "tc_audit_tail", {"n": 20}, lambda p: None if isinstance(p, list) else "not a list")
         await self.check(ph, "tc_reload_config", {}, lambda p: None if isinstance(p, dict) and "applied" in p else "no applied field")
         await self.check(ph, "wf_project_overview", {})
+        sc = await self.check(ph, "scope_status", {}, lambda p: None if isinstance(p, dict) and "available" in p else "no available field")
+        if isinstance(sc, dict):
+            self.log(f"      scope export tool: {sc.get('export_tool') or 'not found'}")
         rep = self.out / "session_report.md"
         await self.check(ph, "tc_session_report", {"out_path": str(rep)}, lambda p: None if rep.exists() else "file not written")
 
@@ -698,7 +705,7 @@ class Acceptance:
     async def phase_xae(self) -> None:
         ph = "9 xae"
         self.log("[9] XAE, read-only")
-        tools = ("xae_attach", "xae_status", "xae_plc_projects", "xae_tree_get", "xae_pou_get", "xae_list_commands", "xae_dialogs", "xae_links", "xae_diagnostics")
+        tools = ("xae_attach", "xae_status", "xae_plc_projects", "xae_tree_get", "xae_pou_get", "xae_list_commands", "xae_dialogs", "xae_links", "xae_diagnostics", "scope_list")
         if not self.with_xae or sys.platform != "win32":
             for t in tools:
                 self.skip(ph, t, "--no-xae or not Windows")
@@ -733,6 +740,9 @@ class Acceptance:
             self.skip(ph, "xae_tree_get", "xae_plc_projects returned no path")
             self.skip(ph, "xae_pou_get", "xae_plc_projects returned no path")
         await self.check(ph, "xae_list_commands", {"contains": "Build", "limit": 20}, timeout_s=120)
+        sl = await self.check(ph, "scope_list", {}, lambda p: None if isinstance(p, dict) and "count" in p else "no count", timeout_s=120)
+        if isinstance(sl, dict):
+            self.log(f"      Scope configurations open: {[d.get('name') for d in sl.get('scopes') or []]}")
         await self.check(ph, "xae_dialogs", {}, lambda p: None if isinstance(p, dict) and "scope" in p and "none" not in str(p.get("scope")) else "watchdog has no process scope — pid unknown")
         if self.plc_project_path:
             await self.check(ph, "xae_links", {"plc_project_path": self.plc_project_path}, timeout_s=120)

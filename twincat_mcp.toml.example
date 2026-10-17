@@ -32,9 +32,15 @@ engine = "auto"                    # cycle-mode recordings: auto = native C++ ca
                                    # Beckhoff AdsLib on TcAdsDll) when it matches this version, else Python; native | python
 # capture_exe = 'D:\Tools\tcmcp-capture.exe'   # only to use your own build instead of the shipped one
 ring_s = 10.0                      # native: seconds of samples buffered between the ADS callback and the file
+also_scope = "ask"                 # rec_start + a TwinCAT Scope configuration open in XAE: ask | always | never
+
+[scope]
+# export_tool = 'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\TC3ScopeExportTool.exe'
+# export_dir = 'D:\Recordings\scope'   # default: <recordings>\scope
+# project = "Scope_Counter"          # the Scope configuration rec_start(also_scope=true) records; default: the only one open
 
 [server]
-tool_groups = ["ads", "rec", "snap", "test", "proj", "xae", "infosys", "wf"]   # only these groups (tc_* always); remove the line for all
+tool_groups = ["ads", "rec", "snap", "test", "proj", "xae", "infosys", "wf", "scope"]   # only these groups (tc_* always); remove the line for all
 
 [safety]
 mode = "guarded"                   # readonly | guarded | full  (start mode)

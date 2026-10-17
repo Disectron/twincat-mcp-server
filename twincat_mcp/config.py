@@ -124,7 +124,7 @@ class DocsConfig:
     fetch_timeout_s: float = 20.0
 
 
-TOOL_GROUPS = ("tc", "ads", "rec", "snap", "test", "exp", "proj", "xae", "ipc", "hmi", "infosys", "wf", "tcunit", "kb", "hw")
+TOOL_GROUPS = ("tc", "ads", "rec", "snap", "test", "exp", "proj", "xae", "ipc", "hmi", "infosys", "wf", "tcunit", "kb", "hw", "scope")
 
 
 @dataclass
@@ -146,6 +146,20 @@ class RecorderConfig:
     ring_s: float = 10.0                    # native: seconds of samples buffered between the ADS callback and the file
     ring_cap_mb: float = 1024.0             # native: upper limit for that buffer
     local_ams_net_id: str | None = None     # native on a non-TwinCAT host (standalone AdsLib): this PC's AMS Net ID
+    # also record with TwinCAT Scope (a Scope configuration open in XAE) when rec_start runs: "ask" = rec_start asks
+    # the user (elicitation, or a question back to the agent) whenever XAE has a Scope configuration open;
+    # "always" = record it without asking; "never" = don't offer it
+    also_scope: str = "ask"
+
+
+@dataclass
+class ScopeConfig:
+    # TC3ScopeExportTool.exe (TE130x Scope View / TF3300 Scope Server); None = searched in TwinCAT's Functions folders
+    export_tool: str | None = None
+    # where scope_export writes CSVs when no target is given; None = <recordings>/scope
+    export_dir: str | None = None
+    # the Scope configuration rec_start records alongside (name in the XAE solution); None = the only one open
+    project: str | None = None
 
 
 @dataclass
@@ -160,6 +174,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
+    scope: ScopeConfig = field(default_factory=ScopeConfig)
     ads: AdsConfig = field(default_factory=AdsConfig)
     xae: XaeConfig = field(default_factory=XaeConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
@@ -193,7 +208,7 @@ def _find_config_file() -> Path | None:
 
 
 def _apply_toml(cfg: Config, data: dict[str, Any]) -> None:
-    for section in ("server", "knowledge", "recorder", "ads", "xae", "project", "safety", "docs"):
+    for section in ("server", "knowledge", "recorder", "scope", "ads", "xae", "project", "safety", "docs"):
         sub = data.get(section) or {}
         target = getattr(cfg, section)
         for k, v in sub.items():
@@ -352,6 +367,10 @@ def validate(cfg: Config) -> list[str]:
     if cfg.recorder.engine not in ("auto", "native", "python"):
         cfg.warnings.append(f"recorder.engine = {cfg.recorder.engine!r} is not auto | native | python — using auto.")
         cfg.recorder.engine = "auto"
+    cfg.recorder.also_scope = str(cfg.recorder.also_scope or "ask").lower()
+    if cfg.recorder.also_scope not in ("ask", "always", "never"):
+        cfg.warnings.append(f"recorder.also_scope = {cfg.recorder.also_scope!r} is not ask | always | never — using ask.")
+        cfg.recorder.also_scope = "ask"
     if looks_like_placeholder(cfg.recorder.capture_exe):
         cfg.recorder.capture_exe = None
     # --- hard errors ------------------------------------------------------------------------------

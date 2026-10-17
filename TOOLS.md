@@ -1,6 +1,6 @@
 # twincat-mcp 0.8.1 — tool reference
 
-151 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
+155 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
 ## Meta & safety (8)
 
@@ -185,7 +185,7 @@
 - `infosys_search_code` [R] — Search the code examples (<pre> blocks) of indexed pages for a fragment — a call pattern, an attribute, a constant. language: st | xml | cpp | csharp. Returns the matching lines with context and the page URL.
 - `infosys_get_page` [R] — A documentation page as Markdown (headings, tables, fenced code). ref: full Infosys URL, 'book/pageid', a bare page id, or a symbol name ('ADSREAD'). Fetched live and cached; works for any page that exists on the site, indexed or not. refresh=true bypasses the cache.
 
-## Other (7)
+## Other (11)
 
 - `kb_status` [R] — Knowledge base: where it is stored (or the question to ask the user if no folder was chosen yet), the project folders indexed for kb_search, ESI devices indexed for hw_lookup, known-error entries.
 - `kb_set_location` [E] — Choose the folder for the knowledge database — ONLY with a path the user gave you (or use_fallback=true once the user agreed to D:\TwinCAT-MCP\knowledge). The folder is checked: local fixed drive (no network share / mapped drive / USB), not inside OneDrive/Dropbox/Google Drive/iCloud, not inside the plugin folder,…
@@ -194,6 +194,10 @@
 - `kb_reindex` [E] — Re-index one project folder (or every changed one) after edits.
 - `kb_search` [R] — Search the code of the project folders the user added ("alarm handler", "FB_Valve", "CONCAT"): unit, kind, file and the matching declaration/code excerpts, best first. kinds filters (FUNCTION_BLOCK, METHOD, DUT, GVL, …). Also returns the known cause/fix when the query is an error message.
 - `hw_lookup` [R] — EtherCAT terminal/box data from the installed ESI files (K4): name, product code, revisions, PDOs with their entries (index, subindex, bit length, type), CoE objects. query = type ('EL2008'), part of a name, or a product code ('#x07D83052'). The first call indexes TwinCAT's ESI folder into the knowledge database (can…
+- `scope_status` [R] — TwinCAT Scope on this PC: where TC3ScopeExportTool.exe is (TE130x Scope View / TF3300 Scope Server) and the default export folder.
+- `scope_export` [E] — Export a saved TwinCAT Scope recording (.svdx / .svd) to CSV with Beckhoff's TC3ScopeExportTool.exe (command line `"svd=<file>" target=<csv> silent`; CSV needs no extra licence). Default target: <recordings>/scope/<name>.csv ([scope] export_dir). The CSV is Beckhoff's output, unchanged — channels, time column and…
+- `scope_list` [R] — TwinCAT Scope configurations in the solution open in XAE (TwinCAT Measurement projects). Their channels, sample time and record time are what scope_record / rec_start(also_scope=true) record.
+- `scope_record` [E] — Drive a Scope configuration open in XAE (Automation Interface IMeasurementScope): action = start | stop | save (SaveSVD + ExportCSV → <recordings>/scope/<scope>-<time>.svdx/.csv, or path=<file>.svdx). scope = its name when several are open. Affects only the Scope recording, not the PLC.
 
 ## Prompts (5)
 
