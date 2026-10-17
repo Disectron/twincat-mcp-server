@@ -540,18 +540,22 @@ class Acceptance:
             self.skip(ph, "rec_verify", "task info not readable on this target (TwinCAT_SystemInfoVarList._TaskInfo)")
             return
         cycle_ms = ct["value"] / 10_000.0                     # CycleTime is in 100 ns units
-        r = await self.check(ph, "rec_start", {"symbols": [counter], "mode": "cycle", "cycle_ms": cycle_ms, "duration_s": 3.0,
-                                               "name": "acceptance-accuracy"}, timeout_s=60)
-        rid = r.get("id") if isinstance(r, dict) else None
-        if not rid:
-            self.skip(ph, "rec_verify", "accuracy recording did not start")
-            return
-        await asyncio.sleep(4.0)
-        await self.check(ph, "rec_stop", {"id": rid}, optional=True)
-        await self.check(ph, "rec_verify", {"id": rid, "counter": counter},
-                         lambda p: None if isinstance(p, dict) and p.get("verdict") == "PASS" else
-                         f"recording at the task cycle ({cycle_ms} ms) is NOT lossless: "
-                         f"{(p or {}).get('counter')} / {(p or {}).get('timeline', {}).get('missing')} missing")
+        for engine in ("native", "python"):          # both engines must prove every cycle (0.8: native is the default)
+            r = await self.check(ph, "rec_start", {"symbols": [counter], "mode": "cycle", "cycle_ms": cycle_ms, "duration_s": 3.0,
+                                                   "name": f"acceptance-accuracy-{engine}", "engine": engine},
+                                 timeout_s=60, optional=(engine == "native"))
+            rid = r.get("id") if isinstance(r, dict) else None
+            if not rid:
+                self.skip(ph, "rec_verify", f"accuracy recording ({engine} engine) did not start")
+                continue
+            if r.get("engine") != engine:
+                self.skip(ph, "rec_verify", f"{engine} engine not used: {r.get('engine_note')}")
+            await asyncio.sleep(4.0)
+            await self.check(ph, "rec_stop", {"id": rid}, optional=True)
+            await self.check(ph, "rec_verify", {"id": rid, "counter": counter},
+                             lambda p, e=engine: None if isinstance(p, dict) and p.get("verdict") == "PASS" else
+                             f"{e} engine: recording at the task cycle ({cycle_ms} ms) is NOT lossless: "
+                             f"{(p or {}).get('counter')} / {(p or {}).get('timeline', {}).get('missing')} missing")
 
     async def phase_snapshots_and_tests(self) -> None:
         ph = "5 snapshots/tests"

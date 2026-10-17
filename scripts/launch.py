@@ -92,6 +92,7 @@ def source_digest(src: Path) -> str:
     h = hashlib.sha256()
     files = [src / "pyproject.toml", src / "requirements.txt"]
     files += sorted((src / PACKAGE_DIR).rglob("*.py"))
+    files += sorted((src / PACKAGE_DIR / "bin").glob("tcmcp-capture*"))   # native capture service ships as package data
     for f in files:
         if f.is_file():
             h.update(str(f.relative_to(src)).replace("\\", "/").encode())
@@ -104,6 +105,7 @@ def quick_fingerprint(src: Path) -> str:
     h = hashlib.sha256()
     files = [src / "pyproject.toml", src / "requirements.txt"]
     files += sorted((src / PACKAGE_DIR).rglob("*.py"))
+    files += sorted((src / PACKAGE_DIR / "bin").glob("tcmcp-capture*"))   # native capture service ships as package data
     for f in files:
         try:
             st = f.stat()

@@ -149,6 +149,7 @@ class App:
         from .config import _home
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
+        self.rec.rcfg = cfg.recorder
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
         self.profiles = capture.ProfileStore(Path(cfg.safety.audit_log).parent / "profiles")
@@ -712,6 +713,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 rep["xae_running"] = f"FAIL: {exc}"
         else:
             rep["xae"] = "unavailable (not Windows)"
+        try:
+            rep["recorder"] = await asyncio.to_thread(app.rec.engine_info)
+        except Exception as exc:  # noqa: BLE001
+            rep["recorder"] = {"error": f"{type(exc).__name__}: {exc}"}
         rep["project_root"] = cfg.project.root
         rep["solution"] = cfg.xae.solution_path
         rep["config_file"] = cfg.config_file
@@ -1233,7 +1238,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         max_events: int | None = 5_000_000, start_when: str | None = None,
                         stop_when: str | None = None, pre_trigger_ms: float = 0, name: str | None = None,
                         max_symbols: int = 500, post_trigger_s: float | None = None, allow_partial: bool = False,
-                        max_delay_ms: float = 0, cycle_counter: str | None = "auto", edge_triggers: bool = False) -> dict[str, Any]:
+                        max_delay_ms: float = 0, cycle_counter: str | None = "auto", edge_triggers: bool = False,
+                        engine: str | None = None) -> dict[str, Any]:
         """Start a continuous real-time recording of online PLC variables (runs in the background
         until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or
         struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it)
@@ -1254,14 +1260,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (AppTimestamp, OnlineChangeCnt, tasks, TwinCAT build, symbol version). Conditions are levels: a start_when that
         already holds fires at once — edge_triggers=true fires only when it BECOMES true. A condition may name one
         element of an array recorded as a whole (GVL_Test.aCounter[1] when GVL_Test.aCounter is recorded).
-        After stopping: rec_verify."""
+        engine (cycle mode): 'native' = the C++ capture service (Beckhoff AdsLib on TcAdsDll: ADS callback → ring →
+        file, no Python on the data path), 'python' = the in-process recorder, None = recorder.engine from the config
+        (default 'auto': native when installed). The response says which engine ran and why. After stopping: rec_verify."""
         res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
                                  cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
                                  start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
                                  name=name, max_symbols=max_symbols, post_trigger_s=post_trigger_s,
                                  allow_partial=allow_partial, max_delay_ms=max_delay_ms, cycle_counter=cycle_counter,
-                                 edge_triggers=edge_triggers, timeout=120)
-        app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode}, OpClass.EDIT, "ok")
+                                 edge_triggers=edge_triggers, engine=engine, timeout=120)
+        app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode, "engine": res.get("engine")},
+                  OpClass.EDIT, "ok")
         return res
 
 
@@ -1511,14 +1520,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=EDIT)
     async def rec_capture(symbols: list[str] | None = None, seconds: float = 5.0, mode: str = "cycle", cycle_ms: float = 10,
-                          prefix: str | None = None, counter: str | None = None) -> dict[str, Any]:
+                          prefix: str | None = None, counter: str | None = None, engine: str | None = None) -> dict[str, Any]:
         """One call for "record X for N s and give me the stats": starts a recording, waits (≤ 60 s), stops, and
         returns per-symbol statistics, completeness and the rec_verify verdict (integrity + PLC timeline, plus the
         optional per-cycle `counter`) with the file path. For longer or triggered captures use rec_start."""
         seconds = float(min(max(seconds, 0.1), 60.0))
         st = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=None, mode=mode, cycle_ms=cycle_ms,
                                 duration_s=seconds, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0,
-                                name="rec_capture", max_symbols=500, timeout=120)
+                                name="rec_capture", max_symbols=500, engine=engine, timeout=120)
         rid = st["id"]
         t_end = time.monotonic() + seconds + 10
         while time.monotonic() < t_end:
@@ -1528,10 +1537,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         fin = await app.rec_call(app.rec.stop, rid, "rec_capture done", timeout=120)
         ver = await app.mem_call(app.rec.verify, rid, counter, None)
         app.audit("rec_capture", {"id": rid, "symbols": fin.get("symbols"), "seconds": seconds}, OpClass.EDIT, "ok")
-        keep = ("id", "file", "mode", "time_source", "symbols", "samples", "events", "missing_samples", "completeness",
-                "dropped", "dropped_on_stop", "plc_span_s", "stop_reason", "warnings")
-        return {**{k: fin[k] for k in keep if k in fin}, "verify": {k: ver.get(k) for k in ("verdict", "integrity", "timeline", "counter") if k in ver},
-                "stats": fin.get("stats")}
+        keep = ("id", "file", "mode", "engine", "engine_note", "time_source", "symbols", "samples", "events", "missing_samples",
+                "completeness", "dropped", "dropped_on_stop", "overflow_samples", "plc_span_s", "stop_reason", "warnings")
+        stats = fin.get("stats")
+        if stats is None and (fin.get("symbols") or 0) <= 50:
+            stats = (await app.mem_call(app.rec.stats, rid, None, False, 0, True)).get("symbols")
+        out = {**{k: fin[k] for k in keep if k in fin}, "verify": {k: ver.get(k) for k in ("verdict", "integrity", "timeline", "counter") if k in ver},
+               "stats": stats}
+        out["engine"] = st.get("engine", out.get("engine"))
+        if st.get("engine_note"):
+            out["engine_note"] = st["engine_note"]
+        return out
 
     @mcp.tool(annotations=READ)
     async def rec_verify(id: str, counter: str | None = None, step: int | None = None) -> dict[str, Any]:

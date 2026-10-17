@@ -93,6 +93,9 @@ def bundle_members() -> list[tuple[Path, str]]:
         if "__pycache__" in py.parts:
             continue
         members.append((py, "server/src/" + py.relative_to(ROOT).as_posix()))
+    # native capture service (tcmcp-capture.exe, built by CI from native/capture) when present
+    for exe in sorted((ROOT / PKG / "bin").glob("tcmcp-capture*")):
+        members.append((exe, "server/src/" + exe.relative_to(ROOT).as_posix()))
     return members
 
 

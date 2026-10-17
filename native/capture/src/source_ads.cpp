@@ -1,0 +1,214 @@
+// ADS source built on Beckhoff's AdsLib (C++ AdsDevice / AdsNotification).
+//   Windows + TwinCAT (USE_TWINCAT_ROUTER): AdsLib over Beckhoff's TcAdsDll.dll — the local TwinCAT router,
+//     same path as TwinCAT's own tools; works for the local runtime and every routed target.
+//   Elsewhere (standalone AdsLib): AdsLib's own AMS/TCP router to a remote IPC (route on the IPC needed).
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <cstddef>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "AdsDevice.h"
+#include "AdsException.h"
+#include "AdsLib.h"
+#include "AdsNotificationOOI.h"
+#include "source.hpp"
+
+#if defined(USE_TWINCAT_ROUTER) && defined(TCMCP_TCADSDLL_RUNTIME)
+#include "TcAdsAPI.h"   // tcmcp_load_tcadsdll
+#endif
+
+// The notification callback reads the header in place and copies the sample bytes. Layout checks against
+// whichever header this was built with (TwinCAT SDK, tcmcp's declarations, or standalone AdsLib):
+static_assert(sizeof(AmsNetId) == 6, "AmsNetId layout");
+static_assert(sizeof(AmsAddr) == 8, "AmsAddr layout");
+static_assert(sizeof(AdsNotificationAttrib) == 16, "AdsNotificationAttrib layout");
+#if defined(USE_TWINCAT_ROUTER)
+static_assert(offsetof(AdsNotificationHeader, hNotification) == 0, "TcAdsDll AdsNotificationHeader layout");
+static_assert(offsetof(AdsNotificationHeader, nTimeStamp) == 4, "TcAdsDll AdsNotificationHeader layout");
+static_assert(offsetof(AdsNotificationHeader, cbSampleSize) == 12, "TcAdsDll AdsNotificationHeader layout");
+static_assert(offsetof(AdsNotificationHeader, data) == 16, "TcAdsDll AdsNotificationHeader layout");
+#else
+static_assert(sizeof(AdsNotificationHeader) == 16, "AdsLib AdsNotificationHeader layout");
+#endif
+
+namespace tcmcp {
+namespace {
+
+std::atomic<Sink*> g_sink{nullptr};
+
+inline const uint8_t* sample_bytes(const AdsNotificationHeader* h) {
+    return reinterpret_cast<const uint8_t*>(h) + 16;
+}
+
+// One call per sample (TcAdsDll and AdsLib both split batched frames into single samples).
+void on_notification(const AmsAddr*, const AdsNotificationHeader* h, uint32_t hUser) {
+    Sink* s = g_sink.load(std::memory_order_acquire);
+    if (s) s->on_sample(hUser, static_cast<int64_t>(h->nTimeStamp), sample_bytes(h), static_cast<uint32_t>(h->cbSampleSize));
+}
+
+std::string ads_error_text(long code);
+
+std::string ads_error(long code) {
+    char b[48];
+    std::snprintf(b, sizeof b, "ADS error 0x%lX (%ld)", static_cast<unsigned long>(code), code);
+    std::string t = ads_error_text(code);
+    return t.empty() ? std::string(b) : std::string(b) + ": " + t;
+}
+
+std::string ads_error_text(long code) {
+    switch (code) {
+        case 0x6: return "target port not found (is the PLC runtime started?)";
+        case 0x7: return "target machine not found (missing ADS route?)";
+        case 0x702: return "invalid index group";
+        case 0x703: return "invalid index offset";
+        case 0x704: return "reading/writing not permitted";
+        case 0x705: return "parameter size not correct";
+        case 0x706: return "invalid data";
+        case 0x707: return "device not ready (PLC not in RUN?)";
+        case 0x713: return "transmission mode not supported";
+        case 0x716: return "no more notification handles";
+        case 0x717: return "notification size too large";
+        case 0x745: return "timeout (ADS route / firewall / target busy)";
+        case 0x748: return "ADS port not open (router not running / TcAdsDll not loaded)";
+        default: return "";
+    }
+}
+
+class AdsSource : public Source {
+public:
+    AdsSource(std::string net_id, uint16_t port, std::string ip, uint32_t timeout_ms)
+        : net_id_(std::move(net_id)), port_(port), ip_(std::move(ip)), timeout_ms_(timeout_ms) {}
+
+    ~AdsSource() override { unsubscribe(); }
+
+    bool connect(std::string& err) {
+        AmsNetId id = make_AmsNetId(net_id_);
+        bool zero = true;
+        for (unsigned char c : id.b) zero = zero && c == 0;
+        if (zero) {
+            err = "invalid AMS Net ID " + net_id_;
+            return false;
+        }
+        try {
+            dev_.reset(new AdsDevice(ip_, id, port_));
+            if (dev_->GetLocalPort() == 0) {
+                err = "could not open an ADS port on the local router (TwinCAT router not running?)";
+                dev_.reset();
+                return false;
+            }
+            dev_->SetTimeout(timeout_ms_);
+            DeviceInfo info = dev_->GetDeviceInfo();
+            std::ostringstream os;
+            os << int(info.version.version) << '.' << int(info.version.revision) << '.' << info.version.build;
+            dev_name_ = std::string(info.name, strnlen(info.name, sizeof(info.name)));
+            dev_version_ = os.str();
+        } catch (const AdsException& ex) {
+            err = "ADS connect to " + net_id_ + ":" + std::to_string(port_) + " failed: " + ads_error(ex.errorCode);
+            dev_.reset();
+            return false;
+        } catch (const std::exception& ex) {
+            err = std::string("ADS connect failed: ") + ex.what();
+            dev_.reset();
+            return false;
+        }
+        return true;
+    }
+
+    bool subscribe(const std::vector<BlockSpec>& blocks, int64_t cycle_100ns, int64_t max_delay_100ns, Sink* sink,
+                   SubscribeError& err) override {
+        g_sink.store(sink, std::memory_order_release);
+        for (size_t k = 0; k < blocks.size(); ++k) {
+            const BlockSpec& b = blocks[k];
+            AdsNotificationAttrib attr{};
+            attr.cbLength = b.size;
+            attr.nTransMode = ADSTRANS_SERVERCYCLE;
+            attr.nMaxDelay = static_cast<uint32_t>(max_delay_100ns);
+            attr.nCycleTime = static_cast<uint32_t>(cycle_100ns);
+            try {
+                notes_.emplace_back(new AdsNotification(*dev_, b.igrp, b.ioffs, attr, &on_notification,
+                                                        static_cast<uint32_t>(k)));
+            } catch (const AdsException& ex) {
+                err.block = static_cast<int>(k);
+                err.code = ex.errorCode;
+                err.message = ads_error(ex.errorCode);
+                unsubscribe();
+                return false;
+            } catch (const std::exception& ex) {
+                err.block = static_cast<int>(k);
+                err.message = ex.what();
+                unsubscribe();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void unsubscribe() override {
+        // AdsNotification's destructor deletes the device notification (synchronous ADS request).
+        notes_.clear();
+        g_sink.store(nullptr, std::memory_order_release);
+    }
+
+    std::string describe() const override {
+        JObj o;
+        o.str("ads_lib", "Beckhoff AdsLib");
+#if defined(USE_TWINCAT_ROUTER)
+        o.str("router", "TwinCAT (TcAdsDll)");
+        if (!dll_.empty()) o.str("tcadsdll", dll_);
+#else
+        o.str("router", "AdsLib standalone (AMS/TCP)");
+#endif
+        o.str("target", net_id_ + ":" + std::to_string(port_));
+        o.str("device", dev_name_);
+        o.str("device_version", dev_version_);
+        return o.done();
+    }
+
+    std::string dll_;
+
+private:
+    std::string net_id_;
+    uint16_t port_;
+    std::string ip_;
+    uint32_t timeout_ms_;
+    std::unique_ptr<AdsDevice> dev_;
+    std::vector<std::unique_ptr<AdsNotification>> notes_;
+    std::string dev_name_, dev_version_;
+};
+
+}  // namespace
+
+std::unique_ptr<Source> make_ads_source(const JVal& cfg, std::string& err) {
+    std::string net_id = cfg.str("ams_net_id");
+    int64_t port = cfg.integer("port", 851);
+    std::string ip = cfg.str("ip");
+    uint32_t timeout_ms = static_cast<uint32_t>(cfg.integer("timeout_ms", 5000));
+    std::string dll;
+#if defined(USE_TWINCAT_ROUTER) && defined(TCMCP_TCADSDLL_RUNTIME)
+    char e[512] = {0}, from[512] = {0};
+    if (!tcmcp_load_tcadsdll(cfg.str("tcadsdll_path").c_str(), e, sizeof e, from, sizeof from)) {
+        err = e;
+        return nullptr;
+    }
+    dll = from;
+#elif !defined(USE_TWINCAT_ROUTER)
+    // standalone AdsLib: our own AMS Net ID (the IPC needs a route to it) and the IPC's IP address
+    std::string local = cfg.str("local_ams_net_id");
+    if (ip.empty()) {
+        err = "standalone AdsLib needs \"ip\" (the target's IP address) and \"local_ams_net_id\" with a route on the target";
+        return nullptr;
+    }
+    if (!local.empty()) bhf::ads::SetLocalAddress(make_AmsNetId(local));
+#endif
+    if (ip.empty()) ip = "127.0.0.1";   // ignored by the TwinCAT router
+    auto src = std::make_unique<AdsSource>(net_id, static_cast<uint16_t>(port), ip, timeout_ms);
+    src->dll_ = dll;
+    if (!src->connect(err)) return nullptr;
+    return src;
+}
+
+}  // namespace tcmcp

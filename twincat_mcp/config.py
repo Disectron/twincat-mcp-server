@@ -137,6 +137,18 @@ class KnowledgeConfig:
 
 
 @dataclass
+class RecorderConfig:
+    # engine for cycle-mode recordings: "auto" = native capture service (tcmcp-capture, Beckhoff AdsLib on TcAdsDll)
+    # when its executable is present and matches this version, else the Python recorder; "native" = native or fail;
+    # "python" = always the Python recorder. change/poll modes always use the Python recorder.
+    engine: str = "auto"
+    capture_exe: str | None = None          # explicit path to tcmcp-capture(.exe); None = the one shipped in the package
+    ring_s: float = 10.0                    # native: seconds of samples buffered between the ADS callback and the file
+    ring_cap_mb: float = 1024.0             # native: upper limit for that buffer
+    local_ams_net_id: str | None = None     # native on a non-TwinCAT host (standalone AdsLib): this PC's AMS Net ID
+
+
+@dataclass
 class ServerConfig:
     # tool groups exposed to the agent (by name prefix); None = all. 'tc' (doctor, safety, audit) is always on.
     # e.g. ["ads", "rec", "proj"] on a machine where XAE is never driven — fewer tool descriptions to load.
@@ -147,6 +159,7 @@ class ServerConfig:
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
+    recorder: RecorderConfig = field(default_factory=RecorderConfig)
     ads: AdsConfig = field(default_factory=AdsConfig)
     xae: XaeConfig = field(default_factory=XaeConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
@@ -180,7 +193,7 @@ def _find_config_file() -> Path | None:
 
 
 def _apply_toml(cfg: Config, data: dict[str, Any]) -> None:
-    for section in ("server", "knowledge", "ads", "xae", "project", "safety", "docs"):
+    for section in ("server", "knowledge", "recorder", "ads", "xae", "project", "safety", "docs"):
         sub = data.get(section) or {}
         target = getattr(cfg, section)
         for k, v in sub.items():
@@ -223,6 +236,11 @@ def _env_override(cfg: Config, key: str, env: str, new: Any) -> None:
 def _apply_env(cfg: Config) -> None:
     if v := _env("TCMCP_KNOWLEDGE_DIR"):
         cfg.knowledge.location = v
+    if v := _env("TCMCP_REC_ENGINE"):
+        _env_override(cfg, "recorder.engine", "TCMCP_REC_ENGINE", v.lower())
+        cfg.recorder.engine = v.lower()
+    if v := _env("TCMCP_CAPTURE_EXE"):
+        cfg.recorder.capture_exe = v
     if (lst := _env_list("TCMCP_TOOL_GROUPS")) is not None:
         cfg.server.tool_groups = [g.strip().lower() for g in lst]
     # safety
@@ -331,6 +349,11 @@ def validate(cfg: Config) -> list[str]:
             setattr(cfg.project, attr, None)
     if cfg.project.root and not Path(cfg.project.root).is_dir():
         cfg.warnings.append(f"project.root {cfg.project.root!r} is not a folder on this PC — project tools will find nothing.")
+    if cfg.recorder.engine not in ("auto", "native", "python"):
+        cfg.warnings.append(f"recorder.engine = {cfg.recorder.engine!r} is not auto | native | python — using auto.")
+        cfg.recorder.engine = "auto"
+    if looks_like_placeholder(cfg.recorder.capture_exe):
+        cfg.recorder.capture_exe = None
     # --- hard errors ------------------------------------------------------------------------------
     if cfg.safety.mode not in MODES:
         problems.append(f"safety.mode must be one of {MODES}, got {cfg.safety.mode!r}")

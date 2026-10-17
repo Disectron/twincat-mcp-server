@@ -119,7 +119,7 @@ If `claude plugin configure` also refuses, the options are plain environment var
 **Pre-build the venv now** (optional but recommended — it removes the one-minute first-start wait from §5):
 
 ```powershell
-python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.7.2\scripts\launch.py" --no-run
+python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.0\scripts\launch.py" --no-run
 ```
 (the version folder changes with each plugin version; `dir $env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp` lists it.)
 
@@ -338,6 +338,21 @@ If only step 11 fails, everything else is usable; Infosys lookup is the one laye
 website's markup to be verified.
 
 ---
+
+## 6a. Native capture service — check it once
+
+Cycle-mode recordings use `twincat_mcp\bin\tcmcp-capture.exe` (C++, Beckhoff AdsLib over TcAdsDll). It is not
+code-signed: if SmartScreen or the virus scanner quarantines it, allow it or set `[recorder] engine = "python"`.
+
+```powershell
+$exe = "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.0\twincat_mcp\bin\tcmcp-capture.exe"
+& $exe --version      # {"version": "0.8.0", ... "ads": "Beckhoff AdsLib on TcAdsDll ..."}
+& $exe --selftest     # six "ok" lines
+```
+
+Then in Claude: `tc_doctor` → `recorder.cycle_mode_uses` must be `native`. `rec_capture symbols=[GVL_Test.aCounter]
+seconds=10 mode=cycle cycle_ms=1` → `engine: native`, `verify.verdict: PASS`. If it says `engine: python`, the
+`engine_note` gives the reason (exe missing, other version, TcAdsDll.dll not found).
 
 ## 6b. Every tool, automatically — the acceptance run
 

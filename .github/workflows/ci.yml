@@ -35,6 +35,24 @@ jobs:
           $env:TWINCAT3DIR = $tcdir                                                             # this step
           python -c "import pyads, pyads.pyads_ex as x; print('pyads import ok via', x._adsDLL)"
           if ($LASTEXITCODE -ne 0) { Write-Output "::error title=stand-in DLL::pyads still cannot import with TWINCAT3DIR=$tcdir"; exit 1 }
+      - name: Build native capture service (Beckhoff AdsLib; Windows = TcAdsDll router mode)
+        shell: bash
+        run: |
+          cmake -S native/capture -B build/capture -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/capture --config Release -j 4
+          exe=$(ls build/capture/tcmcp-capture build/capture/Release/tcmcp-capture.exe 2>/dev/null | head -1)
+          "$exe" --version
+          "$exe" --selftest
+          p="$PWD/$exe"
+          if command -v cygpath >/dev/null; then p=$(cygpath -w "$p"); fi
+          echo "TCMCP_CAPTURE_EXE=$p" >> "$GITHUB_ENV"
+      - name: Upload tcmcp-capture.exe
+        if: runner.os == 'Windows' && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcmcp-capture-windows-x64
+          path: build/capture/Release/tcmcp-capture.exe
+          if-no-files-found: error
       - name: Test
         shell: bash
         run: |

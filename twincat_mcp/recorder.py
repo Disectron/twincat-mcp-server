@@ -316,7 +316,7 @@ class Block:
         self.last_t = t
         self.samples += 1
 
-    def missing(self, end_t: float | None = None) -> int:
+    def missing(self, end_t: float | None = None, start_t: float | None = None) -> int:
         """Holes between the first and last sample, plus — when the window end is known (duration / post-trigger
         stop, or the other blocks' last sample) — the samples this block should have delivered after its last one
         (field report N11: a recording that went quiet halfway must not look complete). One period of slack."""
@@ -324,7 +324,13 @@ class Block:
             return 0
         expected = round((self.last_t - self.first_t) / self.min_step) + 1
         inner = max(0, expected - self.samples)
-        return inner + self.tail_missing(end_t)
+        return inner + self.tail_missing(end_t) + self.head_missing(start_t)
+
+    def head_missing(self, start_t: float | None) -> int:
+        """Samples the window needed before this block's first one (a pre-trigger buffer that was not full yet)."""
+        if start_t is None or not self.min_step or self.first_t is None or self.first_t <= start_t:
+            return 0
+        return int((self.first_t - start_t + 1e-6) / self.min_step)
 
     def tail_missing(self, end_t: float | None) -> int:
         if end_t is None or not self.min_step or self.last_t is None or end_t <= self.last_t:
@@ -463,16 +469,18 @@ class Recording:
             self._sha.update(line.encode("utf-8"))
             self._lines += 1
 
+    def header_dict(self, **extra: Any) -> dict[str, Any]:
+        return {"_header": True, "format": 2, "id": self.id, "name": self.name, "mode": self.mode,
+                "cycle_ms": self.cycle_ms, "time_source": self.time_source,
+                "symbols": [{"id": self.sids[s.name], "name": s.name, "type": s.type, "size": s.size,
+                             "igrp": s.index_group, "ioffs": s.index_offset} for s in self.symbols],
+                "blocks": [b.header() for b in self.blocks],
+                "created": dt.datetime.fromtimestamp(self.created, dt.timezone.utc).isoformat(), **self.meta, **extra}
+
     def start_ingest(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.path, "w", encoding="utf-8", newline="\n", buffering=1 << 16)
-        header = {"_header": True, "format": 2, "id": self.id, "name": self.name, "mode": self.mode,
-                  "cycle_ms": self.cycle_ms, "time_source": self.time_source,
-                  "symbols": [{"id": self.sids[s.name], "name": s.name, "type": s.type, "size": s.size,
-                               "igrp": s.index_group, "ioffs": s.index_offset} for s in self.symbols],
-                  "blocks": [b.header() for b in self.blocks],
-                  "created": dt.datetime.fromtimestamp(self.created, dt.timezone.utc).isoformat(), **self.meta}
-        self._write(json.dumps(header, default=str) + "\n")
+        self._write(json.dumps(self.header_dict(), default=str) + "\n")
         self._thread = threading.Thread(target=self._ingest_loop, name=f"rec-{self.id}", daemon=True)
         self._thread.start()
 
@@ -552,10 +560,6 @@ class Recording:
             self._handle_block(t, self.blocks[key], payload, light)
 
     def _handle_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
-        if self.mode == "cycle":
-            b.note_stamp(t)
-        else:
-            b.samples += 1
         if self.armed:
             self.pre.append((t, b, data))
             while self.pre and t - self.pre[0][0] > self.pre_trigger_ms:
@@ -572,6 +576,11 @@ class Recording:
         self._commit_block(t, b, data, light)
 
     def _commit_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
+        # timeline of what is IN the file (pre-trigger samples that were discarded are not part of it)
+        if self.mode == "cycle":
+            b.note_stamp(t)
+        else:
+            b.samples += 1
         self.last_t = max(self.last_t, t)
         self._write(f'[{t:.4f},"#{b.bid}","{base64.b64encode(data).decode("ascii")}"]\n')
         self.samples += 1
@@ -698,7 +707,7 @@ class Recording:
                           "missing_samples": self.missing_samples(), "dropped": self.dropped,
                           "dropped_on_stop": self.dropped_on_stop, "after_limit": self.after_limit,
                           "unsubscribed": self.unsubscribed, "stop_reason": self.stop_reason,
-                          "window_end_ms": self._cut_t,
+                          "window_end_ms": self._cut_t, "window_start_ms": self.window_start(), "engine": "python",
                           "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "lines": self._lines,
                           "sha256": digest}
                 if self.key:
@@ -712,6 +721,13 @@ class Recording:
         return self.stopped_at is None
 
     # ------------------------------------------------------------ views
+    def window_start(self) -> float | None:
+        """Start of the window that must be complete: trigger − pre_trigger_ms for triggered recordings (samples the
+        pre-trigger buffer could not hold count as missing_head); None otherwise (each block from its first sample)."""
+        if self.triggered_at is None or not self.pre_trigger_ms:
+            return None
+        return self.triggered_at - self.pre_trigger_ms
+
     def window_end(self) -> float | None:
         """End of the recorded window in PLC-relative ms: the duration / post-trigger cut, else the latest sample of
         any block (a block that stopped delivering before the others then shows its tail as missing)."""
@@ -723,8 +739,8 @@ class Recording:
     def missing_samples(self) -> int | None:
         if self.mode != "cycle":
             return None
-        end = self.window_end()
-        return sum(b.missing(end) for b in self.blocks)
+        end, start = self.window_end(), self.window_start()
+        return sum(b.missing(end, start) for b in self.blocks)
 
     def completeness(self) -> float | None:
         if self.mode != "cycle":
@@ -739,7 +755,8 @@ class Recording:
             d: dict[str, Any] = {"id": b.bid, "bytes": b.size, "symbols": len(b.slots), "first": b.slots[0].name if b.slots else None,
                                  "samples": b.samples}
             if self.mode == "cycle":
-                d.update({"missing_samples": b.missing(self.window_end()), "missing_tail": b.tail_missing(self.window_end()),
+                d.update({"missing_samples": b.missing(self.window_end(), self.window_start()),
+                          "missing_head": b.head_missing(self.window_start()), "missing_tail": b.tail_missing(self.window_end()),
                           "period_ms": None if b.min_step is None else round(b.min_step, 4),
                           "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
             if b.error:
@@ -909,7 +926,7 @@ def read_footer(path: Path) -> dict[str, Any] | None:
         with open(path, "rb") as fh:
             fh.seek(0, 2)
             size = fh.tell()
-            fh.seek(max(0, size - 8192))
+            fh.seek(max(0, size - 65536))
             tail = fh.read().decode("utf-8", "replace").strip().splitlines()
     except OSError:
         return None
@@ -931,8 +948,26 @@ class Recorder:
         self.root = root
         self.ring_events = ring_events
         self.max_runs = max_runs
-        self.recs: dict[str, Recording] = {}
+        self.recs: dict[str, Any] = {}      # Recording (Python engine) or NativeRecording
         self._key: bytes | None = None
+        self.rcfg: Any = None                # config.RecorderConfig (engine, capture_exe, ring); None = defaults
+        self.native_extra: dict[str, Any] | None = None   # tests: extra start fields (backend="sim", sim={...})
+
+    # ------------------------------------------------------------ native engine
+    def native_exe(self) -> Path:
+        from . import native_capture as NC
+        exe = getattr(self.rcfg, "capture_exe", None) if self.rcfg is not None else None
+        return Path(exe) if exe else NC.default_exe()
+
+    def engine_info(self) -> dict[str, Any]:
+        """For tc_doctor / rec_start: which engine cycle recordings use and why."""
+        from . import native_capture as NC
+        want = getattr(self.rcfg, "engine", "auto") if self.rcfg is not None else "auto"
+        exe = self.native_exe()
+        ok, reason, info = NC.availability(exe, _pkg_version())
+        return {"setting": want, "native_available": ok, "native_exe": str(exe), "native_reason": reason,
+                "native_version": (info or {}).get("version"), "native_ads": (info or {}).get("ads"),
+                "cycle_mode_uses": ("python" if want == "python" or not ok else "native")}
 
     @property
     def key(self) -> bytes:
@@ -1058,7 +1093,13 @@ class Recorder:
               cycle_ms: float, duration_s: float | None, max_events: int | None, start_when: str | None,
               stop_when: str | None, pre_trigger_ms: float, name: str | None, max_symbols: int,
               port: int | None = None, post_trigger_s: float | None = None, allow_partial: bool = False,
-              max_delay_ms: float = 0.0, cycle_counter: str | None = "auto", edge_triggers: bool = False) -> dict[str, Any]:
+              max_delay_ms: float = 0.0, cycle_counter: str | None = "auto", edge_triggers: bool = False,
+              engine: str | None = None) -> dict[str, Any]:
+        if mode not in ("cycle", "change", "poll"):
+            raise RecorderError("mode must be cycle | change | poll")
+        want = (engine or (getattr(self.rcfg, "engine", "auto") if self.rcfg is not None else "auto")).lower()
+        if want not in ("auto", "native", "python"):
+            raise RecorderError("engine must be auto | native | python")
         if mode not in ("cycle", "change", "poll"):
             raise RecorderError("mode must be cycle | change | poll")
         cycle_ms = max(float(cycle_ms), 0.1)
@@ -1085,6 +1126,15 @@ class Recorder:
                         duration_s, max_events, sw, ew, pre_trigger_ms, meta, post_trigger_s, self.key)
         if mode != "poll":
             rec.set_blocks(build_blocks(syms, rec.sids, rec.types))
+        chosen, engine_note = self._choose_engine(want, mode, allow_partial)
+        if chosen == "native":
+            try:
+                return self._start_native(rec, port, cycle_ms, max_delay_ms, duration_s, post_trigger_s, pre_trigger_ms,
+                                          max_events, syms, counter)
+            except _NativeFallback as exc:
+                if want == "native":
+                    raise RecorderError(f"engine 'native' requested but not usable: {exc}") from exc
+                engine_note = f"native engine not used: {exc}"
         rec.start_ingest()
         try:
             if mode == "poll":
@@ -1098,6 +1148,61 @@ class Recorder:
             raise
         self.recs[rid] = rec
         st = rec.status()
+        st["engine"] = "python"
+        if engine_note:
+            st["engine_note"] = engine_note
+        return self._start_summary(st, rec, syms, counter, mode, cycle_ms)
+
+    def _choose_engine(self, want: str, mode: str, allow_partial: bool) -> tuple[str, str | None]:
+        if want == "python":
+            return "python", None
+        if mode != "cycle":
+            if want == "native":
+                raise RecorderError(f"engine 'native' records cycle mode only (mode={mode!r} uses the Python recorder)")
+            return "python", None
+        if allow_partial:
+            if want == "native":
+                raise RecorderError("engine 'native' subscribes all blocks or none: allow_partial needs the Python recorder")
+            return "python", "allow_partial=true: Python recorder (the native engine is all-or-nothing)"
+        from . import native_capture as NC
+        ok, reason, _info = NC.availability(self.native_exe(), _pkg_version())
+        if not ok:
+            if want == "native":
+                raise RecorderError(f"engine 'native' requested but not usable: {reason}")
+            return "python", f"native engine not used: {reason}"
+        return "native", None
+
+    def _start_native(self, rec: Recording, port: int | None, cycle_ms: float, max_delay_ms: float,
+                      duration_s: float | None, post_trigger_s: float | None, pre_trigger_ms: float,
+                      max_events: int | None, syms: list[SymbolEntry], counter: SymbolEntry | None) -> dict[str, Any]:
+        from . import native_capture as NC
+        extra = dict(self.native_extra or {})
+        backend = extra.pop("backend", "ads")
+        net_id = extra.pop("ams_net_id", None)
+        if net_id is None and backend == "ads":
+            net_id = self.ads.conn(port).ams_net_id      # resolves the local NetId when none is configured
+        info = NC.availability(self.native_exe(), _pkg_version())[2] or {}
+        header = rec.header_dict(engine="native", engine_version=info.get("version"), engine_ads=info.get("ads"))
+        _ = self.key                                      # make sure the HMAC key exists before the service reads it
+        rc = self.rcfg
+        try:
+            nrec = NC.start_native(
+                rec, header, self.native_exe(), net_id=net_id or "", port=port or self.ads.port, ip=self.ads.ip,
+                local_net_id=getattr(rc, "local_ams_net_id", None), cycle_ms=cycle_ms, max_delay_ms=max_delay_ms,
+                duration_s=duration_s, post_trigger_s=post_trigger_s, pre_trigger_ms=pre_trigger_ms,
+                max_events=max_events, key_path=self.root / ".recording.key",
+                ring_s=float(getattr(rc, "ring_s", 10.0)), ring_cap_mb=float(getattr(rc, "ring_cap_mb", 1024.0)),
+                timeout_ms=int(getattr(self.ads.cfg, "timeout_ms", 5000)), backend=backend, extra=extra)
+        except NC.NativeUnavailable as exc:
+            raise _NativeFallback(str(exc)) from exc
+        except NC.NativeStartError as exc:
+            raise AdsError(f"{exc}. Nothing is recorded rather than a recording with holes.") from exc
+        self.recs[rec.id] = nrec
+        st = nrec.status()
+        return self._start_summary(st, rec, syms, counter, "cycle", cycle_ms)
+
+    def _start_summary(self, st: dict[str, Any], rec: Any, syms: list[SymbolEntry], counter: SymbolEntry | None,
+                       mode: str, cycle_ms: float) -> dict[str, Any]:
         notifs = len(rec.blocks) if mode != "poll" else 0
         rate = (notifs or 1) * 1000.0 / cycle_ms
         st["leaves"] = len(syms)
@@ -1118,7 +1223,7 @@ class Recorder:
             st["cycle_counter"] = counter.name
         st["notifications_per_s"] = round(rate, 1) if mode == "cycle" else f"≤{round(rate, 1)}"
         st["values_per_s"] = round(len(syms) * 1000.0 / cycle_ms, 1) if mode == "cycle" else None
-        if mode == "cycle" and rate > 20_000:
+        if mode == "cycle" and rate > 20_000 and st.get("engine") != "native":
             st["warning"] = (f"{notifs} notifications every {cycle_ms} ms: above what this PC was measured to ingest. "
                              "Watch missing_samples / backlog in rec_status, or select fewer, contiguous variables.")
         return st
@@ -1234,6 +1339,11 @@ class Recorder:
 
     def stop(self, rid: str, reason: str = "requested") -> dict[str, Any]:
         rec = self._get(rid)
+        if getattr(rec, "engine", "python") == "native":
+            st = rec.stop(reason)
+            st["stats"] = None
+            st["stats_note"] = "native engine: rec_stats(id, symbols=[…]) computes exact statistics from the file"
+            return st
         if rec.active:
             rec.request_stop(reason)          # reason first: a limit check racing the release must not claim the stop
             if rec.mode != "poll":
@@ -1262,7 +1372,9 @@ class Recorder:
     def reap(self) -> None:
         """Release ADS handles of recordings that ended on their own (limits/stop_when)."""
         for rec in self.recs.values():
-            if not rec.active and rec.conn is not None:
+            if getattr(rec, "engine", "python") == "native":
+                rec.reap()
+            elif not rec.active and rec.conn is not None:
                 self._stop_notifications(rec)
 
     # ------------------------------------------------------------ queries
@@ -1320,6 +1432,11 @@ class Recorder:
                 rec = self._get(rid)
             except RecorderError:
                 rec = None
+        if rec is not None and getattr(rec, "engine", "python") == "native":
+            rec = None if not rec.active else rec
+            if rec is not None:
+                return {"id": rid, "active": True, "source": "none",
+                        "note": "native engine recordings have no live statistics: rec_stop first, then rec_stats (exact, from the file)"}
         if rec is not None:
             coverage = rec.stats_samples / rec.samples if rec.samples else 1.0
             if not exact and (coverage >= 1.0 or rec.active):
@@ -1509,6 +1626,10 @@ class Recorder:
                 out["integrity"] = "intact"
             out["footer"] = {k: footer.get(k) for k in ("events", "samples", "missing_samples", "dropped", "dropped_on_stop",
                                                          "after_limit", "unsubscribed", "stop_reason")}
+            for k in ("engine", "engine_version", "overflow_samples", "missing_head", "missing_gaps", "missing_tail",
+                      "requested_s", "window_start_ms", "window_end_ms", "verdict_hint"):
+                if k in footer:
+                    out["footer"][k] = footer[k]
         header = _read_header(path)
         out["time_source"] = header.get("time_source", "plc")
         if counter is None and header.get("cycle_counter"):
@@ -1532,12 +1653,14 @@ class Recorder:
             tot_s = tot_m = 0
             lasts = [b.last_t for b in blocks.values() if b.last_t is not None]
             end = (footer or {}).get("window_end_ms") or (max(lasts) if lasts else None)
+            start = (footer or {}).get("window_start_ms")
             for b in blocks.values():
-                m = b.missing(end)
+                m = b.missing(end, start)
                 tot_s += b.samples
                 tot_m += m
                 rep.append({"block": b.bid, "first": b.slots[0].name if b.slots else None, "symbols": len(b.slots),
-                            "samples": b.samples, "missing": m, "missing_tail": b.tail_missing(end),
+                            "samples": b.samples, "missing": m, "missing_head": b.head_missing(start),
+                            "missing_tail": b.tail_missing(end),
                             "period_ms": None if b.min_step is None else round(b.min_step, 4),
                             "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
             out["timeline"] = {"samples": tot_s, "missing": tot_m,
@@ -1579,8 +1702,10 @@ class Recorder:
         ok = out.get("integrity", "").startswith("intact")
         tl = out.get("timeline") or {}
         cn = out.get("counter") or {}
-        out["verdict"] = ("PASS" if ok and not tl.get("missing") and cn.get("lossless", True) and not (footer or {}).get("dropped")
-                          and not (footer or {}).get("dropped_on_stop") else "FAIL")
+        ft = footer or {}
+        out["verdict"] = ("PASS" if ok and not tl.get("missing") and cn.get("lossless", True) and not ft.get("dropped")
+                          and not ft.get("dropped_on_stop") and not ft.get("overflow_samples")
+                          and ft.get("verdict_hint", "PASS") == "PASS" else "FAIL")
         return out
 
     # ------------------------------------------------------------ analysis
@@ -1781,6 +1906,10 @@ def _fast_switch(delta: int) -> None:
         if _SWITCH_USERS[0] == 0 and _SWITCH_USERS[1] is not None:
             sys.setswitchinterval(_SWITCH_USERS[1])
             _SWITCH_USERS[1] = None
+
+
+class _NativeFallback(Exception):
+    pass
 
 
 def _pkg_version() -> str:

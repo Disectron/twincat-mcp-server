@@ -27,6 +27,12 @@ tcunit_remote_result = 'boot:TcUnit_xUnit_testresults.xml'   # 'boot:' = the tar
 [project.naming_prefixes]          # overrides for proj_lint's naming rule
 LREAL = ["r", "lr", "f"]
 
+[recorder]
+engine = "auto"                    # cycle-mode recordings: auto = native C++ capture service (bin/tcmcp-capture.exe,
+                                   # Beckhoff AdsLib on TcAdsDll) when it matches this version, else Python; native | python
+# capture_exe = 'D:\Tools\tcmcp-capture.exe'   # only to use your own build instead of the shipped one
+ring_s = 10.0                      # native: seconds of samples buffered between the ADS callback and the file
+
 [server]
 tool_groups = ["ads", "rec", "snap", "test", "proj", "xae", "infosys", "wf"]   # only these groups (tc_* always); remove the line for all
 
