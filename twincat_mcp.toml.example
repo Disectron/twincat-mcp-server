@@ -28,18 +28,20 @@ tcunit_remote_result = 'boot:TcUnit_xUnit_testresults.xml'   # 'boot:' = the tar
 LREAL = ["r", "lr", "f"]
 
 [server]
-# tool_groups = ["ads", "rec", "snap", "test", "proj"]   # only these tool groups (tc_* always); default all
+tool_groups = ["ads", "rec", "snap", "test", "proj", "xae", "infosys", "wf"]   # only these groups (tc_* always); remove the line for all
 
 [safety]
 mode = "guarded"                   # readonly | guarded | full  (start mode)
 max_mode = "full"                  # ceiling for tc_set_mode at runtime
 confirm_destructive = true         # false = activate/restart/reboot in one call (full mode)
 confirm_ttl_s = 180
-write_allowlist = ["MAIN.fb*", "GVL_Test.*", "GVL_Hmi.*"]   # guarded mode: writable symbols
+write_allowlist = ["GVL_Test.*", "MAIN.fbFill.stParams.*"]   # guarded mode: writable symbols — name FBs/structs, never "MAIN.*"
+                                                              # (MAIN.* also covers every valve output under MAIN)
 write_denylist  = ["*.bEStop*", "GVL_Safety.*"]            # never writable, any mode
 audit_reads = false
-allow_elicitation = true            # false: no in-chat confirm prompts; every approval is a tc_request_confirmation token
-edit_requires_config_mode = false   # true: PLC code/project edits refused unless TwinCAT on the target is in CONFIG
+allow_elicitation = false           # no in-chat confirm prompts: every approval is a separate tc_request_confirmation token
+                                    # (field report #73: prompts were accepted in < 1 s without being read)
+edit_requires_config_mode = true    # PLC code/project edits refused unless TwinCAT on the target is in CONFIG
 # audit_log = 'C:\Users\ryan\.twincat_mcp\audit.jsonl'
 
 [docs]                             # Beckhoff Infosys reference (infosys_* tools), TwinCAT 3 only

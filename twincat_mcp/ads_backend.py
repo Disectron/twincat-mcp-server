@@ -27,7 +27,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
+from typing import Callable, Any
 
 import pyads
 from pyads import constants as C
@@ -725,9 +725,17 @@ class AdsBackend:
                 return num
         raise AdsError(f"{value!r} is not a value of {type_name}; valid: {', '.join(e.enum.values())}")
 
+    # set by the server: source-level checks (CONSTANT declarations, no project in guarded mode) that every
+    # write path must pass — ads_write, ads_write_many, snap_apply, test_*, exp_* all end in check_write
+    write_guard: Callable[[str], str | None] | None = None
+
     def check_write(self, name: str, value: Any, port: int | None = None) -> dict[str, Any]:
         """Everything write() would refuse, without writing: READONLY flag, pointer/reference/interface types,
-        enum names, array length, string length, integer range. Returns the encoded value."""
+        source-level CONSTANT, enum names, array length, string length, integer range. Returns the encoded value."""
+        if self.write_guard is not None:
+            why = self.write_guard(name)
+            if why:
+                raise AdsError(why)
         s = self.symbol_info(name, port)
         if s.flags & 0x0020:
             raise AdsError(f"{s.name!r} is flagged READONLY by the runtime")

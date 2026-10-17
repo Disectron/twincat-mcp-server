@@ -141,6 +141,7 @@ class App:
         self.xae = XaeBackend(cfg.xae)
         self.xae_worker = SerialWorker("tcmcp-xae-sta", init=sta_init, teardown=sta_teardown)
         self.proj = ProjectIndex(cfg.project)
+        self.ads.write_guard = self.constant_reason       # every write path: CONSTANT / no-source checks
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
@@ -375,9 +376,15 @@ class App:
         return out
 
     def constant_reason(self, name: str) -> str | None:
-        """Runtime symbol flags do not mark VAR CONSTANT as READONLY on 4026, so the project source decides: a write
-        to anything declared in a CONSTANT block is refused. No project root → no check (stated in the docstring)."""
+        """Source-level write check, installed as AdsBackend.write_guard so every write path runs it.
+        Runtime symbol flags do not mark VAR CONSTANT as READONLY on 4026, so the project source decides: a write
+        to anything declared in a CONSTANT block is refused. Without a project source the check cannot run: in
+        guarded mode that refuses the write, in full mode it is allowed (decision 2026-10-17)."""
         if self.proj.root is None:
+            if self.guard.mode == "guarded":
+                return (f"{name!r}: no project source is loaded (project.root / xae.solution_path), so a write to a "
+                        "CONSTANT cannot be ruled out — guarded mode refuses writes without it. Set the project root "
+                        "(tc_reload_config) or switch to full mode.")
             return None
         try:
             self.proj._ensure()
@@ -392,10 +399,7 @@ class App:
         return None
 
     async def write_preflight(self, name: str, value: Any, port: int | None = None) -> None:
-        why = await asyncio.to_thread(self.constant_reason, name)
-        if why:
-            raise ToolError(why)
-        await self.ads_call(self.ads.check_write, name, value, port, timeout=30)
+        await self.ads_call(self.ads.check_write, name, value, port, timeout=30)   # includes constant_reason
 
     async def _require_config_mode(self, action: str, target: str) -> None:
         """safety.edit_requires_config_mode: refuse code/project edits unless TwinCAT on the ADS target is in CONFIG.

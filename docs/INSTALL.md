@@ -179,7 +179,7 @@ tcunit_remote_result = 'boot:TcUnit_xUnit_testresults.xml'   # 'boot:' resolves 
 # hmi_root = '<PROJECT_DIR>\Hmi'     # TE2000 project folder, for hmi_scan / hmi_vs_runtime
 
 [server]
-# tool_groups = ["ads", "rec", "snap", "test", "proj"]   # expose only these groups (tc_* always); default: all
+tool_groups = ["ads", "rec", "snap", "test", "proj", "xae", "infosys", "wf"]   # only these groups (tc_* always); remove the line for all
 
 [safety]
 mode = "guarded"                     # readonly | guarded | full
@@ -189,8 +189,8 @@ confirm_ttl_s = 180
 write_allowlist = []                 # EMPTY on day one: guarded mode then refuses every write (verified behaviour)
 write_denylist  = ["*.bEStop*", "*EStop*", "GVL_Safety.*", "*.bEmergency*"]   # never writable in any mode
 audit_reads = false
-allow_elicitation = true             # false: no in-chat confirm prompts — every approval is a tc_request_confirmation token
-edit_requires_config_mode = false    # true: code/project edits refused unless TwinCAT on the target is in CONFIG
+allow_elicitation = false            # every approval is a separate tc_request_confirmation token (field report #73)
+edit_requires_config_mode = true     # code/project edits refused unless TwinCAT on the target is in CONFIG
 
 [docs]
 enabled = true

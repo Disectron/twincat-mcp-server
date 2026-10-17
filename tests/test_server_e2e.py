@@ -596,3 +596,25 @@ def test_project_library_books(project_dir):
     cfg = mk_cfg(project_dir)
     app = App(cfg)
     assert app.project_library_books() == ["tcplclib_tc2_smtp", "tcplclib_tc2_standard"]
+
+
+@pytest.mark.anyio
+async def test_source_checks_on_every_write_path(monkeypatch, project_dir):
+    """Decision 2026-10-17: the CONSTANT check runs on every write path (not only ads_write); without a project
+    source, guarded mode refuses writes and full mode allows them."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="full", confirm_destructive=False))
+    async with client_for(srv) as s:
+        sc = payload(await s.call_tool("test_scenario", {"spec": {"name": "c", "steps": [{"write": {"GVL_Machine.MAX_MODULES": 99}}]}}))
+        assert not sc["pass"] and "CONSTANT" in json.dumps(sc)
+    cfg = Config()
+    cfg.ads.ams_net_id = "5.1.2.3.1.1"
+    cfg.safety.mode = "guarded"
+    cfg.safety.write_allowlist = ["MAIN.*"]
+    validate(cfg)
+    async with client_for(build_server(cfg)) as s:
+        r = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 1})
+        assert r.is_error and "no project source is loaded" in text(r)
+    cfg.safety.mode = "full"
+    async with client_for(build_server(cfg)) as s:
+        assert not (await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 1})).is_error
