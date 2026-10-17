@@ -1,4 +1,4 @@
-# twincat-mcp 0.7.0 — tool reference
+# twincat-mcp 0.7.1 — tool reference
 
 143 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
@@ -68,7 +68,7 @@
 - `rec_verify` [R] — Prove a finished recording. integrity: the file is byte-for-byte what the recorder wrote (sha256 of every line, signed with this install's key) — 'MODIFIED' if anything was edited. timeline (cycle mode): per notification block, holes between the PLC's own sample timestamps. counter (optional): a PLC variable that…
 - `rec_read` [R] — Read a time window of a recording from its file. wide=true pivots to one row per event with all selected symbols forward-filled (what you want for 'what else was true when X happened'). Works on finished recordings from earlier sessions too.
 - `rec_stop` [E] — Stop a recording, release the ADS notifications, finalize the file; returns status + stats.
-- `rec_export` [R] — Export a recording to CSV: csv_wide (t_ms + one column per symbol, forward-filled) or csv_long (t_ms,symbol,value). Default path next to the JSONL.
+- `rec_export` [R] — Export a recording to CSV. csv_wide: one row per PLC sample time, one column per variable and per array element (name[i]); an empty cell means no sample of that variable at that time (fill=true forward-fills — handy for charts, but a cell then no longer means "sampled now"). csv_long: t_ms,symbol,value. Both include…
 - `rec_delete` [E] — Stop (if running) and delete a recording and its exports from disk.
 - `rec_pulses` [R] — Pulse / dwell analysis of one recorded symbol: for BOOL → pulse count, high/low widths, period, frequency, duty (fine-dosing valve pulses); for other types → state timeline with dwell times.
 - `rec_latency` [R] — Edge-to-edge latency in a recording: from each time `from_symbol from_op from_value` becomes true to the next time `to_symbol to_op to_value` becomes true (PLC timestamps). E.g. bOpenCmd == TRUE → rFlow > 0.5.
