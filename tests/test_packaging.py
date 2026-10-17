@@ -107,19 +107,46 @@ def test_launch_main_installs_once_then_skips(tmp_path, monkeypatch):
     executed: list[tuple] = []
     monkeypatch.setattr(launch, "exec_server", lambda vp, args, env: executed.append((vp, args, env)) or 0)
     monkeypatch.setenv("TCMCP_MODE", "${user_config.mode}")
+    spawned: list[tuple] = []
+    monkeypatch.setattr(launch, "spawn_background_install", lambda s_, v_, py: spawned.append((s_, v_, py)) or (v_.parent / "log"))
 
-    assert launch.main(["--src", str(src), "--venv", str(venv), "--log", "DEBUG"]) == 0
+    # 1. started as the server with no venv: must NOT install inline (the client would time out) —
+    #    it takes the lock, spawns the detached install and exits 5
+    assert launch.main(["--src", str(src), "--venv", str(venv), "--log", "DEBUG"]) == 5
+    assert spawned and not executed and not any("install" in c for c in calls)
+    assert launch.lock_age_s(venv) is not None, "lock held while the background install runs"
+    # a second server start while the install runs: exit 5 again, nothing spawned twice
+    assert launch.main(["--src", str(src), "--venv", str(venv)]) == 5
+    assert len(spawned) == 1
+
+    # 2. the spawned child (--no-run --lock-held) installs inline and releases the lock
+    assert launch.main(["--src", str(src), "--venv", str(venv), "--no-run", "--lock-held"]) == 0
     assert any(c[1:3] == ["-m", "venv"] for c in calls)
     assert any("install" in c and str(src) in c for c in calls)
+    assert (venv / launch.STAMP_NAME).is_file()
+    assert launch.lock_age_s(venv) is None, "lock released after install"
+
+    # 3. the reconnect: venv present and stamp current → straight to the server, env sanitised, args through
+    calls.clear()
+    assert launch.main(["--src", str(src), "--venv", str(venv), "--log", "DEBUG"]) == 0
     assert executed[0][1] == ["--log", "DEBUG"], "unknown args pass through to the server"
     assert "TCMCP_MODE" not in executed[0][2]
-    assert (venv / launch.STAMP_NAME).is_file()
-
-    calls.clear()
-    assert launch.main(["--src", str(src), "--venv", str(venv), "--no-run"]) == 0
     assert not any("install" in c and str(src) in c for c in calls), "second start must not reinstall"
+
+    # 4. --no-run bootstrap (pre-install step / CI) installs synchronously; --reinstall forces it
     assert launch.main(["--src", str(src), "--venv", str(venv), "--no-run", "--reinstall"]) == 0
     assert any("install" in c and str(src) in c for c in calls)
+    # 5. --sync-install keeps the old inline behaviour for clients with a long connect timeout
+    (venv / launch.STAMP_NAME).unlink()
+    calls.clear(); executed.clear()
+    assert launch.main(["--src", str(src), "--venv", str(venv), "--sync-install"]) == 0
+    assert any("install" in c and str(src) in c for c in calls) and executed
+    # 6. the hook form: --no-run --background spawns and returns at once
+    (venv / launch.STAMP_NAME).unlink()
+    spawned.clear()
+    assert launch.main(["--src", str(src), "--venv", str(venv), "--no-run", "--background"]) == 0
+    assert len(spawned) == 1 and launch.lock_age_s(venv) is not None
+    launch.release_lock(venv)
 
 
 def test_launch_main_rejects_missing_sources(tmp_path):

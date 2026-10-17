@@ -12,6 +12,7 @@ agent by ``tc_config`` without surprises.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -122,6 +123,7 @@ class Config:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     docs: DocsConfig = field(default_factory=DocsConfig)
     config_file: str | None = None
+    warnings: list[str] = field(default_factory=list)   # values that were ignored or corrected at load (tc_doctor shows them)
 
     # ------------------------------------------------------------------ dump
     def to_dict(self) -> dict[str, Any]:
@@ -235,9 +237,46 @@ def _apply_env(cfg: Config) -> None:
         cfg.project.tcunit_remote_result = v
 
 
+_RE_NETID = re.compile(r"^\d{1,3}(\.\d{1,3}){5}$")
+_PLACEHOLDER_MARKS = ("<", ">", "path\\to", "path/to", "yoursolution", "your.sln", "x.x.x.x")
+
+
+def looks_like_placeholder(value: str | None) -> bool:
+    """A template value that was copied without being edited: '<CX_NETID>', 'C:\\path\\to\\YourSolution.sln', 'x.x.x.x.1.1'."""
+    if not value:
+        return False
+    low = str(value).lower()
+    return any(m in low for m in _PLACEHOLDER_MARKS)
+
+
 def validate(cfg: Config) -> list[str]:
-    """Return a list of human-readable problems (empty = fine)."""
+    """Return a list of human-readable problems (empty = fine). Placeholder or malformed values that
+    have a safe fallback are *not* problems: they are dropped and recorded in ``cfg.warnings`` so the
+    server still starts and tc_doctor can point at them."""
     problems: list[str] = []
+    # --- values copied from a template without editing -----------------------------------------
+    if looks_like_placeholder(cfg.ads.ams_net_id):
+        cfg.warnings.append(f"ads.ams_net_id = {cfg.ads.ams_net_id!r} is a template placeholder — ignored; talking to the LOCAL runtime. "
+                            "Set the CX NetId (XAE → System → Routes, e.g. 5.12.34.56.1.1) in twincat_mcp.toml or the plugin option ams_net_id.")
+        cfg.ads.ams_net_id = None
+    elif cfg.ads.ams_net_id and not _RE_NETID.match(cfg.ads.ams_net_id.strip()):
+        cfg.warnings.append(f"ads.ams_net_id = {cfg.ads.ams_net_id!r} is not an AmsNetId (six dotted numbers) — ignored; talking to the LOCAL runtime.")
+        cfg.ads.ams_net_id = None
+    elif cfg.ads.ams_net_id:
+        cfg.ads.ams_net_id = cfg.ads.ams_net_id.strip()
+    if looks_like_placeholder(cfg.xae.solution_path):
+        cfg.warnings.append(f"xae.solution_path = {cfg.xae.solution_path!r} is a template placeholder — ignored. Set the real .sln path.")
+        cfg.xae.solution_path = None
+    elif cfg.xae.solution_path and not Path(cfg.xae.solution_path).is_file():
+        cfg.warnings.append(f"xae.solution_path {cfg.xae.solution_path!r} does not exist on this PC (xae_attach will still try by name).")
+    for attr in ("root", "hmi_root", "experiments_dir"):
+        v = getattr(cfg.project, attr)
+        if looks_like_placeholder(v):
+            cfg.warnings.append(f"project.{attr} = {v!r} is a template placeholder — ignored.")
+            setattr(cfg.project, attr, None)
+    if cfg.project.root and not Path(cfg.project.root).is_dir():
+        cfg.warnings.append(f"project.root {cfg.project.root!r} is not a folder on this PC — project tools will find nothing.")
+    # --- hard errors ------------------------------------------------------------------------------
     if cfg.safety.mode not in MODES:
         problems.append(f"safety.mode must be one of {MODES}, got {cfg.safety.mode!r}")
     if cfg.safety.max_mode is None:

@@ -191,3 +191,27 @@ def test_compare_recordings(rec):
     assert c["common_symbols"] == 2
     assert rows["MAIN.nCycle"]["delta"]["max"] == 4
     assert rows["MAIN.fbFill.bDone"]["pulses"]["a"]["high_ms"]["mean"] == 50 and rows["MAIN.fbFill.bDone"]["pulses"]["b"]["high_ms"]["mean"] == 80
+
+
+def test_limit_ends_recording_promptly_even_while_notifications_keep_coming(rec):
+    """Field report: rec_status stayed active ~11 s after 'stop_reason: duration', and rec_export had more rows
+    than rec_status events. Cause: after the limit the ingest loop kept draining a queue the target kept filling,
+    and notifications were only released at the next rec_list. Now the loop stops at the limit and the
+    notifications are released from the ingest thread itself."""
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="change", cycle_ms=10, duration_s=None,
+                   max_events=5, start_when=None, stop_when=None, pre_trigger_ms=0, name="limit", max_symbols=10)
+    rid = st["id"]
+    c = _conn()
+    for i in range(200):                        # far more than the limit, delivered as fast as the DLL would
+        c.fire("MAIN.nCycle", i, ft(i * 10))
+    assert wait_until(lambda: not rec.status(rid)["active"], timeout=3.0)
+    r = rec.recs[rid]
+    assert r.conn is None and r.handles == [], "notifications must be released when the recording ends on its own"
+    s = rec.status(rid)
+    assert s["events"] == 5 and s["stop_reason"] == "max_events 5"
+    # the file agrees with the status: footer events == rows exported
+    exp = rec.export(rid, "csv_long", None, None)
+    assert exp["rows"] == 5
+    for i in range(200, 260):                   # late notifications after the end change nothing
+        c.fire("MAIN.nCycle", i, ft(i * 10))
+    assert rec.status(rid)["events"] == 5

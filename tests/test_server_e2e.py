@@ -304,3 +304,56 @@ async def test_tc_doctor_survives_router_failure(monkeypatch, project_dir, boom)
         assert str(doc["router"]).startswith("FAIL"), doc["router"]
         assert "router" in str(doc["router"]).lower()
         assert "local_ams_net_id" not in doc
+
+
+@pytest.mark.anyio
+async def test_tc_allow_write_and_reload_config(monkeypatch, project_dir, tmp_path):
+    """In-session allow-list change (confirmed, audited, session-only) and a config reload that applies
+    the list-type settings without a restart but only reports target/mode changes."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded")               # empty allow list: nothing writable
+    toml = tmp_path / "twincat_mcp.toml"
+    toml.write_text('[safety]\nmode = "guarded"\nwrite_allowlist = ["MAIN.nCycle"]\n[ads]\nams_net_id = "9.9.9.9.1.1"\n', encoding="utf-8")
+    cfg.config_file = str(toml)
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        res = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 5})
+        assert res.is_error and "write_allowlist is empty" in text(res)
+        # control-class: no token, no elicitation on this client → refused with the token hint
+        res = await s.call_tool("tc_allow_write", {"pattern": "MAIN.nCycle"})
+        assert res.is_error and "tc_request_confirmation" in text(res)
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "tc_allow_write", "target": "+MAIN.nCycle"}))["confirm_token"]
+        r = payload(await s.call_tool("tc_allow_write", {"pattern": "MAIN.nCycle", "confirm_token": tok}))
+        assert r["changed"] and r["session_only"] and r["write_allowlist"] == ["MAIN.nCycle"]
+        res = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 5})
+        assert not res.is_error
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "tc_allow_write", "target": "-MAIN.nCycle"}))["confirm_token"]
+        r = payload(await s.call_tool("tc_allow_write", {"pattern": "MAIN.nCycle", "remove": True, "confirm_token": tok}))
+        assert r["write_allowlist"] == []
+        res = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 6})
+        assert res.is_error
+        # reload: the allow list from the file is applied; the target change is reported, not applied
+        r = payload(await s.call_tool("tc_reload_config", {}))
+        assert r["applied"]["safety.write_allowlist"]["to"] == ["MAIN.nCycle"]
+        assert "ads.ams_net_id" in r["needs_restart"]
+        res = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 7})
+        assert not res.is_error
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 20}))
+        assert [(a["tool"], a["outcome"]) for a in audit if a["tool"] in ("tc_allow_write", "tc_reload_config")] == [
+            ("tc_allow_write", "refused"), ("tc_allow_write", "ok"), ("tc_allow_write", "ok"), ("tc_reload_config", "ok")]
+
+
+@pytest.mark.anyio
+async def test_tc_doctor_reports_placeholder_config(monkeypatch, project_dir):
+    install(monkeypatch)
+    cfg = Config()
+    cfg.project.root = str(project_dir)
+    cfg.ads.ams_net_id = "<CX_NETID>"
+    cfg.xae.solution_path = r"C:\path\to\YourSolution.sln"
+    validate(cfg)
+    assert cfg.ads.ams_net_id is None and cfg.xae.solution_path is None
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        doc = payload(await s.call_tool("tc_doctor", {}))
+        assert any("placeholder" in w for w in doc["config_FIX_THESE"])
+        assert doc["ads_target"]["ams_net_id"] == "(local)"

@@ -16,7 +16,17 @@ Venv location, first match wins: ``--venv``, ``$TCMCP_VENV``,
 ``$CLAUDE_PLUGIN_DATA/venv`` (Claude Code keeps that directory across plugin updates),
 ``%LOCALAPPDATA%/twincat-mcp/venv`` on Windows, ``~/.twincat_mcp/venv`` elsewhere.
 
-Exit codes: 0 server exited cleanly; 2 bad arguments; 3 Python too old; 4 venv/pip failure.
+First start and the client's connect timeout: an MCP client gives the server about 30 s to answer
+the handshake, and ``pip install`` takes longer. So when the venv is missing or stale and this
+script was started *as the server* (no ``--no-run``), it does not install inline: it starts the
+install as a detached background process, prints where its log is, and exits with code 5. The
+client reports a failed server; a reconnect (``/mcp``) after the install has finished starts in
+about two seconds. ``--no-run`` installs synchronously (pre-install step, CI, the plugin's
+SessionStart hook with ``--background`` spawns the same detached install and returns at once).
+A lock file next to the venv keeps two concurrent installs apart.
+
+Exit codes: 0 server exited cleanly; 2 bad arguments; 3 Python too old; 4 venv/pip failure;
+5 install running in the background — reconnect later.
 """
 from __future__ import annotations
 
@@ -30,6 +40,9 @@ from pathlib import Path
 
 MIN_PY = (3, 10)
 STAMP_NAME = ".twincat-mcp-stamp.json"
+LOCK_NAME = ".twincat-mcp-install.lock"
+INSTALL_LOG = "twincat-mcp-install.log"
+LOCK_STALE_S = 20 * 60
 PACKAGE_DIR = "twincat_mcp"
 UNRESOLVED_MARKERS = ("${user_config.", "${CLAUDE_PLUGIN_", "${__dirname}")
 
@@ -197,6 +210,73 @@ def install(vpython: Path, src: Path, stamp: dict, venv: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# install lock and detached background install
+# ---------------------------------------------------------------------------
+def lock_path(venv: Path) -> Path:
+    return venv.parent / LOCK_NAME
+
+
+def install_log_path(venv: Path) -> Path:
+    return venv.parent / INSTALL_LOG
+
+
+def lock_age_s(venv: Path, now: float | None = None) -> float | None:
+    """Seconds since the lock was written, None when there is no (fresh) lock."""
+    import time
+    lp = lock_path(venv)
+    if not lp.is_file():
+        return None
+    try:
+        data = json.loads(lp.read_text(encoding="utf-8"))
+        age = (time.time() if now is None else now) - float(data.get("ts", 0))
+    except (OSError, ValueError, TypeError):
+        return None
+    if age > LOCK_STALE_S or age < 0:
+        try:
+            lp.unlink()
+        except OSError:
+            pass
+        return None
+    return age
+
+
+def take_lock(venv: Path) -> bool:
+    import time
+    if lock_age_s(venv) is not None:
+        return False
+    venv.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_path(venv).write_text(json.dumps({"pid": os.getpid(), "ts": time.time()}), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def release_lock(venv: Path) -> None:
+    try:
+        lock_path(venv).unlink()
+    except OSError:
+        pass
+
+
+def spawn_background_install(src: Path, venv: Path, base_python: str) -> Path:
+    """Start ``launch.py --no-run`` detached from this process; returns the log file it writes to."""
+    logf = install_log_path(venv)
+    venv.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [base_python, str(Path(__file__).resolve()), "--src", str(src), "--venv", str(venv), "--no-run", "--python", base_python,
+           "--lock-held"]   # the caller took the lock for this child; the child releases it when done
+    fh = open(logf, "ab")
+    kw: dict = {"stdin": subprocess.DEVNULL, "stdout": fh, "stderr": fh, "close_fds": True}
+    if os.name == "nt":
+        kw["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    subprocess.Popen(cmd, **kw)
+    fh.close()
+    return logf
+
+
+# ---------------------------------------------------------------------------
 # hand-over
 # ---------------------------------------------------------------------------
 def exec_server(vpython: Path, server_args: list[str], env: dict[str, str]) -> int:
@@ -217,6 +297,11 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     ap.add_argument("--reinstall", action="store_true", help="force pip install even if the stamp matches")
     ap.add_argument("--no-run", action="store_true", help="bootstrap only; do not start the server")
     ap.add_argument("--python", help="base interpreter for venv creation (default: the one running this script)")
+    ap.add_argument("--background", action="store_true",
+                    help="with --no-run: start the install detached and return at once (SessionStart hook)")
+    ap.add_argument("--sync-install", action="store_true",
+                    help="install inline even when started as the server (clients with a long connect timeout)")
+    ap.add_argument("--lock-held", action="store_true", help=argparse.SUPPRESS)   # internal: spawned by a lock holder
     return ap.parse_known_args(argv)
 
 
@@ -231,11 +316,55 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     venv = Path(args.venv).resolve() if args.venv else default_venv()
     base_python = args.python or sys.executable
-
-    vpython = ensure_venv(venv, base_python)
     stamp = make_stamp(src, base_python)
-    if args.reinstall or needs_install(venv, stamp):
-        install(vpython, src, stamp, venv)
+    must_install = args.reinstall or not venv_ok(venv) or needs_install(venv, stamp)
+
+    if must_install and not args.no_run and not args.sync_install:
+        # started as the MCP server: do not make the client wait through pip
+        age = lock_age_s(venv)
+        if age is not None:
+            log(f"first-start install is running in the background for {age:.0f} s (log: {install_log_path(venv)}). "
+                f"Reconnect in a minute (/mcp in Claude Code).")
+            return 5
+        if take_lock(venv):
+            logf = spawn_background_install(src, venv, base_python)
+            log(f"first start: building the private venv in the background (1-2 min, needs PyPI once). "
+                f"Log: {logf}. Reconnect when it is done (/mcp in Claude Code); later starts take ~2 s.")
+            return 5
+        log("could not create the install lock; falling back to an inline install")
+
+    if must_install and args.no_run and args.background:
+        if lock_age_s(venv) is not None:
+            log("install already running")
+            return 0
+        if take_lock(venv):
+            logf = spawn_background_install(src, venv, base_python)
+            log(f"install started in the background (log: {logf})")
+        return 0
+
+    if must_install:
+        own_lock = True if args.lock_held else take_lock(venv)
+        if not own_lock and not args.reinstall:
+            # someone else is installing right now (the hook, or a previous start): wait for it
+            import time
+            log("another install is running; waiting for it")
+            for _ in range(LOCK_STALE_S // 5):
+                time.sleep(5)
+                if lock_age_s(venv) is None:
+                    break
+            if not needs_install(venv, make_stamp(src, base_python)) and venv_ok(venv):
+                must_install = False
+        if must_install:
+            try:
+                vpython = ensure_venv(venv, base_python)
+                install(vpython, src, stamp, venv)
+            finally:
+                if own_lock:
+                    release_lock(venv)
+    vpython = venv_python(venv)
+    if not vpython.is_file():
+        log(f"no interpreter at {vpython} after install")
+        return 4
     if args.no_run:
         log(f"ready: {vpython}")
         return 0

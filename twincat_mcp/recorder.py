@@ -189,6 +189,7 @@ class Recording:
         self._thread: threading.Thread | None = None
         self.handles: list[tuple[int, int]] = []
         self.conn: pyads.Connection | None = None
+        self.on_finish: Callable[[], None] | None = None   # set by Recorder; runs on the ingest thread when the recording ends
         self._poll_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------ lifecycle
@@ -234,6 +235,8 @@ class Recording:
             t = self._rel_ms(ts)
             self._accept(t, name, value)
             self._check_limits()
+            if self._stop.is_set():
+                break          # a limit was reached: do not keep draining notifications that are still arriving
         self._finish()
 
     def _accept(self, t: float, name: str, value: Any) -> None:
@@ -289,6 +292,13 @@ class Recording:
 
     def _finish(self) -> None:
         self.stopped_at = time.time()
+        cb = self.on_finish
+        if cb is not None:
+            try:
+                cb()                   # Recorder: deregister the notifications now, not at the next rec_list
+            except Exception as exc:  # noqa: BLE001
+                if len(self.errors) < 20:
+                    self.errors.append(f"release on finish: {exc}")
         with self._lock:
             for st in self.stats.values():
                 if st.runs and st.last_t is not None:
@@ -463,6 +473,7 @@ class Recorder:
         except Exception as exc:  # noqa: BLE001
             raise AdsError(f"recorder connection failed: {_fmt_exc(exc)}") from exc
         rec.conn = conn
+        rec.on_finish = lambda: self._stop_notifications(rec)
         trans = C.ADSTRANS_SERVERCYCLE if rec.mode == "cycle" else C.ADSTRANS_SERVERONCHA
         types = rec.types
 
@@ -495,20 +506,20 @@ class Recorder:
                 raise AdsError("no notification could be registered: " + failed[0])
 
     def _stop_notifications(self, rec: Recording) -> None:
-        conn = rec.conn
+        with rec._lock:
+            conn, rec.conn = rec.conn, None
+            handles, rec.handles = list(rec.handles), []
         if conn is None:
             return
-        for nh, uh in rec.handles:
+        for nh, uh in handles:
             try:
                 conn.del_device_notification(nh, uh)
             except Exception:  # noqa: BLE001
                 pass
-        rec.handles.clear()
         try:
             conn.close()
         except Exception:  # noqa: BLE001
             pass
-        rec.conn = None
 
     def _start_poll(self, rec: Recording, port: int | None) -> None:
         base = self.ads.conn(port)
@@ -687,6 +698,7 @@ class Recorder:
             w = csv.writer(fo)
             cols: list[str] = []
             cur: dict[str, Any] = {}
+            footer: dict[str, Any] | None = None
             for ln in fh:
                 try:
                     ev = json.loads(ln)
@@ -696,6 +708,8 @@ class Recorder:
                     if ev.get("_header"):
                         cols = [s["name"] for s in ev.get("symbols", []) if not want or s["name"].lower() in want]
                         w.writerow(["t_ms", *cols] if fmt == "csv_wide" else ["t_ms", "symbol", "value"])
+                    elif ev.get("_footer"):
+                        footer = ev
                     continue
                 t, nme, v = ev
                 if want and nme.lower() not in want:
@@ -707,7 +721,16 @@ class Recorder:
                 else:
                     w.writerow([t, nme, v])
                 n += 1
-        return {"id": rid, "file": str(out), "format": fmt, "rows": n}
+        out_d: dict[str, Any] = {"id": rid, "file": str(out), "format": fmt, "rows": n,
+                                 "note": "one row per event; csv_wide repeats the last known value of the other columns"}
+        if footer is not None:
+            out_d["events_in_file"] = footer.get("events")
+            out_d["dropped"] = footer.get("dropped")
+            out_d["stop_reason"] = footer.get("stop_reason")
+        else:
+            out_d["complete"] = False
+            out_d["note"] += "; no footer: the recording is still running or the process died before it ended"
+        return out_d
 
     def delete(self, rid: str) -> dict[str, Any]:
         rec = self.recs.get(rid)

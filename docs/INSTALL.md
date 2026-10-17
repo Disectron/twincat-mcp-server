@@ -81,33 +81,53 @@ non-elevated Claude Code, and `xae_attach` reports "no running XAE shell" even t
 
 ### 3.1 Claude Code (CLI or desktop app, local session) — recommended
 
-Open a terminal **in the project folder** (the folder holding the `.sln`; the server reads
-`twincat_mcp.toml` from the folder Claude Code is started in):
+Needs **Git for Windows** on the PC: `claude plugin marketplace add owner/repo` clones the repository
+(`git --version` must work in a new terminal). Then, in PowerShell, from the folder holding the `.sln`
+(the server reads `twincat_mcp.toml` from the folder Claude Code is started in):
 
+```powershell
+cd <PROJECT_DIR>
+claude plugin marketplace add Disectron/twincat-mcp-server
+claude plugin install twincat-mcp@twincat-mcp
+claude plugin list                               # must list twincat-mcp
 ```
-> cd <PROJECT_DIR>
-> claude
-/plugin marketplace add Disectron/twincat-mcp-server
-/plugin install twincat-mcp@twincat-mcp
-/plugin configure twincat-mcp@twincat-mcp
+
+Set the five plugin options from the shell (the in-session `/plugin configure` form reports "not installed
+in this project" for a user-scope install on some Claude Code versions):
+
+```powershell
+'{"ams_net_id":"5.12.34.56.1.1","mode":"guarded","max_mode":"full"}' | claude plugin configure twincat-mcp@twincat-mcp --values-stdin
+claude plugin configure twincat-mcp@twincat-mcp  # shows the values
 ```
 
-`/plugin configure` asks for five values; all have defaults, you may leave them empty:
-
-| setting | set it to | default if empty |
+| option | set it to | default if empty |
 |---|---|---|
 | `python_exe` | leave `python` if §2.2 passed with that name; otherwise the full path to a 64-bit `python.exe`. Never `py` (needs `-3`) | `python` |
-| `ams_net_id` | `<CX_NETID>` (e.g. `5.12.34.56.1.1`) | local runtime; can also come from the TOML |
+| `ams_net_id` | the CX's AmsNetId, six dotted numbers, e.g. `5.12.34.56.1.1` (XAE → System → Routes). Leave empty to talk to the **local** runtime on the engineering PC | local runtime |
 | `mode` | `guarded` | `guarded` |
 | `max_mode` | `full` | `full` |
 | `config_file` | full path to your `twincat_mcp.toml` (recommended — removes the dependence on the start folder) | `./twincat_mcp.toml`, then `%USERPROFILE%\.twincat_mcp\config.toml` |
 
-In the desktop app the same can be done from **+ → Plugins → Add plugin** once the marketplace is
-configured; adding the marketplace itself is the `/plugin marketplace add` line typed into the prompt
-box. Cloud and WSL sessions cannot run this plugin (no TwinCAT there); use a **Local** session.
+If `claude plugin configure` also refuses, the options are plain environment variables and can be set in
+`%USERPROFILE%\.claude\settings.json` instead — the launcher passes them through unchanged:
 
-Updating later: `/plugin update twincat-mcp@twincat-mcp`. The launcher detects changed sources by
-content hash and reinstalls into the same venv on the next start.
+```json
+{ "env": { "TCMCP_AMS_NET_ID": "5.12.34.56.1.1", "TCMCP_MODE": "guarded", "TCMCP_MAX_MODE": "full",
+           "TCMCP_CONFIG": "C:\\Projects\\DrumFilling\\twincat_mcp.toml" } }
+```
+
+**Pre-build the venv now** (optional but recommended — it removes the one-minute first-start wait from §5):
+
+```powershell
+python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.6.1\scripts\launch.py" --no-run
+```
+(the version folder changes with each plugin version; `dir $env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp` lists it.)
+
+In the desktop app the same plugin is available from **+ → Plugins → Add plugin** once the marketplace is
+configured. Cloud and WSL sessions cannot run this plugin (no TwinCAT there); use a **Local** session.
+
+Updating later: `claude plugin update twincat-mcp@twincat-mcp`. The launcher detects changed sources by
+content hash and reinstalls into the same venv on the next start (in the background again — reconnect once).
 
 ### 3.2 Claude Desktop (the chat app) — the `.mcpb` bundle
 
@@ -198,26 +218,46 @@ What each safety setting buys you:
 Start a session in the project folder (`claude` in the terminal, or open the folder in the desktop app
 as a Local session) and run `/mcp`.
 
-What happens underneath on the first start: Claude Code runs `python <plugin>\scripts\launch.py --src <plugin>`;
-the launcher creates the venv, pip-installs the server into it (1–2 minutes, PyPI once), writes a
-content-hash stamp, then execs `python -m twincat_mcp` on stdio. Later starts take about two seconds.
+What happens underneath: Claude Code runs `python <plugin>\scripts\launch.py --src <plugin>`. An MCP client
+gives a server about 30 s to answer the handshake, and `pip install` takes longer, so on a **first start
+(or after an update) the launcher does not install inline**: it starts the install as a detached background
+process (log: `%USERPROFILE%\.claude\plugins\data\twincat-mcp-twincat-mcp\twincat-mcp-install.log`), and
+exits with code 5. `/mcp` shows the server as failed for that one attempt. Reconnect after a minute
+(`/mcp` → reconnect, or a new session) and it starts in about two seconds. The plugin's SessionStart hook
+also kicks the same background build off, so usually the venv is ready by the time you reconnect. If you
+ran the pre-build command in §3.1, none of this happens.
 
 | `/mcp` shows | meaning | do |
 |---|---|---|
-| `twincat` connected, 139 tools | done | continue to §6 |
-| `twincat` failed / connecting, first start | pip still running | wait a minute, run `/mcp` again or start a new session — the venv is already there |
-| `twincat` failed, repeatedly | launcher could not start the server | `> claude --mcp-debug` and read the launcher's stderr; the common causes are the table below |
+| `twincat` connected, 141 tools | done | continue to §6 |
+| `twincat` failed, first start or after an update | background install running (exit code 5) | wait a minute, reconnect from `/mcp` or start a new session |
+| `twincat` failed, repeatedly | launcher could not start the server | `> claude --mcp-debug` and read the launcher's stderr; the common causes are the table below. Also read the install log named above |
 | no `twincat` entry at all | plugin not loaded | `> claude plugin list` shows load errors; `CLAUDE_CODE_SKIP_PLUGIN_MCP_SERVERS` in the environment disables plugin servers |
 
 First-start failures and their one-line fixes:
 
-| stderr says | fix |
+| stderr / install log says | fix |
 |---|---|
-| `'python' is not recognized` | §2.2; or set `python_exe` in `/plugin configure` to the full path |
+| `'python' is not recognized` | §2.2; or set `python_exe` to the full path |
 | `twincat-mcp: pyads could not load TcAdsDll.dll` + three numbered fixes | 32-bit Python, or TwinCAT not installed on this PC, or `TWINCAT3DIR` missing from the environment Claude Code runs in — the message names which |
 | `pip … Could not find a version` / SSL / proxy errors | PyPI unreachable: set `HTTPS_PROXY`, or build the venv once by hand (§3.3) and point `TCMCP_VENV` at it |
+| `first-start install is running in the background for N s` on every start, for more than 5 min | the background install died: read the install log; delete `%USERPROFILE%\.claude\plugins\data\twincat-mcp-twincat-mcp\.twincat-mcp-install.lock` and run the pre-build command from §3.1 by hand to see the error |
 | `No module named twincat_mcp` after an update | stale venv: `> python <plugin>\scripts\launch.py --src <plugin> --reinstall --no-run` |
 | server starts, `/mcp` shows tools, every ADS tool times out | not an install problem — §6 step 2 |
+
+**First thing after `/mcp` is green: `run tc_doctor` and read `config_FIX_THESE`.** A value copied from a
+template without editing (`<CX_NETID>`, `C:\path\to\YourSolution.sln`, `x.x.x.x.1.1`) or a malformed
+AmsNetId is *not* loaded: the server falls back (local runtime, no solution path) and lists the offending
+value there. `ads_target.ams_net_id` tells you which runtime you are actually talking to.
+
+Config precedence: plugin options (they become `TCMCP_*` environment variables) override the TOML, the TOML
+overrides built-in defaults. `tc_doctor.config_file` shows which TOML was read (`null` = none found).
+
+Two things no longer need a reconnect:
+- `tc_reload_config` re-reads the TOML and applies the allow/deny lists, confirmation settings, docs and
+  dialog rules; it *reports* target, solution path and mode changes, which still need a restart.
+- `tc_allow_write "GVL_Test.*"` adds an allow-list pattern for this session only, behind a confirmation,
+  audited. The deny list still wins.
 
 Tool names: every tool is `mcp__plugin_twincat-mcp_twincat__<name>`; you never type that, Claude does.
 `/permissions` rules use that form, e.g. allow `mcp__plugin_twincat-mcp_twincat__ads_read*` to stop the
@@ -258,13 +298,43 @@ website's markup to be verified.
 
 ---
 
+## 6b. Every tool, automatically — the acceptance run
+
+The 14 steps above are the hand check. To exercise **every** tool against the live PC and target and get a
+per-tool PASS/FAIL report, run the acceptance script from the solution folder (same config the plugin
+uses; it needs the venv the launcher built):
+
+```powershell
+$v = "$env:USERPROFILE\.claude\plugins\data\twincat-mcp-twincat-mcp\venv\Scripts\python.exe"
+& $v -m twincat_mcp.acceptance                      # read-only; XAE phase if a shell is attached; docs phase if the web is reachable
+& $v -m twincat_mcp.acceptance --no-xae --no-infosys
+& $v -m twincat_mcp.acceptance --allow-writes --write-symbol GVL_Test.nScratch   # one idempotent write + snapshot restore
+```
+
+It discovers its own inputs from the target (a scalar, a BOOL, a struct, the root program), runs the
+read-only tools, a 2 s recording round trip, snapshots and expectations, the experiment pipeline in dry
+run, the documentation lookup, the XAE read-only tools, and — the point of guarded mode — proves that a
+write outside the allow list, a control action and a destructive action are **refused**. Tools that would
+change the machine are listed as MANUAL with the step from `HARDWARE_DAY.md` that covers each. The report
+lands in `<project>\acceptance\acceptance_<timestamp>.md` (+ `.json`); exit code 0 means no FAIL.
+Send the `.md` back when anything fails — it carries the exact tool, arguments and error text.
+
+Statuses: PASS answered with the expected shape · FAIL error or wrong shape · WARN an optional feature
+(EtherCAT master, HMI folder, web) answered with an environmental error · SKIP prerequisite missing ·
+MANUAL changes the machine. Any `error`-severity finding from `proj_lint` / `proj_validate_xml` on a project
+that builds is reported as a WARN with the rule name: those are the false positives I want to hear about.
+
+---
+
 ## 7. Resetting, updating, removing
 
 | action | how |
 |---|---|
-| rebuild the venv | `> python <plugin>\scripts\launch.py --src <plugin> --reinstall --no-run`, or delete the venv folder from §1 and start a session |
+| rebuild the venv | `> python <plugin>\scripts\launch.py --src <plugin> --reinstall --no-run`, or delete the venv folder from §1 and start a session (the first start then installs in the background — reconnect once) |
 | update the server | `/plugin update twincat-mcp@twincat-mcp`; the next start reinstalls automatically |
 | change safety mode for one session | ask "tc_set_mode full" (bounded by `max_mode`; written to the audit log) |
+| allow one symbol for this session | ask "tc_allow_write GVL_Test.*" — confirmation prompt, audited, gone at restart |
+| apply an edited TOML without restarting | ask "tc_reload_config" |
 | see what the server loaded | `tc_doctor` → `config_file`, `safety`, `ads_target` |
 | remove | `/plugin uninstall twincat-mcp@twincat-mcp`; delete `%USERPROFILE%\.twincat_mcp\` if you want the audit log, recordings and index gone too |
 

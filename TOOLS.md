@@ -1,12 +1,14 @@
-# twincat-mcp 0.6.0 — tool reference
+# twincat-mcp 0.6.1 — tool reference
 
-139 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
+141 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
-## Meta & safety (6)
+## Meta & safety (8)
 
 - `tc_doctor` [R] — Environment check: platform, pyads/router, local AMS NetId, XAE ProgIDs in the registry, running XAE shells, project root, safety mode. Run this first.
 - `tc_safety_status` [R] — Current safety mode, ceiling, allow/deny lists, pending confirmation tokens.
 - `tc_set_mode` [E] — Switch safety mode: readonly | guarded | full. Escalation is capped at the configured max_mode (TCMCP_MAX_MODE); lowering is always allowed.
+- `tc_allow_write` [C] — Add (or remove) a write allow-list pattern for THIS session only — the in-session alternative to editing twincat_mcp.toml and reconnecting. fnmatch, case-insensitive: 'GVL_Test.*', 'MAIN.fbDispense.rSetpoint'. Control-class: needs a confirmation (prompt or confirm_token). The deny list still wins; the change is…
+- `tc_reload_config` [E] — Re-read twincat_mcp.toml (and TCMCP_* env) without a restart. Applies: safety allow/deny lists, confirm_destructive, confirm_ttl_s, docs settings, naming prefixes, dialog rules, tcunit result path. Reports — but does not apply — changes that need a restart: ads target/port, solution path, project root, mode/max_mode…
 - `tc_request_confirmation` [R] — Issue a single-use confirm_token for a control/destructive tool. Use the exact action name of the tool (e.g. 'xae_activate_configuration') and its target.
 - `tc_audit_tail` [R] — Last n audit records (mutating calls, confirmations, mode changes).
 - `tc_session_report` [R] — Markdown handover of this session: mode changes, writes, deploys and other mutating calls from the audit log, recordings, snapshots and dumps produced. Written to ~/.twincat_mcp/reports/<ts>.md (or out_path).

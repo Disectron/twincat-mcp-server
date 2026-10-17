@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import json
 import logging
 import platform
 import re
 import sys
+import threading
 import time
 from typing import Any
 
@@ -101,10 +103,29 @@ READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
 EDIT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 DESTR = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False)
+CONTROL = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)   # changes the server's own state under confirmation
 
 
 class ConfirmSchema(BaseModel):
     confirm: bool = Field(description="Set true to allow this operation on the target")
+
+
+_LICENSE_CODES = {
+    "0x98110724": "no valid TwinCAT license for the target (2551252772 / 0x98110724).",
+    "2551252772": "no valid TwinCAT license for the target (2551252772 / 0x98110724).",
+}
+
+
+def _license_hint(text: str) -> str | None:
+    """Beckhoff reports license problems as an opaque number; say what it means and what to do."""
+    low = (text or "").lower()
+    if not ("license" in low or "licence" in low or any(c in low for c in _LICENSE_CODES)):
+        return None
+    what = next((v for k, v in _LICENSE_CODES.items() if k in low), "the target reports a TwinCAT license problem.")
+    return (what + " The runtime falls back to CONFIG. Fix: in XAE open SYSTEM → License → Order Information, "
+            "click '7 Days Trial License', type the captcha, then ActivateConfiguration again (xae_activate_configuration) "
+            "and restart (xae_restart_twincat). A purchased license is entered on the same page (TC1200 for the PLC runtime). "
+            "On a CX with pre-installed licenses this means the activated configuration asks for a function level or a TFxxxx the box does not have — check Project → System → License → Manage Licenses.")
 
 
 class App:
@@ -125,6 +146,7 @@ class App:
         self.profiles = capture.ProfileStore(Path(cfg.safety.audit_log).parent / "profiles")
         self.exp_store = X.ExperimentStore(cfg.project.experiments_dir)
         self.runners: dict[str, X.Runner] = {}
+        self.docs_bg: dict[str, Any] = {}
         self.docs: InfosysIndex | None = None
         if cfg.docs.enabled:
             try:
@@ -151,11 +173,33 @@ class App:
             # safety net for a backend path that did not translate the pyads/socket error itself
             raise ToolError(f"ADS error: {_fmt_ads_exc(exc)}") from exc
 
+    def _dialog_hint(self) -> str:
+        """What is open in the shell right now — the usual reason a COM call is rejected or hangs."""
+        try:
+            from . import dialogs as _dlg
+            live = [d.to_dict() for d in _dlg.list_dialogs(self.xae.pid)]
+        except Exception:  # noqa: BLE001
+            live = []
+        pend = self.xae.watchdog.status().get("pending") or []
+        seen = {d.get("hwnd") for d in live}
+        live += [d for d in pend if d.get("hwnd") not in seen]
+        if not live:
+            return " No dialog is visible in the shell (xae_dialogs); the shell may be mid-build or mid-login — retry in a few seconds."
+        return " Open dialog(s): " + "; ".join(f"'{d.get('title')}' [{', '.join(d.get('buttons') or [])}] {str(d.get('text', ''))[:160]}"
+                                            for d in live[:3]) + " — answer it with xae_dialog_resolve(button=...)."
+
     async def xae_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
         try:
             return await self.xae_worker.run(fn, *a, timeout=timeout or self.cfg.xae.build_timeout_s + 60, **kw)
         except XaeError as exc:
-            raise ToolError(str(exc)) from exc
+            msg = str(exc)
+            low = msg.lower()
+            if "0x80010001" in low or "0x8001010a" in low or "call was rejected" in low or "retry later" in low:
+                msg += " — XAE refused the COM call: it is busy or a modal dialog has the shell." + await asyncio.to_thread(self._dialog_hint)
+            lic = _license_hint(msg)
+            if lic:
+                msg += " " + lic
+            raise ToolError(msg) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             pend = self.xae.watchdog.status().get("pending") or []
             hint = (" Open dialog(s): " + "; ".join(f"'{d['title']}' buttons {d['buttons']}" for d in pend[:3])
@@ -178,16 +222,50 @@ class App:
     async def rec_call(self, fn, *a, timeout: float = 60, **kw) -> Any:
         return await self.ads_call(fn, *a, timeout=timeout, slow=True, **kw)
 
+    def docs_index_status(self) -> dict[str, Any]:
+        st = dict(self.docs_bg)
+        if st.get("started") and not st.get("finished"):
+            st["running_for_s"] = round(time.time() - st["started"], 0)
+        return st
+
+    def start_docs_index_bg(self) -> None:
+        """First documentation lookup on a fresh cache: index the configured default books in a daemon thread
+        so searches stop falling back to the web after a few minutes, without making the first call wait."""
+        if self.docs is None or self.docs_bg.get("started"):
+            return
+        try:
+            if self.docs.indexed_books():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        self.docs_bg = {"started": time.time(), "finished": None, "books": list(self.cfg.docs.books), "result": None}
+
+        def _run() -> None:
+            try:
+                self.docs_bg["result"] = self.docs.ensure_defaults()
+            except Exception as exc:  # noqa: BLE001
+                self.docs_bg["result"] = [{"error": str(exc)}]
+            finally:
+                self.docs_bg["finished"] = time.time()
+
+        threading.Thread(target=_run, name="infosys-default-index", daemon=True).start()
+
     async def docs_call(self, fn, *a, timeout: float = 120, **kw) -> Any:
         """Infosys lookups: network + SQLite, off the event loop; no ADS/COM worker involved."""
         if self.docs is None:
             raise ToolError("Infosys lookup is disabled (docs.enabled=false / TCMCP_DOCS=0)")
+        self.start_docs_index_bg()
         try:
-            return await asyncio.wait_for(asyncio.to_thread(fn, *a, **kw), timeout)
+            res = await asyncio.wait_for(asyncio.to_thread(fn, *a, **kw), timeout)
         except InfosysError as exc:
             raise ToolError(str(exc)) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError(f"Infosys call exceeded {timeout:.0f} s (slow network? smaller max_pages?)") from exc
+        st = self.docs_bg
+        if isinstance(res, dict) and st.get("started") and not st.get("finished"):
+            res["index_status"] = (f"default books are being indexed in the background ({round(time.time() - st['started'])} s so far); "
+                                   "until that finishes, searches answer from the web fallback")
+        return res
 
     async def mem_call(self, fn, *a, **kw) -> Any:
         """Recorder queries that touch only memory/files — no ADS worker needed."""
@@ -223,6 +301,45 @@ class App:
             r.abort(reason)
         for r in live:
             r.join(join_s)
+
+    async def verify_target_after(self, action: str, expect_run: bool, timeout_s: float = 90.0) -> dict[str, Any]:
+        """After ActivateConfiguration / StartRestartTwinCAT the Automation Interface reports success as soon as
+        the command was accepted; whether the target actually came up is a separate question (a missing
+        license drops it back to CONFIG with a dialog in the shell). Poll the target's System Service and
+        the shell's dialogs and report what really happened."""
+        from . import dialogs as _dlg
+        deadline = time.time() + timeout_s
+        mode: str = "unknown"
+        err_dialogs: list[dict[str, Any]] = []
+        polls = 0
+        while True:
+            polls += 1
+            try:
+                st = await self.ads_call(self.ads.system_state, timeout=10)
+                mode = str(st.get("twincat_mode") or st.get("ads_state_name") or "unknown")
+            except ToolError as exc:
+                mode = f"unreachable ({str(exc)[:80]})"
+            try:
+                dl = await asyncio.to_thread(lambda: [d.to_dict() for d in _dlg.list_dialogs(self.xae.pid)])
+            except Exception:  # noqa: BLE001
+                dl = []
+            err_dialogs = [d for d in dl if any(k in (str(d.get("title", "")) + " " + str(d.get("text", ""))).lower()
+                                                 for k in ("error", "license", "licence", "fatal", "failed"))]
+            if err_dialogs or (mode == "RUN" if expect_run else mode in ("RUN", "CONFIG")):
+                break
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(2.0)
+        ok = (mode == "RUN") if expect_run else (mode in ("RUN", "CONFIG"))
+        ok = ok and not err_dialogs
+        out: dict[str, Any] = {"target_mode": mode, "verified": ok, "polls": polls, "dialogs": err_dialogs}
+        hints = [h for h in (_license_hint(json.dumps(err_dialogs)),) if h]
+        if expect_run and mode != "RUN" and not err_dialogs:
+            hints.append(f"target did not reach RUN within {timeout_s:.0f} s — xae_dialogs for a prompt in the shell; "
+                         "ads_status for the runtime; the XAE Error List for 'Target system reports a fatal error'.")
+        if hints:
+            out["hint"] = " ".join(hints)
+        return out
 
     async def check_targets(self, xae_target: str, allow_mismatch: bool) -> None:
         """Refuse deploy/tcunit when XAE targets one machine and ADS another."""
@@ -272,7 +389,12 @@ class App:
             self.guard.audit(action, {"target": target, "scope": scope}, op, "human-confirmed-elicitation")
             return
         self.guard.audit(action, {"target": target, "scope": scope}, op, f"declined-elicitation:{res.action}")
-        raise ToolError(f"{action} on {target!r} was declined by the user ({res.action}).")
+        if res.action == "cancel":
+            # 'cancel' is also what the client sends when the prompt was dismissed or timed out unseen
+            raise ToolError(f"{action} on {target!r}: the confirmation prompt came back cancelled — it was dismissed, timed out, "
+                            f"or never shown. Nothing was done. Either run the tool again and answer the prompt, or confirm "
+                            f"explicitly: tc_request_confirmation(action={action!r}, target={target!r}) and pass the confirm_token.")
+        raise ToolError(f"{action} on {target!r} was declined by the user ({res.action}). Nothing was done.")
 
     def audit(self, tool: str, args: dict[str, Any], op: OpClass, outcome: str, detail: Any = None) -> None:
         self.guard.audit(tool, args, op, outcome, detail)
@@ -324,6 +446,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         rep: dict[str, Any] = {"version": __version__, "python": sys.version.split()[0],
                                "platform": platform.platform(), "windows": is_windows(),
                                "safety": app.guard.status()}
+        if cfg.warnings:
+            rep["config_FIX_THESE"] = list(cfg.warnings)
         # pyads / router
         try:
             rep["local_ams_net_id"] = await app.ads_call(app.ads.local_net_id, timeout=10)
@@ -362,7 +486,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if app.docs is not None:
             try:
                 rep["infosys"] = {"cache": str(app.docs.dir), "fts5": app.docs.has_fts,
-                                  "indexed_books": await app.docs_call(app.docs.indexed_books, timeout=15),
+                                  "indexed_books": await asyncio.to_thread(app.docs.indexed_books),
+                                  "background_index": app.docs_index_status(),
                                   "default_books": cfg.docs.books}
             except ToolError as exc:
                 rep["infosys"] = f"FAIL: {exc}"
@@ -385,6 +510,70 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         except SafetyError as exc:
             raise ToolError(str(exc)) from exc
         return {"previous": old, "mode": app.guard.mode}
+
+    @mcp.tool(annotations=CONTROL)
+    async def tc_allow_write(pattern: str, remove: bool = False, confirm_token: str | None = None,
+                             ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Add (or remove) a write allow-list pattern for THIS session only — the in-session alternative
+        to editing twincat_mcp.toml and reconnecting. fnmatch, case-insensitive: 'GVL_Test.*',
+        'MAIN.fbDispense.rSetpoint'. Control-class: needs a confirmation (prompt or confirm_token).
+        The deny list still wins; the change is audited and lost at the next server start."""
+        pat = (pattern or "").strip()
+        if not pat:
+            raise ToolError("pattern is empty")
+        await app.permit(ctx, OpClass.CONTROL, "tc_allow_write", target=("-" if remove else "+") + pat, confirm_token=confirm_token)
+        lst = app.guard.cfg.write_allowlist
+        if remove:
+            before = len(lst)
+            lst[:] = [x for x in lst if x.lower() != pat.lower()]
+            changed = len(lst) != before
+        else:
+            changed = pat.lower() not in {x.lower() for x in lst}
+            if changed:
+                lst.append(pat)
+        denied = [d for d in app.guard.cfg.write_denylist if fnmatch.fnmatch(pat.lower(), d.lower()) or fnmatch.fnmatch(d.lower(), pat.lower())]
+        app.audit("tc_allow_write", {"pattern": pat, "remove": remove}, OpClass.CONTROL, "ok" if changed else "unchanged",
+                  {"write_allowlist": list(lst)})
+        return {"write_allowlist": list(lst), "changed": changed, "session_only": True,
+                "note": ("overlaps the deny list, which always wins: " + ", ".join(denied)) if denied else
+                        "persist it in twincat_mcp.toml [safety] write_allowlist to keep it across restarts"}
+
+    @mcp.tool(annotations=EDIT)
+    async def tc_reload_config() -> dict[str, Any]:
+        """Re-read twincat_mcp.toml (and TCMCP_* env) without a restart. Applies: safety allow/deny lists,
+        confirm_destructive, confirm_ttl_s, docs settings, naming prefixes, dialog rules, tcunit result path.
+        Reports — but does not apply — changes that need a restart: ads target/port, solution path, project
+        root, mode/max_mode (use tc_set_mode)."""
+        try:
+            fresh = load_config(cfg.config_file)
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"config reload failed: {exc}") from exc
+        applied: dict[str, Any] = {}
+        needs_restart: dict[str, Any] = {}
+
+        def _apply(section: str, key: str) -> None:
+            new_v, old_v = getattr(getattr(fresh, section), key), getattr(getattr(cfg, section), key)
+            if new_v != old_v:
+                setattr(getattr(cfg, section), key, new_v)
+                applied[f"{section}.{key}"] = {"from": old_v, "to": new_v}
+
+        for key in ("write_allowlist", "write_denylist", "confirm_destructive", "confirm_ttl_s", "audit_reads"):
+            _apply("safety", key)
+        for key in ("books", "exclude_books", "web_fallback", "max_workers", "max_index_pages", "enabled"):
+            _apply("docs", key)
+        for key in ("naming_prefixes", "tcunit_remote_result", "hmi_root"):
+            _apply("project", key)
+        for key in ("dialog_rules", "allow_safety", "build_timeout_s", "attach_only"):
+            _apply("xae", key)
+        app.xae.watchdog.rules = list(cfg.xae.dialog_rules)
+        for section, key in (("ads", "ams_net_id"), ("ads", "ams_port"), ("xae", "solution_path"), ("project", "root"),
+                             ("safety", "mode"), ("safety", "max_mode")):
+            new_v, old_v = getattr(getattr(fresh, section), key), getattr(getattr(cfg, section), key)
+            if new_v != old_v:
+                needs_restart[f"{section}.{key}"] = {"running": old_v, "file": new_v}
+        app.audit("tc_reload_config", {"file": fresh.config_file}, OpClass.EDIT, "ok", {"applied": list(applied), "needs_restart": list(needs_restart)})
+        return {"config_file": fresh.config_file, "applied": applied, "needs_restart": needs_restart,
+                "warnings": fresh.warnings, "write_allowlist": list(cfg.safety.write_allowlist)}
 
     @mcp.tool(annotations=READ)
     async def tc_request_confirmation(action: str, target: str = "") -> dict[str, Any]:
@@ -1476,7 +1665,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         Function | Program | Method | Property | Action | Enum | Struct | Union | Alias | Interface |
         GlobalVariable | Library. library: 'Tc2_System' or the book slug. Indexes the default
         libraries on first use if nothing is indexed."""
-        return await app.docs_call(app.docs.search_symbols, query, kind, library, limit, timeout=1800)
+        return await app.docs_call(app.docs.search_symbols, query, kind, library, limit, False, timeout=300)   # indexing runs in the background, not inline
 
     @mcp.tool(annotations=READ)
     async def infosys_declaration(symbol: str, library: str | None = None) -> dict[str, Any]:
@@ -1778,7 +1967,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_activate_configuration", tgt, confirm_token)
         res = await app.xae_call(app.xae.activate_configuration, timeout=600)
         await app.ads_call(app.ads.disconnect, timeout=10)
-        app.audit("xae_activate_configuration", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", res)
+        ver = await app.verify_target_after("xae_activate_configuration", expect_run=False, timeout_s=30)
+        res.update({"target_mode": ver["target_mode"], "dialogs": ver["dialogs"]})
+        if ver.get("hint"):
+            res["hint"] = ver["hint"]
+        app.audit("xae_activate_configuration", {"target": tgt}, OpClass.DESTRUCTIVE, "ok" if ver["verified"] else "dialog-after-activate", res)
+        if ver["dialogs"]:
+            res["activated"] = False
+            raise ToolError("ActivateConfiguration was accepted but the shell shows an error dialog: "
+                            f"{ver['dialogs'][0].get('title')}: {ver['dialogs'][0].get('text', '')[:300]}"
+                            + (f". {ver['hint']}" if ver.get("hint") else ""))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -1788,7 +1986,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_restart_twincat", tgt, confirm_token)
         res = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
-        app.audit("xae_restart_twincat", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", res)
+        ver = await app.verify_target_after("xae_restart_twincat", expect_run=True)
+        res.update({"restarted": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
+                    "verification_polls": ver["polls"]})
+        if ver.get("hint"):
+            res["hint"] = ver["hint"]
+        app.audit("xae_restart_twincat", {"target": tgt}, OpClass.DESTRUCTIVE, "ok" if ver["verified"] else "target-not-in-run", res)
+        if not ver["verified"]:
+            raise ToolError(f"StartRestartTwinCAT was accepted but the target is in {ver['target_mode']}"
+                            + (f"; dialog: {ver['dialogs'][0].get('title')}: {ver['dialogs'][0].get('text', '')[:300]}" if ver["dialogs"] else "")
+                            + (f". {ver['hint']}" if ver.get("hint") else ""))
         return res
 
     @mcp.tool(annotations=DESTR)

@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/launch.py", "--src", "${CLAUDE_PLUGIN_ROOT}", "--no-run", "--background"],
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
