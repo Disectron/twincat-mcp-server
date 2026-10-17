@@ -56,6 +56,7 @@ from .hmi import HmiIndex
 from .infosys import InfosysIndex, InfosysError
 from . import profiles as capture
 from . import knowledge as K
+from .recorder import read_footer as K_footer
 from . import experiments as X
 from pathlib import Path
 
@@ -143,6 +144,7 @@ class App:
         self.xae_worker = SerialWorker("tcmcp-xae-sta", init=sta_init, teardown=sta_teardown)
         self.proj = ProjectIndex(cfg.project)
         self.ads.write_guard = self.constant_reason       # every write path: CONSTANT / no-source checks
+        self.ads.interface_hint = self.is_source_interface
         from .config import _home
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
@@ -385,6 +387,18 @@ class App:
         if hints:
             out["hint"] = " ".join(hints)
         return out
+
+    def is_source_interface(self, type_name: str) -> bool:
+        """The project declares `type_name` (qualified or not) as an INTERFACE."""
+        if self.proj.root is None:
+            return False
+        try:
+            self.proj._ensure()
+        except Exception:  # noqa: BLE001
+            return False
+        base = self.proj._base_type_name(type_name or "").split(".")[-1].lower()
+        u = self.proj.units.get(base)
+        return bool(u is not None and u.kind == "INTERFACE")
 
     def constant_reason(self, name: str) -> str | None:
         """Source-level write check, installed as AdsBackend.write_guard so every write path runs it.
@@ -1521,10 +1535,26 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await app.mem_call(app.rec.export, id, fmt, out_path, symbols, fill)
 
     @mcp.tool(annotations=DESTR)
-    async def rec_delete(id: str) -> dict[str, Any]:
-        """Stop (if running) and delete a recording and its exports from disk."""
-        res = await app.rec_call(app.rec.delete, id)
-        app.audit("rec_delete", {"id": id}, OpClass.EDIT, "ok", res)
+    async def rec_delete(id: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Stop (if running) and delete a recording and its exports from disk. Destructive-class (field report R11):
+        a recording is evidence — guarded mode needs tc_request_confirmation(action='rec_delete', target=<id>); the
+        audit keeps the deleted file's size and SHA-256 so its content stays identifiable."""
+        try:
+            path = await asyncio.to_thread(app.rec._path_for, id)
+        except RecorderError as exc:
+            raise ToolError(str(exc)) from exc
+        await app.permit(ctx, OpClass.DESTRUCTIVE, "rec_delete", path.stem, confirm_token)
+
+        def _fingerprint() -> dict[str, Any]:
+            import hashlib
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            return {"file": str(path), "bytes": path.stat().st_size, "sha256": h.hexdigest(), "footer": K_footer(path)}
+        fp = await asyncio.to_thread(_fingerprint)
+        res = await app.confirmed("rec_delete", {"id": path.stem, **fp}, OpClass.DESTRUCTIVE, app.rec_call(app.rec.delete, path.stem))
+        res["deleted_file_sha256"] = fp["sha256"]
         return res
 
 

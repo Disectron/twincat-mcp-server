@@ -521,7 +521,8 @@ class Acceptance:
             await self.check(ph, "rec_stop", {"id": rid2}, optional=True)
             if rids:
                 await self.check(ph, "rec_compare", {"id_a": rids[0], "id_b": rid2})
-            await self.check(ph, "rec_delete", {"id": rid2})
+            tok = await self.check(ph, "tc_request_confirmation", {"action": "rec_delete", "target": rid2})
+            await self.check(ph, "rec_delete", {"id": rid2, "confirm_token": (tok or {}).get("confirm_token")})
         else:
             for t in ("rec_stop", "rec_compare", "rec_delete"):
                 self.skip(ph, t, "poll recording did not start")

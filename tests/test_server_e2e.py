@@ -618,3 +618,39 @@ async def test_source_checks_on_every_write_path(monkeypatch, project_dir):
     cfg.safety.mode = "full"
     async with client_for(build_server(cfg)) as s:
         assert not (await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 1})).is_error
+
+
+@pytest.mark.anyio
+async def test_rec_delete_needs_confirmation_and_keeps_a_fingerprint(monkeypatch, project_dir):
+    """R11: deleting a recording is destructive-class; the audit keeps its SHA-256."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    async with client_for(srv) as s:
+        rid = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change"}))["id"]
+        await s.call_tool("rec_stop", {"id": rid})
+        r = await s.call_tool("rec_delete", {"id": rid})
+        assert r.is_error and "tc_request_confirmation" in text(r)
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "rec_delete", "target": rid}))["confirm_token"]
+        d = payload(await s.call_tool("rec_delete", {"id": rid, "confirm_token": tok}))
+        assert d["removed"] and len(d["deleted_file_sha256"]) == 64
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 10}))
+        last = [a for a in audit if a["tool"] == "rec_delete"]
+        assert [a["outcome"] for a in last] == ["refused", "ok"] and last[-1]["args"]["sha256"] == d["deleted_file_sha256"]
+
+
+@pytest.mark.anyio
+async def test_interfaces_known_from_source(monkeypatch, project_dir):
+    """Retest #52/#64: the runtime's datatype table did not mark I_Module recognisably; the project source does."""
+    install(monkeypatch)
+    (project_dir / "Plc" / "POUs" / "I_Thing.TcIO").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject Version="1.1.0.1"><Itf Name="I_Thing" Id="{00000000-0000-0000-0003-000000000001}">'
+        '<Declaration><![CDATA[INTERFACE I_Thing\n]]></Declaration></Itf></TcPlcObject>')
+    srv = build_server(mk_cfg(project_dir, mode="full", confirm_destructive=False))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("ads_read", {"name": "PRG_Test.ipThing"}))
+        assert r["value"] == "0x" + format(-114343974404328 & (2**64 - 1), "016X") and "INTERFACE" in r["note"]
+        a = payload(await s.call_tool("ads_read", {"name": "PRG_Test.aThings"}))
+        assert a["value"][0] is None and a["value"][1].startswith("0xFFFF")
+        for name, val in (("PRG_Test.ipThing", 12345), ("PRG_Test.aThings", [0, 0])):
+            w = await s.call_tool("ads_write", {"name": name, "value": val})
+            assert w.is_error and "INTERFACE (declared in the project source)" in text(w), text(w)

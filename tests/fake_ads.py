@@ -45,6 +45,8 @@ SYMBOLS: list[tuple[str, str, int, Any, int]] = [
     ("PRG_Test.abStateLit", "ARRAY [0..7] OF BOOL", 8, [False, False, False, False, False, True, False, False], 0),
     ("GVL_Machine.MAX_MODULES", "INT", 2, 16, 0),               # VAR_GLOBAL CONSTANT in the sample project; no READONLY flag
     ("PRG_Test.eCmd", "E_FillState", 2, 0, 0),
+    ("PRG_Test.ipThing", "I_Thing", 8, -114343974404328, 0),          # interface NOT recognisable in the datatype table
+    ("PRG_Test.aThings", "ARRAY [1..2] OF I_Thing", 16, [0, -114343974404328], 0),
 ]
 
 

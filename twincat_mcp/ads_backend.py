@@ -603,19 +603,17 @@ class AdsBackend:
             ts = self.typesystem(False, port)
             if ts is not None and ts.get(s.type) is not None:
                 return self.read_full(s.name, None, port)
-        if expand_struct and tt0.kind == "array" and tt0.elem is not None and tt0.elem.kind == "enum":
-            # ARRAY OF <interface> parses as an enum-sized array by name; the datatype table knows better
-            ts = self.typesystem(False, port)
-            if ts is not None and _is_iface_name(ts, tt0.elem.name):
-                return self.read_full(s.name, None, port)
         tt, val = self._typed_read(c, s)
         out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
-        if tt.kind == "enum" and not isinstance(val, (bytes, bytearray)):
-            ts = self.typesystem(False, port)
-            if ts is not None and _is_iface_name(ts, s.type):
-                out["value"] = T.fmt_pointer(val, s.size)
-                out["note"] = "INTERFACE variable: the value is the address of the assigned FB instance (null = unassigned)"
-                return out
+        if tt.kind == "enum" and not isinstance(val, (bytes, bytearray)) and self.is_interface_type(s.type, port):
+            out["value"] = T.fmt_pointer(val, s.size)
+            out["note"] = "INTERFACE variable: the value is the address of the assigned FB instance (null = unassigned)"
+            return out
+        if tt.kind == "array" and tt.elem is not None and tt.elem.kind == "enum" and isinstance(val, (list, tuple)) \
+                and self.is_interface_type(tt.elem.name, port):
+            out["value"] = [T.fmt_pointer(v, tt.elem.size) for v in val]
+            out["note"] = "ARRAY OF INTERFACE: each value is the address of the assigned FB instance (null = unassigned)"
+            return out
         if isinstance(val, (bytes, bytearray)):
             out["raw_hex"] = val.hex()
             if tt.kind == "array" and tt.elem and tt.elem.kind in ("string", "wstring"):
@@ -668,6 +666,24 @@ class AdsBackend:
                         results[n] = {"error": _fmt_exc(exc)}
         return results
 
+    # set by the server: True when the project source declares this name as an INTERFACE — the runtime's datatype
+    # table does not always mark interface types recognisably (field retest #52/#64)
+    interface_hint: Callable[[str], bool] | None = None
+
+    def is_interface_type(self, type_name: str, port: int | None = None) -> bool:
+        try:
+            ts = self.typesystem(False, port)
+        except Exception:  # noqa: BLE001
+            ts = None
+        if ts is not None and _is_iface_name(ts, type_name):
+            return True
+        if self.interface_hint is not None:
+            try:
+                return bool(self.interface_hint(type_name))
+            except Exception:  # noqa: BLE001
+                return False
+        return False
+
     def unwritable_reason(self, type_name: str, size: int | None, port: int | None = None) -> str | None:
         """Why a variable of this type must not be written through ADS, or None. POINTER/REFERENCE TO are
         addresses; an INTERFACE variable is a pointer to an FB instance's method table — any value the agent
@@ -677,6 +693,9 @@ class AdsBackend:
         if tt.kind == "pointer":
             return f"{type_name} is a POINTER/REFERENCE — writing an address is refused; write the variable it points to"
         base = tt.elem.name if tt.kind == "array" and tt.elem else type_name
+        if self.interface_hint is not None and self.interface_hint(base):
+            return (f"{base} is an INTERFACE (declared in the project source) — writing it would make the PLC call a wild "
+                    "pointer; assign interfaces in PLC code, not over ADS")
         try:
             ts = self.typesystem(False, port)
         except Exception:  # noqa: BLE001
