@@ -40,7 +40,12 @@ jobs:
         run: |
           cmake -S native/capture -B build/capture -DCMAKE_BUILD_TYPE=Release
           cmake --build build/capture --config Release -j 4
-          exe=$(ls build/capture/tcmcp-capture build/capture/Release/tcmcp-capture.exe 2>/dev/null | head -1)
+          # GitHub runs bash with -e -o pipefail: `ls a b | head` fails when either path is missing, so test each
+          exe=""
+          for c in build/capture/tcmcp-capture build/capture/Release/tcmcp-capture.exe; do
+            if [ -f "$c" ]; then exe="$c"; break; fi
+          done
+          if [ -z "$exe" ]; then echo "::error::tcmcp-capture was not built"; exit 1; fi
           "$exe" --version
           "$exe" --selftest
           p="$PWD/$exe"
