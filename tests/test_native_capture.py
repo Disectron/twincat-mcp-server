@@ -366,19 +366,19 @@ def test_r9_truncated_file_verifies_to_last_checkpoint(rec):
     fin = rec.stop(st["id"])
     p = Path(fin["file"])
     R.make_writable(p)
-    lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
-    chain_idx = [i for i, ln in enumerate(lines) if ln.startswith('{"_chain"')]
+    lines = p.read_bytes().splitlines(keepends=True)        # bytes: write_text would turn \n into \r\n on Windows
+    chain_idx = [i for i, ln in enumerate(lines) if ln.startswith(b'{"_chain"')]
     assert len(chain_idx) >= 2
     cut = chain_idx[-1] + 5                                   # a few rows after the last checkpoint, no footer
-    p.write_text("".join(lines[:cut]), encoding="utf-8")
+    p.write_bytes(b"".join(lines[:cut]))
     v = rec.verify(st["id"])
     assert v["integrity"].startswith("NO FOOTER — intact up to the last checkpoint"), v["integrity"]
     assert v["checkpoints"]["verified"] == len(chain_idx) and v["checkpoints"]["last_verified_line"] == chain_idx[-1]
     # change one sample before the first checkpoint
-    j = next(i for i, ln in enumerate(lines) if ln.startswith("[") and i < chain_idx[0])
+    j = next(i for i, ln in enumerate(lines) if ln.startswith(b"[") and i < chain_idx[0])
     bad = lines[:cut]
-    bad[j] = bad[j].replace("[", "[9", 1)
-    p.write_text("".join(bad), encoding="utf-8")
+    bad[j] = bad[j].replace(b"[", b"[9", 1)
+    p.write_bytes(b"".join(bad))
     v = rec.verify(st["id"])
     assert v["integrity"].startswith("MODIFIED") and f"line {chain_idx[0] + 1}" in v["integrity"]
 
