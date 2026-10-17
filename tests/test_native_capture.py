@@ -459,3 +459,16 @@ def test_native_refusal_is_not_a_fallback(rec):
                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="nf", max_symbols=5,
                   cycle_counter=None)
     assert not list(rec.root.glob("*.jsonl"))
+
+
+def test_release_exe_must_match_its_pinned_sha256(capture_exe, tmp_path):
+    """The release ships tcmcp-capture.exe.sha256 next to the exe; a binary that differs is never run."""
+    exe = tmp_path / capture_exe.name
+    shutil.copy2(capture_exe, exe)
+    pin = exe.with_name(exe.name + ".sha256")
+    pin.write_text(NC.exe_sha256(exe) + "  " + exe.name + "\n", encoding="ascii")
+    ok, why, info = NC.availability(exe, __version__)
+    assert ok and info["sha256_verified"], why
+    pin.write_text("0" * 64 + "  " + exe.name + "\n", encoding="ascii")
+    ok, why, _ = NC.availability(exe, __version__)
+    assert not ok and "does not match the SHA-256" in why

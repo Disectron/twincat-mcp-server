@@ -1,0 +1,158 @@
+name: release
+
+# A release is cut by pushing a branch named release/v<version> whose package version equals <version>.
+# The workflow builds tcmcp-capture.exe on Windows, runs the whole test suite against it, then commits the exe and
+# its SHA-256 onto that branch, tags v<version>, fast-forwards main to it and publishes the GitHub release.
+# main therefore never carries a version whose capture service is missing (field report N25), and the plugin
+# installed from the marketplace contains the exact exe the release built.
+
+on:
+  push:
+    branches: ["release/v*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Version check (branch, package, plugin, marketplace must agree)
+        id: ver
+        shell: python
+        run: |
+          import json, os, re, pathlib
+          want = os.environ["GITHUB_REF_NAME"].split("release/v", 1)[1]
+          init = re.search(r'__version__ = "([^"]+)"', pathlib.Path("twincat_mcp/__init__.py").read_text()).group(1)
+          pyp = re.search(r'^version = "([^"]+)"', pathlib.Path("pyproject.toml").read_text(), re.M).group(1)
+          plug = json.loads(pathlib.Path(".claude-plugin/plugin.json").read_text())["version"]
+          mkt = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text())["metadata"]["version"]
+          got = {"branch": want, "__init__": init, "pyproject": pyp, "plugin.json": plug, "marketplace.json": mkt}
+          if len(set(got.values())) != 1:
+              print(f"::error title=version::versions disagree: {got}")
+              raise SystemExit(1)
+          notes = pathlib.Path("README.md").read_text(encoding="utf-8")
+          if f"**{want}**" not in notes:
+              print(f"::error title=notes::README.md has no '**{want}**' changelog entry")
+              raise SystemExit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"version={want}\n")
+      - name: Install
+        run: python -m pip install --quiet -e ".[dev]"
+      - name: Stand-in TcAdsDll.dll (runner has no TwinCAT; tests use fake connections)
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "tc"
+          New-Item -ItemType Directory -Force (Join-Path $root "Common64") | Out-Null
+          Copy-Item "$env:SystemRoot\System32\version.dll" (Join-Path $root "Common64\TcAdsDll.dll")
+          "TWINCAT3DIR=$(Join-Path $root '3.1')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build tcmcp-capture.exe (Release, deterministic /Brepro)
+        shell: bash
+        run: |
+          cmake -S native/capture -B build/capture
+          cmake --build build/capture --config Release -j 4
+          exe=build/capture/Release/tcmcp-capture.exe
+          test -f "$exe"
+          v=$("$exe" --version)
+          echo "$v"
+          python -c "import json,sys; d=json.loads(sys.argv[1]); assert d['version']=='${{ steps.ver.outputs.version }}', d" "$v"
+          "$exe" --selftest
+          echo "TCMCP_CAPTURE_EXE=$(cygpath -w "$PWD/$exe")" >> "$GITHUB_ENV"
+      - name: Test (whole suite, with this exe)
+        shell: bash
+        run: python -m pytest -q -p anyio -rfE --tb=short
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcmcp-capture-release
+          path: build/capture/Release/tcmcp-capture.exe
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # commit the exe, tag, fast-forward main, create the release
+      id-token: write          # build provenance attestation
+      attestations: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: tcmcp-capture-release
+          path: twincat_mcp/bin
+      - name: Pin SHA-256 next to the exe
+        run: |
+          cd twincat_mcp/bin
+          sha256sum tcmcp-capture.exe > tcmcp-capture.exe.sha256
+          cat tcmcp-capture.exe.sha256
+      - name: Attest build provenance (gh attestation verify tcmcp-capture.exe -R <repo>)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: twincat_mcp/bin/tcmcp-capture.exe
+      - name: Commit exe, tag, fast-forward main
+        run: |
+          set -eo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error title=tag::v$VERSION already exists"; exit 1
+          fi
+          git add -f twincat_mcp/bin/tcmcp-capture.exe twincat_mcp/bin/tcmcp-capture.exe.sha256
+          git commit -m "release v$VERSION: tcmcp-capture.exe built by release run ${GITHUB_RUN_ID} from ${GITHUB_SHA}"
+          git tag -a "v$VERSION" -m "twincat-mcp $VERSION"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "v$VERSION"
+          git fetch origin main
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "::error title=main::main has commits that are not on ${GITHUB_REF_NAME}; rebase the release branch"; exit 1
+          fi
+          git push origin HEAD:main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build release files
+        run: |
+          set -eo pipefail
+          mkdir -p dist
+          git archive --format=zip --prefix="twincat-mcp-$VERSION/" -o "dist/twincat-mcp-$VERSION-windows-x64.zip" HEAD
+          python -m pip install --quiet -e .
+          python packaging/mcpb/build.py --out dist
+          python - <<'EOF'
+          import zipfile, os
+          v = os.environ["VERSION"]
+          for f, want in ((f"dist/twincat-mcp-{v}-windows-x64.zip", f"twincat-mcp-{v}/twincat_mcp/bin/tcmcp-capture.exe"),
+                          (f"dist/twincat-mcp-{v}.mcpb", "server/src/twincat_mcp/bin/tcmcp-capture.exe")):
+              names = zipfile.ZipFile(f).namelist()
+              assert want in names, (f, want)
+          print("exe present in zip and mcpb")
+          EOF
+          cp twincat_mcp/bin/tcmcp-capture.exe dist/
+          rm -rf dist/mcpb-stage-*
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          python - <<'EOF'
+          import os, re
+          v = os.environ["VERSION"]
+          text = open("README.md", encoding="utf-8").read()
+          m = re.search(r"^\*\*" + re.escape(v) + r"\*\*.*?(?=^\*\*\d+\.\d+\.\d+\*\*|\Z)", text, re.M | re.S)
+          body = (m.group(0).strip() if m else f"twincat-mcp {v}")
+          body += ("\n\n**Files**: `twincat-mcp-" + v + "-windows-x64.zip` (sources + tcmcp-capture.exe), `twincat-mcp-" + v
+                   + ".mcpb` (Claude Desktop bundle), `tcmcp-capture.exe`, `SHA256SUMS`.\n"
+                   "Verify the exe: `gh attestation verify tcmcp-capture.exe -R " + os.environ["GITHUB_REPOSITORY"] + "`.\n")
+          open("dist/NOTES.md", "w", encoding="utf-8").write(body)
+          EOF
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" --title "twincat-mcp $VERSION" --notes-file dist/NOTES.md \
+            "dist/twincat-mcp-$VERSION-windows-x64.zip" "dist/twincat-mcp-$VERSION.mcpb" dist/tcmcp-capture.exe dist/SHA256SUMS

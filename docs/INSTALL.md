@@ -119,7 +119,7 @@ If `claude plugin configure` also refuses, the options are plain environment var
 **Pre-build the venv now** (optional but recommended — it removes the one-minute first-start wait from §5):
 
 ```powershell
-python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.0\scripts\launch.py" --no-run
+python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.1\scripts\launch.py" --no-run
 ```
 (the version folder changes with each plugin version; `dir $env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp` lists it.)
 
@@ -341,12 +341,16 @@ website's markup to be verified.
 
 ## 6a. Native capture service — check it once
 
-Cycle-mode recordings use `twincat_mcp\bin\tcmcp-capture.exe` (C++, Beckhoff AdsLib over TcAdsDll). It is not
-code-signed: if SmartScreen or the virus scanner quarantines it, allow it or set `[recorder] engine = "python"`.
+Cycle-mode recordings use `twincat_mcp\bin\tcmcp-capture.exe` (C++, Beckhoff AdsLib over TcAdsDll). Since 0.8.1 it
+ships inside the plugin: the release workflow builds it, runs the test suite against it and commits it with
+`tcmcp-capture.exe.sha256`; the server refuses an exe that does not match that hash. The same files are on the
+GitHub release (`twincat-mcp-<version>-windows-x64.zip`, `.mcpb`, `SHA256SUMS`). Check where it came from:
+`gh attestation verify tcmcp-capture.exe -R Disectron/twincat-mcp-server`. It is not code-signed: if SmartScreen
+or the virus scanner quarantines it, allow it or set `[recorder] engine = "python"`.
 
 ```powershell
-$exe = "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.0\twincat_mcp\bin\tcmcp-capture.exe"
-& $exe --version      # {"version": "0.8.0", ... "ads": "Beckhoff AdsLib on TcAdsDll ..."}
+$exe = "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.1\twincat_mcp\bin\tcmcp-capture.exe"
+& $exe --version      # {"version": "0.8.1", ... "ads": "Beckhoff AdsLib on TcAdsDll ..."}
 & $exe --selftest     # six "ok" lines
 ```
 

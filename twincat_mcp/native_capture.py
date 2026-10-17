@@ -15,6 +15,7 @@ The file it writes is recording format 2, byte-compatible with the Python record
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -78,10 +79,47 @@ def probe(exe: Path) -> tuple[dict[str, Any] | None, str | None]:
     return info, reason
 
 
+def pinned_sha256(exe: Path) -> str | None:
+    """The SHA-256 the release workflow wrote next to the exe it built (``tcmcp-capture.exe.sha256``)."""
+    f = exe.with_name(exe.name + ".sha256")
+    try:
+        tok = f.read_text(encoding="ascii", errors="replace").split()
+    except OSError:
+        return None
+    return tok[0].lower() if tok and len(tok[0]) == 64 else None
+
+
+_HASHED: dict[str, str] = {}
+
+
+def exe_sha256(exe: Path) -> str:
+    st = exe.stat()
+    key = f"{exe}|{st.st_mtime_ns}|{st.st_size}"
+    if key not in _HASHED:
+        h = hashlib.sha256()
+        with open(exe, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        _HASHED[key] = h.hexdigest()
+    return _HASHED[key]
+
+
 def availability(exe: Path, version: str) -> tuple[bool, str, dict[str, Any] | None]:
+    pin = pinned_sha256(exe)
+    if pin is not None and exe.is_file():
+        try:
+            got = exe_sha256(exe)
+        except OSError as exc:
+            return False, f"{exe.name} unreadable: {exc}", None
+        if got != pin:
+            # never run a capture binary that is not byte-for-byte the one the release built
+            return False, (f"{exe.name} does not match the SHA-256 shipped with it ({got[:12]}… ≠ {pin[:12]}…): "
+                           "replaced or corrupted — reinstall the plugin; recording on the Python engine"), None
     info, reason = probe(exe)
     if info is None:
         return False, reason or "unknown", None
+    if pin is not None:
+        info = {**info, "sha256": pin, "sha256_verified": True}
     if info.get("protocol") != PROTOCOL:
         return False, f"{exe.name} speaks protocol {info.get('protocol')}, this server {PROTOCOL}", info
     if info.get("version") != version:

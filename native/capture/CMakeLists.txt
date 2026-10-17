@@ -91,6 +91,10 @@ if(MSVC)
   set_property(TARGET tcmcp-capture PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   target_compile_definitions(tcmcp-capture PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
   target_compile_options(tcmcp-capture PRIVATE /W3 /EHsc /permissive- /utf-8)
+  # deterministic output (no timestamps in the PE/PDB): the same sources + toolchain give the same bytes, so a
+  # release exe can be rebuilt and compared against the SHA-256 shipped next to it
+  target_compile_options(tcmcp-capture PRIVATE /Brepro)
+  target_link_options(tcmcp-capture PRIVATE /Brepro)
 else()
   target_compile_options(tcmcp-capture PRIVATE -Wall -Wextra)
   if(WIN32)
