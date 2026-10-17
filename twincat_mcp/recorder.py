@@ -49,9 +49,11 @@ import hashlib
 import hmac as _hmac
 import json
 import math
+import os
 import queue
 import re
 import secrets
+import stat
 import struct
 import threading
 import time
@@ -420,6 +422,7 @@ class Recording:
         self.pre: deque[tuple[float, Any, Any]] = deque()
         self.meta = meta
         self.key = key
+        self.manifest: dict[str, Any] | None = None
         self.q: "queue.Queue[Any]" = queue.Queue(maxsize=200_000)
         self.events = 0             # leaf values represented in the file
         self.samples = 0            # rows written (block samples / poll cycles)
@@ -761,6 +764,11 @@ class Recording:
                 self._fh.write(json.dumps(footer, default=str) + "\n")
                 self._fh.close()
                 self._fh = None
+                sealed = True
+            else:
+                sealed = False
+        if sealed:
+            self.manifest = seal_recording(self.path, self.key)
 
     def label(self, miss: int | None = None) -> str:
         """R5: COMPLETE only when the PLC timeline proves every sample is in the file (cycle mode); INCOMPLETE when
@@ -995,6 +1003,72 @@ def read_footer(path: Path) -> dict[str, Any] | None:
             except json.JSONDecodeError:
                 return None
     return None
+
+
+MANIFEST_SUFFIX = ".manifest.json"
+_MANIFEST_FIELDS = ("label", "samples", "events", "missing_samples", "gap_markers", "chain_checkpoints", "dropped",
+                    "stop_reason", "engine", "engine_version", "window_start_ms", "window_end_ms", "stopped", "lines")
+
+
+def manifest_path(path: Path) -> Path:
+    return path.with_suffix(MANIFEST_SUFFIX)
+
+
+def _manifest_sig(key: bytes, m: dict[str, Any]) -> str:
+    body = json.dumps({k: v for k, v in m.items() if k != "hmac"}, sort_keys=True, separators=(",", ":"), default=str)
+    return _hmac.new(key, body.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def file_sha256(path: Path) -> tuple[str, int]:
+    h, n = hashlib.sha256(), 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+            n += len(chunk)
+    return h.hexdigest(), n
+
+
+def is_read_only(path: Path) -> bool:
+    try:
+        return not (path.stat().st_mode & stat.S_IWUSR)
+    except OSError:
+        return False
+
+
+def make_writable(path: Path) -> None:
+    try:
+        if path.exists():
+            os.chmod(path, path.stat().st_mode | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def seal_recording(path: Path, key: bytes | None) -> dict[str, Any] | None:
+    """R9: after a recording has ended, write ``<id>.manifest.json`` (whole-file SHA-256 and size, the footer's
+    checksum and signature, a summary) signed with this install's key, then mark both files read-only so an
+    accidental edit fails loudly. The recording itself is never touched. Idempotent: an existing manifest is kept."""
+    mp = manifest_path(path)
+    if mp.exists() or not path.is_file():
+        return None
+    try:
+        footer = read_footer(path) or {}
+        sha, size = file_sha256(path)
+        m: dict[str, Any] = {"_manifest": 1, "file": path.name, "size": size, "sha256_file": sha,
+                             "footer_sha256": footer.get("sha256"), "footer_hmac": footer.get("hmac"),
+                             "has_footer": bool(footer),
+                             "sealed": dt.datetime.now(dt.timezone.utc).isoformat()}
+        for k in _MANIFEST_FIELDS:
+            if k in footer:
+                m[k] = footer[k]
+        if key:
+            m["hmac"] = _manifest_sig(key, m)
+        with open(mp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(m, indent=1, default=str) + "\n")
+        for p in (path, mp):
+            os.chmod(p, p.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+        return m
+    except OSError:
+        return None
 
 
 class Recorder:
@@ -1639,14 +1713,101 @@ class Recorder:
             self.stop(rid, "deleted")
         path = self._path_for(rid)
         removed = []
-        for p in (path, path.with_suffix(".wide.csv"), path.with_suffix(".long.csv")):
+        for p in (path, manifest_path(path), path.with_suffix(".wide.csv"), path.with_suffix(".long.csv")):
             if p.exists():
+                make_writable(p)                       # sealed recordings are read-only (R9)
                 p.unlink()
                 removed.append(str(p))
         self.recs.pop(rid, None)
         return {"id": rid, "removed": removed}
 
     # ------------------------------------------------------------ verification
+    def _integrity(self, path: Path) -> dict[str, Any]:
+        """Integrity of the file as written: running SHA-256 checked at every ``_chain`` checkpoint and at the
+        footer, each signature checked with this install's key, then the sealed sidecar (whole-file hash)."""
+        out: dict[str, Any] = {}
+        sha = hashlib.sha256()
+        nbytes = nlines = 0
+        footer = None
+        chk = {"checked": 0, "bad": None, "last_ok_line": 0, "last_ok_bytes": 0}
+        unsigned = False
+        with open(path, "rb") as fh:
+            for raw in fh:
+                if raw.startswith(b'{"_footer"'):
+                    try:
+                        footer = json.loads(raw)
+                    except json.JSONDecodeError:
+                        footer = None
+                    break
+                if raw.startswith(b'{"_chain"') and chk["bad"] is None:
+                    try:
+                        c = json.loads(raw)["_chain"]
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        c = None
+                    d = sha.hexdigest()
+                    if (c is None or c.get("sha256") != d or c.get("bytes") != nbytes or c.get("lines") != nlines):
+                        chk["bad"] = f"checkpoint at line {nlines + 1} does not match the content before it"
+                    elif "hmac" in c and _hmac.new(self.key, d.encode("ascii"), hashlib.sha256).hexdigest() != c["hmac"]:
+                        chk["bad"] = f"checkpoint at line {nlines + 1} is not signed by this install's key"
+                    else:
+                        unsigned |= "hmac" not in c
+                        chk["checked"] += 1
+                        chk["last_ok_line"], chk["last_ok_bytes"] = nlines, nbytes
+                sha.update(raw)
+                nbytes += len(raw)
+                nlines += 1
+        out["checkpoints"] = {"verified": chk["checked"], "last_verified_line": chk["last_ok_line"]}
+        if chk["bad"]:
+            out["checkpoints"]["problem"] = chk["bad"]
+        if footer is None:
+            if chk["bad"]:
+                out["integrity"] = f"MODIFIED — {chk['bad']} (and no footer)"
+            elif chk["checked"]:
+                after = nlines - chk["last_ok_line"]
+                out["integrity"] = (f"NO FOOTER — intact up to the last checkpoint (line {chk['last_ok_line']}); "
+                                    f"the {after} line(s) after it cannot be proven (process killed or still writing?)")
+            else:
+                out["integrity"] = "NO FOOTER — the recording did not end cleanly (process killed?); content cannot be proven"
+        else:
+            digest = sha.hexdigest()
+            if digest != footer.get("sha256"):
+                where = f"; {chk['bad']}" if chk["bad"] else (f"; intact up to line {chk['last_ok_line']}" if chk["checked"] else "")
+                out["integrity"] = "MODIFIED — the content does not match the checksum written when the recording ended" + where
+            elif chk["bad"]:
+                out["integrity"] = f"MODIFIED — {chk['bad']} although the footer checksum matches (checksum re-written?)"
+            elif "hmac" in footer and _hmac.new(self.key, digest.encode("ascii"), hashlib.sha256).hexdigest() != footer["hmac"]:
+                out["integrity"] = "CHECKSUM RE-WRITTEN — content matches its checksum but the signature is not this install's"
+            elif "hmac" not in footer or unsigned:
+                out["integrity"] = "intact (unsigned: recorded without a signing key)"
+            else:
+                out["integrity"] = "intact"
+            out["footer"] = {k: footer.get(k) for k in ("events", "samples", "missing_samples", "dropped", "dropped_on_stop",
+                                                         "after_limit", "unsubscribed", "stop_reason")}
+            for k in ("label", "gap_markers", "chain_checkpoints", "engine", "engine_version", "overflow_samples",
+                      "missing_head", "missing_gaps", "missing_tail", "requested_s", "window_start_ms", "window_end_ms",
+                      "verdict_hint"):
+                if k in footer:
+                    out["footer"][k] = footer[k]
+        out["seal"] = self._check_seal(path)
+        out["read_only"] = is_read_only(path)
+        out["_footer_raw"] = footer
+        return out
+
+    def _check_seal(self, path: Path) -> str:
+        mp = manifest_path(path)
+        if not mp.is_file():
+            return "no manifest (recorded before 0.8.1, or the server stopped before sealing)"
+        try:
+            m = json.loads(mp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "manifest unreadable"
+        if "hmac" in m and _manifest_sig(self.key, m) != m["hmac"]:
+            return "MANIFEST NOT SIGNED BY THIS INSTALL — the manifest was edited or comes from another install"
+        sha, size = file_sha256(path)
+        if sha != m.get("sha256_file") or size != m.get("size"):
+            return f"FILE CHANGED SINCE SEALING — sealed {m.get('size')} bytes, now {size}; hashes differ"
+        return "matches manifest" + ("" if "hmac" in m else " (unsigned)")
+
     def verify(self, rid: str, counter: str | None = None, step: int | None = None, max_gaps: int = 20) -> dict[str, Any]:
         """Prove a recording: (1) integrity — the file is byte-for-byte what the recorder wrote (sha256 over every
         line, signed with this install's key); (2) timeline — per notification block, PLC timestamps without
@@ -1659,35 +1820,8 @@ class Recorder:
         path = self._path_for(rid)
         out: dict[str, Any] = {"id": rid, "file": str(path)}
         # (1) integrity
-        sha = hashlib.sha256()
-        footer = None
-        with open(path, "rb") as fh:
-            for raw in fh:
-                if raw.startswith(b'{"_footer"'):
-                    try:
-                        footer = json.loads(raw)
-                    except json.JSONDecodeError:
-                        footer = None
-                    break
-                sha.update(raw)
-        if footer is None:
-            out["integrity"] = "NO FOOTER — the recording did not end cleanly (process killed?); content cannot be proven"
-        else:
-            digest = sha.hexdigest()
-            if digest != footer.get("sha256"):
-                out["integrity"] = "MODIFIED — the content does not match the checksum written when the recording ended"
-            elif "hmac" in footer and _hmac.new(self.key, digest.encode("ascii"), hashlib.sha256).hexdigest() != footer["hmac"]:
-                out["integrity"] = "CHECKSUM RE-WRITTEN — content matches its checksum but the signature is not this install's"
-            elif "hmac" not in footer:
-                out["integrity"] = "intact (unsigned: recorded before signatures were added)"
-            else:
-                out["integrity"] = "intact"
-            out["footer"] = {k: footer.get(k) for k in ("events", "samples", "missing_samples", "dropped", "dropped_on_stop",
-                                                         "after_limit", "unsubscribed", "stop_reason")}
-            for k in ("engine", "engine_version", "overflow_samples", "missing_head", "missing_gaps", "missing_tail",
-                      "requested_s", "window_start_ms", "window_end_ms", "verdict_hint"):
-                if k in footer:
-                    out["footer"][k] = footer[k]
+        out.update(self._integrity(path))
+        footer = out.pop("_footer_raw")
         header = _read_header(path)
         out["time_source"] = header.get("time_source", "plc")
         if counter is None and header.get("cycle_counter"):

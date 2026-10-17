@@ -6,6 +6,7 @@ import pytest
 
 from twincat_mcp.config import AdsConfig
 from twincat_mcp.ads_backend import AdsBackend, AdsError
+from twincat_mcp import recorder as R
 from twincat_mcp.recorder import Recorder, RecorderError, FILETIME_EPOCH_OFFSET_100NS
 from tests.fake_ads import install, FakeConnection
 
@@ -116,7 +117,7 @@ def test_change_mode_capture_stats_export_read(rec, tmp_path):
     lst = rec.list()
     assert lst["session"][0]["id"] == rid
     d = rec.delete(rid)
-    assert len(d["removed"]) == 3 and not Path(out["file"]).exists()
+    assert len(d["removed"]) == 4 and not Path(out["file"]).exists()
 
 
 def test_triggers_pre_and_stop(rec):
@@ -301,13 +302,19 @@ def test_block_notification_gaps_are_counted_and_file_is_provable(rec):
     # every sample carries the PLC's FILETIME exactly: t0 + t_ms * 1e4
     rows = rec.read(st["id"], None, None, ["MAIN.nCycle"], 5, False)["rows"]
     assert [v["t0"]["filetime"] + round(r["t_ms"] * 1e4) for r in rows] == [ft(i) for i in range(5)]
-    # tampering is detected
+    # R9: sealed — sidecar manifest written, file and manifest read-only
     p = Path(out["file"])
-    lines = p.read_text().splitlines(keepends=True)
+    assert v["seal"] == "matches manifest" and v["read_only"] and R.is_read_only(R.manifest_path(p))
+    m = json.loads(R.manifest_path(p).read_text(encoding="utf-8"))
+    assert m["sha256_file"] == R.file_sha256(p)[0] and m["label"] == "INCOMPLETE" and m["hmac"]
+    # tampering is detected (a deliberate edit has to clear read-only first)
+    R.make_writable(p)
+    lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
     i = next(k for k, ln in enumerate(lines) if ln.startswith("[500"))
     lines[i] = lines[i].replace("[500", "[501", 1)
-    p.write_text("".join(lines))
-    assert rec.verify(st["id"])["integrity"].startswith("MODIFIED")
+    p.write_text("".join(lines), encoding="utf-8")
+    v2 = rec.verify(st["id"])
+    assert v2["integrity"].startswith("MODIFIED") and v2["seal"].startswith("FILE CHANGED SINCE SEALING")
 
 
 def test_lossless_run_passes_verification(rec):

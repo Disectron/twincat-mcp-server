@@ -19,6 +19,7 @@ from twincat_mcp import __version__
 from twincat_mcp import native_capture as NC
 from twincat_mcp.ads_backend import AdsBackend, AdsError
 from twincat_mcp.config import AdsConfig, RecorderConfig
+from twincat_mcp import recorder as R
 from twincat_mcp.recorder import Recorder, RecorderError, recording_key
 from tests.fake_ads import install
 
@@ -343,12 +344,55 @@ def test_spec9_one_byte_edit_is_modified(rec):
     _wait_done(rec, st["id"])
     fin = rec.stop(st["id"])
     p = Path(fin["file"])
+    assert R.is_read_only(p) and R.manifest_path(p).is_file()          # R9: sealed after stop
+    R.make_writable(p)
     data = bytearray(p.read_bytes())
     i = data.index(b'"#')
     data[i - 2] = ord("9") if data[i - 2] != ord("9") else ord("8")
     p.write_bytes(bytes(data))
     v = rec.verify(st["id"])
     assert v["integrity"].startswith("MODIFIED") and v["verdict"] == "FAIL"
+    assert v["seal"].startswith("FILE CHANGED SINCE SEALING")
+
+
+def test_r9_truncated_file_verifies_to_last_checkpoint(rec):
+    """A file whose footer never got written (power cut) is still proven intact up to its last checkpoint;
+    an edit before a checkpoint is located."""
+    rec.native_extra["sim"] = {**rec.native_extra["sim"], "speed": 1}     # real time: one checkpoint per second
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=2.5,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="r9t", max_symbols=50,
+                   cycle_counter=None)
+    _wait_done(rec, st["id"])
+    fin = rec.stop(st["id"])
+    p = Path(fin["file"])
+    R.make_writable(p)
+    lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+    chain_idx = [i for i, ln in enumerate(lines) if ln.startswith('{"_chain"')]
+    assert len(chain_idx) >= 2
+    cut = chain_idx[-1] + 5                                   # a few rows after the last checkpoint, no footer
+    p.write_text("".join(lines[:cut]), encoding="utf-8")
+    v = rec.verify(st["id"])
+    assert v["integrity"].startswith("NO FOOTER — intact up to the last checkpoint"), v["integrity"]
+    assert v["checkpoints"]["verified"] == len(chain_idx) and v["checkpoints"]["last_verified_line"] == chain_idx[-1]
+    # change one sample before the first checkpoint
+    j = next(i for i, ln in enumerate(lines) if ln.startswith("[") and i < chain_idx[0])
+    bad = lines[:cut]
+    bad[j] = bad[j].replace("[", "[9", 1)
+    p.write_text("".join(bad), encoding="utf-8")
+    v = rec.verify(st["id"])
+    assert v["integrity"].startswith("MODIFIED") and f"line {chain_idx[0] + 1}" in v["integrity"]
+
+
+def test_r9_delete_removes_read_only_recording_and_manifest(rec):
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=0.3,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="r9d", max_symbols=50,
+                   cycle_counter=None)
+    _wait_done(rec, st["id"])
+    fin = rec.stop(st["id"])
+    p = Path(fin["file"])
+    assert R.is_read_only(p)
+    out = rec.delete(st["id"])
+    assert not p.exists() and not R.manifest_path(p).exists() and str(R.manifest_path(p)) in out["removed"]
 
 
 def test_spec10_export_identical_to_python_engine(rec, tmp_path):

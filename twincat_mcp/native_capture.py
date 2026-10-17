@@ -236,6 +236,7 @@ class NativeRecording:
         self.conn = None
         self._last: dict[str, Any] = {}
         self._closed = False
+        self.manifest: dict[str, Any] | None = None
 
     # -------------------------------------------------- state
     @property
@@ -266,6 +267,7 @@ class NativeRecording:
             self.proc.close()
             self._closed = True
             self._mark_stopped()
+            self._seal()
         return self.status()
 
     def reap(self) -> None:
@@ -274,6 +276,12 @@ class NativeRecording:
             self.proc.close()
             self._closed = True
             self._mark_stopped()
+            self._seal()
+
+    def _seal(self) -> None:
+        """R9: sidecar manifest + read-only, once the service has closed the file."""
+        from .recorder import seal_recording
+        self.manifest = seal_recording(self.path, getattr(self.rec, "key", None))
 
     def request_stop(self, reason: str = "requested") -> None:
         self.stop(reason)
