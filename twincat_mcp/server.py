@@ -869,10 +869,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=WRITE)
     async def ads_write_many(values: dict[str, Any], ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Write several symbols ({name: value}) all-or-nothing up front: every symbol is gated (allow/deny list)
-        and pre-checked (type, range, enum name, array/string length, CONSTANT, pointer/interface) BEFORE the
-        first write; one refusal → nothing is written and every problem is listed. The writes then run in
-        order; if one fails at the PLC, the result says which were already applied (ADS has no transaction)."""
+        """Write several symbols ({name: value}) together. Every symbol is gated (allow/deny list) and pre-checked
+        (type, range, enum name, array/string length, CONSTANT, pointer/interface) BEFORE anything is written —
+        one refusal → nothing is written and every problem is listed. Then ONE ADS sum-write: the runtime applies
+        all values between the same two task cycles (method says if it had to fall back to one-by-one). Per-item
+        before/written/read_back; applied/failed/not_attempted if the PLC rejects one."""
         problems: dict[str, str] = {}
         for n, v in values.items():
             try:
@@ -884,17 +885,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             app.audit("ads_write_many", {"names": list(values)}, OpClass.WRITE, "refused", problems)
             raise ToolError("nothing was written — refused in pre-check: "
                             + "; ".join(f"{k}: {v}" for k, v in problems.items()))
-        applied: dict[str, Any] = {}
-        for n, v in values.items():
-            try:
-                applied[n] = await app.ads_call(app.ads.write, n, v, timeout=30)
-                app.audit("ads_write_many", {"name": n, "value": v}, OpClass.WRITE, "ok", applied[n])
-            except ToolError as exc:
-                app.audit("ads_write_many", {"name": n, "value": v}, OpClass.WRITE, "error", str(exc))
-                return {"complete": False, "applied": applied, "failed": {n: str(exc)},
-                        "not_attempted": [k for k in values if k not in applied and k != n],
-                        "note": "the writes in 'applied' took effect; snap_apply a snapshot to roll back if needed"}
-        return {"complete": True, "applied": applied}
+        try:
+            res = await app.ads_call(app.ads.write_many, values, timeout=60)
+        except ToolError as exc:
+            app.audit("ads_write_many", {"values": values}, OpClass.WRITE, "error", str(exc))
+            raise
+        app.audit("ads_write_many", {"values": values}, OpClass.WRITE, "ok" if res["complete"] else "partial",
+                  {"method": res["method"], "applied": res["applied"], "failed": res["failed"]})
+        if not res["complete"]:
+            res["note"] = "the values in 'applied' took effect; snap_apply a snapshot to roll back if needed"
+        return res
 
     @mcp.tool(annotations=READ)
     async def ads_io_read(area: str, offset: int, size: int = 1, port: int = 851) -> dict[str, Any]:
@@ -939,21 +939,94 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def ads_watch(names: list[str], duration_ms: int = 2000, interval_ms: int = 50,
                         change_only: bool = True) -> dict[str, Any]:
-        """Sample symbols for duration_ms every interval_ms (polling trace). change_only keeps
-        only rows where a value changed. Caps: 60 s, ≥10 ms, 5000 rows. Use for timing
-        questions: 'does bDone pulse?', 'how long is the valve open?'. Runs on the slow ADS
-        worker, so ads_write calls issued *concurrently* interleave with it — but a client that
-        sends tool calls one after another will see the writes land after the watch ends; for a
-        stimulus-response measurement use test_response or rec_start + the write + rec_stop."""
-        return await app.ads_call(app.ads.watch, names, duration_ms, interval_ms, change_only,
-                                  timeout=cfg.ads.max_watch_duration_ms / 1000 + 30, slow=True)
+        """Trace symbols for duration_ms. Uses ADS notifications (PLC-timestamped, every change the runtime sees at
+        its task cycle — not 50 ms polling from this PC): change_only=true records changes, false one sample per
+        interval_ms. Falls back to polling when notifications are unavailable (method field says which). Caps: 60 s,
+        5000 rows. The wait happens off the ADS workers, so writes issued concurrently land during the watch — a
+        client that sends calls one after another still sees them after it; for stimulus→response use
+        test_response, or rec_start + the write + rec_stop."""
+        duration_ms = int(min(max(duration_ms, 10), cfg.ads.max_watch_duration_ms))
+        try:
+            st = await app.rec_call(app.rec.start, symbols=names, prefix=None, pattern=None,
+                                    mode="change" if change_only else "cycle", cycle_ms=max(1.0, float(interval_ms)) if not change_only else 1.0,
+                                    duration_s=None, max_events=200_000, start_when=None, stop_when=None, pre_trigger_ms=0,
+                                    name="ads_watch", max_symbols=200, timeout=60)
+        except ToolError as exc:
+            res = await app.ads_call(app.ads.watch, names, duration_ms, interval_ms, change_only,
+                                     timeout=cfg.ads.max_watch_duration_ms / 1000 + 30, slow=True)
+            res["method"] = f"polling from this PC every {interval_ms} ms (notifications failed: {str(exc)[:160]})"
+            return res
+        rid = st["id"]
+        try:
+            await asyncio.sleep(duration_ms / 1000.0)
+            stop = await app.rec_call(app.rec.stop, rid, "ads_watch done", timeout=90)
+            rows = await app.mem_call(app.rec.read, rid, None, None, None, 5000, False)
+        finally:
+            try:
+                await app.mem_call(app.rec.delete, rid)
+            except ToolError:
+                pass
+        out = {"method": "ADS notifications (PLC timestamps)", "mode": "change" if change_only else f"cycle {interval_ms} ms",
+               "duration_ms": duration_ms, "rows": [{"t_ms": r["t_ms"], "symbol": r["symbol"], "value": r["value"]} for r in rows["rows"]],
+               "count": rows["count"], "truncated": rows["truncated"]}
+        if stop.get("warnings"):
+            out["warnings"] = stop["warnings"]
+        return out
 
     @mcp.tool(annotations=READ)
     async def ads_wait_until(name: str, op: str, value: Any, timeout_ms: int = 10000,
                              interval_ms: int = 50) -> dict[str, Any]:
-        """Block until symbol <op> value (==, !=, >, >=, <, <=) or timeout. Returns met/elapsed."""
-        return await app.ads_call(app.ads.wait_until, name, op, value, timeout_ms, interval_ms,
-                                  timeout=min(timeout_ms, 600_000) / 1000 + 10, slow=True)
+        """Block until symbol <op> value (==, !=, >, >=, <, <=) or timeout. Uses an ADS change notification, so it
+        returns as soon as the runtime sees the condition (met_at_plc_ms = PLC-relative timestamp of that sample);
+        falls back to polling every interval_ms when notifications are unavailable. Returns met/value/elapsed."""
+        if op not in ("==", "!=", ">", ">=", "<", "<="):
+            raise ToolError("op must be one of ==, !=, >, >=, <, <=")
+        lit = json.dumps(value) if isinstance(value, bool) else str(value)
+        timeout_ms = int(min(timeout_ms, 600_000))
+        t0 = time.perf_counter()
+        try:
+            st = await app.rec_call(app.rec.start, symbols=[name], prefix=None, pattern=None, mode="change", cycle_ms=1.0,
+                                    duration_s=None, max_events=None, start_when=None, stop_when=f"{name} {op} {lit}",
+                                    pre_trigger_ms=0, name="ads_wait_until", max_symbols=1, timeout=60)
+        except ToolError as exc:
+            res = await app.ads_call(app.ads.wait_until, name, op, value, timeout_ms, interval_ms,
+                                     timeout=timeout_ms / 1000 + 10, slow=True)
+            res["method"] = f"polling (notifications failed: {str(exc)[:160]})"
+            return res
+        rid = st["id"]
+        try:
+            met = False
+            # already true before the first change arrives? (a change notification only fires on change)
+            cond = app.rec.recs[rid].stop_when
+            try:
+                cur = (await app.ads_call(app.ads.read, name, False, timeout=10)).get("value")
+                if cond is not None and cond.test(cur):
+                    await app.rec_call(app.rec.stop, rid, "already true", timeout=60)
+                    return {"met": True, "value": cur, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                            "method": "read (condition already held)"}
+            except ToolError:
+                pass
+            while (time.perf_counter() - t0) * 1000 < timeout_ms:
+                s_ = await app.mem_call(app.rec.status, rid)
+                if not s_["active"]:
+                    met = str(s_.get("stop_reason") or "").startswith("stop_when")
+                    break
+                await asyncio.sleep(0.02)
+            fin = await app.rec_call(app.rec.stop, rid, "ads_wait_until timeout", timeout=60)
+            met = met or str(fin.get("stop_reason") or "").startswith("stop_when")
+            last = (fin.get("last_values") or {}).get(name)
+            if last is None:
+                last = next(iter((fin.get("last_values") or {}).values()), None)
+        finally:
+            try:
+                await app.mem_call(app.rec.delete, rid)
+            except ToolError:
+                pass
+        out = {"met": met, "value": last, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+               "method": "ADS change notification"}
+        if met:
+            out["met_at_plc_ms"] = fin.get("plc_span_s", 0) * 1000.0
+        return out
 
     @mcp.tool(annotations=DESTR)
     async def ads_plc_state(action: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]

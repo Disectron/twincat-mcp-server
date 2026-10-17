@@ -186,6 +186,31 @@ class FakeConnection:
 
     def write(self, index_group, index_offset, value, plc_datatype):
         self.writes.append((f"raw:{index_group:X}/{index_offset:X}", bytes(value)))
+        self._apply_raw(index_group, index_offset, bytes(value))
+
+    def _apply_raw(self, igrp, ioffs, data):
+        """A raw write into PLC memory updates the symbol at that offset (scalars/arrays of the fake layout)."""
+        if igrp != 0x4040 or ioffs % 64:
+            return 0
+        i = ioffs // 64
+        if i >= len(SYMBOLS):
+            return 1793
+        name, typ, size, _v, _f = SYMBOLS[i]
+        from twincat_mcp import types_tc as _T
+        tt = _T.parse_type(typ, size)
+        try:
+            if tt.kind == "string":
+                val = data.split(b"\x00", 1)[0].decode("latin-1")
+            elif tt.ctype is not None and not tt.opaque:
+                obj = tt.ctype.from_buffer_copy(data[:ctypes.sizeof(tt.ctype)])
+                val = list(obj) if tt.kind == "array" else obj.value
+            else:
+                return 0
+        except Exception:  # noqa: BLE001
+            return 1797
+        self.values[name] = val
+        FakeConnection.broadcast(name, val)
+        return 0
 
     def read_by_name(self, name, plc_datatype=None, **kw):
         if name not in self.values:
@@ -208,6 +233,18 @@ class FakeConnection:
             inst._deliver(name, value, ts)
 
     def read_write(self, index_group, index_offset, plc_read_datatype, value, plc_write_datatype, return_ctypes=False, check_length=True):
+        if index_group == 0xF081:                     # ADSIGRP_SUMUP_WRITE: n × (igrp, ioffs, len) then the data
+            raw = bytes(value)
+            n = index_offset
+            hdr = [struct.unpack_from("<III", raw, 12 * k) for k in range(n)]
+            pos = 12 * n
+            codes = []
+            self.sum_writes = getattr(self, "sum_writes", 0) + 1
+            for igrp, ioffs, ln in hdr:
+                codes.append(self._apply_raw(igrp, ioffs, raw[pos:pos + ln]))
+                self.writes.append((f"sum:{igrp:X}/{ioffs:X}", raw[pos:pos + ln]))
+                pos += ln
+            return (ctypes.c_uint32 * n)(*codes)
         # RPC emulation: handle by name for "inst#method", then VALBYHND = call
         if index_group == C.ADSIGRP_SYM_HNDBYNAME:
             if "#" not in value:

@@ -419,6 +419,9 @@ async def test_write_refusals_round2(monkeypatch, project_dir):
         assert payload(await s.call_tool("ads_read", {"name": "MAIN.nCycle"}))["value"] == 42
         r = payload(await s.call_tool("ads_write_many", {"values": {"MAIN.nCycle": 7, "MAIN.bStart": False}}))
         assert r["complete"] and set(r["applied"]) == {"MAIN.nCycle", "MAIN.bStart"}
+        # P6: one ADS sum-write, values verified by read-back
+        assert r["method"].startswith("sum-write") and r["results"]["MAIN.nCycle"]["read_back"] == 7
+        assert r["results"]["MAIN.bStart"]["read_back"] is False
         t = payload(await s.call_tool("test_expect", {"checks": [{"symbol": "PRG_Test.eCmd", "op": "==", "value": "Fine"}]}))   # #62
         assert t["pass"]
 
@@ -527,3 +530,31 @@ async def test_edit_requires_config_mode(monkeypatch, project_dir):
         assert not res.is_error, text(res)
         # reads are never gated
         assert not (await s.call_tool("proj_get_code", {"name": "MAIN"})).is_error
+
+
+@pytest.mark.anyio
+async def test_watch_and_wait_use_notifications_and_let_writes_through(monkeypatch, project_dir):
+    """P4/P5: ads_wait_until returns when the runtime reports the condition (notification), ads_watch records the
+    changes a concurrent write makes — neither blocks the write."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="full", confirm_destructive=False))
+    async with client_for(srv) as s:
+        res: dict[str, Any] = {}
+
+        async def wait():
+            res["wait"] = payload(await s.call_tool("ads_wait_until", {"name": "MAIN.nCycle", "op": "==", "value": 7, "timeout_ms": 5000}))
+
+        async def watch():
+            res["watch"] = payload(await s.call_tool("ads_watch", {"names": ["MAIN.nCycle"], "duration_ms": 1500}))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(wait)
+            tg.start_soon(watch)
+            await anyio.sleep(0.5)
+            w = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 7})
+            assert not w.is_error, text(w)
+        assert res["wait"]["met"] and res["wait"]["method"] == "ADS change notification" and res["wait"]["elapsed_ms"] < 4000
+        assert res["watch"]["method"].startswith("ADS notifications") and any(r["value"] == 7 for r in res["watch"]["rows"])
+        already = payload(await s.call_tool("ads_wait_until", {"name": "MAIN.nCycle", "op": ">=", "value": 7, "timeout_ms": 2000}))
+        assert already["met"] and already["method"].startswith("read")
+        # the temporary recordings are cleaned up
+        assert payload(await s.call_tool("rec_list", {}))["session"] == []

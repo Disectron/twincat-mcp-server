@@ -743,6 +743,76 @@ class AdsBackend:
                            "clears, or a variable the program assigns every cycle). The write itself was accepted.")
         return out
 
+    @staticmethod
+    def _value_bytes(s: "SymbolEntry", tt: T.TcType, chk: dict[str, Any]) -> bytes:
+        """The exact bytes a write puts into the variable (what a sum-write sends)."""
+        if chk.get("hex") is not None:
+            return bytes.fromhex(chk["hex"])
+        enc = chk["encoded"]
+        if tt.kind == "string":
+            return enc.encode("latin-1", "replace")[: s.size - 1].ljust(s.size, b"\x00")
+        if tt.kind == "wstring":
+            return enc.encode("utf-16-le")[: s.size - 2].ljust(s.size, b"\x00")
+        if tt.kind == "array":
+            return bytes(tt.ctype(*enc))
+        return bytes(tt.ctype(enc))
+
+    def write_many(self, items: dict[str, Any], port: int | None = None) -> dict[str, Any]:
+        """Pre-check every item (all refusals raised before anything is written), then ONE ADS sum-write
+        (ADSIGRP_SUMUP_WRITE): the runtime applies all sub-writes in one request, i.e. between the same two task
+        cycles — no cycle sees half of them. Falls back to sequential writes where sum commands are unsupported."""
+        c = self.conn(port)
+        checks: list[tuple[str, Any, Any, T.TcType, dict[str, Any]]] = []
+        problems = {}
+        for name, value in items.items():
+            try:
+                chk = self.check_write(name, value, port)
+                checks.append((name, value, chk["symbol"], chk["tt"], chk))
+            except AdsError as exc:
+                problems[name] = str(exc)
+        if problems:
+            raise AdsError("nothing was written — " + "; ".join(f"{k}: {v}" for k, v in problems.items()))
+        before = self.read_many([s.name for _n, _v, s, _t, _c in checks], port)
+        payload_hdr = b"".join(struct.pack("<III", s.index_group, s.index_offset, s.size) for _n, _v, s, _t, _c in checks)
+        payload = payload_hdr + b"".join(self._value_bytes(s, tt, chk) for _n, _v, s, tt, chk in checks)
+        method = "sum-write (one ADS request: all values applied between the same two PLC cycles)"
+        codes: list[int] | None = None
+        try:
+            res = c.read_write(0xF081, len(checks), ctypes.c_uint32 * len(checks), (ctypes.c_ubyte * len(payload))(*payload),
+                               ctypes.c_ubyte * len(payload), return_ctypes=True)
+            codes = [int(x) for x in res]
+        except Exception as exc:  # noqa: BLE001 — sum commands unsupported here: one by one
+            method = f"sequential (sum-write unavailable: {_fmt_exc(exc)[:80]})"
+        results: dict[str, Any] = {}
+        applied: list[str] = []
+        if codes is not None:
+            for (name, _v, s, _t, _c), code in zip(checks, codes):
+                if code:
+                    results[s.name] = {"error": f"ADSError {code} (0x{code:X})"}
+                else:
+                    applied.append(s.name)
+        else:
+            for name, value, s, tt, chk in checks:
+                try:
+                    data = self._value_bytes(s, tt, chk)
+                    c.write(s.index_group, s.index_offset, (ctypes.c_ubyte * len(data))(*data), ctypes.c_ubyte * len(data))
+                    applied.append(s.name)
+                except Exception as exc:  # noqa: BLE001
+                    results[s.name] = {"error": _fmt_exc(exc)}
+                    break
+        after = self.read_many(applied, port) if applied else {}
+        for name, value, s, tt, chk in checks:
+            if s.name in applied:
+                written = T.decode(tt, chk["encoded"]) if chk.get("encoded") is not None else chk.get("hex")
+                d = {"before": before.get(s.name), "written": written, "read_back": after.get(s.name)}
+                if not _same_value(written, after.get(s.name)):
+                    d["note"] = "read_back differs: the PLC changed it after the write"
+                results[s.name] = d
+        failed = [k for k, v in results.items() if "error" in v]
+        return {"method": method, "complete": not failed, "applied": applied, "failed": failed,
+                "not_attempted": [s.name for _n, _v, s, _t, _c in checks if s.name not in applied and s.name not in failed],
+                "results": results}
+
     def io_read(self, area: str, offset: int, size: int, port: int | None = None) -> dict[str, Any]:
         """Read the raw process image: area 'I' (inputs, ADSIGRP_IOIMAGE_RWIB) or 'Q' (outputs,
         ADSIGRP_IOIMAGE_RWOB) at byte offset — what the PLC task actually sees/wrote, independent
