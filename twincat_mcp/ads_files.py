@@ -303,6 +303,15 @@ class SystemServiceFiles:
         self.ads.disconnect()
         return {"requested": "reboot" if reboot else "shutdown", "delay_s": delay_s}
 
+    def exists(self, path: str) -> bool:
+        """One FOPEN probe: the file is there and readable."""
+        try:
+            h = self.fopen(path, MODE_READ | MODE_BINARY)
+        except AdsError:
+            return False
+        self.fclose(h)
+        return True
+
     def wait_for_file(self, path: str, timeout_s: float, poll_s: float = 2.0) -> dict[str, Any]:
         t0 = time.time()
         last_err = ""

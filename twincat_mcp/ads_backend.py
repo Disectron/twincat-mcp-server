@@ -480,6 +480,15 @@ class AdsBackend:
                 budget -= len(lv)
                 if budget <= 0:
                     break
+            elif pre.startswith(low + ".") or pre.startswith(low + "["):
+                # D31: the prefix is inside a root that is not in the symbol table on its own
+                # (one element of an array of structs: GVL_Sim.aCh[1]) → that root's leaves below the prefix
+                s, lv = self.leaves(r.name, 10 * max_leaves, port)
+                sub = [x for x in lv if x.path.lower() == pre or x.path.lower().startswith((pre + ".", pre + "["))]
+                if sub:
+                    out.append((s, sub[:budget]))
+                    budget -= len(sub)
+                break
         return out
 
     def leaf_values(self, root: SymbolEntry, leaves: list[Leaf], port: int | None = None) -> dict[str, Any]:

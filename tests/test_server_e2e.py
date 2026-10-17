@@ -241,6 +241,13 @@ async def test_whole_project_variable_tools(monkeypatch, project_dir, tmp_path):
         steps = next(e for e in cmp_["extra_online"] if e["path"].lower() == "main.arrsteps[*].nid")
         assert steps["count"] == 2 and steps["example"] == "MAIN.arrSteps[1].nId"
         assert cmp_["matched"] >= 10
+        # #20: the PLC's / the source's spelling, never lower-cased
+        assert "MAIN.sLabel" in extra and "MAIN.fbValve2.bOpen" in extra and cmp_["roots"] == ["GVL_Machine", "MAIN"]
+        assert cmp_["complete"] is True and "not_judged" not in cmp_
+        # D23: max_items=5 cut both lists; the cut part was reported as missing_online / extra_online
+        small = payload(await s.call_tool("proj_vs_runtime", {"max_items": 5}))
+        assert small["complete"] is False and small["missing_online"] == [] and small["extra_online"] == []
+        assert small["not_judged"]["missing_candidates"] >= 1 and "max_items=5" in small["not_judged"]["reason"]
 
 
 @pytest.mark.anyio
@@ -459,19 +466,45 @@ async def test_ipc_eventlog_token_provider_cleanup(monkeypatch, project_dir):
     monkeypatch.setattr(F.SystemServiceFiles, "wait_for_file", lambda self, p, t, poll=2.0: {"exists": p in fs})
     monkeypatch.setattr(F.SystemServiceFiles, "read_file", lambda self, p, mx=None, as_text=True, enc="utf-8": {"text": fs[p], "bytes": len(fs[p])})
 
+    locked = [0]
+
     def delete(self, p):
-        deleted.append(p); fs.pop(p, None)
+        deleted.append(p)
+        if locked[0]:
+            locked[0] -= 1
+            raise F.AdsError(f"FDELETE {p!r}: ADSError 1804 (sharing violation)")
+        fs.pop(p, None)
         return {"deleted": p}
     monkeypatch.setattr(F.SystemServiceFiles, "delete_file", delete)
+    monkeypatch.setattr(F.SystemServiceFiles, "exists", lambda self, p: p in fs)
     srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    tmp = r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot\tcmcp_eventlog.txt"
     async with client_for(srv) as s:
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "ipc_eventlog", "target": "Application"}))["confirm_token"]
         r = payload(await s.call_tool("ipc_eventlog", {"confirm_token": tok}))
         assert r["entries_text"] == "" and r["events"] == 0
         assert "not registered" in r["note"] and r["providers_on_target"] == ["TwinCAT3 Scope Server"]
-        assert deleted == [r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot\tcmcp_eventlog.txt"] and not fs
+        assert deleted == [tmp] and not fs and r["temp_file"] == {"path": tmp, "deleted": True}
         bad = await s.call_tool("ipc_eventlog", {"provider": "x' & del C:\\*", "confirm_token": "t"})
         assert bad.is_error and "only letters" in text(bad) and len(started) == 1
+        # #56: cmd.exe still holds the file → the delete is retried and checked, never claimed
+        locked[0], deleted[:] = 1, []
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "ipc_eventlog", "target": "Application"}))["confirm_token"]
+        r = payload(await s.call_tool("ipc_eventlog", {"confirm_token": tok}))
+        assert deleted == [tmp, tmp] and not fs and r["temp_file"]["deleted"] is True
+        locked[0], deleted[:] = 99, []
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "ipc_eventlog", "target": "Application"}))["confirm_token"]
+        r = payload(await s.call_tool("ipc_eventlog", {"confirm_token": tok}))
+        assert r["temp_file"]["deleted"] is False and "sharing violation" in r["temp_file"]["error"] and len(deleted) == 4
+        fs.clear(); locked[0] = 0
+
+        # #56: no guessed boot folder (C:\TwinCAT\3.1\Boot is a stale copy on 4026) → nothing is started
+        def no_boot(self, p):
+            raise F.AdsError("FFILEFIND: no boot folder found")
+        monkeypatch.setattr(F.SystemServiceFiles, "resolve_prefix_dir", no_boot)
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "ipc_eventlog", "target": "Application"}))["confirm_token"]
+        r = await s.call_tool("ipc_eventlog", {"confirm_token": tok})
+        assert r.is_error and "boot folder" in text(r) and len(started) == 3
 
 
 @pytest.mark.anyio
@@ -715,3 +748,72 @@ async def test_d8_published_schemas_declare_every_parameter(monkeypatch, project
         assert {"engine", "also_scope", "scope", "edge_triggers", "cycle_counter"} <= props("rec_start")
         assert {"engine", "counter"} <= props("rec_capture")
         assert "confirm_token" in props("tc_set_mode") and "fill" in props("rec_read")
+
+
+@pytest.mark.anyio
+async def test_d24_ads6_hint_names_the_port_that_was_asked(monkeypatch, project_dir):
+    """D24: ads_status(port=852) on a target without a second PLC explained the error for port 851."""
+    import pyads
+    from tests.fake_ads import FakeConnection
+    from twincat_mcp.server import _call_port
+    install(monkeypatch)
+    orig = FakeConnection.read_state
+
+    def read_state(self):
+        if self.ams_net_port == 852:
+            raise pyads.ADSError(6)
+        return orig(self)
+    monkeypatch.setattr(FakeConnection, "read_state", read_state)
+
+    def f(name, port=None): ...
+    assert _call_port(f, ("x", 852), {}) == 852 and _call_port(f, ("x",), {"port": 853}) == 853
+    assert _call_port(f, ("x",), {}) is None and _call_port(len, ([],), {}) is None
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        r = await s.call_tool("ads_status", {"port": 852})
+        assert r.is_error
+        msg = text(r)
+        assert "ADSError 6" in msg and "851 is the first" in msg, msg
+
+
+@pytest.mark.anyio
+async def test_n4_restart_is_verified_only_after_the_target_left_run(monkeypatch, project_dir):
+    """#4: the first poll after StartRestartTwinCAT read the old runtime's RUN → 'restarted: true, duration_s: 0'
+    while the target then fell back to CONFIG (no license)."""
+    import time as _time
+    from twincat_mcp import dialogs as _dlg
+    from twincat_mcp.server import App, ToolError
+    app = App(mk_cfg(project_dir))
+    clock = [1000.0]
+    monkeypatch.setattr(_time, "time", lambda: clock[0])
+
+    async def fake_sleep(d):
+        clock[0] += d
+    monkeypatch.setattr("twincat_mcp.server.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(_dlg, "list_dialogs", lambda pid: [])
+
+    def script(*modes):
+        seq = list(modes)
+
+        async def ads_call(fn, *a, **kw):
+            m = seq.pop(0) if len(seq) > 1 else seq[0]
+            if m == "down":
+                raise ToolError("ADS error: target port not found")
+            return {"twincat_mode": m}
+        monkeypatch.setattr(app, "ads_call", ads_call)
+
+    script("RUN", "RUN", "CONFIG")                                   # license fallback
+    v = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True, timeout_s=30)
+    assert not v["verified"] and v["transition_seen"] and v["target_mode"] == "CONFIG" and v["modes_seen"] == ["RUN", "CONFIG"]
+
+    script("RUN")                                                    # nothing happened
+    v = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True, leave_timeout_s=5)
+    assert not v["verified"] and v["transition_seen"] is False and "stayed in RUN" in v["hint"]
+    assert v["verify_s"] >= 5 and v["polls"] >= 10                   # 0.5 s polls in the first phase
+
+    script("RUN", "down", "CONFIG", "RUN")                           # a real restart
+    v = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True)
+    assert v["verified"] and v["modes_seen"] == ["RUN", "unreachable", "CONFIG", "RUN"] and v["left_run_after_s"] == 0.5
+
+    script("RUN")                                                    # activation keeps the old contract
+    assert (await app.verify_target_after("xae_activate_configuration", expect_run=False))["verified"]

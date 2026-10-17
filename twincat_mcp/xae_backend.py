@@ -18,8 +18,8 @@ matches ``cfg.solution_path``; else the first one. Launching a new shell is
 opt-in (``attach_only=False`` or ``xae_attach(launch=True)``).
 
 Tree paths use Beckhoff syntax: ``TIPC^PlcName^PlcName Project^POUs^MAIN``.
-Common roots: TIID (I/O), TIPC (PLC), TIRC (real-time), TIRR (routes),
-TINC (NC), TIRS (safety), TIRT (tasks under TIRC^Tasks).
+Common roots: TIID (I/O), TIPC (PLC), TIRT (tasks), TIRC (real-time settings), TIRR (routes),
+TINC (NC), TIRS (safety).
 """
 from __future__ import annotations
 
@@ -684,20 +684,40 @@ class XaeBackend:
     def tree_children(self, path: str, depth: int = 1, max_items: int = 2000) -> dict[str, Any]:
         root = self._item(path)
         out: list[dict[str, Any]] = []
+        unreadable: list[dict[str, Any]] = []
+
+        def _name(x: Any) -> str:
+            try:
+                return str(x.Name)
+            except Exception:  # noqa: BLE001
+                return ""
 
         def walk(it: Any, lvl: int) -> None:
             if lvl > depth or len(out) >= max_items:
                 return
             children: list[Any] = []
             try:
+                ipath = str(it.PathName)
+            except Exception:  # noqa: BLE001
+                ipath = ""
+            try:
                 n = int(it.ChildCount)
                 for i in range(1, n + 1):
                     try:
                         children.append(it.Child(i))
-                    except Exception:  # noqa: BLE001
-                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        unreadable.append({"parent": ipath, "index": i, "error": str(exc)[:160]})
             except Exception:  # noqa: BLE001
                 n = 0
+            # #17: the PLC container 'TIPC^<Name>' enumerates '<Name> Instance' but not its nested '<Name> Project'
+            # (the item users need most); that one is reachable by path
+            if ipath.upper().startswith("TIPC^") and ipath.count("^") == 1:
+                want = f"{_name(it)} Project"
+                if want.strip() != "Project" and want not in {_name(c) for c in children}:
+                    try:
+                        children.insert(0, self._sm().LookupTreeItem(f"{ipath}^{want}"))
+                    except Exception:  # noqa: BLE001
+                        pass
             if not children:
                 # the nested PLC project node (ItemType 56) does not enumerate its children through ChildCount;
                 # its folders are reachable by path
@@ -722,7 +742,10 @@ class XaeBackend:
                     walk(ch, lvl + 1)
 
         walk(root, 1)
-        return {"path": path, "count": len(out), "items": out}
+        res: dict[str, Any] = {"path": path, "count": len(out), "items": out}
+        if unreadable:
+            res["unreadable_children"] = unreadable[:50]
+        return res
 
     def tree_xml(self, path: str) -> dict[str, Any]:
         it = self._item(path)

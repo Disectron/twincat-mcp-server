@@ -219,7 +219,11 @@ async def release_check(app, plc_project_path: str | None = None, run_build: boo
         from .server import _vs_runtime  # local import to avoid a cycle at module load
         vr = await _vs_runtime(app, None, 200_000)
         c["source_vs_runtime"] = {"declared": vr["declared"], "matched": vr["matched"], "missing_online": len(vr["missing_online"]),
-                                  "extra_online": len(vr["extra_online"]), "sample_missing": vr["missing_online"][:10]}
+                                  "extra_online": len(vr["extra_online"]), "sample_missing": vr["missing_online"][:10],
+                                  "complete": vr.get("complete", True)}
+        if vr.get("not_judged"):
+            c["source_vs_runtime"]["not_judged"] = vr["not_judged"]
+            rep["warnings"].append("source vs runtime comparison incomplete: " + vr["not_judged"]["reason"])
         if vr["missing_online"]:
             rep["warnings"].append(f"{len(vr['missing_online'])} declared variables not online — target not running this source?")
     except Exception as exc:  # noqa: BLE001

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import fnmatch
+import inspect
 import datetime as dt
 import json
 import logging
@@ -125,6 +126,17 @@ _LICENSE_CODES = {
 }
 
 
+def _call_port(fn: Any, a: tuple, kw: dict) -> Any:
+    """The ADS port a backend call targets, passed by keyword or positionally (D24)."""
+    if kw.get("port") is not None:
+        return kw["port"]
+    try:
+        bound = inspect.signature(fn).bind_partial(*a, **kw)
+    except (TypeError, ValueError):
+        return None
+    return bound.arguments.get("port")
+
+
 def _license_hint(text: str) -> str | None:
     """Beckhoff reports license problems as an opaque number; say what it means and what to do."""
     low = (text or "").lower()
@@ -211,12 +223,12 @@ class App:
         try:
             return await worker.run(fn, *a, timeout=timeout or (self.cfg.ads.max_watch_duration_ms / 1000 + 30), **kw)
         except (AdsError, RecorderError, TestError) as exc:
-            raise ToolError(await self._ads_explain(str(exc), kw.get("port"))) from exc
+            raise ToolError(await self._ads_explain(str(exc), _call_port(fn, a, kw))) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError("ADS call timed out (router/route/firewall? run tc_doctor)") from exc
         except (pyads.ADSError, OSError) as exc:
             # safety net for a backend path that did not translate the pyads/socket error itself
-            raise ToolError(await self._ads_explain(f"ADS error: {_fmt_ads_exc(exc)}", kw.get("port"))) from exc
+            raise ToolError(await self._ads_explain(f"ADS error: {_fmt_ads_exc(exc)}", _call_port(fn, a, kw))) from exc
 
     async def _ads_explain(self, msg: str, port: Any) -> str:
         """Known cause/fix for an ADS error; ADSError 6 is explained from the real port and TwinCAT mode (N17)."""
@@ -456,16 +468,28 @@ class App:
         for r in live:
             r.join(join_s)
 
-    async def verify_target_after(self, action: str, expect_run: bool, timeout_s: float = 90.0) -> dict[str, Any]:
+    async def verify_target_after(self, action: str, expect_run: bool, timeout_s: float = 90.0,
+                                  require_transition: bool = False, leave_timeout_s: float = 20.0,
+                                  poll_s: float = 2.0) -> dict[str, Any]:
         """After ActivateConfiguration / StartRestartTwinCAT the Automation Interface reports success as soon as
         the command was accepted; whether the target actually came up is a separate question (a missing
         license drops it back to CONFIG with a dialog in the shell). Poll the target's System Service and
-        the shell's dialogs and report what really happened."""
+        the shell's dialogs and report what really happened.
+
+        ``require_transition`` (#4): a restart is only proven once the System Service was seen leaving RUN
+        (any other state, or unreachable) and coming back. Without it the first poll can read the old runtime's
+        RUN before the restart has even begun — that was the ``duration_s: 0`` success on a target that then
+        fell back to CONFIG. The first phase polls every 0.5 s for ``leave_timeout_s``."""
         from . import dialogs as _dlg
-        deadline = time.time() + timeout_s
+        t0 = time.time()
+        deadline = t0 + timeout_s
+        leave_deadline = t0 + leave_timeout_s
         mode: str = "unknown"
         err_dialogs: list[dict[str, Any]] = []
         polls = 0
+        left_run = not require_transition
+        left_at: float | None = None
+        modes_seen: list[str] = []
         while True:
             polls += 1
             try:
@@ -473,22 +497,37 @@ class App:
                 mode = str(st.get("twincat_mode") or st.get("ads_state_name") or "unknown")
             except ToolError as exc:
                 mode = f"unreachable ({str(exc)[:80]})"
+            short = mode.split(" ", 1)[0]
+            if not modes_seen or modes_seen[-1] != short:
+                modes_seen.append(short)
+            if mode != "RUN" and not left_run:
+                left_run, left_at = True, time.time()
             try:
                 dl = await asyncio.to_thread(lambda: [d.to_dict() for d in _dlg.list_dialogs(self.xae.pid)])
             except Exception:  # noqa: BLE001
                 dl = []
             err_dialogs = [d for d in dl if any(k in (str(d.get("title", "")) + " " + str(d.get("text", ""))).lower()
                                                  for k in ("error", "license", "licence", "fatal", "failed"))]
-            if err_dialogs or (mode == "RUN" if expect_run else mode in ("RUN", "CONFIG")):
+            reached = (mode == "RUN") if expect_run else (mode in ("RUN", "CONFIG"))
+            if err_dialogs or (left_run and reached):
                 break
-            if time.time() >= deadline:
+            now = time.time()
+            if now >= deadline or (not left_run and now >= leave_deadline):
                 break
-            await asyncio.sleep(2.0)
-        ok = (mode == "RUN") if expect_run else (mode in ("RUN", "CONFIG"))
-        ok = ok and not err_dialogs
-        out: dict[str, Any] = {"target_mode": mode, "verified": ok, "polls": polls, "dialogs": err_dialogs}
+            await asyncio.sleep(0.5 if not left_run else poll_s)
+        ok = ((mode == "RUN") if expect_run else (mode in ("RUN", "CONFIG"))) and left_run and not err_dialogs
+        out: dict[str, Any] = {"target_mode": mode, "verified": ok, "polls": polls, "dialogs": err_dialogs,
+                               "modes_seen": modes_seen, "verify_s": round(time.time() - t0, 1)}
+        if require_transition:
+            out["transition_seen"] = left_run
+            if left_at is not None:
+                out["left_run_after_s"] = round(left_at - t0, 1)
         hints = [h for h in (_license_hint(json.dumps(err_dialogs)),) if h]
-        if expect_run and mode != "RUN" and not err_dialogs:
+        if require_transition and not left_run and not err_dialogs:
+            hints.append(f"the System Service stayed in RUN for {leave_timeout_s:.0f} s after the command — no restart was "
+                         "observed (it did not happen, or it finished between two 0.5 s polls). Check the XAE Output / "
+                         "Error List and ads_status before relying on the new configuration.")
+        elif expect_run and mode != "RUN" and not err_dialogs:
             hints.append(f"target did not reach RUN within {timeout_s:.0f} s — xae_dialogs for a prompt in the shell; "
                          "ads_status for the runtime; the XAE Error List for 'Target system reports a fatal error'.")
         if hints:
@@ -655,7 +694,9 @@ class App:
 
 
 async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str, Any]:
+    max_items = max(int(max_items), 1)
     proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False)
+    src_cut = bool(proj.get("truncated"))
     declared = {it["path"].lower(): it for it in proj["items"] if "[*]" not in it["path"]}
     # source arrays are declared once as x[*].y — the runtime has one leaf per element: match by pattern
     templates = {it["path"].lower(): it for it in proj["items"] if "[*]" in it["path"]}
@@ -664,20 +705,28 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
     if tmpl_keys:
         alts = "|".join("(" + re.escape(k).replace(r"\[\*\]", r"\[[0-9, ]+\]") + ")" for k in tmpl_keys)
         tmpl_re = re.compile(r"^(?:" + alts + r")(?=$|[.\[])")
-    roots = {p.split(".")[0] for p in list(declared) + tmpl_keys}
+    root_names = {it["path"].split(".")[0].lower(): it["path"].split(".")[0] for it in proj["items"]}
+    roots = set(root_names)
     online: set[str] = set()
     online_types: dict[str, str] = {}
     online_names: dict[str, str] = {}
-    for r in roots:
+    online_cut: set[str] = set()              # roots whose online enumeration hit max_items (D23)
+    unreadable: list[str] = []
+    for r in sorted(roots):
         try:
-            groups = await app.ads_call(app.ads.leaves_under, r, max_items, timeout=300)
+            groups = await app.ads_call(app.ads.leaves_under, root_names[r], max_items, timeout=300)
         except ToolError:
+            unreadable.append(root_names[r])
             continue
+        n = 0
         for root, leaves in groups:
+            n += len(leaves)
             for lf in leaves:
                 online.add(lf.path.lower())
                 online_types[lf.path.lower()] = lf.type
                 online_names[lf.path.lower()] = lf.path          # keep the PLC's spelling in the report
+        if n >= max_items:
+            online_cut.add(r)
     tmpl_hit: set[str] = set()
     via_template: set[str] = set()
     if tmpl_re is not None:
@@ -698,11 +747,19 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
             continue
         missing_final.append(it)
     missing_final += [templates[k] for k in tmpl_keys if k not in tmpl_hit]
+    # D23: a verdict needs both sides complete. A declared item under a root whose online list was cut (or could not
+    # be read) is not "missing", and with the source list cut no online leaf can be called "extra".
+    blind = online_cut | {u.lower() for u in unreadable}
+    not_judged_missing = [it for it in missing_final if it["path"].split(".")[0].lower() in blind]
+    missing_final = [it for it in missing_final if it["path"].split(".")[0].lower() not in blind]
     extra_raw = []
     for o in sorted(online - set(declared) - via_template):
         if any(o.startswith(cp + ".") or o.startswith(cp + "[") for cp in composite_prefixes):
             continue
         extra_raw.append(o)
+    not_judged_extra = 0
+    if src_cut:
+        not_judged_extra, extra_raw = len(extra_raw), []
     # collapse array elements: aAlarms[1..32].x → one line with a count
     collapsed: dict[str, dict[str, Any]] = {}
     for e in extra_raw:
@@ -713,11 +770,25 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
     extra = list(collapsed.values())
     cap = 300
     out = {"declared": len(declared) + len(templates), "online_under_same_roots": len(online),
-           "matched": len(declared) + len(templates) - len(missing_final), "missing_online": missing_final[:cap],
+           "matched": len(declared) + len(templates) - len(missing_final) - len(not_judged_missing),
+           "missing_online": missing_final[:cap],
            "extra_online": extra[:cap], "extra_online_leaves": len(extra_raw),
            "array_templates_matched": len(tmpl_hit), "array_elements_matched": len(via_template),
            "library_instances": [declared[cp]["path"] for cp in composite_prefixes][:200],
-           "roots": sorted(roots)}
+           "roots": sorted(root_names[r] for r in roots),
+           "complete": not (src_cut or blind)}
+    if src_cut or blind:
+        why = []
+        if src_cut:
+            why.append(f"the source list stopped at max_items={max_items}: {not_judged_extra} online leaves not judged "
+                       "(they may be declared in the part that was cut)")
+        if online_cut:
+            why.append(f"the online list of {sorted(root_names[r] for r in online_cut)} stopped at max_items={max_items}: "
+                       f"{len(not_judged_missing)} declared items under them not judged")
+        if unreadable:
+            why.append(f"online symbols of {unreadable} could not be read: their declared items are not judged")
+        out["not_judged"] = {"missing_candidates": len(not_judged_missing), "extra_candidates": not_judged_extra,
+                             "reason": "; ".join(why) + ". Raise max_items or narrow with scope= for a full verdict."}
     if len(missing_final) > cap or len(extra) > cap:
         out["truncated"] = f"lists capped at {cap}; narrow with scope="
     return out
@@ -1375,8 +1446,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Start a continuous real-time recording of online PLC variables (runs in the background
         until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or
-        struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it)
-        or fnmatch pattern. mode: 'cycle' = one PLC-timestamped sample per symbol per cycle_ms
+        struct instance expands to all its leaves), prefix ('MAIN.fbFill', 'GVL_Sim.aCh[1]' → every leaf under it)
+        or pattern — the same leaves rec_scan lists for it: '*'/'?' wildcards, '[ ]' literal ('GVL_Sim.aCh[1].*'),
+        a leaf is recorded when it or one of its parents matches ('*bOpen' → every bOpen). mode: 'cycle' = one PLC-timestamped sample per symbol per cycle_ms
         (ADS notification, cycle-accurate); 'change' = PLC-timestamped sample only when the value
         changes (checked every cycle_ms); 'poll' = sum-read every cycle_ms from this PC.
         Triggers: start_when='MAIN.bStart == TRUE' with pre_trigger_ms keeps the events before the
@@ -1522,9 +1594,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # Capture profiles: scan → choose → save → start
     # ======================================================================
     def _scan_runtime(prefix: str | None, pattern: str | None, max_items: int) -> list[dict[str, Any]]:
-        import fnmatch
+        from .recorder import pattern_leaves
         out: list[dict[str, Any]] = []
-        if prefix:
+        if pattern:
+            # A5: the selection rec_start(pattern=…) records, leaf for leaf
+            groups = pattern_leaves(app.ads, pattern, max_items, None, prefix)
+        elif prefix:
             groups = app.ads.leaves_under(prefix, max_items)
         else:
             groups = []
@@ -1535,11 +1610,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 budget -= len(lv)
                 if budget <= 0:
                     break
-        pat = pattern.lower() if pattern else None
         for _root, leaves in groups:
             for lf in leaves:
-                if pat and not fnmatch.fnmatchcase(lf.path.lower(), pat):
-                    continue
                 out.append({"path": lf.path, "type": lf.type, "size": lf.size})
                 if len(out) >= max_items:
                     return out
@@ -1551,25 +1623,28 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                        max_items: int = 5000, show: int = 100) -> dict[str, Any]:
         """Enumerate the variables that could be recorded and what each would cost. source='runtime'
         walks the live symbol/datatype tables (every scalar leaf under prefix, or all programs/GVLs);
-        source='project' walks the source declarations (works offline). pattern = fnmatch filter on the
-        full path. Returns counts by type and by group (program.instance) with bytes/s estimates at
+        source='project' walks the source declarations (works offline). pattern selects leaves exactly as
+        rec_start does: '*'/'?' wildcards, '[ ]' literal, a leaf matches when it or a parent matches. Returns counts by type and by group (program.instance) with bytes/s estimates at
         cycle_ms, a suggested mode per leaf, and — when checklist='<name>' — writes
         ~/.twincat_mcp/profiles/<name>.checklist.csv with a 'select' column to mark (preselect =
         patterns already marked). Then rec_profile_save(name, from_checklist=name)."""
         if source == "runtime":
             leaves = await app.ads_call(_scan_runtime, prefix, pattern, max_items, timeout=300, slow=True)
         elif source == "project":
-            import fnmatch
+            from .recorder import path_selected, selection_regex
+            rx = selection_regex(pattern) if pattern else None
             pv = await app.proj_call(app.proj.variables, prefix, 64, max_items * 4, False)
             leaves = [{"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")}
                       for it in pv["items"] if "[*]" not in it["path"]
-                      and (not pattern or fnmatch.fnmatchcase(it["path"].lower(), pattern.lower()))][:max_items]
+                      and (rx is None or path_selected(rx, it["path"]))][:max_items]
         else:
             raise ToolError("source must be runtime | project")
         if not leaves:
             raise ToolError("scan found no variables (prefix/pattern wrong, or not connected / not scanned)")
-        scan_note = ("array elements are listed one by one here; rec_start records an array of scalars as ONE variable "
-                     "(the same bytes, one notification) and exports its elements as name[i] — counts differ, data does not")
+        scan_note = ("rec_start with the same prefix/pattern records exactly these leaves (array elements one by one); "
+                     "an array named explicitly in rec_start(symbols=[…]) is recorded as ONE variable (same bytes, "
+                     "exported as name[i]). pattern: '*' and '?' are wildcards, '[ ]' are literal (array indices); a "
+                     "leaf is listed when the pattern matches it or one of its parents")
         by_type: dict[str, int] = {}
         by_group: dict[str, dict[str, Any]] = {}
         modes: dict[str, int] = {}
@@ -2482,7 +2557,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if firmware_check:
             try:
                 vr = await _vs_runtime(app, None, 50_000)
-                meta["firmware_match"] = f"{vr['matched']}/{vr['declared']} declared symbols online, {len(vr['missing_online'])} missing"
+                meta["firmware_match"] = (f"{vr['matched']}/{vr['declared']} declared symbols online, {len(vr['missing_online'])} missing"
+                                          + ("" if vr.get("complete", True) else f" (incomplete: {vr['not_judged']['reason']})"))
             except ToolError as exc:
                 meta["firmware_match"] = f"check failed: {exc}"
         st = app.exp_store.status(name)
@@ -2668,8 +2744,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         await app.permit(ctx, OpClass.DESTRUCTIVE, "ipc_eventlog", log, confirm_token)
         try:
             folder = await app.ads_call(app.files.resolve_prefix_dir, "boot:", timeout=60)
-        except ToolError:
-            folder = r"C:\TwinCAT\3.1\Boot"
+        except ToolError as exc:
+            # #56: no guessed folder — the old fallback C:\TwinCAT\3.1\Boot is a stale legacy copy on 3.1.4026
+            raise ToolError(f"cannot resolve the target's boot folder for the temp file ({exc}); nothing was started "
+                            "on the IPC") from exc
         if folder.startswith("/"):
             raise ToolError(f"target boot folder is {folder}: not a Windows target (wevtutil exists only on Windows IPCs)")
         out = folder.rstrip("\\") + "\\tcmcp_eventlog.txt"
@@ -2692,15 +2770,29 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                     text_ = (await app.ads_call(app.files.read_file, out, 2_000_000, True, "utf-8", timeout=120, slow=True)).get("text") or ""
                     break
         finally:
-            try:
-                await app.ads_call(app.files.delete_file, out, timeout=30)
-            except ToolError:
-                pass
+            # #56: the temp file must not stay behind; cmd.exe may still hold it for a moment → retry, then check
+            del_err = ""
+            for attempt in range(4):
+                try:
+                    await app.ads_call(app.files.delete_file, out, timeout=30)
+                    del_err = ""
+                except ToolError as exc:
+                    del_err = str(exc)[:200]
+                try:
+                    still = await app.ads_call(app.files.exists, out, timeout=15)
+                except ToolError:
+                    still = None
+                if still is False:
+                    break
+                await asyncio.sleep(1.0 + attempt)
+            temp = {"path": out, "deleted": still is False}
+            if still is not False:
+                temp["error"] = (del_err or "the file is still there after the delete") + " — delete it with ipc_delete_file"
         entries, _, prov_txt = text_.partition(marker)
         providers = sorted({ln.strip() for ln in prov_txt.splitlines() if ln.strip()})
         entries = entries.strip()
         res = {"provider": provider, "log": log, "entries_text": entries, "bytes": len(entries.encode("utf-8")),
-               "events": entries.count("Event["), "providers_on_target": providers, "temp_file_deleted": out}
+               "events": entries.count("Event["), "providers_on_target": providers, "temp_file": temp}
         if not entries or "No events were found" in entries:
             res["entries_text"] = ""
             res["note"] = (f"no events from provider {provider!r} in {log}" +
@@ -2916,10 +3008,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         t0 = time.monotonic()
         res = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
-        ver = await app.verify_target_after("xae_restart_twincat", expect_run=True)
+        ver = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True)
         # N5: the shell returns as soon as the command is accepted; the restart is over when the target reports RUN
         res.update({"restarted": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
-                    "verification_polls": ver["polls"], "command_s": res.pop("duration_s", None),
+                    "verification_polls": ver["polls"], "modes_seen": ver["modes_seen"],
+                    "transition_seen": ver.get("transition_seen"), "command_s": res.pop("duration_s", None),
                     "duration_s": round(time.monotonic() - t0, 1)})
         if ver.get("hint"):
             res["hint"] = ver["hint"]
@@ -2955,9 +3048,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
         # P17: a deploy is done when the target runs it, not when the shell accepted the commands
-        ver = await app.verify_target_after("xae_deploy", expect_run=True)
+        ver = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True)
         steps["verify"] = {"running": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
-                           "polls": ver["polls"]}
+                           "polls": ver["polls"], "modes_seen": ver["modes_seen"], "transition_seen": ver.get("transition_seen")}
         if ver.get("hint"):
             steps["verify"]["hint"] = ver["hint"]
         ok = bool(ver["verified"])

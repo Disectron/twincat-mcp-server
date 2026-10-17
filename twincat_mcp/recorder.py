@@ -347,6 +347,67 @@ class Block:
         return max(0, int((end_t - self.last_t) / self.min_step) - 1)
 
 
+# ------------------------------------------------------------------ selection patterns (A5)
+_ANCESTOR_CUT = re.compile(r"(?=[.\[])")
+
+
+def selection_regex(pattern: str) -> re.Pattern[str]:
+    """One pattern language for rec_start and rec_scan: case-insensitive glob where '*' and '?' are the only
+    wildcards — '[' and ']' are literal, so 'MAIN.arr[3].*' means element 3 (fnmatch read [3] as a character class)."""
+    out = []
+    for ch in pattern:
+        out.append(".*" if ch == "*" else "." if ch == "?" else re.escape(ch))
+    return re.compile("^" + "".join(out) + "$", re.I | re.S)
+
+
+def _literal_prefix(pattern: str) -> str:
+    m = re.search(r"[*?]", pattern)
+    return (pattern[:m.start()] if m else pattern).lower()
+
+
+def path_selected(rx: re.Pattern[str], path: str) -> bool:
+    """A leaf is selected when the pattern matches the leaf or any of its ancestors (root, FB, struct member, array
+    element): 'MAIN.fbFill' selects every leaf below it, '*bOpen' selects each bOpen however deep."""
+    if rx.match(path):
+        return True
+    cuts = [m.start() for m in _ANCESTOR_CUT.finditer(path)]
+    return any(rx.match(path[:c]) for c in cuts if c > 0)
+
+
+def pattern_leaves(ads: AdsBackend, pattern: str, max_leaves: int, port: int | None = None,
+                   prefix: str | None = None) -> list[tuple[SymbolEntry, list[Any]]]:
+    """(root, selected leaves) for every root symbol that can hold a match. System symbols
+    (TwinCAT_SystemInfoVarList …) are only searched when the pattern names them literally."""
+    rx = selection_regex(pattern)
+    lp = _literal_prefix(pattern)
+    pre = (prefix or "").rstrip(".").lower()
+    out: list[tuple[SymbolEntry, list[Any]]] = []
+    n = 0
+    for r in ads.roots(None, True, port):
+        low = r.name.lower()
+        if pre and not (low == pre or low.startswith(pre + ".") or low.startswith(pre + "[") or pre.startswith(low + ".")
+                        or pre.startswith(low + "[")):
+            continue
+        if lp and not (low.startswith(lp) or lp.startswith(low)):
+            continue
+        if not lp and _is_system_root(r.name):
+            continue
+        root, leaves = ads.leaves(r.name, max_leaves + 1, port)
+        sel = [lf for lf in leaves if path_selected(rx, lf.path)
+               and (not pre or lf.path.lower() == pre or lf.path.lower().startswith((pre + ".", pre + "[")))]
+        if sel:
+            out.append((root, sel))
+            n += len(sel)
+            if n > max_leaves:
+                break
+    return out
+
+
+def _is_system_root(name: str) -> bool:
+    from .ads_backend import _is_system_symbol
+    return _is_system_symbol(name)
+
+
 def build_blocks(syms: list[SymbolEntry], sids: dict[str, int], types: dict[str, T.TcType],
                  merge_gap: int = MERGE_GAP_BYTES, max_bytes: int = MAX_BLOCK_BYTES) -> list[Block]:
     """Group leaves by index group and address into blocks; a leaf larger than max_bytes gets its own block."""
@@ -1261,8 +1322,9 @@ class Recorder:
     def expand_symbols(self, symbols: list[str] | None, prefix: str | None, pattern: str | None,
                        max_symbols: int, port: int | None = None) -> list[SymbolEntry]:
         """Resolve a selection to scalar/array leaves. Composite symbols (FB/struct instances, arrays of
-        structs) are expanded through the datatype table — for explicit symbols, prefixes AND patterns
-        (a pattern matching MAIN.fbFill records every leaf beneath it, the same set rec_scan lists)."""
+        structs) are expanded through the datatype table — for explicit symbols, prefixes AND patterns.
+        A pattern selects exactly the leaves rec_scan lists for it (A5): every leaf whose path, or one of
+        whose ancestors, matches — 'MAIN.fbFill' → every leaf beneath it, '*bOpen' → each bOpen."""
         lst, idx = self.ads.symbols_cached(False, port)
         chosen: dict[str, SymbolEntry] = {}
 
@@ -1300,13 +1362,11 @@ class Recorder:
             for root, leaves in groups:
                 add_leaves(root, leaves)
         if pattern:
-            import fnmatch
-            pat = pattern.lower()
-            for s in lst:
-                if fnmatch.fnmatchcase(s.name.lower(), pat):
-                    add(s)
-                    if len(chosen) > max_symbols:
-                        break
+            # A5: the same leaves rec_scan lists for this pattern (leaf or any ancestor matches; '[ ]' literal)
+            for root, leaves in pattern_leaves(self.ads, pattern, max_symbols, port):
+                add_leaves(root, leaves)
+                if len(chosen) > max_symbols:
+                    break
         out = list(chosen.values())
         if not out:
             raise AdsError("no recordable (scalar/array) symbols selected")

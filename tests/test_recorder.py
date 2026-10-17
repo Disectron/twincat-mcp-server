@@ -556,3 +556,30 @@ def test_trigger_on_array_element_and_edge(rec):
         rec.start(symbols=["MAIN.fbFill.arrWeights"], prefix=None, pattern=None, mode="change", cycle_ms=1, duration_s=None,
                   max_events=None, start_when="MAIN.fbFill.arrWeights[9] > 0", stop_when=None, pre_trigger_ms=0, name=None,
                   max_symbols=10)
+
+
+def test_a5_pattern_selects_the_same_leaves_in_rec_start_and_rec_scan(monkeypatch, project_dir):
+    """A5: rec_start matched patterns against root symbols only ('*bOpen' → nothing, 'GVL_Sim.aCh[[]1].*' → nothing)
+    while rec_scan matched leaves. D31: prefix on one element of an array of structs → 'matches no symbol'."""
+    from tests.fake_ads import install
+    from tests.test_server_e2e import mk_cfg
+    from twincat_mcp.recorder import pattern_leaves, selection_regex, path_selected
+    from twincat_mcp.server import App
+    install(monkeypatch)
+    app = App(mk_cfg(project_dir))
+    rx = selection_regex("MAIN.arrSteps[1].*")
+    assert path_selected(rx, "MAIN.arrSteps[1].nId") and not path_selected(rx, "MAIN.arrSteps[2].nId")
+    assert path_selected(selection_regex("main.fbfill"), "MAIN.fbFill.arrWeights[3]")
+    for pat in ("*bOpen", "MAIN.arrSteps[1].*", "MAIN.*", "MAIN.fbValve2", "*.arrHist[1]"):
+        started = sorted(s.name for s in app.rec.expand_symbols(None, None, pat, 500))
+        scanned = sorted(lf.path for _r, lvs in pattern_leaves(app.ads, pat, 5000) for lf in lvs)
+        assert started == scanned and started, (pat, started, scanned)
+    assert sorted(s.name for s in app.rec.expand_symbols(None, None, "*bOpen", 500)) == ["MAIN.fbValve2.bOpen"]
+    assert [s.name for s in app.rec.expand_symbols(None, None, "*.arrHist[1]", 500)] == ["MAIN.fbValve2.arrHist[1]"]
+    # system lists only when named
+    assert not any(s.name.startswith("TwinCAT_") for s in app.rec.expand_symbols(None, None, "*", 500))
+    # D31: one element of an array of structs as prefix
+    one = sorted(s.name for s in app.rec.expand_symbols(None, "MAIN.arrSteps[2]", None, 500))
+    assert one == ["MAIN.arrSteps[2].bDone", "MAIN.arrSteps[2].eState", "MAIN.arrSteps[2].nId", "MAIN.arrSteps[2].tDwell"], one
+    with pytest.raises(Exception, match="matches no symbol"):
+        app.rec.expand_symbols(None, "MAIN.arrSteps[9]", None, 500)

@@ -81,3 +81,17 @@ def test_audit_log_written(tmp_path):
     rec = json.loads(lines[0])
     assert rec["tool"] == "ads_write" and rec["mode"] == "full"
     assert g.tail_audit(5)[0]["tool"] == "ads_write"
+
+
+def test_n78_status_purges_expired_and_spent_tokens(monkeypatch):
+    """#78: tc_safety_status listed a token that had already expired (and kept it until the next issue)."""
+    import time as _time
+    g = mk("guarded", confirm_ttl_s=10)
+    now = [1000.0]
+    monkeypatch.setattr(_time, "time", lambda: now[0])
+    a = g.request_token("ads_write", "MAIN.nA")["confirm_token"]
+    b = g.request_token("ads_write", "MAIN.nB")["confirm_token"]
+    g.consume_token(b, "ads_write", "MAIN.nB")
+    assert [t["target"] for t in g.status()["pending_tokens"]] == ["MAIN.nA"]
+    now[0] += 10.1
+    assert g.status()["pending_tokens"] == [] and a not in g._tokens and b not in g._tokens

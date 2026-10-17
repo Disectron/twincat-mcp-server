@@ -253,6 +253,28 @@ def test_tree_ops(xae):
         be.tree_item("TIPC^Missing")
 
 
+def test_n17_tree_descends_into_nested_plc_project(xae):
+    """#17: TIPC^Untitled1 enumerated only 'Untitled1 Instance'; the nested 'Untitled1 Project' (POUs …) was never
+    walked because Child(i) did not return it."""
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    inst = FakeItem("Plc Instance", "TIPC^Plc^Plc Instance")
+
+    class Container(FakeItem):
+        def Child(self, i):
+            if i == 1:
+                raise ComError(-2147467259, "nested project not enumerable")
+            return inst
+    c = Container("Plc", "TIPC^Plc", [proj, inst])
+    sm.tipc._children[0] = c
+    sm.items["TIPC^Plc"] = c
+    ch = be.tree_children("TIPC", depth=3)
+    names = [x["Name"] for x in ch["items"]]
+    assert names == ["Plc", "Plc Project", "POUs", "Plc Instance"], names
+    assert ch["unreadable_children"][0]["parent"] == "TIPC^Plc" and ch["unreadable_children"][0]["index"] == 1
+    assert [p["plc_project_path"] for p in be.plc_projects()["projects"]] == ["TIPC^Plc^Plc Project"]
+
+
 def test_pou_get_set_create(xae):
     be, dte, sm = xae
     g = be.pou_get("TIPC^Plc^Plc Project^POUs^MAIN")
