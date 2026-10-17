@@ -1129,7 +1129,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         max_events: int | None = 5_000_000, start_when: str | None = None,
                         stop_when: str | None = None, pre_trigger_ms: float = 0, name: str | None = None,
                         max_symbols: int = 500, post_trigger_s: float | None = None, allow_partial: bool = False,
-                        max_delay_ms: float = 0) -> dict[str, Any]:
+                        max_delay_ms: float = 0, cycle_counter: str | None = "auto") -> dict[str, Any]:
         """Start a continuous real-time recording of online PLC variables (runs in the background
         until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or
         struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it)
@@ -1144,12 +1144,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         variables share ONE notification (a block), which is what keeps 1 ms recordings lossless — select whole FBs,
         structs or arrays rather than hundreds of scattered globals. Any notification that cannot be registered fails
         the start (allow_partial=true records the rest and lists unsubscribed_symbols). max_delay_ms > 0 lets the
-        runtime batch samples (fewer ADS frames; each sample keeps its own timestamp). After stopping: rec_verify."""
+        runtime batch samples (fewer ADS frames; each sample keeps its own timestamp). cycle mode also records a
+        per-cycle counter as ground truth (cycle_counter='auto' = the matching task's _TaskInfo[n].CycleCount, or your
+        own e.g. 'MAIN.nCycleCount', or null for none) and the header carries a manifest of what was recorded from
+        (AppTimestamp, OnlineChangeCnt, tasks, TwinCAT build, symbol version). After stopping: rec_verify."""
         res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
                                  cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
                                  start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
                                  name=name, max_symbols=max_symbols, post_trigger_s=post_trigger_s,
-                                 allow_partial=allow_partial, max_delay_ms=max_delay_ms, timeout=120)
+                                 allow_partial=allow_partial, max_delay_ms=max_delay_ms, cycle_counter=cycle_counter,
+                                 timeout=120)
         app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode}, OpClass.EDIT, "ok")
         return res
 
@@ -1445,10 +1449,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def rec_export(id: str, fmt: str = "csv_wide", out_path: str | None = None,
-                         symbols: list[str] | None = None) -> dict[str, Any]:
-        """Export a recording to CSV: csv_wide (t_ms + one column per symbol, forward-filled) or
-        csv_long (t_ms,symbol,value). Default path next to the JSONL."""
-        return await app.mem_call(app.rec.export, id, fmt, out_path, symbols)
+                         symbols: list[str] | None = None, fill: bool = False) -> dict[str, Any]:
+        """Export a recording to CSV. csv_wide: one row per PLC sample time, one column per variable and per array
+        element (name[i]); an empty cell means no sample of that variable at that time (fill=true forward-fills —
+        handy for charts, but a cell then no longer means "sampled now"). csv_long: t_ms,symbol,value. Both include
+        plc_filetime (the PLC's own sample timestamp) when available. Default path next to the JSONL."""
+        return await app.mem_call(app.rec.export, id, fmt, out_path, symbols, fill)
 
     @mcp.tool(annotations=DESTR)
     async def rec_delete(id: str) -> dict[str, Any]:

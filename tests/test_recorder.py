@@ -105,7 +105,12 @@ def test_change_mode_capture_stats_export_read(rec, tmp_path):
     e = rec.export(rid, "csv_wide", None, None)
     csv_lines = Path(e["file"]).read_text().splitlines()
     assert csv_lines[0] == "t_ms,plc_filetime,MAIN.fbFill.eState,MAIN.fbFill.bDone,MAIN.fbFill.tSettle"
-    assert csv_lines[-1] == f"1200.0,{ft(1200)},3,False,750"      # the PLC's own FILETIME of the sample
+    # one row per sample time; only what was sampled then (the PLC's own FILETIME per row)
+    assert csv_lines[-1] == f"1200.0,{ft(1200)},,False,"
+    assert f"900.0,{ft(900)},3,True," in csv_lines                # two changes at the same PLC time → one row
+    ef = rec.export(rid, "csv_wide", str(tmp_path / "filled.csv"), None, fill=True)
+    assert (tmp_path / "filled.csv").read_text().splitlines()[-1] == f"1200.0,{ft(1200)},3,False,750"
+    assert e["rows"] == 6 and ef["rows"] == 6               # sample times 0, 100, 350, 350.5, 900, 1200
     e2 = rec.export(rid, "csv_long", None, ["MAIN.fbFill.eState"])
     assert e2["rows"] == 4
     lst = rec.list()
@@ -264,7 +269,7 @@ def test_post_trigger_window(rec):
 def _cycle_rec(rec, **kw):
     args = dict(symbols=["MAIN.nCycle", "MAIN.bStart", "MAIN.fbFill.bDone"], prefix=None, pattern=None, mode="cycle",
                 cycle_ms=1, duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0,
-                name=None, max_symbols=50)
+                name=None, max_symbols=50, cycle_counter=None)
     args.update(kw)
     return rec.start(**args)
 
@@ -323,7 +328,8 @@ def test_partial_subscription_fails_unless_allowed(rec):
     FakeConnection.fail_offsets = {5 * 64}
     try:
         kw = dict(symbols=["MAIN.nCycle", "MAIN.fbFill.bDone"], prefix=None, pattern=None, mode="cycle", cycle_ms=1,
-                  duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=50)
+                  duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=50,
+                  cycle_counter=None)
         with pytest.raises(AdsError, match="1 of 2 notifications could not be registered"):
             rec.start(**kw)
         st = rec.start(**kw, allow_partial=True)
@@ -347,3 +353,20 @@ def test_duration_cut_by_plc_time_and_pattern_expands(rec):
                     max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=50)
     assert st2["leaves"] == 8 and st2["notifications"] == 1
     rec.stop(st2["id"])
+
+
+
+def test_cycle_mode_records_counter_and_manifest(rec):
+    """Provenance: a cycle-mode recording carries the per-cycle task counter (ground truth for rec_verify) and a
+    manifest of what it was taken from (application timestamp / online changes, tasks, TwinCAT build)."""
+    st = _cycle_rec(rec, cycle_counter="auto", cycle_ms=10)
+    assert st["cycle_counter"] == "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount" and st["notifications"] == 2
+    out = rec.stop(st["id"])
+    head = json.loads(Path(out["file"]).read_text().splitlines()[0])
+    m = head["manifest"]
+    assert head["cycle_counter"] == st["cycle_counter"] and m["app"]["OnlineChangeCnt"] == 3
+    assert m["tasks"][0]["cycle_time_ms"] == 10.0 and m["device"]["version"].startswith("3.1")
+    v = rec.verify(st["id"])
+    assert v["counter_source"] == "recorded automatically" and v["manifest"]["tasks"][0]["name"] == "PlcTask"
+    with pytest.raises(AdsError):
+        _cycle_rec(rec, cycle_counter="MAIN.nope")

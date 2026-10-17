@@ -914,16 +914,78 @@ class Recorder:
             raise AdsError(f"{len(out)} leaves selected, limit {max_symbols}; narrow the selection or raise max_symbols")
         return out
 
+
+    # ------------------------------------------------------------ provenance
+    def _manifest(self, port: int | None) -> dict[str, Any]:
+        """What the recording was taken from: the PLC application (AppTimestamp / OnlineChangeCnt identify the
+        exact download), its tasks and cycle times, the TwinCAT build and the symbol version. Best effort — a field
+        the runtime does not offer is recorded as unavailable, never guessed."""
+        m: dict[str, Any] = {}
+        base = "TwinCAT_SystemInfoVarList._AppInfo"
+        try:
+            vals = self.ads.read_many([f"{base}.{k}" for k in ("AppTimestamp", "OnlineChangeCnt", "ProjectName", "AppName")], port)
+            m["app"] = {k.rsplit(".", 1)[-1]: v for k, v in vals.items() if not (isinstance(v, dict) and "error" in v)} or "unavailable"
+        except Exception as exc:  # noqa: BLE001
+            m["app"] = f"unavailable: {exc}"
+        tasks = []
+        for i in range(1, 9):
+            tb = f"TwinCAT_SystemInfoVarList._TaskInfo[{i}]"
+            try:
+                vals = self.ads.read_many([f"{tb}.CycleTime", f"{tb}.TaskName", f"{tb}.Priority"], port)
+            except Exception:  # noqa: BLE001
+                break
+            ct = vals.get(f"{tb}.CycleTime")
+            if isinstance(ct, dict) and "error" in ct or ct is None:
+                break
+            tasks.append({"index": i, "name": vals.get(f"{tb}.TaskName"), "cycle_time_ms": _raw_val(ct) / 10_000.0
+                          if isinstance(_raw_val(ct), (int, float)) else ct, "priority": vals.get(f"{tb}.Priority")})
+        m["tasks"] = tasks or "unavailable"
+        try:
+            m["device"] = self.ads.device_info(port)
+        except Exception as exc:  # noqa: BLE001
+            m["device"] = f"unavailable: {exc}"
+        try:
+            m["symbol_version"] = self.ads._symbol_version(self.ads.conn(port))
+        except Exception:  # noqa: BLE001
+            m["symbol_version"] = None
+        return m
+
+    def _pick_counter(self, choice: str, manifest: dict[str, Any], cycle_ms: float, port: int | None) -> SymbolEntry | None:
+        """The per-cycle ground truth recorded with every cycle-mode recording: 'auto' = the task whose cycle time
+        is the largest one not above cycle_ms (else task 1); or an explicit symbol (e.g. MAIN.nCycleCount)."""
+        name = choice
+        if choice == "auto":
+            tasks = manifest.get("tasks") if isinstance(manifest.get("tasks"), list) else []
+            fit = [t for t in tasks if isinstance(t.get("cycle_time_ms"), (int, float)) and 0 < t["cycle_time_ms"] <= cycle_ms + 1e-9]
+            idx = max(fit, key=lambda t: t["cycle_time_ms"])["index"] if fit else 1
+            name = f"TwinCAT_SystemInfoVarList._TaskInfo[{idx}].CycleCount"
+        try:
+            s = self.ads.symbol_info(name, port)
+        except Exception:  # noqa: BLE001 — not offered on this runtime: the timestamps remain the evidence
+            if choice != "auto":
+                raise
+            return None
+        tt = T.parse_type(s.type, s.size)
+        if tt.kind not in ("int", "uint"):
+            raise RecorderError(f"cycle_counter {name!r} is {s.type}, not an integer counter")
+        return s
+
     # ------------------------------------------------------------ start / stop
     def start(self, *, symbols: list[str] | None, prefix: str | None, pattern: str | None, mode: str,
               cycle_ms: float, duration_s: float | None, max_events: int | None, start_when: str | None,
               stop_when: str | None, pre_trigger_ms: float, name: str | None, max_symbols: int,
               port: int | None = None, post_trigger_s: float | None = None, allow_partial: bool = False,
-              max_delay_ms: float = 0.0) -> dict[str, Any]:
+              max_delay_ms: float = 0.0, cycle_counter: str | None = "auto") -> dict[str, Any]:
         if mode not in ("cycle", "change", "poll"):
             raise RecorderError("mode must be cycle | change | poll")
         cycle_ms = max(float(cycle_ms), 0.1)
         syms = self.expand_symbols(symbols, prefix, pattern, max_symbols, port)
+        manifest = self._manifest(port)
+        counter = None
+        if mode == "cycle" and cycle_counter:
+            counter = self._pick_counter(cycle_counter, manifest, cycle_ms, port)
+            if counter is not None and all(s.name.lower() != counter.name.lower() for s in syms):
+                syms = syms + [counter]
         rid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
         path = self.root / f"{rid}.jsonl"
         types = {s.name: T.parse_type(s.type, s.size) for s in syms}
@@ -933,7 +995,9 @@ class Recorder:
             raise RecorderError("post_trigger_s needs start_when (it counts from the trigger)")
         meta = {"ams_net_id": self.ads.net_id, "port": port or self.ads.port, "start_when": start_when,
                 "stop_when": stop_when, "pre_trigger_ms": pre_trigger_ms, "post_trigger_s": post_trigger_s,
-                "selection": {"symbols": symbols, "prefix": prefix, "pattern": pattern}}
+                "selection": {"symbols": symbols, "prefix": prefix, "pattern": pattern},
+                "cycle_counter": counter.name if counter is not None else None, "max_delay_ms": max_delay_ms,
+                "manifest": manifest, "recorder": f"twincat-mcp {_pkg_version()}"}
         rec = Recording(rid, name or rid, syms, mode, cycle_ms, path, self.ring_events, self.max_runs,
                         duration_s, max_events, sw, ew, pre_trigger_ms, meta, post_trigger_s, self.key)
         if mode != "poll":
@@ -954,6 +1018,8 @@ class Recorder:
         notifs = len(rec.blocks) if mode != "poll" else 0
         rate = (notifs or 1) * 1000.0 / cycle_ms
         st["leaves"] = len(syms)
+        if counter is not None:
+            st["cycle_counter"] = counter.name
         st["notifications_per_s"] = round(rate, 1) if mode == "cycle" else f"≤{round(rate, 1)}"
         st["values_per_s"] = round(len(syms) * 1000.0 / cycle_ms, 1) if mode == "cycle" else None
         if mode == "cycle" and rate > 20_000:
@@ -1201,7 +1267,12 @@ class Recorder:
         return {"id": rid, "file": str(path), "name": header.get("name"), "time_source": header.get("time_source", "plc"),
                 "rows": rows, "count": len(rows), "truncated": truncated}
 
-    def export(self, rid: str, fmt: str, out_path: str | None, symbols: list[str] | None) -> dict[str, Any]:
+    def export(self, rid: str, fmt: str, out_path: str | None, symbols: list[str] | None,
+               fill: bool = False) -> dict[str, Any]:
+        """csv_wide: one row per PLC sample time, one column per variable and per array element (name[i]); a cell is
+        empty when that variable has no sample at that time (fill=true repeats the last known value instead —
+        convenient for charts, but then a cell no longer means "sampled at this time"). csv_long: one row per value.
+        Both carry plc_filetime (the PLC's own timestamp of the sample) when the recording has one."""
         path = self._path_for(rid)
         if fmt not in ("csv_long", "csv_wide", "jsonl"):
             raise RecorderError("fmt must be csv_long | csv_wide | jsonl")
@@ -1210,31 +1281,66 @@ class Recorder:
         out = Path(out_path) if out_path else path.with_suffix(f".{'wide' if fmt == 'csv_wide' else 'long'}.csv")
         want = {s.lower() for s in symbols} if symbols else None
         header = _read_header(path)
-        cols = [s["name"] for s in header.get("symbols", []) if not want or s["name"].lower() in want]
+        syms = [x for x in header.get("symbols", []) if not want or x["name"].lower() in want]
+        cols: list[str] = []
+        expand: dict[str, list[str]] = {}
+        for x in syms:
+            tt = T.parse_type(x.get("type") or "", x.get("size"))
+            if tt.kind == "array" and tt.dims and not tt.opaque:
+                names = _element_names(x["name"], tt.dims)
+                expand[x["name"]] = names
+                cols += names
+            else:
+                cols.append(x["name"])
         t0 = None
-        for_t0 = _read_t0(path)
-        if for_t0 and "filetime" in for_t0:
-            t0 = int(for_t0["filetime"])
+        t0d = _read_t0(path)
+        if t0d and "filetime" in t0d:
+            t0 = int(t0d["filetime"])
         import csv
         n = 0
+        rows_written = 0
         with open(out, "w", newline="", encoding="utf-8") as fo:
             w = csv.writer(fo)
             plc_col = ["plc_filetime"] if t0 is not None else []
             w.writerow(["t_ms", *plc_col, *cols] if fmt == "csv_wide" else ["t_ms", *plc_col, "symbol", "value"])
             cur: dict[str, Any] = {}
+            row_t: float | None = None
+
+            def flush() -> None:
+                nonlocal rows_written
+                if row_t is None:
+                    return
+                ft = [t0 + int(round(row_t * 1e4))] if t0 is not None else []
+                w.writerow([row_t, *ft, *[cur.get(c, "") for c in cols]])
+                rows_written += 1
+
             for t, nme, v in iter_events(path, want):
-                ft = [t0 + int(round(t * 1e4))] if t0 is not None else []
-                v = _flat(v)
                 if fmt == "csv_wide":
-                    cur[nme] = v
-                    w.writerow([t, *ft, *[cur.get(c, "") for c in cols]])
+                    if row_t is not None and t != row_t:
+                        flush()
+                        if not fill:
+                            cur = {}
+                    row_t = t
+                    names = expand.get(nme)
+                    if names and isinstance(v, list):
+                        for c, ev in zip(names, _flatten_values(v)):
+                            cur[c] = _flat(ev)
+                    else:
+                        cur[nme] = _flat(v)
                 else:
-                    w.writerow([t, *ft, nme, v])
+                    ft = [t0 + int(round(t * 1e4))] if t0 is not None else []
+                    w.writerow([t, *ft, nme, _flat(v)])
+                    rows_written += 1
                 n += 1
+            if fmt == "csv_wide":
+                flush()
         footer = read_footer(path)
-        out_d: dict[str, Any] = {"id": rid, "file": str(out), "format": fmt, "rows": n,
+        out_d: dict[str, Any] = {"id": rid, "file": str(out), "format": fmt, "rows": rows_written, "values": n,
                                  "time_source": header.get("time_source", "plc"),
-                                 "note": "one row per value; csv_wide repeats the last known value of the other columns"}
+                                 "note": ("one row per sample time; empty cell = no sample of that variable at that time"
+                                          if fmt == "csv_wide" and not fill else
+                                          "one row per sample time; empty cells forward-filled from the last sample"
+                                          if fmt == "csv_wide" else "one row per value")}
         if t0 is not None:
             out_d["note"] += "; plc_filetime = the PLC's own timestamp of the sample (100 ns since 1601-01-01 UTC)"
         if footer is not None:
@@ -1299,6 +1405,11 @@ class Recorder:
                                                          "after_limit", "unsubscribed", "stop_reason")}
         header = _read_header(path)
         out["time_source"] = header.get("time_source", "plc")
+        if counter is None and header.get("cycle_counter"):
+            counter = header["cycle_counter"]          # recorded automatically with the data (cycle mode)
+            out["counter_source"] = "recorded automatically"
+        if header.get("manifest"):
+            out["manifest"] = header["manifest"]
         t0 = _read_t0(path)
         if t0:
             out["t0"] = t0
@@ -1529,6 +1640,30 @@ def _flat(v: Any) -> Any:
     if isinstance(v, list):
         return json.dumps(v)
     return v
+
+
+def _element_names(name: str, dims: list[tuple[int, int]]) -> list[str]:
+    import itertools
+    ranges = [range(lo, hi + 1) for lo, hi in dims]
+    return [f"{name}[{','.join(str(i) for i in idx)}]" for idx in itertools.product(*ranges)]
+
+
+def _flatten_values(v: Any) -> list[Any]:
+    out: list[Any] = []
+    for x in v:
+        if isinstance(x, list):
+            out.extend(_flatten_values(x))
+        else:
+            out.append(x)
+    return out
+
+
+def _pkg_version() -> str:
+    try:
+        from . import __version__
+        return __version__
+    except Exception:  # noqa: BLE001
+        return "?"
 
 
 def _read_header(path: Path) -> dict[str, Any]:
