@@ -325,3 +325,26 @@ def test_io_disable_and_links(xae):
     r = be.links("TIPC^Plc^Plc Project")
     assert r["unlinked"] == [{"group": "PlcTask Inputs", "name": "GVL_Machine.bEStop", "type": "BOOL"}]
     assert r["groups"][1]["variables"][0]["linked_to"] == "TIID^X^Y"
+
+
+def test_stale_system_manager_refreshed(xae, monkeypatch):
+    """N9: after a solution close/reopen, System Manager calls fail with DISP_E_EXCEPTION / E_POINTER until the
+    cached object is re-found — the retry does that once by itself."""
+    be, dte, sm = xae
+    be.attach()
+    calls = {"n": 0, "found": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            e = ComError(X.DISP_E_EXCEPTION, "Invalid pointer")
+            e.excepinfo = (0, "TcSysManager", "Invalid pointer", None, 0, X.E_POINTER)
+            raise e
+        return "ok"
+    orig = be._find_sysman
+
+    def counting():
+        calls["found"] += 1
+        return orig()
+    monkeypatch.setattr(be, "_find_sysman", counting)
+    assert be._retry(flaky, "LookupTreeItem") == "ok" and calls["found"] == 1

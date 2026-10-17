@@ -154,6 +154,8 @@ class Config:
     docs: DocsConfig = field(default_factory=DocsConfig)
     config_file: str | None = None
     warnings: list[str] = field(default_factory=list)   # values that were ignored or corrected at load (tc_doctor shows them)
+    overrides: list[dict[str, Any]] = field(default_factory=list)   # env var beat a TOML value (N10)
+    toml_keys: list[str] = field(default_factory=list)              # "section.key" set by the TOML file
 
     # ------------------------------------------------------------------ dump
     def to_dict(self) -> dict[str, Any]:
@@ -186,6 +188,7 @@ def _apply_toml(cfg: Config, data: dict[str, Any]) -> None:
                 if k == "progids":
                     v = tuple(v)
                 setattr(target, k, v)
+                cfg.toml_keys.append(f"{section}.{k}")
 
 
 def _env(name: str) -> str | None:
@@ -207,6 +210,16 @@ def _env_list(name: str) -> list[str] | None:
     return [p.strip() for p in v.split(";") if p.strip()]
 
 
+def _env_override(cfg: Config, key: str, env: str, new: Any) -> None:
+    """Record when an environment variable (e.g. a plugin install setting) replaces a value the TOML set."""
+    section, attr = key.split(".")
+    old = getattr(getattr(cfg, section), attr)
+    if cfg.config_file and key in cfg.toml_keys and old != new:
+        cfg.overrides.append({"setting": key, "toml": old, "env": env, "value": new,
+                              "note": f"{key}: {cfg.config_file} says {old!r}, environment {env} says {new!r} — the environment wins "
+                                      "(plugin settings are passed as TCMCP_* variables; change it there or remove it)"})
+
+
 def _apply_env(cfg: Config) -> None:
     if v := _env("TCMCP_KNOWLEDGE_DIR"):
         cfg.knowledge.location = v
@@ -214,12 +227,15 @@ def _apply_env(cfg: Config) -> None:
         cfg.server.tool_groups = [g.strip().lower() for g in lst]
     # safety
     if m := _env("TCMCP_MODE"):
+        _env_override(cfg, "safety.mode", "TCMCP_MODE", m.lower())
         cfg.safety.mode = m.lower()
     if m := _env("TCMCP_MAX_MODE"):
+        _env_override(cfg, "safety.max_mode", "TCMCP_MAX_MODE", m.lower())
         cfg.safety.max_mode = m.lower()
     if (b := _env_bool("TCMCP_CONFIRM")) is not None:
         cfg.safety.confirm_destructive = b
     if (lst := _env_list("TCMCP_WRITE_ALLOW")) is not None:
+        _env_override(cfg, "safety.write_allowlist", "TCMCP_WRITE_ALLOW", lst)
         cfg.safety.write_allowlist = lst
     if (lst := _env_list("TCMCP_WRITE_DENY")) is not None:
         cfg.safety.write_denylist = lst
@@ -233,6 +249,7 @@ def _apply_env(cfg: Config) -> None:
         cfg.safety.edit_requires_config_mode = b
     # ads
     if v := _env("TCMCP_AMS_NET_ID"):
+        _env_override(cfg, "ads.ams_net_id", "TCMCP_AMS_NET_ID", v)
         cfg.ads.ams_net_id = v
     if v := _env("TCMCP_AMS_PORT"):
         cfg.ads.ams_port = int(v)

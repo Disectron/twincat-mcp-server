@@ -156,6 +156,7 @@ def test_debug_symbol_writer_classification():
     assert c("fbMachine(eCmd := GVL_Machine.eCmd);", "eCmd", segs) == "named_input_parameter"
     assert c("fb(a := 1, eCmd := x);", "eCmd", segs) == "named_input_parameter"
     assert c("GVL_Machine.eCmd := E_Cmd.Start;", "eCmd", segs) == "assignment"
+    assert c("eCmd := 1;", "eCmd", segs) == "assignment_unqualified"       # scope decided by the caller (N3)
     assert c("fbMachine(bOk => GVL_Machine.eCmd);", "eCmd", segs) == "output_binding"
     assert c("other.eCmd := 1;", "eCmd", segs) is None
     assert c("// eCmd := 1;", "eCmd", segs) is None

@@ -21,6 +21,7 @@ import base64
 import fnmatch
 import json
 import logging
+import os
 import platform
 import re
 import sqlite3
@@ -154,6 +155,7 @@ class App:
         self.exp_store = X.ExperimentStore(cfg.project.experiments_dir)
         self.runners: dict[str, X.Runner] = {}
         self.docs_bg: dict[str, Any] = {}
+        self.session_allow: list[str] = []      # tc_allow_write additions; survive tc_reload_config (N6)
         self.docs: InfosysIndex | None = None
         if cfg.docs.enabled:
             try:
@@ -676,6 +678,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                "safety": app.guard.status()}
         if cfg.warnings:
             rep["config_FIX_THESE"] = list(cfg.warnings)
+        if cfg.overrides:
+            rep["config_overridden_by_env"] = [o["note"] for o in cfg.overrides]
         # pyads / router
         try:
             rep["local_ams_net_id"] = await app.ads_call(app.ads.local_net_id, timeout=10)
@@ -732,8 +736,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def tc_safety_status() -> dict[str, Any]:
-        """Current safety mode, ceiling, allow/deny lists, pending confirmation tokens."""
-        return app.guard.status()
+        """Current safety mode (and where it came from), ceiling, allow/deny lists, pending confirmation tokens."""
+        st = app.guard.status()
+        src = next((o for o in cfg.overrides if o["setting"] == "safety.mode"), None)
+        st["mode_source"] = (src["note"] if src else
+                             "TOML" if "safety.mode" in cfg.toml_keys else
+                             "environment TCMCP_MODE" if os.environ.get("TCMCP_MODE") else "default")
+        if app.guard.mode != cfg.safety.mode:
+            st["mode_source"] += f"; changed in this session with tc_set_mode (started as {cfg.safety.mode})"
+        return st
 
     @mcp.tool(annotations=CONTROL)
     async def tc_set_mode(mode: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -757,21 +768,25 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                              ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Add (or remove) a write allow-list pattern for THIS session only — the in-session alternative
         to editing twincat_mcp.toml and reconnecting. fnmatch, case-insensitive: 'GVL_Test.*',
-        'MAIN.fbDispense.rSetpoint'. Control-class: needs a confirmation (prompt or confirm_token).
+        'MAIN.fbDispense.rSetpoint'. Control-class: needs a confirmation (prompt or confirm_token from
+        tc_request_confirmation(action='tc_allow_write', target='<pattern>'), or target='-<pattern>' to remove).
         The deny list still wins; the change is audited and lost at the next server start."""
         pat = (pattern or "").strip()
         if not pat:
             raise ToolError("pattern is empty")
-        await app.permit(ctx, OpClass.CONTROL, "tc_allow_write", target=("-" if remove else "+") + pat, confirm_token=confirm_token)
+        # token target: the pattern itself to add, '-<pattern>' to remove (N1)
+        await app.permit(ctx, OpClass.CONTROL, "tc_allow_write", target=("-" + pat) if remove else pat, confirm_token=confirm_token)
         lst = app.guard.cfg.write_allowlist
         if remove:
             before = len(lst)
             lst[:] = [x for x in lst if x.lower() != pat.lower()]
             changed = len(lst) != before
+            app.session_allow = [x for x in app.session_allow if x.lower() != pat.lower()]
         else:
             changed = pat.lower() not in {x.lower() for x in lst}
             if changed:
                 lst.append(pat)
+                app.session_allow.append(pat)
         denied = [d for d in app.guard.cfg.write_denylist if fnmatch.fnmatch(pat.lower(), d.lower()) or fnmatch.fnmatch(d.lower(), pat.lower())]
         app.audit("tc_allow_write", {"pattern": pat, "remove": remove}, OpClass.CONTROL, "ok" if changed else "unchanged",
                   {"write_allowlist": list(lst)})
@@ -808,14 +823,21 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         for key in ("dialog_rules", "allow_safety", "build_timeout_s", "attach_only"):
             _apply("xae", key)
         app.xae.watchdog.rules = list(cfg.xae.dialog_rules)
+        kept = [x for x in app.session_allow if x.lower() not in {y.lower() for y in cfg.safety.write_allowlist}]
+        cfg.safety.write_allowlist = list(cfg.safety.write_allowlist) + kept     # N6: session additions are kept
         for section, key in (("ads", "ams_net_id"), ("ads", "ams_port"), ("xae", "solution_path"), ("project", "root"),
                              ("safety", "mode"), ("safety", "max_mode")):
             new_v, old_v = getattr(getattr(fresh, section), key), getattr(getattr(cfg, section), key)
             if new_v != old_v:
                 needs_restart[f"{section}.{key}"] = {"running": old_v, "file": new_v}
         app.audit("tc_reload_config", {"file": fresh.config_file}, OpClass.EDIT, "ok", {"applied": list(applied), "needs_restart": list(needs_restart)})
-        return {"config_file": fresh.config_file, "applied": applied, "needs_restart": needs_restart,
-                "warnings": fresh.warnings, "write_allowlist": list(cfg.safety.write_allowlist)}
+        out = {"config_file": fresh.config_file, "applied": applied, "needs_restart": needs_restart,
+               "warnings": fresh.warnings, "write_allowlist": list(cfg.safety.write_allowlist)}
+        if fresh.overrides:
+            out["overridden_by_env"] = [o["note"] for o in fresh.overrides]
+        if kept:
+            out["kept_session_allow"] = kept
+        return out
 
     # ---- knowledge base (decisions 2026-10-17) -----------------------------
     @mcp.tool(annotations=READ)
@@ -894,6 +916,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 tok["warning"] = (f"ADS side targets {app.ads.net_id} while XAE targets {real}: the deploy/restart will hit the XAE "
                                   f"target and the ADS tools will keep reading the other machine. ads_connect(ams_net_id={real!r}) to align.")
             return tok
+        if act == "tc_allow_write":
+            # N1: the token is for the pattern as typed (adding); '-pattern' removes. A leading '+' is tolerated.
+            target = (target or "").strip()
+            target = target[1:] if target.startswith("+") else target
         return app.guard.request_token(act, target, app.scope())
 
     @mcp.tool(annotations=READ)
@@ -1722,7 +1748,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Generate <FB>_Tests.TcPOU (TcUnit.FB_TestSuite) with Test_InitialState and one test
         method per public method, arranged from the FB interface, and register it in the
         .plcproj. Assertions are left as TODO stubs."""
-        await app.permit(None, OpClass.EDIT, "tcunit_scaffold", fb_name)
+        touches_project = add_to_plcproj or out_dir is None
+        if not touches_project and app.proj.root is not None:
+            try:
+                touches_project = Path(app.proj.root).resolve() in Path(out_dir).resolve().parents or \
+                    Path(out_dir).resolve() == Path(app.proj.root).resolve()
+            except OSError:
+                touches_project = True
+        # N12: a scaffold written outside the project (and not registered in the .plcproj) is not a code edit of the
+        # PLC project, so edit_requires_config_mode does not apply to it
+        await app.permit(None, OpClass.EDIT, "tcunit_scaffold" if touches_project else "tcunit_scaffold_external", fb_name)
         res = await app.confirmed("tcunit_scaffold", {"fb": fb_name}, OpClass.EDIT, app.proj_call(codecheck.tcunit_scaffold, app.proj, fb_name, out_dir, add_to_plcproj, overwrite))
         return res
 
@@ -2539,11 +2574,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """StartRestartTwinCAT on the current target (runtime restarts in RUN mode). Destructive-class."""
         tgt = await app.xae_target_for("xae_restart_twincat", OpClass.DESTRUCTIVE, confirm_token)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_restart_twincat", tgt, confirm_token)
+        t0 = time.monotonic()
         res = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
         ver = await app.verify_target_after("xae_restart_twincat", expect_run=True)
+        # N5: the shell returns as soon as the command is accepted; the restart is over when the target reports RUN
         res.update({"restarted": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
-                    "verification_polls": ver["polls"]})
+                    "verification_polls": ver["polls"], "command_s": res.pop("duration_s", None),
+                    "duration_s": round(time.monotonic() - t0, 1)})
         if ver.get("hint"):
             res["hint"] = ver["hint"]
         app.audit("xae_restart_twincat", {"target": tgt}, OpClass.DESTRUCTIVE, "ok" if ver["verified"] else "target-not-in-run", res)

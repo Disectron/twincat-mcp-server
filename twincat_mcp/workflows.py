@@ -36,8 +36,22 @@ def _classify_write(line: str, leaf: str, segs: list[str]) -> str | None:
             got = [x.lower() for x in parts]
             if got != want[-len(got):] and got[0] not in ("this", "super"):
                 continue
-        return "assignment"
+            return "assignment"
+        return "assignment_unqualified"
     return None
+
+
+def _in_scope(app, unit_name: str, declared_in: str | None) -> bool:
+    if not declared_in or not unit_name:
+        return True
+    owner = unit_name.split(".")[0].lower()
+    if owner == declared_in.split(".")[0].lower():
+        return True
+    try:
+        u = app.proj.units.get(owner)
+        return bool(u is not None and any(a.name.lower() == declared_in.lower() for a in codecheck._ancestors(app.proj, u)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: int = 12) -> dict[str, Any]:
@@ -55,11 +69,19 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
         # a bare `, x)` / `(x,` inside a call — reported separately as possible writes)
         writers = await app.proj_call(app.proj.search, rf"(\b{leaf}\b\s*:=|=>\s*{leaf}\b)", None, 50, True)
         segs = [x.split("[")[0] for x in symbol.split(".")]
+        hops = res.get("hops") or []
+        declared_in = next((h.get("declared_in") for h in reversed(hops) if h.get("declared_in")), None)
         kept, input_bindings = [], []
         for h in writers["hits"]:
             kind = _classify_write(h.get("text", ""), leaf, segs)
             if kind is None:
                 continue
+            if kind == "assignment_unqualified":
+                # N3: a bare `x :=` writes the x in scope of that unit — only a writer if that unit (or one derived
+                # from it) declares this symbol's x; FB_Counter.OnReset's nCount is not MAIN.nCount
+                if not _in_scope(app, h.get("unit", ""), declared_in):
+                    continue
+                kind = "assignment"
             h["kind"] = kind
             (input_bindings if kind == "named_input_parameter" else kept).append(h)
         writers["hits"] = kept

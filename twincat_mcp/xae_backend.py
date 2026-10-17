@@ -49,6 +49,8 @@ RPC_E_CALL_REJECTED = -2147418111        # 0x80010001
 RPC_E_SERVERCALL_RETRYLATER = -2147417846  # 0x8001010A
 RPC_E_DISCONNECTED = -2147417848        # 0x80010108
 RPC_S_SERVER_UNAVAILABLE = -2147023174  # 0x800706BA — the shell was closed/reopened; our DTE proxy points at a dead process
+DISP_E_EXCEPTION = -2147352567          # 0x80020009 — with scode E_POINTER after a solution reopen: stale System Manager
+E_POINTER = -2147467261                 # 0x80004003
 
 VS_WINDOW_ERRORLIST = "{D78612C7-9962-4B83-95D9-268046DAD23A}"
 VS_WINDOW_OUTPUT = "{34E76E81-EE4A-11D0-AE2E-00A0C90FFFC3}"
@@ -152,6 +154,18 @@ class XaeBackend:
                         finally:
                             self._reattaching = False
                     raise XaeError(f"{what}: XAE shell disconnected (closed or crashed). Re-run xae_attach.") from exc
+                if self._stale_sysman(exc) and not getattr(self, "_refreshing_sm", False):
+                    # N9: the solution was closed and reopened; the cached ITcSysManager belongs to the old one
+                    self._refreshing_sm = True
+                    try:
+                        self.sysman = None
+                        self._find_sysman()
+                        log.warning("%s: System Manager object was stale (solution reopened); refreshed and retrying", what)
+                        return fn()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    finally:
+                        self._refreshing_sm = False
                 msg = _com_msg(exc)
                 if "logged into" in msg.lower() or "logged in" in msg.lower():
                     msg += " — XAE is logged in to the PLC; the project cannot be changed online. Log out first: xae_plc('logout')."
@@ -169,10 +183,27 @@ class XaeBackend:
             self.attach()
         return self.dte
 
+    @staticmethod
+    def _stale_sysman(exc: BaseException) -> bool:
+        hr = getattr(exc, "hresult", None)
+        info = getattr(exc, "excepinfo", None) or ()
+        scode = info[5] if len(info) > 5 else None
+        return hr == E_POINTER or (hr == DISP_E_EXCEPTION and (scode == E_POINTER or "pointer" in str(info).lower()))
+
     def _sm(self) -> Any:
         if self.sysman is None:
             self._need()
             self._find_sysman()
+        else:
+            # N9: a solution closed and reopened behind us leaves the cached System Manager stale — compare the
+            # solution that is open now with the one the cached object came from
+            try:
+                cur = self.dte.Solution.FullName if self.dte is not None else None
+            except Exception:  # noqa: BLE001
+                cur = None
+            if cur is not None and getattr(self, "_sysman_solution", None) not in (None, cur):
+                self.sysman = None
+                self._find_sysman()
         return self.sysman
 
     # ------------------------------------------------------------ attach
@@ -296,6 +327,11 @@ class XaeBackend:
             d["projects"] = prjs
         except Exception as exc:  # noqa: BLE001
             d["solution_error"] = _com_msg(exc)
+        if not d.get("solution_open"):
+            # no solution: say so instead of a stale project name and a raw COM exception (retest 0.7.1)
+            self.sysman = None
+            d["note"] = "no solution is open in the shell — xae_open_solution(path) or open one in XAE"
+            return d
         try:
             sm = self._sm()
             d["twincat_project"] = self._sysman_project_name
@@ -318,6 +354,10 @@ class XaeBackend:
                 obj.GetTargetNetId()  # proves it's an ITcSysManager
                 self.sysman = obj
                 self._sysman_project_name = p.Name
+                try:
+                    self._sysman_solution = sol.FullName
+                except Exception:  # noqa: BLE001
+                    self._sysman_solution = None
                 return
             except Exception:  # noqa: BLE001
                 continue
@@ -515,26 +555,45 @@ class XaeBackend:
         return sorted(out, key=lambda n: (n.lower().endswith("none"), n))
 
     def _select_plc_project_node(self) -> str | None:
-        """Make a PLC project the active one by selecting its node in Solution Explorer (what a click does)."""
+        """Make a PLC project the active one by selecting its node in Solution Explorer (what a click does).
+        Solution Explorer nests it as Solution → <TwinCAT project> → PLC → <PLC> → '<PLC> Project'; the node is
+        found by walking the UI hierarchy (fixed paths missed the TwinCAT project level — retest #10)."""
         try:
             dte = self._need()
-            sol_name = Path(str(dte.Solution.FullName)).stem
             projs = self.plc_projects().get("projects") or []
             if not projs:
                 return None
             pname = str(projs[0].get("name") or "").removesuffix(" Project")
+            want = {f"{pname} Project".lower(), pname.lower()}
             se = dte.ToolWindows.SolutionExplorer
-            for cand in (f"{sol_name}\\{pname}\\{pname} Project", f"{sol_name}\\PLC\\{pname}\\{pname} Project",
-                         f"{sol_name}\\{pname}"):
-                try:
-                    item = se.GetItem(cand)
-                    item.Select(1)   # vsUISelectionTypeSelect
-                    return cand
-                except Exception:  # noqa: BLE001
-                    continue
+
+            def walk(items, depth: int, trail: list[str]):
+                if depth > 7:
+                    return None
+                for i in range(1, items.Count + 1):
+                    it = items.Item(i)
+                    name = str(it.Name)
+                    if name.lower() == f"{pname} Project".lower():
+                        return it, trail + [name]
+                    try:
+                        was = it.UIHierarchyItems.Expanded
+                        it.UIHierarchyItems.Expanded = True
+                        hit = walk(it.UIHierarchyItems, depth + 1, trail + [name])
+                        if hit is None:
+                            it.UIHierarchyItems.Expanded = was
+                        if hit is not None:
+                            return hit
+                    except Exception:  # noqa: BLE001
+                        continue
+                return None
+            hit = walk(se.UIHierarchyItems, 0, [])
+            if hit is None:
+                return None
+            item, trail = hit
+            item.Select(1)   # vsUISelectionTypeSelect
+            return "\\".join(trail)
         except Exception:  # noqa: BLE001
             return None
-        return None
 
     def plc_action(self, action: str) -> dict[str, Any]:
         """login/logout/start/stop/reset_cold/reset_origin/download via DTE commands. Command names
@@ -901,17 +960,32 @@ class XaeBackend:
             cands += [c for c in listed if "checkallobject" in c.lower().replace(" ", "") and c not in cands]
         except XaeError:
             listed = []
+        # the shell's own names first: a guessed name that does not exist only adds noise to the error
+        cands = [c for c in cands if c in listed] + [c for c in cands if c not in listed]
         tried = []
-        for c in cands:
-            try:
-                self.command(c)
-                time.sleep(1.0)
-                return {"command": c, **self.errors()}
-            except XaeError as exc:
-                tried.append({"command": c, "error": str(exc)[:120]})
-        raise XaeError(f"no CheckAllObjects command found in this shell (tried {[t['command'] for t in tried]}; "
-                       f"shell lists {listed[:10]}). Unused POUs are then not compiled — xae_build still compiles everything "
-                       f"referenced. In the IDE: right-click the PLC project → Check all objects.")
+        selected = None
+        for attempt in range(2):
+            for c in cands:
+                try:
+                    self.command(c)
+                    time.sleep(1.0)
+                    out = {"command": c, **self.errors()}
+                    if selected:
+                        out["selected_node"] = selected
+                    return out
+                except XaeError as exc:
+                    tried.append({"command": c, "error": str(exc)[:240]})
+            if attempt == 0:
+                # 'command not available' usually means no PLC project node is selected (retest #45)
+                selected = self._select_plc_project_node()
+                if not selected:
+                    break
+        listed_hits = [t for t in tried if t["command"] in listed]
+        raise XaeError("Check all objects did not run. "
+                       + (f"The shell has {[t['command'] for t in listed_hits]} but refused it: {listed_hits[-1]['error']}. "
+                          if listed_hits else f"No such command in this shell (looked for {cands}; it lists {listed[:10]}). ")
+                       + ("Selecting the PLC project node did not help. " if selected else "The PLC project node could not be selected. ")
+                       + "In the IDE: right-click the PLC project → Check all objects; xae_build still compiles everything referenced.")
 
 
 # ----------------------------------------------------------------------------

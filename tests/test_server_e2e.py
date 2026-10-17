@@ -339,7 +339,7 @@ async def test_tc_allow_write_and_reload_config(monkeypatch, project_dir, tmp_pa
         # control-class: no token, no elicitation on this client → refused with the token hint
         res = await s.call_tool("tc_allow_write", {"pattern": "MAIN.nCycle"})
         assert res.is_error and "tc_request_confirmation" in text(res)
-        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "tc_allow_write", "target": "+MAIN.nCycle"}))["confirm_token"]
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "tc_allow_write", "target": "MAIN.nCycle"}))["confirm_token"]
         r = payload(await s.call_tool("tc_allow_write", {"pattern": "MAIN.nCycle", "confirm_token": tok}))
         assert r["changed"] and r["session_only"] and r["write_allowlist"] == ["MAIN.nCycle"]
         res = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 5})
@@ -355,9 +355,15 @@ async def test_tc_allow_write_and_reload_config(monkeypatch, project_dir, tmp_pa
         assert "ads.ams_net_id" in r["needs_restart"]
         res = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 7})
         assert not res.is_error
+        # N6: a session addition survives a reload
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "tc_allow_write", "target": "+MAIN.bStart"}))["confirm_token"]
+        assert payload(await s.call_tool("tc_allow_write", {"pattern": "MAIN.bStart", "confirm_token": tok}))["changed"]
+        r = payload(await s.call_tool("tc_reload_config", {}))
+        assert r["kept_session_allow"] == ["MAIN.bStart"] and "MAIN.bStart" in r["write_allowlist"]
         audit = payload(await s.call_tool("tc_audit_tail", {"n": 20}))
         assert [(a["tool"], a["outcome"]) for a in audit if a["tool"] in ("tc_allow_write", "tc_reload_config")] == [
-            ("tc_allow_write", "refused"), ("tc_allow_write", "ok"), ("tc_allow_write", "ok"), ("tc_reload_config", "ok")]
+            ("tc_allow_write", "refused"), ("tc_allow_write", "ok"), ("tc_allow_write", "ok"), ("tc_reload_config", "ok"),
+            ("tc_allow_write", "ok"), ("tc_reload_config", "ok")]
 
 
 @pytest.mark.anyio
@@ -654,3 +660,31 @@ async def test_interfaces_known_from_source(monkeypatch, project_dir):
         for name, val in (("PRG_Test.ipThing", 12345), ("PRG_Test.aThings", [0, 0])):
             w = await s.call_tool("ads_write", {"name": name, "value": val})
             assert w.is_error and "INTERFACE (declared in the project source)" in text(w), text(w)
+
+
+@pytest.mark.anyio
+async def test_debug_symbol_writers_respect_scope(monkeypatch, project_dir):
+    """N3: FB_Other's own `nCycle := 0` is not a writer of MAIN.nCycle."""
+    install(monkeypatch)
+    (project_dir / "Plc" / "POUs" / "FB_Other.TcPOU").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject Version="1.1.0.1"><POU Name="FB_Other" Id="{00000000-0000-0000-0000-000000000077}">'
+        '<Declaration><![CDATA[FUNCTION_BLOCK FB_Other\nVAR\n\tnCycle : UDINT;\nEND_VAR\n]]></Declaration>'
+        '<Implementation><ST><![CDATA[nCycle := 0;]]></ST></Implementation></POU></TcPlcObject>')
+    srv = build_server(mk_cfg(project_dir, mode="readonly"))
+    async with client_for(srv) as s:
+        d = payload(await s.call_tool("wf_debug_symbol", {"symbol": "MAIN.nCycle", "watch_ms": 0}))
+        units = {w["unit"] for w in d["writers"]}
+        assert "MAIN" in units and "FB_Other" not in units, d["writers"]
+
+
+def test_env_override_of_toml_is_reported(tmp_path, monkeypatch):
+    """N10: mode = "full" in the TOML silently lost to TCMCP_MODE from the plugin settings."""
+    from twincat_mcp.config import load
+    toml = tmp_path / "twincat_mcp.toml"
+    toml.write_text('[safety]\nmode = "full"\n', encoding="utf-8")
+    monkeypatch.setenv("TCMCP_MODE", "guarded")
+    cfg = load(str(toml))
+    assert cfg.safety.mode == "guarded"
+    assert cfg.overrides and "TCMCP_MODE says 'guarded'" in cfg.overrides[0]["note"] and "says 'full'" in cfg.overrides[0]["note"]
+    monkeypatch.delenv("TCMCP_MODE")
+    assert load(str(toml)).overrides == []
