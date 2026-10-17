@@ -119,7 +119,7 @@ If `claude plugin configure` also refuses, the options are plain environment var
 **Pre-build the venv now** (optional but recommended — it removes the one-minute first-start wait from §5):
 
 ```powershell
-python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.6.3\scripts\launch.py" --no-run
+python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.7.0\scripts\launch.py" --no-run
 ```
 (the version folder changes with each plugin version; `dir $env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp` lists it.)
 
@@ -178,6 +178,9 @@ allow_safety = false                 # TwinSAFE / TISC edits refused
 tcunit_remote_result = 'boot:TcUnit_xUnit_testresults.xml'   # 'boot:' resolves on the target: \Hard Disk\TwinCAT\3.1\Boot on CE7
 # hmi_root = '<PROJECT_DIR>\Hmi'     # TE2000 project folder, for hmi_scan / hmi_vs_runtime
 
+[server]
+# tool_groups = ["ads", "rec", "snap", "test", "proj"]   # expose only these groups (tc_* always); default: all
+
 [safety]
 mode = "guarded"                     # readonly | guarded | full
 max_mode = "full"                    # tc_set_mode may not go above this
@@ -231,7 +234,7 @@ ran the pre-build command in §3.1, none of this happens.
 
 | `/mcp` shows | meaning | do |
 |---|---|---|
-| `twincat` connected, 141 tools | done | continue to §6 |
+| `twincat` connected, 143 tools | done | continue to §6 |
 | `twincat` failed, first start or after an update | background install running (exit code 5) | wait a minute, reconnect from `/mcp` or start a new session |
 | `twincat` failed, repeatedly | launcher could not start the server | `> claude --mcp-debug` and read the launcher's stderr; the common causes are the table below. Also read the install log named above |
 | no `twincat` entry at all | plugin not loaded | `> claude plugin list` shows load errors; `CLAUDE_CODE_SKIP_PLUGIN_MCP_SERVERS` in the environment disables plugin servers |
@@ -287,6 +290,15 @@ Behaviours that look like failures and are not (0.6.2 / 0.6.3):
   exist on this TwinCAT build — pass one of the listed names.
 - `rec_start(..., start_when=…, duration_s=…)`: `duration_s` counts from the first sample, including the wait for
   the trigger. Use `post_trigger_s` for "N seconds after the trigger".
+- (0.7) `rec_start` fails if any notification cannot be registered — by design, a recording with silent holes is
+  worse than none. `allow_partial=true` records the rest and lists `unsubscribed_symbols`.
+- (0.7) `rec_status` shows `samples`, `missing_samples`, `completeness`, `backlog`. `missing_samples > 0` in cycle
+  mode means holes in the PLC timeline — trust timings only after `rec_verify <id> counter=<per-cycle counter>`
+  says PASS. `stats_coverage < 1` only means the live statistics skipped samples under load; `rec_stats` after
+  `rec_stop` recomputes them exactly from the file.
+- (0.7) Recordings made by 0.6.x stay readable; new files are format 2 (raw bytes + PLC FILETIME, signed footer).
+- (0.7) `tc_doctor` returns a one-line `summary` first; `tc_doctor verbose=true` for the full configuration.
+  `[server] tool_groups = ["ads", "rec", "proj"]` exposes only those groups (tc_* always).
 
 Tool names: every tool is `mcp__plugin_twincat-mcp_twincat__<name>`; you never type that, Claude does.
 `/permissions` rules use that form, e.g. allow `mcp__plugin_twincat-mcp_twincat__ads_read*` to stop the

@@ -27,6 +27,9 @@ tcunit_remote_result = 'boot:TcUnit_xUnit_testresults.xml'   # 'boot:' = the tar
 [project.naming_prefixes]          # overrides for proj_lint's naming rule
 LREAL = ["r", "lr", "f"]
 
+[server]
+# tool_groups = ["ads", "rec", "snap", "test", "proj"]   # only these tool groups (tc_* always); default all
+
 [safety]
 mode = "guarded"                   # readonly | guarded | full  (start mode)
 max_mode = "full"                  # ceiling for tc_set_mode at runtime

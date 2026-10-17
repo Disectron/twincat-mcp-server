@@ -1,10 +1,10 @@
-# twincat-mcp 0.6.3 — tool reference
+# twincat-mcp 0.7.0 — tool reference
 
-141 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
+143 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
 ## Meta & safety (8)
 
-- `tc_doctor` [R] — Environment check: platform, pyads/router, local AMS NetId, XAE ProgIDs in the registry, running XAE shells, project root, safety mode. Run this first.
+- `tc_doctor` [R] — Environment check: platform, pyads/router, local AMS NetId, XAE ProgIDs in the registry, running XAE shells, project root, safety mode. Run this first. Starts with a one-line `summary`; verbose=true adds the full loaded configuration.
 - `tc_safety_status` [R] — Current safety mode, ceiling, allow/deny lists, pending confirmation tokens.
 - `tc_set_mode` [C] — Switch safety mode: readonly | guarded | full. Lowering is free. Escalating (guarded→full, readonly→guarded) is capped at max_mode AND needs a confirmation (prompt or confirm_token) — an agent must not be able to widen its own permissions silently.
 - `tc_allow_write` [C] — Add (or remove) a write allow-list pattern for THIS session only — the in-session alternative to editing twincat_mcp.toml and reconnecting. fnmatch, case-insensitive: 'GVL_Test.*', 'MAIN.fbDispense.rSetpoint'. Control-class: needs a confirmation (prompt or confirm_token). The deny list still wins; the change is…
@@ -29,14 +29,14 @@
 - `ads_read` [R] — Read one symbol with type-aware decoding. Structs/FB instances/arrays of structs decode into a nested tree (datatype table); TIME/DATE/DT/TOD get readable text; enums get names. Trees larger than max_chars are summarised (member names + sizes) — use ads_leaves or ads_dump for the full content.
 - `ads_read_many` [R] — Read several symbols in one ADS sum-command. Returns {name: value | {error}}.
 - `ads_write` [W] — Write a symbol on the running PLC. Accepts JSON scalars, lists for arrays, and literals like 'T#1s500ms', 'D#2026-10-15', '16#FF'. Returns before/after. Gated: readonly=never; guarded=write_allowlist; full=denylist only.
-- `ads_write_many` [W] — Write several symbols ({name: value}) all-or-nothing up front: every symbol is gated (allow/deny list) and pre-checked (type, range, enum name, array/string length, CONSTANT, pointer/interface) BEFORE the first write; one refusal → nothing is written and every problem is listed. The writes then run in order; if one…
+- `ads_write_many` [W] — Write several symbols ({name: value}) together. Every symbol is gated (allow/deny list) and pre-checked (type, range, enum name, array/string length, CONSTANT, pointer/interface) BEFORE anything is written — one refusal → nothing is written and every problem is listed. Then ONE ADS sum-write: the runtime applies all…
 - `ads_io_read` [R] — Raw process image of the PLC: area 'I' (%IB inputs) or 'Q' (%QB outputs) at a byte offset — what the task actually sees/wrote, independent of symbol names (link checks).
 - `ads_read_raw` [R] — Raw ADS read by index group/offset on any port (hex + little-endian uint).
 - `ads_write_raw` [W] — Raw ADS write by index group/offset — PLC runtime ports (851-859) only. Every symbol whose memory overlaps the written range is checked against the write allow/deny lists; the raw target itself is 'raw:<port>/<igrp hex>/<ioffs hex>'.
-- `ads_watch` [R] — Sample symbols for duration_ms every interval_ms (polling trace). change_only keeps only rows where a value changed. Caps: 60 s, ≥10 ms, 5000 rows. Use for timing questions: 'does bDone pulse?', 'how long is the valve open?'. Runs on the slow ADS worker, so ads_write calls issued *concurrently* interleave with it —…
-- `ads_wait_until` [R] — Block until symbol <op> value (==, !=, >, >=, <, <=) or timeout. Returns met/elapsed.
+- `ads_watch` [R] — Trace symbols for duration_ms. Uses ADS notifications (PLC-timestamped, every change the runtime sees at its task cycle — not 50 ms polling from this PC): change_only=true records changes, false one sample per interval_ms. Falls back to polling when notifications are unavailable (method field says which). Caps: 60 s,…
+- `ads_wait_until` [R] — Block until symbol <op> value (==, !=, >, >=, <, <=) or timeout. Uses an ADS change notification, so it returns as soon as the runtime sees the condition (met_at_plc_ms = PLC-relative timestamp of that sample); falls back to polling every interval_ms when notifications are unavailable. Returns met/value/elapsed.
 - `ads_plc_state` [C/D] — PLC runtime control via ADS: run | stop | reset. 'reset' is a cold reset (all non-persistent data lost). Control-class: confirmation in guarded mode.
-- `ads_system_mode` [D] — Switch TwinCAT on the target between 'run' and 'config' mode (restarts the runtime, I/O goes down). Destructive-class.
+- `ads_system_mode` [D] — Switch TwinCAT on the target between 'run' and 'config' mode (restarts the runtime, I/O goes down). Destructive-class. Waits (≤20 s) until the target reports the requested mode and returns before/after; reached=false when it did not get there (license / configuration error).
 - `ads_ethercat` [R] — EtherCAT master state (INIT/PREOP/SAFEOP/OP) and slave count via the master's ADS port (default 65535 for the first master; see Device → ADS tab in XAE).
 - `ads_routes` [R] — Local static ADS routes (parsed from StaticRoutes.xml on this PC).
 - `ads_add_route_to_plc` [C] — Create the PLC-side route back to this PC (UDP discovery protocol, needs the target's Windows/TC-BSD credentials). Control-class.
@@ -50,7 +50,7 @@
 - `ads_discover` [R] — Broadcast search for TwinCAT targets on the local network (UDP 48899): NetId, host name, TwinCAT version, IP — the same thing XAE's 'Broadcast Search' does.
 - `ads_export` [R] — Generate code from the runtime: fmt=csharp (explicit-offset structs + enums for Beckhoff.TwinCAT.Ads ReadAny/WriteAny), typescript (interfaces), json (type descriptions), or csharp_symbols (const symbol paths under prefix). types = struct/enum names; prefix = take the types of every symbol under it.
 
-## Real-time recorder (19)
+## Real-time recorder (21)
 
 - `rec_start` [E] — Start a continuous real-time recording of online PLC variables (runs in the background until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it) or fnmatch pattern. mode: 'cycle' = one…
 - `rec_scan` [R] — Enumerate the variables that could be recorded and what each would cost. source='runtime' walks the live symbol/datatype tables (every scalar leaf under prefix, or all programs/GVLs); source='project' walks the source declarations (works offline). pattern = fnmatch filter on the full path. Returns counts by type and…
@@ -60,10 +60,12 @@
 - `rec_profile_delete` [E] — Delete a profile and its checklist file.
 - `rec_profile_start` [E] — Start recording a saved profile: one recording per (mode, cycle_ms) group, all named '<profile>/<mode>@<cycle>'. Triggers given here override the profile's. Returns the recording ids; rec_profile_stop(name) stops them together, rec_stats/rec_export work per id.
 - `rec_profile_stop` [E] — Stop every live recording started from this profile; returns per-recording status + stats.
-- `rec_list` [R] — Recordings of this session (live status) and recording files on disk.
-- `rec_status` [R] — Live status of one recording: events, rate, drops, armed/triggered, last value per symbol.
+- `rec_list` [R] — Recordings of this session (compact status) and recording files on disk, newest first (paged: limit/offset; on_disk_total says how many exist).
+- `rec_status` [R] — Live status of one recording: samples, events, rate, missing_samples (holes in the PLC timeline, cycle mode), completeness, dropped (lost on this PC), backlog, stats_coverage, per-block report, warnings, armed/triggered, last value per symbol.
 - `rec_snapshot` [R] — Most recent events of a running (or finished) recording — the live tail.
-- `rec_stats` [R] — Per-symbol statistics over the whole recording so far: count, first/last, min/max/mean, change count, BOOL rising/falling edges with timestamps, and value runs (state timeline with dwell times) — computed incrementally, no re-read of the file.
+- `rec_stats` [R] — Per-symbol statistics over the whole recording so far: count, first/last, min/max/mean, change count, BOOL rising/falling edges with timestamps, and value runs (state timeline with dwell times). Live (incremental) while complete; recomputed from the file when the ingest had to skip statistics under load, for…
+- `rec_capture` [E] — One call for "record X for N s and give me the stats": starts a recording, waits (≤ 60 s), stops, and returns per-symbol statistics, completeness and the rec_verify verdict (integrity + PLC timeline, plus the optional per-cycle `counter`) with the file path. For longer or triggered captures use rec_start.
+- `rec_verify` [R] — Prove a finished recording. integrity: the file is byte-for-byte what the recorder wrote (sha256 of every line, signed with this install's key) — 'MODIFIED' if anything was edited. timeline (cycle mode): per notification block, holes between the PLC's own sample timestamps. counter (optional): a PLC variable that…
 - `rec_read` [R] — Read a time window of a recording from its file. wide=true pivots to one row per event with all selected symbols forward-filled (what you want for 'what else was true when X happened'). Works on finished recordings from earlier sessions too.
 - `rec_stop` [E] — Stop a recording, release the ADS notifications, finalize the file; returns status + stats.
 - `rec_export` [R] — Export a recording to CSV: csv_wide (t_ms + one column per symbol, forward-filled) or csv_long (t_ms,symbol,value). Default path next to the JSONL.

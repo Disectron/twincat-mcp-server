@@ -128,7 +128,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **"Absolute control" setting:** `TCMCP_MODE=full TCMCP_MAX_MODE=full TCMCP_CONFIRM=0`. In that configuration a single mis-aimed tool call can stop the PLC, activate a half-built configuration or reboot the IPC. The server will do exactly what it is told; the only remaining gate is the MCP client's own tool-permission prompt. Keep a denylist for E-stop/safety symbols regardless.
 
-## Tools (141) + 5 prompts
+## Tools (143) + 5 prompts
 
 **Workflows (one call = a whole chain)** `wf_debug_symbol` · `wf_fb_profile` · `wf_release_check` · `wf_project_overview`
 
@@ -138,7 +138,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **Runtime (ADS)** `ads_discover` · `ads_connect` · `ads_status[port]` · `ads_list_symbols[flag]` · `ads_symbol_info` · `ads_read` · `ads_read_many` · `ads_leaves` · `ads_dump` · `ads_types` · `ads_io_read` · `ads_write` · `ads_write_many` · `ads_read_raw` · `ads_write_raw` · `ads_watch` · `ads_wait_until` · `ads_plc_state` · `ads_system_mode` · `ads_ethercat` · `ads_routes` · `ads_add_route_to_plc` · `ads_app_info` · `ads_task_stats` · `ads_ping` · `ads_call_method` · `ads_export` (C#/TS/JSON from the datatype table)
 
-**Recorder** `rec_start` · `rec_list` · `rec_status` · `rec_snapshot` · `rec_stats` · `rec_read` · `rec_stop` · `rec_export` · `rec_delete` · `rec_pulses` · `rec_latency` · `rec_compare`
+**Recorder** `rec_start` · `rec_capture` · `rec_list` · `rec_status` · `rec_snapshot` · `rec_stats` · `rec_read` · `rec_stop` · `rec_verify` · `rec_export` · `rec_delete` · `rec_pulses` · `rec_latency` · `rec_compare`
 
 **Test bench** `test_expect` · `test_stable` · `test_response` · `test_scenario` · `snap_save` · `snap_compare` · `snap_apply` · `snap_list`
 
@@ -216,7 +216,7 @@ If the datatype upload fails on a target, every tool falls back to the member sy
 > rec_start prefix=MAIN.fbFill mode=change cycle_ms=1 name=fill-cycle
     → every scalar under MAIN.fbFill, PLC-timestamped on every change
 > …run the machine, deploy, whatever…
-> rec_status <id>          → events, rate, drops, last value of every symbol
+> rec_status <id>          → samples, missing_samples, completeness, drops, backlog, last values
 > rec_snapshot <id>        → the live tail
 > rec_stats <id>           → per symbol: count, min/max/mean, change count, BOOL edges,
                               state runs with dwell times
@@ -224,10 +224,15 @@ If the datatype upload fails on a target, every tool falls back to the member sy
 > rec_pulses <id> MAIN.fbFill.fbFine.bOpen   → pulse count, width, period, duty
 > rec_latency <id> MAIN.fbFill.fbValve.bOpen == TRUE  MAIN.fbFill.rFlow > 0.5
 > rec_read <id> t_from_ms=800 t_to_ms=1200 wide=true  → what else was true around the event
-> rec_export <id> csv_wide  → spreadsheet
+> rec_export <id> csv_wide  → spreadsheet (with the PLC's FILETIME per row)
+> rec_verify <id> counter=MAIN.nCycleCount → PASS/FAIL: unmodified, no gaps, every cycle present
 ```
 
-Modes: `cycle` = one sample per symbol per `cycle_ms` (set it to the task cycle for a complete trace; expensive), `change` = only when the value changes (cheap, exact edge times), `poll` = sum-read from the PC (any port, no notifications). Triggers: `start_when='MAIN.bStart == TRUE' pre_trigger_ms=500` keeps the half second before the trigger; `stop_when`, `duration_s`, `max_events` end it. Events stream to `~/.twincat_mcp/recordings/<id>.jsonl`; stats are incremental, so a two-hour recording costs no RAM. Recordings from earlier sessions stay readable (`rec_list`, `rec_read`, `rec_pulses`, `rec_export`).
+Modes: `cycle` = one sample per `cycle_ms` (set it to the task cycle for a complete trace), `change` = only when the value changes (cheap, exact edge times), `poll` = sum-read from the PC (any port, no notifications; timestamps are this PC's, labelled `time_source: pc`). Triggers: `start_when='MAIN.bStart == TRUE' pre_trigger_ms=500` keeps the half second before the trigger; `stop_when`, `duration_s` (PLC time), `post_trigger_s`, `max_events` end it. Recordings from earlier sessions stay readable (`rec_list`, `rec_read`, `rec_pulses`, `rec_export`).
+
+**Accuracy (0.7).** Neighbouring variables share one ADS notification per contiguous memory block (an FB, a struct, an array): the runtime sends the whole block per sample and the leaves are decoded on the PC. On a 1 ms task, 300 counters as one block were lossless; as 300 separate notifications ~5 % complete — so select whole FBs/structs/arrays rather than hundreds of scattered globals. Every loss is counted: `missing_samples` / `completeness` per block from the PLC timestamps (cycle mode), `dropped` (backlog full), `dropped_on_stop`. A notification that cannot be registered fails the start (`allow_partial=true` records the rest and lists `unsubscribed_symbols`).
+
+**Provenance.** The file (`~/.twincat_mcp/recordings/<id>.jsonl`) stores the raw bytes the runtime sent and the runtime's own sample timestamps: `_t0.filetime` is the PLC FILETIME of the first sample and `t_ms` has 0.1 µs resolution, so `filetime + t_ms·10⁴` is each sample's exact PLC time (`rec_export` adds it as `plc_filetime`). The footer carries a SHA-256 over every line, signed with a per-install key. `rec_verify <id> counter=MAIN.nCycleCount` proves (1) the file is unmodified, (2) no holes in the PLC timeline, (3) the per-cycle counter steps by exactly 1 — the ground truth for "no sample lost". The acceptance run does this with `TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount` at the task cycle.
 
 ## Choosing what to record: capture profiles
 
@@ -427,6 +432,8 @@ The XAE and System-Service paths are written against Beckhoff's Infosys document
 Anything that fails: the tool error text contains the ADS/HRESULT code; paste it back and the fix is usually one constant.
 
 ## Changelog
+
+**0.7.0** — recording accuracy and field report round 3 (A1–A7, #75–79, P2–P19, K1). Recorder: one ADS notification per contiguous memory block instead of per symbol (the field test: 300 values as one block lossless, as 300 notifications ~5 %); the callback only copies the raw sample; file format 2 keeps the runtime's raw bytes and exact PLC FILETIME per sample, a symbol table and block layout in the header, and a signed SHA-256 footer; `missing_samples`/`completeness` per block from the PLC timestamps, `dropped`, `dropped_on_stop`; a stop drains the backlog to the file; duration is PLC time; a notification that cannot be registered fails the start (`allow_partial`); patterns expand to leaves like `rec_scan`; live statistics step aside under load and `rec_stats` recomputes them from the file; new `rec_verify` (integrity, timeline, per-cycle counter) and `rec_capture` (record → stats → verdict in one call); the acceptance run proves a lossless recording of `_TaskInfo[1].CycleCount` at the task cycle. `ads_watch` / `ads_wait_until` on ADS notifications, off the ADS workers; `ads_write_many` as one sum-write (all values in the same PLC cycle); writes report `written` vs `read_back`; symbol/datatype caches follow the runtime's symbol version instead of a 300 s timer; `ads_system_mode` waits for the requested mode; COM calls blocked by a modal dialog fail within a second naming it; `xae_deploy` fails unless the target runs afterwards; `tc_doctor` one-line summary (`verbose` for the config); `server.tool_groups`; launcher skips hashing unchanged sources; Infosys indexes the books of the libraries the project references. Older recording files stay readable. 143 tools.
 
 **0.6.3** — field report round 2 (items 51–74, framework project with inheritance, interfaces, enums, strings, arrays). Writes: an array write must supply every element (a short list zeroed the rest); POINTER/REFERENCE and INTERFACE variables are refused (an interface is a pointer the PLC calls through) and read as `0x…` hex or null; writes to anything declared in a `VAR … CONSTANT` block are refused from the project source (the runtime does not flag them READONLY); STRING(n) length is checked before ADS; enum names are accepted (`Idle`, `E_State.Idle`) in `ads_write` and `test_expect`; `ads_write_many` pre-checks every item before the first write and reports applied/failed/not_attempted if the PLC rejects one. Recorder: `duration_s` no longer compares the PLC's task clock with Windows time (cycle mode ran on for 30 s), `rec_stop` keeps its own stop reason, the file is flushed every second, `post_trigger_s` ends a triggered recording after the trigger. Project: the index refreshes incrementally (mtime) before every index-based tool; `proj_vs_runtime` matches `x[*]` source arrays to their elements, collapses arrays and caps output; `proj_call_graph` follows interface calls to every implementing FB, inherited methods and THIS^ overrides; `proj_interface` merges the EXTENDS chain (`inherited_from`) and inherited IMPLEMENTS; `wf_debug_symbol` no longer calls `fb(x := y)` a write of y and lists .TcVIS input-action writes; `tcunit_scaffold` takes the project's ProductVersion, keeps declared input defaults, includes inherited methods; `empty_method` skips interface/abstract methods; C# enums use the declared base type. Safety: confirmation prompts read `DESTRUCTIVE: <tool> / Target / Machine / Mode / Effect`, the audit records how long the prompt was open and flags sub-1.5 s answers, `safety.allow_elicitation = false` forces the token path, `safety.edit_requires_config_mode = true` refuses code edits unless TwinCAT is in CONFIG; destructive XAE tools refuse via the guard even with no shell attached. IPC: `ipc_eventlog` is confirmed as itself, lists the registered TwinCAT/Beckhoff providers, deletes its temp file; `boot:` resolves to the live 4026 folder (ProgramData), not the stale `C:\TwinCAT\3.1\Boot`. ADS errors 6/7/1797/1808/1861 carry a plain-language hint; TOML config loads on Python 3.10 (tomli). 141 tools.
 
