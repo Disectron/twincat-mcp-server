@@ -1,4 +1,4 @@
-# twincat-mcp 0.6.2 — tool reference
+# twincat-mcp 0.6.3 — tool reference
 
 141 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
@@ -29,7 +29,7 @@
 - `ads_read` [R] — Read one symbol with type-aware decoding. Structs/FB instances/arrays of structs decode into a nested tree (datatype table); TIME/DATE/DT/TOD get readable text; enums get names. Trees larger than max_chars are summarised (member names + sizes) — use ads_leaves or ads_dump for the full content.
 - `ads_read_many` [R] — Read several symbols in one ADS sum-command. Returns {name: value | {error}}.
 - `ads_write` [W] — Write a symbol on the running PLC. Accepts JSON scalars, lists for arrays, and literals like 'T#1s500ms', 'D#2026-10-15', '16#FF'. Returns before/after. Gated: readonly=never; guarded=write_allowlist; full=denylist only.
-- `ads_write_many` [W] — Write several symbols sequentially ({name: value}). Each one is gated and audited; stops at the first refusal.
+- `ads_write_many` [W] — Write several symbols ({name: value}) all-or-nothing up front: every symbol is gated (allow/deny list) and pre-checked (type, range, enum name, array/string length, CONSTANT, pointer/interface) BEFORE the first write; one refusal → nothing is written and every problem is listed. The writes then run in order; if one…
 - `ads_io_read` [R] — Raw process image of the PLC: area 'I' (%IB inputs) or 'Q' (%QB outputs) at a byte offset — what the task actually sees/wrote, independent of symbol names (link checks).
 - `ads_read_raw` [R] — Raw ADS read by index group/offset on any port (hex + little-endian uint).
 - `ads_write_raw` [W] — Raw ADS write by index group/offset — PLC runtime ports (851-859) only. Every symbol whose memory overlaps the written range is checked against the write allow/deny lists; the raw target itself is 'raw:<port>/<igrp hex>/<ioffs hex>'.
@@ -88,9 +88,9 @@
 
 ## Target OS — System Service (7)
 
-- `ipc_eventlog` [D] — Windows event log of the target (Windows 7/10/11 IPCs): runs wevtutil on the IPC via the System Service, then reads the result file back. Not available on Windows CE / TC-BSD targets (use the XAE error list for ADS logger messages there). Destructive-class because it starts a process on the IPC.
-- `ipc_read_file` [R] — Read a file from the target IPC's file system over ADS (no share needed), e.g. 'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml' or a log. Binary → base64. OS-independent prefixes resolve on the target: 'boot:<name>' (TwinCAT boot folder — \Hard Disk\TwinCAT\3.1\Boot on CE7), 'bootprj:', 'bootdata:', 'target:',…
-- `ipc_list_dir` [R] — List files on the target matching a Win32 pattern, e.g. 'C:\TwinCAT\3.1\Boot\*' or 'boot:*' (boot folder on any target OS; see ipc_read_file for the other prefixes).
+- `ipc_eventlog` [D] — Windows event log of the target (Windows 7/10/11 IPCs): runs wevtutil on the IPC via the System Service, reads the result back and deletes the temp file. Also lists the event providers registered on the target whose name contains 'TwinCAT' or 'Beckhoff', so a provider that does not exist there (the default name…
+- `ipc_read_file` [R] — Read a file from the target IPC's file system over ADS (no share needed). Binary → base64. Prefer the OS-independent prefixes, which the target resolves itself: 'boot:<name>' (the live TwinCAT boot folder — C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot on 3.1.4026, \Hard Disk\TwinCAT\3.1\Boot on CE7), 'bootprj:',…
+- `ipc_list_dir` [R] — List files on the target matching a Win32 pattern. Prefer 'boot:*' (the live boot folder on any target OS; the result names the absolute folder in resolved_pattern) over a hard-coded 'C:\TwinCAT\3.1\Boot\*', which is the stale legacy folder on 3.1.4026. Other prefixes: see ipc_read_file.
 - `ipc_write_file` [C] — Write a file on the target IPC (text or base64). Control-class.
 - `ipc_delete_file` [D] — Delete a file on the target IPC. Destructive-class.
 - `ipc_start_process` [D] — Start a process on the target IPC (NT_StartProcess equivalent). Destructive-class.

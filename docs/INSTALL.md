@@ -119,7 +119,7 @@ If `claude plugin configure` also refuses, the options are plain environment var
 **Pre-build the venv now** (optional but recommended — it removes the one-minute first-start wait from §5):
 
 ```powershell
-python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.6.2\scripts\launch.py" --no-run
+python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.6.3\scripts\launch.py" --no-run
 ```
 (the version folder changes with each plugin version; `dir $env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp` lists it.)
 
@@ -186,6 +186,8 @@ confirm_ttl_s = 180
 write_allowlist = []                 # EMPTY on day one: guarded mode then refuses every write (verified behaviour)
 write_denylist  = ["*.bEStop*", "*EStop*", "GVL_Safety.*", "*.bEmergency*"]   # never writable in any mode
 audit_reads = false
+allow_elicitation = true             # false: no in-chat confirm prompts — every approval is a tc_request_confirmation token
+edit_requires_config_mode = false    # true: code/project edits refused unless TwinCAT on the target is in CONFIG
 
 [docs]
 enabled = true
@@ -259,7 +261,7 @@ Two things no longer need a reconnect:
 - `tc_allow_write "GVL_Test.*"` adds an allow-list pattern for this session only, behind a confirmation,
   audited. The deny list still wins.
 
-Behaviours that look like failures and are not (0.6.2):
+Behaviours that look like failures and are not (0.6.2 / 0.6.3):
 - `tc_set_mode full` from `readonly`/`guarded` returns a confirmation request first. Escalation is confirmed
   and audited; lowering the mode is free. Loading `mode = "full"` from the TOML still needs no confirmation.
 - `ads_write` of 70000 into a WORD (or any out-of-range integer, or `"yes"` into a BOOL) is refused with
@@ -274,6 +276,17 @@ Behaviours that look like failures and are not (0.6.2):
   `RPC server unavailable`.
 - `hmi_scan` on a PLC project folder reports `.TcVIS` bindings (kinds `tcvis` and `tcvis_write`); point
   `project.hmi_root` at the TE2000 folder only if you have one.
+- `ads_write` refuses, by design: a list shorter than the array (`has 8 elements; got 2`), POINTER/REFERENCE and
+  INTERFACE variables, anything declared in a `VAR ... CONSTANT` block, a string longer than its STRING(n).
+  `ads_write_many` writes nothing if any item would be refused, and lists every problem.
+- A confirmation prompt now starts with `DESTRUCTIVE:` or `MACHINE CONTROL:` and names target, machine, mode and
+  effect. `tc_audit_tail` shows `prompt_open_s`; `fast_answer` marks an accept under 1.5 s. If prompts get clicked
+  through, set `allow_elicitation = false` and approve with tokens instead.
+- `ipc_eventlog` is confirmed as `tc_request_confirmation(action='ipc_eventlog', target='Application')`.
+  An empty result with `note: … not registered` and `providers_on_target` means the default provider name does not
+  exist on this TwinCAT build — pass one of the listed names.
+- `rec_start(..., start_when=…, duration_s=…)`: `duration_s` counts from the first sample, including the wait for
+  the trigger. Use `post_trigger_s` for "N seconds after the trigger".
 
 Tool names: every tool is `mcp__plugin_twincat-mcp_twincat__<name>`; you never type that, Claude does.
 `/permissions` rules use that form, e.g. allow `mcp__plugin_twincat-mcp_twincat__ads_read*` to stop the

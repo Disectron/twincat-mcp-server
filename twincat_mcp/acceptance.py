@@ -70,7 +70,8 @@ MANUAL: dict[str, str] = {
     "test_response": "stimulus → response on a stopped machine, with restore=true",
     "test_scenario": "a multi-step scenario spec on a stopped machine",
     "snap_apply": "covered with --allow-writes (dry run is exercised read-only)",
-    "ipc_eventlog": "Windows targets only (wevtutil); not CE7",
+    "ipc_eventlog": "Windows targets only (wevtutil); not CE7. Token: tc_request_confirmation(action='ipc_eventlog', "
+                    "target='Application'); check providers_on_target and that the temp file is gone (ipc_list_dir boot:tcmcp*)",
     "ipc_write_file": "write a scratch file under boot: on the test box, then ipc_delete_file it",
     "ipc_delete_file": "delete the scratch file written above",
     "ipc_start_process": "start an exe that exists on the target (CE7: \\Windows\\cmd.exe), test box only",
@@ -743,7 +744,8 @@ class Acceptance:
         val = cur.get("value")
         await self.check(ph, "snap_save", {"name": "acceptance_pre", "symbols": [sym]})
         await self.check(ph, "ads_write", {"name": sym, "value": val}, lambda p: None if isinstance(p, dict) else "not a dict")
-        await self.check(ph, "ads_write_many", {"values": {sym: val}})
+        await self.check(ph, "ads_write_many", {"values": {sym: val}},
+                         lambda p: None if isinstance(p, dict) and p.get("complete") and sym in p.get("applied", {}) else "not complete")
         await self.check(ph, "snap_compare", {"a": "acceptance_pre"}, lambda p: None if isinstance(p, dict) else "not a dict")
         await self.check(ph, "snap_apply", {"name": "acceptance_pre"})
         tail = await self.check(ph, "tc_audit_tail", {"n": 10})
