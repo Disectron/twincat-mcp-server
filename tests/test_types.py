@@ -68,6 +68,10 @@ def test_int_literals_and_bool():
     assert T.encode(i, "2#101") == 5
     b = T.parse_type("BOOL")
     assert T.encode(b, "TRUE") is True and T.encode(b, "0") is False
+    # N22: only what the error text documents — "yes" once reset a counter on the test PLC
+    for bad in ("yes", "no", "on", "off", "maybe", 2, -1):
+        with pytest.raises(ValueError):
+            T.encode(b, bad)
 
 
 def test_pointer_size():

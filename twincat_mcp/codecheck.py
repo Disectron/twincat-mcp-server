@@ -552,7 +552,7 @@ def call_graph(idx: ProjectIndex, root: str, depth: int = 4) -> dict[str, Any]:
         # direct function / FB-type calls
         for m in _RE_CALL.finditer(impl):
             tu = idx.units.get(m.group(1).lower())
-            if tu and tu.kind in ("FUNCTION", "FUNCTION_BLOCK") and tu.name.lower() != key:
+            if tu and tu.kind in ("FUNCTION", "FUNCTION_BLOCK", "PROGRAM") and tu.name.lower() != key:
                 visit(tu, lvl + 1, f"{u.name} → {m.group(1)}()")
         owner = idx.units.get((u.parent or u.name).split(".")[0].lower()) if u.parent else u
         for m in _RE_METHOD_CALL.finditer(impl):
@@ -778,11 +778,7 @@ def tcunit_scaffold(idx: ProjectIndex, fb_name: str, out_dir: str | None = None,
                                f"{v['comment'] or v['type']}{' (declared default)' if v.get('init') else ''}"
                                f"{' — inherited from ' + v['inherited_from'] if v.get('inherited_from') else ''}"
                                for v in iface["inputs"])
-    try:
-        mpv = re.search(r'ProductVersion="([^"]+)"', src.read_text(encoding="utf-8-sig", errors="replace")[:400])
-    except OSError:
-        mpv = None
-    product_version = mpv.group(1) if mpv else "3.1.4024.12"
+    product_version = _product_version(src)
     out_asserts = "\n".join(f"\tAssertEquals_{_assert_suffix(v['type'])}(Expected := {_default_for(v['type'])}, Actual := fbUut.{v['name']}, Message := '{v['name']} initial');"
                             for v in iface["outputs"] if _assert_suffix(v["type"]))
     tests.append(("Test_InitialState",
@@ -840,6 +836,31 @@ def _register_in_plcproj(idx: ProjectIndex, pou: Path) -> dict[str, Any]:
         proj.write_text(new, encoding="utf-8")
         return {"file": str(proj), "added": inc}
     return {"added": False, "note": "POU is outside every known .plcproj folder"}
+
+
+def _product_version(src: Path) -> str:
+    """#66: the TwinCAT build the project is on — the newest of the source file's ProductVersion and the
+    TcVersion of the .tsproj above it (a POU last saved by an older XAE still lives in a newer project)."""
+    found: list[str] = []
+    try:
+        m = re.search(r'ProductVersion="([^"]+)"', src.read_text(encoding="utf-8-sig", errors="replace")[:2000])
+        if m:
+            found.append(m.group(1))
+    except OSError:
+        pass
+    for d in list(src.parents)[:6]:
+        for ts in d.glob("*.tsproj"):
+            try:
+                m = re.search(r'TcVersion="([\d.]+)"', ts.read_text(encoding="utf-8-sig", errors="replace")[:4000])
+            except OSError:
+                m = None
+            if m:
+                found.append(m.group(1))
+        if found and len(found) > 1:
+            break
+    def key(v: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in re.findall(r"\d+", v))
+    return max(found, key=key) if found else "3.1.4024.12"
 
 
 def _default_for(type_str: str) -> str:

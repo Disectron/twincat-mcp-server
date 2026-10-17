@@ -47,6 +47,7 @@ def kb(tmp_path):
     for lib, vers in (("Tc2_Standard", ["3.3.3.0", "3.4.5.0"]), ("Tc2_Smtp", ["3.3.4.0"])):
         for v in vers:
             (libs / lib / v).mkdir(parents=True)
+    (tmp_path / "libs" / "System" / "VisuElems" / "3.5.13.40").mkdir(parents=True)
     k = K.Knowledge(tmp_path / "home", None, [str(esi)], [str(tmp_path / "libs")])
     return k, tmp_path
 
@@ -119,9 +120,19 @@ def test_library_versions(kb, project_dir):
     pp.write_text(pp.read_text().replace(
         '<PlaceholderReference Include="Tc2_Standard">',
         '<PlaceholderReference Include="Tc2_Smtp"><DefaultResolution>Tc2_Smtp, 3.3.1.0 (Beckhoff Automation GmbH)</DefaultResolution></PlaceholderReference>'
+        '<PlaceholderReference Include="VisuElems"><DefaultResolution>VisuElems, 4.10.0.0 (System)</DefaultResolution></PlaceholderReference>'
         '<PlaceholderReference Include="Tc2_Standard">'))
     rep = K.library_report([str(pp)], k.installed_libraries())
     libs = {x["library"]: x for x in rep["projects"][0]["libraries"]}
     assert libs["Tc2_Standard"]["requested"] == "*" and libs["Tc2_Standard"]["effective"] == "3.4.5.0"
     assert libs["Tc2_Standard"]["installed"] == ["3.3.3.0", "3.4.5.0"]
     assert "not installed on this PC" in libs["Tc2_Smtp"]["warning"]
+    # N19: a (System) placeholder is resolved by the placeholder profile — information, not a build failure
+    assert "warning" not in libs["VisuElems"] and "placeholder profile" in libs["VisuElems"]["info"]
+
+
+def test_n17_ads_error_6_explained_from_port_and_mode():
+    assert "CONFIG" in K.ads6_context(851, "CONFIG")["cause"] and "ads_system_mode run" in K.ads6_context(851, "CONFIG")["fix"]
+    assert "852" not in K.ads6_context(851, "RUN")["cause"] and "no PLC project is activated" in K.ads6_context(851, "RUN")["cause"]
+    assert "851 is the first" in K.ads6_context(852, "RUN")["cause"]
+    assert "ads_ping" in K.ads6_context(851, None)["fix"]

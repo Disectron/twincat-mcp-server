@@ -176,12 +176,26 @@ class App:
         try:
             return await worker.run(fn, *a, timeout=timeout or (self.cfg.ads.max_watch_duration_ms / 1000 + 30), **kw)
         except (AdsError, RecorderError, TestError) as exc:
-            raise ToolError(K.annotate(str(exc))) from exc
+            raise ToolError(await self._ads_explain(str(exc), kw.get("port"))) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError("ADS call timed out (router/route/firewall? run tc_doctor)") from exc
         except (pyads.ADSError, OSError) as exc:
             # safety net for a backend path that did not translate the pyads/socket error itself
-            raise ToolError(K.annotate(f"ADS error: {_fmt_ads_exc(exc)}")) from exc
+            raise ToolError(await self._ads_explain(f"ADS error: {_fmt_ads_exc(exc)}", kw.get("port"))) from exc
+
+    async def _ads_explain(self, msg: str, port: Any) -> str:
+        """Known cause/fix for an ADS error; ADSError 6 is explained from the real port and TwinCAT mode (N17)."""
+        if re.search(r"ADSError 6 \(0x6\)", msg):
+            p = port if isinstance(port, int) else self.ads.port
+            mode = None
+            if p != 10000:
+                try:
+                    mode = (await self.ads_worker.run(self.ads.system_state, timeout=5)).get("twincat_mode")
+                except Exception:  # noqa: BLE001
+                    mode = None
+            k = K.ads6_context(p, mode if isinstance(mode, str) else None)
+            return f"{msg} [cause: {k['cause']}. fix: {k['fix']}]"
+        return K.annotate(msg)
 
     def _dialog_hint(self) -> str:
         """What is open in the shell right now — the usual reason a COM call is rejected or hangs."""
@@ -247,6 +261,9 @@ class App:
         st = dict(self.docs_bg)
         if st.get("started") and not st.get("finished"):
             st["running_for_s"] = round(time.time() - st["started"], 0)
+        errs = [r for r in (st.get("result") or []) if isinstance(r, dict) and r.get("error")]
+        if errs:
+            st["errors"] = errs          # N21: a book that fails to index is reported, not silently retried
         return st
 
     def project_library_books(self) -> list[str]:
@@ -305,7 +322,7 @@ class App:
         except sqlite3.OperationalError as exc:
             st = self.docs_index_status()
             busy = st.get("started") and not st.get("finished")
-            raise ToolError(f"Infosys index busy ({exc})" + (f" — the default books are being indexed in the background "
+            raise ToolError(f"Infosys index busy ({exc})" + (f" — {', '.join(st.get('books') or [])} being indexed in the background "
                             f"({st.get('running_for_s', 0):.0f} s so far); retry in a moment or search with web_fallback=true" if busy else "")) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError(f"Infosys call exceeded {timeout:.0f} s (slow network? smaller max_pages?)") from exc
@@ -313,8 +330,14 @@ class App:
             raise ToolError(f"Infosys lookup failed: {type(exc).__name__}: {exc}") from exc
         st = self.docs_bg
         if isinstance(res, dict) and st.get("started") and not st.get("finished"):
-            res["index_status"] = (f"default books are being indexed in the background ({round(time.time() - st['started'])} s so far); "
-                                   "until that finishes, searches answer from the web fallback")
+            books = ", ".join(st.get("books") or [])
+            msg = f"indexing in the background: {books} ({round(time.time() - st['started'])} s so far)"
+            backend = str(res.get("backend") or "")
+            if backend and "web" in backend.lower():
+                msg += "; this answer came from the web fallback"
+            elif backend:
+                msg += f"; this answer came from the local index ({backend}) — results from those books follow once indexed"
+            res["index_status"] = msg
         return res
 
     async def mem_call(self, fn, *a, **kw) -> Any:
@@ -1544,6 +1567,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             stats = (await app.mem_call(app.rec.stats, rid, None, False, 0, True)).get("symbols")
         out = {**{k: fin[k] for k in keep if k in fin}, "verify": {k: ver.get(k) for k in ("verdict", "integrity", "timeline", "counter") if k in ver},
                "stats": stats}
+        for k in ("label", "gap_markers"):
+            if fin.get(k) is not None:
+                out[k] = fin[k]
+        if stats is None:
+            # N23: say why instead of a bare null
+            out["stats_note"] = (f"{fin.get('symbols')} symbols: per-symbol statistics are not inlined above 50 symbols "
+                                 f"(response size); rec_stats(id='{rid}', symbols=[…]) computes them from the file")
         out["engine"] = st.get("engine", out.get("engine"))
         if st.get("engine_note"):
             out["engine_note"] = st["engine_note"]

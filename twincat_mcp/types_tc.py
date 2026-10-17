@@ -260,11 +260,12 @@ def encode(tt: TcType, value: Any) -> Any:
             return value
         if isinstance(value, str):
             low = value.strip().lower()
-            if low in ("1", "true", "on", "yes"):
+            # N22: exactly what the error text documents — a write to the PLC is no place to guess intent
+            if low in ("1", "true"):
                 return True
-            if low in ("0", "false", "off", "no"):
+            if low in ("0", "false"):
                 return False
-            raise ValueError(f"not a BOOL: {value!r} (use true/false or 0/1)")
+            raise ValueError(f"not a BOOL: {value!r} (use true/false or 0/1; yes/no/on/off are refused)")
         if isinstance(value, (int, float)) and value in (0, 1):
             return bool(value)
         raise ValueError(f"not a BOOL: {value!r} (use true/false or 0/1; -1 and other numbers are refused rather than coerced)")

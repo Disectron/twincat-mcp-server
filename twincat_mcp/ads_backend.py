@@ -1156,8 +1156,7 @@ def _csv_val(v: Any) -> Any:
 
 
 _ADS_HINTS = {
-    6: "target port not found — nothing is listening on that AMS port (e.g. no PLC runtime on 852: only 851 exists unless a "
-       "second PLC project is activated)",
+    6: "target port not found — nothing is listening on that AMS port",
     7: "target machine not found — the AMS route to that NetId is missing or the target is off",
     1797: "parameter size not correct — the value does not fit the variable (string too long, wrong array length or type)",
     1808: "symbol not found — check the spelling (ads_list_symbols) or whether the program was downloaded",

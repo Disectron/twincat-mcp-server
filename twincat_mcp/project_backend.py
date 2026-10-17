@@ -20,6 +20,7 @@ discipline. (Semantic search à la twincat-index-mcp is a different tool.)
 from __future__ import annotations
 
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, asdict
@@ -114,9 +115,16 @@ class ProjectIndex:
         self.tsproj: list[str] = []
         self.plcproj: list[dict[str, Any]] = []
         self.scanned_at: float | None = None
+        # N26: tools run in worker threads; parallel first calls must not scan concurrently (each scan clears
+        # and re-appends → duplicated plcproj/units). Re-entrant: refresh() may fall back to scan().
+        self._scan_lock = threading.RLock()
 
     # ------------------------------------------------------------ scan
     def scan(self, root: str | None = None) -> dict[str, Any]:
+        with self._scan_lock:
+            return self._scan(root)
+
+    def _scan(self, root: str | None = None) -> dict[str, Any]:
         if root:
             self.root = Path(root)
         if self.root is None or not self.root.is_dir():
@@ -155,7 +163,9 @@ class ProjectIndex:
         """Scan on first use; afterwards an incremental mtime refresh (throttled) so objects XAE just created or
         edited are seen without a manual proj_scan — a stale index silently answering is worse than a slow one."""
         if self.scanned_at is None:
-            self.scan()
+            with self._scan_lock:
+                if self.scanned_at is None:          # another thread may have finished the scan meanwhile
+                    self.scan()
             return
         if time.time() - self.scanned_at >= self.REFRESH_MIN_S and self.root is not None and self.root.is_dir():
             try:
@@ -174,6 +184,10 @@ class ProjectIndex:
 
     def refresh(self) -> dict[str, Any]:
         """Incremental rescan: re-index files whose mtime changed, pick up new files, drop deleted ones."""
+        with self._scan_lock:
+            return self._refresh()
+
+    def _refresh(self) -> dict[str, Any]:
         if self.scanned_at is None or self.root is None:
             return self.scan()
         changed, added, removed = [], [], []

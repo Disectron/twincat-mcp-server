@@ -73,6 +73,7 @@ MERGE_GAP_BYTES = 256          # leaves closer than this share one notification
 MAX_BLOCK_BYTES = 16384        # one notification never carries more than this
 QUEUE_BYTES = 256 << 20        # in-memory backlog cap per recording
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
+TAIL_WAIT_S = 1.0             # after the duration: wait at most this long for in-flight samples up to the cut
 LIVE_VALUES_PER_S = 20_000     # above this (leaves × samples/s) nothing is decoded while recording (see Recording)
 _HDR_DATA_OFFSET = 16          # SAdsNotificationHeader: u32 handle, u64 timestamp, u32 size, data
 
@@ -446,6 +447,7 @@ class Recording:
         self.max_backlog = 0
         self.live_stats = True               # decode + statistics while recording (False: deferred to the file)
         self._cut_t: float | None = None     # drain only samples up to this PLC-relative time
+        self._tail_wait: float | None = None  # monotonic time the duration was reached (N13 tail wait)
         self._cut_now = False                 # discard the backlog (limit reached at a known sample)
         self._sha = hashlib.sha256()
         self._lines = 0
@@ -705,19 +707,28 @@ class Recording:
             self.stop_reason = f"post_trigger {self.post_trigger_s}s after the start_when trigger"
             self._cut_t = self.triggered_at + self.post_trigger_s * 1000.0
             self._stop.set()
-        elif self.duration_s and self.last_t / 1000.0 >= self.duration_s:
-            self.stop_reason = f"duration {self.duration_s}s"
-            self._cut_t = self.duration_s * 1000.0
-            self._stop.set()
-        elif self.duration_s and mono is not None and mono >= self.duration_s:
-            # this PC's clock says the time is up; samples taken by the PLC within the duration may still be
-            # queued (ingest behind): they are drained and written, later ones are not part of the recording
-            self.stop_reason = f"duration {self.duration_s}s"
-            self._cut_t = self.duration_s * 1000.0
-            self._stop.set()
+        elif self.duration_s and (self.last_t / 1000.0 >= self.duration_s or (mono is not None and mono >= self.duration_s)):
+            # N13: the window is [0, duration]. Either the PLC time or this PC's clock says it is over — but samples
+            # the PLC took inside the window may still be on their way (ADS → queue). Keep the notifications until
+            # every block has delivered up to the cut (bounded by TAIL_WAIT_S), so the tail isn't lost to the stop;
+            # samples after the cut are not part of the recording (counted in after_limit).
+            cut = self.duration_s * 1000.0
+            self._cut_t = cut
+            now = time.monotonic()
+            if self._tail_wait is None:
+                self._tail_wait = now
+            if self._tail_reached(cut) or now - self._tail_wait >= TAIL_WAIT_S:
+                self.stop_reason = f"duration {self.duration_s}s"
+                self._stop.set()
         elif self.duration_s and self.t0_mono is None and (time.time() - self.created) >= self.duration_s + 5:
             self.stop_reason = "duration elapsed with no data (symbols never updated?)"
             self._stop.set()
+
+    def _tail_reached(self, cut: float) -> bool:
+        """Every block that delivered at all has a sample within one period of the cut."""
+        if self.mode != "cycle" or not self.blocks:
+            return True
+        return all(b.last_t is None or not b.min_step or b.tail_missing(cut) == 0 for b in self.blocks)
 
     def request_stop(self, reason: str = "requested") -> None:
         if not self._stop.is_set():
@@ -1307,6 +1318,7 @@ class Recorder:
             raise RecorderError("post_trigger_s needs start_when (it counts from the trigger)")
         meta = {"ams_net_id": self.ads.net_id, "port": port or self.ads.port, "start_when": start_when,
                 "stop_when": stop_when, "pre_trigger_ms": pre_trigger_ms, "post_trigger_s": post_trigger_s,
+                "edge_triggers": bool(edge_triggers),
                 "selection": {"symbols": symbols, "prefix": prefix, "pattern": pattern},
                 "cycle_counter": counter.name if counter is not None else None, "max_delay_ms": max_delay_ms,
                 "manifest": manifest, "recorder": f"twincat-mcp {_pkg_version()}"}

@@ -68,8 +68,9 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, str]] = [(re.compile(p, re.I), c,
      "the target did not answer in time: missing/broken route, firewall (TCP 48898), target busy or stopped",
      "ads_ping; ads_routes; check the route on both sides and the Windows firewall"),
     (r"adserror 6\b|0x6\b.*port|target port not found",
-     "nothing listens on that AMS port (e.g. no second PLC runtime on 852)",
-     "use port 851 for the first PLC runtime; ads_status port=10000 for the system service"),
+     "nothing listens on that AMS port: TwinCAT is in CONFIG (PLC runtimes exist only in RUN), no PLC project is "
+     "activated on it, or the port number is wrong (851 = first PLC runtime, 852 = second …)",
+     "ads_status port=10000 shows RUN/CONFIG; ads_system_mode run, or activate the PLC project"),
     (r"adserror 7\b|target machine not found",
      "no route to that AMS NetId",
      "ads_add_route_to_plc / XAE → Choose Target → Search; check ams_net_id in the config"),
@@ -83,6 +84,23 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, str]] = [(re.compile(p, re.I), c,
      "reading/writing this index group/offset is not permitted (read-only area or protected symbol)",
      "write a writable symbol instead; check READONLY flags with ads_symbol_info"),
 ]]
+
+
+def ads6_context(port: int | None, mode: str | None) -> dict[str, str]:
+    """N17: ADSError 6 (target port not found) explained from the actual port and TwinCAT mode."""
+    p = port or 851
+    if mode == "CONFIG" and 850 <= p <= 899:
+        return {"cause": f"TwinCAT is in CONFIG mode — the PLC runtime on port {p} exists only in RUN",
+                "fix": "ads_system_mode run (or activate the configuration and restart in RUN)"}
+    if mode == "RUN" and 851 <= p <= 899:
+        return {"cause": f"TwinCAT is in RUN but no PLC runtime listens on port {p}: no PLC project is activated on it"
+                         + (" (851 is the first PLC runtime)" if p != 851 else "") + ", or there is no boot project",
+                "fix": "activate the PLC project (xae_activate_configuration), or use the port it runs on"}
+    if mode is None:
+        return {"cause": f"nothing listens on AMS port {p} and the system service (port 10000) did not answer either — "
+                         "is TwinCAT running on the target, and is the route right?",
+                "fix": "ads_ping; ads_routes; tc_doctor"}
+    return {"cause": f"nothing listens on AMS port {p} (TwinCAT is in {mode})", "fix": "check the port number"}
 
 
 def known_error(msg: str) -> dict[str, str] | None:
@@ -560,8 +578,16 @@ def _lib_row(name: str, resolution: str, kind: str, installed: dict[str, dict[st
                            "effective": eff, "installed": versions}
     if overridden:
         row["pinned_by"] = "PlaceholderResolution"
-    if req != "*" and versions and req not in versions:
-        row["warning"] = f"{lib} {req} is not installed on this PC (installed: {versions}) — the build will fail to resolve it"
+    if (kind == "placeholder" and not overridden and req != "*" and versions and req not in versions
+            and (vendor or inst.get("vendor") or "").lower() == "system"):
+        # N19: a placeholder's DefaultResolution is only the fallback — TwinCAT resolves it through the compiler's
+        # placeholder profile first; "(System)" libraries (VisuElems …) are always profile-managed
+        row["effective"] = None
+        row["info"] = (f"{lib} {req} (DefaultResolution) is not installed; TwinCAT resolves this placeholder through its "
+                       f"placeholder profile first (installed: {versions}). Only a problem if the build reports it.")
+    elif req != "*" and versions and req not in versions:
+        row["warning"] = (f"{lib} {req} is not installed on this PC (installed: {versions}) — the build will fail to resolve it"
+                          + (" unless the compiler's placeholder profile maps it" if kind == "placeholder" and not overridden else ""))
     elif req == "*" and not versions and installed:
         row["warning"] = f"{lib} is not installed on this PC"
     return row

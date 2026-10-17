@@ -336,6 +336,33 @@ def test_block_notification_gaps_are_counted_and_file_is_provable(rec):
     assert v2["integrity"].startswith("MODIFIED") and v2["seal"].startswith("FILE CHANGED SINCE SEALING")
 
 
+def test_n13_duration_stop_waits_for_in_flight_tail(rec):
+    """N13: this PC's clock reaches the duration while the PLC samples up to the cut are still in flight. The
+    recorder keeps the notifications until they have arrived, so a lossless run is COMPLETE, not FAIL by 3–10."""
+    st = _cycle_rec(rec, symbols=["MAIN.nCycle"], duration_s=0.4)
+    c = _conn()
+    for i in range(300):
+        c.fire("MAIN.nCycle", i, ft(i))
+    time.sleep(0.6)                                   # PC deadline passed; PLC samples 300..400 not delivered yet
+    assert rec.status(st["id"])["active"]
+    for i in range(300, 420):                         # the late tail arrives (and a few after the cut)
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: not rec.status(st["id"])["active"], 3.0)
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    assert out["samples"] == 401 and out["missing_samples"] == 0 and out["label"] == "COMPLETE", out
+    assert rec.verify(st["id"])["verdict"] == "PASS"
+
+
+def test_n13_tail_wait_is_bounded(rec):
+    st = _cycle_rec(rec, symbols=["MAIN.nCycle"], duration_s=0.3)
+    c = _conn()
+    for i in range(200):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: not rec.status(st["id"])["active"], 0.3 + R.TAIL_WAIT_S + 1.5)
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    assert out["label"] == "INCOMPLETE" and out["missing_samples"] == 100     # the tail that never came is counted
+
+
 def test_lossless_run_passes_verification(rec):
     st = _cycle_rec(rec)
     c = _conn()

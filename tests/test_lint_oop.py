@@ -230,3 +230,9 @@ def test_round2_interface_dispatch_inheritance_scaffold(oop_dir):
     body = Path(sc["file"]).read_text()
     assert 'ProductVersion="3.1.4026.12"' in body and "fbUut.nPreset := 10;" in body
     assert "Test_Start" in sc["tests"] and "Test_Stop" in sc["tests"] and "inherited from FB_Hooked" in body
+    # #66: a POU last saved by an older XAE inside a newer project → the project's build (from the .tsproj) wins
+    (oop_dir / "Machine.tsproj").write_text('<?xml version="1.0"?>\n<TcSmProject TcVersion="3.1.4026.14"></TcSmProject>\n')
+    (d / "FB_Counter.TcPOU").write_text((d / "FB_Counter.TcPOU").read_text().replace("3.1.4026.12", "3.1.4024.12"))
+    idx.scan()
+    sc = codecheck.tcunit_scaffold(idx, "FB_Counter", add_to_plcproj=False, overwrite=True)
+    assert 'ProductVersion="3.1.4026.14"' in Path(sc["file"]).read_text()
