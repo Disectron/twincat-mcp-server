@@ -286,6 +286,16 @@ class FakeConnection:
         self.notifications = getattr(self, "notifications", {})
         h = len(self.notifications) + 1
         self.notifications[h] = (key, attr, callback)
+        if getattr(FakeConnection, "initial_notification", False):
+            # real ADS sends the current value right after the registration (both server-cycle and on-change)
+            import time as _t
+            ts = int(_t.time() * 1e7) + 116444736000000000
+            if isinstance(key, tuple):
+                data = memory_image(key[2], key[3])
+                buf = ctypes.create_string_buffer(struct.pack("<IQI", h, ts, len(data)) + data)
+                callback(ctypes.cast(buf, ctypes.POINTER(SAdsNotificationHeader)), (key[1], key[2]))
+            else:
+                callback(type("N", (), {"h": h, "ts": ts, "value": self.values.get(key)})(), key)
         return (h, h)
 
     def del_device_notification(self, nh, uh):
@@ -369,6 +379,7 @@ def install(monkeypatch):
     FakeConnection.shared_state = {}
     FakeConnection.reset_values()
     FakeConnection.no_datatypes = False
+    FakeConnection.initial_notification = False      # tests that model real ADS registration behaviour turn it on
 
     def fake_symbol_info(port, adr, name):
         if name in EXTRA_SYMBOLS:

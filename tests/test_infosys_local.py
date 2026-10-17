@@ -68,7 +68,9 @@ def test_package_maps_to_web_urls(pkg):
     pages = src.pages()
     assert F.ADSREAD in pages and all(u.startswith(C) for u in pages)
     assert not any("/1031/" in u for u in pages), "only the configured language"
-    assert len(set(pages.values())) == 1 and pages[F.ADSREAD] == src.lastmod
+    # identity per page = content (CRC-32 + size), not a file date: equal pages, equal identity
+    assert all(v.startswith("crc:") for v in pages.values()) and len(set(pages.values())) == len(pages)
+    assert src.content_stamp() == HV.HelpViewerSource(pkg).content_stamp()
     assert src.describe()["kind"] == "helpviewer" and src.describe()["books"] == 3
 
 
@@ -89,16 +91,17 @@ def test_index_search_declaration_without_network(idx):
     assert r["fetched"] == 7 and r["failed"] == []          # the book index page too
     d = idx.declaration("ADSREAD")
     assert d["inputs"][0]["name"] == "NETID" and d["outputs"][0]["name"] == "BUSY"
-    assert d["doc_version"] == "Tc2_System (TwinCAT v3.1.0)" and d["source"]["kind"] == "helpviewer"
+    assert d["doc_version"] == "Tc2_System (TwinCAT v3.1.0)" and d["doc_date"]
     s = idx.search("ADS read command")
-    assert s["backend"].endswith("+helpviewer") and s["items"][0]["url"] == F.ADSREAD and s["source"]["modified"]
+    assert s["backend"].endswith("+helpviewer") and s["items"][0]["url"] == F.ADSREAD and s["doc_date"]
+    assert "indexed_books" not in s and "source" not in s and s["indexed_books_count"] == 1      # D3
     assert idx.search("zzqxvj")["count"] == 0          # and no web fallback (NoNetwork would raise)
     assert idx.search_symbols("ADSREAD")["items"][0]["url"] == F.ADSREAD
 
 
 def test_get_page_any_page_in_package_no_breadcrumb_noise(idx):
     p = idx.get_page(F.TF)                                     # never indexed: read straight from the package
-    assert p["title"] == "Display of technology data" and p["source"]["kind"] == "helpviewer"
+    assert p["title"] == "Display of technology data" and p["doc_date"]
     assert p["breadcrumb"] == "TwinCAT 3 > PLC Lib > tf5100_tc3_nc_i" and "PLC Lib" not in p["markdown"]
     assert "junk" not in p["markdown"] and p["version"] == "TwinCAT v3.1.4024"
     assert idx.get_page("tcplclib_tc2_system/30945803")["url"] == F.ADSREAD
@@ -107,19 +110,62 @@ def test_get_page_any_page_in_package_no_breadcrumb_noise(idx):
         idx.get_page(C + "tcplclib_tc2_system/99999999.html")
 
 
-def test_books_and_index_all_and_new_package_reindexes(idx, pkg, tmp_path):
+def test_books_and_index_all_and_the_reindex_rule(idx, pkg, tmp_path):
+    """The rule: a page is parsed again only when its content changed or the indexer version changed. A copied
+    or re-installed package (new file date, same content) costs nothing; the index is portable."""
     b = idx.books()
     assert {x["book"] for x in b["books"]} == {"tcplclib_tc2_system", "tf5100_tc3_nc_i"}     # TC2 book dropped
     r = idx.index_all()
-    assert r["books"] == 2 and r["pages_indexed"] == 8 and idx.indexed_stamp() == idx.local.stamp
+    assert r["books"] == 2 and r["pages_indexed"] == 8 and r["book_errors"] == [] and idx.index_complete()
     assert idx.index_all()["pages_indexed"] == 0, "same package: nothing re-read"
-    # a Help Viewer content update replaces the package → every page is re-indexed
-    time.sleep(0.01)
-    make_mshc(pkg)
-    os.utime(pkg, (time.time() + 120, time.time() + 120))
+    # same content, new file date (Help Viewer re-install, or the index copied to another PC): complete, nothing to do
+    os.utime(pkg, (time.time() + 300, time.time() + 300))
     idx2 = InfosysIndex(idx.dir, fetcher=NoNetwork(), local=HV.HelpViewerSource(pkg))
-    assert idx2.indexed_stamp() != idx2.local.stamp
-    assert idx2.index_all()["pages_indexed"] == 8
+    assert idx2.index_complete() and idx2.index_all()["pages_indexed"] == 0
+    # a content update changes ONE page → exactly that page is parsed again
+    page = F.PAGES[F.ADSWRITE]
+    F.PAGES[F.ADSWRITE] = page.replace("ADS write command", "ADS write command (updated)")
+    try:
+        make_mshc(pkg)
+    finally:
+        F.PAGES[F.ADSWRITE] = page
+    idx3 = InfosysIndex(idx.dir, fetcher=NoNetwork(), local=HV.HelpViewerSource(pkg))
+    assert not idx3.index_complete()
+    assert idx3.index_all()["pages_indexed"] == 1 and idx3.index_complete()
+    # another indexer version: one full rebuild, then complete again
+    from twincat_mcp import infosys as inf
+    old = inf.INDEXER_VERSION
+    try:
+        inf.INDEXER_VERSION = old + 1000
+        idx4 = InfosysIndex(idx.dir, fetcher=NoNetwork(), local=HV.HelpViewerSource(pkg))
+        assert not idx4.index_complete() and idx4.indexed_books() == []
+        assert idx4.index_all()["pages_indexed"] == 8 and idx4.index_complete()
+    finally:
+        inf.INDEXER_VERSION = old
+
+
+# Fingerprint of the code that turns a page into stored rows. When this test fails: the extraction logic changed —
+# bump infosys.INDEXER_VERSION (every index is rebuilt once) and update the fingerprint below together.
+INDEXER_FINGERPRINT = (2, "c062b9caaa65b3ad")
+
+
+def _indexer_source_hash() -> str:
+    import hashlib
+    import inspect
+    from twincat_mcp import helpviewer as hv
+    from twincat_mcp import infosys as inf
+    parts = [inspect.getsource(o) for o in (inf._MdWalker, inf.html_to_doc, inf.parse_declaration, inf.classify,
+                                            inf._parse_vars, inf._descriptions, inf._library_from_tables,
+                                            inf.InfosysIndex._store, inf._doc_version, hv.body_html, hv.page_meta)]
+    norm = ["\n".join(ln.rstrip() for ln in p.splitlines() if ln.strip() and not ln.strip().startswith("#")) for p in parts]
+    return hashlib.sha256("\n\n".join(norm).encode()).hexdigest()[:16]
+
+
+def test_indexer_version_tracks_the_extraction_code():
+    from twincat_mcp import infosys as inf
+    got = (inf.INDEXER_VERSION, _indexer_source_hash())
+    assert got == INDEXER_FINGERPRINT, (
+        f"page extraction code changed: bump infosys.INDEXER_VERSION and set INDEXER_FINGERPRINT = {got!r}")
 
 
 def test_not_a_package(tmp_path):
@@ -146,7 +192,7 @@ async def test_server_uses_local_package(monkeypatch, tmp_path, pkg):
     srv = build_server(cfg)
     async with client_for(srv) as s:
         d = payload(await s.call_tool("infosys_get_page", {"ref": "ADSWRITE", "max_chars": 500}))
-        assert d["source"]["kind"] == "helpviewer"
+        assert d["doc_date"]
         doc = payload(await s.call_tool("tc_doctor", {}))
         assert doc["infosys"]["source"]["kind"] == "helpviewer" and "helpviewer-1033" in doc["infosys"]["cache"]
         for _ in range(100):                                   # background index of the whole package

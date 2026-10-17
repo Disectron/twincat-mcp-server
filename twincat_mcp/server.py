@@ -354,7 +354,7 @@ class App:
         docs = self.docs
         assert docs is not None and docs.local is not None
         try:
-            if docs.indexed_stamp() == docs.local.stamp:
+            if docs.index_complete():          # same package content, same indexer version: nothing to do
                 return
         except Exception:  # noqa: BLE001
             return
@@ -373,6 +373,7 @@ class App:
 
                 def prog(book: str, i: int, n: int) -> None:
                     self.docs_bg["done_books"], self.docs_bg["total_books"] = i, n
+                    self.docs_bg["current_book"] = book
                 out.append(docs.index_all(prog))
             except Exception as exc:  # noqa: BLE001
                 out.append({"error": f"{type(exc).__name__}: {exc}"})
@@ -826,6 +827,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if app.docs is not None:
             try:
                 rep["infosys"] = {"source": app.docs.source(), "cache": str(app.docs.dir), "fts5": app.docs.has_fts,
+                                  "complete": await asyncio.to_thread(app.docs.index_complete) if app.docs.local is not None else None,
                                   "indexed_books": len(await asyncio.to_thread(app.docs.indexed_books))
                                   if app.docs.local is not None else await asyncio.to_thread(app.docs.indexed_books),
                                   "background_index": app.docs_index_status(),

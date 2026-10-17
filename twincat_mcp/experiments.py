@@ -1031,10 +1031,17 @@ class Runner:
                 rec_ids.append(res["id"])
                 self._live_recs.append(res["id"])
             record["recordings"] = list(rec_ids)
+            # D22: the stimulus must come after every recording delivers — a stimulus written before the first sample
+            # makes the edge the acknowledgement looks for invisible (the first sample already shows the new state)
+            silent = self._wait_delivering(rec_ids, float(run.get("record_ready_timeout_ms") or 5000) / 1000)
+            if silent:
+                raise ExperimentError(f"recording(s) {silent} delivered no sample within "
+                                      f"{int(run.get('record_ready_timeout_ms') or 5000)} ms — stimulus not written "
+                                      "(is the PLC running? run.record_ready_timeout_ms to wait longer)")
             # stimulus
             st = run.get("start")
             if st:
-                t_stim_ms = self._rec_elapsed_ms(rec_ids)
+                t_stim_ms = self._rec_plc_now_ms(rec_ids)
                 self._write(st["symbol"], st["value"])
                 if "reset_value" in st:
                     self._abort.wait(float(st.get("reset_after_ms") or 0) / 1000)
@@ -1122,6 +1129,40 @@ class Runner:
                 self._write(w["symbol"], w["value"])
             else:
                 raise ExperimentError(f"{where} item {w!r}: needs symbol+value, wait_ms or wait_until")
+
+    def _wait_delivering(self, rec_ids: list[str], timeout_s: float) -> list[str]:
+        """Wait until every recording (and every notification block in it) has at least one sample; returns the ids
+        still silent at the deadline."""
+        pending = list(rec_ids)
+        deadline = time.monotonic() + max(0.1, timeout_s)
+        while pending:
+            for rid in list(pending):
+                try:
+                    st = self.d.rec.status(rid)
+                except Exception:  # noqa: BLE001 — gone: nothing to wait for
+                    pending.remove(rid)
+                    continue
+                blocks = st.get("blocks") or []
+                if (st.get("samples") or 0) > 0 and all((b.get("samples") or 0) > 0 for b in blocks):
+                    pending.remove(rid)
+            if not pending or time.monotonic() >= deadline or self._abort.is_set():
+                break
+            self._abort.wait(0.02)
+        return pending
+
+    def _rec_plc_now_ms(self, rec_ids: list[str]) -> float | None:
+        """Where the recordings' PLC time stands now (ms since their first sample — the same clock as the value runs
+        the acknowledgement reads), latest of all recordings; None when none has delivered yet."""
+        best = None
+        for rid in rec_ids:
+            try:
+                st = self.d.rec.status(rid)
+            except Exception:  # noqa: BLE001
+                continue
+            span = st.get("plc_span_s")
+            if isinstance(span, (int, float)):
+                best = max(best or 0.0, float(span) * 1000.0)
+        return best if best is not None else self._rec_elapsed_ms(rec_ids)
 
     def _rec_elapsed_ms(self, rec_ids: list[str]) -> float | None:
         """Where the first live recording's clock stands now (ms since its first sample), or None."""

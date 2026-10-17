@@ -1014,9 +1014,10 @@ class XaeBackend:
                     visit(sub, depth + 1)
                     continue
                 obj = _try(lambda: it.Object)
-                if fn.lower().endswith(".tcmproj") and obj is not None and _has_member(obj, "StartRecord"):
+                ms = _measurement_scope(obj) if fn.lower().endswith(".tcmproj") and obj is not None else None
+                if ms is not None:
                     found.append({"name": str(it.Name), "project": str(_try(lambda: p.Name) or ""), "file": fn,
-                                  "_obj": obj})
+                                  "_obj": ms})
 
         projs = self._retry(lambda: dte.Solution.Projects, "Solution.Projects")
         for i in range(1, projs.Count + 1):
@@ -1099,10 +1100,35 @@ def _parse_build_output(text: str) -> list[dict[str, Any]]:
     return items
 
 
+# TwinCAT.Measurement.AutomationInterface.IMeasurementScope — [ComImport, Guid(...)], dual. The ProjectItem's Object
+# is the .NET ScopeProjectNode whose default IDispatch (class interface _ScopeProjectNode) does NOT expose
+# StartRecord/StopRecord/SaveSVD/ExportCSV; QueryInterface for this IID gives the dispatch that does (N28,
+# verified on TC 3.1.4026: StartRecord dispid 1610743808, StopRecord …809, SaveSVD …811, ExportCSV …812).
+IID_IMEASUREMENT_SCOPE = "{8FBF6B86-2B51-4B09-8045-D071F2663878}"
+
+
+def _measurement_scope(obj: Any) -> Any:
+    """The IMeasurementScope view of a Measurement project item, or None when the item is no Scope configuration."""
+    if _has_member(obj, "StartRecord"):          # already the right dispatch (and the test doubles)
+        return obj
+    try:
+        import pythoncom  # type: ignore
+        import pywintypes  # type: ignore
+        import win32com.client  # type: ignore
+        disp = obj._oleobj_.QueryInterface(pywintypes.IID(IID_IMEASUREMENT_SCOPE), pythoncom.IID_IDispatch)
+        ms = win32com.client.Dispatch(disp)
+    except Exception:  # noqa: BLE001 — not a Scope node (data pool, chart, …) or no pywin32
+        return None
+    return ms if _has_member(ms, "StartRecord") else None
+
+
 def _has_member(obj: Any, name: str) -> bool:
     """Late-bound COM object exposes ``name`` (IDispatch::GetIDsOfNames)."""
+    ole = getattr(obj, "_oleobj_", None)
+    if ole is None:
+        return callable(getattr(obj, name, None))      # plain Python objects (tests)
     try:
-        obj._oleobj_.GetIDsOfNames(name)
+        ole.GetIDsOfNames(name)
         return True
     except Exception:  # noqa: BLE001
         return False

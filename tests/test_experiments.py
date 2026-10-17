@@ -12,6 +12,11 @@ import pytest
 from twincat_mcp import experiments as X
 
 
+def _fake_fc():
+    from tests.fake_ads import FakeConnection
+    return FakeConnection
+
+
 # ---------------------------------------------------------------------------
 # spec
 # ---------------------------------------------------------------------------
@@ -264,6 +269,7 @@ async def test_experiment_e2e(monkeypatch, project_dir, tmp_path):
     from twincat_mcp.server import build_server
 
     install(monkeypatch)
+    _fake_fc().initial_notification = True     # real ADS: first sample right after registration (D22)
     cfg = mk_cfg(project_dir, mode="full", write_allowlist=["MAIN.*"])
     cfg.project.experiments_dir = str(tmp_path / "experiments")
     srv = build_server(cfg)
@@ -347,6 +353,7 @@ async def test_experiment_refused_in_guarded_mode_without_allowlist(monkeypatch,
     from twincat_mcp.server import build_server
 
     install(monkeypatch)
+    _fake_fc().initial_notification = True     # real ADS: first sample right after registration (D22)
     cfg = mk_cfg(project_dir, mode="guarded")
     cfg.project.experiments_dir = str(tmp_path / "experiments")
     srv = build_server(cfg)
@@ -367,6 +374,7 @@ async def test_experiment_guarded_mode_needs_confirmation_then_runs(monkeypatch,
     from twincat_mcp.server import build_server
 
     install(monkeypatch)
+    _fake_fc().initial_notification = True     # real ADS: first sample right after registration (D22)
     cfg = mk_cfg(project_dir, mode="guarded", write_allowlist=["MAIN.stRecipe.*", "MAIN.bStart", "MAIN.fbFill.bDone"])
     cfg.project.experiments_dir = str(tmp_path / "experiments")
     srv = build_server(cfg)
@@ -406,6 +414,7 @@ async def test_experiment_abort_and_readonly_switch(monkeypatch, project_dir, tm
     from twincat_mcp.server import build_server
 
     install(monkeypatch)
+    _fake_fc().initial_notification = True     # real ADS: first sample right after registration (D22)
     cfg = mk_cfg(project_dir, mode="full", write_allowlist=["MAIN.*"])
     cfg.project.experiments_dir = str(tmp_path / "experiments")
     srv = build_server(cfg)
@@ -503,6 +512,7 @@ async def test_experiment_ack_modes_wait_steps_cleanup_and_archive(monkeypatch, 
     from twincat_mcp.server import build_server
 
     install(monkeypatch)
+    _fake_fc().initial_notification = True     # real ADS: first sample right after registration (D22)
     cfg = mk_cfg(project_dir, mode="full", write_allowlist=["MAIN.*", "GVL_Machine.*"])
     cfg.project.experiments_dir = str(tmp_path / "experiments")
     srv = build_server(cfg)
@@ -558,5 +568,16 @@ async def test_experiment_ack_modes_wait_steps_cleanup_and_archive(monkeypatch, 
             # evaluate sees only the current series
             ev = payload(await s.call_tool("exp_evaluate", {"name": "fast"}))
             assert ev.get("runs_total", ev.get("runs", 1)) in (1, None) or True
+            # 4. D22: a recording that has not delivered yet → the stimulus is NOT written, the run says why
+            FakeConnection.initial_notification = False
+            FakeConnection.shared_values["MAIN.bStart"] = False
+            spec["run"]["record_ready_timeout_ms"] = 300
+            spec["version"] = 3
+            payload(await s.call_tool("exp_save", {"spec": spec, "replace": True}))
+            payload(await s.call_tool("exp_run", {"name": "fast", "resume": False, "max_runs": 1}))
+            await _run_to_end(s, payload, "fast")
+            runs = payload(await s.call_tool("exp_runs", {"name": "fast"}))["runs"]
+            assert runs[-1]["status"] == "failed" and "delivered no sample" in runs[-1]["error"], runs[-1]
+            assert FakeConnection.shared_values["MAIN.bStart"] is False, "no stimulus before the recording is live"
     finally:
         machine.stop.set()

@@ -94,6 +94,7 @@ class HelpViewerSource:
         self.lastmod = (dt.datetime.fromtimestamp(self.mtime, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                         + "#" + hashlib.sha256(self.stamp.encode()).hexdigest()[:10])
         self._entries: dict[str, str] | None = None    # url -> zip entry name
+        self._crc: dict[str, str] = {}                  # url -> "crc32:size" of the entry (content identity)
         self._tls = threading.local()
         self._lock = threading.Lock()
 
@@ -112,12 +113,17 @@ class HelpViewerSource:
         with self._lock:
             if self._entries is None:
                 out: dict[str, str] = {}
-                for name in self._zip().namelist():
+                crc: dict[str, str] = {}
+                for zi in self._zip().infolist():
+                    name = zi.filename
                     m = _ENTRY.match(name.replace("\\", "/"))
                     if not m or m.group(2) != self.lcid:
                         continue
                     url = f"{PREFIX}{self.lcid}/{m.group(1).lower()}/{m.group(3)}.html"
-                    out.setdefault(url, name)
+                    if url not in out:
+                        out[url] = name
+                        crc[url] = f"crc:{zi.CRC:08x}:{zi.file_size}"
+                self._crc = crc
                 if not out:
                     raise HelpViewerError(f"{self.path.name}: no <book>/{self.lcid}/<id>.html pages inside — not a Beckhoff "
                                           "Infosys package?")
@@ -125,8 +131,19 @@ class HelpViewerSource:
             return self._entries
 
     def pages(self) -> dict[str, str]:
-        """url -> lastmod (the package stamp), the same shape as the web sitemap."""
-        return {u: self.lastmod for u in self.entries()}
+        """url -> identity of the page's content (CRC-32 + size from the zip directory), the same shape as the web
+        sitemap's url -> lastmod. A Help Viewer update re-parses only the pages whose content changed; the index is
+        portable to another PC with the same package (no file dates involved)."""
+        self.entries()
+        return dict(self._crc)
+
+    def content_stamp(self) -> str:
+        """Identity of the whole package content, independent of file name and modification time."""
+        self.entries()
+        h = hashlib.sha256()
+        for u in sorted(self._crc):
+            h.update(f"{u}={self._crc[u]}\n".encode())
+        return "content:" + h.hexdigest()[:24]
 
     def has(self, url: str) -> bool:
         return url in self.entries()

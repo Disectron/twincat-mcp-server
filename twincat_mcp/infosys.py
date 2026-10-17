@@ -47,6 +47,12 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
+# Bump when the code that turns a page into stored rows changes (html_to_doc / _MdWalker, parse_declaration, classify,
+# _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
+# re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
+# changes without a bump.
+INDEXER_VERSION = 2
+
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
 CONTENT_PREFIX = f"{INFOSYS}/content/{LANG}/"
@@ -349,6 +355,20 @@ class _MdWalker(HTMLParser):
         return f"```st\n{code}\n```"
 
 
+_VERSIONISH = re.compile(r"(TwinCAT|\bv?\d+\.\d+)", re.I)
+
+
+def _doc_version(raw: str | None) -> str | None:
+    """D2: Microsoft.Help.DisplayVersion, unescaped — and only when it reads like a version ('Tc2_Utilities (TwinCAT
+    v3.1.0)'); some non-library pages carry API description text in that tag."""
+    if not raw:
+        return None
+    v = " ".join(html.unescape(raw).split())
+    if len(v) > 80 or not _VERSIONISH.search(v) or v.lower().startswith("type:"):
+        return None
+    return v
+
+
 def _nobr(text: str) -> str:
     return " ".join(text.replace("\ue000", " ").split())
 
@@ -620,11 +640,32 @@ class InfosysIndex:
             for c in ("version", "crumb"):          # added with the Help Viewer source
                 if c not in cols:
                     con.execute(f"ALTER TABLE pages ADD COLUMN {c} TEXT")
+            # external-content FTS: the index points at pages' own columns instead of keeping a second copy of every
+            # page's text (≈ a third of the database). An older self-contained FTS table is replaced and rebuilt
+            # from pages — no page has to be parsed again for that.
             try:
-                con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, text, code, tokenize='unicode61')")
+                row = con.execute("SELECT sql FROM sqlite_master WHERE name = 'pages_fts'").fetchone()
+                if row is not None and "content='pages'" not in (row[0] or ""):
+                    con.execute("DROP TABLE pages_fts")
+                    row = None
+                con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, text, code, "
+                            "content='pages', content_rowid='rowid', tokenize='unicode61')")
                 self._fts = True
+                if row is None:
+                    con.execute("INSERT INTO pages_fts(pages_fts) VALUES ('rebuild')")
             except sqlite3.OperationalError:
                 self._fts = False
+            r = con.execute("SELECT value FROM meta WHERE key = 'indexer_version'").fetchone()
+            have = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+            if have and (r is None or r[0] != str(INDEXER_VERSION)):
+                # rows built by other extraction logic: rebuild once (the page identity alone would keep them)
+                con.execute("DELETE FROM pages")
+                con.execute("DELETE FROM books")
+                con.execute("DELETE FROM meta WHERE key = 'source_stamp'")
+                if self._fts:
+                    con.execute("INSERT INTO pages_fts(pages_fts) VALUES ('delete-all')")
+            if r is None or r[0] != str(INDEXER_VERSION):
+                con.execute("INSERT OR REPLACE INTO meta VALUES ('indexer_version', ?)", (str(INDEXER_VERSION),))
 
     @property
     def has_fts(self) -> bool:
@@ -633,7 +674,7 @@ class InfosysIndex:
     # -- sitemap ------------------------------------------------------------------
     def sitemap(self, force: bool = False) -> dict[str, str]:
         """url -> lastmod for every English content page. Cached on disk for sitemap_ttl. With a local Help Viewer
-        package: its page list, lastmod = the package stamp (a new package re-indexes every page)."""
+        package: its page list, lastmod = the page's content identity (CRC-32 + size): only changed pages re-index."""
         with self._lock:
             if self._sitemap is not None and not force:
                 return self._sitemap
@@ -705,6 +746,8 @@ class InfosysIndex:
 
     # -- indexing -------------------------------------------------------------------
     def _store(self, con: sqlite3.Connection, url: str, lastmod: str, doc: HtmlDoc) -> dict[str, Any]:
+        """One page → one pages row + one FTS row with the same rowid (D1: deleting by an UNINDEXED column was a full
+        scan of the FTS table per page — quadratic over a 50k-page package)."""
         bk = book_of(url) or ("", "")
         title = doc.title or url
         decl = parse_declaration(title, doc)
@@ -713,14 +756,20 @@ class InfosysIndex:
         text = re.sub(r"```.*?```", " ", doc.markdown, flags=re.S)
         code = CODE_SEP.join(f"{lang}\n{c}" for lang, c in doc.code_blocks)
         has_decl = kind != "Page" and decl["declaration"] is not None
-        version = doc.meta.get("Microsoft.Help.DisplayVersion") or None
-        con.execute("INSERT OR REPLACE INTO pages(url, book, page_id, lastmod, title, kind, library, markdown, text, code, "
-                    "decl, fetched, version, crumb) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (url, bk[0], bk[1], lastmod, title, kind, library, doc.markdown, text, code,
-                     json.dumps(decl) if has_decl or kind != "Page" else None, time.time(), version, doc.crumb or None))
+        version = _doc_version(doc.meta.get("Microsoft.Help.DisplayVersion"))
+        old = con.execute("SELECT rowid, url, title, text, code FROM pages WHERE url = ?", (url,)).fetchone()
+        if old is not None:
+            if self._fts:   # external content: the index entry is removed with the values it was built from
+                con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code) VALUES ('delete', ?, ?, ?, ?, ?)",
+                            (old[0], old[1], old[2], old[3], old[4]))
+            con.execute("DELETE FROM pages WHERE rowid = ?", (old[0],))
+        cur = con.execute("INSERT INTO pages(url, book, page_id, lastmod, title, kind, library, markdown, text, code, "
+                          "decl, fetched, version, crumb) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          (url, bk[0], bk[1], lastmod, title, kind, library, doc.markdown, text, code,
+                           json.dumps(decl) if has_decl or kind != "Page" else None, time.time(), version, doc.crumb or None))
         if self._fts:
-            con.execute("DELETE FROM pages_fts WHERE url = ?", (url,))
-            con.execute("INSERT INTO pages_fts(url, title, text, code) VALUES (?,?,?,?)", (url, title, text, code))
+            con.execute("INSERT INTO pages_fts(rowid, url, title, text, code) VALUES (?,?,?,?,?)",
+                        (cur.lastrowid, url, title, text, code))
         return {"url": url, "title": title, "kind": kind, "library": library}
 
     def _fetch_doc(self, url: str) -> HtmlDoc:
@@ -738,6 +787,13 @@ class InfosysIndex:
         if doc.meta.get("Title") and (not doc.title or doc.title.lower().startswith("beckhoff information system")):
             doc.title = doc.meta["Title"].strip()
         return doc
+
+    def _answer_meta(self) -> dict[str, Any]:
+        """D3: what every answer carries — the date of the documentation it came from (a local package can be months
+        old) and how much is indexed; the full book list and source block live in tc_doctor / infosys_books."""
+        if self.local is not None:
+            return {"doc_date": self.local.describe()["modified"], "indexed_books_count": len(self.indexed_books())}
+        return {"indexed_books_count": len(self.indexed_books())}
 
     def source(self) -> dict[str, Any]:
         """Where the documentation comes from — every answer carries it (a local package can be months old)."""
@@ -784,7 +840,7 @@ class InfosysIndex:
                     info = self._store(con, u, pages[u], doc)
                 kinds[info["kind"]] = kinds.get(info["kind"], 0) + 1
                 done += 1
-                if done % 25 == 0:
+                if done % (2000 if self.local is not None else 25) == 0:
                     con.commit()
                 if progress:
                     progress(done, len(todo))
@@ -819,16 +875,50 @@ class InfosysIndex:
         books = sorted({b[0] for u in sm if (b := book_of(u)) and self.book_allowed(b[0])})
         t0 = time.time()
         fetched = failed = 0
+        book_errors: list[dict[str, str]] = []
         for i, bk in enumerate(books):
-            r = self.index_book(bk)
+            if progress:
+                progress(bk, i, len(books))
+            try:
+                r = self.index_book(bk)
+            except Exception as exc:  # noqa: BLE001 — D25: one bad book must not end the run; it is reported
+                book_errors.append({"book": bk, "error": f"{type(exc).__name__}: {exc}"[:300]})
+                continue
             fetched += r["fetched"]
             failed += len(r["failed"])
-            if progress:
-                progress(bk, i + 1, len(books))
+        if progress:
+            progress("", len(books), len(books))
         with self._db() as con:
-            con.execute("INSERT OR REPLACE INTO meta VALUES ('source_stamp', ?)", (self.local.stamp,))
-        return {"books": len(books), "pages_indexed": fetched, "failed": failed, "seconds": round(time.time() - t0, 1),
-                "source": self.source()}
+            # pages of books that are no longer in the package (or no longer allowed) leave the index
+            keep = set(books)
+            gone = [r[0] for r in con.execute("SELECT DISTINCT book FROM pages") if r[0] not in keep]
+            for bk in gone:
+                if self._fts:
+                    con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code) "
+                                "SELECT 'delete', rowid, url, title, text, code FROM pages WHERE book = ?", (bk,))
+                con.execute("DELETE FROM pages WHERE book = ?", (bk,))
+                con.execute("DELETE FROM books WHERE book = ?", (bk,))
+            if self._fts and fetched:
+                con.execute("INSERT INTO pages_fts(pages_fts) VALUES ('optimize')")
+            if not book_errors:          # complete only when every book went in; otherwise the next start resumes
+                con.execute("INSERT OR REPLACE INTO meta VALUES ('source_stamp', ?)", (self.local.content_stamp(),))
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('indexer_version', ?)", (str(INDEXER_VERSION),))
+        return {"books": len(books), "pages_indexed": fetched, "failed": failed, "book_errors": book_errors[:20],
+                "seconds": round(time.time() - t0, 1), "removed_books": gone, "source": self.source()}
+
+    def index_complete(self) -> bool:
+        """The whole package is in the index, built by this indexer version."""
+        if self.local is None:
+            return False
+        try:
+            return self.indexed_stamp() == self.local.content_stamp() and self._meta("indexer_version") == str(INDEXER_VERSION)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _meta(self, key: str) -> str | None:
+        with self._db() as con:
+            r = con.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return r["value"] if r else None
 
     def indexed_stamp(self) -> str | None:
         with self._db() as con:
@@ -882,7 +972,7 @@ class InfosysIndex:
         rows.sort(key=rank)
         items = [{"name": r["title"], "kind": r["kind"], "library": r["library"], "book": r["book"], "url": r["url"],
                   "summary": _summary(r["markdown"])} for r in rows[:limit]]
-        res = {"query": q, "count": len(rows), "items": items, "indexed_books": self.indexed_books()}
+        res = {"query": q, "count": len(rows), "items": items, **self._answer_meta()}
         if did:
             res["auto_indexed"] = did
         if not rows:
@@ -901,8 +991,7 @@ class InfosysIndex:
             backend = "duckduckgo+sitemap"
         if self.local is not None:
             backend += "+helpviewer"
-        return {"query": q, "backend": backend, "count": len(items), "items": items,
-                "indexed_books": self.indexed_books(), "source": self.source()}
+        return {"query": q, "backend": backend, "count": len(items), "items": items, **self._answer_meta()}
 
     def search_code(self, query: str, language: str | None = None, limit: int = 10) -> dict[str, Any]:
         q = query.strip()
@@ -928,7 +1017,7 @@ class InfosysIndex:
                         break
             if len(out) >= limit:
                 break
-        res = {"query": q, "count": len(out), "items": out, "indexed_books": self.indexed_books()}
+        res = {"query": q, "count": len(out), "items": out, **self._answer_meta()}
         if not out:
             res["hint"] = "code search covers indexed books only — infosys_index(book=...) first"
         return res
@@ -958,7 +1047,7 @@ class InfosysIndex:
             out["lastmod"] = None
             out["version"] = row["version"]
             out["breadcrumb"] = row["crumb"]
-            out["source"] = self.source()
+            out.update(self._answer_meta())
         return out
 
     def declaration(self, symbol: str, library: str | None = None) -> dict[str, Any]:
@@ -986,7 +1075,7 @@ class InfosysIndex:
                 v = con.execute("SELECT version FROM pages WHERE url = ?", (row["url"],)).fetchone()
             if v and v["version"]:
                 decl["doc_version"] = v["version"]
-            decl["source"] = self.source()
+            decl.update(self._answer_meta())
         return decl
 
     # -- resolution ----------------------------------------------------------------
@@ -1032,7 +1121,7 @@ class InfosysIndex:
             match = joiner.join('"' + t.replace('"', '""') + '"' for t in toks)
             sql = (f"SELECT p.url, p.title, p.kind, p.library, p.book, p.version, "
                    f"snippet(pages_fts, 2, '[', ']', '…', 24) AS snip, bm25(pages_fts, 0.0, 10.0, 1.0, 0.5) AS score "
-                   f"FROM pages_fts JOIN pages p ON p.url = pages_fts.url WHERE pages_fts MATCH ?")
+                   f"FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE pages_fts MATCH ?")
             params: list[Any] = [match]
             if library:
                 sql += " AND (p.library = ? COLLATE NOCASE OR p.book = ? COLLATE NOCASE)"
