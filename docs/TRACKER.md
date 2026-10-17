@@ -12,6 +12,9 @@ tool wishlist (2026-10-18).
 | 0.8.1 | sealing on Windows: read-only recording + manifest, `rec_delete` of a read-only file | covered by Windows CI only |
 | 0.8.2 | Scope via the XAE Automation Interface (`IMeasurementScope`, late-bound) | `scope_list`; `scope_record` start → stop → save; `rec_start(also_scope=true)` + `rec_stop` → `<id>.svdx/.scope.csv/.scope.json` |
 | 0.8.2 | `scope_export` with the real `TC3ScopeExportTool.exe` | `scope_export svd=<saved .svdx>` |
+| 0.8.4 | native re-subscription after RUN → CONFIG → RUN and the `_stall` line on PLC STOP (tested on the simulator backend) | `rec_capture … cycle_ms=1 seconds=40`, toggle RUN/CONFIG → `resubscriptions ≥ 1`; PLC stop → `label: INCOMPLETE`, `label_reason: PLC stopped …` |
+| 0.8.4 | restart verification (`modes_seen`, `transition_seen`) | `xae_restart_twincat` → `modes_seen` contains a non-RUN state, `duration_s` > 0; without license → error naming CONFIG |
+| 0.8.4 | Infosys index time on the real package (one transaction per book) | `tc_doctor` → infosys `complete: true`; time for 282 books |
 | 0.8.3 | local Infosys against the real `BKINFOSYS3_VS_100_EN-US.2.mshc` (built from the layout in the knowledge README, tested with a synthetic package) | `infosys_declaration ADSREAD` lists NETID…TMOUT; `infosys_get_page FB_CXProfiler` has `version` + `breadcrumb`, markdown without breadcrumb text; `tc_doctor` → infosys `source.kind = helpviewer` |
 
 ## Waiting on Ryan
@@ -19,7 +22,8 @@ tool wishlist (2026-10-18).
 - `D:\TwinCAT-MCP\knowledge\sop\scope\ScopeAI.cs` — the real property names, before `scope_add_channel` /
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
-- Retest of 0.8.1–0.8.3.
+- D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
+- Retest of 0.8.4.
 
 ## Decided (wishlist 2026-10-18)
 
@@ -42,9 +46,27 @@ tool wishlist (2026-10-18).
 | ID | What |
 |---|---|
 | R12 / A6 | `rec_verify` over many counters (pattern/list) and the 300 × 1 ms acceptance run per recording method; capacity documented |
-| #17 | `xae_tree_get('TIPC', depth=3)` does not descend into the project |
 | #45 | Check all objects does not run |
 | #10 | login needs the PLC project node selected |
+
+### Next patch (0.8.5), from the 0.8.3 deep test
+
+| ID | Sev | What |
+|---|---|---|
+| D44 | S1 | `xae_build(save_first)` / deploy / `tcunit_run` must save (File.SaveAll, dirty docs → 0) and report what was saved |
+| D34 | S1 | `exp_run` latency from the first sample when the edge was not captured |
+| D35 | S2 | `exp_run` with change-mode profiles: per-symbol phase → reordered events |
+| D33 | S2 | measure `last` taken after the `after` steps |
+| D37 | S2 | `exp_abort` does not stop; last run's `after` skipped |
+| D40 | S2 | `tcunit_run`: `xUnitEnablePublish` not checked; note names the legacy Boot folder |
+| D41 | S2 | 4026 compiler lines `File.TcPOU@Method(9) : error:` not parsed (file/line empty) |
+| D42 | S2 | `xae_tree_delete` token target contradiction |
+| D38 | S3 | `proj_libraries`: 4026 `PlcEngineering\Managed Libraries` not scanned |
+| D39 | S3 | `tcunit_scaffold`: `E_Command.0` literal; stubs |
+| D43 | S3 | `tcunit_run` composite token target undocumented |
+| D20 | S3 | `xae_diagnostics` does not read the XAE Error List |
+| D26–D29, D32, D36 | S4 | `rec_pulses` duty, `rec_profile_stop` after end, `updated` format, profile groups start apart, `rec_snapshot` events, negative CI of a count |
+| N19b, xae_status | S4 | `effective` library version; "no solution open" without the raw error |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
 
