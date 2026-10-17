@@ -643,7 +643,13 @@ class ExperimentStore:
             p.unlink()
             return 0
         import time as _t
-        p.rename(self.dir(name) / f"runs_archive_{_t.strftime('%Y%m%d-%H%M%S')}.jsonl")
+        stamp = _t.strftime("%Y%m%d-%H%M%S")
+        target = self.dir(name) / f"runs_archive_{stamp}.jsonl"
+        k = 1
+        while target.exists():   # two archives in one second: never overwrite evidence (POSIX rename would)
+            k += 1
+            target = self.dir(name) / f"runs_archive_{stamp}_{k}.jsonl"
+        p.rename(target)
         return n
 
     def status(self, name: str) -> dict[str, Any]:

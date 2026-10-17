@@ -43,8 +43,12 @@ jobs:
       - name: Report failures as annotations (log hosts are not reachable everywhere)
         if: failure()
         shell: python
+        env:
+          PYTHONUTF8: "1"            # the Windows console is cp1252; pytest output holds → — … and would kill this step
+          PYTHONIOENCODING: utf-8
         run: |
-          import os, re
+          import os, re, sys
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
           if not os.path.exists("pytest-output.txt"):
               print("::error title=ci::pytest did not run (an earlier step failed); see that step")
               raise SystemExit(0)

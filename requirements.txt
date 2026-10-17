@@ -3,3 +3,4 @@ pyads>=3.4,<4
 pywin32>=306; sys_platform == "win32"
 uvicorn>=0.30
 pyyaml>=6
+tomli>=2; python_version < "3.11"
