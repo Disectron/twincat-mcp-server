@@ -464,7 +464,7 @@ class Acceptance:
         self.log("[4] recorder round trip")
         tools = ("rec_scan", "rec_profile_save", "rec_profile_list", "rec_profile_get", "rec_profile_start", "rec_list", "rec_status",
                  "rec_snapshot", "rec_stats", "rec_read", "rec_profile_stop", "rec_export", "rec_pulses", "rec_latency", "rec_start",
-                 "rec_stop", "rec_compare", "rec_delete", "rec_profile_delete", "rec_verify")
+                 "rec_stop", "rec_compare", "rec_delete", "rec_profile_delete", "rec_verify", "rec_capture")
         if not self.ads_ok or not self.sym:
             for t in tools:
                 self.skip(ph, t, "needs ADS and a discovered symbol")
@@ -517,6 +517,8 @@ class Acceptance:
             for t in ("rec_stop", "rec_compare", "rec_delete"):
                 self.skip(ph, t, "poll recording did not start")
         await self.check(ph, "rec_profile_delete", {"name": "acceptance"})
+        await self.check(ph, "rec_capture", {"symbols": [self.sym], "seconds": 1.0, "mode": "cycle", "cycle_ms": 10}, timeout_s=90,
+                         verify=lambda p: None if isinstance(p, dict) and (p.get("verify") or {}).get("integrity") == "intact" else "not intact")
         await self._recording_accuracy(ph)
 
     async def _recording_accuracy(self, ph: str) -> None:

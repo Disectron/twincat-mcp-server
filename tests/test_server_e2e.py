@@ -558,3 +558,41 @@ async def test_watch_and_wait_use_notifications_and_let_writes_through(monkeypat
         assert already["met"] and already["method"].startswith("read")
         # the temporary recordings are cleaned up
         assert payload(await s.call_tool("rec_list", {}))["session"] == []
+
+
+@pytest.mark.anyio
+async def test_tool_groups_limit_the_tool_list(monkeypatch, project_dir):
+    """P3: server.tool_groups exposes only the named groups (tc_* always)."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="readonly")
+    cfg.server.tool_groups = ["ads", "rec", "nonsense"]
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        names = {t.name for t in (await s.list_tools()).tools}
+        assert {n.split("_", 1)[0] for n in names} == {"tc", "ads", "rec"}
+        doc = payload(await s.call_tool("tc_doctor", {}))
+        assert any("nonsense" in w for w in doc["config_FIX_THESE"]) and doc["summary"].startswith("PROBLEMS")
+
+
+@pytest.mark.anyio
+async def test_rec_capture_one_call(monkeypatch, project_dir):
+    """P19: record → wait → stop → stats + verification in one call."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_capture", {"symbols": ["MAIN.nCycle"], "seconds": 0.3, "mode": "change"}))
+        assert r["id"] and r["verify"]["integrity"] == "intact" and "MAIN.nCycle" in r["stats"] and Path(r["file"]).exists()
+
+
+def test_project_library_books(project_dir):
+    """K1: the Beckhoff libraries the .plcproj references become Infosys books to index (Tc2_Smtp → tcplclib_tc2_smtp)."""
+    from twincat_mcp.server import App
+    pp = project_dir / "Plc" / "Plc.plcproj"
+    pp.write_text(pp.read_text().replace(
+        '<PlaceholderReference Include="Tc2_Standard">',
+        '<PlaceholderReference Include="Tc2_Smtp"><DefaultResolution>Tc2_Smtp, *</DefaultResolution></PlaceholderReference>'
+        '<PlaceholderReference Include="ThirdParty_Lib"></PlaceholderReference>'
+        '<PlaceholderReference Include="Tc2_Standard">'))
+    cfg = mk_cfg(project_dir)
+    app = App(cfg)
+    assert app.project_library_books() == ["tcplclib_tc2_smtp", "tcplclib_tc2_standard"]

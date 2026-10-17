@@ -232,24 +232,46 @@ class App:
             st["running_for_s"] = round(time.time() - st["started"], 0)
         return st
 
+    def project_library_books(self) -> list[str]:
+        """Infosys books for the Beckhoff libraries the PLC projects reference (K1): Tc2_Smtp → tcplclib_tc2_smtp."""
+        try:
+            if self.proj.root is not None:
+                self.proj._ensure()
+        except Exception:  # noqa: BLE001
+            return []
+        libs = set()
+        for pp in self.proj.plcproj:
+            for lib in pp.get("libraries") or []:
+                name = str(lib or "").split(",")[0].strip()
+                if re.fullmatch(r"Tc[23]_\w+", name, re.I):
+                    libs.add("tcplclib_" + name.lower())
+        return sorted(libs)
+
     def start_docs_index_bg(self) -> None:
-        """First documentation lookup on a fresh cache: index the configured default books in a daemon thread
-        so searches stop falling back to the web after a few minutes, without making the first call wait."""
+        """First documentation lookup: index, in a daemon thread, the configured default books (fresh cache) and
+        every Beckhoff library book the project references that is not indexed yet — the first call does not wait."""
         if self.docs is None or self.docs_bg.get("started"):
             return
         try:
-            if self.docs.indexed_books():
-                return
+            have = set(self.docs.indexed_books())
         except Exception:  # noqa: BLE001
             return
-        self.docs_bg = {"started": time.time(), "finished": None, "books": list(self.cfg.docs.books), "result": None}
+        todo = [] if have else list(self.cfg.docs.books)
+        todo += [b for b in self.project_library_books() if b not in have and b not in todo]
+        if not todo:
+            return
+        self.docs_bg = {"started": time.time(), "finished": None, "books": todo, "result": None}
 
         def _run() -> None:
+            out = []
             try:
-                self.docs_bg["result"] = self.docs.ensure_defaults()
-            except Exception as exc:  # noqa: BLE001
-                self.docs_bg["result"] = [{"error": str(exc)}]
+                for b in todo:
+                    try:
+                        out.append(self.docs.index_book(b))
+                    except Exception as exc:  # noqa: BLE001 — unknown slug for a third-party-looking name: report, go on
+                        out.append({"book": b, "error": str(exc)})
             finally:
+                self.docs_bg["result"] = out
                 self.docs_bg["finished"] = time.time()
 
         threading.Thread(target=_run, name="infosys-default-index", daemon=True).start()
@@ -591,6 +613,22 @@ ACTION_EFFECTS = {
 }
 
 
+def _apply_tool_groups(mcp: MCPServer, cfg: Config) -> None:
+    """server.tool_groups (P3): expose only the named groups. Unknown names are reported in tc_doctor."""
+    groups = cfg.server.tool_groups
+    if not groups:
+        return
+    from .config import TOOL_GROUPS
+    want = {g.lower() for g in groups} | {"tc"}
+    unknown = sorted(want - set(TOOL_GROUPS))
+    if unknown:
+        cfg.warnings.append(f"server.tool_groups: unknown group(s) {unknown}; known: {list(TOOL_GROUPS)}")
+    for t in list(mcp._tool_manager.list_tools()):
+        grp = t.name.split("_", 1)[0]
+        if grp not in want:
+            mcp.remove_tool(t.name)
+
+
 def build_server(cfg: Config | None = None) -> MCPServer:
     cfg = cfg or load_config()
     app = App(cfg)
@@ -600,9 +638,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # tc_* meta
     # ======================================================================
     @mcp.tool(annotations=READ)
-    async def tc_doctor() -> dict[str, Any]:
+    async def tc_doctor(verbose: bool = False) -> dict[str, Any]:
         """Environment check: platform, pyads/router, local AMS NetId, XAE ProgIDs in the
-        registry, running XAE shells, project root, safety mode. Run this first."""
+        registry, running XAE shells, project root, safety mode. Run this first. Starts with a one-line `summary`;
+        verbose=true adds the full loaded configuration."""
         rep: dict[str, Any] = {"version": __version__, "python": sys.version.split()[0],
                                "platform": platform.platform(), "windows": is_windows(),
                                "safety": app.guard.status()}
@@ -653,7 +692,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 rep["infosys"] = f"FAIL: {exc}"
         else:
             rep["infosys"] = "disabled"
-        rep["config"] = cfg.to_dict()
+        problems = [k for k, v in rep.items() if isinstance(v, str) and v.startswith("FAIL")]
+        if cfg.warnings:
+            problems.append("config_FIX_THESE")
+        rep = {"summary": ("OK" if not problems else "PROBLEMS: " + ", ".join(problems)) +
+                          f" — target {rep['ads_target']['ams_net_id']}:{rep['ads_target']['port']}, mode {app.guard.mode}", **rep}
+        if verbose:
+            rep["config"] = cfg.to_dict()
         return rep
 
     @mcp.tool(annotations=READ)
@@ -1344,6 +1389,30 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         with dwell times). Live (incremental) while complete; recomputed from the file when the ingest had
         to skip statistics under load, for recordings of earlier sessions, or with exact=true."""
         return await app.mem_call(app.rec.stats, id, symbols, include_runs, min(max_runs, 5000), exact or None)
+
+    @mcp.tool(annotations=EDIT)
+    async def rec_capture(symbols: list[str] | None = None, seconds: float = 5.0, mode: str = "cycle", cycle_ms: float = 10,
+                          prefix: str | None = None, counter: str | None = None) -> dict[str, Any]:
+        """One call for "record X for N s and give me the stats": starts a recording, waits (≤ 60 s), stops, and
+        returns per-symbol statistics, completeness and the rec_verify verdict (integrity + PLC timeline, plus the
+        optional per-cycle `counter`) with the file path. For longer or triggered captures use rec_start."""
+        seconds = float(min(max(seconds, 0.1), 60.0))
+        st = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=None, mode=mode, cycle_ms=cycle_ms,
+                                duration_s=seconds, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0,
+                                name="rec_capture", max_symbols=500, timeout=120)
+        rid = st["id"]
+        t_end = time.monotonic() + seconds + 10
+        while time.monotonic() < t_end:
+            await asyncio.sleep(0.25)
+            if not (await app.mem_call(app.rec.status, rid))["active"]:
+                break
+        fin = await app.rec_call(app.rec.stop, rid, "rec_capture done", timeout=120)
+        ver = await app.mem_call(app.rec.verify, rid, counter, None)
+        app.audit("rec_capture", {"id": rid, "symbols": fin.get("symbols"), "seconds": seconds}, OpClass.EDIT, "ok")
+        keep = ("id", "file", "mode", "time_source", "symbols", "samples", "events", "missing_samples", "completeness",
+                "dropped", "dropped_on_stop", "plc_span_s", "stop_reason", "warnings")
+        return {**{k: fin[k] for k in keep if k in fin}, "verify": {k: ver.get(k) for k in ("verdict", "integrity", "timeline", "counter") if k in ver},
+                "stats": fin.get("stats")}
 
     @mcp.tool(annotations=READ)
     async def rec_verify(id: str, counter: str | None = None, step: int | None = None) -> dict[str, Any]:
@@ -2196,7 +2265,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await app.ads_call(app.files.read_file, path, max_bytes, as_text, encoding, timeout=120, slow=True)
 
     @mcp.tool(annotations=READ)
-    async def ipc_list_dir(pattern: str, max_entries: int = 500) -> dict[str, Any]:
+    async def ipc_list_dir(pattern: str, max_entries: int = 100) -> dict[str, Any]:
         r"""List files on the target matching a Win32 pattern. Prefer 'boot:*' (the live boot folder on any
         target OS; the result names the absolute folder in resolved_pattern) over a hard-coded
         'C:\TwinCAT\3.1\Boot\*', which is the stale legacy folder on 3.1.4026. Other prefixes: see ipc_read_file."""
@@ -2388,7 +2457,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         steps["activate"] = await app.xae_call(app.xae.activate_configuration, timeout=600)
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
-        app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", steps)
+        # P17: a deploy is done when the target runs it, not when the shell accepted the commands
+        ver = await app.verify_target_after("xae_deploy", expect_run=True)
+        steps["verify"] = {"running": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
+                           "polls": ver["polls"]}
+        if ver.get("hint"):
+            steps["verify"]["hint"] = ver["hint"]
+        ok = bool(ver["verified"])
+        app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "ok" if ok else "not-running-after-restart", steps)
+        if not ok:
+            raise ToolError("xae_deploy: activated and restarted, but the target is not in RUN afterwards "
+                            f"(mode {ver['target_mode']}). Dialogs: {ver['dialogs'][:2]}" + (f". {ver['hint']}" if ver.get("hint") else ""))
         return {"deployed": True, "target": tgt, "steps": steps}
 
     # ---- tree ------------------------------------------------------------
@@ -2689,4 +2768,5 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     atexit.register(app.rec.stop_all)
     atexit.register(app.stop_experiments)   # registered after → runs first: restore factors, then close recordings
     mcp._tcmcp_app = app  # type: ignore[attr-defined]  (tests)
+    _apply_tool_groups(mcp, cfg)
     return mcp

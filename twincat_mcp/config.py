@@ -124,8 +124,19 @@ class DocsConfig:
     fetch_timeout_s: float = 20.0
 
 
+TOOL_GROUPS = ("tc", "ads", "rec", "snap", "test", "exp", "proj", "xae", "ipc", "hmi", "infosys", "wf", "tcunit")
+
+
+@dataclass
+class ServerConfig:
+    # tool groups exposed to the agent (by name prefix); None = all. 'tc' (doctor, safety, audit) is always on.
+    # e.g. ["ads", "rec", "proj"] on a machine where XAE is never driven — fewer tool descriptions to load.
+    tool_groups: list[str] | None = None
+
+
 @dataclass
 class Config:
+    server: ServerConfig = field(default_factory=ServerConfig)
     ads: AdsConfig = field(default_factory=AdsConfig)
     xae: XaeConfig = field(default_factory=XaeConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
@@ -157,7 +168,7 @@ def _find_config_file() -> Path | None:
 
 
 def _apply_toml(cfg: Config, data: dict[str, Any]) -> None:
-    for section in ("ads", "xae", "project", "safety", "docs"):
+    for section in ("server", "ads", "xae", "project", "safety", "docs"):
         sub = data.get(section) or {}
         target = getattr(cfg, section)
         for k, v in sub.items():
@@ -187,6 +198,8 @@ def _env_list(name: str) -> list[str] | None:
 
 
 def _apply_env(cfg: Config) -> None:
+    if (lst := _env_list("TCMCP_TOOL_GROUPS")) is not None:
+        cfg.server.tool_groups = [g.strip().lower() for g in lst]
     # safety
     if m := _env("TCMCP_MODE"):
         cfg.safety.mode = m.lower()

@@ -267,3 +267,29 @@ def test_mcpb_build_produces_installable_zip(tmp_path):
     with zipfile.ZipFile(out) as zf:
         zf.extractall(stage)
     assert launch.default_src(stage / "server" / "launch.py") == (stage / "server" / "src").resolve()
+
+
+def test_stamp_quick_path_skips_hashing(tmp_path, monkeypatch):
+    """P13: unchanged names/sizes/mtimes → no content hashing on start; a touched file falls back to the digest,
+    so an mtime-only change (git checkout) does not trigger a reinstall."""
+    src = tmp_path / "src"
+    (src / "twincat_mcp").mkdir(parents=True)
+    (src / "pyproject.toml").write_text("[project]\nname='x'\n")
+    (src / "twincat_mcp" / "__init__.py").write_text('__version__ = "9.9.9"\n')
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    launch.write_stamp(venv, launch.LazyStamp(src, "py"))
+    calls = {"n": 0}
+    real = launch.source_digest
+
+    def counting(s):
+        calls["n"] += 1
+        return real(s)
+    monkeypatch.setattr(launch, "source_digest", counting)
+    assert not launch.needs_install(venv, launch.LazyStamp(src, "py")) and calls["n"] == 0
+    import os, time
+    f = src / "twincat_mcp" / "__init__.py"
+    os.utime(f, (time.time() + 5, time.time() + 5))          # touched, same content
+    assert not launch.needs_install(venv, launch.LazyStamp(src, "py")) and calls["n"] == 1
+    f.write_text('__version__ = "9.9.9"\nX = 1\n')            # real change
+    assert launch.needs_install(venv, launch.LazyStamp(src, "py"))

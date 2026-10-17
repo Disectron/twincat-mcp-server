@@ -99,6 +99,20 @@ def source_digest(src: Path) -> str:
     return h.hexdigest()
 
 
+def quick_fingerprint(src: Path) -> str:
+    """Names, sizes and mtimes only — no file is read. Matches the stamp → nothing changed, skip hashing (P13)."""
+    h = hashlib.sha256()
+    files = [src / "pyproject.toml", src / "requirements.txt"]
+    files += sorted((src / PACKAGE_DIR).rglob("*.py"))
+    for f in files:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        h.update(f"{f.relative_to(src).as_posix()}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+    return h.hexdigest()
+
+
 def shipped_version(src: Path) -> str:
     init = src / PACKAGE_DIR / "__init__.py"
     if init.is_file():
@@ -109,8 +123,25 @@ def shipped_version(src: Path) -> str:
 
 
 def make_stamp(src: Path, base_python: str) -> dict:
-    return {"version": shipped_version(src), "digest": source_digest(src),
+    return {"version": shipped_version(src), "digest": source_digest(src), "quick": quick_fingerprint(src),
             "src": str(src.resolve()), "base_python": base_python}
+
+
+class LazyStamp(dict):
+    """version + quick fingerprint up front; the content digest only when someone asks for it."""
+    def __init__(self, src: Path, base_python: str):
+        super().__init__(version=shipped_version(src), quick=quick_fingerprint(src), src=str(src.resolve()),
+                         base_python=base_python)
+        self._src = src
+
+    def __getitem__(self, k):
+        if k == "digest" and not dict.__contains__(self, "digest"):
+            dict.__setitem__(self, "digest", source_digest(self._src))
+        return dict.__getitem__(self, k)
+
+    def full(self) -> dict:
+        self["digest"]
+        return dict(self)
 
 
 def read_stamp(venv: Path) -> dict | None:
@@ -122,14 +153,19 @@ def read_stamp(venv: Path) -> dict | None:
 
 
 def write_stamp(venv: Path, stamp: dict) -> None:
-    (venv / STAMP_NAME).write_text(json.dumps(stamp, indent=1), encoding="utf-8")
+    data = stamp.full() if hasattr(stamp, "full") else stamp
+    (venv / STAMP_NAME).write_text(json.dumps(data, indent=1), encoding="utf-8")
 
 
 def needs_install(venv: Path, stamp: dict) -> bool:
     old = read_stamp(venv)
     if old is None:
         return True
-    return old.get("digest") != stamp["digest"] or old.get("version") != stamp["version"]
+    if old.get("version") != stamp["version"]:
+        return True
+    if old.get("quick") and old.get("quick") == stamp.get("quick"):
+        return False                      # same files, same sizes, same mtimes: no hashing needed
+    return old.get("digest") != stamp["digest"]
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     venv = Path(args.venv).resolve() if args.venv else default_venv()
     base_python = args.python or sys.executable
-    stamp = make_stamp(src, base_python)
+    stamp = LazyStamp(src, base_python)
     must_install = args.reinstall or not venv_ok(venv) or needs_install(venv, stamp)
 
     if must_install and not args.no_run and not args.sync_install:
