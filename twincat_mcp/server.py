@@ -195,7 +195,10 @@ class App:
         except XaeError as exc:
             msg = str(exc)
             low = msg.lower()
-            if "0x80010001" in low or "0x8001010a" in low or "call was rejected" in low or "retry later" in low:
+            if "blocked by dialog" in low:
+                pass                                   # the backend already named the dialog
+            elif ("0x80010001" in low or "0x8001010a" in low or "-2147418111" in low or "-2147417846" in low
+                    or "call was rejected" in low or "retry later" in low):
                 msg += " — XAE refused the COM call: it is busy or a modal dialog has the shell." + await asyncio.to_thread(self._dialog_hint)
             lic = _license_hint(msg)
             if lic:
@@ -794,12 +797,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         500 NC, 10000 system service, 65535 EtherCAT master 1)."""
         if port is not None:
             return await app.ads_call(app.ads.state, port, timeout=15)
-        out: dict[str, Any] = {"connection": app.ads.connection_status()}
+        out: dict[str, Any] = {}
         for key, fn in (("plc", app.ads.state), ("system", app.ads.system_state), ("device", app.ads.device_info)):
             try:
                 out[key] = await app.ads_call(fn, timeout=15)
             except ToolError as exc:
                 out[key] = {"error": str(exc)}
+        out["connection"] = app.ads.connection_status()       # after the reads: the connections they opened (#76)
         return out
 
     @mcp.tool(annotations=READ)
@@ -963,9 +967,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=DESTR)
     async def ads_system_mode(action: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Switch TwinCAT on the target between 'run' and 'config' mode (restarts the
-        runtime, I/O goes down). Destructive-class."""
+        runtime, I/O goes down). Destructive-class. Waits (≤20 s) until the target reports the requested mode and
+        returns before/after; reached=false when it did not get there (license / configuration error)."""
         await app.permit(ctx, OpClass.DESTRUCTIVE, "ads_system_mode", action, confirm_token)
-        res = await app.confirmed("ads_system_mode", {"action": action}, OpClass.DESTRUCTIVE, app.ads_call(app.ads.set_system_mode, action, timeout=30))
+        res = await app.confirmed("ads_system_mode", {"action": action}, OpClass.DESTRUCTIVE, app.ads_call(app.ads.set_system_mode, action, timeout=40))
+        if isinstance(res, dict) and not res.get("reached", True):
+            res["dialogs"] = await asyncio.to_thread(app._dialog_hint)
         return res
 
     @mcp.tool(annotations=READ)

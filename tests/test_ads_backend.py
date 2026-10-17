@@ -107,9 +107,9 @@ def test_read_many_mixed(ads):
 
 def test_write_typed_and_readonly(ads, monkeypatch):
     r = ads.write("MAIN.fbFill.tSettle", "T#2s")
-    assert r["before"]["raw_ms"] == 1500 and r["after"]["raw_ms"] == 2000
+    assert r["before"]["raw_ms"] == 1500 and r["read_back"]["raw_ms"] == 2000
     r = ads.write("MAIN.bStart", "false")
-    assert r["after"] is False
+    assert r["read_back"] is False
     with pytest.raises(AdsError, match="READONLY"):
         ads.write("Constants.CompilerVersion", 1)
     with pytest.raises(AdsError, match="opaque"):
@@ -151,7 +151,9 @@ def test_plc_state_and_system_mode(ads):
     with pytest.raises(AdsError):
         ads.set_plc_state("explode")
     r = ads.set_system_mode("config")
-    assert r["requested"] == "config" and ads.connection_status()["open"] == []
+    assert r["requested"] == "config" and r["reached"] and r["after"]["twincat_mode"] == "CONFIG"   # #75: verified, not assumed
+    r = ads.set_system_mode("run", timeout_s=1.5)
+    assert r["reached"] and r["after"]["twincat_mode"] == "RUN"
 
 
 def test_ethercat_overview(ads):
@@ -167,3 +169,16 @@ def test_local_routes_missing_file(ads, tmp_path):
         '<NetId>5.1.2.3.1.1</NetId><Type>TCP_IP</Type></Route></RemoteConnections></TcConfig>')
     r = ads.local_routes()
     assert r["routes"][0]["NetId"] == "5.1.2.3.1.1"
+
+
+def test_write_reports_read_back_changed_by_plc(ads, monkeypatch):
+    """#77: a one-shot the PLC clears every cycle reads back as 0 — that is not a failed write."""
+    from tests.fake_ads import FakeConnection
+    orig = FakeConnection.write_by_name
+
+    def one_shot(self, name, value, plc_datatype=None, **kw):
+        orig(self, name, value, plc_datatype)
+        self.values[name] = 0                      # the PLC consumed the command in the same cycle
+    monkeypatch.setattr(FakeConnection, "write_by_name", one_shot)
+    r = ads.write("MAIN.nCycle", 1)
+    assert r["written"] == 1 and r["read_back"] == 0 and "PLC changed it after the write" in r["note"]

@@ -108,7 +108,6 @@ class FakeConnection:
         self._port = 30000
         self._adr = pyads.AmsAddr(ams_net_id or "1.1.1.1.1.1", ams_net_port or 851)
         self.types = {n: (t, s, f) for n, t, s, v, f in SYMBOLS}
-        self.state = (C.ADSSTATE_RUN, 0)
         self.writes: list[tuple[str, Any]] = []
         self.control: list[tuple[int, int, Any]] = []
         self.timeout = None
@@ -129,7 +128,17 @@ class FakeConnection:
     def close(self): self.is_open = False
     def set_timeout(self, ms): self.timeout = ms
 
-    # state / info
+    # state / info — shared per AMS port, like the real runtime (a reconnect sees the same state)
+    shared_state: dict[int, tuple[int, int]] = {}
+
+    @property
+    def state(self):
+        return FakeConnection.shared_state.get(self.ams_net_port or 851, (C.ADSSTATE_RUN, 0))
+
+    @state.setter
+    def state(self, v):
+        FakeConnection.shared_state[self.ams_net_port or 851] = v
+
     def read_state(self): return self.state
     def read_device_info(self):
         ver = type("V", (), {"version": 3, "revision": 1, "build": 4024})()
@@ -138,6 +147,8 @@ class FakeConnection:
         self.control.append((ads_state, device_state, data))
         if ads_state == C.ADSSTATE_STOP: self.state = (C.ADSSTATE_STOP, 0)
         if ads_state == C.ADSSTATE_RUN: self.state = (C.ADSSTATE_RUN, 0)
+        if ads_state == C.ADSSTATE_RECONFIG: self.state = (C.ADSSTATE_CONFIG, 0)      # system service ends in CONFIG
+        if ads_state == C.ADSSTATE_RESET and (self.ams_net_port == 10000): self.state = (C.ADSSTATE_RUN, 0)
 
     # symbol table
     def read(self, index_group, index_offset, plc_datatype, return_ctypes=False, check_length=True):
@@ -315,6 +326,7 @@ def _scalar_bytes(typ, size, v):
 def install(monkeypatch):
     """Patch pyads so AdsBackend uses FakeConnection and a fake local NetId."""
     FakeConnection.instances.clear()
+    FakeConnection.shared_state = {}
     FakeConnection.reset_values()
     FakeConnection.no_datatypes = False
 

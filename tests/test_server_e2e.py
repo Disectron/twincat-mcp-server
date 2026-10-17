@@ -80,7 +80,7 @@ async def test_ads_read_and_guarded_write(monkeypatch, project_dir):
         res = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 1})
         assert res.is_error and "not in write_allowlist" in text(res)
         res = await s.call_tool("ads_write", {"name": "MAIN.fbFill.tSettle", "value": "T#3s"})
-        assert not res.is_error and payload(res)["after"]["raw_ms"] == 3000
+        assert not res.is_error and payload(res)["read_back"]["raw_ms"] == 3000
         # control op needs a token in guarded mode (no elicitation support on this client)
         res = await s.call_tool("ads_plc_state", {"action": "stop"})
         assert res.is_error and "tc_request_confirmation" in text(res)
@@ -410,7 +410,7 @@ async def test_write_refusals_round2(monkeypatch, project_dir):
             r = await s.call_tool("ads_write", {"name": name, "value": val})
             assert r.is_error and why in text(r), (name, text(r))
         ok = payload(await s.call_tool("ads_write", {"name": "PRG_Test.eCmd", "value": "E_FillState.Fine"}))   # #61
-        assert ok["after"] == 2
+        assert ok["read_back"] == 2 and ok["written"] == 2
         r = payload(await s.call_tool("ads_read", {"name": "PRG_Test.ipModule"}))                              # #64
         assert r["value"] is None and "INTERFACE" in r["note"]
         # #54: one bad item → nothing written, every problem named

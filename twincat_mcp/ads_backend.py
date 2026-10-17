@@ -48,6 +48,24 @@ SYMFLAG = {
 }
 
 
+def _same_value(a: Any, b: Any) -> bool:
+    def raw(v: Any) -> Any:
+        if isinstance(v, dict):
+            for k in ("raw_ms", "raw", "raw_ns", "value"):
+                if k in v:
+                    return v[k]
+        return v
+    a, b = raw(a), raw(b)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return abs(float(a) - float(b)) <= 1e-6 * max(1.0, abs(float(a)))    # REAL rounding
+        except (TypeError, ValueError):
+            return False
+    return a == b
+
+
 def _is_iface_name(ts: Any, type_name: str) -> bool:
     from .ads_types import is_interface
     e = ts.get(type_name)
@@ -210,7 +228,7 @@ class AdsBackend:
         time.sleep(0.3)
         return {"before": before, "after": self._state_dict(c)}
 
-    def set_system_mode(self, action: str) -> dict[str, Any]:
+    def set_system_mode(self, action: str, timeout_s: float = 20.0) -> dict[str, Any]:
         """config | run on the System Service. 'run' restarts TwinCAT in run mode
         (same as ADSSTATE_RESET on port 10000); 'config' = ADSSTATE_RECONFIG."""
         c = self.conn(SYSTEM_SERVICE_PORT)
@@ -222,10 +240,28 @@ class AdsBackend:
             c.write_control(code, 0, 0, C.PLCTYPE_INT)
         except Exception as exc:  # noqa: BLE001
             raise AdsError(f"system mode switch ({action}) failed: {_fmt_exc(exc)}") from exc
-        # the system service drops connections while switching
+        # the system service drops connections while switching: reconnect and poll until the requested mode is
+        # reached (or the timeout) — the answer is the state TwinCAT is actually in, not the request
         self.disconnect()
-        return {"before": before, "requested": action,
-                "note": "TwinCAT restarts; call ads_system_state after a few seconds."}
+        want = "RUN" if action == "run" else "CONFIG"
+        t0 = time.time()
+        after: dict[str, Any] | str = "unreadable"
+        polls = 0
+        while time.time() - t0 < timeout_s:
+            time.sleep(0.5 if polls < 6 else 1.0)
+            polls += 1
+            try:
+                after = self.system_state()
+            except Exception as exc:  # noqa: BLE001 — restarting: the port is briefly gone
+                after = f"unreadable: {exc}"
+                self.disconnect()
+                continue
+            if isinstance(after, dict) and after.get("twincat_mode") == want:
+                return {"before": before, "requested": action, "after": after, "reached": True,
+                        "seconds": round(time.time() - t0, 1)}
+        return {"before": before, "requested": action, "after": after, "reached": False, "seconds": round(time.time() - t0, 1),
+                "note": f"TwinCAT did not report {want} within {timeout_s:.0f} s — a license error or a configuration "
+                        "problem makes it fall back to CONFIG; check xae_dialogs / ads_status"}
 
     # ------------------------------------------------------------ symbols
     def _load_symbols(self, c: pyads.Connection) -> tuple[list[SymbolEntry], dict[str, SymbolEntry]]:
@@ -699,8 +735,13 @@ class AdsBackend:
             raise
         except Exception as exc:  # noqa: BLE001
             raise AdsError(f"write {s.name!r}={value!r} as {s.type}: {_fmt_exc(exc)}") from exc
-        after = self.read(name, expand_struct=False, port=port).get("value")
-        return {"name": s.name, "type": s.type, "before": before, "after": after}
+        read_back = self.read(name, expand_struct=False, port=port).get("value")
+        written = T.decode(tt, enc)
+        out = {"name": s.name, "type": s.type, "before": before, "written": written, "read_back": read_back}
+        if not _same_value(written, read_back):
+            out["note"] = ("read_back differs from the written value: the PLC changed it after the write (a one-shot it "
+                           "clears, or a variable the program assigns every cycle). The write itself was accepted.")
+        return out
 
     def io_read(self, area: str, offset: int, size: int, port: int | None = None) -> dict[str, Any]:
         """Read the raw process image: area 'I' (inputs, ADSIGRP_IOIMAGE_RWIB) or 'Q' (outputs,

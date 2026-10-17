@@ -114,13 +114,24 @@ class XaeBackend:
 
     def _retry(self, fn: Callable[[], Any], what: str = "COM call") -> Any:
         """Retry COM calls while the shell is busy."""
-        deadline = time.time() + self.cfg.com_retry_s
+        t_start = time.time()
+        deadline = t_start + self.cfg.com_retry_s
         delay = 0.25
         while True:
             try:
                 return fn()
             except Exception as exc:  # noqa: BLE001
                 hr = getattr(exc, "hresult", None)
+                if hr in (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER) and time.time() - t_start > min(1.0, self.cfg.com_retry_s / 2):
+                    # busy for more than a second: if a modal dialog has the shell, retrying for a minute is pointless
+                    dlg = self._modal_dialogs()
+                    if dlg:
+                        d = dlg[0]
+                        raise XaeError(
+                            f"{what}: BLOCKED BY DIALOG '{d.get('title')}' — buttons {d.get('buttons')}; text: "
+                            f"{str(d.get('text', ''))[:300]!r}. The shell is waiting for an answer, so whether the action ran "
+                            "is unknown until the dialog is answered (xae_dialog_resolve(button=...)), then check the result."
+                        ) from exc
                 if hr in (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER) and time.time() < deadline:
                     time.sleep(delay)
                     delay = min(delay * 1.5, 2.0)
@@ -145,6 +156,13 @@ class XaeBackend:
                 if "logged into" in msg.lower() or "logged in" in msg.lower():
                     msg += " — XAE is logged in to the PLC; the project cannot be changed online. Log out first: xae_plc('logout')."
                 raise XaeError(f"{what}: {msg}") from exc
+
+    def _modal_dialogs(self) -> list[dict[str, Any]]:
+        try:
+            from . import dialogs as _dlg
+            return [d.to_dict() for d in _dlg.list_dialogs(self.pid)]
+        except Exception:  # noqa: BLE001 — no dialog enumeration (non-Windows, no pid)
+            return []
 
     def _need(self) -> Any:
         if self.dte is None:

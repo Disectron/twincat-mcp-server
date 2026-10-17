@@ -101,7 +101,10 @@ class Guard:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            live = [t for t in self._tokens.values() if not t.used and t.expires > time.time()]
+            now = time.time()
+            for k in [k for k, t in self._tokens.items() if t.expires <= now]:
+                del self._tokens[k]                         # purge expired tokens before listing (#78)
+            live = [t for t in self._tokens.values() if not t.used and t.expires > now + 0.5]
         return {
             "mode": self.mode,
             "max_mode": self.max_mode,

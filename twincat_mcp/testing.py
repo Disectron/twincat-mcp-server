@@ -249,7 +249,7 @@ class TestBench:
                     for k, v in stp["write"].items():
                         try:
                             r = self.ads.write(k, v)
-                            res[k] = {"before": r.get("before"), "after": r.get("after")}
+                            res[k] = {kk: r.get(kk) for kk in ("before", "written", "read_back", "note") if kk in r}
                         except AdsError as exc:
                             res[k] = {"error": str(exc)}; overall = False
                     entry["write"] = res

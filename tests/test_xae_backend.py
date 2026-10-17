@@ -210,6 +210,23 @@ def test_com_retry_on_busy(xae):
     assert be.dte is None
 
 
+def test_com_rejected_by_modal_dialog_fails_fast(xae, monkeypatch):
+    """#79 / P15: a rejected call while a modal dialog is open names the dialog after ~1 s instead of retrying
+    for com_retry_s (60 s) and ending in a raw com_error."""
+    import time as _t
+    be, dte, sm = xae
+    be.attach()
+    monkeypatch.setattr(be, "_modal_dialogs", lambda: [{"title": "Microsoft Visual Studio", "buttons": ["Save", "Don't Save", "Cancel"],
+                                                        "text": "Save changes to the following items?"}])
+
+    def rejected():
+        raise ComError(X.RPC_E_CALL_REJECTED)
+    t0 = _t.time()
+    with pytest.raises(X.XaeError, match="BLOCKED BY DIALOG 'Microsoft Visual Studio'.*Don't Save"):
+        be._retry(rejected, "ExecuteCommand File.CloseSolution")
+    assert _t.time() - t0 < 5
+
+
 def test_target_activate_restart(xae):
     be, dte, sm = xae
     assert be.target_get()["target_net_id"] == "5.1.2.3.1.1"
