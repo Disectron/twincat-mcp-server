@@ -1,4 +1,4 @@
-# twincat-mcp 0.8.4 — tool reference
+# twincat-mcp 0.8.5 — tool reference
 
 155 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
@@ -107,7 +107,7 @@
 - `xae_attach` [E] — Attach to the running XAE shell / Visual Studio (Running Object Table). Picks the instance holding solution_path when given. launch=true starts a new shell (slow).
 - `xae_status` [R] — Shell version, open solution, projects, TwinCAT project name, target NetId, started flag. Attaches to the shell first if not attached yet (as every xae_* tool does).
 - `xae_open_solution` [E] — Open a .sln in the attached shell.
-- `xae_build` [E] — Build the solution (File.SaveAll first by default). Returns success, error/warning items with file:line (VS error list, or parsed from the Build output pane) and the output tail. check_all_objects=true runs PLC 'Check all objects' instead (compiles unused POUs).
+- `xae_build` [E] — Build the solution. save_first (default) runs File.SaveAll, saves whatever the shell still reports unsaved, and checks that every xae_pou_set / xae_pou_create edit of this session is in the source files — it refuses to build otherwise (an external reload would discard the edits). Returns success, error/warning items…
 - `xae_diagnostics` [R] — Current error list (errors/warnings/messages with file:line) plus the tail of the Build output pane, without rebuilding.
 - `xae_list_commands` [R] — List DTE command names containing a substring (to discover what this shell exposes).
 - `xae_command` [C/D] — Execute an arbitrary DTE command (e.g. 'PLC.Login'). Control-class; commands whose name contains download/reset/activate/restart/delete/remove/shutdown are destructive-class.

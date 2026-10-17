@@ -40,3 +40,4 @@ tag; `main` contains all of them.
 | 0.8.2 | TwinCAT Scope: `scope_export`, `scope_list`, `scope_record`, `rec_start(also_scope)`, `[recorder] also_scope` | 2026-10-18 |
 | 0.8.3 | Infosys from the local Help Viewer package (`docs.source = "local"`, no network) | 2026-10-18 |
 | 0.8.4 | 0.8.3 deep test: stalled PLC + re-subscription, honest live status, sealing of self-ended recordings, one pattern language rec_start/rec_scan, verified restart, Infosys index speed + reindex rule, ESI parsing | 2026-10-18 |
+| 0.8.5 | verified save before build/deploy/tcunit_run (D44); experiment measures honest (D33–D37); tc_doctor CONFIG as info (D45) | 2026-10-18 |
