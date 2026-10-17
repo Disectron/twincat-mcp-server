@@ -55,6 +55,7 @@ from . import exporters
 from .hmi import HmiIndex
 from .infosys import InfosysIndex, InfosysError
 from . import profiles as capture
+from . import knowledge as K
 from . import experiments as X
 from pathlib import Path
 
@@ -142,6 +143,8 @@ class App:
         self.xae_worker = SerialWorker("tcmcp-xae-sta", init=sta_init, teardown=sta_teardown)
         self.proj = ProjectIndex(cfg.project)
         self.ads.write_guard = self.constant_reason       # every write path: CONSTANT / no-source checks
+        from .config import _home
+        self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
@@ -168,12 +171,12 @@ class App:
         try:
             return await worker.run(fn, *a, timeout=timeout or (self.cfg.ads.max_watch_duration_ms / 1000 + 30), **kw)
         except (AdsError, RecorderError, TestError) as exc:
-            raise ToolError(str(exc)) from exc
+            raise ToolError(K.annotate(str(exc))) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError("ADS call timed out (router/route/firewall? run tc_doctor)") from exc
         except (pyads.ADSError, OSError) as exc:
             # safety net for a backend path that did not translate the pyads/socket error itself
-            raise ToolError(f"ADS error: {_fmt_ads_exc(exc)}") from exc
+            raise ToolError(K.annotate(f"ADS error: {_fmt_ads_exc(exc)}")) from exc
 
     def _dialog_hint(self) -> str:
         """What is open in the shell right now — the usual reason a COM call is rejected or hangs."""
@@ -204,7 +207,7 @@ class App:
             lic = _license_hint(msg)
             if lic:
                 msg += " " + lic
-            raise ToolError(msg) from exc
+            raise ToolError(K.annotate(msg)) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             pend = self.xae.watchdog.status().get("pending") or []
             hint = (" Open dialog(s): " + "; ".join(f"'{d['title']}' buttons {d['buttons']}" for d in pend[:3])
@@ -222,7 +225,15 @@ class App:
         try:
             return await asyncio.to_thread(fn, *a, **kw)
         except ProjectError as exc:
+            raise ToolError(K.annotate(str(exc))) from exc
+
+    async def kb_call(self, fn, *a, timeout: float = 600, **kw) -> Any:
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fn, *a, **kw), timeout)
+        except K.KnowledgeError as exc:
             raise ToolError(str(exc)) from exc
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise ToolError(f"knowledge base call timed out after {timeout:.0f} s (still running in the background)") from exc
 
     async def rec_call(self, fn, *a, timeout: float = 60, **kw) -> Any:
         return await self.ads_call(fn, *a, timeout=timeout, slow=True, **kw)
@@ -791,6 +802,59 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         app.audit("tc_reload_config", {"file": fresh.config_file}, OpClass.EDIT, "ok", {"applied": list(applied), "needs_restart": list(needs_restart)})
         return {"config_file": fresh.config_file, "applied": applied, "needs_restart": needs_restart,
                 "warnings": fresh.warnings, "write_allowlist": list(cfg.safety.write_allowlist)}
+
+    # ---- knowledge base (decisions 2026-10-17) -----------------------------
+    @mcp.tool(annotations=READ)
+    async def kb_status() -> dict[str, Any]:
+        """Knowledge base: where it is stored (or the question to ask the user if no folder was chosen yet), the
+        project folders indexed for kb_search, ESI devices indexed for hw_lookup, known-error entries."""
+        return await app.kb_call(app.kb.status)
+
+    @mcp.tool(annotations=EDIT)
+    async def kb_set_location(path: str | None = None, use_fallback: bool = False) -> dict[str, Any]:
+        """Choose the folder for the knowledge database — ONLY with a path the user gave you (or use_fallback=true
+        once the user agreed to D:\\TwinCAT-MCP\\knowledge). The folder is checked: local fixed drive (no network
+        share / mapped drive / USB), not inside OneDrive/Dropbox/Google Drive/iCloud, not inside the plugin folder,
+        writable, >= 1 GB free — a failing condition is named and nothing is changed. An existing database is never
+        moved or deleted."""
+        res = await app.kb_call(app.kb.set_location, path, use_fallback)
+        app.audit("kb_set_location", {"path": path, "use_fallback": use_fallback}, OpClass.EDIT, "ok", res)
+        return res
+
+    @mcp.tool(annotations=EDIT)
+    async def kb_add_project(path: str, label: str | None = None) -> dict[str, Any]:
+        """Index a project folder for kb_search (cross-project pattern search) — ONLY a folder the user named. Reads
+        .TcPOU/.TcDUT/.TcGVL/.TcIO beneath it into the knowledge database; nothing is indexed by default."""
+        res = await app.kb_call(app.kb.add_project, path, label)
+        app.audit("kb_add_project", {"path": path}, OpClass.EDIT, "ok", res)
+        return res
+
+    @mcp.tool(annotations=EDIT)
+    async def kb_remove_project(path: str) -> dict[str, Any]:
+        """Remove a project folder from the knowledge base (index entries only; the files are untouched)."""
+        res = await app.kb_call(app.kb.remove_project, path)
+        app.audit("kb_remove_project", {"path": path}, OpClass.EDIT, "ok", res)
+        return res
+
+    @mcp.tool(annotations=EDIT)
+    async def kb_reindex(path: str | None = None) -> dict[str, Any]:
+        """Re-index one project folder (or every changed one) after edits."""
+        return await app.kb_call(app.kb.reindex, path)
+
+    @mcp.tool(annotations=READ)
+    async def kb_search(query: str, kinds: list[str] | None = None, project: str | None = None, limit: int = 20) -> dict[str, Any]:
+        """Search the code of the project folders the user added ("alarm handler", "FB_Valve", "CONCAT"): unit, kind,
+        file and the matching declaration/code excerpts, best first. kinds filters (FUNCTION_BLOCK, METHOD, DUT,
+        GVL, …). Also returns the known cause/fix when the query is an error message."""
+        return await app.kb_call(app.kb.search, query, kinds, project, limit)
+
+    @mcp.tool(annotations=READ)
+    async def hw_lookup(query: str, limit: int = 3, revision: int | None = None) -> dict[str, Any]:
+        """EtherCAT terminal/box data from the installed ESI files (K4): name, product code, revisions, PDOs with
+        their entries (index, subindex, bit length, type), CoE objects. query = type ('EL2008'), part of a name, or a
+        product code ('#x07D83052'). The first call indexes TwinCAT's ESI folder into the knowledge database (can
+        take a minute)."""
+        return await app.kb_call(app.kb.hw_lookup, query, limit, revision, timeout=900)
 
     @mcp.tool(annotations=READ)
     async def tc_request_confirmation(action: str, target: str = "") -> dict[str, Any]:
@@ -1579,6 +1643,22 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # ======================================================================
     # static checks
     # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def proj_libraries() -> dict[str, Any]:
+        """Library versions (K3): every library reference of each PLC project — the version it asks for, the version
+        it effectively resolves to on this PC ('*' = newest installed) and what is installed in TwinCAT's library
+        repository. Flags a pinned version that is not installed. Reads the .plcproj and folder names only."""
+        await app.proj_call(app.proj._ensure)
+        files = [pp["file"] for pp in app.proj.plcproj]
+        if not files:
+            raise ToolError("no .plcproj under the project root (proj_scan / project.root)")
+        installed = await asyncio.to_thread(app.kb.installed_libraries)
+        out = await asyncio.to_thread(K.library_report, files, installed)
+        out["repository"] = [str(d) for d in await asyncio.to_thread(app.kb.library_folders)]
+        if not out["repository"]:
+            out["note"] += "; no library repository found on this PC (not the engineering PC?) — installed versions unknown"
+        return out
+
     @mcp.tool(annotations=READ)
     async def proj_interface(name: str) -> dict[str, Any]:
         """Public interface of an FB/program: inputs/outputs/in-out with types and comments,

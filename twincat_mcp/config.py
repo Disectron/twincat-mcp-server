@@ -124,7 +124,16 @@ class DocsConfig:
     fetch_timeout_s: float = 20.0
 
 
-TOOL_GROUPS = ("tc", "ads", "rec", "snap", "test", "exp", "proj", "xae", "ipc", "hmi", "infosys", "wf", "tcunit")
+TOOL_GROUPS = ("tc", "ads", "rec", "snap", "test", "exp", "proj", "xae", "ipc", "hmi", "infosys", "wf", "tcunit", "kb", "hw")
+
+
+@dataclass
+class KnowledgeConfig:
+    # folder for knowledge.db; None = ask the user on first use (kb_set_location). Conditions: local fixed drive,
+    # not cloud-synced, not inside the plugin folder, writable, >= 1 GB free.
+    location: str | None = None
+    esi_dirs: list[str] = field(default_factory=list)       # extra ESI folders (TwinCAT's own are probed)
+    library_dirs: list[str] = field(default_factory=list)   # extra managed-library repositories
 
 
 @dataclass
@@ -137,6 +146,7 @@ class ServerConfig:
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
+    knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     ads: AdsConfig = field(default_factory=AdsConfig)
     xae: XaeConfig = field(default_factory=XaeConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
@@ -168,7 +178,7 @@ def _find_config_file() -> Path | None:
 
 
 def _apply_toml(cfg: Config, data: dict[str, Any]) -> None:
-    for section in ("server", "ads", "xae", "project", "safety", "docs"):
+    for section in ("server", "knowledge", "ads", "xae", "project", "safety", "docs"):
         sub = data.get(section) or {}
         target = getattr(cfg, section)
         for k, v in sub.items():
@@ -198,6 +208,8 @@ def _env_list(name: str) -> list[str] | None:
 
 
 def _apply_env(cfg: Config) -> None:
+    if v := _env("TCMCP_KNOWLEDGE_DIR"):
+        cfg.knowledge.location = v
     if (lst := _env_list("TCMCP_TOOL_GROUPS")) is not None:
         cfg.server.tool_groups = [g.strip().lower() for g in lst]
     # safety

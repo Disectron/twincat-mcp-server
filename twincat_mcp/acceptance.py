@@ -61,6 +61,13 @@ class Check:
 
 # tools this run never calls, with the manual step that exercises each (docs/HARDWARE_DAY.md)
 MANUAL: dict[str, str] = {
+    "kb_set_location": "only with a folder you name (kb_status says what to ask); then kb_status shows the database",
+    "kb_status": "after kb_set_location: location, projects, ESI devices",
+    "kb_add_project": "with a project folder you name; then kb_search for an FB name you know",
+    "kb_remove_project": "remove the folder you added; kb_search no longer finds it",
+    "kb_reindex": "after editing a POU in an added folder",
+    "kb_search": "an FB name from an added folder, and an error text (e.g. 'ADSError 1861') → known_error",
+    "hw_lookup": "'EL2008' (or a terminal you use) → PDOs and CoE objects from the installed ESI files",
     "ads_connect": "re-target to a second PLC port: ads_connect ams_port=852 on a box that has one",
     "ads_write_raw": "raw write by index group/offset — only with a known address on the test box",
     "ads_plc_state": "HARDWARE_DAY §7+: ads_plc_state stop/start on the test box with a confirm token",
@@ -398,7 +405,8 @@ class Acceptance:
         self.log("[3] project files")
         tools = ("proj_scan", "proj_list", "proj_get_code", "proj_resolve_symbol", "proj_search", "proj_references", "proj_read_file",
                  "proj_interface", "proj_lint", "proj_call_graph", "proj_variables", "proj_vs_runtime", "proj_changed", "proj_validate_xml",
-                 "hmi_scan", "hmi_bindings", "hmi_vs_runtime", "tcunit_scaffold", "tcunit_results", "wf_release_check", "rec_scan")
+                 "hmi_scan", "hmi_bindings", "hmi_vs_runtime", "tcunit_scaffold", "tcunit_results", "wf_release_check", "rec_scan",
+                 "proj_libraries")
         if not self.cfg.project.root and not self.proj_ok:
             for t in tools:
                 self.skip(ph, t, "no project root (xae.solution_path / project.root)")
@@ -417,6 +425,7 @@ class Acceptance:
         else:
             for t in ("proj_get_code", "proj_references", "proj_call_graph"):
                 self.skip(ph, t, "no units indexed")
+        await self.check(ph, "proj_libraries", {}, optional=True)
         if self.first_fb:
             await self.check(ph, "proj_interface", {"name": self.first_fb})
         else:
