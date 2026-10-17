@@ -98,10 +98,15 @@ def test_change_mode_capture_stats_export_read(rec, tmp_path):
     # read: long + window
     r = rec.read(rid, 300, 1000, None, 100, wide=False)
     assert [x["symbol"] for x in r["rows"]] == ["MAIN.fbFill.eState", "MAIN.fbFill.tSettle", "MAIN.fbFill.eState", "MAIN.fbFill.bDone"]
-    # read: wide with forward fill from before the window
+    # read: wide = one row per PLC timestamp, null where nothing was sampled (D9: no invented rows / values)
     w = rec.read(rid, 300, 1000, ["MAIN.fbFill.eState", "MAIN.fbFill.bDone"], 100, wide=True)
-    assert w["rows"][0]["MAIN.fbFill.bDone"] is False and w["rows"][0]["MAIN.fbFill.eState"] == 2
-    assert w["rows"][-1]["MAIN.fbFill.bDone"] is True
+    assert [r["t_ms"] for r in w["rows"]] == [350.0, 900.0]                  # PLC timestamps of the selected symbols
+    assert w["rows"][0]["MAIN.fbFill.eState"] == 2 and w["rows"][0]["MAIN.fbFill.bDone"] is None and "_filled" not in w["rows"][0]
+    assert w["rows"][-1] == {"t_ms": 900.0, "MAIN.fbFill.eState": 3, "MAIN.fbFill.bDone": True}
+    # fill=true: forward fill on request, every filled cell named
+    wf = rec.read(rid, 300, 1000, ["MAIN.fbFill.eState", "MAIN.fbFill.bDone"], 100, wide=True, fill=True)
+    assert wf["rows"][0]["MAIN.fbFill.bDone"] is False and wf["rows"][0]["_filled"] == ["MAIN.fbFill.bDone"]
+    assert wf["rows"][-1]["_filled"] == [] and "forward-filled" in wf["note"]
     # export
     e = rec.export(rid, "csv_wide", None, None)
     csv_lines = Path(e["file"]).read_text().splitlines()
@@ -362,6 +367,66 @@ def test_n13_tail_wait_is_bounded(rec):
     assert wait_until(lambda: not rec.status(st["id"])["active"], 0.3 + R.TAIL_WAIT_S + 1.5)
     out = rec.stop(st["id"], "manual (rec_stop)")
     assert out["label"] == "INCOMPLETE" and out["missing_samples"] == 100     # the tail that never came is counted
+
+
+def test_d11_python_engine_marks_a_frozen_counter_as_stall(rec):
+    """D11 (Python engine): notifications keep coming while the PLC is stopped, every value frozen. The cycle counter
+    recorded with the data stops advancing → {"_stall"} marker, stalled samples not counted as data, INCOMPLETE."""
+    st = _cycle_rec(rec, symbols=["MAIN.nCycle"], cycle_counter="MAIN.nCycle")
+    c = _conn()
+    for i in range(1000):
+        c.fire("MAIN.nCycle", i if not 400 <= i <= 599 else 399, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == 1000)
+    live = rec.status(st["id"])
+    assert live["stalls"] == 1 and live["stalled_samples"] == 200 and not live["stalled"]
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    assert out["missing_samples"] == 0 and out["label"] == "INCOMPLETE"
+    assert out["label_reason"] == "PLC stopped (cycle counter frozen) 399.0000-600.0000 ms"
+    assert abs(out["completeness"] - 800 / 1000) < 1e-6
+    lines = Path(out["file"]).read_text(encoding="utf-8").splitlines()
+    assert [json.loads(ln)["_stall"] for ln in lines if ln.startswith('{"_stall"')] == [
+        {"block": 0, "t_from": 399.0, "t_to": 600.0, "samples": 200}]
+    foot = json.loads(lines[-1])
+    assert foot["stalls"] == 1 and foot["stalled_samples"] == 200 and foot["stall_counter_block"] == 0
+    v = rec.verify(st["id"], counter="MAIN.nCycle")
+    # D12: 1000 samples over 800 distinct counter values (0..399 and 600..999 → expected 1000) — never above 100 %
+    assert v["counter"]["duplicates"] == 200 and v["counter"]["completeness"] == 0.8 and "PLC stopped" in v["counter"]["note"]
+    assert v["verdict"] == "FAIL" and v["footer"]["stalls"] == 1
+
+
+def test_n29_n30_status_after_trigger_and_values_per_s(rec):
+    FakeConnection.shared_values.update({"MAIN.bStart": False})
+    st = _cycle_rec(rec, symbols=["MAIN.nCycle", "MAIN.bStart", "MAIN.fbFill.arrWeights"], start_when="MAIN.bStart == TRUE")
+    assert st["values_per_sample"] == 6 and st["values_per_s"] == 6000.0       # N30: array elements counted
+    c = _conn()
+    c.fire("MAIN.bStart", True, ft(5))
+    assert wait_until(lambda: rec.status(st["id"])["triggered_at_ms"] is not None)
+    assert rec.status(st["id"])["armed"] is False                              # N29
+    rec.stop(st["id"], "manual (rec_stop)")
+
+
+def test_d7_delete_after_self_ended_recording_and_seal_sweep(rec):
+    """D7: a recording that ended by itself is sealed (read-only) by its own thread; deleting right after must wait
+    for that and succeed. N27: an unsealed finished recording is sealed by the start-up sweep."""
+    st = _cycle_rec(rec, symbols=["MAIN.nCycle"], max_events=50)
+    c = _conn()
+    for i in range(60):
+        c.fire("MAIN.nCycle", i, ft(i))
+    p = Path(rec.recs[st["id"]].path)
+    assert rec.delete(st["id"])["removed"] and not p.exists() and not R.manifest_path(p).exists()
+    # sweep: a finished file without manifest (server died before sealing) gets sealed; an unfinished one does not
+    st2 = _cycle_rec(rec, symbols=["MAIN.nCycle"])
+    c = _conn()
+    for i in range(10):
+        c.fire("MAIN.nCycle", i, ft(i))
+    out = rec.stop(st2["id"], "manual (rec_stop)")
+    p2 = Path(out["file"])
+    R.make_writable(R.manifest_path(p2)); R.manifest_path(p2).unlink()
+    half = p2.with_name("20990101-000000-dead.jsonl")
+    half.write_text('{"_header": true, "format": 2}\n[0.0,"#0","AAAA"]\n', encoding="utf-8")
+    sw = rec.seal_unsealed()
+    assert sw["sealed"] == [p2.stem] and sw["unfinished"] == 1 and R.manifest_path(p2).exists()
+    assert not R.manifest_path(half).exists()
 
 
 def test_lossless_run_passes_verification(rec):

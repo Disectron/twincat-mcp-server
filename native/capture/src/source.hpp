@@ -39,6 +39,10 @@ public:
                            Sink* sink, SubscribeError& err) = 0;
     // After return no further on_sample calls start (calls already running may still finish).
     virtual void unsubscribe() = 0;
+    // The target stopped delivering (TwinCAT restart, route loss): register every block again. True when all blocks
+    // are subscribed again; false (with err) when the target is still away — the engine retries later.
+    virtual bool resubscribe(std::string& err) { err = "not supported by this source"; return false; }
+    virtual uint64_t resubscriptions() const { return 0; }
     // Describes the target once connected ({"device": ..., "router": ...}); JSON object text.
     virtual std::string describe() const = 0;
 };

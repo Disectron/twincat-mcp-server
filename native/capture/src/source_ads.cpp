@@ -121,6 +121,9 @@ public:
     bool subscribe(const std::vector<BlockSpec>& blocks, int64_t cycle_100ns, int64_t max_delay_100ns, Sink* sink,
                    SubscribeError& err) override {
         g_sink.store(sink, std::memory_order_release);
+        blocks_ = blocks;
+        cycle_ = cycle_100ns;
+        max_delay_ = max_delay_100ns;
         for (size_t k = 0; k < blocks.size(); ++k) {
             const BlockSpec& b = blocks[k];
             AdsNotificationAttrib attr{};
@@ -153,6 +156,41 @@ public:
         g_sink.store(nullptr, std::memory_order_release);
     }
 
+    // D13: after RUN→CONFIG→RUN the runtime's notification table is gone; the handles we hold are dead. Drop them
+    // (the delete request fails fast while the port is away) and register every block again. All or nothing, like
+    // subscribe(): a partial set would record some blocks and silently miss others.
+    bool resubscribe(std::string& err) override {
+        if (!dev_ || blocks_.empty()) {
+            err = "nothing subscribed";
+            return false;
+        }
+        notes_.clear();
+        std::vector<std::unique_ptr<AdsNotification>> fresh;
+        for (size_t k = 0; k < blocks_.size(); ++k) {
+            const BlockSpec& b = blocks_[k];
+            AdsNotificationAttrib attr{};
+            attr.cbLength = b.size;
+            attr.nTransMode = ADSTRANS_SERVERCYCLE;
+            attr.nMaxDelay = static_cast<uint32_t>(max_delay_);
+            attr.nCycleTime = static_cast<uint32_t>(cycle_);
+            try {
+                fresh.emplace_back(new AdsNotification(*dev_, b.igrp, b.ioffs, attr, &on_notification,
+                                                       static_cast<uint32_t>(k)));
+            } catch (const AdsException& ex) {
+                err = "block " + std::to_string(b.id) + ": " + ads_error(ex.errorCode);
+                return false;
+            } catch (const std::exception& ex) {
+                err = "block " + std::to_string(b.id) + ": " + ex.what();
+                return false;
+            }
+        }
+        notes_.swap(fresh);
+        ++resubs_;
+        return true;
+    }
+
+    uint64_t resubscriptions() const override { return resubs_; }
+
     std::string describe() const override {
         JObj o;
         o.str("ads_lib", "Beckhoff AdsLib");
@@ -178,6 +216,9 @@ private:
     std::unique_ptr<AdsDevice> dev_;
     std::vector<std::unique_ptr<AdsNotification>> notes_;
     std::string dev_name_, dev_version_;
+    std::vector<BlockSpec> blocks_;
+    int64_t cycle_ = 10000, max_delay_ = 0;
+    uint64_t resubs_ = 0;
 };
 
 }  // namespace

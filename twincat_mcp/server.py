@@ -163,6 +163,7 @@ class App:
         self.runners: dict[str, X.Runner] = {}
         self.docs_bg: dict[str, Any] = {}
         self.session_allow: list[str] = []      # tc_allow_write additions; survive tc_reload_config (N6)
+        threading.Thread(target=self._seal_sweep, name="tcmcp-seal-sweep", daemon=True).start()
         self.docs: InfosysIndex | None = None
         self.docs_error: str | None = None
         if cfg.docs.enabled:
@@ -192,6 +193,15 @@ class App:
                 self.docs_error = str(exc)
                 log.warning("infosys index disabled: %s", exc)
         self.started = time.time()
+
+    def _seal_sweep(self) -> None:
+        """N27: recordings that finished while no server was there to seal them get their manifest now."""
+        try:
+            r = self.rec.seal_unsealed()
+            if r.get("sealed"):
+                log.info("sealed %d recording(s) left unsealed by an earlier server: %s", len(r["sealed"]), r["sealed"][:10])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("seal sweep failed: %s", exc)
 
     # --- runners -----------------------------------------------------------
     async def ads_call(self, fn, *a, timeout: float | None = None, slow: bool = False, **kw) -> Any:
@@ -414,6 +424,8 @@ class App:
             return await asyncio.to_thread(fn, *a, **kw)
         except (RecorderError, AdsError, TestError) as exc:
             raise ToolError(str(exc)) from exc
+        except OSError as exc:            # a file the OS refuses (read-only, in use): the reason, never an empty error (D7)
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
 
     def scope(self) -> str:
         return self.ads.target_label()
@@ -1237,7 +1249,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         try:
             st = await app.rec_call(app.rec.start, symbols=[name], prefix=None, pattern=None, mode="change", cycle_ms=1.0,
                                     duration_s=None, max_events=None, start_when=None, stop_when=f"{name} {op} {lit}",
-                                    pre_trigger_ms=0, name="ads_wait_until", max_symbols=1, timeout=60)
+                                    pre_trigger_ms=0, name="ads_wait_until", max_symbols=1, scratch=True, timeout=60)
         except ToolError as exc:
             res = await app.ads_call(app.ads.wait_until, name, op, value, timeout_ms, interval_ms,
                                      timeout=timeout_ms / 1000 + 10, slow=True)
@@ -1268,14 +1280,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             if last is None:
                 last = next(iter((fin.get("last_values") or {}).values()), None)
         finally:
+            # the helper recording is scratch: whatever happens to its file must not turn a met condition into an
+            # error (D7). Anything left behind is reported, not hidden.
+            cleanup_error = None
             try:
                 await app.mem_call(app.rec.delete, rid)
-            except ToolError:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                cleanup_error = f"{type(exc).__name__}: {exc}"[:300]
         out = {"met": met, "value": last, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
                "method": "ADS change notification"}
         if met:
             out["met_at_plc_ms"] = fin.get("plc_span_s", 0) * 1000.0
+        if cleanup_error:
+            out["cleanup_warning"] = f"temporary recording {rid} could not be removed: {cleanup_error}"
         return out
 
     @mcp.tool(annotations=DESTR)
@@ -1772,11 +1789,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def rec_read(id: str, t_from_ms: float | None = None, t_to_ms: float | None = None,
-                       symbols: list[str] | None = None, max_rows: int = 2000, wide: bool = False) -> dict[str, Any]:
-        """Read a time window of a recording from its file. wide=true pivots to one row per event
-        with all selected symbols forward-filled (what you want for 'what else was true when X
-        happened'). Works on finished recordings from earlier sessions too."""
-        return await app.mem_call(app.rec.read, id, t_from_ms, t_to_ms, symbols, min(max_rows, 50_000), wide)
+                       symbols: list[str] | None = None, max_rows: int = 2000, wide: bool = False,
+                       fill: bool = False) -> dict[str, Any]:
+        """Read a time window of a recording from its file. wide=true: one row per PLC timestamp with one column per
+        selected symbol; a cell is null when that symbol has no sample at that time — nothing is invented (R4).
+        fill=true repeats the last known value into those cells and lists them per row under "_filled" (handy for
+        'what else was true when X happened', but a filled cell is not a sample). Works on finished recordings from
+        earlier sessions too."""
+        return await app.mem_call(app.rec.read, id, t_from_ms, t_to_ms, symbols, min(max_rows, 50_000), wide, fill)
 
     @mcp.tool(annotations=EDIT)
     async def rec_stop(id: str) -> dict[str, Any]:

@@ -3,7 +3,10 @@
 // like _TaskInfo[n].CycleCount. Faults are injected on request:
 //   "sim": {"start_ft": <FILETIME>, "speed": <x real time, 0 = flat out>, "stop_after_cycles": n,
 //           "drop": [[block, first_cycle, last_cycle], ...], "late": [[block, cycles], ...], "fail_block": k,
-//           "max_cycles": n}
+//           "max_cycles": n,
+//           "freeze": [first_cycle, last_cycle]   (PLC STOP: samples keep coming, every value frozen),
+//           "outage": [first_cycle, last_cycle]}  (TwinCAT in CONFIG: no samples; resubscribe() succeeds only after
+//                                                  last_cycle, as the runtime answers again)
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -38,6 +41,10 @@ public:
         if (const JVal* l = sim.get("late"))
             for (auto& r : l->a)
                 if (r.a.size() == 2) late_.push_back({r.a[0].i, r.a[1].i, 0});
+        if (const JVal* f = sim.get("freeze"))
+            if (f->a.size() == 2) { freeze_from_ = f->a[0].i; freeze_to_ = f->a[1].i; }
+        if (const JVal* o = sim.get("outage"))
+            if (o->a.size() == 2) { outage_from_ = o->a[0].i; outage_to_ = o->a[1].i; }
     }
     ~SimSource() override { unsubscribe(); }
 
@@ -63,6 +70,19 @@ public:
         if (run_.exchange(false) && th_.joinable()) th_.join();
         else if (th_.joinable()) th_.join();
     }
+
+    bool resubscribe(std::string& err) override {
+        // the "runtime" is back once the outage is over; until then the request fails like ADS error 0x6
+        if (outage_from_ >= 0 && cycle_now_.load() <= outage_to_) {
+            err = "ADS error 0x6 (6): target port not found (simulated outage)";
+            return false;
+        }
+        dead_.store(false);
+        ++resubs_;
+        return true;
+    }
+
+    uint64_t resubscriptions() const override { return resubs_; }
 
     std::string describe() const override {
         JObj o;
@@ -92,19 +112,26 @@ private:
                 continue;
             }
             const int64_t ft = start_ft_ + c * cycle_;
+            cycle_now_.store(c);
+            if (outage_from_ >= 0 && c == outage_from_) dead_.store(true);   // the runtime went away: handles dead
+            // frozen PLC: the notification keeps coming, the values stay at the last cycle before the freeze
+            const int64_t cv = (freeze_from_ >= 0 && c >= freeze_from_ && c <= freeze_to_) ? freeze_from_ - 1 : c;
             for (size_t k = 0; k < blocks_.size(); ++k) {
-                if (dropped(static_cast<int64_t>(k), c)) continue;
+                if (dropped(static_cast<int64_t>(k), c) || dead_.load()) continue;
                 auto& b = buf[k];
                 size_t words = b.size() / 4;
                 for (size_t i = 0; i < words; ++i) {
-                    uint32_t v = static_cast<uint32_t>(c + static_cast<int64_t>(i));
+                    uint32_t v = static_cast<uint32_t>(cv + static_cast<int64_t>(i));
                     std::memcpy(&b[i * 4], &v, 4);
                 }
-                for (size_t i = words * 4; i < b.size(); ++i) b[i] = static_cast<uint8_t>(c);
+                for (size_t i = words * 4; i < b.size(); ++i) b[i] = static_cast<uint8_t>(cv);
                 sink_->on_sample(static_cast<uint32_t>(k), ft, b.data(), static_cast<uint32_t>(b.size()));
             }
             ++c;
-            if ((c & 63) == 0) {
+            // pace every cycle when a cycle lasts ≥ 1 ms of wall time (a 10 ms PLC must not arrive in bursts of 64),
+            // in groups of 64 otherwise
+            const bool slow = speed_ > 0 && double(cycle_) * 100.0 / speed_ >= 1e6;
+            if (slow || (c & 63) == 0) {
                 if (speed_ > 0) {
                     // sim time c*cycle (100 ns units) runs `speed` times faster than the wall clock
                     auto due = t0 + std::chrono::nanoseconds(static_cast<int64_t>(c * cycle_ * 100 / speed_));
@@ -118,6 +145,10 @@ private:
     }
 
     int64_t start_ft_ = 0, cycle_ = 10000, stop_after_ = -1, max_cycles_ = -1, fail_block_ = -1;
+    int64_t freeze_from_ = -1, freeze_to_ = -1, outage_from_ = -1, outage_to_ = -1;
+    std::atomic<int64_t> cycle_now_{0};
+    std::atomic<bool> dead_{false};
+    uint64_t resubs_ = 0;
     double speed_ = 1.0;
     std::vector<Range> drops_, late_;
     std::vector<BlockSpec> blocks_;

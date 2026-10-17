@@ -562,8 +562,10 @@ async def test_watch_and_wait_use_notifications_and_let_writes_through(monkeypat
         assert res["watch"]["method"].startswith("ADS notifications") and any(r["value"] == 7 for r in res["watch"]["rows"])
         already = payload(await s.call_tool("ads_wait_until", {"name": "MAIN.nCycle", "op": ">=", "value": 7, "timeout_ms": 2000}))
         assert already["met"] and already["method"].startswith("read")
-        # the temporary recordings are cleaned up
-        assert payload(await s.call_tool("rec_list", {}))["session"] == []
+        # the temporary recordings are cleaned up — none left on disk either, and never sealed (D7)
+        lst = payload(await s.call_tool("rec_list", {}))
+        assert lst["session"] == [] and not any(r.get("name") == "ads_wait_until" for r in lst.get("on_disk", []))
+        assert "cleanup_warning" not in res["wait"] and "cleanup_warning" not in already
 
 
 @pytest.mark.anyio

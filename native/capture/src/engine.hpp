@@ -83,6 +83,9 @@ private:
     void write_line(const std::string& line);
     void write_chain();                      // hash checkpoint over every byte written so far (R9)
     void write_gap(const BState& s, const char* kind, const std::string& from, const std::string& to, int64_t n);
+    void note_counter(size_t b, int64_t ft, const uint8_t* d, uint32_t n);   // D11 stall detection
+    void close_stall(int64_t to_ft);
+    double live_missing_estimate(std::chrono::steady_clock::time_point now) const;   // D14
     void write_t0(int64_t ft);
     void finish_now(const std::string& reason, int64_t end_ft, bool have_end);
     void unsubscribe_once();
@@ -112,7 +115,13 @@ private:
     std::vector<uint8_t> key_;
     std::string key_error_;
     int64_t silent_ns_ = 500000000;
+    int64_t resub_after_ns_ = 3000000000;   // D13: all blocks silent this long → ask the source to subscribe again
+    int64_t resub_retry_ms_ = 2000;         // then retry at this interval until the target answers
     int64_t writer_stall_ms_ = 0;
+    // D11: the recorded cycle counter must advance between samples; frozen values (PLC STOP) are not data
+    int stall_block_ = -1;
+    uint32_t stall_off_ = 0, stall_size_ = 0;
+    int64_t stall_after_ = 0;              // 100 ns: counter unchanged longer than this → stall
     double ring_seconds_ = 0;
     size_t ring_bytes_ = 0;
 
@@ -150,6 +159,21 @@ private:
     size_t max_backlog_ = 0;
     std::string stop_reason_;
     std::vector<std::string> errors_;
+    // stall state (writer-owned)
+    std::vector<uint8_t> stall_prev_;
+    bool stall_have_prev_ = false;
+    int64_t stall_adv_ft_ = 0;             // last sample where the counter advanced
+    uint64_t stall_rep_ = 0;               // repeated samples since then
+    bool stall_open_ = false;
+    uint64_t stalls_ = 0, stalled_samples_ = 0;
+    int64_t stall_100ns_ = 0;
+    std::vector<std::pair<int64_t, int64_t>> stall_list_;   // [from, to] first 20
+    // resubscription state (writer-owned)
+    std::chrono::steady_clock::time_point last_resub_try_;
+    bool resub_tried_ = false;
+    uint64_t resub_failures_ = 0;
+    std::string resub_error_;
+    std::vector<std::string> resub_notes_;
     std::string row_;                // reused line buffer
     std::chrono::steady_clock::time_point t_start_, t_first_;
     bool have_first_wall_ = false;

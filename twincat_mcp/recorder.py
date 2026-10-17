@@ -299,6 +299,7 @@ class Block:
     prev: bytes | None = None
     registered: bool = False
     error: str | None = None
+    last_wall: float | None = None          # monotonic time the last sample arrived (D14: silence estimate)
 
     def header(self) -> dict[str, Any]:
         return {"id": self.bid, "igrp": self.igrp, "ioffs": self.ioffs, "size": self.size,
@@ -425,6 +426,18 @@ class Recording:
         self.key = key
         self.manifest: dict[str, Any] | None = None
         self.type_info: dict[str, dict[str, Any]] = {}   # R3: datatype GUID / layout per symbol
+        # D11: the recorded cycle counter must advance; frozen values (PLC STOP) are counted as stalled, not as data
+        self.stall_cfg: dict[str, Any] | None = None     # {"block", "off", "size", "after_100ns"} (also sent to the native engine)
+        self.scratch = False                             # helper recording: not sealed (deleted right after)
+        self._stall_block: Block | None = None
+        self._stall_prev: bytes | None = None
+        self._stall_adv_t: float | None = None
+        self._stall_rep = 0
+        self._stall_open = False
+        self.stalls = 0
+        self.stalled_samples = 0
+        self.stall_ms = 0.0
+        self.stall_list: list[list[float]] = []
         self.q: "queue.Queue[Any]" = queue.Queue(maxsize=200_000)
         self.events = 0             # leaf values represented in the file
         self.samples = 0            # rows written (block samples / poll cycles)
@@ -505,6 +518,61 @@ class Recording:
         self._write(line + "}}\n")
         self._chain_lines = self._lines
         self.chains += 1
+
+    def _note_counter(self, t: float, data: bytes) -> None:
+        """D11: the cycle counter slot (block, off, size) must advance between samples. A PLC in STOP keeps sending its
+        notifications with every value frozen; after stall_after the interval is a stall: marked in the file, counted
+        against completeness, label INCOMPLETE. The bytes stay as the PLC sent them."""
+        cfg = self.stall_cfg or {}
+        off, size = int(cfg.get("off", 0)), int(cfg.get("size", 4))
+        cur = data[off:off + size]
+        if self._stall_prev is None:
+            self._stall_prev, self._stall_adv_t = cur, t
+            return
+        if cur != self._stall_prev:
+            if self._stall_open:
+                self._close_stall(t)
+            self._stall_prev, self._stall_adv_t, self._stall_rep = cur, t, 0
+            return
+        self._stall_rep += 1
+        if not self._stall_open and self._stall_adv_t is not None and (t - self._stall_adv_t) * 10_000 > float(cfg.get("after_100ns", 0)):
+            self._stall_open = True
+
+    def _close_stall(self, t_to: float) -> None:
+        b = self._stall_block
+        if b is None or self._stall_adv_t is None:
+            return
+        self._write(f'{{"_stall": {{"block": {b.bid}, "t_from": {self._stall_adv_t:.4f}, "t_to": {t_to:.4f}, "samples": {self._stall_rep}}}}}\n')
+        self.stalls += 1
+        self.stalled_samples += self._stall_rep
+        self.stall_ms += t_to - self._stall_adv_t
+        if len(self.stall_list) < 20:
+            self.stall_list.append([round(self._stall_adv_t, 4), round(t_to, 4)])
+        self._stall_open = False
+        self._stall_rep = 0
+
+    def stalled_now(self) -> int:
+        return self.stalled_samples + (self._stall_rep if self._stall_open else 0)
+
+    def label_reason(self) -> str | None:
+        if not self.stall_list:
+            return None
+        spans = ", ".join(f"{a:.4f}-{b:.4f} ms" for a, b in self.stall_list[:5])     # same text as the native engine
+        return f"PLC stopped (cycle counter frozen) {spans}"
+
+    def silent_missing_estimate(self) -> float:
+        """D14: silence so far on this PC's clock, in sample periods, for blocks that stopped delivering (live only)."""
+        if self.mode != "cycle" or not self.active:
+            return 0.0
+        now = time.monotonic()
+        est = 0.0
+        for b in self.blocks:
+            if b.last_wall is None or not b.min_step:
+                continue
+            silent_ms = (now - b.last_wall) * 1000.0
+            if silent_ms > max(500.0, 50 * b.min_step):
+                est += max(0.0, silent_ms / b.min_step - 1.0)
+        return est
 
     def header_dict(self, **extra: Any) -> dict[str, Any]:
         return {"_header": True, "format": 2, "id": self.id, "name": self.name, "mode": self.mode,
@@ -596,7 +664,9 @@ class Recording:
         if key is None:
             self._handle_poll(t, payload, light)
         else:
-            self._handle_block(t, self.blocks[key], payload, light)
+            b = self.blocks[key]
+            b.last_wall = time.monotonic()
+            self._handle_block(t, b, payload, light)
 
     def _handle_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
         if self.armed:
@@ -626,6 +696,8 @@ class Recording:
         self.last_t = max(self.last_t, t)
         self._write(f'[{t:.4f},"#{b.bid}","{base64.b64encode(data).decode("ascii")}"]\n')
         self.samples += 1
+        if b is self._stall_block:
+            self._note_counter(t, data)
         prev, b.prev = b.prev, data
         if self.mode == "cycle" or prev is None:
             changed = b.slots
@@ -754,6 +826,9 @@ class Recording:
                     st.runs[-1][1] = st.last_t
             if self._fh:
                 miss = self.missing_samples()
+                if self._stall_open and self.t0_wall is not None:
+                    we_ = self.window_end()
+                    self._close_stall(max(we_ if we_ is not None else self.last_t, self._stall_adv_t or 0.0))
                 if self.mode == "cycle" and self.t0_wall is not None:
                     ws, we = self.window_start(), self.window_end()
                     for b in self.blocks:
@@ -766,12 +841,17 @@ class Recording:
                 digest = self._sha.hexdigest()
                 footer = {"_footer": True, "events": self.events, "samples": self.samples,
                           "missing_samples": miss, "label": self.label(miss), "gap_markers": self.gap_markers,
-                          "chain_checkpoints": self.chains, "dropped": self.dropped,
+                          "chain_checkpoints": self.chains, "stalls": self.stalls, "stalled_samples": self.stalled_samples,
+                          "stall_s": round(self.stall_ms / 1000.0, 6), "dropped": self.dropped,
                           "dropped_on_stop": self.dropped_on_stop, "after_limit": self.after_limit,
                           "unsubscribed": self.unsubscribed, "stop_reason": self.stop_reason,
                           "window_end_ms": self._cut_t, "window_start_ms": self.window_start(), "engine": "python",
                           "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "lines": self._lines,
                           "sha256": digest}
+                if self.label_reason():
+                    footer["label_reason"] = self.label_reason()
+                if self.stall_cfg:
+                    footer["stall_counter_block"] = self.stall_cfg.get("block")
                 if self.key:
                     footer["hmac"] = _hmac.new(self.key, digest.encode("ascii"), hashlib.sha256).hexdigest()
                 self._fh.write(json.dumps(footer, default=str) + "\n")
@@ -780,7 +860,7 @@ class Recording:
                 sealed = True
             else:
                 sealed = False
-        if sealed:
+        if sealed and not self.scratch:
             self.manifest = seal_recording(self.path, self.key)
 
     def label(self, miss: int | None = None) -> str:
@@ -790,7 +870,7 @@ class Recording:
             return "NOT_PROVABLE"
         miss = self.missing_samples() if miss is None else miss
         ok = (self.samples > 0 and not miss and not self.dropped and not self.dropped_on_stop and not self.unsubscribed
-              and (self.start_when is None or self.triggered_at is not None))
+              and (self.start_when is None or self.triggered_at is not None) and not self.stalled_now())
         return "COMPLETE" if ok else "INCOMPLETE"
 
     @property
@@ -819,12 +899,16 @@ class Recording:
         end, start = self.window_end(), self.window_start()
         return sum(b.missing(end, start) for b in self.blocks)
 
-    def completeness(self) -> float | None:
+    def completeness(self, live_estimate: float = 0.0) -> float | None:
+        """Share of the window that is in the file as samples of a running PLC: stalled samples don't count, and
+        while a block is silent the estimated silence (live_estimate, D14) is added to the denominator."""
         if self.mode != "cycle":
             return None
         got = sum(b.samples for b in self.blocks)
         miss = self.missing_samples() or 0
-        return round(got / (got + miss), 6) if got + miss else None
+        good = max(0, got - self.stalled_now())
+        den = got + miss + live_estimate
+        return round(good / den, 6) if den else None
 
     def block_report(self, limit: int = 20) -> list[dict[str, Any]]:
         out = []
@@ -836,6 +920,9 @@ class Recording:
                           "missing_head": b.head_missing(self.window_start()), "missing_tail": b.tail_missing(self.window_end()),
                           "period_ms": None if b.min_step is None else round(b.min_step, 4),
                           "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
+                if self.active and b.last_wall is not None and b.min_step and (time.monotonic() - b.last_wall) * 1000 > max(500.0, 50 * b.min_step):
+                    d["silent"] = True
+                    d["silent_s"] = round(time.monotonic() - b.last_wall, 1)
             if b.error:
                 d["error"] = b.error
             out.append(d)
@@ -850,30 +937,43 @@ class Recording:
             else:
                 elapsed = max(0.0, (self.stopped_mono or time.monotonic()) - self.t0_mono)
             backlog = self.q.qsize()
+            est = self.silent_missing_estimate()
             st: dict[str, Any] = {
                 "id": self.id, "name": self.name, "active": self.active, "mode": self.mode, "cycle_ms": self.cycle_ms,
                 "time_source": self.time_source, "symbols": len(self.symbols), "notifications": len(self.blocks) or None,
                 "events": self.events, "samples": self.samples,
-                "missing_samples": self.missing_samples(), "completeness": self.completeness(),
+                "missing_samples": self.missing_samples(), "completeness": self.completeness(est),
                 "label": self.label() + ("" if not self.active else " (so far)"),
-                "gap_markers": self.gap_markers,
+                "gap_markers": self.gap_markers, "stalls": self.stalls, "stalled_samples": self.stalled_now(),
+                "stalled": self._stall_open,
                 "dropped": self.dropped, "dropped_on_stop": self.dropped_on_stop, "backlog": backlog,
                 "max_backlog": self.max_backlog,
                 "stats_coverage": (round(self.stats_samples / self.samples, 4) if self.samples else 1.0) if self.live_stats
                                   else "deferred (high rate: computed from the file by rec_stats)",
                 "events_per_s": round(self.events / elapsed, 1) if elapsed > 0 else 0.0,
                 "elapsed_s": round(elapsed, 2), "plc_span_s": round(self.last_t / 1000.0, 4),
-                "armed": self.armed,
+                "armed": self.armed and self.triggered_at is None,
                 "triggered_at_ms": None if self.triggered_at is None else round(self.triggered_at, 3),
                 "stop_reason": self.stop_reason, "file": str(self.path),
                 "file_bytes": self.path.stat().st_size if self.path.exists() else 0,
                 "last_values": self._last_values_view(), "errors": self.errors[-5:],
             }
+        if est > 0:
+            st["missing_silent_est"] = round(est, 1)
+            st["completeness_estimated"] = True
+        if self._stall_open and self._stall_adv_t is not None:
+            st["stalled_since_ms"] = round(self._stall_adv_t, 4)
+        if self.label_reason():
+            st["label_reason"] = self.label_reason()
         if self.unsubscribed:
             st["unsubscribed_symbols"] = self.unsubscribed[:50]
         if self.blocks:
             st["blocks"] = self.block_report()
         warn = []
+        if self._stall_open:
+            warn.append(f"PLC STOPPED? the cycle counter has not advanced since {self._stall_adv_t:.1f} ms — samples since then are frozen values, not measurements")
+        if est > 0:
+            warn.append(f"{[b.bid for b in self.blocks if b.last_wall is not None and (time.monotonic() - b.last_wall) * 1000 > max(500.0, 50 * (b.min_step or 0))]} silent: ≈{est:.0f} samples missing so far (PC clock estimate)")
         if self.dropped or self.dropped_on_stop:
             warn.append(f"{self.dropped + self.dropped_on_stop} samples LOST on this PC (backlog full / stop timeout)")
         if st["missing_samples"]:
@@ -1059,6 +1159,23 @@ def file_sha256(path: Path) -> tuple[str, int]:
             h.update(chunk)
             n += len(chunk)
     return h.hexdigest(), n
+
+
+def _remove_file(p: Path, tries: int = 10) -> None:
+    """Delete a (possibly read-only, possibly just-closed) file; on Windows a handle closed a moment ago can still
+    refuse the delete for a few ms — retry briefly, then fail with the OS reason as a RecorderError."""
+    last: OSError | None = None
+    for i in range(tries):
+        try:
+            make_writable(p)
+            p.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last = exc
+            time.sleep(0.05 * (i + 1))
+    raise RecorderError(f"could not delete {p}: {last}")
 
 
 def is_read_only(path: Path) -> bool:
@@ -1293,7 +1410,8 @@ class Recorder:
               stop_when: str | None, pre_trigger_ms: float, name: str | None, max_symbols: int,
               port: int | None = None, post_trigger_s: float | None = None, allow_partial: bool = False,
               max_delay_ms: float = 0.0, cycle_counter: str | None = "auto", edge_triggers: bool = False,
-              engine: str | None = None) -> dict[str, Any]:
+              engine: str | None = None, scratch: bool = False) -> dict[str, Any]:
+        # scratch: a helper recording (ads_wait_until) that is deleted right after — never sealed, never read-only
         if mode not in ("cycle", "change", "poll"):
             raise RecorderError("mode must be cycle | change | poll")
         want = (engine or (getattr(self.rcfg, "engine", "auto") if self.rcfg is not None else "auto")).lower()
@@ -1324,9 +1442,16 @@ class Recorder:
                 "manifest": manifest, "recorder": f"twincat-mcp {_pkg_version()}"}
         rec = Recording(rid, name or rid, syms, mode, cycle_ms, path, self.ring_events, self.max_runs,
                         duration_s, max_events, sw, ew, pre_trigger_ms, meta, post_trigger_s, self.key)
+        rec.scratch = scratch
         rec.type_info = self._type_info(syms, port)
         if mode != "poll":
             rec.set_blocks(build_blocks(syms, rec.sids, rec.types))
+        if mode == "cycle" and counter is not None and counter.name in rec.slot_of:
+            blk, slot = rec.slot_of[counter.name]
+            after_ms = 3.0 * max(cycle_ms, _task_cycle_ms(counter.name, manifest, cycle_ms))
+            rec.stall_cfg = {"block": blk.bid, "off": slot.off, "size": slot.size, "after_100ns": int(round(after_ms * 10_000))}
+            rec._stall_block = blk
+            rec.meta["stall_detection"] = {"counter": counter.name, "block": blk.bid, "after_ms": round(after_ms, 3)}
         chosen, engine_note = self._choose_engine(want, mode, allow_partial)
         if chosen == "native":
             try:
@@ -1386,6 +1511,8 @@ class Recorder:
         header = rec.header_dict(engine="native", engine_version=info.get("version"), engine_ads=info.get("ads"))
         _ = self.key                                      # make sure the HMAC key exists before the service reads it
         rc = self.rcfg
+        if rec.stall_cfg:
+            extra["stall"] = rec.stall_cfg
         try:
             nrec = NC.start_native(
                 rec, header, self.native_exe(), net_id=net_id or "", port=port or self.ads.port, ip=self.ads.ip,
@@ -1423,7 +1550,7 @@ class Recorder:
         if counter is not None:
             st["cycle_counter"] = counter.name
         st["notifications_per_s"] = round(rate, 1) if mode == "cycle" else f"≤{round(rate, 1)}"
-        st["values_per_s"] = round(len(syms) * 1000.0 / cycle_ms, 1) if mode == "cycle" else None
+        st["values_per_s"] = round(vals * 1000.0 / cycle_ms, 1) if mode == "cycle" else None
         if mode == "cycle" and rate > 20_000 and st.get("engine") != "native":
             st["warning"] = (f"{notifs} notifications every {cycle_ms} ms: above what this PC was measured to ingest. "
                              "Watch missing_samples / backlog in rec_status, or select fewer, contiguous variables.")
@@ -1551,8 +1678,8 @@ class Recorder:
                 self._stop_notifications(rec)
             if rec._poll_thread:
                 rec._poll_thread.join(timeout=5)
-            if rec._thread:
-                rec._thread.join(timeout=DRAIN_TIMEOUT_S + 10)
+        if rec._thread:
+            rec._thread.join(timeout=DRAIN_TIMEOUT_S + 10)   # also when it ended by itself: the footer/seal may be in progress (D7)
         st = rec.status()
         if rec.live_stats and rec.stats_samples == rec.samples and len(rec.symbols) <= 50:
             st["stats"] = rec.stats_dict(None, False, 0)
@@ -1664,32 +1791,71 @@ class Recorder:
         return round((end - rec.t0_mono) * 1000, 1)
 
     def read(self, rid: str, t_from_ms: float | None, t_to_ms: float | None, symbols: list[str] | None,
-             max_rows: int, wide: bool) -> dict[str, Any]:
-        """Stream the file; optionally pivot to wide rows with forward fill."""
+             max_rows: int, wide: bool, fill: bool = False) -> dict[str, Any]:
+        """Stream the file. wide: one row per PLC timestamp, one column per symbol, null where that symbol has no sample
+        at that time (D9: a row that never existed in the PLC is not produced). fill: repeat the last known value into
+        the empty cells and name them in the row's "_filled" list."""
         path = self._path_for(rid)
         want = {s.lower() for s in symbols} if symbols else None
         header = _read_header(path)
         cols = [s["name"] for s in header.get("symbols", []) if not want or s["name"].lower() in want]
         rows: list[Any] = []
-        cur: dict[str, Any] = {}
+        last: dict[str, Any] = {}          # last known value per column (fill only)
+        row_t: float | None = None
+        row_vals: dict[str, Any] = {}
         truncated = False
+        filled_cells = 0
+
+        def flush() -> None:
+            nonlocal filled_cells
+            if row_t is None:
+                return
+            r: dict[str, Any] = {"t_ms": row_t}
+            filled = []
+            for c in cols:
+                if c in row_vals:
+                    r[c] = row_vals[c]
+                elif fill and c in last:
+                    r[c] = last[c]
+                    filled.append(c)
+                else:
+                    r[c] = None
+            if fill:
+                r["_filled"] = filled
+                filled_cells += len(filled)
+            rows.append(r)
+
         for t, n, v in iter_events(path, want):
             if t_from_ms is not None and t < t_from_ms:
-                if wide:
-                    cur[n] = v
+                if wide and fill:
+                    last[n] = v
                 continue
             if t_to_ms is not None and t > t_to_ms:
                 break
             if wide:
-                cur[n] = v
-                rows.append({"t_ms": t, **{c: cur.get(c) for c in cols}})
+                if row_t is not None and t != row_t:
+                    flush()
+                    if len(rows) >= max_rows:
+                        truncated = True
+                        row_t = None
+                        break
+                    row_vals = {}
+                row_t = t
+                row_vals[n] = v
+                last[n] = v
             else:
                 rows.append({"t_ms": t, "symbol": n, "value": v})
-            if len(rows) >= max_rows:
-                truncated = True
-                break
-        return {"id": rid, "file": str(path), "name": header.get("name"), "time_source": header.get("time_source", "plc"),
-                "rows": rows, "count": len(rows), "truncated": truncated}
+                if len(rows) >= max_rows:
+                    truncated = True
+                    break
+        if wide and row_t is not None and len(rows) < max_rows:
+            flush()
+        out = {"id": rid, "file": str(path), "name": header.get("name"), "time_source": header.get("time_source", "plc"),
+               "rows": rows, "count": len(rows), "truncated": truncated}
+        if wide:
+            out["note"] = ("one row per PLC timestamp; null = no sample of that symbol at that time" if not fill else
+                           f"one row per PLC timestamp; {filled_cells} cells forward-filled from the last sample (listed per row in _filled)")
+        return out
 
     def export(self, rid: str, fmt: str, out_path: str | None, symbols: list[str] | None,
                fill: bool = False) -> dict[str, Any]:
@@ -1804,20 +1970,49 @@ class Recorder:
         p["file"] = str(pp)
         return p
 
+    def _settle(self, rec: Any) -> None:
+        """Wait until a recording's own threads are done with its file (footer written, sealed): a recording that ended
+        by itself is 'inactive' while _finish is still hashing and chmod-ing — deleting then races (D7)."""
+        if getattr(rec, "engine", "python") == "native":
+            if rec.proc.finished.is_set():
+                rec.reap()
+            return
+        th = getattr(rec, "_thread", None)
+        if th is not None and th.is_alive():
+            th.join(timeout=DRAIN_TIMEOUT_S + 10)
+
     def delete(self, rid: str) -> dict[str, Any]:
         rec = self.recs.get(rid)
         if rec and rec.active:
             self.stop(rid, "deleted")
+        if rec is not None:
+            self._settle(rec)
         path = self._path_for(rid)
         removed = []
         for p in (path, manifest_path(path), path.with_suffix(".wide.csv"), path.with_suffix(".long.csv"),
                   provenance_path(path.with_suffix(".wide.csv")), provenance_path(path.with_suffix(".long.csv"))):
             if p.exists():
-                make_writable(p)                       # sealed recordings are read-only (R9)
-                p.unlink()
+                _remove_file(p)
                 removed.append(str(p))
         self.recs.pop(rid, None)
         return {"id": rid, "removed": removed}
+
+    def seal_unsealed(self, max_files: int = 500) -> dict[str, Any]:
+        """N27 / server start: a recording whose footer is in the file but that has no manifest (the server went away
+        before sealing) is sealed now. Only files with a footer: an unfinished file must not be sealed."""
+        sealed, skipped = [], 0
+        if not self.root.is_dir():
+            return {"sealed": [], "checked": 0}
+        files = sorted(self.root.glob("*.jsonl"))[-max_files:]
+        for f in files:
+            if manifest_path(f).exists() or self.recs.get(f.stem) is not None and self.recs[f.stem].active:
+                continue
+            if read_footer(f) is None:
+                skipped += 1
+                continue
+            if seal_recording(f, self.key) is not None:
+                sealed.append(f.stem)
+        return {"sealed": sealed, "checked": len(files), "unfinished": skipped}
 
     # ------------------------------------------------------------ verification
     def _integrity(self, path: Path) -> dict[str, Any]:
@@ -1881,7 +2076,8 @@ class Recorder:
                 out["integrity"] = "intact"
             out["footer"] = {k: footer.get(k) for k in ("events", "samples", "missing_samples", "dropped", "dropped_on_stop",
                                                          "after_limit", "unsubscribed", "stop_reason")}
-            for k in ("label", "gap_markers", "chain_checkpoints", "engine", "engine_version", "overflow_samples",
+            for k in ("label", "label_reason", "stalls", "stalled_samples", "stall_s", "resubscriptions",
+                      "gap_markers", "chain_checkpoints", "engine", "engine_version", "overflow_samples",
                       "missing_head", "missing_gaps", "missing_tail", "requested_s", "window_start_ms", "window_end_ms",
                       "verdict_hint"):
                 if k in footer:
@@ -1985,16 +2181,22 @@ class Recorder:
                         if len(gaps) < max_gaps:
                             gaps.append({"t_ms": tb, "from": va, "to": vb, "missing_samples": miss})
                 span = (vals[-1][1] - vals[0][1]) // step + 1 if step else None
+                # D12: completeness = distinct counter values present / expected — repeated values (a stopped PLC
+                # keeps sending the same CycleCount) are duplicates, never more than 100 %
+                distinct = len(vals) - dups
                 out["counter"] = {"symbol": counter, "samples": len(vals), "step": step, "expected_samples": span,
                                   "missing_samples": missing, "duplicates": dups, "backwards": back,
-                                  "completeness": round(len(vals) / span, 6) if span else None,
+                                  "completeness": round(min(1.0, distinct / span), 6) if span else None,
                                   "lossless": missing == 0 and dups == 0 and back == 0, "first_gaps": gaps}
+                if dups:
+                    out["counter"]["note"] = (f"{dups} samples repeat the previous counter value: the task did not run "
+                                              "between them (PLC stopped / breakpoint) — frozen values, not new data")
         ok = out.get("integrity", "").startswith("intact")
         tl = out.get("timeline") or {}
         cn = out.get("counter") or {}
         ft = footer or {}
         out["verdict"] = ("PASS" if ok and not tl.get("missing") and cn.get("lossless", True) and not ft.get("dropped")
-                          and not ft.get("dropped_on_stop") and not ft.get("overflow_samples")
+                          and not ft.get("dropped_on_stop") and not ft.get("overflow_samples") and not ft.get("stalls")
                           and ft.get("verdict_hint", "PASS") == "PASS" else "FAIL")
         return out
 
@@ -2200,6 +2402,20 @@ def _fast_switch(delta: int) -> None:
 
 class _NativeFallback(Exception):
     pass
+
+
+def _task_cycle_ms(counter: str, manifest: dict[str, Any], cycle_ms: float) -> float:
+    """Cycle time of the task that increments the recorded counter: _TaskInfo[n] → task n from the manifest; an own
+    counter → the slowest task not above the notification cycle (else the notification cycle itself)."""
+    tasks = manifest.get("tasks") if isinstance(manifest, dict) and isinstance(manifest.get("tasks"), list) else []
+    m = re.search(r"_TaskInfo\[(\d+)\]", counter)
+    if m:
+        for t in tasks:
+            if t.get("index") == int(m.group(1)) and isinstance(t.get("cycle_time_ms"), (int, float)) and t["cycle_time_ms"] > 0:
+                return float(t["cycle_time_ms"])
+    fit = [float(t["cycle_time_ms"]) for t in tasks
+           if isinstance(t.get("cycle_time_ms"), (int, float)) and 0 < t["cycle_time_ms"] <= cycle_ms + 1e-9]
+    return max(fit) if fit else float(cycle_ms)
 
 
 def _pkg_version() -> str:

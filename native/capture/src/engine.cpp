@@ -286,6 +286,19 @@ std::string Engine::start(const JVal& cmd) {
     writer_stall_ms_ = cmd.integer("debug_writer_stall_ms", 0);
     silent_ns_ = std::max<int64_t>(500000000LL, 50 * cycle_ * 100 + 3 * max_delay_ * 100);
     if (cmd.has("silent_ms")) silent_ns_ = std::max<int64_t>(1, cmd.integer("silent_ms", 500)) * 1000000LL;
+    resub_after_ns_ = std::max<int64_t>(silent_ns_, cmd.integer("resubscribe_after_ms", 3000) * 1000000LL);
+    resub_retry_ms_ = std::max<int64_t>(50, cmd.integer("resubscribe_retry_ms", 2000));
+    if (const JVal* st = cmd.get("stall")) {
+        int64_t bid = st->integer("block", -1);
+        for (size_t k = 0; k < specs.size(); ++k)
+            if (static_cast<int64_t>(specs[k].id) == bid) stall_block_ = static_cast<int>(k);
+        stall_off_ = static_cast<uint32_t>(st->integer("off", 0));
+        stall_size_ = static_cast<uint32_t>(st->integer("size", 4));
+        stall_after_ = st->integer("after_100ns", 3 * cycle_);
+        if (stall_block_ < 0 || stall_size_ == 0 || stall_off_ + stall_size_ > specs[stall_block_].size)
+            return fail_reply("stall: counter slot outside its block");
+        stall_prev_.assign(stall_size_, 0);
+    }
 
     // ------------------------------------------------ rings (pre-allocated before anything subscribes)
     double ring_s = cmd.num("ring_s", 10.0);
@@ -416,6 +429,56 @@ void Engine::write_gap(const BState& s, const char* kind, const std::string& fro
     ++gap_markers_;
 }
 
+// D11: a PLC in STOP keeps sending its notifications every cycle with every value frozen — including the task's
+// CycleCount that every cycle recording carries. Samples whose counter did not advance for longer than stall_after_
+// are not measurements of a running program: the interval is written into the file as a {"_stall": …} marker,
+// the samples are counted as stalled, the label is INCOMPLETE. The bytes themselves stay as the PLC sent them.
+void Engine::note_counter(size_t, int64_t ft, const uint8_t* d, uint32_t) {
+    const uint8_t* c = d + stall_off_;
+    if (!stall_have_prev_) {
+        std::memcpy(stall_prev_.data(), c, stall_size_);
+        stall_have_prev_ = true;
+        stall_adv_ft_ = ft;
+        return;
+    }
+    if (std::memcmp(stall_prev_.data(), c, stall_size_) != 0) {
+        if (stall_open_) close_stall(ft);
+        std::memcpy(stall_prev_.data(), c, stall_size_);
+        stall_adv_ft_ = ft;
+        stall_rep_ = 0;
+        return;
+    }
+    ++stall_rep_;
+    if (!stall_open_ && ft - stall_adv_ft_ > stall_after_) stall_open_ = true;
+}
+
+void Engine::close_stall(int64_t to_ft) {
+    std::string l = "{\"_stall\": {\"block\": " + std::to_string(blocks_[stall_block_]->spec.id) + ", \"t_from\": " +
+                    ms(stall_adv_ft_) + ", \"t_to\": " + ms(to_ft) + ", \"samples\": " + std::to_string(stall_rep_) + "}}\n";
+    write_line(l);
+    ++stalls_;
+    stalled_samples_ += stall_rep_;
+    stall_100ns_ += to_ft - stall_adv_ft_;
+    if (stall_list_.size() < 20) stall_list_.emplace_back(stall_adv_ft_, to_ft);
+    stall_open_ = false;
+    stall_rep_ = 0;
+}
+
+// D14: while a block is silent the file cannot tell how much is missing yet (no PLC timestamp arrives); this PC's
+// clock can: the silence so far, in sample periods. Reported live as an estimate, never written to the file.
+double Engine::live_missing_estimate(std::chrono::steady_clock::time_point now) const {
+    double est = 0;
+    for (auto& bp : blocks_) {
+        const BState& s = *bp;
+        if (!s.silent || !s.have) continue;
+        const int64_t step = step_of(s);
+        if (step <= 0) continue;
+        const double silent_100ns = std::chrono::duration<double, std::nano>(now - s.progress).count() / 100.0;
+        est += std::max(0.0, silent_100ns / double(step) - 1.0);
+    }
+    return est;
+}
+
 // R9: a checkpoint commits to every byte before it (running SHA-256, HMAC-signed), so a file whose footer never got
 // written (crash, power loss) is still provably intact up to its last checkpoint.
 void Engine::write_chain() {
@@ -465,6 +528,7 @@ void Engine::commit(size_t b, int64_t ft, const uint8_t* d, uint32_t n) {
     events_ += s.spec.leaves;
     if (!any_emitted_ || ft > last_emitted_) last_emitted_ = ft;
     any_emitted_ = true;
+    if (static_cast<int>(b) == stall_block_ && len >= stall_off_ + stall_size_) note_counter(b, ft, d, n);
     if (stop_when_.set && stop_when_.block == b && stop_when_.fires(d, n)) {
         finish_now("stop_when " + stop_when_.text, ft, true);
         return;
@@ -607,6 +671,30 @@ void Engine::writer_loop() {
                     ++done;
                 }
             }
+            // D13: every block silent for resub_after → the runtime restarted (CONFIG→RUN) or the route dropped; the
+            // handles we hold are dead. Ask the source for new ones, at most every 2 s, until it succeeds.
+            if (!finish_req_.load() && !stopping && all_silent && have_first_wall_ && source_) {
+                bool long_silent = true;
+                for (auto& bp : blocks_)
+                    if (now - bp->progress < std::chrono::nanoseconds(resub_after_ns_)) long_silent = false;
+                if (long_silent && (!resub_tried_ || now - last_resub_try_ > std::chrono::milliseconds(resub_retry_ms_))) {
+                    resub_tried_ = true;
+                    last_resub_try_ = now;
+                    std::string err;
+                    if (source_->resubscribe(err)) {
+                        char n[200];
+                        std::snprintf(n, sizeof n, "notifications registered again after %.1f s without samples (TwinCAT restart / route loss?) at %s ms",
+                                      std::chrono::duration<double>(now - blocks_[0]->progress).count(),
+                                      have_t0_ ? ms(last_emitted_).c_str() : "?");
+                        resub_notes_.push_back(n);
+                        resub_error_.clear();
+                        for (auto& bp : blocks_) bp->progress = now;   // give the new handles their silence budget
+                    } else {
+                        ++resub_failures_;
+                        resub_error_ = err;
+                    }
+                }
+            }
             // limits on this PC's clock (the PLC stopped delivering: nothing would ever reach the cut)
             if (!finish_req_.load() && !stopping && duration_s_ > 0) {
                 const auto grace = std::chrono::seconds(1) + std::chrono::nanoseconds(max_delay_ * 100);
@@ -730,9 +818,20 @@ void Engine::finish() {
             errors_.push_back("block " + std::to_string(bp->spec.id) + ": " + std::to_string(bp->size_mismatch) +
                               " samples with a size other than the block size");
     if (start_when_.set && !triggered_) errors_.push_back("start_when never fired: nothing recorded after the trigger");
+    if (fh_ && have_t0_ && stall_open_) close_stall(have_end ? std::max(end, stall_adv_ft_) : blocks_[stall_block_]->last_ft);
+    for (auto& n : resub_notes_) errors_.push_back(n);
+    if (!resub_error_.empty()) errors_.push_back("re-registering the notifications failed " + std::to_string(resub_failures_) +
+                                                 " time(s), last: " + resub_error_);
     const int64_t miss = head + gaps + tail;
-    const double comp = (samples_ + miss) ? double(samples_) / double(samples_ + static_cast<uint64_t>(miss)) : 0.0;
-    const bool pass = samples_ > 0 && miss == 0 && ovf == 0 && mismatch == 0 && (!start_when_.set || triggered_);
+    const uint64_t good = samples_ > stalled_samples_ ? samples_ - stalled_samples_ : 0;
+    const double comp = (samples_ + miss) ? double(good) / double(samples_ + static_cast<uint64_t>(miss)) : 0.0;
+    const bool pass = samples_ > 0 && miss == 0 && ovf == 0 && mismatch == 0 && (!start_when_.set || triggered_) && stalls_ == 0;
+    std::string label_reason;
+    if (stalls_ > 0 && have_t0_) {
+        label_reason = "PLC stopped (cycle counter frozen) ";
+        for (size_t k = 0; k < stall_list_.size() && k < 5; ++k)
+            label_reason += (k ? ", " : "") + ms(stall_list_[k].first) + "-" + ms(stall_list_[k].second) + " ms";
+    }
     // head / tail holes as markers too (block order), then the footer's digest covers them
     if (fh_ && have_t0_) {
         for (auto& bp : blocks_) {
@@ -769,7 +868,11 @@ void Engine::finish() {
     f.raw("window_end_ms", have_end && have_t0_ ? ms(end) : "null");
     if (triggered_) f.raw("triggered_at_ms", ms(trig_ft_));
     f.d("completeness", comp, 8).str("verdict_hint", pass ? "PASS" : "FAIL").str("label", pass ? "COMPLETE" : "INCOMPLETE")
-        .u("gap_markers", gap_markers_).u("chain_checkpoints", chains_);
+        .u("gap_markers", gap_markers_).u("chain_checkpoints", chains_)
+        .u("stalls", stalls_).u("stalled_samples", stalled_samples_).d("stall_s", double(stall_100ns_) / 1e7, 8)
+        .u("resubscriptions", source_ ? source_->resubscriptions() : 0);
+    if (!label_reason.empty()) f.str("label_reason", label_reason);
+    if (stall_block_ >= 0) f.u("stall_counter_block", blocks_[stall_block_]->spec.id);
     f.raw("blocks", jarr(bl)).raw("errors", jarr(errs));
     if (!key_error_.empty()) f.str("key_error", key_error_);
     f.str("stopped", utc_iso_now()).u("lines", lines_).str("sha256", digest);
@@ -805,6 +908,9 @@ std::string Engine::status() {
     const int64_t miss = head + gaps + tail;
     const auto now = std::chrono::steady_clock::now();
     const double elapsed = have_first_wall_ ? std::chrono::duration<double>(now - t_first_).count() : 0.0;
+    const double est = finished_.load() ? 0.0 : live_missing_estimate(now);
+    const uint64_t stalled_now = stalled_samples_ + (stall_open_ ? stall_rep_ : 0);
+    const uint64_t good = samples_ > stalled_now ? samples_ - stalled_now : 0;
     JObj o;
     o.str("reply", "status").b("ok", true).str("engine", "native").b("active", started_ && !finished_.load())
         .b("armed", armed_).raw("triggered_at_ms", triggered_ && have_t0_ ? ms(trig_ft_) : "null")
@@ -814,7 +920,12 @@ std::string Engine::status() {
         .d("ring_seconds", ring_seconds_, 6).u("ring_bytes", ring_bytes_).u("bytes_written", bytes_).u("lines", lines_)
         .raw("plc_span_s", any_emitted_ && have_t0_ ? jnum(double(last_emitted_ - t0_) / 1e7, 12) : "0")
         .d("elapsed_s", elapsed, 6).u("silent_blocks", silent).u("after_limit", after_limit_);
-    o.d("completeness", (samples_ + miss) ? double(samples_) / double(samples_ + uint64_t(miss)) : 0.0, 8);
+    o.d("completeness", (double(samples_) + double(miss) + est) > 0 ? double(good) / (double(samples_) + double(miss) + est) : 0.0, 8);
+    if (est > 0) o.d("missing_silent_est", est, 8).b("completeness_estimated", true);
+    o.u("stalls", stalls_).u("stalled_samples", stalled_now).b("stalled", stall_open_);
+    if (stall_open_ && have_t0_) o.raw("stalled_since_ms", ms(stall_adv_ft_));
+    o.u("resubscriptions", source_ ? source_->resubscriptions() : 0);
+    if (!resub_error_.empty()) o.str("resubscribe_error", resub_error_);
     if (stop_reason_.empty()) o.null("stop_reason");
     else o.str("stop_reason", stop_reason_);
     std::vector<std::string> errs;

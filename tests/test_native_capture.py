@@ -197,6 +197,59 @@ def test_spec7_plc_stops_counts_missing_tail(capture_exe, tmp_path):
     assert f["label"] == "INCOMPLETE" and f["gap_markers"] == 1
 
 
+def test_d11_frozen_plc_is_a_stall_not_data(capture_exe, tmp_path):
+    """D11: a PLC in STOP keeps sending notifications with frozen values. The cycle counter (block 0, UDINT at
+    offset 0) does not advance → the interval is a {"_stall"} marker, the samples count as stalled, the label is
+    INCOMPLETE and the verdict FAIL — the bytes themselves stay as sent."""
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "d11", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}], duration_s=1,
+                              stall={"block": 0, "off": 0, "size": 4, "after_100ns": 3 * 10_000},
+                              sim={"speed": 50, "freeze": [400, 599]}))
+        assert r["ok"]
+        time.sleep(0.5)                                   # ~1 s of sim time at speed 50 → inside / after the freeze
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    assert f["samples"] == 1001 and f["missing_samples"] == 0          # every notification is in the file
+    assert f["stalls"] == 1 and f["stalled_samples"] == 200 and abs(f["stall_s"] - 0.201) < 1e-6
+    assert f["label"] == "INCOMPLETE" and f["verdict_hint"] == "FAIL" and f["stall_counter_block"] == 0
+    assert f["label_reason"] == "PLC stopped (cycle counter frozen) 399.0000-600.0000 ms"
+    assert abs(f["completeness"] - 801 / 1001) < 1e-6
+    lines = (tmp_path / "d11.jsonl").read_text(encoding="utf-8").splitlines()
+    st = [json.loads(ln)["_stall"] for ln in lines if ln.startswith('{"_stall"')]
+    assert st == [{"block": 0, "t_from": 399.0, "t_to": 600.0, "samples": 200}]
+    rows = _rows(tmp_path / "d11.jsonl")
+    vals = [int.from_bytes(base64.b64decode(r[2])[:4], "little") for r in rows]
+    assert vals[399] == 399 and vals[400] == 399 and vals[599] == 399 and vals[600] == 600   # frozen bytes kept as sent
+
+
+def test_d13_outage_resubscribes_and_marks_the_gap(capture_exe, tmp_path):
+    """D13: TwinCAT RUN→CONFIG→RUN kills the notifications. After the silence the engine registers them again (the
+    source answers once the runtime is back); the hole is a gap marker, the rest of the window is recorded."""
+    s = Svc(capture_exe)
+    try:
+        # 10 ms cycle at speed 1: 0..0.5 s samples, outage 0.5..2.0 s (handles dead), runtime back at 2.0 s
+        r = s.call(_start_cmd(tmp_path, "d13", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}], duration_s=4,
+                              cycle_100ns=100_000, silent_ms=300, resubscribe_after_ms=600, resubscribe_retry_ms=200,
+                              sim={"speed": 1, "outage": [50, 199]}))
+        assert r["ok"]
+        time.sleep(1.5)
+        st = s.call({"cmd": "status"})
+        assert st["silent_blocks"] == 1 and st.get("missing_silent_est", 0) > 50 and st["completeness_estimated"]
+        assert st["completeness"] < 0.6 and "simulated outage" in st.get("resubscribe_error", "")
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    assert f["resubscriptions"] == 1 and f["label"] == "INCOMPLETE"
+    assert f["samples"] >= 200 and f["missing_gaps"] >= 140          # 0..49 + ~200..400 recorded, the outage missing
+    gaps = [json.loads(ln)["_gap"] for ln in (tmp_path / "d13.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.startswith('{"_gap"')]
+    assert gaps and gaps[0]["kind"] == "gap" and gaps[0]["t_from"] == 490.0 and gaps[0]["missing"] >= 140
+    assert any("registered again" in e for e in f["errors"])
+    assert f["stop_reason"] == "duration 4s"                          # the window was completed after the outage
+
+
 def test_r5_gap_markers_where_samples_are_missing(capture_exe, tmp_path):
     """R5: every hole in the PLC timeline is written into the file at the place it happened, with its size."""
     s = Svc(capture_exe)
@@ -381,6 +434,24 @@ def test_r9_truncated_file_verifies_to_last_checkpoint(rec):
     p.write_bytes(b"".join(bad))
     v = rec.verify(st["id"])
     assert v["integrity"].startswith("MODIFIED") and f"line {chain_idx[0] + 1}" in v["integrity"]
+
+
+def test_n27_self_ended_native_recording_is_sealed_without_rec_stop(rec):
+    """N27: a duration-ended recording gets its manifest when the service reports 'finished', not when someone calls
+    rec_stop; the stop time is the finish time (D15), not the time somebody looked."""
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=0.3,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="n27", max_symbols=50,
+                   cycle_counter=None)
+    p = Path(rec.recs[st["id"]].path)
+    t = time.time()
+    while time.time() - t < 20 and not R.manifest_path(p).exists():
+        time.sleep(0.05)
+    assert R.manifest_path(p).exists() and R.is_read_only(p), "sealed by the finished event alone"
+    nrec = rec.recs[st["id"]]
+    time.sleep(0.5)
+    s1 = rec.status(st["id"])
+    assert not s1["active"] and nrec.stopped_at <= t + 20 and abs(s1["elapsed_s"] - rec.status(st["id"])["elapsed_s"]) < 1e-6
+    assert rec.verify(st["id"])["seal"] == "matches manifest"
 
 
 def test_r9_delete_removes_read_only_recording_and_manifest(rec):

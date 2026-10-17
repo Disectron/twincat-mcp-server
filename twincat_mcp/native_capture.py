@@ -164,6 +164,9 @@ class CaptureProcess:
                                      text=True, encoding="utf-8", bufsize=1, creationflags=_NO_WINDOW)
         self.replies: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self.finished = threading.Event()
+        self.finished_mono: float | None = None          # when the finished event arrived (D15: not when someone looked)
+        self.finished_at: float | None = None
+        self.on_finished: Any = None                     # callback (N27: seal as soon as the service closed the file)
         self.footer: dict[str, Any] | None = None
         self.stderr: deque[str] = deque(maxlen=50)
         self.ready: dict[str, Any] | None = None
@@ -190,11 +193,18 @@ class CaptureProcess:
                 continue
             if d.get("event") == "finished":
                 self.footer = d.get("footer")
+                self.finished_mono, self.finished_at = time.monotonic(), time.time()
                 self.finished.set()
+                cb = self.on_finished
+                if cb is not None:
+                    # not on this reader thread: the callback waits for the process to exit, which closes stdout
+                    threading.Thread(target=cb, name="tcmcp-capture-finished", daemon=True).start()
             elif d.get("event") == "ready":
                 self.replies.put(d)
             else:
                 self.replies.put(d)
+        if not self.finished.is_set():
+            self.finished_mono, self.finished_at = time.monotonic(), time.time()
         self.finished.set()            # process gone
         self.replies.put({"reply": "eof", "ok": False, "error": "capture process ended"})
 
@@ -275,6 +285,8 @@ class NativeRecording:
         self._last: dict[str, Any] = {}
         self._closed = False
         self.manifest: dict[str, Any] | None = None
+        self._reap_lock = threading.Lock()
+        proc.on_finished = self.reap
 
     # -------------------------------------------------- state
     @property
@@ -293,28 +305,32 @@ class NativeRecording:
 
     def _mark_stopped(self) -> None:
         if self.stopped_mono is None:
-            self.stopped_mono = time.monotonic()
-            self.stopped_at = time.time()
+            self.stopped_mono = self.proc.finished_mono or time.monotonic()
+            self.stopped_at = self.proc.finished_at or time.time()
 
     # -------------------------------------------------- control
     def stop(self, reason: str) -> dict[str, Any]:
-        if not self._closed:
-            r = self.proc.call({"cmd": "stop", "reason": reason}, timeout=120)
-            if r.get("footer"):
-                self.proc.footer = r["footer"]
-            self.proc.close()
-            self._closed = True
-            self._mark_stopped()
-            self._seal()
+        with self._reap_lock:
+            if not self._closed:
+                if not self.proc.finished.is_set():
+                    r = self.proc.call({"cmd": "stop", "reason": reason}, timeout=120)
+                    if r.get("footer"):
+                        self.proc.footer = r["footer"]
+                self.proc.close()
+                self._closed = True
+                self._mark_stopped()
+                self._seal()
         return self.status()
 
     def reap(self) -> None:
-        """A recording that ended on its own (duration, stop_when…): let the process exit."""
-        if not self._closed and self.proc.finished.is_set():
-            self.proc.close()
-            self._closed = True
-            self._mark_stopped()
-            self._seal()
+        """A recording that ended on its own (duration, stop_when…): let the process exit, then seal (N27). Called from
+        the finished-event thread and from Recorder.reap(); idempotent."""
+        with self._reap_lock:
+            if not self._closed and self.proc.finished.is_set():
+                self.proc.close()
+                self._closed = True
+                self._mark_stopped()
+                self._seal()
 
     def _seal(self) -> None:
         """R9: sidecar manifest + read-only, once the service has closed the file."""
@@ -356,6 +372,16 @@ class NativeRecording:
             "last_values": self._last_values(), "errors": (src.get("errors") or [])[-5:],
             "blocks": (src.get("blocks") or [])[:20],
         }
+        for k in ("stalls", "stalled_samples", "stalled", "stalled_since_ms", "missing_silent_est", "completeness_estimated",
+                  "resubscriptions", "resubscribe_error", "label_reason", "stall_s"):
+            if k in src:
+                st[k] = src[k]
+        if src.get("stalled") and src.get("stalled_since_ms") is not None:
+            st.setdefault("warnings", []).append(
+                f"PLC STOPPED? the cycle counter has not advanced since {src['stalled_since_ms']} ms — samples since then are frozen values, not measurements")
+        if src.get("missing_silent_est"):
+            st.setdefault("warnings", []).append(
+                f"≈{float(src['missing_silent_est']):.0f} samples missing so far from silent blocks (PC clock estimate)")
         if self.proc.footer:
             st["verdict_hint"] = self.proc.footer.get("verdict_hint")
             st["label"] = self.proc.footer.get("label")
@@ -364,7 +390,7 @@ class NativeRecording:
             st["window_end_ms"] = self.proc.footer.get("window_end_ms")
         if not self.active and self.proc.proc.returncode not in (0, None) and not self.proc.footer:
             st["errors"] = st["errors"] + [f"capture process exited with {self.proc.proc.returncode}: {' | '.join(list(self.proc.stderr)[-3:])}"]
-        warn = []
+        warn = list(st.pop("warnings", []))
         if st["overflow_samples"]:
             warn.append(f"{st['overflow_samples']} samples LOST on this PC (capture ring full) — recording is not complete")
         if st["missing_samples"]:
