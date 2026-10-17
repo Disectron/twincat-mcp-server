@@ -444,7 +444,8 @@ def test_n27_self_ended_native_recording_is_sealed_without_rec_stop(rec):
                    cycle_counter=None)
     p = Path(rec.recs[st["id"]].path)
     t = time.time()
-    while time.time() - t < 20 and not R.manifest_path(p).exists():
+    # the seal writes the manifest, then makes both files read-only: wait for the whole seal, not its first step
+    while time.time() - t < 20 and not (R.manifest_path(p).exists() and R.is_read_only(p)):
         time.sleep(0.05)
     assert R.manifest_path(p).exists() and R.is_read_only(p), "sealed by the finished event alone"
     nrec = rec.recs[st["id"]]

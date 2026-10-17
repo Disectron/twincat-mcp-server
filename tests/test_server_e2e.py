@@ -245,9 +245,11 @@ async def test_whole_project_variable_tools(monkeypatch, project_dir, tmp_path):
         assert "MAIN.sLabel" in extra and "MAIN.fbValve2.bOpen" in extra and cmp_["roots"] == ["GVL_Machine", "MAIN"]
         assert cmp_["complete"] is True and "not_judged" not in cmp_
         # D23: max_items=5 cut both lists; the cut part was reported as missing_online / extra_online
+        # (which 5 source items come first depends on the file order of the OS; any verdict given must be a true one)
         small = payload(await s.call_tool("proj_vs_runtime", {"max_items": 5}))
-        assert small["complete"] is False and small["missing_online"] == [] and small["extra_online"] == []
-        assert small["not_judged"]["missing_candidates"] >= 1 and "max_items=5" in small["not_judged"]["reason"]
+        assert small["complete"] is False and small["extra_online"] == [] and "max_items=5" in small["not_judged"]["reason"]
+        assert {m["path"] for m in small["missing_online"]} <= missing, small["missing_online"]
+        assert small["not_judged"]["missing_candidates"] + small["not_judged"]["extra_candidates"] >= 1
 
 
 @pytest.mark.anyio
