@@ -100,6 +100,7 @@ def fb_interface(idx: ProjectIndex, name: str) -> dict[str, Any]:
             d = {"name": v.name, "type": v.type, "init": v.init, "at": v.at, "comment": v.comment, "line": v.line}
             if owner is not u:
                 d["inherited_from"] = owner.name
+                d["file"] = owner.file          # D16: the line number belongs to the base's file
             by_section.setdefault(v.section, []).append(d)
     implements: list[str] = []
     for owner in chain:
@@ -201,7 +202,9 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
         if "real_eq" in enabled:
             real_vars = {v.name for v in u.vars if v.type.upper() in ("REAL", "LREAL")}
             for i, ln in enumerate(impl.splitlines()):
-                if any(re.search(rf"\b{re.escape(rv)}\s*(=|<>)", ln) or re.search(rf"(=|<>)\s*{re.escape(rv)}\b", ln) for rv in real_vars):
+                # D17: an equality test is `=` or `<>` — not the `=` inside `:=`, `<=`, `>=` or the output binding `=>`
+                if any(re.search(rf"\b{re.escape(rv)}\s*(?:(?<![:<>])=(?!>)|<>)", ln)
+                       or re.search(rf"(?:(?<![:<>])=(?!>)|<>)\s*{re.escape(rv)}\b", ln) for rv in real_vars):
                     add("real_eq", u, u.impl_line0 + i, "REAL/LREAL compared with = / <> ; use a tolerance", "warning")
         if "assign_input" in enabled and u.kind in ("FUNCTION_BLOCK", "FUNCTION"):
             inputs = {v.name for v in u.vars if v.section == "VAR_INPUT"}

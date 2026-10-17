@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<EtherCATInfo xmlns="http://www.ethercat.org/esi" Version="1.11">
+ <Vendor><Id>2</Id><Name>Beckhoff Automation GmbH &amp; Co. KG</Name></Vendor>
+ <Descriptions><Devices>
+  <Device Physics="YY">
+   <Type ProductCode="#x0c1e3052" RevisionNo="#x00140000">EL3102</Type>
+   <Name LcId="1031">EL3102 2K. Ana. Eingang</Name><Name LcId="1033">EL3102 2Ch. Ana. Input +/-10V, Diff.</Name>
+   <GroupType>AnaIn</GroupType>
+   <TxPdo Fixed="1" Mandatory="1" Sm="3"><Index>#x1a00</Index><Name>AI Standard Channel 1</Name>
+     <Entry><Index>#x6000</Index><SubIndex>1</SubIndex><BitLen>1</BitLen><Name>Underrange</Name><DataType>BIT</DataType></Entry>
+     <Entry><Index>#x0</Index><BitLen>5</BitLen></Entry>
+     <Entry><Index>#x6000</Index><SubIndex>17</SubIndex><BitLen>16</BitLen><Name>Value</Name><DataType>INT</DataType></Entry>
+   </TxPdo>
+   <Profile><Dictionary><Objects><Object><Index>#x8000</Index><Name>AI Settings Ch.1</Name><Type>DT8000</Type></Object></Objects></Dictionary></Profile>
+  </Device>
+ </Devices></Descriptions>
+</EtherCATInfo>

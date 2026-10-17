@@ -1,5 +1,6 @@
 """Knowledge base (decisions of 2026-10-17): location chosen by the user under stated conditions, known errors,
 library versions from the .plcproj, ESI hardware lookup, pattern search over user-added folders only."""
+import json
 from pathlib import Path
 
 import pytest
@@ -136,3 +137,15 @@ def test_n17_ads_error_6_explained_from_port_and_mode():
     assert "852" not in K.ads6_context(851, "RUN")["cause"] and "no PLC project is activated" in K.ads6_context(851, "RUN")["cause"]
     assert "851 is the first" in K.ads6_context(852, "RUN")["cause"]
     assert "ads_ping" in K.ads6_context(851, None)["fix"]
+
+
+def test_d19_esi_namespaced_pdos_entries_and_coe():
+    """D19: an ESI with a default namespace (and German names first) still yields PDOs, entries and CoE objects."""
+    rows = list(K._parse_esi(Path(__file__).parent / "fixtures" / "esi_namespaced.xml"))
+    assert len(rows) == 1
+    typ, name, pc, rev, vendor, group, _f, pdos, coe = rows[0]
+    pdos, coe = json.loads(pdos), json.loads(coe)
+    assert typ == "EL3102" and name.startswith("EL3102 2Ch.") and vendor.startswith("Beckhoff") and group == "AnaIn"
+    assert pdos[0]["index"] == "#x1A00" and pdos[0]["name"] == "AI Standard Channel 1"
+    assert [(e["index"], e["sub"], e["bits"]) for e in pdos[0]["entries"]] == [("#x6000", 1, 1), ("#x6000", 17, 16)]
+    assert coe == [{"index": "#x8000", "name": "AI Settings Ch.1", "type": "DT8000"}]

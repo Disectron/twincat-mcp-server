@@ -89,3 +89,16 @@ def test_tcunit_scaffold(idx, project_dir):
         cc.tcunit_scaffold(idx, "MAIN")
     r2 = cc.tcunit_scaffold(idx, "FB_Fill", overwrite=True)
     assert r2["plcproj"]["already"]
+
+
+def test_d17_real_eq_ignores_assignments_and_bindings(idx):
+    """D17: only `=` / `<>` comparisons of a REAL count; `:=`, `<=`, `>=` and `=>` are not equality tests."""
+    pou = Path(idx.get_unit("FB_Fill").file)
+    txt = pou.read_text().replace("\tarrWeights : ARRAY[0..9] OF LREAL;\n",
+                                  "\tarrWeights : ARRAY[0..9] OF LREAL;\n\trA : LREAL;\n\trB : LREAL;\n\tbX : BOOL;\n")
+    txt = txt.replace("fbValve.Open();", "fbValve.Open();\n\t\trA := rB;\n\t\tbX := rA >= rB;\n\t\tbX := rA <= 1.0;\n"
+                                         "\t\tIF rA = rB THEN bX := TRUE; END_IF\n\t\tIF rB <> 0.0 THEN bX := FALSE; END_IF")
+    pou.write_text(txt)
+    idx.scan()
+    r = cc.lint(idx, "FB_Fill", rules=["real_eq"])
+    assert r["by_rule"] == {"real_eq": 2}, r["items"]

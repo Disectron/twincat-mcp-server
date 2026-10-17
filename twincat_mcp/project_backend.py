@@ -64,6 +64,11 @@ class VarDecl:
         return "CONSTANT" in self.qualifiers
 
 
+def _section_text(v: "VarDecl") -> str:
+    """D18: the section as declared, qualifiers included ('VAR_GLOBAL CONSTANT', 'VAR RETAIN')."""
+    return " ".join((v.section, *v.qualifiers)) if v.qualifiers else v.section
+
+
 _RE_ATTR = re.compile(r"\{\s*attribute\s+'([^']+)'\s*(?::=\s*'([^']*)')?\s*\}", re.I)
 
 
@@ -608,14 +613,14 @@ class ProjectIndex:
                 self._emit(f"{path}[*]", elem, u, v, depth + 1, seen, items, max_array, walk, attrs)
             return
         if _RE_PTR.match(t):
-            items.append({"path": path, "type": t, "declared_in": u.name, "section": v.section, "line": v.line, **extra})
+            items.append({"path": path, "type": t, "declared_in": u.name, "section": _section_text(v), "line": v.line, **extra})
             return
         tu = self._unit_for_type(t)
         if tu and tu.kind in ("FUNCTION_BLOCK", "STRUCT", "UNION", "PROGRAM") and tu.name.lower() not in seen:
             walk(path, tu, depth + 1, seen + (tu.name.lower(),), attrs or None)
             return
-        items.append({"path": path, "type": t, "declared_in": u.name, "section": v.section, "line": v.line,
-                      **({"at": v.at} if v.at else {}), **extra})
+        items.append({"path": path, "type": t, "declared_in": u.name, "section": _section_text(v), "line": v.line,
+                      **({"at": v.at} if v.at else {}), **({"constant": True} if v.constant else {}), **extra})
 
     # ------------------------------------------------------------ write back
     def set_code(self, name: str, declaration: str | None, implementation: str | None,

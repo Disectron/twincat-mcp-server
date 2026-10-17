@@ -451,6 +451,9 @@ class Knowledge:
         done = skipped = devices = 0
         errors: list[str] = []
         with self._db() as con:
+            # an index built by an older ESI parser is re-read once (D19: PDOs/CoE were empty)
+            if self._esi_parser_stale(con):
+                force = True
             known = {r["file"]: r["mtime"] for r in con.execute("SELECT file, mtime FROM esi_files")}
         for f in files:
             mt = f.stat().st_mtime
@@ -468,14 +471,23 @@ class Knowledge:
                 con.execute("INSERT OR REPLACE INTO esi_files VALUES (?,?,?)", (str(f), mt, len(rows)))
             done += 1
             devices += len(rows)
+        with self._db() as con:
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('esi_parser', ?)", (str(ESI_PARSER_VERSION),))
         return {"folders": [str(d) for d in folders], "files": len(files), "indexed": done, "unchanged": skipped,
                 "devices_added": devices, "errors": errors[:20]}
+
+    @staticmethod
+    def _esi_parser_stale(con: sqlite3.Connection) -> bool:
+        r = con.execute("SELECT v FROM meta WHERE k = 'esi_parser'").fetchone()
+        return r is None or r[0] != str(ESI_PARSER_VERSION)
 
     def hw_lookup(self, query: str, limit: int = 5, revision: int | None = None) -> dict[str, Any]:
         q = (query or "").strip()
         if not q:
             raise KnowledgeError("empty query (e.g. 'EL2008', 'EL3062', '#x0bf03052')")
-        if self._esi_count() == 0:
+        with self._db() as con:
+            stale = self._esi_parser_stale(con)
+        if self._esi_count() == 0 or stale:
             idx = self.esi_index()
         else:
             idx = None
@@ -603,41 +615,68 @@ def _tree_stamp(root: Path) -> str:
     return h.hexdigest()
 
 
+ESI_PARSER_VERSION = 2       # bump when _parse_esi's output changes: every ESI file is read again once
+
+
+def _ln(tag: Any) -> str:
+    """Local name of an element tag ('{ns}TxPdo' → 'TxPdo')."""
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _kids(el: Any, name: str) -> list[Any]:
+    return [c for c in el if _ln(c.tag) == name]
+
+
+def _text(el: Any, name: str, prefer_lcid: str = "1033") -> str:
+    """Text of the child `name` — namespace-agnostic, English (LcId 1033) first when there are several."""
+    cs = _kids(el, name)
+    if not cs:
+        return ""
+    # (an Element without children is falsy: compare with None, never `or`)
+    best = next((c for c in cs if c.get("LcId") == prefer_lcid), None)
+    if best is None:
+        best = next((c for c in cs if c.get("LcId") is None), cs[0])
+    return " ".join("".join(best.itertext()).split())
+
+
 def _parse_esi(path: Path):
-    """Rows for the esi table from one ESI XML (EtherCATInfo): one per Device/revision."""
+    """Rows for the esi table from one ESI XML (EtherCATInfo): one per Device/revision. D19: namespace-agnostic,
+    PDO / entry indices from their element text (#x1A00), English names first, CoE objects from the dictionary."""
     tree = ET.parse(path)
     root = tree.getroot()
-    vendor = (root.findtext("Vendor/Name") or "").strip()
-    for dev in root.iter("Device"):
-        t = dev.find("Type")
+    vendor = next((_text(v, "Name") for v in root.iter() if _ln(v.tag) == "Vendor"), "")
+    for dev in (d for d in root.iter() if _ln(d.tag) == "Device"):
+        t = next(iter(_kids(dev, "Type")), None)
         if t is None or not (t.text or "").strip():
             continue
-        name = next((n.text.strip() for n in dev.findall("Name") if (n.get("LcId") in (None, "1033")) and n.text), "")
+        name = _text(dev, "Name")
         pdos = []
         for kind in ("RxPdo", "TxPdo"):
-            for pdo in dev.findall(kind):
+            for pdo in _kids(dev, kind):
                 entries = []
-                for e in pdo.findall("Entry"):
-                    idx = _hexint(e.findtext("Index"))
+                for e in _kids(pdo, "Entry"):
+                    idx = _hexint(_text(e, "Index"))
                     if not idx:
                         continue                      # padding entry
-                    entries.append({"index": f"#x{idx:04X}", "sub": _hexint(e.findtext("SubIndex")) or 0,
-                                    "bits": _hexint(e.findtext("BitLen")), "name": (e.findtext("Name") or "").strip(),
-                                    "type": (e.findtext("DataType") or "").strip()})
-                pi = _hexint(pdo.findtext("Index"))
+                    entries.append({"index": f"#x{idx:04X}", "sub": _hexint(_text(e, "SubIndex")) or 0,
+                                    "bits": _hexint(_text(e, "BitLen")), "name": _text(e, "Name"),
+                                    "type": _text(e, "DataType")})
+                pi = _hexint(_text(pdo, "Index"))
                 pdos.append({"dir": "out (RxPdo)" if kind == "RxPdo" else "in (TxPdo)", "index": f"#x{pi:04X}" if pi else None,
-                             "name": (pdo.findtext("Name") or "").strip(), "fixed": pdo.get("Fixed") in ("1", "true"),
+                             "name": _text(pdo, "Name"), "fixed": pdo.get("Fixed") in ("1", "true"),
                              "mandatory": pdo.get("Mandatory") in ("1", "true"), "sm": pdo.get("Sm"), "entries": entries[:64]})
         coe = []
-        for obj in dev.iterfind("Profile/Dictionary/Objects/Object"):
-            oi = _hexint(obj.findtext("Index"))
+        objs = [o for prof in _kids(dev, "Profile") for dic in _kids(prof, "Dictionary")
+                for ob in _kids(dic, "Objects") for o in _kids(ob, "Object")]
+        for obj in objs:
+            oi = _hexint(_text(obj, "Index"))
             if oi is None:
                 continue
-            coe.append({"index": f"#x{oi:04X}", "name": (obj.findtext("Name") or "").strip(), "type": (obj.findtext("Type") or "").strip()})
+            coe.append({"index": f"#x{oi:04X}", "name": _text(obj, "Name"), "type": _text(obj, "Type")})
             if len(coe) >= 400:
                 break
         yield ((t.text or "").strip(), name, _hexint(t.get("ProductCode")), _hexint(t.get("RevisionNo")), vendor,
-               (dev.findtext("GroupType") or "").strip(), str(path), json.dumps(pdos), json.dumps(coe))
+               _text(dev, "GroupType"), str(path), json.dumps(pdos), json.dumps(coe))
 
 
 class _Conn:

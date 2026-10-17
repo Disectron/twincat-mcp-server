@@ -1718,10 +1718,12 @@ class Recorder:
     def list(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
         self.reap()
         live = []
-        for r in self.recs.values():
+        # D21: the session list is paged like the files (newest first); session_total says how many there are
+        recs = sorted(self.recs.values(), key=lambda r: getattr(r, "id", ""), reverse=True)
+        for r in recs[offset:offset + limit]:
             s = r.status()
             live.append({k: s[k] for k in ("id", "name", "active", "mode", "symbols", "events", "samples", "missing_samples",
-                                           "dropped", "stop_reason", "file", "file_bytes") if k in s})
+                                           "dropped", "label", "stop_reason", "file", "file_bytes") if k in s})
         files = []
         if self.root.is_dir():
             for p in sorted(self.root.glob("*.jsonl"), reverse=True):
@@ -1740,7 +1742,8 @@ class Recorder:
             out_files.append({"id": p.stem, "file": str(p), "bytes": p.stat().st_size, "name": head.get("name"),
                               "mode": head.get("mode"), "format": head.get("format", 1),
                               "symbols": len(head.get("symbols", [])), "created": head.get("created")})
-        return {"session": live, "on_disk": out_files, "on_disk_total": total, "offset": offset, "root": str(self.root)}
+        return {"session": live, "session_total": len(recs), "on_disk": out_files, "on_disk_total": total,
+                "offset": offset, "limit": limit, "root": str(self.root)}
 
     def status(self, rid: str) -> dict[str, Any]:
         self.reap()
@@ -2153,8 +2156,11 @@ class Recorder:
                                "completeness": round(tot_s / (tot_s + tot_m), 6) if tot_s + tot_m else None,
                                "blocks": rep[:50]}
         elif header.get("mode") != "cycle":
-            out["timeline"] = {"note": f"{header.get('mode')} mode samples only on change (or on this PC's clock for poll): "
-                                       "gaps cannot be told from quiet periods — record in cycle mode to prove completeness"}
+            out["timeline"] = {"note": (
+                "change mode: the PLC sends a sample only when a value changes, so a quiet period cannot be told from a "
+                "lost sample" if header.get("mode") == "change" else
+                "poll mode: samples are taken by this PC's clock (sum read every cycle_ms), not by the PLC, so the PLC "
+                "timeline cannot be checked") + " — record in cycle mode to prove completeness"}
         # (3) counter
         if counter:
             vals: list[tuple[float, int]] = []

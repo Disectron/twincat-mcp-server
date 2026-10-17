@@ -635,6 +635,20 @@ class AdsBackend:
             out["comment"] = s.comment
         return out
 
+    def enum_named(self, type_name: str, value: Any, port: int | None = None) -> Any:
+        """D4: a top-level enum read as a plain number gets the same shape as an enum inside a struct:
+        {"value": 20, "name": "Idle"}. Anything else is returned unchanged."""
+        if not isinstance(value, int) or isinstance(value, bool):
+            return value
+        try:
+            ts = self.typesystem(False, port)
+        except Exception:  # noqa: BLE001
+            return value
+        e = ts.get(type_name) if ts is not None else None
+        if e is None or not e.enum:
+            return value
+        return {"value": value, "name": e.enum.get(value, f"?{value}")}
+
     def read_many(self, names: list[str], port: int | None = None) -> dict[str, Any]:
         c = self.conn(port)
         simple: dict[str, T.TcType] = {}

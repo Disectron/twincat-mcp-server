@@ -1100,6 +1100,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         Trees larger than max_chars are summarised (member names + sizes) — use ads_leaves or
         ads_dump for the full content."""
         res = await app.ads_call(app.ads.read, name, expand_struct, max_members, timeout=60)
+        if isinstance(res.get("value"), int) and res.get("type"):
+            res["value"] = await app.ads_call(app.ads.enum_named, res["type"], res["value"], timeout=30)
         if len(json.dumps(res, default=str)) > max_chars and isinstance(res.get("value"), (dict, list)):
             v = res["value"]
             res["value_summary"] = {"members": list(v.keys())[:200] if isinstance(v, dict) else f"list[{len(v)}]",
@@ -1112,7 +1114,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Read several symbols in one ADS sum-command. Returns {name: value | {error}}."""
         if len(names) > 500:
             raise ToolError("max 500 symbols per call")
-        return await app.ads_call(app.ads.read_many, names, timeout=60)
+        res = await app.ads_call(app.ads.read_many, names, timeout=60)
+
+        def _named() -> dict[str, Any]:
+            out = {}
+            for n, v in res.items():
+                if isinstance(v, int) and not isinstance(v, bool):
+                    try:
+                        v = app.ads.enum_named(app.ads.symbol_info(n).type, v)
+                    except Exception:  # noqa: BLE001
+                        pass
+                out[n] = v
+            return out
+        return await app.ads_call(_named, timeout=60)
 
     @mcp.tool(annotations=WRITE)
     async def ads_write(name: str, value: Any, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -1210,29 +1224,36 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         client that sends calls one after another still sees them after it; for stimulus→response use
         test_response, or rec_start + the write + rec_stop."""
         duration_ms = int(min(max(duration_ms, 10), cfg.ads.max_watch_duration_ms))
+        interval_ms = int(max(1, interval_ms))
         try:
+            # D6: interval_ms is the notification cycle in both modes — change mode looks for changes every interval_ms
+            # (a value changing every PLC cycle gives one row per interval, not one per cycle)
             st = await app.rec_call(app.rec.start, symbols=names, prefix=None, pattern=None,
-                                    mode="change" if change_only else "cycle", cycle_ms=max(1.0, float(interval_ms)) if not change_only else 1.0,
+                                    mode="change" if change_only else "cycle", cycle_ms=float(interval_ms),
                                     duration_s=None, max_events=200_000, start_when=None, stop_when=None, pre_trigger_ms=0,
-                                    name="ads_watch", max_symbols=200, timeout=60)
+                                    name="ads_watch", max_symbols=200, scratch=True, timeout=60)
         except ToolError as exc:
             res = await app.ads_call(app.ads.watch, names, duration_ms, interval_ms, change_only,
                                      timeout=cfg.ads.max_watch_duration_ms / 1000 + 30, slow=True)
             res["method"] = f"polling from this PC every {interval_ms} ms (notifications failed: {str(exc)[:160]})"
             return res
         rid = st["id"]
+        cleanup_error = None
         try:
             await asyncio.sleep(duration_ms / 1000.0)
             stop = await app.rec_call(app.rec.stop, rid, "ads_watch done", timeout=90)
-            rows = await app.mem_call(app.rec.read, rid, None, None, None, 5000, False)
+            rows = await app.mem_call(app.rec.read, rid, None, float(duration_ms), None, 5000, False)
         finally:
             try:
                 await app.mem_call(app.rec.delete, rid)
-            except ToolError:
-                pass
-        out = {"method": "ADS notifications (PLC timestamps)", "mode": "change" if change_only else f"cycle {interval_ms} ms",
+            except Exception as exc:  # noqa: BLE001
+                cleanup_error = f"{type(exc).__name__}: {exc}"[:300]
+        out = {"method": "ADS notifications (PLC timestamps)",
+               "mode": f"change, checked every {interval_ms} ms" if change_only else f"cycle {interval_ms} ms",
                "duration_ms": duration_ms, "rows": [{"t_ms": r["t_ms"], "symbol": r["symbol"], "value": r["value"]} for r in rows["rows"]],
                "count": rows["count"], "truncated": rows["truncated"]}
+        if cleanup_error:
+            out["cleanup_warning"] = f"temporary recording {rid} could not be removed: {cleanup_error}"
         if stop.get("warnings"):
             out["warnings"] = stop["warnings"]
         return out

@@ -690,3 +690,28 @@ def test_env_override_of_toml_is_reported(tmp_path, monkeypatch):
     assert cfg.overrides and "TCMCP_MODE says 'guarded'" in cfg.overrides[0]["note"] and "says 'full'" in cfg.overrides[0]["note"]
     monkeypatch.delenv("TCMCP_MODE")
     assert load(str(toml)).overrides == []
+
+
+@pytest.mark.anyio
+async def test_d4_top_level_enum_reads_carry_the_name(monkeypatch, project_dir):
+    """D4: a top-level enum read the same way as an enum inside a struct: {value, name}."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("ads_read", {"name": "MAIN.fbFill.eState"}))
+        assert r["value"] == {"value": 1, "name": "Bulk"}, r
+        m = payload(await s.call_tool("ads_read_many", {"names": ["MAIN.fbFill.eState", "MAIN.nCycle"]}))
+        assert m["MAIN.fbFill.eState"] == {"value": 1, "name": "Bulk"} and m["MAIN.nCycle"] == 42
+
+
+@pytest.mark.anyio
+async def test_d8_published_schemas_declare_every_parameter(monkeypatch, project_dir):
+    """D8: parameters the tools accept are in the schemas the client sees (engine / also_scope / scope, …)."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        tools = {t.name: t for t in (await s.list_tools()).tools}
+        props = lambda n: set((tools[n].input_schema or {}).get("properties", {}))    # noqa: E731
+        assert {"engine", "also_scope", "scope", "edge_triggers", "cycle_counter"} <= props("rec_start")
+        assert {"engine", "counter"} <= props("rec_capture")
+        assert "confirm_token" in props("tc_set_mode") and "fill" in props("rec_read")
