@@ -94,7 +94,7 @@ def _start_cmd(tmp: Path, name: str, blocks: list[dict], **kw) -> dict:
 
 
 def _rows(path: Path) -> list[list]:
-    return [json.loads(ln) for ln in path.read_text().splitlines() if ln.startswith("[")]
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.startswith("[")]
 
 
 def test_version_and_selftest(capture_exe):
@@ -197,7 +197,7 @@ def test_gap_and_stdin_close_footer(capture_exe, tmp_path):
     st = s.call({"cmd": "status"})
     assert st["active"] and st["samples"] > 0 and st["missing_gaps"] == 10
     s.close()
-    lines = (tmp_path / "rg.jsonl").read_text().splitlines()
+    lines = (tmp_path / "rg.jsonl").read_text(encoding="utf-8").splitlines()
     f = json.loads(lines[-1])
     assert f["_footer"] and f["missing_gaps"] == 10 and "stdin closed" in f["stop_reason"]
     assert f["blocks"][0]["first_gaps"][0] == [99.0, 10]
@@ -249,7 +249,7 @@ def test_recorder_native_duration_verify_pass(rec):
     v = rec.verify(st["id"], counter="MAIN.nCycle")
     assert v["integrity"] == "intact" and v["verdict"] == "PASS", v
     assert v["counter"]["lossless"] and v["footer"]["engine"] == "native"
-    head = json.loads(Path(fin["file"]).read_text().splitlines()[0])
+    head = json.loads(Path(fin["file"]).read_text(encoding="utf-8").splitlines()[0])
     assert head["engine"] == "native" and head["engine_version"] == __version__
     stats = rec.stats(st["id"], ["MAIN.nCycle"], False, 0)
     assert stats["source"] == "file" and stats["symbols"]["MAIN.nCycle"]["count"] >= 2000
@@ -320,7 +320,7 @@ def test_spec10_export_identical_to_python_engine(rec, tmp_path):
     nat = rec.stop(st["id"])
     native_path = Path(nat["file"])
     # replay the very same (filetime, block, bytes) through the Python engine's ingest
-    lines = native_path.read_text().splitlines()
+    lines = native_path.read_text(encoding="utf-8").splitlines()
     t0 = json.loads(lines[1])["_t0"]["filetime"]
     from twincat_mcp.recorder import Recording, build_blocks
     syms = rec.expand_symbols(["MAIN.nCycle", "MAIN.stRecipe"], None, None, 50)
@@ -339,10 +339,10 @@ def test_spec10_export_identical_to_python_engine(rec, tmp_path):
         a = rec.export(st["id"], fmt, str(tmp_path / f"n.{fmt}.csv"), None)
         b = rec.export("py10", fmt, str(tmp_path / f"p.{fmt}.csv"), None)
         assert a["rows"] == b["rows"] > 0
-        assert Path(a["file"]).read_text() == Path(b["file"]).read_text(), fmt
+        assert Path(a["file"]).read_text(encoding="utf-8") == Path(b["file"]).read_text(encoding="utf-8"), fmt
     # and the raw rows are byte-identical
-    assert [ln for ln in native_path.read_text().splitlines() if ln.startswith("[")] == \
-           [ln for ln in (tmp_path / "py10.jsonl").read_text().splitlines() if ln.startswith("[")]
+    assert [ln for ln in native_path.read_text(encoding="utf-8").splitlines() if ln.startswith("[")] == \
+           [ln for ln in (tmp_path / "py10.jsonl").read_text(encoding="utf-8").splitlines() if ln.startswith("[")]
 
 
 def test_auto_falls_back_to_python_with_reason(monkeypatch, tmp_path):
