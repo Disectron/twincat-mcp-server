@@ -2270,10 +2270,12 @@ class Recorder:
     def _events_for(self, rid: str, symbols: list[str]) -> list[dict[str, Any]]:
         return self.read(rid, None, None, symbols, 10_000_000, False)["rows"]
 
-    def pulses(self, rid: str, symbol: str, max_list: int = 200) -> dict[str, Any]:
+    def pulses(self, rid: str, symbol: str, max_list: int = 200, t_to: float | None = None) -> dict[str, Any]:
         """Pulse analysis of one symbol: for BOOL the high/low widths, period, duty;
         for any other type the value runs with dwell times (state machine timing)."""
         ev = self._events_for(rid, [symbol])
+        if t_to is not None:
+            ev = [e for e in ev if e["t_ms"] <= t_to]
         if not ev:
             raise RecorderError(f"no events for {symbol!r} in {rid}")
         runs: list[list[Any]] = []
@@ -2310,12 +2312,61 @@ class Recorder:
                                      for a, b, v in runs[:max_list]]})
         return out
 
+    def timing_of(self, rid: str, symbols: list[str]) -> dict[str, Any]:
+        """How far the timestamps of ``symbols`` in this recording can be trusted relative to each other (D35).
+
+        cycle mode: every sample carries the PLC cycle it was taken in → order exact, resolution = cycle_ms.
+        change mode: the runtime checks each notification every cycle_ms, every notification at its own phase →
+        inside one notification block the order is exact (resolution cycle_ms); across blocks a later change can
+        carry an earlier timestamp (up to cycle_ms off) → order and differences unreliable.
+        poll mode: PC-side sum reads → resolution cycle_ms plus PC jitter, one timestamp per read."""
+        try:
+            with open(self._path_for(rid), encoding="utf-8") as fh:
+                head = json.loads(fh.readline())
+        except Exception as exc:  # noqa: BLE001
+            return {"trust": "unknown", "why": f"header unreadable: {exc}"}
+        mode, cyc = head.get("mode"), float(head.get("cycle_ms") or 0)
+        names = [x.get("name", "") for x in head.get("symbols", [])]
+
+        def sid_of(sym: str) -> int | None:
+            low = sym.lower()
+            for i, n in enumerate(names):
+                nl = n.lower()
+                if nl == low or low.startswith(nl + "[") or low.startswith(nl + "."):
+                    return i
+            return None
+        block_of: dict[str, Any] = {}
+        for sym in symbols:
+            sid = sid_of(sym)
+            block_of[sym] = next((b.get("id") for b in head.get("blocks", []) if sid is not None
+                                  and any(sl[0] == sid for sl in b.get("slots", []))), None)
+        same_block = len({v for v in block_of.values()}) == 1 and None not in block_of.values()
+        if mode == "cycle":
+            trust, why = "exact", f"cycle mode: PLC cycle timestamps, resolution {cyc:g} ms"
+        elif mode == "change":
+            if same_block:
+                trust, why = "quantised", f"change mode, one notification: order exact, timestamps on a {cyc:g} ms grid"
+            else:
+                trust, why = ("unreliable", f"change mode, separate notifications checked every {cyc:g} ms at different "
+                              f"phases: timestamps up to {cyc:g} ms off, events between them can be reordered")
+        else:
+            trust, why = "quantised", f"{mode} mode: PC-side reads every {cyc:g} ms"
+        return {"mode": mode, "cycle_ms": cyc, "blocks": block_of, "same_block": same_block, "trust": trust,
+                "resolution_ms": cyc, "why": why}
+
     def latency(self, rid: str, from_symbol: str, from_op: str, from_value: Any, to_symbol: str, to_op: str,
-                to_value: Any, max_pairs: int = 500) -> dict[str, Any]:
+                to_value: Any, max_pairs: int = 500, t_to: float | None = None) -> dict[str, Any]:
         """Time from each moment ``from_symbol <from_op> from_value`` becomes true to the next
-        moment ``to_symbol <to_op> to_value`` becomes true (edge-to-edge, PLC timestamps)."""
+        moment ``to_symbol <to_op> to_value`` becomes true (edge-to-edge, PLC timestamps).
+
+        A symbol's FIRST sample is its initial state, not an edge (D34): a condition that already holds there
+        became true before the recording started, at an unknown time — it opens no pair and closes none."""
         ev = self._events_for(rid, [from_symbol, to_symbol])
+        if t_to is not None:
+            ev = [e for e in ev if e["t_ms"] <= t_to]
         f_prev = t_prev = False
+        f_seen = t_seen = False
+        from_at_start = to_at_start = False
         pending: list[float] = []
         absorbed = 0
         pairs: list[dict[str, Any]] = []
@@ -2323,11 +2374,17 @@ class Recorder:
             v = _raw_val(e["value"])
             if e["symbol"].lower() == from_symbol.lower():
                 now = _OPS.get(from_op, lambda a, b: False)(v, _coerce(from_value, v))
-                if now and not f_prev:
+                if not f_seen:
+                    f_seen, from_at_start = True, bool(now)
+                elif now and not f_prev:
                     pending.append(e["t_ms"])
                 f_prev = now
             if e["symbol"].lower() == to_symbol.lower():
                 now = _OPS.get(to_op, lambda a, b: False)(v, _coerce(to_value, v))
+                if not t_seen:
+                    t_seen, to_at_start = True, bool(now)
+                    t_prev = now
+                    continue
                 if now and not t_prev and pending:
                     t_from = pending.pop(0)
                     pairs.append({"t_from_ms": round(t_from, 3), "t_to_ms": round(e["t_ms"], 3), "latency_ms": round(e["t_ms"] - t_from, 3)})
@@ -2337,11 +2394,17 @@ class Recorder:
             if len(pairs) >= max_pairs:
                 break
         lat = [p["latency_ms"] for p in pairs]
-        return {"id": rid, "from": f"{from_symbol} {from_op} {from_value}", "to": f"{to_symbol} {to_op} {to_value}",
-                "pairs": len(pairs), "unmatched_from_edges": len(pending) + absorbed,
-                "from_edges_total": len(pairs) + len(pending) + absorbed, "absorbed_from_edges": absorbed,
-                "note": "a from-edge that occurs again before the to-condition fires is 'absorbed' — one response for several stimuli",
-                "latency_ms": _stat(lat), "samples": pairs[:100]}
+        out = {"id": rid, "from": f"{from_symbol} {from_op} {from_value}", "to": f"{to_symbol} {to_op} {to_value}",
+               "pairs": len(pairs), "unmatched_from_edges": len(pending) + absorbed,
+               "from_edges_total": len(pairs) + len(pending) + absorbed, "absorbed_from_edges": absorbed,
+               "note": "a from-edge that occurs again before the to-condition fires is 'absorbed' — one response for several stimuli",
+               "latency_ms": _stat(lat), "samples": pairs[:100],
+               "from_true_at_start": from_at_start, "to_true_at_start": to_at_start,
+               "timing": self.timing_of(rid, [from_symbol, to_symbol])}
+        if from_at_start:
+            out["start_note"] = ("the from-condition already held at the recording's first sample: that edge happened before "
+                                 "the recording started and is not measured")
+        return out
 
     def compare(self, rid_a: str, rid_b: str, symbols: list[str] | None = None) -> dict[str, Any]:
         """Before/after comparison of two recordings over their common symbols: stats deltas

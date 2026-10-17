@@ -925,10 +925,22 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         except ToolError as exc:
             rep["router"] = f"FAIL: {exc} — is TwinCAT XAE/XAR installed and the TwinCAT System Service running?"
         rep["ads_target"] = {"ams_net_id": cfg.ads.ams_net_id or "(local)", "port": cfg.ads.ams_port}
+        infos: list[str] = []
         try:
             rep["target_state"] = await app.ads_call(app.ads.state, timeout=10)
         except ToolError as exc:
-            rep["target_state"] = f"FAIL: {exc}"
+            # D45: CONFIG is a state the operator chooses, not a fault — the PLC port is simply not there
+            sysmode = None
+            try:
+                sysmode = (await app.ads_call(app.ads.system_state, timeout=10)).get("twincat_mode")
+            except ToolError:
+                pass
+            if sysmode == "CONFIG":
+                rep["target_state"] = {"info": "TwinCAT in CONFIG — PLC runtime not running", "twincat_mode": "CONFIG",
+                                       "plc_port": cfg.ads.ams_port, "detail": str(exc)[:160]}
+                infos.append("TwinCAT in CONFIG — PLC runtime not running")
+            else:
+                rep["target_state"] = f"FAIL: {exc}" + (f" (TwinCAT system mode {sysmode})" if sysmode else "")
         # XAE
         if is_windows():
             try:
@@ -973,6 +985,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if cfg.warnings:
             problems.append("config_FIX_THESE")
         rep = {"summary": ("OK" if not problems else "PROBLEMS: " + ", ".join(problems)) +
+                          (f" (info: {'; '.join(infos)})" if infos else "") +
                           f" — target {rep['ads_target']['ams_net_id']}:{rep['ads_target']['port']}, mode {app.guard.mode}", **rep}
         if verbose:
             rep["config"] = cfg.to_dict()

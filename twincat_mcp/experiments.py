@@ -432,6 +432,35 @@ def stats(values: list[float], tolerance: float | None = None) -> dict[str, Any]
     return out
 
 
+# measures that cannot be negative: counts and durations (D36)
+_NONNEG_KINDS = frozenset({"changes", "edges", "pulses", "latency", "dwell", "settle"})
+
+
+def _bound_ci(st: dict[str, Any], lower: float | None, resolution: float | None) -> dict[str, Any]:
+    """The t-interval of the mean, made honest for what it describes: never below a measure's physical lower bound
+    (a count of −1.1, D36), never narrower than the timestamp resolution (n identical 1 ms readings are a ±0.5 ms
+    statement about the mean, not a zero-width one — D34's CI [1, 1])."""
+    ci = st.get("ci95_mean")
+    if not ci:
+        return st
+    lo, hi = ci
+    notes = []
+    if resolution:
+        q = resolution / 2.0
+        mean = st["mean"]
+        if (hi - lo) / 2.0 < q:
+            lo, hi = mean - q, mean + q
+            notes.append(f"widened to the timestamp resolution ±{q:g}")
+    if lower is not None and lo < lower:
+        lo = lower
+        notes.append(f"clipped at {lower:g} (the measure cannot be lower)")
+    if notes:
+        st = dict(st)
+        st["ci95_mean"] = [lo, hi]
+        st["ci95_note"] = "; ".join(notes)
+    return st
+
+
 def _metric_value(st: dict[str, Any], stat: str) -> float | None:
     return st.get(stat)
 
@@ -505,12 +534,24 @@ def evaluate(spec: dict[str, Any], runs: list[dict[str, Any]]) -> dict[str, Any]
         measure_stats: dict[str, Any] = {}
         for mname in (spec.get("measures") or {}):
             vals = [r["measures"].get(mname) for r in lv_runs if isinstance(r.get("measures"), dict)]
-            measure_stats[mname] = stats([v for v in vals if isinstance(v, (int, float))])
+            mk = ((spec.get("measures") or {}).get(mname) or {}).get("kind")
+            mres = max([float(r["measure_resolution_ms"][mname]) for r in lv_runs
+                        if isinstance(r.get("measure_resolution_ms"), dict)
+                        and isinstance(r["measure_resolution_ms"].get(mname), (int, float))] or [0.0]) or None
+            measure_stats[mname] = _bound_ci(stats([v for v in vals if isinstance(v, (int, float))]),
+                                             0.0 if mk in _NONNEG_KINDS else None, mres)
         for name, mt in metrics_spec.items():
             st = stats([r["measures"].get(mt["measure"]) for r in lv_runs if isinstance(r.get("measures"), dict)
                         and isinstance(r["measures"].get(mt["measure"]), (int, float))], mt.get("tolerance"))
+            kind = ((spec.get("measures") or {}).get(mt["measure"]) or {}).get("kind")
+            res_ms = max([float(r["measure_resolution_ms"][mt["measure"]]) for r in lv_runs
+                          if isinstance(r.get("measure_resolution_ms"), dict)
+                          and isinstance(r["measure_resolution_ms"].get(mt["measure"]), (int, float))] or [0.0]) or None
+            st = _bound_ci(st, 0.0 if kind in _NONNEG_KINDS else None, res_ms)
             metrics[name] = {"value": _metric_value(st, mt["stat"]), "ci95": _metric_ci(st, mt["stat"]), "n": st["count"],
                              "measure": mt["measure"], "stat": mt["stat"]}
+            if st.get("ci95_note") and mt["stat"] == "mean":
+                metrics[name]["ci95_note"] = st["ci95_note"]
         crits = []
         for c in spec.get("criteria") or []:
             if c.get("metric"):
@@ -707,6 +748,7 @@ class Runner:
         self._archived_note: str | None = None
         self._scope0 = ""
         self._types: dict[str, Any] = {}        # symbol -> SymbolEntry (resolved at start)
+        self._cut: dict[str, float] = {}         # recording id -> its PLC time when the after-steps began (D33)
 
     # -- lifecycle ------------------------------------------------------------
     def start(self, max_runs: int | None = None, resume: bool = True, dry_run: bool = False) -> dict[str, Any]:
@@ -754,8 +796,12 @@ class Runner:
 
     def abort(self, reason: str = "requested") -> dict[str, Any]:
         self._abort.set()
-        self._set(abort_reason=reason)
-        return {"experiment": self.name, "aborting": True, "reason": reason}
+        cur = self.state.get("current")
+        got = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "during": cur,
+               "runs_attempted": self.state.get("attempted_this_session", 0)}
+        self._set(abort_reason=reason, abort_received=got)
+        return {"experiment": self.name, "aborting": True, "reason": reason, "received_during": cur,
+                "note": "the current run stops at its next step, its after-steps still run (cleanup), no further run starts"}
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -926,7 +972,8 @@ class Runner:
                 if between and not self._abort.is_set():
                     self._abort.wait(between / 1000)
             else:
-                self._set(state="done", finished=time.time())
+                # D37: an abort during the last run is still an abort, not 'done'
+                self._set(state="aborted" if self._abort.is_set() else "done", finished=time.time())
             if self._abort.is_set() and self.state.get("state") == "running":
                 self._set(state="aborted", finished=time.time())
         except Exception as exc:  # noqa: BLE001
@@ -977,15 +1024,17 @@ class Runner:
         self.d.audit("exp_write", {"experiment": self.name, "symbol": symbol, "value": value, "purpose": purpose,
                                    "run": (self.state.get("current") or {})}, "ok")
 
-    def _wait(self, cond: dict[str, Any], default_timeout: int = 600_000, invert: bool = False) -> dict[str, Any]:
-        """wait_until in ≤1 s slices so exp_abort interrupts within a second instead of after done_when's timeout."""
+    def _wait(self, cond: dict[str, Any], default_timeout: int = 600_000, invert: bool = False,
+              cleanup: bool = False) -> dict[str, Any]:
+        """wait_until in ≤1 s slices so exp_abort interrupts within a second instead of after done_when's timeout.
+        ``cleanup`` (the run's after-steps): an abort does not interrupt it — cleanup must finish (D37)."""
         tmo = int(cond.get("timeout_ms") or default_timeout)
         op = _INVERSE[cond["op"]] if invert else cond["op"]
         value = self.coerce(cond["symbol"], cond["value"])
         deadline = time.monotonic() + tmo / 1000
         polls = 0
         while True:
-            if self._abort.is_set():
+            if self._abort.is_set() and not cleanup:
                 raise ExperimentError("aborted")
             slice_ms = int(max(50, min(1000, (deadline - time.monotonic()) * 1000)))
             r = self.d.slow_call(self.d.ads.wait_until, cond["symbol"], op, value, slice_ms,
@@ -1085,11 +1134,18 @@ class Runner:
             record["status"] = "failed"
             record["error"] = str(exc)[:300]
         finally:
-            # 'after' has cleanup semantics: it runs on failure too, so state does not leak into the next run
-            # (not after a fatal error or an abort — run.on_abort is the cleanup for those)
-            if not record.get("fatal") and not self._abort.is_set():
+            # D33: measures end where the after-steps begin — 'last' read after the reset was always the reset value
+            self._cut = self._cut_points(rec_ids)
+            if self._abort.is_set() and not record.get("fatal"):
+                # the run was cut short or its data is partial: not a valid observation, and not a failure of the
+                # system under test either
+                record["status"] = "aborted"
+                record["error"] = f"aborted during the run ({self.state.get('abort_reason') or 'requested'})"
+            # 'after' has cleanup semantics: it runs on failure AND on abort, so state does not leak (D37); not after
+            # a fatal error (guard refusal / target change: writing is what must stop)
+            if not record.get("fatal"):
                 try:
-                    self._steps(run.get("after") or [], "after")
+                    self._steps(run.get("after") or [], "after", cleanup=True)
                 except FatalRunError as exc:       # guard refusal / abort / target change during cleanup: stop the series
                     record["status"] = "failed"
                     record["error"] = f"after: {str(exc)[:280]}"
@@ -1099,12 +1155,16 @@ class Runner:
                     if record["status"] == "ok":
                         record["status"] = "failed"
                         record["error"] = f"after: {str(exc)[:280]}"
+                if run.get("after"):
+                    record["after_ran"] = True
             for rid in list(rec_ids):
                 if self._stop_rec(rid, "run ended"):
                     pass
         if record["status"] == "ok":
             try:
                 record["measures"], record["measure_notes"] = self._measure(rec_ids, lv)
+                if getattr(self, "_last_resolution", None):
+                    record["measure_resolution_ms"] = dict(self._last_resolution)
             except Exception as exc:  # noqa: BLE001
                 record["status"] = "failed"
                 record["error"] = f"measurement: {exc}"[:300]
@@ -1112,23 +1172,61 @@ class Runner:
         record["duration_s"] = round(record["finished"] - t0, 2)
         return record
 
-    def _steps(self, items: list[dict[str, Any]], where: str) -> None:
+    def _steps(self, items: list[dict[str, Any]], where: str, cleanup: bool = False) -> None:
         """before/after items: {symbol, value} writes a value; {wait_ms: N} pauses (so a 10 ms task sees a pulse);
-        {wait_until: {symbol, op, value, timeout_ms}} waits for a condition."""
+        {wait_until: {symbol, op, value, timeout_ms}} waits for a condition. ``cleanup`` (after-steps): runs to the
+        end even when an abort arrives (D37: an abort used to skip the reset and leak PLC state)."""
         for w in items:
-            if self._abort.is_set():
+            if self._abort.is_set() and not cleanup:
                 raise FatalRunError("aborted")
             if "wait_ms" in w:
-                self._abort.wait(float(w["wait_ms"]) / 1000)
+                if cleanup:
+                    time.sleep(min(float(w["wait_ms"]), 60_000) / 1000)
+                else:
+                    self._abort.wait(float(w["wait_ms"]) / 1000)
             elif "wait_until" in w:
                 c = w["wait_until"]
-                r = self._wait(c, int(c.get("timeout_ms") or 10_000))
+                r = self._wait(c, int(c.get("timeout_ms") or 10_000), cleanup=cleanup)
                 if not r.get("met"):
                     raise ExperimentError(f"{where}: {c.get('symbol')} {c.get('op')} {c.get('value')} not met in {c.get('timeout_ms', 10000)} ms")
             elif "symbol" in w and "value" in w:
                 self._write(w["symbol"], w["value"])
             else:
                 raise ExperimentError(f"{where} item {w!r}: needs symbol+value, wait_ms or wait_until")
+
+    def _cut_points(self, rec_ids: list[str], timeout_s: float = 1.5) -> dict[str, float]:
+        """Each recording's PLC time (its own clock) once everything sampled before now has arrived: wait two check
+        cycles (a change-mode notification reports a change at its next check), then until the recorded span stops
+        growing. Samples after this point belong to the after-steps, not to the run (D33)."""
+        cyc = 0.0
+        for rid in rec_ids:
+            rec = self.d.rec.recs.get(rid)
+            cyc = max(cyc, float(getattr(rec, "cycle_ms", 0) or 0))
+        time.sleep(min(0.5, 2 * cyc / 1000.0 + 0.02))
+        out: dict[str, float] = {}
+        deadline = time.monotonic() + timeout_s
+        for rid in rec_ids:
+            last = None
+            while True:
+                try:
+                    st = self.d.rec.status(rid)
+                except Exception:  # noqa: BLE001
+                    break
+                span = st.get("plc_span_s")
+                q = getattr(self.d.rec.recs.get(rid), "q", None)
+                busy = q is not None and hasattr(q, "empty") and not q.empty()
+                if isinstance(span, (int, float)) and span == last and not busy:
+                    break
+                last = span if isinstance(span, (int, float)) else last
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            exact = getattr(self.d.rec.recs.get(rid), "last_t", None)
+            if isinstance(exact, (int, float)) and exact > 0:
+                out[rid] = float(exact)                       # python engine: the exact last sample time
+            elif isinstance(last, (int, float)):
+                out[rid] = float(last) * 1000.0 + 0.1         # status rounds to 0.1 ms: keep the last sample inside
+        return out
 
     def _wait_delivering(self, rec_ids: list[str], timeout_s: float) -> list[str]:
         """Wait until every recording (and every notification block in it) has at least one sample; returns the ids
@@ -1259,11 +1357,14 @@ class Runner:
         return None
 
     def _events(self, rid: str, symbol: str) -> list[dict[str, Any]]:
-        return self.d.rec.read(rid, None, None, [symbol], 10_000_000, False)["rows"]
+        """The symbol's samples up to the start of the after-steps (D33)."""
+        return self.d.rec.read(rid, None, self._cut.get(rid), [symbol], 10_000_000, False)["rows"]
 
     def _measure(self, rec_ids: list[str], lv: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
         out: dict[str, Any] = {}
         notes: dict[str, str] = {}
+        resolution: dict[str, float] = {}
+        self._last_resolution = resolution
         specs = self.spec.get("measures") or {}
         # non-expr first, expr last
         order = [k for k, m in specs.items() if m.get("kind") != "expr"] + [k for k, m in specs.items() if m.get("kind") == "expr"]
@@ -1289,12 +1390,25 @@ class Runner:
                         notes[name] = "from/to symbols are not recorded together"
                         continue
                     r = self.d.rec.latency(rid, f["symbol"], f["op"], self.coerce(f["symbol"], f["value"]),
-                                           t["symbol"], t["op"], self.coerce(t["symbol"], t["value"]))
+                                           t["symbol"], t["op"], self.coerce(t["symbol"], t["value"]),
+                                           t_to=self._cut.get(rid))
                     pairs = r.get("samples") or []
                     agg = m.get("agg", "first")
-                    if not pairs:
+                    tm = r.get("timing") or {}
+                    if tm.get("resolution_ms"):
+                        resolution[name] = float(tm["resolution_ms"])
+                    if tm.get("trust") == "unreliable":
+                        # D35: separate change-mode notifications — a latency from them is not a measurement
+                        out[name] = None
+                        notes[name] = (f"not measurable from this capture: {tm.get('why')}. Use a cycle-mode profile, or "
+                                       "record from and to in one notification (same FB/struct)")
+                    elif not pairs:
                         out[name] = None
                         notes[name] = f"no from→to pair ({r.get('unmatched_from_edges', 0)} unmatched from-edges)"
+                        if r.get("from_true_at_start"):
+                            # D34: the edge was before the first sample; the old code measured from the first sample
+                            notes[name] += ("; the from-condition already held at the first sample — the edge happened "
+                                            "before the recording delivered, its latency is unknown")
                     elif agg == "first":
                         out[name] = pairs[0]["latency_ms"]
                     elif agg == "max":
@@ -1308,7 +1422,7 @@ class Runner:
                     notes[name] = "symbol not in the run's recordings (add it to the capture profile)"
                     continue
                 if kind == "pulses":
-                    r = self.d.rec.pulses(rid, m["symbol"])
+                    r = self.d.rec.pulses(rid, m["symbol"], t_to=self._cut.get(rid))
                     fld = m.get("field")
                     if fld:
                         cur: Any = r
@@ -1343,6 +1457,7 @@ class Runner:
                     out[name] = sum(1 for a, b in zip(vals, vals[1:]) if (a or 0) == 0 and (b or 0) != 0)
                 elif kind == "dwell":
                     out[name] = _dwell(ev, self.coerce(m["symbol"], m["value"]), m.get("mode", "equal"))
+                    resolution[name] = float(self.d.rec.timing_of(rid, [m["symbol"]]).get("resolution_ms") or 0) or None
                 elif kind == "settle":
                     anchor = None
                     if isinstance(m.get("from"), dict):
@@ -1352,6 +1467,7 @@ class Runner:
                             notes[name] = f"anchor {m['from']['symbol']} {m['from']['op']} {m['from']['value']} never became true"
                             continue
                     out[name] = _settle(ev, float(m.get("tolerance", 0.0)), anchor)
+                    resolution[name] = float(self.d.rec.timing_of(rid, [m["symbol"]]).get("resolution_ms") or 0) or None
                 if out.get(name) is None and name not in notes:
                     notes[name] = "no numeric events"
             except Exception as exc:  # noqa: BLE001

@@ -583,3 +583,29 @@ def test_a5_pattern_selects_the_same_leaves_in_rec_start_and_rec_scan(monkeypatc
     assert one == ["MAIN.arrSteps[2].bDone", "MAIN.arrSteps[2].eState", "MAIN.arrSteps[2].nId", "MAIN.arrSteps[2].tDwell"], one
     with pytest.raises(Exception, match="matches no symbol"):
         app.rec.expand_symbols(None, "MAIN.arrSteps[9]", None, 500)
+
+
+def test_d34_d35_latency_ignores_initial_state_and_says_how_far_timestamps_hold(rec, monkeypatch):
+    """D34: the condition already true at the first sample (edge before the recording) produced a '1 ms' latency
+    from the two first samples. D35: separate change-mode notifications are checked at different phases."""
+    rid = "lat-test"
+    rec.root.mkdir(parents=True, exist_ok=True)
+    head = {"_header": True, "format": 2, "id": rid, "mode": "change", "cycle_ms": 10,
+            "symbols": [{"id": 0, "name": "MAIN.bPulse"}, {"id": 1, "name": "MAIN.bDone"}, {"id": 2, "name": "MAIN.st"}],
+            "blocks": [{"id": 0, "slots": [[0, 0, 1]]}, {"id": 1, "slots": [[1, 0, 1]]}, {"id": 2, "slots": [[2, 0, 8]]}]}
+    (rec.root / f"{rid}.jsonl").write_text(json.dumps(head) + "\n", encoding="utf-8")
+    ev = [{"t_ms": 0.0, "symbol": "MAIN.bPulse", "value": True}, {"t_ms": 1.0, "symbol": "MAIN.bDone", "value": True},
+          {"t_ms": 50.0, "symbol": "MAIN.bPulse", "value": False}, {"t_ms": 60.0, "symbol": "MAIN.bDone", "value": False}]
+    monkeypatch.setattr(rec, "_events_for", lambda r, syms: list(ev))
+    r = rec.latency(rid, "MAIN.bPulse", "==", True, "MAIN.bDone", "==", True)
+    assert r["pairs"] == 0 and r["from_true_at_start"] and r["to_true_at_start"] and "before the recording" in r["start_note"]
+    ev += [{"t_ms": 100.0, "symbol": "MAIN.bPulse", "value": True}, {"t_ms": 120.0, "symbol": "MAIN.bDone", "value": True}]
+    r = rec.latency(rid, "MAIN.bPulse", "==", True, "MAIN.bDone", "==", True)
+    assert r["pairs"] == 1 and r["samples"][0]["latency_ms"] == 20.0
+    assert rec.latency(rid, "MAIN.bPulse", "==", True, "MAIN.bDone", "==", True, t_to=110.0)["pairs"] == 0   # D33 window
+    t = r["timing"]
+    assert t["trust"] == "unreliable" and not t["same_block"] and "reordered" in t["why"]
+    assert rec.timing_of(rid, ["MAIN.st.a", "MAIN.st.b"])["trust"] == "quantised"     # one notification
+    head["mode"] = "cycle"
+    (rec.root / f"{rid}.jsonl").write_text(json.dumps(head) + "\n", encoding="utf-8")
+    assert rec.timing_of(rid, ["MAIN.bPulse", "MAIN.bDone"])["trust"] == "exact"

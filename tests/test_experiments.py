@@ -243,6 +243,7 @@ EXP_SPEC = {
             "settle_ms": 20, "between_runs_ms": 20},
     "measures": {
         "drums_after": {"kind": "last", "symbol": "GVL_Machine.nDrumsFilled"},
+        "done_last": {"kind": "last", "symbol": "MAIN.fbFill.bDone"},      # D33: before the after-step resets it
         "done_edges": {"kind": "edges", "symbol": "MAIN.fbFill.bDone"},
         "state_changes": {"kind": "changes", "symbol": "MAIN.fbFill.eState"},
         "fill_ms": {"kind": "dwell", "symbol": "MAIN.fbFill.eState", "value": 1, "mode": "not_equal_total"},
@@ -316,6 +317,7 @@ async def test_experiment_e2e(monkeypatch, project_dir, tmp_path):
             assert m["fill_ms"] and 100 <= m["fill_ms"] <= 600, m
             assert m["lat_ms"] and 100 <= m["lat_ms"] <= 600, m
             assert m["drums_after"] == 8
+            assert m["done_last"] == 1.0, "D33: 'last' is taken before the after-step (bDone := FALSE)"
             assert len(runs[0]["recordings"]) == 1
 
             ev = payload(await s.call_tool("exp_evaluate", {"name": "fake-fill"}))
@@ -426,10 +428,13 @@ async def test_experiment_abort_and_readonly_switch(monkeypatch, project_dir, tm
     spec["run"]["done_when"]["timeout_ms"] = 60_000   # no machine → the wait would hang a minute
     spec["run"]["start"] = {"symbol": "MAIN.bStart", "value": True, "reset_value": False, "reset_after_ms": 10}
     spec["run"]["start_timeout_ms"] = 30_000
+    spec["run"]["after"] = [{"symbol": "MAIN.nCycle", "value": 77}]      # D37: the cleanup must run on abort too
+    spec["writes_allowed"] = spec["writes_allowed"] + ["MAIN.nCycle"]
+    FakeConnection.shared_values["MAIN.nCycle"] = 0
     async with client_for(srv) as s:
         payload(await s.call_tool("rec_profile_save", {"name": "fill-prof", "symbols": ["MAIN.fbFill.bDone"], "mode": "change"}))
         payload(await s.call_tool("exp_save", {"spec": spec}))
-        payload(await s.call_tool("exp_run", {"name": "hang"}))
+        payload(await s.call_tool("exp_run", {"name": "hang", "max_runs": 1}))     # D37: abort during the LAST run
         time.sleep(0.6)
         st = payload(await s.call_tool("exp_status", {"name": "hang"}))
         assert st["alive"] and st["live_recordings"], st
@@ -440,8 +445,12 @@ async def test_experiment_abort_and_readonly_switch(monkeypatch, project_dir, tm
             if not st["alive"]:
                 break
             time.sleep(0.1)
-        assert not st["alive"] and st["state"] == "aborted", st
+        assert not st["alive"] and st["state"] == "aborted", st          # was 'done' when the last run was aborted
         assert time.time() - t0 < 5, "abort must not wait for done_when's timeout"
+        assert st["abort_received"]["during"] is not None
+        runs = payload(await s.call_tool("exp_runs", {"name": "hang"}))["runs"]
+        assert runs[-1]["status"] == "aborted" and runs[-1].get("after_ran"), runs[-1]
+        assert FakeConnection.shared_values["MAIN.nCycle"] == 77, "after-step ran although the run was aborted"
         assert st["live_recordings"] == [] and st.get("restore_warning") in (None, "")
         assert FakeConnection.shared_values["MAIN.stRecipe.rTargetKg"] == orig
         live = payload(await s.call_tool("rec_list", {}))
@@ -581,3 +590,27 @@ async def test_experiment_ack_modes_wait_steps_cleanup_and_archive(monkeypatch, 
             assert FakeConnection.shared_values["MAIN.bStart"] is False, "no stimulus before the recording is live"
     finally:
         machine.stop.set()
+
+
+def test_d36_d34_ci_of_counts_and_quantised_latencies():
+    """D36: the CI of a count went negative (−1.1). D34: six identical 1 ms latencies gave CI [1, 1] — a zero-width
+    statement from a 1 ms timestamp grid."""
+    spec = {"name": "c", "profile": "p", "runs_per_level": 6, "run": {"done_when": {"symbol": "X", "op": "==", "value": 1}},
+            "factors": [{"name": "pv", "symbol": "X.pv", "levels": [1]}],
+            "measures": {"count": {"kind": "edges", "symbol": "X.b"}, "lat": {"kind": "latency", "from": {"symbol": "A", "op": "==", "value": 1},
+                                                                             "to": {"symbol": "B", "op": "==", "value": 1}},
+                         "err": {"kind": "last", "symbol": "X.e"}},
+            "metrics": {"count_mean": {"measure": "count", "stat": "mean"}, "lat_mean": {"measure": "lat", "stat": "mean"},
+                        "err_mean": {"measure": "err", "stat": "mean"}},
+            "criteria": [{"metric": "lat_mean", "op": "le", "value": 1.2}], "writes_allowed": ["X.pv"]}
+    counts, lats, errs = [0, 0, 0, 0, 0, 3], [1.0] * 6, [-2.0, -2.5, -1.0, -3.0, -2.0, -0.5]
+    runs = [{"run_no": i + 1, "level": {"pv": 1}, "status": "ok", "measures": {"count": c, "lat": la, "err": e},
+             "measure_resolution_ms": {"lat": 1.0}} for i, (c, la, e) in enumerate(zip(counts, lats, errs))]
+    ev = X.evaluate(spec, runs)
+    m = ev["levels"][0]["metrics"]
+    assert m["count_mean"]["ci95"][0] == 0.0 and "clipped at 0" in m["count_mean"]["ci95_note"]
+    assert m["lat_mean"]["ci95"] == [0.5, 1.5] and "resolution ±0.5" in m["lat_mean"]["ci95_note"]
+    assert m["err_mean"]["ci95"][0] < -2.5 and "ci95_note" not in m["err_mean"]       # signed measure: untouched
+    # the criterion is no longer a certain pass: the limit 1.2 lies inside ±0.5 ms of the grid
+    assert ev["levels"][0]["criteria"][0]["verdict"] == "inconclusive"
+    assert ev["levels"][0]["measures"]["count"]["ci95_mean"][0] == 0.0

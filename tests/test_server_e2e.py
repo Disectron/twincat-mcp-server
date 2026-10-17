@@ -867,3 +867,31 @@ async def test_d44_build_refuses_until_shell_edits_are_on_disk(monkeypatch, proj
 
 async def _noop():
     return None
+
+
+@pytest.mark.anyio
+async def test_d45_doctor_reports_config_mode_as_info(monkeypatch, project_dir):
+    """D45: TwinCAT deliberately in CONFIG made tc_doctor say 'PROBLEMS: target_state'."""
+    import pyads
+    from pyads import constants as C
+    from tests.fake_ads import FakeConnection
+    install(monkeypatch)
+    orig = FakeConnection.read_state
+
+    def read_state(self):
+        if (self.ams_net_port or 851) == 851:
+            raise pyads.ADSError(6)                      # no PLC runtime in CONFIG
+        return orig(self)
+    monkeypatch.setattr(FakeConnection, "read_state", read_state)
+    FakeConnection.shared_state[10000] = (C.ADSSTATE_CONFIG, 0)
+    try:
+        async with client_for(build_server(mk_cfg(project_dir))) as s:
+            d = payload(await s.call_tool("tc_doctor", {}))
+            # (infosys may be a PROBLEM here: the test PC has no Help Viewer package)
+            assert "target_state" not in d["summary"] and "(info: TwinCAT in CONFIG — PLC runtime not running)" in d["summary"], d["summary"]
+            assert d["target_state"]["twincat_mode"] == "CONFIG"
+            FakeConnection.shared_state[10000] = (C.ADSSTATE_RUN, 0)        # RUN but no PLC answering: a real fault
+            d = payload(await s.call_tool("tc_doctor", {}))
+            assert "PROBLEMS: target_state" in d["summary"] and "system mode RUN" in d["target_state"]
+    finally:
+        FakeConnection.shared_state.pop(10000, None)
