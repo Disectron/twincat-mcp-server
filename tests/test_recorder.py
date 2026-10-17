@@ -289,6 +289,11 @@ def test_block_notification_gaps_are_counted_and_file_is_provable(rec):
     assert s["blocks"][0]["first_gaps"][0] == [299.0, 20] and any("missing" in w for w in s["warnings"])
     out = rec.stop(st["id"], "manual (rec_stop)")
     assert out["missing_samples"] == 21
+    # R5: the holes are in the file where they happened, identical format to the native engine
+    gl = [json.loads(ln)["_gap"] for ln in Path(out["file"]).read_text(encoding="utf-8").splitlines() if ln.startswith('{"_gap"')]
+    assert gl == [{"block": 0, "kind": "gap", "t_from": 299.0, "t_to": 320.0, "missing": 20},
+                  {"block": 0, "kind": "gap", "t_from": 776.0, "t_to": 778.0, "missing": 1}]
+    assert out["label"] == "INCOMPLETE"
     v = rec.verify(st["id"], counter="MAIN.nCycle")
     assert v["integrity"] == "intact" and v["timeline"]["missing"] == 21 and v["verdict"] == "FAIL"
     assert v["counter"]["missing_samples"] == 21 and v["counter"]["step"] == 1 and not v["counter"]["lossless"]

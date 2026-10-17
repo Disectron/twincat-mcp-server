@@ -385,15 +385,18 @@ void Engine::write_t0(int64_t ft) {
     write_line(l);
 }
 
-void Engine::stamp(BState& s, int64_t ft) {
+int64_t Engine::stamp(BState& s, int64_t ft) {
+    int64_t missing = 0;
     if (s.have) {
         int64_t step = ft - s.last_ft;
         if (step <= 0) {
             ++s.dups;
         } else {
             if (!s.min_step || step < s.min_step) s.min_step = step;
-            if (s.min_step && 2 * step > 3 * s.min_step && s.gaps.size() < 20)
-                s.gaps.emplace_back(s.last_ft, std::llround(double(step) / double(s.min_step)) - 1);
+            if (s.min_step && 2 * step > 3 * s.min_step) {
+                missing = std::llround(double(step) / double(s.min_step)) - 1;
+                if (s.gaps.size() < 20) s.gaps.emplace_back(s.last_ft, missing);
+            }
         }
     } else {
         s.first_ft = ft;
@@ -401,6 +404,30 @@ void Engine::stamp(BState& s, int64_t ft) {
     }
     s.last_ft = ft;
     ++s.samples;
+    return missing;
+}
+
+// R5: every hole in the PLC timeline is written into the file where it happened, not only counted. Same line format
+// as the Python recorder: {"_gap": {"block": id, "kind": "gap"|"head"|"tail", "t_from": ms, "t_to": ms, "missing": n}}
+void Engine::write_gap(const BState& s, const char* kind, const std::string& from, const std::string& to, int64_t n) {
+    std::string l = "{\"_gap\": {\"block\": " + std::to_string(s.spec.id) + ", \"kind\": \"" + kind + "\", \"t_from\": " +
+                    from + ", \"t_to\": " + to + ", \"missing\": " + std::to_string(n) + "}}\n";
+    write_line(l);
+    ++gap_markers_;
+}
+
+// R9: a checkpoint commits to every byte before it (running SHA-256, HMAC-signed), so a file whose footer never got
+// written (crash, power loss) is still provably intact up to its last checkpoint.
+void Engine::write_chain() {
+    if (lines_ == chain_lines_) return;            // nothing new since the last checkpoint
+    const std::string d = sha_.hexdigest();
+    std::string l = "{\"_chain\": {\"lines\": " + std::to_string(lines_) + ", \"bytes\": " + std::to_string(bytes_) +
+                    ", \"sha256\": \"" + d + "\"";
+    if (!key_.empty()) l += ", \"hmac\": \"" + hmac_sha256_hex(key_, d) + "\"";
+    l += "}}\n";
+    write_line(l);
+    chain_lines_ = lines_;
+    ++chains_;
 }
 
 void Engine::finish_now(const std::string& reason, int64_t end_ft, bool have_end) {
@@ -421,7 +448,10 @@ void Engine::commit(size_t b, int64_t ft, const uint8_t* d, uint32_t n) {
         if (len > s.spec.size) len = s.spec.size;
     }
     if (any_emitted_ && ft < last_emitted_) ++s.late;
-    stamp(s, ft);
+    const bool had = s.have;
+    const int64_t prev_ft = s.last_ft;
+    const int64_t gap = stamp(s, ft);
+    if (had && gap > 0) write_gap(s, "gap", ms(prev_ft), ms(ft), gap);
     row_.clear();
     row_ += '[';
     row_ += ms(ft);
@@ -591,6 +621,7 @@ void Engine::writer_loop() {
                 }
             }
             if (fh_ && now - last_flush_ > std::chrono::seconds(1)) {
+                if (have_t0_) write_chain();
                 std::fflush(fh_);
                 last_flush_ = now;
             }
@@ -702,6 +733,16 @@ void Engine::finish() {
     const int64_t miss = head + gaps + tail;
     const double comp = (samples_ + miss) ? double(samples_) / double(samples_ + static_cast<uint64_t>(miss)) : 0.0;
     const bool pass = samples_ > 0 && miss == 0 && ovf == 0 && mismatch == 0 && (!start_when_.set || triggered_);
+    // head / tail holes as markers too (block order), then the footer's digest covers them
+    if (fh_ && have_t0_) {
+        for (auto& bp : blocks_) {
+            const BState& s = *bp;
+            const int64_t h = head_missing(s);
+            if (h > 0) write_gap(s, "head", ms(ws_), ms(s.first_ft), h);
+            const int64_t t = tail_missing(s, end, have_end);
+            if (t > 0) write_gap(s, "tail", s.have ? ms(s.last_ft) : (have_ws_ ? ms(ws_) : std::string("null")), ms(end), t);
+        }
+    }
     std::vector<std::string> errs;
     for (auto& e : errors_) errs.push_back(jq(e));
     int64_t span_end = 0;
@@ -727,7 +768,8 @@ void Engine::finish() {
     f.raw("window_start_ms", have_ws_ && have_t0_ ? ms(ws_) : "null");
     f.raw("window_end_ms", have_end && have_t0_ ? ms(end) : "null");
     if (triggered_) f.raw("triggered_at_ms", ms(trig_ft_));
-    f.d("completeness", comp, 8).str("verdict_hint", pass ? "PASS" : "FAIL");
+    f.d("completeness", comp, 8).str("verdict_hint", pass ? "PASS" : "FAIL").str("label", pass ? "COMPLETE" : "INCOMPLETE")
+        .u("gap_markers", gap_markers_).u("chain_checkpoints", chains_);
     f.raw("blocks", jarr(bl)).raw("errors", jarr(errs));
     if (!key_error_.empty()) f.str("key_error", key_error_);
     f.str("stopped", utc_iso_now()).u("lines", lines_).str("sha256", digest);

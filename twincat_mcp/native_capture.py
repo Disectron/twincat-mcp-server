@@ -312,6 +312,8 @@ class NativeRecording:
         }
         if self.proc.footer:
             st["verdict_hint"] = self.proc.footer.get("verdict_hint")
+            st["label"] = self.proc.footer.get("label")
+            st["gap_markers"] = self.proc.footer.get("gap_markers")
             st["window_start_ms"] = self.proc.footer.get("window_start_ms")
             st["window_end_ms"] = self.proc.footer.get("window_end_ms")
         if not self.active and self.proc.proc.returncode not in (0, None) and not self.proc.footer:

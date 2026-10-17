@@ -79,8 +79,10 @@ private:
     void writer_loop();
     void process(size_t b, int64_t ft, const uint8_t* d, uint32_t n);
     void commit(size_t b, int64_t ft, const uint8_t* d, uint32_t n);
-    void stamp(BState& s, int64_t ft);
+    int64_t stamp(BState& s, int64_t ft);   // returns the samples missing before this one (0: none)
     void write_line(const std::string& line);
+    void write_chain();                      // hash checkpoint over every byte written so far (R9)
+    void write_gap(const BState& s, const char* kind, const std::string& from, const std::string& to, int64_t n);
     void write_t0(int64_t ft);
     void finish_now(const std::string& reason, int64_t end_ft, bool have_end);
     void unsubscribe_once();
@@ -119,6 +121,7 @@ private:
     std::FILE* fh_ = nullptr;
     Sha256 sha_;
     uint64_t lines_ = 0, bytes_ = 0;
+    uint64_t chain_lines_ = 0, chains_ = 0, gap_markers_ = 0;
     bool have_t0_ = false;
     int64_t t0_ = 0;
     bool have_ws_ = false;

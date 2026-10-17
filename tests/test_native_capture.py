@@ -142,7 +142,22 @@ def test_spec1_60s_lossless_exact_timestamps(capture_exe, tmp_path):
     assert hashlib.sha256(body).hexdigest() == f["sha256"]
     key = recording_key(tmp_path)
     assert hmac.new(key, f["sha256"].encode(), hashlib.sha256).hexdigest() == f["hmac"]
-    assert f["lines"] == len(rows) + 2
+    # header + _t0 + sample rows + hash checkpoints (R9); no gaps → no gap markers, label COMPLETE (R5)
+    chains = [json.loads(ln) for ln in lines if ln.startswith(b'{"_chain"')]
+    assert f["lines"] == len(rows) + 2 + len(chains) and f["chain_checkpoints"] == len(chains) >= 1
+    assert f["gap_markers"] == 0 and f["label"] == "COMPLETE"
+    # every checkpoint commits to exactly the bytes before it, signed with the install key
+    run = hashlib.sha256()
+    seen = 0
+    for ln in lines:
+        if ln.startswith(b'{"_footer"'):
+            break
+        if ln.startswith(b'{"_chain"'):
+            c = json.loads(ln)["_chain"]
+            assert c["sha256"] == run.hexdigest() and c["bytes"] == seen
+            assert hmac.new(key, c["sha256"].encode(), hashlib.sha256).hexdigest() == c["hmac"]
+        run.update(ln + b"\n")
+        seen += len(ln) + 1
 
 
 def test_spec6_overflow_is_reported_never_pass(capture_exe, tmp_path):
@@ -174,6 +189,31 @@ def test_spec7_plc_stops_counts_missing_tail(capture_exe, tmp_path):
     assert 695 <= f["missing_tail"] <= 700 and f["verdict_hint"] == "FAIL"
     assert "stopped delivering" in f["stop_reason"]
     assert f["window_end_ms"] == 1000.0
+    # R5: the tail is in the file as a marker, the recording is labelled INCOMPLETE
+    gaps = [json.loads(ln)["_gap"] for ln in (tmp_path / "r7.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.startswith('{"_gap"')]
+    assert gaps == [{"block": 0, "kind": "tail", "t_from": 299.0, "t_to": 1000.0, "missing": f["missing_tail"]}]
+    assert f["label"] == "INCOMPLETE" and f["gap_markers"] == 1
+
+
+def test_r5_gap_markers_where_samples_are_missing(capture_exe, tmp_path):
+    """R5: every hole in the PLC timeline is written into the file at the place it happened, with its size."""
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "r5", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}], duration_s=1,
+                              sim={"speed": 0, "drop": [[0, 300, 319], [0, 777, 777]]}))
+        assert r["ok"], r
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    lines = (tmp_path / "r5.jsonl").read_text(encoding="utf-8").splitlines()
+    gaps = [(i, json.loads(ln)["_gap"]) for i, ln in enumerate(lines) if ln.startswith('{"_gap"')]
+    assert [g for _i, g in gaps] == [{"block": 0, "kind": "gap", "t_from": 299.0, "t_to": 320.0, "missing": 20},
+                                     {"block": 0, "kind": "gap", "t_from": 776.0, "t_to": 778.0, "missing": 1}]
+    # each marker sits right before the first sample after the hole
+    for i, g in gaps:
+        assert json.loads(lines[i + 1])[0] == g["t_to"] and json.loads(lines[i - 1 if not lines[i - 1].startswith("{") else i - 2])[0] == g["t_from"]
+    assert f["missing_gaps"] == 21 and f["label"] == "INCOMPLETE" and f["gap_markers"] == 2
 
 
 def test_spec8_unsubscribable_block_refuses_start(capture_exe, tmp_path):

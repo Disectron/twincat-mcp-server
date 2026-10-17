@@ -301,7 +301,9 @@ class Block:
         return {"id": self.bid, "igrp": self.igrp, "ioffs": self.ioffs, "size": self.size,
                 "slots": [[s.sid, s.off, s.size] for s in self.slots]}
 
-    def note_stamp(self, t: float) -> None:
+    def note_stamp(self, t: float) -> int:
+        """Record the sample time; returns how many samples are missing right before it (0: none)."""
+        missing = 0
         if self.last_t is not None:
             step = t - self.last_t
             if step <= 0:
@@ -309,12 +311,15 @@ class Block:
             else:
                 if self.min_step is None or step < self.min_step:
                     self.min_step = step
-                if self.min_step and step > 1.5 * self.min_step and len(self.gaps) < 20:
-                    self.gaps.append([round(self.last_t, 4), round(step / self.min_step) - 1])
+                if self.min_step and step > 1.5 * self.min_step:
+                    missing = round(step / self.min_step) - 1
+                    if len(self.gaps) < 20:
+                        self.gaps.append([round(self.last_t, 4), missing])
         else:
             self.first_t = t
         self.last_t = t
         self.samples += 1
+        return missing
 
     def missing(self, end_t: float | None = None, start_t: float | None = None) -> int:
         """Holes between the first and last sample, plus — when the window end is known (duration / post-trigger
@@ -440,6 +445,10 @@ class Recording:
         self._cut_now = False                 # discard the backlog (limit reached at a known sample)
         self._sha = hashlib.sha256()
         self._lines = 0
+        self._bytes = 0
+        self._chain_lines = 0
+        self.chains = 0
+        self.gap_markers = 0
         self._fh = None
         self._last_flush = time.monotonic()
         self._lock = threading.Lock()
@@ -466,8 +475,30 @@ class Recording:
     def _write(self, line: str) -> None:
         if self._fh:
             self._fh.write(line)
-            self._sha.update(line.encode("utf-8"))
+            raw = line.encode("utf-8")
+            self._sha.update(raw)
             self._lines += 1
+            self._bytes += len(raw)
+
+    def _write_gap(self, b: "Block", kind: str, t_from: float | None, t_to: float, missing: int) -> None:
+        """R5: a hole in the PLC timeline is written into the file where it happened (identical line format in the
+        native engine)."""
+        tf = "null" if t_from is None else f"{t_from:.4f}"
+        self._write(f'{{"_gap": {{"block": {b.bid}, "kind": "{kind}", "t_from": {tf}, "t_to": {t_to:.4f}, "missing": {missing}}}}}\n')
+        self.gap_markers += 1
+
+    def _write_chain(self) -> None:
+        """R9: checkpoint over every byte written so far (running SHA-256, HMAC-signed): a file whose footer never
+        got written is still provably intact up to its last checkpoint."""
+        if not self._fh or self._lines == self._chain_lines or self.t0_wall is None:
+            return
+        d = self._sha.hexdigest()
+        line = f'{{"_chain": {{"lines": {self._lines}, "bytes": {self._bytes}, "sha256": "{d}"'
+        if self.key:
+            line += f', "hmac": "{_hmac.new(self.key, d.encode("ascii"), hashlib.sha256).hexdigest()}"'
+        self._write(line + "}}\n")
+        self._chain_lines = self._lines
+        self.chains += 1
 
     def header_dict(self, **extra: Any) -> dict[str, Any]:
         return {"_header": True, "format": 2, "id": self.id, "name": self.name, "mode": self.mode,
@@ -542,6 +573,7 @@ class Recording:
             if not stopping:
                 self._check_limits()
             if self._fh and time.monotonic() - self._last_flush > 1.0:
+                self._write_chain()
                 self._fh.flush()
                 self._last_flush = time.monotonic()
         self._finish()
@@ -578,7 +610,10 @@ class Recording:
     def _commit_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
         # timeline of what is IN the file (pre-trigger samples that were discarded are not part of it)
         if self.mode == "cycle":
-            b.note_stamp(t)
+            prev = b.last_t
+            gap = b.note_stamp(t)
+            if gap and prev is not None:
+                self._write_gap(b, "gap", prev, t, gap)
         else:
             b.samples += 1
         self.last_t = max(self.last_t, t)
@@ -702,9 +737,20 @@ class Recording:
                 if st.runs and st.last_t is not None:
                     st.runs[-1][1] = st.last_t
             if self._fh:
+                miss = self.missing_samples()
+                if self.mode == "cycle" and self.t0_wall is not None:
+                    ws, we = self.window_start(), self.window_end()
+                    for b in self.blocks:
+                        h = b.head_missing(ws)
+                        if h > 0 and ws is not None and b.first_t is not None:
+                            self._write_gap(b, "head", ws, b.first_t, h)
+                        tm = b.tail_missing(we)
+                        if tm > 0 and we is not None:
+                            self._write_gap(b, "tail", b.last_t, we, tm)
                 digest = self._sha.hexdigest()
                 footer = {"_footer": True, "events": self.events, "samples": self.samples,
-                          "missing_samples": self.missing_samples(), "dropped": self.dropped,
+                          "missing_samples": miss, "label": self.label(miss), "gap_markers": self.gap_markers,
+                          "chain_checkpoints": self.chains, "dropped": self.dropped,
                           "dropped_on_stop": self.dropped_on_stop, "after_limit": self.after_limit,
                           "unsubscribed": self.unsubscribed, "stop_reason": self.stop_reason,
                           "window_end_ms": self._cut_t, "window_start_ms": self.window_start(), "engine": "python",
@@ -715,6 +761,16 @@ class Recording:
                 self._fh.write(json.dumps(footer, default=str) + "\n")
                 self._fh.close()
                 self._fh = None
+
+    def label(self, miss: int | None = None) -> str:
+        """R5: COMPLETE only when the PLC timeline proves every sample is in the file (cycle mode); INCOMPLETE when
+        anything is missing or was lost; NOT_PROVABLE for change/poll recordings (silence can't be told from loss)."""
+        if self.mode != "cycle":
+            return "NOT_PROVABLE"
+        miss = self.missing_samples() if miss is None else miss
+        ok = (self.samples > 0 and not miss and not self.dropped and not self.dropped_on_stop and not self.unsubscribed
+              and (self.start_when is None or self.triggered_at is not None))
+        return "COMPLETE" if ok else "INCOMPLETE"
 
     @property
     def active(self) -> bool:
@@ -778,6 +834,8 @@ class Recording:
                 "time_source": self.time_source, "symbols": len(self.symbols), "notifications": len(self.blocks) or None,
                 "events": self.events, "samples": self.samples,
                 "missing_samples": self.missing_samples(), "completeness": self.completeness(),
+                "label": self.label() + ("" if not self.active else " (so far)"),
+                "gap_markers": self.gap_markers,
                 "dropped": self.dropped, "dropped_on_stop": self.dropped_on_stop, "backlog": backlog,
                 "max_backlog": self.max_backlog,
                 "stats_coverage": (round(self.stats_samples / self.samples, 4) if self.samples else 1.0) if self.live_stats
