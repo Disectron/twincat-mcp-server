@@ -372,6 +372,21 @@ class App:
             raise ToolError(why)
         await self.ads_call(self.ads.check_write, name, value, port, timeout=30)
 
+    async def _require_config_mode(self, action: str, target: str) -> None:
+        """safety.edit_requires_config_mode: refuse code/project edits unless TwinCAT on the ADS target is in CONFIG.
+        Fails closed — an unreadable system state refuses the edit."""
+        try:
+            st = await self.ads_call(self.ads.system_state, timeout=10)
+            mode = st.get("twincat_mode")
+        except ToolError as exc:
+            self.guard.audit(action, {"target": target}, OpClass.EDIT, "refused", f"config-mode check failed: {exc}")
+            raise ToolError(f"{action}: edits require CONFIG mode (safety.edit_requires_config_mode) and the TwinCAT system "
+                            f"state could not be read: {exc}") from exc
+        if mode != "CONFIG":
+            self.guard.audit(action, {"target": target}, OpClass.EDIT, "refused", f"TwinCAT is in {mode}")
+            raise ToolError(f"{action}: TwinCAT on {self.scope()} is in {mode} — switch to CONFIG first "
+                            "(safety.edit_requires_config_mode = true). ads_system_mode('config') or the XAE toolbar.")
+
     async def xae_target_for(self, action: str, op: OpClass, confirm_token: str | None) -> str:
         """The shell's target NetId for a target-bound XAE action. If no shell can be reached, the guard still
         gets the first word: in readonly/guarded-without-token the refusal is the guard's (the human never
@@ -408,6 +423,8 @@ class App:
         readonly/guarded gating and only demands the confirmation — for tc_set_mode, which must be
         able to leave readonly mode with a human's consent."""
         scope = self.scope()
+        if op is OpClass.EDIT and action in CODE_EDIT_ACTIONS and self.cfg.safety.edit_requires_config_mode:
+            await self._require_config_mode(action, target)
         try:
             if mode_gate:
                 self.guard.check(op, action=action, target=target, confirm_token=confirm_token, scope=scope)
@@ -418,15 +435,26 @@ class App:
             # elicitation only replaces a *missing* token; a wrong/stale/foreign token is a hard error
             needs_token = confirm_token is None and "needs a confirm_token" in str(exc) \
                 and op in (OpClass.CONTROL, OpClass.DESTRUCTIVE)
+            if needs_token and ctx is not None and not self.cfg.safety.allow_elicitation:
+                self.guard.audit(action, {"target": target, "scope": scope}, op, "refused", "allow_elicitation=false: token required")
+                raise ToolError(f"{action} on {target!r} needs confirmation, and in-chat prompts are disabled "
+                                f"(safety.allow_elicitation = false). Call tc_request_confirmation(action={action!r}, "
+                                f"target={target!r}) and pass the confirm_token — the approval then shows up as its own step.") from exc
             if not needs_token or ctx is None:
                 # a refusal is evidence too: who tried what, and why it did not happen
                 self.guard.audit(action, {"target": target, "scope": scope}, op, "refused", str(exc))
                 raise ToolError(str(exc)) from exc
-        # elicitation path
+        # elicitation path — the prompt must read as what it is: a safety confirmation, with the exact effect
+        effect = ACTION_EFFECTS.get(action, "changes the state of the machine or project")
+        kind = "DESTRUCTIVE" if op is OpClass.DESTRUCTIVE else "MACHINE CONTROL"
+        prompt = (f"{kind}: {action}\n"
+                  f"Target: {target or '(current target)'}\n"
+                  f"Machine: {scope}   Mode: {self.guard.mode}\n"
+                  f"Effect: {effect}\n"
+                  f"Accept only if you intend this to happen now.")
+        t_prompt = time.monotonic()
         try:
-            res = await ctx.elicit(
-                f"twincat-mcp wants to run {action} on {target or 'the target'} — machine {scope} "
-                f"(mode={self.guard.mode}). Allow?", ConfirmSchema)
+            res = await ctx.elicit(prompt, ConfirmSchema)
         except Exception as exc:  # noqa: BLE001 — client has no elicitation support
             self.guard.audit(action, {"target": target, "scope": scope}, op, "refused",
                              f"needs confirm_token; client has no elicitation ({type(exc).__name__})")
@@ -435,10 +463,14 @@ class App:
                 f"elicitation ({type(exc).__name__}). Call tc_request_confirmation(action={action!r}, "
                 f"target={target!r}) and pass the confirm_token."
             ) from exc
+        answered_s = round(time.monotonic() - t_prompt, 2)
+        timing = {"prompt_open_s": answered_s}
+        if answered_s < 1.5:
+            timing["fast_answer"] = "answered in under 1.5 s — check that the operator saw and read the prompt"
         if res.action == "accept" and res.data is not None and res.data.confirm:
-            self.guard.audit(action, {"target": target, "scope": scope}, op, "human-confirmed-elicitation")
+            self.guard.audit(action, {"target": target, "scope": scope}, op, "human-confirmed-elicitation", timing)
             return
-        self.guard.audit(action, {"target": target, "scope": scope}, op, f"declined-elicitation:{res.action}")
+        self.guard.audit(action, {"target": target, "scope": scope}, op, f"declined-elicitation:{res.action}", timing)
         if res.action == "cancel":
             # 'cancel' is also what the client sends when the prompt was dismissed or timed out unseen
             raise ToolError(f"{action} on {target!r}: the confirmation prompt came back cancelled — it was dismissed, timed out, "
@@ -529,6 +561,31 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
         out["truncated"] = f"lists capped at {cap}; narrow with scope="
     return out
 
+
+
+# PLC code / project edits gated by safety.edit_requires_config_mode
+CODE_EDIT_ACTIONS = frozenset({"xae_pou_set", "xae_pou_create", "proj_set_code", "xae_tree_consume_xml", "xae_tree_set_values",
+                               "xae_tree_create_child", "xae_plcopen_import", "tcunit_scaffold", "xae_io_disable"})
+
+# what the confirmation prompt says will happen
+ACTION_EFFECTS = {
+    "xae_activate_configuration": "overwrites the boot configuration on the target; the runtime goes to CONFIG/restart",
+    "xae_restart_twincat": "restarts the TwinCAT runtime on the target: the PLC stops and starts, outputs drop during the restart",
+    "xae_deploy": "build + activate + restart on the target: the running program is replaced and the PLC restarts",
+    "xae_plc": "PLC online action (login / download / online change / start / stop / reset) on the target",
+    "xae_command": "runs an arbitrary XAE shell command — may download, log in, activate or delete",
+    "xae_tree_delete": "deletes the item from the TwinCAT project",
+    "ads_plc_state": "changes the PLC run state (RUN/STOP/RESET) — the machine stops or starts executing",
+    "ads_system_mode": "switches TwinCAT between RUN and CONFIG — the PLC stops in CONFIG",
+    "ipc_reboot": "reboots or shuts down the IPC",
+    "ipc_start_process": "starts a program on the IPC",
+    "ipc_eventlog": "starts wevtutil on the IPC to export the event log (read-only, but a process start)",
+    "ipc_delete_file": "deletes a file on the IPC",
+    "ipc_write_file": "writes a file on the IPC",
+    "tc_set_mode": "raises the server's safety mode — more tools will be allowed to act on the machine",
+    "tc_allow_write": "adds a symbol pattern to the write allow-list for this session",
+    "exp_run": "runs an experiment that writes PLC variables on the machine",
+}
 
 
 def build_server(cfg: Config | None = None) -> MCPServer:
@@ -664,7 +721,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 setattr(getattr(cfg, section), key, new_v)
                 applied[f"{section}.{key}"] = {"from": old_v, "to": new_v}
 
-        for key in ("write_allowlist", "write_denylist", "confirm_destructive", "confirm_ttl_s", "audit_reads"):
+        for key in ("write_allowlist", "write_denylist", "confirm_destructive", "confirm_ttl_s", "audit_reads",
+                    "allow_elicitation", "edit_requires_config_mode"):
             _apply("safety", key)
         for key in ("books", "exclude_books", "web_fallback", "max_workers", "max_index_pages", "enabled"):
             _apply("docs", key)

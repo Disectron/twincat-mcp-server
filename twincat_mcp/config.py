@@ -93,6 +93,12 @@ class SafetyConfig:
     write_denylist: list[str] = field(default_factory=list)    # always wins
     audit_log: str | None = None           # None -> ~/.twincat_mcp/audit.jsonl
     audit_reads: bool = False
+    # false → no in-chat confirmation prompts: every control/destructive call needs a tc_request_confirmation token,
+    # so each approval is a separate, visible, audited step (prompts are easy to click through without reading)
+    allow_elicitation: bool = True
+    # true → PLC code/project edits (xae_pou_*, proj_set_code, xae_tree_*, tcunit_scaffold, PLCopen import) are refused
+    # unless the ADS target's TwinCAT system is in CONFIG mode (read from port 10000 before every edit)
+    edit_requires_config_mode: bool = False
 
 
 # Infosys books indexed on the first symbol lookup when nothing else is configured. Slugs are
@@ -196,6 +202,10 @@ def _apply_env(cfg: Config) -> None:
         cfg.safety.audit_log = v
     if (b := _env_bool("TCMCP_AUDIT_READS")) is not None:
         cfg.safety.audit_reads = b
+    if (b := _env_bool("TCMCP_ALLOW_ELICITATION")) is not None:
+        cfg.safety.allow_elicitation = b
+    if (b := _env_bool("TCMCP_EDIT_REQUIRES_CONFIG")) is not None:
+        cfg.safety.edit_requires_config_mode = b
     # ads
     if v := _env("TCMCP_AMS_NET_ID"):
         cfg.ads.ams_net_id = v

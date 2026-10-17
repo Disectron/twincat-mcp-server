@@ -479,3 +479,51 @@ async def test_vs_runtime_array_templates(monkeypatch, project_dir):
         assert not any(e["path"].lower().startswith("main.arrsteps") for e in cmp_["extra_online"])
         assert cmp_["array_elements_matched"] >= 8 and cmp_["array_templates_matched"] >= 1
         assert not any(m["path"].lower().startswith("main.arrsteps") for m in cmp_["missing_online"])
+
+
+@pytest.mark.anyio
+async def test_elicitation_wording_timing_and_policy(monkeypatch, project_dir):
+    """#73: the prompt names kind, target, machine, mode and effect; the audit records how long it was open and
+    flags sub-second answers; allow_elicitation=false forces the token path even on a prompting client."""
+    install(monkeypatch)
+    asked = []
+
+    async def elicit(context, params):
+        asked.append(params.message)
+        return types.ElicitResult(action="accept", content={"confirm": True})
+    srv = build_server(mk_cfg(project_dir, mode="full"))
+    async with client_for(srv, elicitation_callback=elicit) as s:
+        assert not (await s.call_tool("ads_system_mode", {"action": "config"})).is_error
+        msg = asked[0]
+        assert msg.startswith("DESTRUCTIVE: ads_system_mode") or msg.startswith("MACHINE CONTROL: ads_system_mode"), msg
+        assert "Machine: 5.1.2.3.1.1" in msg and "Effect: switches TwinCAT between RUN and CONFIG" in msg
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 5}))
+        conf = [a for a in audit if a["outcome"] == "human-confirmed-elicitation"][-1]
+        assert "prompt_open_s" in conf["detail"] and "fast_answer" in conf["detail"]
+    asked.clear()
+    srv = build_server(mk_cfg(project_dir, mode="full", allow_elicitation=False))
+    async with client_for(srv, elicitation_callback=elicit) as s:
+        res = await s.call_tool("ads_system_mode", {"action": "config"})
+        assert res.is_error and "allow_elicitation = false" in text(res) and asked == []
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "ads_system_mode", "target": "config"}))["confirm_token"]
+        assert not (await s.call_tool("ads_system_mode", {"action": "config", "confirm_token": tok})).is_error
+
+
+@pytest.mark.anyio
+async def test_edit_requires_config_mode(monkeypatch, project_dir):
+    """#74: with safety.edit_requires_config_mode, code edits are refused while TwinCAT is in RUN (and when the
+    state cannot be read); in CONFIG they go through."""
+    install(monkeypatch)
+    from twincat_mcp import ads_backend as AB
+    state = {"mode": "RUN"}
+    monkeypatch.setattr(AB.AdsBackend, "system_state", lambda self: {"twincat_mode": state["mode"]})
+    srv = build_server(mk_cfg(project_dir, mode="full", edit_requires_config_mode=True))
+    async with client_for(srv) as s:
+        code = "nCycle := nCycle + 1;"
+        res = await s.call_tool("proj_set_code", {"name": "MAIN", "implementation": code})
+        assert res.is_error and "is in RUN — switch to CONFIG first" in text(res), text(res)
+        state["mode"] = "CONFIG"
+        res = await s.call_tool("proj_set_code", {"name": "MAIN", "implementation": code})
+        assert not res.is_error, text(res)
+        # reads are never gated
+        assert not (await s.call_tool("proj_get_code", {"name": "MAIN"})).is_error
