@@ -370,3 +370,36 @@ def test_cycle_mode_records_counter_and_manifest(rec):
     assert v["counter_source"] == "recorded automatically" and v["manifest"]["tasks"][0]["name"] == "PlcTask"
     with pytest.raises(AdsError):
         _cycle_rec(rec, cycle_counter="MAIN.nope")
+
+
+def test_high_rate_recording_defers_decoding_and_counts_the_tail(rec):
+    """Retest 0.7.1: (1) above 20,000 values/s nothing is decoded on the ingest thread (it starved the ADS callback);
+    statistics come from the file. (2) N11: a recording that goes quiet before its window ends counts the tail."""
+    st = _cycle_rec(rec, cycle_ms=0.1)                     # 3 leaves × 10,000 samples/s = 30,000 values/s
+    c = _conn()
+    for i in range(100):
+        c.fire("MAIN.nCycle", i, ft(i * 0.1))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == 100)
+    s = rec.status(st["id"])
+    assert str(s["stats_coverage"]).startswith("deferred") and s["last_values"]["MAIN.nCycle"] == 99
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    assert out["stats"] is None and "rec_stats" in out["stats_note"]
+    exact = rec.stats(st["id"], ["MAIN.nCycle"], False, 0)
+    assert exact["source"] == "file" and exact["symbols"]["MAIN.nCycle"]["count"] == 100
+    # N11: 0.5 s window, the block delivers only the first 200 ms
+    st2 = _cycle_rec(rec, duration_s=0.5)
+    c = _conn()
+    for i in range(200):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: not rec.status(st2["id"])["active"], timeout=4)
+    s2 = rec.status(st2["id"])
+    assert s2["stop_reason"] == "duration 0.5s" and s2["missing_samples"] == 300 and s2["blocks"][0]["missing_tail"] == 300
+    v = rec.verify(st2["id"])
+    assert v["timeline"]["missing"] == 300 and v["verdict"] == "FAIL"
+
+
+def test_long_array_values_are_trimmed_in_responses(rec):
+    """P1: a 300-element array in rec_status / stats is summarised, not dumped."""
+    from twincat_mcp.recorder import trim_value
+    assert trim_value(list(range(300))) == {"len": 300, "first": [0, 1, 2, 3, 4], "last": [298, 299]}
+    assert trim_value([1, 2]) == [1, 2]

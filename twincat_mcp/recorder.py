@@ -71,6 +71,7 @@ MERGE_GAP_BYTES = 256          # leaves closer than this share one notification
 MAX_BLOCK_BYTES = 16384        # one notification never carries more than this
 QUEUE_BYTES = 256 << 20        # in-memory backlog cap per recording
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
+LIVE_VALUES_PER_S = 20_000     # above this (leaves × samples/s) nothing is decoded while recording (see Recording)
 _HDR_DATA_OFFSET = 16          # SAdsNotificationHeader: u32 handle, u64 timestamp, u32 size, data
 
 _OPS: dict[str, Callable[[Any, Any], bool]] = {
@@ -284,11 +285,20 @@ class Block:
         self.last_t = t
         self.samples += 1
 
-    def missing(self) -> int:
+    def missing(self, end_t: float | None = None) -> int:
+        """Holes between the first and last sample, plus — when the window end is known (duration / post-trigger
+        stop, or the other blocks' last sample) — the samples this block should have delivered after its last one
+        (field report N11: a recording that went quiet halfway must not look complete). One period of slack."""
         if self.samples < 2 or not self.min_step or self.first_t is None or self.last_t is None:
             return 0
         expected = round((self.last_t - self.first_t) / self.min_step) + 1
-        return max(0, expected - self.samples)
+        inner = max(0, expected - self.samples)
+        return inner + self.tail_missing(end_t)
+
+    def tail_missing(self, end_t: float | None) -> int:
+        if end_t is None or not self.min_step or self.last_t is None or end_t <= self.last_t:
+            return 0
+        return max(0, int((end_t - self.last_t) / self.min_step) - 1)
 
 
 def build_blocks(syms: list[SymbolEntry], sids: dict[str, int], types: dict[str, T.TcType],
@@ -388,6 +398,7 @@ class Recording:
         self.stop_reason: str | None = None
         self.last_values: dict[str, Any] = {}
         self.max_backlog = 0
+        self.live_stats = True               # decode + statistics while recording (False: deferred to the file)
         self._cut_t: float | None = None     # drain only samples up to this PLC-relative time
         self._cut_now = False                 # discard the backlog (limit reached at a known sample)
         self._sha = hashlib.sha256()
@@ -404,6 +415,12 @@ class Recording:
 
     # ------------------------------------------------------------ setup
     def set_blocks(self, blocks: list[Block]) -> None:
+        # Field retest 0.7.1: decoding 300 leaves per sample at 1 ms on the ingest thread competes with the ADS
+        # callback for the GIL, and the runtime drops samples before they reach the queue. Above LIVE_VALUES_PER_S
+        # the ingest only writes the raw bytes; statistics and values are decoded from the file afterwards.
+        if self.mode == "cycle":
+            leaves = sum(len(b.slots) for b in blocks)
+            self.live_stats = leaves * (1000.0 / max(self.cycle_ms, 0.1)) <= LIVE_VALUES_PER_S
         self.blocks = blocks
         self.slot_of = {sl.name: (b, sl) for b in blocks for sl in b.slots}
         per_sample = max(1, sum(b.size for b in blocks))
@@ -534,7 +551,7 @@ class Recording:
             changed = [s for s in b.slots if data[s.off:s.off + s.size] != prev[s.off:s.off + s.size]]
         self.events += len(changed)
         ew = self.stop_when
-        if not light:
+        if not light and self.live_stats:
             self.stats_samples += 1
             with self._lock:
                 for s in changed:
@@ -650,6 +667,7 @@ class Recording:
                           "missing_samples": self.missing_samples(), "dropped": self.dropped,
                           "dropped_on_stop": self.dropped_on_stop, "after_limit": self.after_limit,
                           "unsubscribed": self.unsubscribed, "stop_reason": self.stop_reason,
+                          "window_end_ms": self._cut_t,
                           "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "lines": self._lines,
                           "sha256": digest}
                 if self.key:
@@ -663,10 +681,19 @@ class Recording:
         return self.stopped_at is None
 
     # ------------------------------------------------------------ views
+    def window_end(self) -> float | None:
+        """End of the recorded window in PLC-relative ms: the duration / post-trigger cut, else the latest sample of
+        any block (a block that stopped delivering before the others then shows its tail as missing)."""
+        if self._cut_t is not None and not self.active:
+            return self._cut_t
+        lasts = [b.last_t for b in self.blocks if b.last_t is not None]
+        return max(lasts) if lasts else None
+
     def missing_samples(self) -> int | None:
         if self.mode != "cycle":
             return None
-        return sum(b.missing() for b in self.blocks)
+        end = self.window_end()
+        return sum(b.missing(end) for b in self.blocks)
 
     def completeness(self) -> float | None:
         if self.mode != "cycle":
@@ -681,7 +708,8 @@ class Recording:
             d: dict[str, Any] = {"id": b.bid, "bytes": b.size, "symbols": len(b.slots), "first": b.slots[0].name if b.slots else None,
                                  "samples": b.samples}
             if self.mode == "cycle":
-                d.update({"missing_samples": b.missing(), "period_ms": None if b.min_step is None else round(b.min_step, 4),
+                d.update({"missing_samples": b.missing(self.window_end()), "missing_tail": b.tail_missing(self.window_end()),
+                          "period_ms": None if b.min_step is None else round(b.min_step, 4),
                           "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
             if b.error:
                 d["error"] = b.error
@@ -704,14 +732,15 @@ class Recording:
                 "missing_samples": self.missing_samples(), "completeness": self.completeness(),
                 "dropped": self.dropped, "dropped_on_stop": self.dropped_on_stop, "backlog": backlog,
                 "max_backlog": self.max_backlog,
-                "stats_coverage": round(self.stats_samples / self.samples, 4) if self.samples else 1.0,
+                "stats_coverage": (round(self.stats_samples / self.samples, 4) if self.samples else 1.0) if self.live_stats
+                                  else "deferred (high rate: computed from the file by rec_stats)",
                 "events_per_s": round(self.events / elapsed, 1) if elapsed > 0 else 0.0,
                 "elapsed_s": round(elapsed, 2), "plc_span_s": round(self.last_t / 1000.0, 4),
                 "armed": self.armed,
                 "triggered_at_ms": None if self.triggered_at is None else round(self.triggered_at, 3),
                 "stop_reason": self.stop_reason, "file": str(self.path),
                 "file_bytes": self.path.stat().st_size if self.path.exists() else 0,
-                "last_values": dict(self.last_values), "errors": self.errors[-5:],
+                "last_values": self._last_values_view(), "errors": self.errors[-5:],
             }
         if self.unsubscribed:
             st["unsubscribed_symbols"] = self.unsubscribed[:50]
@@ -730,6 +759,20 @@ class Recording:
             st["warnings"] = warn
         return st
 
+    def _last_values_view(self, limit: int = 20) -> dict[str, Any]:
+        """Caller holds self._lock. Latest value per leaf (decoded on demand from the last raw sample when live
+        decoding is off), at most `limit` leaves, long arrays summarised."""
+        vals: dict[str, Any] = {}
+        if self.live_stats and self.last_values:
+            items = list(self.last_values.items())
+        else:
+            items = [(sl.name, sl.decode(b.prev)) for b in self.blocks if b.prev is not None for sl in b.slots]
+        for k, v in items[:limit]:
+            vals[k] = trim_value(v)
+        if len(items) > limit:
+            vals["…"] = f"{len(items) - limit} more leaves (rec_snapshot / rec_read for all)"
+        return vals
+
     def snapshot(self, last_n: int, symbols: list[str] | None) -> list[dict[str, Any]]:
         with self._lock:
             ev = list(self.ring)
@@ -743,6 +786,13 @@ class Recording:
             return _stats_out(self.stats, symbols, include_runs, max_runs_out)
 
 
+def trim_value(v: Any, max_len: int = 10) -> Any:
+    """P1: a 300-element array as a value in a tool response is noise — summarise long lists."""
+    if isinstance(v, list) and len(v) > max_len:
+        return {"len": len(v), "first": v[:5], "last": v[-2:]}
+    return v
+
+
 def _stats_out(stats: dict[str, SymStats], symbols: list[str] | None, include_runs: bool, max_runs_out: int) -> dict[str, Any]:
     want = {s.lower() for s in symbols} if symbols else None
     out = {}
@@ -750,6 +800,8 @@ def _stats_out(stats: dict[str, SymStats], symbols: list[str] | None, include_ru
         if want and name.lower() not in want:
             continue
         d = st.to_dict()
+        for k in ("first", "last"):
+            d[k] = trim_value(d.get(k))
         if include_runs:
             runs = st.runs[-max_runs_out:] if max_runs_out else []
             d["runs"] = [{"t_start_ms": round(a, 3), "t_end_ms": round(b, 3), "dwell_ms": round(b - a, 3), "value": v} for a, b, v in runs]
@@ -1038,6 +1090,8 @@ class Recorder:
         rec.conn = conn
         rec.on_finish = lambda: self._stop_notifications(rec)
         trans = C.ADSTRANS_SERVERCYCLE if rec.mode == "cycle" else C.ADSTRANS_SERVERONCHA
+        _fast_switch(+1)          # the ADS callback thread gets the GIL within ~0.5 ms instead of up to 5 ms
+        rec._fast_switch = True
 
         def make_cb(bid: int) -> Callable:
             def cb(notification: Any, _data: Any) -> None:
@@ -1076,6 +1130,9 @@ class Recorder:
         with rec._lock:
             conn, rec.conn = rec.conn, None
             handles, rec.handles = list(rec.handles), []
+            fs, rec._fast_switch = getattr(rec, "_fast_switch", False), False
+        if fs:
+            _fast_switch(-1)
         if conn is None:
             return
         for nh, uh in handles:
@@ -1142,7 +1199,12 @@ class Recorder:
             if rec._thread:
                 rec._thread.join(timeout=DRAIN_TIMEOUT_S + 10)
         st = rec.status()
-        st["stats"] = self.stats(rec.id, None, False, 0)["symbols"]
+        if rec.live_stats and rec.stats_samples == rec.samples and len(rec.symbols) <= 50:
+            st["stats"] = rec.stats_dict(None, False, 0)
+        else:
+            st["stats"] = None
+            st["stats_note"] = (f"{len(rec.symbols)} leaves" + ("" if rec.live_stats else ", high-rate recording") +
+                                " — rec_stats(id, symbols=[…]) computes exact statistics from the file")
         return st
 
     def stop_all(self) -> None:
@@ -1424,12 +1486,15 @@ class Recorder:
                         b.note_stamp(t)
             rep = []
             tot_s = tot_m = 0
+            lasts = [b.last_t for b in blocks.values() if b.last_t is not None]
+            end = (footer or {}).get("window_end_ms") or (max(lasts) if lasts else None)
             for b in blocks.values():
-                m = b.missing()
+                m = b.missing(end)
                 tot_s += b.samples
                 tot_m += m
                 rep.append({"block": b.bid, "first": b.slots[0].name if b.slots else None, "symbols": len(b.slots),
-                            "samples": b.samples, "missing": m, "period_ms": None if b.min_step is None else round(b.min_step, 4),
+                            "samples": b.samples, "missing": m, "missing_tail": b.tail_missing(end),
+                            "period_ms": None if b.min_step is None else round(b.min_step, 4),
                             "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
             out["timeline"] = {"samples": tot_s, "missing": tot_m,
                                "completeness": round(tot_s / (tot_s + tot_m), 6) if tot_s + tot_m else None,
@@ -1656,6 +1721,22 @@ def _flatten_values(v: Any) -> list[Any]:
         else:
             out.append(x)
     return out
+
+
+_SWITCH_LOCK = threading.Lock()
+_SWITCH_USERS = [0, None]
+
+
+def _fast_switch(delta: int) -> None:
+    import sys
+    with _SWITCH_LOCK:
+        if _SWITCH_USERS[0] == 0 and delta > 0:
+            _SWITCH_USERS[1] = sys.getswitchinterval()
+            sys.setswitchinterval(0.0005)
+        _SWITCH_USERS[0] = max(0, _SWITCH_USERS[0] + delta)
+        if _SWITCH_USERS[0] == 0 and _SWITCH_USERS[1] is not None:
+            sys.setswitchinterval(_SWITCH_USERS[1])
+            _SWITCH_USERS[1] = None
 
 
 def _pkg_version() -> str:
