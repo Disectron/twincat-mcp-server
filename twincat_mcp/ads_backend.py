@@ -48,6 +48,16 @@ SYMFLAG = {
 }
 
 
+def _is_iface_name(ts: Any, type_name: str) -> bool:
+    from .ads_types import is_interface
+    e = ts.get(type_name)
+    if e is None:
+        want = type_name.strip().lower()
+        hits = [k for k in ts.table if k.lower().rsplit(".", 1)[-1] == want]
+        e = ts.table[hits[0]] if len(hits) == 1 else None
+    return is_interface(e)
+
+
 class AdsError(RuntimeError):
     pass
 
@@ -527,8 +537,19 @@ class AdsBackend:
             ts = self.typesystem(False, port)
             if ts is not None and ts.get(s.type) is not None:
                 return self.read_full(s.name, None, port)
+        if expand_struct and tt0.kind == "array" and tt0.elem is not None and tt0.elem.kind == "enum":
+            # ARRAY OF <interface> parses as an enum-sized array by name; the datatype table knows better
+            ts = self.typesystem(False, port)
+            if ts is not None and _is_iface_name(ts, tt0.elem.name):
+                return self.read_full(s.name, None, port)
         tt, val = self._typed_read(c, s)
         out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
+        if tt.kind == "enum" and not isinstance(val, (bytes, bytearray)):
+            ts = self.typesystem(False, port)
+            if ts is not None and _is_iface_name(ts, s.type):
+                out["value"] = T.fmt_pointer(val, s.size)
+                out["note"] = "INTERFACE variable: the value is the address of the assigned FB instance (null = unassigned)"
+                return out
         if isinstance(val, (bytes, bytearray)):
             out["raw_hex"] = val.hex()
             if tt.kind == "array" and tt.elem and tt.elem.kind in ("string", "wstring"):
@@ -581,23 +602,98 @@ class AdsBackend:
                         results[n] = {"error": _fmt_exc(exc)}
         return results
 
-    def write(self, name: str, value: Any, port: int | None = None) -> dict[str, Any]:
-        c = self.conn(port)
+    def unwritable_reason(self, type_name: str, size: int | None, port: int | None = None) -> str | None:
+        """Why a variable of this type must not be written through ADS, or None. POINTER/REFERENCE TO are
+        addresses; an INTERFACE variable is a pointer to an FB instance's method table — any value the agent
+        writes is a wild pointer the PLC will call. The datatype table marks interfaces as pointer-sized BIGTYPEs
+        with method infos and no members (and TcCOM interface pointers with TCCOMIFACEPTR)."""
+        tt = T.parse_type(type_name, size)
+        if tt.kind == "pointer":
+            return f"{type_name} is a POINTER/REFERENCE — writing an address is refused; write the variable it points to"
+        base = tt.elem.name if tt.kind == "array" and tt.elem else type_name
+        try:
+            ts = self.typesystem(False, port)
+        except Exception:  # noqa: BLE001
+            ts = None
+        if ts is not None:
+            e = ts.get(base)
+            if e is None:
+                want = base.strip().lower()
+                hits = [k for k in ts.table if k.lower() == want or k.lower().rsplit(".", 1)[-1] == want]
+                e = ts.table[hits[0]] if len(hits) == 1 else None
+            if e is not None:
+                from .ads_types import F_TCCOMIFACEPTR, F_REFERENCETO, is_interface
+                if e.flags & F_TCCOMIFACEPTR:
+                    return f"{base} is a TcCOM interface pointer — not writable through ADS"
+                if e.flags & F_REFERENCETO:
+                    return f"{base} is a REFERENCE — writing the reference itself is refused; write the referenced variable"
+                if is_interface(e):
+                    return (f"{base} is an INTERFACE type (pointer to an FB's method table) — writing it would make the PLC call a "
+                            "wild pointer; assign interfaces in PLC code, not over ADS")
+        return None
+
+    def enum_literal(self, type_name: str, value: Any, port: int | None = None) -> Any:
+        """'Idle' / 'E_State.Idle' / 'E_State#Idle' → the enum's integer via the datatype table; anything else unchanged."""
+        if not isinstance(value, str):
+            return value
+        v = value.strip()
+        if re.fullmatch(r"[-+]?(\d+|0x[0-9a-fA-F]+|16#[0-9a-fA-F_]+|2#[01_]+)", v):
+            return value
+        try:
+            ts = self.typesystem(False, port)
+        except Exception:  # noqa: BLE001
+            ts = None
+        e = None
+        if ts is not None:
+            e = ts.get(type_name)
+            if e is None:
+                want = type_name.strip().lower()
+                hits = [k for k in ts.table if k.lower().rsplit(".", 1)[-1] == want]
+                e = ts.table[hits[0]] if len(hits) == 1 else None
+        if e is None or not e.enum:
+            raise AdsError(f"{value!r} is not a number and the datatype table has no enum values for {type_name} "
+                           "(write the integer instead)")
+        lit = re.split(r"[.#]", v)[-1].lower()
+        for num, nm in e.enum.items():
+            if nm.lower() == lit:
+                return num
+        raise AdsError(f"{value!r} is not a value of {type_name}; valid: {', '.join(e.enum.values())}")
+
+    def check_write(self, name: str, value: Any, port: int | None = None) -> dict[str, Any]:
+        """Everything write() would refuse, without writing: READONLY flag, pointer/reference/interface types,
+        enum names, array length, string length, integer range. Returns the encoded value."""
         s = self.symbol_info(name, port)
         if s.flags & 0x0020:
             raise AdsError(f"{s.name!r} is flagged READONLY by the runtime")
+        why = self.unwritable_reason(s.type, s.size, port)
+        if why:
+            raise AdsError(f"{s.name!r}: {why}")
         tt = T.parse_type(s.type, s.size)
-        before = self.read(name, expand_struct=False, port=port).get("value")
         if tt.ctype is None or tt.opaque:
             if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]*", value) and len(value) == s.size * 2:
-                data = bytes.fromhex(value)
-                c.write(s.index_group, s.index_offset, (ctypes.c_ubyte * len(data))(*data), ctypes.c_ubyte * len(data))
-                return {"name": s.name, "type": s.type, "before": before, "written_hex": value}
+                return {"symbol": s, "tt": tt, "encoded": None, "hex": value}
             raise AdsError(
                 f"{s.name!r} has opaque type {s.type}; write its members individually "
                 f"(see ads_read with expand_struct) or pass a {s.size*2}-char hex string.")
+        if tt.kind == "enum":
+            value = self.enum_literal(s.type, value, port)
         try:
             enc = T.encode(tt, value)
+        except Exception as exc:  # noqa: BLE001
+            raise AdsError(f"write {s.name!r}={value!r} as {s.type}: {_fmt_exc(exc)}") from exc
+        return {"symbol": s, "tt": tt, "encoded": enc, "hex": None}
+
+    def write(self, name: str, value: Any, port: int | None = None) -> dict[str, Any]:
+        c = self.conn(port)
+        chk = self.check_write(name, value, port)
+        s, tt = chk["symbol"], chk["tt"]
+        before = self.read(name, expand_struct=False, port=port).get("value")
+        if chk["hex"] is not None:
+            data = bytes.fromhex(chk["hex"])
+            c.write(s.index_group, s.index_offset, (ctypes.c_ubyte * len(data))(*data), ctypes.c_ubyte * len(data))
+            return {"name": s.name, "type": s.type, "before": before, "written_hex": chk["hex"]}
+        try:
+            enc = chk["encoded"]
             c.write_by_name(s.name, enc, tt.ctype)
         except AdsError:
             raise

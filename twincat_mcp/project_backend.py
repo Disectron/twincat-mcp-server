@@ -32,7 +32,7 @@ SRC_EXT = {".tcpou": "POU", ".tcdut": "DUT", ".tcgvl": "GVL", ".tcio": "Itf"}
 
 _RE_VAR_BLOCK = re.compile(
     r"^[ \t]*(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_STAT|VAR_TEMP|VAR_INST|VAR_EXTERNAL|VAR|STRUCT|UNION)\b"
-    r"(?:[ \t]+(?:CONSTANT|RETAIN|PERSISTENT|NON_RETAIN))*[ \t]*$(.*?)^[ \t]*END_(?:VAR|STRUCT|UNION)",
+    r"(?P<quals>(?:[ \t]+(?:CONSTANT|RETAIN|PERSISTENT|NON_RETAIN))*)[ \t]*$(.*?)^[ \t]*END_(?:VAR|STRUCT|UNION)",
     re.M | re.S | re.I)
 _RE_VAR_DECL = re.compile(
     r"^[ \t]*(?P<names>[A-Za-z_][\w]*(?:[ \t]*,[ \t]*[A-Za-z_][\w]*)*)[ \t]*(?:AT[ \t]+(?P<at>%[IQM][XBWDL]?[\d\.\*]+))?[ \t]*:[ \t]*"
@@ -56,6 +56,11 @@ class VarDecl:
     at: str | None = None
     comment: str | None = None
     attrs: dict[str, str] = field(default_factory=dict)   # {attribute 'name' := 'value'} pragmas above the line
+    qualifiers: tuple[str, ...] = ()                       # CONSTANT / RETAIN / PERSISTENT / NON_RETAIN on the VAR block
+
+    @property
+    def constant(self) -> bool:
+        return "CONSTANT" in self.qualifiers
 
 
 _RE_ATTR = re.compile(r"\{\s*attribute\s+'([^']+)'\s*(?::=\s*'([^']*)')?\s*\}", re.I)
@@ -144,9 +149,28 @@ class ProjectIndex:
                 "plcproj": [{"file": p["file"], "name": p["name"], "compile_items": len(p["compile"])} for p in self.plcproj],
                 "duration_s": round(time.time() - t0, 2)}
 
+    REFRESH_MIN_S = 2.0   # index-based tools re-check file mtimes at most this often
+
     def _ensure(self) -> None:
+        """Scan on first use; afterwards an incremental mtime refresh (throttled) so objects XAE just created or
+        edited are seen without a manual proj_scan — a stale index silently answering is worse than a slow one."""
         if self.scanned_at is None:
             self.scan()
+            return
+        if time.time() - self.scanned_at >= self.REFRESH_MIN_S and self.root is not None and self.root.is_dir():
+            try:
+                self.refresh()
+            except OSError:
+                pass
+
+    def ensure_fresh(self) -> dict[str, Any] | None:
+        """Public: scan or refresh now (no throttle); returns the refresh delta, or None when no root is set."""
+        if self.root is None:
+            return None
+        if self.scanned_at is None:
+            r = self.scan()
+            return {"scanned": True, "units": r["units"]}
+        return self.refresh()
 
     def refresh(self) -> dict[str, Any]:
         """Incremental rescan: re-index files whose mtime changed, pick up new files, drop deleted ones."""
@@ -368,7 +392,8 @@ class ProjectIndex:
             hit = self._find_var_anywhere(parts[0], kinds=("GVL",))
             if hit:
                 unit, var = hit
-                hops.append({"segment": parts[0], "declared_in": unit.name, "file": unit.file, "line": var.line, "type": var.type, "section": var.section})
+                hops.append({"segment": parts[0], "declared_in": unit.name, "file": unit.file, "line": var.line, "type": var.type, "section": var.section,
+                             "constant": var.constant})
                 cur = self._unit_for_type(var.type)
                 parts = parts[1:]
             else:
@@ -396,7 +421,7 @@ class ProjectIndex:
                 break
             unit_of_var, v = var
             hops.append({"segment": seg, "declared_in": unit_of_var.name, "file": unit_of_var.file, "line": v.line,
-                         "type": v.type, "section": v.section, "comment": v.comment})
+                         "type": v.type, "section": v.section, "comment": v.comment, "constant": v.constant})
             cur = self._unit_for_type(v.type)
         library_tail = [h["segment"] for h in hops if h.get("library_member")]
         return {"symbol": symbol, "hops": hops, "resolved": all("error" not in h for h in hops),
@@ -690,8 +715,9 @@ def parse_vars(decl: str, base_line: int = 0) -> list[VarDecl]:
         return out
     for m in _RE_VAR_BLOCK.finditer(decl):
         section = m.group(1).upper()
-        body = m.group(2)
-        body_start_line = decl[:m.start(2)].count("\n")
+        quals = tuple(q.upper() for q in (m.group("quals") or "").split())
+        body = m.group(3)
+        body_start_line = decl[:m.start(3)].count("\n")
         prev_end = 0
         for d in _RE_VAR_DECL.finditer(body):
             line = base_line + body_start_line + body[:d.start()].count("\n")
@@ -701,7 +727,7 @@ def parse_vars(decl: str, base_line: int = 0) -> list[VarDecl]:
             prev_end = d.end()
             for nm in d.group("names").split(","):
                 out.append(VarDecl(nm.strip(), d.group("type").strip(), section, line,
-                                   (d.group("init") or "").strip() or None, d.group("at"), cmt, dict(attrs)))
+                                   (d.group("init") or "").strip() or None, d.group("at"), cmt, dict(attrs), quals))
     return out
 
 

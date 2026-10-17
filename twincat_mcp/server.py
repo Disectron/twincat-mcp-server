@@ -349,6 +349,29 @@ class App:
             out["hint"] = " ".join(hints)
         return out
 
+    def constant_reason(self, name: str) -> str | None:
+        """Runtime symbol flags do not mark VAR CONSTANT as READONLY on 4026, so the project source decides: a write
+        to anything declared in a CONSTANT block is refused. No project root → no check (stated in the docstring)."""
+        if self.proj.root is None:
+            return None
+        try:
+            self.proj._ensure()
+            r = self.proj.resolve_symbol(name)
+        except Exception:  # noqa: BLE001 — unknown in source: the runtime check is all we have
+            return None
+        for h in r.get("hops", []):
+            if h.get("constant"):
+                return (f"{name!r}: {h['segment']} is declared in a VAR ... CONSTANT block ({h.get('declared_in')}, "
+                        f"{Path(h.get('file') or '').name}:{h.get('line')}). The runtime accepts the write, but a constant changed "
+                        "at runtime desynchronises array bounds and code compiled against it — change it in source and download")
+        return None
+
+    async def write_preflight(self, name: str, value: Any, port: int | None = None) -> None:
+        why = await asyncio.to_thread(self.constant_reason, name)
+        if why:
+            raise ToolError(why)
+        await self.ads_call(self.ads.check_write, name, value, port, timeout=30)
+
     async def xae_target_for(self, action: str, op: OpClass, confirm_token: str | None) -> str:
         """The shell's target NetId for a target-bound XAE action. If no shell can be reached, the guard still
         gets the first word: in readonly/guarded-without-token the refusal is the guard's (the human never
@@ -745,6 +768,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         for member in await app.ads_call(app.ads.members, name, timeout=30):  # opaque hex write touches every member
             await app.permit(ctx, OpClass.WRITE, "ads_write", member.name)
         try:
+            await app.write_preflight(name, value)
             res = await app.ads_call(app.ads.write, name, value, timeout=30)
         except ToolError as exc:
             app.audit("ads_write", {"name": name, "value": value}, OpClass.WRITE, "error", str(exc))
@@ -754,18 +778,32 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=WRITE)
     async def ads_write_many(values: dict[str, Any], ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Write several symbols sequentially ({name: value}). Each one is gated and audited;
-        stops at the first refusal."""
-        out: dict[str, Any] = {}
+        """Write several symbols ({name: value}) all-or-nothing up front: every symbol is gated (allow/deny list)
+        and pre-checked (type, range, enum name, array/string length, CONSTANT, pointer/interface) BEFORE the
+        first write; one refusal → nothing is written and every problem is listed. The writes then run in
+        order; if one fails at the PLC, the result says which were already applied (ADS has no transaction)."""
+        problems: dict[str, str] = {}
         for n, v in values.items():
-            await app.permit(ctx, OpClass.WRITE, "ads_write", n)
             try:
-                out[n] = await app.ads_call(app.ads.write, n, v, timeout=30)
-                app.audit("ads_write_many", {"name": n, "value": v}, OpClass.WRITE, "ok", out[n])
+                await app.permit(ctx, OpClass.WRITE, "ads_write", n)
+                await app.write_preflight(n, v)
             except ToolError as exc:
-                out[n] = {"error": str(exc)}
+                problems[n] = str(exc)
+        if problems:
+            app.audit("ads_write_many", {"names": list(values)}, OpClass.WRITE, "refused", problems)
+            raise ToolError("nothing was written — refused in pre-check: "
+                            + "; ".join(f"{k}: {v}" for k, v in problems.items()))
+        applied: dict[str, Any] = {}
+        for n, v in values.items():
+            try:
+                applied[n] = await app.ads_call(app.ads.write, n, v, timeout=30)
+                app.audit("ads_write_many", {"name": n, "value": v}, OpClass.WRITE, "ok", applied[n])
+            except ToolError as exc:
                 app.audit("ads_write_many", {"name": n, "value": v}, OpClass.WRITE, "error", str(exc))
-        return out
+                return {"complete": False, "applied": applied, "failed": {n: str(exc)},
+                        "not_attempted": [k for k in values if k not in applied and k != n],
+                        "note": "the writes in 'applied' took effect; snap_apply a snapshot to roll back if needed"}
+        return {"complete": True, "applied": applied}
 
     @mcp.tool(annotations=READ)
     async def ads_io_read(area: str, offset: int, size: int = 1, port: int = 851) -> dict[str, Any]:

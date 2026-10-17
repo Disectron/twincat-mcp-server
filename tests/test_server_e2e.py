@@ -387,3 +387,41 @@ async def test_destructive_xae_tools_refuse_by_guard_before_touching_the_shell(m
             assert res.is_error and "confirm_token" in text(res), (tool, text(res))
         audit = payload(await s.call_tool("tc_audit_tail", {"n": 10}))
         assert [a["outcome"] for a in audit if a["tool"].startswith("xae_")] == ["refused"] * 3
+
+
+@pytest.mark.anyio
+async def test_write_refusals_round2(monkeypatch, project_dir):
+    """Field report round 2 (#51–#54, #61–#64): every one of these was accepted (or crashed) on the engineering PC."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="full", confirm_destructive=False))
+    async with client_for(srv) as s:
+        refused = {
+            "PRG_Test.ipModule": (0, "INTERFACE"),                       # #52 wild pointer
+            "PRG_Test.pData": (0, "POINTER"),
+            "PRG_Test.abStateLit": ([True, False], "has 8 elements; got 2"),   # #51 silent zeroing
+            "GVL_Machine.MAX_MODULES": (99, "CONSTANT"),                  # #53 no READONLY flag on the symbol
+            "MAIN.sLabel": ("x" * 11, "holds at most 10"),                # #63 raw ADSError 1797
+            "PRG_Test.eCmd": ("Nope", "valid: Idle, Bulk, Fine, Done"),
+        }
+        for name, (val, why) in refused.items():
+            r = await s.call_tool("ads_write", {"name": name, "value": val})
+            assert r.is_error and why in text(r), (name, text(r))
+        ok = payload(await s.call_tool("ads_write", {"name": "PRG_Test.eCmd", "value": "E_FillState.Fine"}))   # #61
+        assert ok["after"] == 2
+        r = payload(await s.call_tool("ads_read", {"name": "PRG_Test.ipModule"}))                              # #64
+        assert r["value"] is None and "INTERFACE" in r["note"]
+        # #54: one bad item → nothing written, every problem named
+        r = await s.call_tool("ads_write_many", {"values": {"MAIN.nCycle": 1, "GVL_Machine.MAX_MODULES": 3, "MAIN.sLabel": "y" * 20}})
+        assert r.is_error and "nothing was written" in text(r) and "MAX_MODULES" in text(r) and "sLabel" in text(r)
+        assert payload(await s.call_tool("ads_read", {"name": "MAIN.nCycle"}))["value"] == 42
+        r = payload(await s.call_tool("ads_write_many", {"values": {"MAIN.nCycle": 7, "MAIN.bStart": False}}))
+        assert r["complete"] and set(r["applied"]) == {"MAIN.nCycle", "MAIN.bStart"}
+        t = payload(await s.call_tool("test_expect", {"checks": [{"symbol": "PRG_Test.eCmd", "op": "==", "value": "Fine"}]}))   # #62
+        assert t["pass"]
+
+
+def test_pointer_format():
+    from twincat_mcp import types_tc as T
+    assert T.fmt_pointer(0) is None
+    assert T.fmt_pointer(-114343974404328) == "0xFFFF98002F3C4018"[:2] + format((-114343974404328) & (2**64 - 1), "016X")
+    assert T.fmt_pointer(0x1234, 4) == "0x00001234"

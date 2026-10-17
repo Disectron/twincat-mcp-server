@@ -52,7 +52,7 @@ def test_expand_symbols(rec):
     everything = rec.expand_symbols(None, "MAIN", None, 500)
     assert len(everything) == 25
     s = rec.expand_symbols(None, None, "GVL_*", 500)
-    assert [x.name for x in s] == ["GVL_Machine.nDrumsFilled"]
+    assert sorted(x.name for x in s) == ["GVL_Machine.MAX_MODULES", "GVL_Machine.nDrumsFilled"]
     with pytest.raises(AdsError, match="limit"):
         rec.expand_symbols(None, "MAIN", None, 2)
     with pytest.raises(AdsError, match="not found"):

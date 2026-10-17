@@ -82,7 +82,7 @@ def test_leaves_roots_and_dump(ads, tmp_path):
     roots = [r.name for r in ads.roots()]
     assert "MAIN.stRecipe" in roots and "MAIN.stRecipe.sName" not in roots and "Constants.CompilerVersion" not in roots
     assert "Constants.CompilerVersion" in [r.name for r in ads.roots(include_system=True)]
-    assert [r.name for r in ads.roots("GVL_*")] == ["GVL_Machine.nDrumsFilled"]
+    assert sorted(r.name for r in ads.roots("GVL_*")) == ["GVL_Machine.MAX_MODULES", "GVL_Machine.nDrumsFilled"]
     d = ads.dump(None, False, str(tmp_path / "dumps"))
     assert d["roots"] == len(roots) and d["leaves"] >= 25 and not d["errors"]
     import json, csv

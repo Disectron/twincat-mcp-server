@@ -38,6 +38,11 @@ SYMBOLS: list[tuple[str, str, int, Any, int]] = [
     ("MAIN.sLabel", "STRING(10)", 11, "hello", 0),
     ("MAIN.arrSteps", "ARRAY [1..2] OF ST_Step", 32, None, 0),
     ("MAIN.fbValve2", "FB_Valve", 16, None, 0),
+    ("PRG_Test.ipModule", "I_Module", 8, 0, 0),                      # interface variable: a pointer the PLC calls through
+    ("PRG_Test.pData", "POINTER TO INT", 8, 0, 0),
+    ("PRG_Test.abStateLit", "ARRAY [0..7] OF BOOL", 8, [False, False, False, False, False, True, False, False], 0),
+    ("GVL_Machine.MAX_MODULES", "INT", 2, 16, 0),               # VAR_GLOBAL CONSTANT in the sample project; no READONLY flag
+    ("PRG_Test.eCmd", "E_FillState", 2, 0, 0),
 ]
 
 
@@ -58,6 +63,9 @@ DATATYPES = [
     _dt("FB_Valve", "", 16, subs=[_dt("bOpen", "BOOL", 1, 0, 33), _dt("tOpened", "TIME", 4, 4, 19),
                                    _dt("arrHist", "ARRAY [0..1] OF INT", 4, 8, 2, dims=[(0, 2)])]),
     _dt("ARRAY [0..1] OF INT", "INT", 4, dtype=2, dims=[(0, 2)]),
+    _dt("I_Module", "", 8, dtype=65, flags=0x800),                 # METHODINFOS, no members, pointer-sized → interface
+    _dt("POINTER TO INT", "INT", 8, dtype=21),
+    _dt("ARRAY [0..7] OF BOOL", "BOOL", 8, dtype=33, dims=[(0, 8)]),
 ]
 DATATYPE_BLOB = b"".join(encode_entry(e) for e in DATATYPES)
 

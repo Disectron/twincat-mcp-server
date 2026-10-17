@@ -46,6 +46,15 @@ ADST_NAME = {0: "VOID", 2: "INT16", 3: "INT32", 4: "REAL32", 5: "REAL64", 16: "I
              19: "UINT32", 20: "INT64", 21: "UINT64", 30: "STRING", 31: "WSTRING", 32: "REAL80", 33: "BIT", 65: "BIGTYPE"}
 
 HDR = struct.Struct("<IIIIIIIIHHHHH")   # 42 bytes
+
+
+def is_interface(e: "DtEntry | None") -> bool:
+    """INTERFACE types appear as pointer-sized entries with a method table and no data members (TcCOM interface
+    pointers carry TCCOMIFACEPTR). Their value is an address, never a number to show or write."""
+    if e is None:
+        return False
+    return bool(e.flags & F_TCCOMIFACEPTR) or (bool(e.flags & F_METHODINFOS) and not e.subitems and not e.dims
+                                               and not e.enum and e.size in (4, 8))
 MAX_ARRAY_ELEMENTS = 4096                # per expansion of a single array (guard)
 
 
@@ -272,8 +281,8 @@ class TypeSystem:
         e = entry or self.get(type_name)
         if e is None or depth > 32:
             return self._decode_scalar(buf, off, type_name, None, None)
-        if e.flags & F_REFERENCETO:
-            return {"pointer": int.from_bytes(buf[off:off + e.size], "little")} if e.size in (4, 8) else None
+        if e.flags & F_REFERENCETO or is_interface(e):
+            return T.fmt_pointer(int.from_bytes(buf[off:off + e.size], "little"), e.size) if e.size in (4, 8) else None
         if e.dims:
             if entry is not None:
                 top = self.get(e.type)
@@ -307,6 +316,8 @@ class TypeSystem:
 
     def decode_leaf(self, buf: bytes, leaf: "Leaf") -> Any:
         e = self.get(leaf.type)
+        if e is not None and (is_interface(e) or e.flags & F_REFERENCETO) and e.size == leaf.size:
+            return T.fmt_pointer(int.from_bytes(buf[leaf.offset:leaf.offset + e.size], "little"), e.size)
         if e is None or e.size != leaf.size:
             e = DtEntry(leaf.type, "", leaf.size, 0, leaf.data_type or (e.data_type if e else 0), 0, "", enum=dict(leaf.enum or {}))
         return self._decode_scalar(buf, leaf.offset, leaf.type, e, leaf.enum or (e.enum or None))
@@ -372,6 +383,8 @@ def encode_entry(e: DtEntry) -> bytes:
         body += encode_entry(s)
     flags = e.flags
     tail = b""
+    if flags & F_METHODINFOS:           # method table: count only (parse_entry skips the entries by length)
+        tail += struct.pack("<H", 0)
     if e.attributes:
         flags |= F_ATTRIBUTES
         tail += struct.pack("<H", len(e.attributes))

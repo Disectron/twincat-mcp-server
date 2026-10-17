@@ -82,9 +82,14 @@ class TestBench:
     def _encode_expected(self, symbol: str, value: Any) -> Any:
         s = self.ads.symbol_info(symbol)
         tt = T.parse_type(s.type, s.size)
+
+        def one(v: Any) -> Any:
+            if tt.kind == "enum":
+                v = self.ads.enum_literal(s.type, v)   # 'Stopped' / 'E_State.Stopped' → its number (raises with the valid names)
+            return self._encode_scalar(tt, v)
         if isinstance(value, (list, tuple)):
-            return [self._encode_scalar(tt, v) for v in value]
-        return self._encode_scalar(tt, value)
+            return [one(v) for v in value]
+        return one(value)
 
     @staticmethod
     def _encode_scalar(tt: T.TcType, v: Any) -> Any:
@@ -191,7 +196,8 @@ class TestBench:
                 resp_t = r["t_ms"]
         met = out.get("stop_reason", "").startswith("stop_when")
         return {"met": met, "latency_ms": None if (stim_t is None or resp_t is None or not met) else round(resp_t - stim_t, 3),
-                "stimulus_seen_at_ms": stim_t, "response_at_ms": resp_t, "recording": rid,
+                "stimulus_seen_at_ms": stim_t, "response_at_ms": resp_t if met else None,
+                "last_response_change_ms": None if met else resp_t, "recording": rid,
                 "wall_timeout_ms": timeout_ms, "note": "latency uses PLC notification timestamps; "
                 "resolution = task cycle time" if met else "response condition not reached before timeout"}
 

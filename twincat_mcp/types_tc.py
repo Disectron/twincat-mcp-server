@@ -154,9 +154,22 @@ def _fmt_ltime_ns(ns: int) -> str:
     return base
 
 
+def fmt_pointer(value: Any, size: int | None = 8) -> str | None:
+    """An address as the PLC shows it: 0x-hex of the full width, None for a null pointer/interface."""
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return None
+    width = (size or 8)
+    iv &= (1 << (8 * width)) - 1          # a signed read of a high address must not print negative
+    return None if iv == 0 else f"0x{iv:0{2 * width}X}"
+
+
 def decode(tt: TcType, value: Any) -> Any:
     """Turn the raw pyads value into a JSON-friendly readable value."""
     k = tt.kind
+    if k == "pointer":
+        return fmt_pointer(value, tt.size)
     if k == "array" and isinstance(value, (list, tuple)):
         vals = [decode(tt.elem, v) for v in value] if tt.elem else list(value)
         if tt.dims and len(tt.dims) > 1:
@@ -235,6 +248,10 @@ def encode(tt: TcType, value: Any) -> Any:
         if not isinstance(value, (list, tuple)):
             raise ValueError("array write needs a JSON list")
         flat = _flatten(value)
+        count = array_count(tt)
+        if count is not None and len(flat) != count:
+            raise ValueError(f"{tt.name} has {count} elements; got {len(flat)}. A short list would zero the rest of the array "
+                             f"(ADS writes the whole variable) — pass all {count} values, or write single elements by index")
         if tt.elem:
             return [encode(tt.elem, v) for v in flat]
         return flat
@@ -251,7 +268,10 @@ def encode(tt: TcType, value: Any) -> Any:
         if isinstance(value, (int, float)) and value in (0, 1):
             return bool(value)
         raise ValueError(f"not a BOOL: {value!r} (use true/false or 0/1; -1 and other numbers are refused rather than coerced)")
-    if k in ("int", "uint", "enum", "pointer"):
+    if k == "pointer":
+        raise ValueError(f"{tt.name} is a POINTER/REFERENCE: writing an address through ADS is refused (a wrong address is an "
+                         "access violation on the PLC). Write the variable it points to instead")
+    if k in ("int", "uint", "enum"):
         if isinstance(value, bool):
             iv = int(value)
         elif isinstance(value, str):
@@ -273,7 +293,12 @@ def encode(tt: TcType, value: Any) -> Any:
             raise ValueError(f"{fv!r} is out of range for REAL")
         return fv
     if k in ("string", "wstring"):
-        return str(value)
+        sv = str(value)
+        cap = string_capacity(tt)
+        if cap is not None and len(sv) > cap:
+            raise ValueError(f"string is {len(sv)} chars, {tt.name} holds at most {cap}; shorten it (ADS would reject the write "
+                             "with 'parameter size not correct' or the PLC would truncate it)")
+        return sv
     if k == "time":
         return parse_time_literal(value) if isinstance(value, str) else int(value)
     if k == "tod":
@@ -300,6 +325,25 @@ def encode(tt: TcType, value: Any) -> Any:
             return int((d - _EPOCH).total_seconds()) * 1_000_000_000
         return int(value)
     raise ValueError(f"cannot encode value for type {tt.name!r} (kind {k})")
+
+
+def array_count(tt: TcType) -> int | None:
+    """Number of elements of an ARRAY type (None when the bounds are unknown)."""
+    if not tt.dims:
+        return None
+    n = 1
+    for lo, hi in tt.dims:
+        n *= hi - lo + 1
+    return n
+
+
+def string_capacity(tt: TcType) -> int | None:
+    """Declared character capacity of a STRING(n)/WSTRING(n) (the byte size minus the terminator)."""
+    if tt.kind == "string" and tt.size:
+        return tt.size - 1
+    if tt.kind == "wstring" and tt.size:
+        return tt.size // 2 - 1
+    return None
 
 
 def int_range(tt: TcType) -> tuple[int | None, int | None]:

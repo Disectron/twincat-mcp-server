@@ -6,6 +6,9 @@ VAR_GLOBAL
 	nDrumsFilled : UDINT;
 	bEStop AT %I* : BOOL;
 END_VAR
+VAR_GLOBAL CONSTANT
+	MAX_MODULES : INT := 16;	// sizing constant: the runtime exports it without a READONLY flag
+END_VAR
 ]]></Declaration>
   </GVL>
 </TcPlcObject>
