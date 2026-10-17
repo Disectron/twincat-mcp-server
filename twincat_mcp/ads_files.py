@@ -60,7 +60,10 @@ _CHUNK = 64 * 1024
 def _raw_rw(conn: pyads.Connection, igrp: int, ioffs: int, read_len: int,
             write_bytes: bytes) -> bytes:
     """ReadWrite returning exactly the bytes the server sent (bytes_read)."""
-    fn = _adsDLL.AdsSyncReadWriteReqEx2
+    fn = getattr(_adsDLL, "AdsSyncReadWriteReqEx2", None) if _adsDLL is not None else None
+    if fn is None:
+        raise AdsError("the loaded TcAdsDll.dll has no AdsSyncReadWriteReqEx2 export — this PC has no TwinCAT ADS router "
+                       "(or a stand-in DLL was loaded); the System Service file API needs the real TwinCAT installation")
     addr = ctypes.pointer(conn._adr.amsAddrStruct())  # type: ignore[attr-defined]
     rbuf = (ctypes.c_ubyte * max(read_len, 1))()
     wbuf = (ctypes.c_ubyte * max(len(write_bytes), 1))(*write_bytes) if write_bytes else None

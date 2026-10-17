@@ -371,3 +371,19 @@ async def test_tc_doctor_reports_placeholder_config(monkeypatch, project_dir):
         doc = payload(await s.call_tool("tc_doctor", {}))
         assert any("placeholder" in w for w in doc["config_FIX_THESE"])
         assert doc["ads_target"]["ams_net_id"] == "(local)"
+
+
+@pytest.mark.anyio
+async def test_destructive_xae_tools_refuse_by_guard_before_touching_the_shell(monkeypatch, project_dir):
+    """guarded, no token, no elicitation: the refusal must be the guard's even when no XAE shell can be reached
+    (on CI there is none; on the engineering PC the shell may be closed). The attach problem is appended, not
+    substituted — otherwise the acceptance guard proofs read 'no shell' instead of 'needs confirmation'."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded")
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        for tool in ("xae_activate_configuration", "xae_restart_twincat", "xae_deploy"):
+            res = await s.call_tool(tool, {})
+            assert res.is_error and "confirm_token" in text(res), (tool, text(res))
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 10}))
+        assert [a["outcome"] for a in audit if a["tool"].startswith("xae_")] == ["refused"] * 3

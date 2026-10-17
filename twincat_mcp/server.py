@@ -349,6 +349,20 @@ class App:
             out["hint"] = " ".join(hints)
         return out
 
+    async def xae_target_for(self, action: str, op: OpClass, confirm_token: str | None) -> str:
+        """The shell's target NetId for a target-bound XAE action. If no shell can be reached, the guard still
+        gets the first word: in readonly/guarded-without-token the refusal is the guard's (the human never
+        needed a shell to learn that), only a permitted call surfaces the attach error."""
+        try:
+            return (await self.xae_call(self.xae.target_get, timeout=60)).get("target_net_id", "")
+        except ToolError as xae_exc:
+            try:
+                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope())
+            except SafetyError as exc:
+                self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
+                raise ToolError(f"{exc} (and no XAE shell is attached: {str(xae_exc)[:160]})") from exc
+            raise
+
     async def check_targets(self, xae_target: str, allow_mismatch: bool) -> None:
         """Refuse deploy/tcunit when XAE targets one machine and ADS another."""
         ads_t = self.ads.net_id
@@ -2042,7 +2056,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_activate_configuration(confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """ActivateConfiguration on the current target (overwrites the boot project on the IPC).
         Destructive-class. Follow with xae_restart_twincat."""
-        tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
+        tgt = await app.xae_target_for("xae_activate_configuration", OpClass.DESTRUCTIVE, confirm_token)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_activate_configuration", tgt, confirm_token)
         res = await app.xae_call(app.xae.activate_configuration, timeout=600)
         await app.ads_call(app.ads.disconnect, timeout=10)
@@ -2061,7 +2075,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=DESTR)
     async def xae_restart_twincat(confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """StartRestartTwinCAT on the current target (runtime restarts in RUN mode). Destructive-class."""
-        tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
+        tgt = await app.xae_target_for("xae_restart_twincat", OpClass.DESTRUCTIVE, confirm_token)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_restart_twincat", tgt, confirm_token)
         res = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
@@ -2084,7 +2098,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Save → build → (boot project autostart on) → activate → restart, in one call.
         Stops at the first build error. Destructive-class (one confirmation covers all steps).
         Refuses when the XAE target and the ADS target of this server differ."""
-        tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
+        tgt = await app.xae_target_for("xae_deploy", OpClass.DESTRUCTIVE, confirm_token)
         await app.check_targets(tgt, allow_target_mismatch)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_deploy", tgt, confirm_token)
         steps: dict[str, Any] = {}
