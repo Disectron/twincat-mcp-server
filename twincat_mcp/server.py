@@ -8,7 +8,7 @@ Tool prefixes
   proj_*   offline project files
   tcunit_* TcUnit orchestration + result parsing
   exp_*    experiments: spec → runs → metrics with CIs → verdict → report
-  infosys_* Beckhoff Infosys reference (TwinCAT 3 docs, locally indexed)
+  infosys_* Beckhoff Infosys reference (TwinCAT 3 docs from the local Help Viewer package, offline)
 
 Confirmation for destructive operations: if the MCP client supports
 elicitation, the human is asked directly (``ctx.elicit``); otherwise the
@@ -164,13 +164,32 @@ class App:
         self.docs_bg: dict[str, Any] = {}
         self.session_allow: list[str] = []      # tc_allow_write additions; survive tc_reload_config (N6)
         self.docs: InfosysIndex | None = None
+        self.docs_error: str | None = None
         if cfg.docs.enabled:
             try:
-                self.docs = InfosysIndex(cfg.docs.cache_dir, books=cfg.docs.books, exclude_books=cfg.docs.exclude_books,
+                local = None
+                cache = cfg.docs.cache_dir
+                if cfg.docs.source == "local":
+                    from . import helpviewer as HV
+                    pk = HV.find_packages(cfg.docs.mshc)
+                    if not pk:
+                        where = cfg.docs.mshc or " / ".join(str(r) for r in HV.catalog_roots())
+                        raise RuntimeError(
+                            f"docs.source = 'local' but no Beckhoff Infosys Help Viewer package (BKINFOSYS3_*.mshc) was "
+                            f"found under {where}. Install the TwinCAT documentation for the Help Viewer, set "
+                            "[docs] mshc = '<path to the .mshc>', or docs.source = 'web' to use infosys.beckhoff.com.")
+                    local = HV.HelpViewerSource(pk[0])
+                    # the full package index (≈ 50k pages) belongs next to the knowledge base when one is chosen
+                    kb_dir = self.kb.location()[0]
+                    base = Path(cache) if (cfg.docs_cache_explicit or kb_dir is None) else kb_dir / "infosys"
+                    cache = str(base / f"helpviewer-{local.lcid}")
+                self.docs = InfosysIndex(cache, books=cfg.docs.books, exclude_books=cfg.docs.exclude_books,
                                          tc3_only=cfg.docs.tc3_only, max_workers=cfg.docs.max_workers,
                                          max_index_pages=cfg.docs.max_index_pages, sitemap_ttl_days=cfg.docs.sitemap_ttl_days,
-                                         web_fallback=cfg.docs.web_fallback, fetch_timeout_s=cfg.docs.fetch_timeout_s)
-            except Exception as exc:  # noqa: BLE001 — a broken cache dir must not take the server down
+                                         web_fallback=cfg.docs.web_fallback, fetch_timeout_s=cfg.docs.fetch_timeout_s,
+                                         local=local)
+            except Exception as exc:  # noqa: BLE001 — a broken cache dir / missing package must not take the server down
+                self.docs_error = str(exc)
                 log.warning("infosys index disabled: %s", exc)
         self.started = time.time()
 
@@ -292,6 +311,9 @@ class App:
         every Beckhoff library book the project references that is not indexed yet — the first call does not wait."""
         if self.docs is None or self.docs_bg.get("started"):
             return
+        if self.docs.local is not None:
+            self._start_local_index_bg()
+            return
         try:
             have = set(self.docs.indexed_books())
         except Exception:  # noqa: BLE001
@@ -316,10 +338,46 @@ class App:
 
         threading.Thread(target=_run, name="infosys-default-index", daemon=True).start()
 
+    def _start_local_index_bg(self) -> None:
+        """Local Help Viewer package: the default books first (what most lookups need), then every other TwinCAT 3
+        book, in a daemon thread. A package already indexed at the same stamp is skipped outright."""
+        docs = self.docs
+        assert docs is not None and docs.local is not None
+        try:
+            if docs.indexed_stamp() == docs.local.stamp:
+                return
+        except Exception:  # noqa: BLE001
+            return
+        self.docs_bg = {"started": time.time(), "finished": None, "books": ["all books of " + docs.local.path.name],
+                        "done_books": 0, "total_books": None, "result": None}
+
+        def _run() -> None:
+            out: list[dict[str, Any]] = []
+            try:
+                for b in self.cfg.docs.books:
+                    try:
+                        r = docs.index_book(b)
+                        out.append({k: r.get(k) for k in ("book", "fetched", "seconds")})
+                    except Exception as exc:  # noqa: BLE001
+                        out.append({"book": b, "error": str(exc)})
+
+                def prog(book: str, i: int, n: int) -> None:
+                    self.docs_bg["done_books"], self.docs_bg["total_books"] = i, n
+                out.append(docs.index_all(prog))
+            except Exception as exc:  # noqa: BLE001
+                out.append({"error": f"{type(exc).__name__}: {exc}"})
+            finally:
+                self.docs_bg["result"] = out
+                self.docs_bg["finished"] = time.time()
+
+        threading.Thread(target=_run, name="infosys-helpviewer-index", daemon=True).start()
+
     async def docs_call(self, fn, *a, timeout: float = 120, **kw) -> Any:
-        """Infosys lookups: network + SQLite, off the event loop; no ADS/COM worker involved."""
+        """Infosys lookups: local package (or network) + SQLite, off the event loop; no ADS/COM worker involved."""
         if self.docs is None:
-            raise ToolError("Infosys lookup is disabled (docs.enabled=false / TCMCP_DOCS=0)")
+            raise ToolError(self.docs_error or "Infosys lookup is disabled (docs.enabled=false / TCMCP_DOCS=0)")
+        if isinstance(fn, str):
+            fn = getattr(self.docs, fn)
         self.start_docs_index_bg()
         try:
             res = await asyncio.wait_for(asyncio.to_thread(fn, *a, **kw), timeout)
@@ -331,13 +389,17 @@ class App:
             raise ToolError(f"Infosys index busy ({exc})" + (f" — {', '.join(st.get('books') or [])} being indexed in the background "
                             f"({st.get('running_for_s', 0):.0f} s so far); retry in a moment or search with web_fallback=true" if busy else "")) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise ToolError(f"Infosys call exceeded {timeout:.0f} s (slow network? smaller max_pages?)") from exc
+            raise ToolError(f"Infosys call exceeded {timeout:.0f} s" + (" (the package index is still being built — retry "
+                            "in a minute)" if self.docs.local is not None else " (slow network? smaller max_pages?)")) from exc
         except Exception as exc:  # noqa: BLE001 — never an empty error message to the client
             raise ToolError(f"Infosys lookup failed: {type(exc).__name__}: {exc}") from exc
         st = self.docs_bg
         if isinstance(res, dict) and st.get("started") and not st.get("finished"):
             books = ", ".join(st.get("books") or [])
-            msg = f"indexing in the background: {books} ({round(time.time() - st['started'])} s so far)"
+            msg = f"indexing in the background: {books} ({round(time.time() - st['started'])} s so far"
+            if st.get("total_books"):
+                msg += f", {st.get('done_books')}/{st['total_books']} books"
+            msg += ")"
             backend = str(res.get("backend") or "")
             if backend and "web" in backend.lower():
                 msg += "; this answer came from the web fallback"
@@ -751,14 +813,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         rep["config_file"] = cfg.config_file
         if app.docs is not None:
             try:
-                rep["infosys"] = {"cache": str(app.docs.dir), "fts5": app.docs.has_fts,
-                                  "indexed_books": await asyncio.to_thread(app.docs.indexed_books),
+                rep["infosys"] = {"source": app.docs.source(), "cache": str(app.docs.dir), "fts5": app.docs.has_fts,
+                                  "indexed_books": len(await asyncio.to_thread(app.docs.indexed_books))
+                                  if app.docs.local is not None else await asyncio.to_thread(app.docs.indexed_books),
                                   "background_index": app.docs_index_status(),
                                   "default_books": cfg.docs.books}
             except ToolError as exc:
                 rep["infosys"] = f"FAIL: {exc}"
         else:
-            rep["infosys"] = "disabled"
+            rep["infosys"] = f"FAIL: {app.docs_error}" if app.docs_error else "disabled"
         problems = [k for k, v in rep.items() if isinstance(v, str) and v.startswith("FAIL")]
         if cfg.warnings:
             problems.append("config_FIX_THESE")
@@ -2416,11 +2479,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # ======================================================================
     @mcp.tool(annotations=READ)
     async def infosys_books(pattern: str | None = None, category: str | None = None, limit: int = 200) -> dict[str, Any]:
-        """List Infosys books (documentation sets) from the site's own sitemap, with page counts and
-        whether they are indexed locally. pattern is a glob on the slug ('tcplclib_*', '*json*');
-        category: plc-library | function-tf | engineering-te | twincat-system | hardware | other.
-        TwinCAT 2 books are excluded. First call downloads the sitemap (a few MB, cached 7 days)."""
-        res = await app.docs_call(app.docs.books, pattern, category, limit, timeout=300)
+        """List Infosys books (documentation sets) with page counts and whether they are indexed. Source: the Help
+        Viewer package installed with TwinCAT (docs.source='local', default — every book, offline) or the website's
+        sitemap (docs.source='web'). pattern is a glob on the slug ('tcplclib_*', '*json*'); category: plc-library |
+        function-tf | engineering-te | twincat-system | hardware | other. TwinCAT 2 books are excluded."""
+        res = await app.docs_call("books", pattern, category, limit, timeout=300)
         st = app.docs_index_status()
         if isinstance(res, dict) and st.get("started") and not st.get("finished"):
             for b in res.get("books", []):
@@ -2430,13 +2493,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def infosys_index(book: str, force: bool = False, max_pages: int | None = None) -> dict[str, Any]:
-        """Index a book (or glob of books, e.g. 'tcplclib_tc3_*') into the local cache: fetches every page
-        that is new or changed since the last run (sitemap lastmod), extracts title/kind/library/
-        declaration, builds the full-text index. Tc2_System ≈ 300 pages ≈ 30-60 s. Needed before
-        infosys_search_symbols/search_code can see a library; infosys_search falls back to the web."""
+        """Index a book (or glob, e.g. 'tcplclib_tc3_*'): pages new or changed since the last run, title/kind/library/
+        declaration, full-text index. With the local Help Viewer package every book is indexed in the background on
+        first use anyway (≈ 50k pages, a few minutes); this indexes one book now. With docs.source='web' it fetches
+        from infosys.beckhoff.com (Tc2_System ≈ 300 pages ≈ 30-60 s)."""
         if any(c in book for c in "*?"):
-            return await app.docs_call(app.docs.index_books, book, force, max_pages, timeout=3600)
-        return await app.docs_call(app.docs.index_book, book, force, max_pages, timeout=1800)
+            return await app.docs_call("index_books", book, force, max_pages, timeout=3600)
+        return await app.docs_call("index_book", book, force, max_pages, timeout=1800)
 
     @mcp.tool(annotations=READ)
     async def infosys_search_symbols(query: str, kind: str | None = None, library: str | None = None,
@@ -2446,7 +2509,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         Function | Program | Method | Property | Action | Enum | Struct | Union | Alias | Interface |
         GlobalVariable | Library. library: 'Tc2_System' or the book slug. Indexes the default
         libraries on first use if nothing is indexed."""
-        return await app.docs_call(app.docs.search_symbols, query, kind, library, limit, False, timeout=300)   # indexing runs in the background, not inline
+        return await app.docs_call("search_symbols", query, kind, library, limit, False, timeout=300)   # indexing runs in the background, not inline
 
     @mcp.tool(annotations=READ)
     async def infosys_declaration(symbol: str, library: str | None = None) -> dict[str, Any]:
@@ -2454,30 +2517,30 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         description from the page's table), struct members, enum values, return type, EXTENDS /
         IMPLEMENTS, plus the ST declaration text and the page URL. The thing to call before writing
         code against an FB you have not used before."""
-        return await app.docs_call(app.docs.declaration, symbol, library, timeout=1800)
+        return await app.docs_call("declaration", symbol, library, timeout=1800)
 
     @mcp.tool(annotations=READ)
     async def infosys_search(query: str, library: str | None = None, limit: int = 10,
                              web_fallback: bool | None = None) -> dict[str, Any]:
-        """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]).
-        When the local index has nothing, falls back to a DuckDuckGo site: query whose results are
-        verified against the Infosys sitemap (TwinCAT 3 only) and fetched for title/excerpt; the
+        """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]). Local Help Viewer
+        package (default): no network, results carry the page's doc version and the package date ('source').
+        docs.source='web': when the index has nothing, a DuckDuckGo site: query verified against the sitemap; the
         'backend' field says which path answered."""
-        return await app.docs_call(app.docs.search, query, library, limit, web_fallback, timeout=300)
+        return await app.docs_call("search", query, library, limit, web_fallback, timeout=300)
 
     @mcp.tool(annotations=READ)
     async def infosys_search_code(query: str, language: str | None = None, limit: int = 10) -> dict[str, Any]:
         """Search the code examples (<pre> blocks) of indexed pages for a fragment — a call pattern,
         an attribute, a constant. language: st | xml | cpp | csharp. Returns the matching lines
         with context and the page URL."""
-        return await app.docs_call(app.docs.search_code, query, language, limit, timeout=120)
+        return await app.docs_call("search_code", query, language, limit, timeout=120)
 
     @mcp.tool(annotations=READ)
     async def infosys_get_page(ref: str, refresh: bool = False, max_chars: int = 60000) -> dict[str, Any]:
-        """A documentation page as Markdown (headings, tables, fenced code). ref: full Infosys URL,
-        'book/pageid', a bare page id, or a symbol name ('ADSREAD'). Fetched live and cached; works
-        for any page that exists on the site, indexed or not. refresh=true bypasses the cache."""
-        return await app.docs_call(app.docs.get_page, ref, refresh, max_chars, timeout=600)
+        """A documentation page as Markdown (headings, tables, fenced code). ref: full Infosys URL, 'book/pageid', a
+        bare page id, or a symbol name ('ADSREAD'). Read from the local Help Viewer package (any page in it, indexed or
+        not; doc version + breadcrumb included) or, with docs.source='web', fetched live. Use max_chars to keep it short."""
+        return await app.docs_call("get_page", ref, refresh, max_chars, timeout=600)
 
     # ======================================================================
     # exports for MES / HMI code, snapshots apply, XML validation, reports

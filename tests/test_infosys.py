@@ -218,6 +218,7 @@ async def test_infosys_tools_e2e(monkeypatch, tmp_path):
 
     monkeypatch.setattr(inf, "Fetcher", lambda *a, **k: FakeFetcher())
     cfg = Config()
+    cfg.docs.source = "web"              # this test exercises the website path (sitemap + DuckDuckGo fallback)
     cfg.docs.cache_dir = str(tmp_path / "docs")
     cfg.docs.books = ["tcplclib_tc2_system"]
     validate(cfg)

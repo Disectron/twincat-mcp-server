@@ -336,9 +336,10 @@ def test_block_notification_gaps_are_counted_and_file_is_provable(rec):
     assert v2["integrity"].startswith("MODIFIED") and v2["seal"].startswith("FILE CHANGED SINCE SEALING")
 
 
-def test_n13_duration_stop_waits_for_in_flight_tail(rec):
+def test_n13_duration_stop_waits_for_in_flight_tail(rec, monkeypatch):
     """N13: this PC's clock reaches the duration while the PLC samples up to the cut are still in flight. The
     recorder keeps the notifications until they have arrived, so a lossless run is COMPLETE, not FAIL by 3–10."""
+    monkeypatch.setattr(R, "TAIL_WAIT_S", 5.0)       # a loaded CI runner must not turn the grace into the result
     st = _cycle_rec(rec, symbols=["MAIN.nCycle"], duration_s=0.4)
     c = _conn()
     for i in range(300):

@@ -117,6 +117,8 @@ class HtmlDoc:
     code_blocks: list[tuple[str, str]] = field(default_factory=list)   # (language, code)
     tables: list[list[list[str]]] = field(default_factory=list)          # table -> rows -> cells
     headings: list[tuple[int, str]] = field(default_factory=list)
+    meta: dict[str, str] = field(default_factory=dict)                   # <meta name=…> (Help Viewer pages)
+    crumb: str = ""                                                      # breadcrumb (Help Viewer pages)
 
 
 class _MdWalker(HTMLParser):
@@ -575,7 +577,12 @@ class InfosysIndex:
     def __init__(self, cache_dir: str | Path, fetcher: Fetcher | None = None, books: list[str] | None = None,
                  exclude_books: list[str] | None = None, tc3_only: bool = True, max_workers: int = 6,
                  max_index_pages: int = 4000, sitemap_ttl_days: int = 7, web_fallback: bool = True,
-                 fetch_timeout_s: float = 20.0):
+                 fetch_timeout_s: float = 20.0, local: Any = None):
+        # local: a helpviewer.HelpViewerSource — the installed Help Viewer package replaces the website entirely
+        # (page list, page content); nothing is fetched from the network and there is no web fallback.
+        self.local = local
+        if local is not None:
+            web_fallback = False
         self.dir = Path(cache_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.fetch = fetcher or Fetcher(fetch_timeout_s)
@@ -607,7 +614,12 @@ class InfosysIndex:
                 CREATE INDEX IF NOT EXISTS pages_book ON pages(book);
                 CREATE INDEX IF NOT EXISTS pages_title ON pages(title COLLATE NOCASE);
                 CREATE TABLE IF NOT EXISTS books(book TEXT PRIMARY KEY, indexed_at REAL, pages INTEGER);
+                CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             """)
+            cols = {r["name"] for r in con.execute("PRAGMA table_info(pages)")}
+            for c in ("version", "crumb"):          # added with the Help Viewer source
+                if c not in cols:
+                    con.execute(f"ALTER TABLE pages ADD COLUMN {c} TEXT")
             try:
                 con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, text, code, tokenize='unicode61')")
                 self._fts = True
@@ -620,9 +632,16 @@ class InfosysIndex:
 
     # -- sitemap ------------------------------------------------------------------
     def sitemap(self, force: bool = False) -> dict[str, str]:
-        """url -> lastmod for every English content page. Cached on disk for sitemap_ttl."""
+        """url -> lastmod for every English content page. Cached on disk for sitemap_ttl. With a local Help Viewer
+        package: its page list, lastmod = the package stamp (a new package re-indexes every page)."""
         with self._lock:
             if self._sitemap is not None and not force:
+                return self._sitemap
+            if self.local is not None:
+                try:
+                    self._sitemap = self.local.pages()
+                except Exception as exc:  # noqa: BLE001 — HelpViewerError
+                    raise InfosysError(str(exc)) from exc
                 return self._sitemap
             cache = self.dir / "sitemap.json.gz"
             if cache.is_file() and not force and time.time() - cache.stat().st_mtime < self.sitemap_ttl:
@@ -694,16 +713,37 @@ class InfosysIndex:
         text = re.sub(r"```.*?```", " ", doc.markdown, flags=re.S)
         code = CODE_SEP.join(f"{lang}\n{c}" for lang, c in doc.code_blocks)
         has_decl = kind != "Page" and decl["declaration"] is not None
-        con.execute("INSERT OR REPLACE INTO pages VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        version = doc.meta.get("Microsoft.Help.DisplayVersion") or None
+        con.execute("INSERT OR REPLACE INTO pages(url, book, page_id, lastmod, title, kind, library, markdown, text, code, "
+                    "decl, fetched, version, crumb) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (url, bk[0], bk[1], lastmod, title, kind, library, doc.markdown, text, code,
-                     json.dumps(decl) if has_decl or kind != "Page" else None, time.time()))
+                     json.dumps(decl) if has_decl or kind != "Page" else None, time.time(), version, doc.crumb or None))
         if self._fts:
             con.execute("DELETE FROM pages_fts WHERE url = ?", (url,))
             con.execute("INSERT INTO pages_fts(url, title, text, code) VALUES (?,?,?,?)", (url, title, text, code))
         return {"url": url, "title": title, "kind": kind, "library": library}
 
     def _fetch_doc(self, url: str) -> HtmlDoc:
-        return html_to_doc(self.fetch.get(url))
+        if self.local is None:
+            return html_to_doc(self.fetch.get(url))
+        from .helpviewer import body_html, page_meta
+        try:
+            raw = self.local.get(url)
+        except Exception as exc:  # noqa: BLE001 — HelpViewerError
+            raise InfosysError(str(exc)) from exc
+        text, crumb = body_html(raw)
+        doc = html_to_doc(text)
+        doc.meta = page_meta(raw)
+        doc.crumb = crumb
+        if doc.meta.get("Title") and (not doc.title or doc.title.lower().startswith("beckhoff information system")):
+            doc.title = doc.meta["Title"].strip()
+        return doc
+
+    def source(self) -> dict[str, Any]:
+        """Where the documentation comes from — every answer carries it (a local package can be months old)."""
+        if self.local is not None:
+            return self.local.describe()
+        return {"kind": "web", "site": INFOSYS}
 
     def index_book(self, book: str, force: bool = False, max_pages: int | None = None,
                    progress: Callable[[int, int], None] | None = None) -> dict[str, Any]:
@@ -721,7 +761,7 @@ class InfosysIndex:
         if not pages:
             near = sorted({b[0] for u in sm if (b := book_of(u)) and book.split("_")[-1][:6] in b[0]})[:8]
             raise InfosysError(f"no book {book!r} in the Infosys sitemap. Similar: {near}. Use infosys_books(pattern=...)")
-        cap = min(max_pages or self.max_index_pages, self.max_index_pages)
+        cap = (max_pages or len(pages)) if self.local is not None else min(max_pages or self.max_index_pages, self.max_index_pages)
         with self._db() as con:
             have = {r["url"]: r["lastmod"] for r in con.execute("SELECT url, lastmod FROM pages WHERE book = ?", (book,))}
         todo = [u for u, lm in pages.items() if force or u not in have or have[u] != lm]
@@ -730,7 +770,8 @@ class InfosysIndex:
         done, failed = 0, []
         kinds: dict[str, int] = {}
         t0 = time.time()
-        with ThreadPoolExecutor(max_workers=self.max_workers) as ex, self._db() as con:
+        # local package: parsing is CPU-bound (one thread is as fast as many); the website: polite parallel fetches
+        with ThreadPoolExecutor(max_workers=1 if self.local is not None else self.max_workers) as ex, self._db() as con:
             futs = {ex.submit(self._fetch_doc, u): u for u in todo}
             for fut in as_completed(futs):
                 u = futs[fut]
@@ -769,6 +810,30 @@ class InfosysIndex:
             budget -= r["fetched"]
             results.append(r)
         return {"books": results, "remaining_budget": budget}
+
+    def index_all(self, progress: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
+        """Local package only: index every TwinCAT 3 book (unchanged pages are skipped, so a repeat is cheap)."""
+        if self.local is None:
+            raise InfosysError("index_all needs the local Help Viewer package (docs.source = 'local')")
+        sm = self.sitemap()
+        books = sorted({b[0] for u in sm if (b := book_of(u)) and self.book_allowed(b[0])})
+        t0 = time.time()
+        fetched = failed = 0
+        for i, bk in enumerate(books):
+            r = self.index_book(bk)
+            fetched += r["fetched"]
+            failed += len(r["failed"])
+            if progress:
+                progress(bk, i + 1, len(books))
+        with self._db() as con:
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('source_stamp', ?)", (self.local.stamp,))
+        return {"books": len(books), "pages_indexed": fetched, "failed": failed, "seconds": round(time.time() - t0, 1),
+                "source": self.source()}
+
+    def indexed_stamp(self) -> str | None:
+        with self._db() as con:
+            r = con.execute("SELECT value FROM meta WHERE key = 'source_stamp'").fetchone()
+        return r["value"] if r else None
 
     def indexed_books(self) -> list[str]:
         with self._db() as con:
@@ -831,11 +896,13 @@ class InfosysIndex:
             raise InfosysError("empty query")
         items = self._fts_search(q, library, limit) if self._fts else self._like_search(q, library, limit)
         backend = "local-fts5" if self._fts else "local-like"
-        if not items and (self.web_fallback if web_fallback is None else web_fallback):
+        if not items and self.local is None and (self.web_fallback if web_fallback is None else web_fallback):
             items = self._ddg(q, limit)
             backend = "duckduckgo+sitemap"
+        if self.local is not None:
+            backend += "+helpviewer"
         return {"query": q, "backend": backend, "count": len(items), "items": items,
-                "indexed_books": self.indexed_books()}
+                "indexed_books": self.indexed_books(), "source": self.source()}
 
     def search_code(self, query: str, language: str | None = None, limit: int = 10) -> dict[str, Any]:
         q = query.strip()
@@ -875,15 +942,24 @@ class InfosysIndex:
         lastmod = sm.get(url, "")
         with self._db() as con:
             row = con.execute("SELECT * FROM pages WHERE url = ?", (url,)).fetchone()
+        if self.local is not None and url not in sm:
+            raise InfosysError(f"{url} is not in the local Help Viewer package ({self.local.path.name}, "
+                               f"{self.local.describe()['modified']}) — no web lookup in local mode")
         if row is None or refresh or (lastmod and row["lastmod"] != lastmod):
             doc = self._fetch_doc(url)
             with self._db() as con, self._lock:
                 self._store(con, url, lastmod, doc)
                 row = con.execute("SELECT * FROM pages WHERE url = ?", (url,)).fetchone()
         md = row["markdown"] or ""
-        return {"url": url, "title": row["title"], "kind": row["kind"], "library": row["library"], "book": row["book"],
-                "lastmod": row["lastmod"] or None, "in_sitemap": url in sm,
-                "markdown": md[:max_chars], "truncated": len(md) > max_chars, "chars": len(md)}
+        out = {"url": url, "title": row["title"], "kind": row["kind"], "library": row["library"], "book": row["book"],
+               "lastmod": row["lastmod"] or None, "in_sitemap": url in sm,
+               "markdown": md[:max_chars], "truncated": len(md) > max_chars, "chars": len(md)}
+        if self.local is not None:
+            out["lastmod"] = None
+            out["version"] = row["version"]
+            out["breadcrumb"] = row["crumb"]
+            out["source"] = self.source()
+        return out
 
     def declaration(self, symbol: str, library: str | None = None) -> dict[str, Any]:
         s = symbol.strip()
@@ -905,6 +981,12 @@ class InfosysIndex:
                 row = con.execute("SELECT url, title, kind, library, decl FROM pages WHERE url = ?", (exact[0]["url"],)).fetchone()
         decl = json.loads(row["decl"]) if row["decl"] else {"name": row["title"], "kind": row["kind"], "declaration": None}
         decl.update({"url": row["url"], "library": row["library"]})
+        if self.local is not None:
+            with self._db() as con:
+                v = con.execute("SELECT version FROM pages WHERE url = ?", (row["url"],)).fetchone()
+            if v and v["version"]:
+                decl["doc_version"] = v["version"]
+            decl["source"] = self.source()
         return decl
 
     # -- resolution ----------------------------------------------------------------
@@ -948,7 +1030,7 @@ class InfosysIndex:
             return []
         for joiner in (" AND ", " OR "):
             match = joiner.join('"' + t.replace('"', '""') + '"' for t in toks)
-            sql = (f"SELECT p.url, p.title, p.kind, p.library, p.book, "
+            sql = (f"SELECT p.url, p.title, p.kind, p.library, p.book, p.version, "
                    f"snippet(pages_fts, 2, '[', ']', '…', 24) AS snip, bm25(pages_fts, 0.0, 10.0, 1.0, 0.5) AS score "
                    f"FROM pages_fts JOIN pages p ON p.url = pages_fts.url WHERE pages_fts MATCH ?")
             params: list[Any] = [match]
@@ -964,6 +1046,7 @@ class InfosysIndex:
                 raise InfosysError(f"search syntax: {exc}") from exc
             if rows:
                 return [{"url": r["url"], "title": r["title"], "kind": r["kind"], "library": r["library"], "book": r["book"],
+                         **({"version": r["version"]} if r["version"] else {}),
                          "excerpt": r["snip"], "score": round(-r["score"], 3)} for r in rows]
         return []
 

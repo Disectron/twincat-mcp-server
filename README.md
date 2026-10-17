@@ -110,7 +110,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 | `TCMCP_XAE_ATTACH_ONLY` | `0` → `xae_attach` may launch a shell | `1` |
 | `TCMCP_TCUNIT_RESULT` | result path on the target | `C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml` |
 | `TCMCP_AUDIT_LOG`, `TCMCP_AUDIT_READS` | JSONL audit file; also log reads | `~/.twincat_mcp/audit.jsonl`, `0` |
-| `TCMCP_DOCS`, `TCMCP_DOCS_BOOKS`, `TCMCP_DOCS_EXCLUDE`, `TCMCP_DOCS_WEB_FALLBACK`, `TCMCP_DOCS_CACHE` | Infosys lookup on/off; `;`-separated default books; exclude regexes; web fallback; cache dir | `1`, 8 core PLC libraries, —, `1`, `~/.twincat_mcp/infosys` |
+| `TCMCP_DOCS`, `TCMCP_DOCS_SOURCE`, `TCMCP_DOCS_MSHC`, `TCMCP_DOCS_BOOKS`, `TCMCP_DOCS_EXCLUDE`, `TCMCP_DOCS_WEB_FALLBACK`, `TCMCP_DOCS_CACHE` | Infosys lookup on/off; `local` (Help Viewer package) or `web`; the .mshc; `;`-separated books indexed first; exclude regexes; web fallback (web only); cache dir | `1`, `local`, newest found, 8 core PLC libraries, —, `1`, `~/.twincat_mcp/infosys` |
 
 ## Safety model
 
@@ -364,7 +364,20 @@ here, `infosys_search_symbols("ADSREAD")` returned nothing, `infosys_get_page` r
 Tc2_System page as not found, and `TON` ranked BA2 helper functions first. This server does not ship
 an index:
 
-* **What exists** comes from `infosys.beckhoff.com/sitemap.xml` (every English page URL with its
+* **Source (0.8.3+): the Help Viewer package on this PC, by default.** TwinCAT XAE installs the complete
+  Information System as `BKINFOSYS3_VS_100_EN-US.<n>.mshc` under
+  `%ProgramData%\Microsoft\HelpLibrary2\Catalogs\<catalog>\ContentStore\EN-US\` (≈ 1 GB, ≈ 50k pages,
+  ≈ 280 books). It is a zip of `<book>/1033/<pageid>.html` with the **same page ids as the website**, so
+  every page is stored under its real `https://infosys.beckhoff.com/content/1033/<book>/<id>.html` URL.
+  `docs.source = "local"` (default): no network call at all, no web fallback; the newest package is found
+  automatically (`[docs] mshc` to pin one); every TwinCAT 3 book is indexed in the background on first use
+  (default books first), into `<knowledge location>\infosys\helpviewer-1033` when a knowledge base folder is
+  chosen. A Help Viewer content update changes the package stamp and re-indexes everything; an unchanged
+  package is never re-read. Results carry the page's doc version (`Microsoft.Help.DisplayVersion`) and
+  `source.modified` — **the package is as old as the last Help Viewer update on this PC**; check that date
+  before trusting a page about a new build or library version. `infosys_get_page` reads any page in the package,
+  indexed or not, with its breadcrumb. `docs.source = "web"` brings back the behaviour below.
+* **What exists** (web) comes from `infosys.beckhoff.com/sitemap.xml` (every English page URL with its
   `lastmod`), cached a week. `infosys_books` groups it by book (`tcplclib_tc2_system`, `tf6100_tc3_opcua`,
   `el3xxx`…) with page counts; TwinCAT 2 books are dropped (`tcplclib<name>` without underscore,
   `twincat2/`). `Tc2_System`, `Tc2_Standard`, `Tc2_Utilities` are TwinCAT 3 libraries and stay.
@@ -387,7 +400,7 @@ an index:
   fetches them for title/excerpt and caches them. `backend` in the result says which path answered.
   `docs.web_fallback=false` turns it off.
 
-Config (`[docs]` in the TOML / `TCMCP_DOCS*`): `enabled`, `books` (indexed on first use), `exclude_books`
+Config (`[docs]` in the TOML / `TCMCP_DOCS*`): `source` (local | web), `mshc`, `enabled`, `books` (indexed first), `exclude_books`
 (regexes), `tc3_only`, `max_workers` (≤16; be polite), `max_index_pages`, `sitemap_ttl_days`,
 `web_fallback`, `cache_dir`. Nothing here touches a PLC; all seven tools are read-only class.
 
@@ -436,6 +449,8 @@ The XAE and System-Service paths are written against Beckhoff's Infosys document
 Anything that fails: the tool error text contains the ADS/HRESULT code; paste it back and the fix is usually one constant.
 
 ## Changelog
+
+**0.8.3** — Infosys offline from the Help Viewer package. `docs.source = "local"` (default) reads the `BKINFOSYS3_*.mshc` TwinCAT XAE installs (found under `%ProgramData%\Microsoft\HelpLibrary2`, or `[docs] mshc`): every TwinCAT 3 book indexed in the background (default books first), pages keyed by their real infosys.beckhoff.com URL, no network call and no web fallback; results carry the doc version and the package date; a new package re-indexes, an unchanged one is never re-read; index next to the knowledge base. Missing package → the infosys tools say where they looked and how to fix it (`docs.source = "web"` keeps the website path). Infosys tools no longer crash when the index is disabled.
 
 **0.8.2** — TwinCAT Scope next to the ADS recorder. `scope_export` runs Beckhoff's `TC3ScopeExportTool.exe` (`"svd=<file>" target=<csv> silent`, TE130x / TF3300 folders, `[scope] export_tool`) on a saved `.svdx`, never edits its CSV, and writes a signed `<csv>.provenance.json` (source and tool SHA-256, command line). Through the XAE Automation Interface (`IMeasurementScope` of a Measurement project): `scope_list`, `scope_record` start / stop / save (SaveSVD + ExportCSV into `<recordings>/scope`). `rec_start(also_scope=true, scope=…)` starts the Scope configuration with the recording; `rec_stop` stops it, saves `<id>.svdx`, exports `<id>.scope.csv` (falls back to the export tool) and writes a signed `<id>.scope.json` with both SHA-256s; the files are read-only. `[recorder] also_scope = "ask"` (default) asks the user whenever XAE has a Scope configuration open — by prompt, or with `allow_elicitation = false` by an error telling the agent to ask and call again; `always` / `never`. New tool group `scope`; 155 tools. The XAE Scope calls are late-bound against the documented interface and not yet run against a real Scope View.
 

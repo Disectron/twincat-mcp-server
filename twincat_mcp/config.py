@@ -113,6 +113,10 @@ DEFAULT_DOCS_BOOKS = (
 class DocsConfig:
     """Beckhoff Infosys reference lookup (infosys_* tools)."""
     enabled: bool = True
+    # "local" = the Help Viewer package TwinCAT XAE installs (BKINFOSYS3_*.mshc, every book, offline; no network
+    # call at all); "web" = infosys.beckhoff.com (sitemap + page fetches + optional DuckDuckGo fallback)
+    source: str = "local"
+    mshc: str | None = None                # the .mshc (or its folder); None = newest under %ProgramData%\Microsoft\HelpLibrary2
     cache_dir: str | None = None           # None -> ~/.twincat_mcp/infosys
     books: list[str] = field(default_factory=lambda: list(DEFAULT_DOCS_BOOKS))
     exclude_books: list[str] = field(default_factory=list)   # extra regexes on the book slug
@@ -184,6 +188,7 @@ class Config:
     warnings: list[str] = field(default_factory=list)   # values that were ignored or corrected at load (tc_doctor shows them)
     overrides: list[dict[str, Any]] = field(default_factory=list)   # env var beat a TOML value (N10)
     toml_keys: list[str] = field(default_factory=list)              # "section.key" set by the TOML file
+    docs_cache_explicit: bool = False      # docs.cache_dir came from the TOML / env (not the default)
 
     # ------------------------------------------------------------------ dump
     def to_dict(self) -> dict[str, Any]:
@@ -319,6 +324,10 @@ def _apply_env(cfg: Config) -> None:
         cfg.docs.web_fallback = b
     if v := _env("TCMCP_DOCS_CACHE"):
         cfg.docs.cache_dir = v
+    if v := _env("TCMCP_DOCS_SOURCE"):
+        cfg.docs.source = v.lower()
+    if v := _env("TCMCP_DOCS_MSHC"):
+        cfg.docs.mshc = v
     if v := _env("TCMCP_EXPERIMENTS"):
         cfg.project.experiments_dir = v
     if v := _env("TCMCP_TCUNIT_RESULT"):
@@ -388,6 +397,11 @@ def validate(cfg: Config) -> list[str]:
         problems.append("ads.ams_port out of range")
     if cfg.project.root is None and cfg.xae.solution_path:
         cfg.project.root = str(Path(cfg.xae.solution_path).parent)
+    cfg.docs.source = str(cfg.docs.source or "local").lower()
+    if cfg.docs.source not in ("local", "web"):
+        cfg.warnings.append(f"docs.source = {cfg.docs.source!r} is not local | web — using local.")
+        cfg.docs.source = "local"
+    cfg.docs_cache_explicit = cfg.docs.cache_dir is not None
     if cfg.docs.cache_dir is None:
         cfg.docs.cache_dir = str(_home() / "infosys")
     if cfg.project.experiments_dir is None:
