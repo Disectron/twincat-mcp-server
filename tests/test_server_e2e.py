@@ -425,3 +425,38 @@ def test_pointer_format():
     assert T.fmt_pointer(0) is None
     assert T.fmt_pointer(-114343974404328) == "0xFFFF98002F3C4018"[:2] + format((-114343974404328) & (2**64 - 1), "016X")
     assert T.fmt_pointer(0x1234, 4) == "0x00001234"
+
+
+@pytest.mark.anyio
+async def test_ipc_eventlog_token_provider_cleanup(monkeypatch, project_dir):
+    """#55: the token is checked against ipc_eventlog/<log>, not the inner process start; #56: a provider that is
+    not registered is named as such with the registered ones listed, and the temp file is deleted."""
+    install(monkeypatch)
+    from twincat_mcp import ads_files as F
+    fs: dict[str, str] = {}
+    deleted: list[str] = []
+    started: list[str] = []
+    monkeypatch.setattr(F.SystemServiceFiles, "resolve_prefix_dir", lambda self, p: r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot")
+
+    def start(self, path, directory="", command_line=""):
+        started.append(command_line)
+        out = command_line.split('> "', 1)[1].split('"', 1)[0]
+        fs[out] = "No events were found that match the specified selection criteria.\r\n===TCMCP_PROVIDERS===\r\nTwinCAT3 Scope Server\r\n"
+        return {"started": path}
+    monkeypatch.setattr(F.SystemServiceFiles, "start_process", start)
+    monkeypatch.setattr(F.SystemServiceFiles, "wait_for_file", lambda self, p, t, poll=2.0: {"exists": p in fs})
+    monkeypatch.setattr(F.SystemServiceFiles, "read_file", lambda self, p, mx=None, as_text=True, enc="utf-8": {"text": fs[p], "bytes": len(fs[p])})
+
+    def delete(self, p):
+        deleted.append(p); fs.pop(p, None)
+        return {"deleted": p}
+    monkeypatch.setattr(F.SystemServiceFiles, "delete_file", delete)
+    srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    async with client_for(srv) as s:
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "ipc_eventlog", "target": "Application"}))["confirm_token"]
+        r = payload(await s.call_tool("ipc_eventlog", {"confirm_token": tok}))
+        assert r["entries_text"] == "" and r["events"] == 0
+        assert "not registered" in r["note"] and r["providers_on_target"] == ["TwinCAT3 Scope Server"]
+        assert deleted == [r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot\tcmcp_eventlog.txt"] and not fs
+        bad = await s.call_tool("ipc_eventlog", {"provider": "x' & del C:\\*", "confirm_token": "t"})
+        assert bad.is_error and "only letters" in text(bad) and len(started) == 1

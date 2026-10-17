@@ -987,7 +987,18 @@ def _csv_val(v: Any) -> Any:
     return v
 
 
+_ADS_HINTS = {
+    6: "target port not found — nothing is listening on that AMS port (e.g. no PLC runtime on 852: only 851 exists unless a "
+       "second PLC project is activated)",
+    7: "target machine not found — the AMS route to that NetId is missing or the target is off",
+    1797: "parameter size not correct — the value does not fit the variable (string too long, wrong array length or type)",
+    1808: "symbol not found — check the spelling (ads_list_symbols) or whether the program was downloaded",
+    1861: "timeout — the target did not answer (router, route, or the target is busy/stopped)",
+}
+
+
 def _fmt_exc(exc: BaseException) -> str:
     if isinstance(exc, pyads.ADSError):
-        return f"ADSError {exc.err_code} (0x{exc.err_code:X}): {exc.msg}"
+        hint = _ADS_HINTS.get(exc.err_code)
+        return f"ADSError {exc.err_code} (0x{exc.err_code:X}): {exc.msg}" + (f" — {hint}" if hint else "")
     return f"{type(exc).__name__}: {exc}"

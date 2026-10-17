@@ -1901,21 +1901,60 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def ipc_eventlog(provider: str = "TwinCAT System Service", count: int = 50, log: str = "Application",
                            confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Windows event log of the target (Windows 7/10/11 IPCs): runs wevtutil on the IPC via
-        the System Service, then reads the result file back. Not available on Windows CE / TC-BSD
-        targets (use the XAE error list for ADS logger messages there). Destructive-class because
-        it starts a process on the IPC."""
-        await app.permit(ctx, OpClass.DESTRUCTIVE, "ipc_start_process", "wevtutil", confirm_token)
-        out = r"C:\TwinCAT\3.1\Boot\tcmcp_eventlog.txt"
+        the System Service, reads the result back and deletes the temp file. Also lists the event providers
+        registered on the target whose name contains 'TwinCAT' or 'Beckhoff', so a provider that does not exist there
+        (the default name differs between TwinCAT builds) is reported as such instead of an empty result.
+        Not available on Windows CE / TC-BSD targets. Destructive-class because it starts a process on the IPC:
+        confirm with tc_request_confirmation(action='ipc_eventlog', target=<log>)."""
+        for label, v in (("provider", provider), ("log", log)):
+            if not re.fullmatch(r"[\w .\-/]{1,120}", v or ""):
+                raise ToolError(f"{label} {v!r}: only letters, digits, space, '.', '-', '/' allowed (it goes into a command line on the IPC)")
+        await app.permit(ctx, OpClass.DESTRUCTIVE, "ipc_eventlog", log, confirm_token)
+        try:
+            folder = await app.ads_call(app.files.resolve_prefix_dir, "boot:", timeout=60)
+        except ToolError:
+            folder = r"C:\TwinCAT\3.1\Boot"
+        if folder.startswith("/"):
+            raise ToolError(f"target boot folder is {folder}: not a Windows target (wevtutil exists only on Windows IPCs)")
+        out = folder.rstrip("\\") + "\\tcmcp_eventlog.txt"
+        marker = "===TCMCP_PROVIDERS==="
         q = f"*[System[Provider[@Name='{provider}']]]"
-        cmd = f'/c wevtutil qe {log} /q:"{q}" /c:{int(count)} /rd:true /f:text > "{out}" 2>&1'
+        cmd = (f'/c wevtutil qe {log} /q:"{q}" /c:{int(count)} /rd:true /f:text > "{out}" 2>&1 '
+               f'& echo {marker} >> "{out}" & wevtutil ep | findstr /i /c:"TwinCAT" /c:"Beckhoff" >> "{out}"')
         await app.ads_call(app.files.start_process, r"C:\Windows\System32\cmd.exe", r"C:\Windows\System32", cmd, timeout=30)
-        waited = await app.ads_call(app.files.wait_for_file, out, 20, 1.0, timeout=40, slow=True)
-        if not waited.get("exists"):
-            raise ToolError("wevtutil produced no output file (Windows CE/TC-BSD target, or no permission)")
-        await asyncio.sleep(1.0)
-        txt = await app.ads_call(app.files.read_file, out, 2_000_000, True, "utf-8", timeout=120, slow=True)
-        app.audit("ipc_eventlog", {"provider": provider, "count": count}, OpClass.DESTRUCTIVE, "ok")
-        return {"provider": provider, "log": log, "entries_text": txt["text"], "bytes": txt["bytes"], "file_on_target": out}
+        try:
+            waited = await app.ads_call(app.files.wait_for_file, out, 20, 1.0, timeout=40, slow=True)
+            if not waited.get("exists"):
+                raise ToolError("wevtutil produced no output file (Windows CE/TC-BSD target, or no permission)")
+            text_ = ""
+            for _ in range(10):        # the provider listing is appended last: wait for the marker and a little after it
+                await asyncio.sleep(1.0)
+                txt = await app.ads_call(app.files.read_file, out, 2_000_000, True, "utf-8", timeout=120, slow=True)
+                text_ = txt.get("text") or ""
+                if marker in text_:
+                    await asyncio.sleep(0.5)
+                    text_ = (await app.ads_call(app.files.read_file, out, 2_000_000, True, "utf-8", timeout=120, slow=True)).get("text") or ""
+                    break
+        finally:
+            try:
+                await app.ads_call(app.files.delete_file, out, timeout=30)
+            except ToolError:
+                pass
+        entries, _, prov_txt = text_.partition(marker)
+        providers = sorted({ln.strip() for ln in prov_txt.splitlines() if ln.strip()})
+        entries = entries.strip()
+        res = {"provider": provider, "log": log, "entries_text": entries, "bytes": len(entries.encode("utf-8")),
+               "events": entries.count("Event["), "providers_on_target": providers, "temp_file_deleted": out}
+        if not entries or "No events were found" in entries:
+            res["entries_text"] = ""
+            res["note"] = (f"no events from provider {provider!r} in {log}" +
+                           ("" if any(pv.lower() == provider.lower() for pv in providers)
+                            else f" — that provider is not registered on this target; registered TwinCAT/Beckhoff providers: {providers or 'none'}"))
+        elif entries.lower().startswith(("failed to", "the specified", "access is denied")):
+            res["error"] = entries[:300]
+        app.audit("ipc_eventlog", {"provider": provider, "count": count, "log": log}, OpClass.DESTRUCTIVE, "ok",
+                  {"events": res["events"], "providers": len(providers)})
+        return res
 
     @mcp.tool(annotations=READ)
     async def tc_session_report(out_path: str | None = None) -> dict[str, Any]:
@@ -1955,16 +1994,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def ipc_read_file(path: str, max_bytes: int | None = None, as_text: bool = True,
                             encoding: str = "utf-8") -> dict[str, Any]:
-        r"""Read a file from the target IPC's file system over ADS (no share needed), e.g.
-        'C:\TwinCAT\3.1\Boot\TcUnit_xUnit_testresults.xml' or a log. Binary → base64. OS-independent
-        prefixes resolve on the target: 'boot:<name>' (TwinCAT boot folder — \Hard Disk\TwinCAT\3.1\Boot on
-        CE7), 'bootprj:', 'bootdata:', 'target:', 'config:', 'install:', 'user1:'..'user9:'."""
+        r"""Read a file from the target IPC's file system over ADS (no share needed). Binary → base64.
+        Prefer the OS-independent prefixes, which the target resolves itself: 'boot:<name>' (the live TwinCAT
+        boot folder — C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot on 3.1.4026, \Hard Disk\TwinCAT\3.1\Boot on CE7),
+        'bootprj:', 'bootdata:', 'target:', 'config:', 'install:', 'user1:'..'user9:'. On 4026 the old absolute
+        C:\TwinCAT\3.1\Boot still exists but is a stale legacy copy (e.g. a CurrentConfig.xml from years ago) —
+        do not draw conclusions from it."""
         return await app.ads_call(app.files.read_file, path, max_bytes, as_text, encoding, timeout=120, slow=True)
 
     @mcp.tool(annotations=READ)
     async def ipc_list_dir(pattern: str, max_entries: int = 500) -> dict[str, Any]:
-        r"""List files on the target matching a Win32 pattern, e.g. 'C:\TwinCAT\3.1\Boot\*' or 'boot:*'
-        (boot folder on any target OS; see ipc_read_file for the other prefixes)."""
+        r"""List files on the target matching a Win32 pattern. Prefer 'boot:*' (the live boot folder on any
+        target OS; the result names the absolute folder in resolved_pattern) over a hard-coded
+        'C:\TwinCAT\3.1\Boot\*', which is the stale legacy folder on 3.1.4026. Other prefixes: see ipc_read_file."""
         return await app.ads_call(app.files.list_dir, pattern, max_entries, timeout=60)
 
     @mcp.tool(annotations=WRITE)

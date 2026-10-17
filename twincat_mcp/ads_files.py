@@ -175,17 +175,22 @@ class SystemServiceFiles:
     # FFILEFIND ignores the path id in the index offset (observed on 3.1.4026: 'boot:*' listed System32, the
     # service's working directory). So a prefixed *listing* pattern is resolved to an absolute folder by
     # probing the known locations once per target; FOPEN honours the path id and needs no resolution.
+    # probe order: 3.1.4026 (ProgramData) first — on 4026 the old C:\TwinCAT\3.1\Boot still exists as a stale legacy copy
+    _PD = r"C:\ProgramData\Beckhoff\TwinCAT\3.1"
     _PREFIX_DIRS: dict[str, list[str]] = {
-        "boot": [r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
-        "bootprj": [r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
-        "bootdata": [r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
-        "config": [r"C:\TwinCAT\3.1\Config", r"\Hard Disk\TwinCAT\3.1\Config", "/usr/local/etc/TwinCAT/3.1/Config"],
-        "target": [r"C:\TwinCAT\3.1\Target", r"\Hard Disk\TwinCAT\3.1\Target", "/usr/local/etc/TwinCAT/3.1/Target"],
-        "install": [r"C:\TwinCAT\3.1", r"\Hard Disk\TwinCAT\3.1", "/usr/local/etc/TwinCAT/3.1"],
+        "boot": [_PD + r"\Boot", r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
+        "bootprj": [_PD + r"\Boot", r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
+        "bootdata": [_PD + r"\Boot", r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
+        "config": [_PD + r"\Config", r"C:\TwinCAT\3.1\Config", r"\Hard Disk\TwinCAT\3.1\Config", "/usr/local/etc/TwinCAT/3.1/Config"],
+        "target": [_PD + r"\Target", r"C:\TwinCAT\3.1\Target", r"\Hard Disk\TwinCAT\3.1\Target", "/usr/local/etc/TwinCAT/3.1/Target"],
+        "install": [r"C:\Program Files (x86)\Beckhoff\TwinCAT\3.1", r"C:\TwinCAT\3.1", r"\Hard Disk\TwinCAT\3.1", "/usr/local/etc/TwinCAT/3.1"],
     }
 
     def resolve_prefix_dir(self, prefix: str) -> str:
-        """Absolute folder behind 'boot:' etc. on the connected target, probed once and cached."""
+        """Absolute folder behind 'boot:' etc. on the connected target, probed once and cached. FFIND ignores ADS
+        path ids, so the folder is found by probing known locations. When several boot folders exist (4026 keeps the
+        legacy one), the one whose CurrentConfig.xml has the size the target itself returns for 'boot:CurrentConfig.xml'
+        (FOPEN honours path ids) wins; without that evidence the first in probe order (the 4026 location) wins."""
         key = (prefix.lower(), self.ads.target_label())
         cache = getattr(self, "_prefix_cache", None)
         if cache is None:
@@ -196,6 +201,7 @@ class SystemServiceFiles:
         if not cands:
             raise AdsError(f"no folder is known for the prefix {prefix!r}: ipc_list_dir needs an absolute path here "
                            f"(ipc_read_file accepts the prefix; the target resolves it for FOPEN)")
+        found: list[str] = []
         for d in cands:
             sep = "/" if d.startswith("/") else "\\"
             try:
@@ -203,9 +209,27 @@ class SystemServiceFiles:
             except AdsError:
                 continue
             if probe:
-                cache[key] = d
-                return d
-        raise AdsError(f"none of the known folders for {prefix!r} exist on the target: {cands}. Pass the absolute path.")
+                found.append(d)
+        if not found:
+            raise AdsError(f"none of the known folders for {prefix!r} exist on the target: {cands}. Pass the absolute path.")
+        pick = found[0]
+        if len(found) > 1 and prefix.lower() in ("boot", "bootprj", "bootdata"):
+            try:
+                live = self.read_file(f"{prefix}:CurrentConfig.xml", 64 << 20, False)["bytes"]
+            except Exception:  # noqa: BLE001 — no activated configuration: keep probe order
+                live = None
+            if live is not None:
+                for d in found:
+                    sep = "/" if d.startswith("/") else "\\"
+                    try:
+                        hit = self._ffind_raw(d + sep + "CurrentConfig.xml", 1)
+                    except AdsError:
+                        continue
+                    if hit and hit[0].get("size") == live:
+                        pick = d
+                        break
+        cache[key] = pick
+        return pick
 
     def _ffind_raw(self, pattern: str, max_entries: int) -> list[dict[str, Any]]:
         c = self._c()

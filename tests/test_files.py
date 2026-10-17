@@ -67,7 +67,7 @@ class FakeFS:
                 # a CE7 box: only the \Hard Disk\... boot folder exists; '.'/'..' come first like Windows returns them
                 if pattern.startswith(self.boot_dir):
                     self._iter = iter([(".", 0, True), ("..", 0, True)] + list(self.find_entries))
-                elif pattern.startswith(("C:\\TwinCAT\\3.1\\Boot", "/usr/local")):   # not on a CE7 box
+                elif pattern.startswith(("C:\\TwinCAT\\3.1\\Boot", "C:\\ProgramData", "/usr/local")):   # not on a CE7 box
                     raise pyads.ADSError(1804)
                 else:
                     self._iter = iter(self.find_entries)
@@ -170,8 +170,9 @@ def test_list_dir_boot_relative(files):
     svc, fs = files
     fs.find_entries = [("TcUnit_xUnit_testresults.xml", 10, False)] + [(f"f{i}.txt", 1, False) for i in range(5)]
     r = svc.list_dir("boot:*", max_entries=3)
-    # resolved by probing: C:\TwinCAT\3.1\Boot does not exist on this (CE7) target, \Hard Disk\... does
-    assert fs.find_patterns[0].startswith("C:\\TwinCAT") and fs.find_patterns[1].startswith(fs.boot_dir)
+    # resolved by probing: neither the 4026 ProgramData folder nor C:\TwinCAT\3.1\Boot exists on this (CE7) target, \Hard Disk\... does
+    assert fs.find_patterns[0].startswith("C:\\ProgramData") and fs.find_patterns[1].startswith("C:\\TwinCAT")
+    assert fs.find_patterns[2].startswith(fs.boot_dir)
     assert r["resolved_pattern"] == fs.boot_dir + "\\*"
     assert [e["name"] for e in r["entries"]] == ["TcUnit_xUnit_testresults.xml", "f0.txt", "f1.txt"], "'.' and '..' dropped, cap applied"
     assert r["truncated"] is True and r["count"] == 3
@@ -183,3 +184,34 @@ def test_list_dir_boot_relative(files):
     fs.find_entries = [("x", 1, False)]
     r3 = svc.list_dir(r"C:\TwinCAT\3.1\*")
     assert fs.find_patterns[-1] == r"C:\TwinCAT\3.1\*"
+
+
+def test_boot_prefix_prefers_live_folder_on_4026(files, monkeypatch):
+    """#72: on 3.1.4026 both C:\\ProgramData\\Beckhoff\\TwinCAT\\3.1\\Boot (live) and C:\\TwinCAT\\3.1\\Boot (stale legacy,
+    CurrentConfig.xml from 2012) exist. The folder whose CurrentConfig.xml matches what the target returns for
+    boot:CurrentConfig.xml (FOPEN honours path ids) wins, whatever the probe order."""
+    svc, _ = files
+    live, legacy = r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot", r"C:\TwinCAT\3.1\Boot"
+    sizes = {live: 52_311, legacy: 9_004}
+
+    def ffind(pattern, max_entries):
+        for d, sz in sizes.items():
+            if pattern == d + "\\*":
+                return [{"name": "CurrentConfig.xml", "size": sz, "is_dir": False}]
+            if pattern == d + "\\CurrentConfig.xml":
+                return [{"name": "CurrentConfig.xml", "size": sz, "is_dir": False}]
+        return []
+    monkeypatch.setattr(svc, "_ffind_raw", ffind)
+    monkeypatch.setattr(svc, "read_file", lambda path, mx=None, as_text=True, enc="utf-8": {"bytes": sizes[live]})
+    assert svc.resolve_prefix_dir("boot") == live
+    # legacy first in probe order must not matter either
+    svc._prefix_cache = {}
+    monkeypatch.setattr(type(svc), "_PREFIX_DIRS", {"boot": [legacy, live]})
+    assert svc.resolve_prefix_dir("boot") == live
+    # no activated configuration → probe order (4026 location first in the real table)
+    svc._prefix_cache = {}
+    def nofile(*a, **k):
+        raise F.AdsError("FOPEN: not found")
+    monkeypatch.setattr(svc, "read_file", nofile)
+    monkeypatch.setattr(type(svc), "_PREFIX_DIRS", {"boot": [live, legacy]})
+    assert svc.resolve_prefix_dir("boot") == live
