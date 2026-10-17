@@ -160,7 +160,11 @@ class Recording:
     def __init__(self, rid: str, name: str, symbols: list[SymbolEntry], mode: str, cycle_ms: float,
                  path: Path, ring_events: int, max_runs: int, duration_s: float | None,
                  max_events: int | None, start_when: Condition | None, stop_when: Condition | None,
-                 pre_trigger_ms: float, meta: dict[str, Any]):
+                 pre_trigger_ms: float, meta: dict[str, Any], post_trigger_s: float | None = None):
+        self.post_trigger_s = post_trigger_s
+        self.t0_mono: float | None = None          # this PC's monotonic clock at the first event (duration base)
+        self.last_t: float = 0.0                   # PLC-relative ms of the newest event
+        self._last_flush = time.monotonic()
         self.id, self.name, self.mode, self.cycle_ms, self.path = rid, name, mode, cycle_ms, path
         self.symbols = symbols
         self.types: dict[str, T.TcType] = {s.name: T.parse_type(s.type, s.size) for s in symbols}
@@ -233,8 +237,14 @@ class Recording:
                 break
             ts, name, value = item
             t = self._rel_ms(ts)
+            if self.t0_mono is None:
+                self.t0_mono = time.monotonic()
+            self.last_t = max(self.last_t, t)
             self._accept(t, name, value)
             self._check_limits()
+            if self._fh and time.monotonic() - self._last_flush > 1.0:
+                self._fh.flush()                      # rec_status file_bytes grows while recording
+                self._last_flush = time.monotonic()
             if self._stop.is_set():
                 break          # a limit was reached: do not keep draining notifications that are still arriving
         self._finish()
@@ -275,13 +285,20 @@ class Recording:
     def _check_limits(self) -> None:
         if self._stop.is_set():
             return
+        # Durations use this PC's monotonic clock from the first event, or the PLC-relative time of the newest event,
+        # whichever is reached first. Never the PLC's absolute FILETIME against time.time(): in cycle mode the
+        # notification stamp is the task's clock, which can sit seconds to minutes away from Windows time.
+        mono = (time.monotonic() - self.t0_mono) if self.t0_mono is not None else None
         if self.max_events and self.events >= self.max_events:
             self.stop_reason = f"max_events {self.max_events}"
             self._stop.set()
-        elif self.duration_s and self.t0_wall and (time.time() - self.t0_wall) >= self.duration_s:
+        elif self.post_trigger_s and self.triggered_at is not None and (self.last_t - self.triggered_at) / 1000.0 >= self.post_trigger_s:
+            self.stop_reason = f"post_trigger {self.post_trigger_s}s after the start_when trigger"
+            self._stop.set()
+        elif self.duration_s and mono is not None and (mono >= self.duration_s or self.last_t / 1000.0 >= self.duration_s):
             self.stop_reason = f"duration {self.duration_s}s"
             self._stop.set()
-        elif self.duration_s and not self.t0_wall and (time.time() - self.created) >= self.duration_s + 5:
+        elif self.duration_s and self.t0_mono is None and (time.time() - self.created) >= self.duration_s + 5:
             self.stop_reason = "duration elapsed with no data (symbols never updated?)"
             self._stop.set()
 
@@ -290,7 +307,10 @@ class Recording:
             self.stop_reason = self.stop_reason or reason
             self._stop.set()
 
+    stopped_mono: float | None = None
+
     def _finish(self) -> None:
+        self.stopped_mono = time.monotonic()
         self.stopped_at = time.time()
         cb = self.on_finish
         if cb is not None:
@@ -316,8 +336,12 @@ class Recording:
     # ------------------------------------------------------------ views
     def status(self) -> dict[str, Any]:
         with self._lock:
-            elapsed = (time.time() - self.t0_wall) if self.t0_wall and self.active else (
-                (self.stopped_at - self.t0_wall) if (self.t0_wall and self.stopped_at) else 0.0)
+            if self.t0_mono is None:
+                elapsed = 0.0
+            elif self.active:
+                elapsed = time.monotonic() - self.t0_mono
+            else:
+                elapsed = max(0.0, (self.stopped_mono or time.monotonic()) - self.t0_mono)
             return {
                 "id": self.id, "name": self.name, "active": self.active, "mode": self.mode, "cycle_ms": self.cycle_ms,
                 "symbols": len(self.symbols), "events": self.events, "dropped": self.dropped,
@@ -433,7 +457,7 @@ class Recorder:
     def start(self, *, symbols: list[str] | None, prefix: str | None, pattern: str | None, mode: str,
               cycle_ms: float, duration_s: float | None, max_events: int | None, start_when: str | None,
               stop_when: str | None, pre_trigger_ms: float, name: str | None, max_symbols: int,
-              port: int | None = None) -> dict[str, Any]:
+              port: int | None = None, post_trigger_s: float | None = None) -> dict[str, Any]:
         if mode not in ("cycle", "change", "poll"):
             raise RecorderError("mode must be cycle | change | poll")
         cycle_ms = max(float(cycle_ms), 0.1)
@@ -446,8 +470,11 @@ class Recorder:
         rate = len(syms) * 1000.0 / cycle_ms
         meta = {"ams_net_id": self.ads.net_id, "port": port or self.ads.port, "start_when": start_when,
                 "stop_when": stop_when, "pre_trigger_ms": pre_trigger_ms}
+        if post_trigger_s and not sw:
+            raise RecorderError("post_trigger_s needs start_when (it counts from the trigger)")
+        meta["post_trigger_s"] = post_trigger_s
         rec = Recording(rid, name or rid, syms, mode, cycle_ms, path, self.ring_events, self.max_runs,
-                        duration_s, max_events, sw, ew, pre_trigger_ms, meta)
+                        duration_s, max_events, sw, ew, pre_trigger_ms, meta, post_trigger_s)
         rec.start_ingest()
         try:
             if mode == "poll":
@@ -568,9 +595,9 @@ class Recorder:
     def stop(self, rid: str, reason: str = "requested") -> dict[str, Any]:
         rec = self._get(rid)
         if rec.active:
+            rec.request_stop(reason)          # reason first: a limit check racing the release must not claim the stop
             if rec.mode != "poll":
                 self._stop_notifications(rec)
-            rec.request_stop(reason)
             if rec._thread:
                 rec._thread.join(timeout=10)
             if rec._poll_thread:

@@ -215,3 +215,43 @@ def test_limit_ends_recording_promptly_even_while_notifications_keep_coming(rec)
     for i in range(200, 260):                   # late notifications after the end change nothing
         c.fire("MAIN.nCycle", i, ft(i * 10))
     assert rec.status(rid)["events"] == 5
+
+
+def test_cycle_mode_duration_independent_of_plc_clock(rec):
+    """Round 2, #1 re-check: rec_start(mode='cycle', duration_s=3) was still active at 17.8 s on the engineering PC —
+    the cyclic notification stamps come from the task clock, which can be far from Windows time. Duration is now
+    this PC's monotonic time from the first sample (or the PLC-relative span), never PLC FILETIME vs time.time()."""
+    ahead = int(90 * 1e7)                       # PLC clock 90 s ahead of Windows
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=100, duration_s=0.5,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10)
+    c = _conn()
+    c.fire("MAIN.nCycle", 1, ft(0) + ahead)
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=3)
+    s = rec.status(st["id"])
+    assert s["stop_reason"] == "duration 0.5s" and 0.3 < s["elapsed_s"] < 2.5
+    # manual stop keeps its own reason even when a limit check races it
+    st2 = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=100, duration_s=60,
+                    max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10)
+    _conn().fire("MAIN.nCycle", 2, ft(0) - ahead)   # and 90 s behind
+    out = rec.stop(st2["id"], "manual (rec_stop)")
+    assert out["stop_reason"] == "manual (rec_stop)"
+
+
+def test_post_trigger_window(rec):
+    """#69: post_trigger_s ends the recording that long after start_when fired (duration_s counts from the first sample)."""
+    with pytest.raises(RecorderError, match="needs start_when"):
+        rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=10, duration_s=None,
+                  max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10,
+                  post_trigger_s=1)
+    st = rec.start(symbols=["MAIN.nCycle", "MAIN.bStart"], prefix=None, pattern=None, mode="cycle", cycle_ms=10,
+                   duration_s=None, max_events=None, start_when="MAIN.bStart == TRUE", stop_when=None, pre_trigger_ms=0,
+                   name=None, max_symbols=10, post_trigger_s=0.1)
+    c = _conn()
+    c.fire("MAIN.bStart", True, ft(5000))
+    for ms in range(5010, 5300, 10):
+        c.fire("MAIN.nCycle", ms, ft(ms))
+    assert wait_until(lambda: not rec.status(st["id"])["active"])
+    s = rec.status(st["id"])
+    assert s["stop_reason"].startswith("post_trigger 0.1s")
+    r = rec.read(st["id"], None, None, ["MAIN.nCycle"], 1000, False)
+    assert max(x["t_ms"] for x in r["rows"]) <= 100 + 10.01   # nothing recorded past the window (+1 sample)

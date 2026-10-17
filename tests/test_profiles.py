@@ -156,5 +156,7 @@ async def test_profile_tools_e2e(monkeypatch, project_dir, tmp_path):
         assert ps["count"] >= 4 and all(i["path"].startswith("MAIN.fbFill") for i in ps["items"])
 
         assert payload(await s.call_tool("rec_profile_delete", {"name": "batch"}))["deleted"] is True
+        gone = await s.call_tool("rec_profile_delete", {"name": "does_not_exist"})      # #70: say why, not {"deleted": false}
+        assert gone.is_error and "not found" in gone.content[0].text
         res = await s.call_tool("rec_profile_get", {"name": "batch"})
         assert res.is_error and "no profile" in res.content[0].text

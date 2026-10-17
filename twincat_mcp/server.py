@@ -999,7 +999,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         mode: str = "change", cycle_ms: float = 10, duration_s: float | None = None,
                         max_events: int | None = 5_000_000, start_when: str | None = None,
                         stop_when: str | None = None, pre_trigger_ms: float = 0, name: str | None = None,
-                        max_symbols: int = 500) -> dict[str, Any]:
+                        max_symbols: int = 500, post_trigger_s: float | None = None) -> dict[str, Any]:
         """Start a continuous real-time recording of online PLC variables (runs in the background
         until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or
         struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it)
@@ -1007,11 +1007,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (ADS notification, cycle-accurate); 'change' = PLC-timestamped sample only when the value
         changes (checked every cycle_ms); 'poll' = sum-read every cycle_ms from this PC.
         Triggers: start_when='MAIN.bStart == TRUE' with pre_trigger_ms keeps the events before the
-        trigger (scope-style); stop_when='MAIN.fbFill.bDone == TRUE'. Events stream to a JSONL file."""
+        trigger (scope-style); stop_when='MAIN.fbFill.bDone == TRUE'. Events stream to a JSONL file.
+        duration_s counts from the first sample (also while waiting for start_when); post_trigger_s ends the
+        recording that long after the start_when trigger fired (scope-style post-trigger window)."""
         res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
                                  cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
                                  start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
-                                 name=name, max_symbols=max_symbols, timeout=120)
+                                 name=name, max_symbols=max_symbols, post_trigger_s=post_trigger_s, timeout=120)
         app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode}, OpClass.EDIT, "ok")
         return res
 
@@ -1174,7 +1176,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         except capture.ProfileError as exc:
             raise ToolError(str(exc)) from exc
         app.audit("rec_profile_delete", {"name": name}, OpClass.EDIT, "ok" if ok else "absent")
-        return {"deleted": ok}
+        if not ok:
+            names = [x.get("name") for x in await asyncio.to_thread(app.profiles.list)][:30]
+            raise ToolError(f"profile {name!r} not found; existing profiles: {names}")
+        return {"deleted": True, "name": name}
 
     @mcp.tool(annotations=EDIT)
     async def rec_profile_start(name: str, start_when: str | None = None, stop_when: str | None = None,
@@ -1220,7 +1225,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         out = []
         for rid, rec in list(app.rec.recs.items()):
             if rec.active and (rec.name or "").startswith(f"{name}/"):
-                out.append(await app.rec_call(app.rec.stop, rid, timeout=60))
+                out.append(await app.rec_call(app.rec.stop, rid, "manual (rec_profile_stop)", timeout=60))
         if not out:
             raise ToolError(f"no live recording of profile {name!r} (rec_list shows what is running)")
         app.audit("rec_profile_stop", {"profile": name, "recordings": [o["id"] for o in out]}, OpClass.EDIT, "ok")
@@ -1260,7 +1265,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def rec_stop(id: str) -> dict[str, Any]:
         """Stop a recording, release the ADS notifications, finalize the file; returns status + stats."""
-        res = await app.rec_call(app.rec.stop, id, timeout=60)
+        res = await app.rec_call(app.rec.stop, id, "manual (rec_stop)", timeout=60)
         app.audit("rec_stop", {"id": id, "events": res.get("events")}, OpClass.EDIT, "ok")
         return res
 
