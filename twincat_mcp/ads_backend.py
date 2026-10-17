@@ -287,14 +287,38 @@ class AdsBackend:
             ptr += entry_len
         return out, {s.name.lower(): s for s in out}
 
+    def _symbol_version(self, c: pyads.Connection) -> int | None:
+        """ADSIGRP_SYM_VERSION (0xF008): one byte the runtime increments on every download / online change.
+        Checked at most every 2 s per target; None where the runtime does not offer it."""
+        key = (c.ams_net_id, c.ams_net_port)
+        vc = self.__dict__.setdefault("_symver", {})
+        hit = vc.get(key)
+        if hit and time.time() - hit[0] < 2.0:
+            return hit[1]
+        try:
+            v = int(c.read(0xF008, 0, ctypes.c_ubyte))
+        except Exception:  # noqa: BLE001
+            v = None
+        vc[key] = (time.time(), v)
+        return v
+
     def symbols_cached(self, refresh: bool = False, port: int | None = None) -> tuple[list[SymbolEntry], dict[str, SymbolEntry]]:
+        """Symbol table cache. Invalidated when the runtime's symbol version changes (download / online change /
+        activation) — not on a fixed timer; the TTL only applies where the version is not readable."""
         c = self.conn(port)
         key = (c.ams_net_id, c.ams_net_port)
         hit = self._symcache.get(key)
-        if hit and not refresh and time.time() - hit[0] < self.cfg.symbol_cache_ttl_s:
-            return hit[1], hit[2]
+        ver = self._symbol_version(c)
+        if hit and not refresh:
+            cached_ver = hit[3] if len(hit) > 3 else None
+            if ver is not None and cached_ver is not None:
+                if ver == cached_ver:
+                    return hit[1], hit[2]
+                self._dtcache.pop(key, None)        # the datatype table changed with it
+            elif time.time() - hit[0] < self.cfg.symbol_cache_ttl_s:
+                return hit[1], hit[2]
         lst, idx = self._load_symbols(c)
-        self._symcache[key] = (time.time(), lst, idx)
+        self._symcache[key] = (time.time(), lst, idx, ver)
         return lst, idx
 
     def list_symbols(self, pattern: str | None, limit: int, offset: int, refresh: bool,
@@ -354,8 +378,14 @@ class AdsBackend:
         c = self.conn(port)
         key = (c.ams_net_id, c.ams_net_port)
         hit = self._dtcache.get(key)
-        if hit and not refresh and time.time() - hit[0] < self.cfg.symbol_cache_ttl_s:
-            return hit[1]
+        ver = self._symbol_version(c)
+        dtver = self.__dict__.setdefault("_dtver", {})
+        if hit and not refresh:
+            if ver is not None and dtver.get(key) == ver:
+                return hit[1]
+            if ver is None and time.time() - hit[0] < self.cfg.symbol_cache_ttl_s:
+                return hit[1]
+        dtver[key] = ver
         try:
             ts = self._load_datatypes(c)
             err = ""

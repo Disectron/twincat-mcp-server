@@ -182,3 +182,32 @@ def test_write_reports_read_back_changed_by_plc(ads, monkeypatch):
     monkeypatch.setattr(FakeConnection, "write_by_name", one_shot)
     r = ads.write("MAIN.nCycle", 1)
     assert r["written"] == 1 and r["read_back"] == 0 and "PLC changed it after the write" in r["note"]
+
+
+def test_symbol_cache_follows_symbol_version(ads, monkeypatch):
+    """P7: the cache is reloaded when the runtime's symbol version changes (download / online change), not on a timer."""
+    from tests.fake_ads import FakeConnection
+    ver = {"v": 3}
+    orig = FakeConnection.read
+
+    def read(self, igrp, ioffs, dt, return_ctypes=False, check_length=True):
+        if igrp == 0xF008:
+            return ver["v"]
+        return orig(self, igrp, ioffs, dt, return_ctypes, check_length)
+    monkeypatch.setattr(FakeConnection, "read", read)
+    loads = {"n": 0}
+    orig_load = ads._load_symbols
+
+    def counting(c):
+        loads["n"] += 1
+        return orig_load(c)
+    monkeypatch.setattr(ads, "_load_symbols", counting)
+    ads.cfg.symbol_cache_ttl_s = 0            # a timer would reload on every call
+    ads.symbols_cached()
+    ads.__dict__.get("_symver", {}).clear()
+    ads.symbols_cached()
+    assert loads["n"] == 1                     # same version: cached despite the zero TTL
+    ver["v"] = 4
+    ads.__dict__.get("_symver", {}).clear()
+    ads.symbols_cached()
+    assert loads["n"] == 2                     # online change: reloaded
