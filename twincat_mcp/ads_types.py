@@ -79,6 +79,10 @@ class DtEntry:
 
     def summary(self) -> dict[str, Any]:
         d: dict[str, Any] = {"name": self.name, "type": self.type, "size": self.size, "ads_type": ADST_NAME.get(self.data_type, self.data_type)}
+        if not self.type:
+            # the table leaves 'type' empty for composite entries; say what the entry is
+            d["type"] = "ENUM" if self.enum else ("ARRAY" if self.dims else ("FUNCTION_BLOCK/STRUCT" if self.subitems else self.name))
+            d["kind"] = "enum" if self.enum else ("array" if self.dims else ("composite" if self.subitems else "scalar"))
         if self.dims:
             d["array"] = [{"lbound": lb, "elements": e} for lb, e in self.dims]
         if self.subitems:
@@ -251,8 +255,13 @@ class TypeSystem:
                 if len(out) >= max_leaves:
                     return
             return
-        # alias chain (e.g. T_MaxString -> STRING(255))
+        # alias chain (e.g. T_MaxString -> STRING(255); on 4026 the table also carries BOOL -> BYTE / BIT)
         if e.type and e.type.lower() != e.name.lower() and self.get(e.type) is not None and not e.enum:
+            tgt = self.get(e.type)
+            if tgt is not None and not tgt.subitems and not tgt.dims and not tgt.enum:
+                # scalar alias: keep the declared name (BOOL, T_MaxString), take the storage from the base type
+                out.append(Leaf(path, e.name, off, e.size or tgt.size, tgt.data_type or e.data_type, None))
+                return
             self._expand(path, e.type, off, out, max_leaves, max_array, None, depth + 1)
             return
         out.append(Leaf(path, e.name if entry is None else e.type, off, e.size, e.data_type, e.enum or None))

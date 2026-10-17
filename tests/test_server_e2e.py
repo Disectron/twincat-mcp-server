@@ -124,13 +124,24 @@ async def test_mode_ceiling_and_readonly(monkeypatch, project_dir):
     install(monkeypatch)
     srv = build_server(mk_cfg(project_dir, mode="readonly", max_mode="guarded"))
     async with client_for(srv) as s:
+        # escalation needs a confirmation first (readonly is the start mode here)
         res = await s.call_tool("tc_set_mode", {"mode": "full"})
-        assert res.is_error and "ceiling" in text(res)
+        assert res.is_error and "tc_request_confirmation" in text(res)
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "tc_set_mode", "target": "full"}))["confirm_token"]
+        res = await s.call_tool("tc_set_mode", {"mode": "full", "confirm_token": tok})
+        assert res.is_error and "ceiling" in text(res), "confirmed, but still above max_mode"
         res = await s.call_tool("proj_set_code", {"name": "MAIN", "implementation": ";"})
         assert res.is_error and "readonly" in text(res)
-        assert payload(await s.call_tool("tc_set_mode", {"mode": "guarded"}))["mode"] == "guarded"
+        res = await s.call_tool("tc_set_mode", {"mode": "guarded"})
+        assert res.is_error, "readonly -> guarded is an escalation too"
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "tc_set_mode", "target": "guarded"}))["confirm_token"]
+        r = payload(await s.call_tool("tc_set_mode", {"mode": "guarded", "confirm_token": tok}))
+        assert r["mode"] == "guarded" and r["escalated"]
         res = await s.call_tool("proj_set_code", {"name": "MAIN", "implementation": ";"})
         assert not res.is_error
+        # lowering is free
+        r = payload(await s.call_tool("tc_set_mode", {"mode": "readonly"}))
+        assert r["mode"] == "readonly" and not r["escalated"]
 
 
 @pytest.mark.anyio
@@ -224,7 +235,8 @@ async def test_whole_project_variable_tools(monkeypatch, project_dir, tmp_path):
         extra = {e["path"] for e in cmp_["extra_online"]}
         assert "MAIN.fbFill.fbValve.bOpen" in missing and "GVL_Machine.bEStop" in missing and "MAIN.fbFill.arrWeights[7]" in missing
         assert "MAIN.fbFill.arrWeights[2]" not in missing and "MAIN.nCycle" not in missing
-        assert "main.slabel" in extra and "main.arrsteps[1].nid" in extra and "main.fbvalve2.bopen" in extra
+        extra_l = {e.lower() for e in extra}
+        assert "main.slabel" in extra_l and "main.arrsteps[1].nid" in extra_l and "main.fbvalve2.bopen" in extra_l   # PLC spelling kept
         assert cmp_["matched"] >= 10
 
 
@@ -265,7 +277,9 @@ async def test_safety_guard_hmi_export_report(monkeypatch, project_dir, tmp_path
         res = await s.call_tool("xae_tree_consume_xml", {"path": "TISC^Safety^Group1", "xml": "<x/>"})
         assert res.is_error and "TwinSAFE" in text(res)
         h = payload(await s.call_tool("hmi_scan", {}))
-        assert h["bindings"] == 5
+        assert h["bindings"] == 11 and h["files"] == 3  # 5 TE2000 (.view/.json) + 6 TF1800 (.TcVIS)
+        tw = payload(await s.call_tool("hmi_bindings", {"pattern": "*", "kind": "tcvis_write"}))
+        assert {b["plc_symbol"] for b in tw["bindings"]} == {"MAIN.bStart", "MAIN.nCycle"}
         v = payload(await s.call_tool("hmi_vs_runtime", {}))
         assert v["broken"] == 1 and v["broken_bindings"][0]["symbol"] == "MAIN.fbFill.rGhostValue"
         e = payload(await s.call_tool("ads_export", {"types": ["ST_Step"], "fmt": "csharp"}))

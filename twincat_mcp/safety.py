@@ -139,6 +139,10 @@ class Guard:
                     f"(machine {scope or 'n/a'}). Single use. Re-read the target before you use it.",
         }
 
+    def consume_token(self, token: str | None, action: str, target: str, scope: str = "") -> None:
+        """Validate and spend a token without the mode gate (tc_set_mode escalation)."""
+        self._consume_token(token, action, target, scope)
+
     def _consume_token(self, token: str | None, action: str, target: str, scope: str = "") -> None:
         if not token:
             raise SafetyError(

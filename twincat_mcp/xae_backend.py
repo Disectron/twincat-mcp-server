@@ -48,6 +48,7 @@ else:  # pragma: no cover
 RPC_E_CALL_REJECTED = -2147418111        # 0x80010001
 RPC_E_SERVERCALL_RETRYLATER = -2147417846  # 0x8001010A
 RPC_E_DISCONNECTED = -2147417848        # 0x80010108
+RPC_S_SERVER_UNAVAILABLE = -2147023174  # 0x800706BA — the shell was closed/reopened; our DTE proxy points at a dead process
 
 VS_WINDOW_ERRORLIST = "{D78612C7-9962-4B83-95D9-268046DAD23A}"
 VS_WINDOW_OUTPUT = "{34E76E81-EE4A-11D0-AE2E-00A0C90FFFC3}"
@@ -64,6 +65,9 @@ POU_SUBTYPE = {
     "property_set": 614, "gvl": 615, "transition": 616, "interface": 618,
     "visualization": 619, "alias": 623, "parameter_list": 629,
 }
+
+TREEITEMTYPE_PLCAPP = 56          # the nested "<Name> Project" node of a PLC project (ITcPlcIECProject)
+PLC_PROJECT_FOLDERS = ("POUs", "DUTs", "GVLs", "VISUs", "References", "External Types", "PlcTask")
 
 PLC_LOGIN_COMMANDS = {
     "login": ["PLC.Login", "OtherContextMenus.PlcProject.Login"],
@@ -121,10 +125,26 @@ class XaeBackend:
                     time.sleep(delay)
                     delay = min(delay * 1.5, 2.0)
                     continue
-                if hr == RPC_E_DISCONNECTED:
+                if hr in (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE):
                     self.dte = self.sysman = None
+                    if not getattr(self, "_reattaching", False):
+                        # the solution was closed and reopened (or the shell restarted): find the live shell and retry once
+                        self._reattaching = True
+                        try:
+                            self.attach()
+                            log.warning("%s: DTE proxy was dead (0x%08X); re-attached to the running shell and retrying", what, hr & 0xFFFFFFFF)
+                            return fn()
+                        except Exception as exc2:  # noqa: BLE001
+                            self.dte = self.sysman = None
+                            raise XaeError(f"{what}: XAE shell disconnected (closed or restarted); re-attach did not help: "
+                                           f"{_com_msg(exc2) if hasattr(exc2, 'hresult') else exc2}. Re-run xae_attach.") from exc2
+                        finally:
+                            self._reattaching = False
                     raise XaeError(f"{what}: XAE shell disconnected (closed or crashed). Re-run xae_attach.") from exc
-                raise XaeError(f"{what}: {_com_msg(exc)}") from exc
+                msg = _com_msg(exc)
+                if "logged into" in msg.lower() or "logged in" in msg.lower():
+                    msg += " — XAE is logged in to the PLC; the project cannot be changed online. Log out first: xae_plc('logout')."
+                raise XaeError(f"{what}: {msg}") from exc
 
     def _need(self) -> Any:
         if self.dte is None:
@@ -455,23 +475,79 @@ class XaeBackend:
                     break
         return {"count": len(out), "commands": out}
 
+    # 4026 shells name the PLC commands after the *active* PLC project: PLC.LogintoUntitled1,
+    # PLC.LogoutfromUntitled1, PLC.StartUntitled1 … and PLC.Logintonone when no project is active.
+    _PLC_VERB = {"login": "Login", "logout": "Logout", "start": "Start", "stop": "Stop", "reset_cold": "ResetCold",
+                 "reset_origin": "ResetOrigin", "download": "Download", "online_change": "Login"}
+
+    def _dynamic_plc_commands(self, action: str) -> list[str]:
+        verb = self._PLC_VERB.get(action, "").lower()
+        if not verb:
+            return []
+        names = self.list_commands("PLC.", 500).get("commands", [])
+        out = []
+        for nm in names:
+            low = nm.lower()
+            if not low.startswith("plc." + verb):
+                continue
+            if low.startswith(("plc.loginto", "plc.logoutfrom")) and verb in ("login", "logout") \
+                    or low == "plc." + verb or (low.startswith("plc." + verb) and verb not in ("login", "logout")):
+                out.append(nm)
+        # the real project first, the 'none' placeholder last
+        return sorted(out, key=lambda n: (n.lower().endswith("none"), n))
+
+    def _select_plc_project_node(self) -> str | None:
+        """Make a PLC project the active one by selecting its node in Solution Explorer (what a click does)."""
+        try:
+            dte = self._need()
+            sol_name = Path(str(dte.Solution.FullName)).stem
+            projs = self.plc_projects().get("projects") or []
+            if not projs:
+                return None
+            pname = str(projs[0].get("name") or "").removesuffix(" Project")
+            se = dte.ToolWindows.SolutionExplorer
+            for cand in (f"{sol_name}\\{pname}\\{pname} Project", f"{sol_name}\\PLC\\{pname}\\{pname} Project",
+                         f"{sol_name}\\{pname}"):
+                try:
+                    item = se.GetItem(cand)
+                    item.Select(1)   # vsUISelectionTypeSelect
+                    return cand
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
     def plc_action(self, action: str) -> dict[str, Any]:
-        """login/logout/start/stop/reset_cold/reset_origin/download via DTE
-        commands. Command availability differs between XAE Shell versions;
-        every candidate is tried and the outcome reported."""
-        cands = PLC_LOGIN_COMMANDS.get(action)
+        """login/logout/start/stop/reset_cold/reset_origin/download via DTE commands. Command names
+        differ between shells (4024: PLC.Login; 4026: PLC.Loginto<ActiveProject>): the static names are
+        tried first, then the shell's own PLC.* list; a '…none' variant means no PLC project is active,
+        so the project node is selected in Solution Explorer and the list re-read."""
+        cands = list(PLC_LOGIN_COMMANDS.get(action) or [])
         if not cands:
             raise XaeError(f"unknown PLC action {action!r}; valid: {list(PLC_LOGIN_COMMANDS)}")
-        tried = []
-        for c in cands:
-            try:
-                self.command(c)
-                return {"action": action, "command": c, "ok": True, "tried": tried}
-            except XaeError as exc:
-                tried.append({"command": c, "error": str(exc)})
+        tried: list[dict[str, str]] = []
+        selected = None
+        for attempt in range(2):
+            dyn = [c for c in self._dynamic_plc_commands(action) if c not in cands]
+            real = [c for c in dyn if not c.lower().endswith("none")]
+            if not real and dyn and attempt == 0:
+                selected = self._select_plc_project_node()     # only '…none' offered: no active project
+                if selected:
+                    continue
+            for c in cands + real:
+                try:
+                    self.command(c)
+                    return {"action": action, "command": c, "ok": True, "tried": tried, "selected_node": selected}
+                except XaeError as exc:
+                    tried.append({"command": c, "error": str(exc)[:200]})
+            break
+        offered = self._dynamic_plc_commands(action)
         raise XaeError(
-            f"no working DTE command for {action!r}: {tried}. Use xae_list_commands('PLC') "
-            "to see what this shell exposes, or use ads_plc_state for run/stop/reset via ADS."
+            f"no working DTE command for {action!r}: tried {[t['command'] for t in tried]}; this shell offers {offered or 'nothing matching'}. "
+            + ("A '…none' command means no PLC project is active: click the PLC project node once in Solution Explorer, then retry. "
+               if any(o.lower().endswith("none") for o in offered) else "")
+            + "ads_plc_state covers run/stop/reset via ADS without the shell."
         )
 
     # ------------------------------------------------------------ target / activate
@@ -534,18 +610,36 @@ class XaeBackend:
         def walk(it: Any, lvl: int) -> None:
             if lvl > depth or len(out) >= max_items:
                 return
+            children: list[Any] = []
             try:
                 n = int(it.ChildCount)
+                for i in range(1, n + 1):
+                    try:
+                        children.append(it.Child(i))
+                    except Exception:  # noqa: BLE001
+                        continue
             except Exception:  # noqa: BLE001
-                return
-            for i in range(1, n + 1):
+                n = 0
+            if not children:
+                # the nested PLC project node (ItemType 56) does not enumerate its children through ChildCount;
+                # its folders are reachable by path
                 try:
-                    ch = it.Child(i)
+                    ptype = str(it.ItemType)
+                    ppath = str(it.PathName)
                 except Exception:  # noqa: BLE001
-                    continue
+                    ptype, ppath = "", ""
+                if ptype == str(TREEITEMTYPE_PLCAPP) or str(getattr(it, "Name", "")).endswith(" Project"):
+                    for sub in PLC_PROJECT_FOLDERS:
+                        try:
+                            children.append(self._sm().LookupTreeItem(f"{ppath}^{sub}"))
+                        except Exception:  # noqa: BLE001
+                            continue
+            for ch in children:
                 d = self._item_dict(ch)
                 d["depth"] = lvl
                 out.append(d)
+                if len(out) >= max_items:
+                    return
                 if lvl < depth:
                     walk(ch, lvl + 1)
 
@@ -609,9 +703,12 @@ class XaeBackend:
         res = self.tree_children("TIPC", depth=2)
         projs = []
         for it in res["items"]:
-            if it.get("depth") == 2 and str(it.get("Name", "")).endswith(" Project"):
-                projs.append({"name": it["Name"], "path": it.get("PathName")})
-        return {"count": len(projs), "projects": projs, "raw": res["items"]}
+            name = str(it.get("Name", ""))
+            if str(it.get("ItemType")) == str(TREEITEMTYPE_PLCAPP) or name.endswith(" Project"):
+                projs.append({"name": name, "path": it.get("PathName"), "item_type": it.get("ItemType"),
+                              "plc_project_path": it.get("PathName")})
+        return {"count": len(projs), "projects": projs, "raw": res["items"],
+                "note": "plc_project_path is what xae_deploy / xae_links / tcunit_run take; POUs live at <path>^POUs"}
 
     def pou_get(self, path: str, include_subitems: bool = True) -> dict[str, Any]:
         it = self._item(path)
@@ -778,14 +875,25 @@ class XaeBackend:
 
     def check_all_objects(self) -> dict[str, Any]:
         """PLC 'Check all objects' (compile every POU incl. unused) via command."""
-        for c in ("PLC.CheckAllObjects", "OtherContextMenus.PlcProject.CheckAllObjects"):
+        cands = ["PLC.CheckAllObjects", "OtherContextMenus.PlcProject.CheckAllObjects"]
+        # the name varies by shell and UI language (4026: PLC.CheckAllObjects<Project>, localised shells differ):
+        # take whatever the shell lists under 'Check' that is not a plain syntax check
+        try:
+            listed = self.list_commands("Check", 200).get("commands", [])
+            cands += [c for c in listed if "checkallobject" in c.lower().replace(" ", "") and c not in cands]
+        except XaeError:
+            listed = []
+        tried = []
+        for c in cands:
             try:
                 self.command(c)
                 time.sleep(1.0)
                 return {"command": c, **self.errors()}
-            except XaeError:
-                continue
-        raise XaeError("CheckAllObjects command not found in this shell; use xae_build instead")
+            except XaeError as exc:
+                tried.append({"command": c, "error": str(exc)[:120]})
+        raise XaeError(f"no CheckAllObjects command found in this shell (tried {[t['command'] for t in tried]}; "
+                       f"shell lists {listed[:10]}). Unused POUs are then not compiled — xae_build still compiles everything "
+                       f"referenced. In the IDE: right-click the PLC project → Check all objects.")
 
 
 # ----------------------------------------------------------------------------

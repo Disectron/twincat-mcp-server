@@ -9,3 +9,4 @@ twincat_mcp.toml
 dist/
 packaging/mcpb/.build-home/
 build/
+.tools-md-home/

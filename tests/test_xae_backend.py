@@ -225,7 +225,8 @@ def test_tree_ops(xae):
     be, dte, sm = xae
     ch = be.tree_children("TIPC", depth=3)
     assert [c["Name"] for c in ch["items"]] == ["Plc", "Plc Project", "POUs"]
-    assert be.plc_projects()["projects"] == [{"name": "Plc Project", "path": "TIPC^Plc^Plc Project"}]
+    pj = be.plc_projects()["projects"]
+    assert [(x["name"], x["path"], x["plc_project_path"]) for x in pj] == [("Plc Project", "TIPC^Plc^Plc Project", "TIPC^Plc^Plc Project")]
     r = be.tree_set_values("TIRC^Tasks^PlcTask", {"TaskDef/CycleTime": "50000"})
     assert r["changed"]["TaskDef/CycleTime"] == {"old": "100000", "new": "50000"}
     assert "<CycleTime>50000</CycleTime>" in sm.items["TIRC^Tasks^PlcTask"].consumed[0]

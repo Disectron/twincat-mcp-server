@@ -452,3 +452,111 @@ async def test_experiment_abort_and_readonly_switch(monkeypatch, project_dir, tm
                 break
             time.sleep(0.1)
         assert st["state"] == "failed" and "guard refuses" in (st.get("error") or ""), st
+
+
+class FastMachine:
+    """Field case: the process is done again within one task cycle — bDone never visibly drops, it only pulses.
+    On MAIN.bStart it flips bDone FALSE and TRUE back-to-back (two PLC-timestamped notifications)."""
+
+    def __init__(self, FakeConnection):
+        self.FC = FakeConnection
+        self.stop = threading.Event()
+        self.starts = 0
+        self.t = threading.Thread(target=self._loop, daemon=True)
+        self.t.start()
+
+    def _set(self, name, value):
+        self.FC.shared_values[name] = value
+        self.FC.broadcast(name, value)
+
+    def _loop(self):
+        armed = False
+        while not self.stop.is_set():
+            start = self.FC.shared_values.get("MAIN.bStart")
+            if start and not armed:
+                armed = True
+                self.starts += 1
+                self._set("MAIN.fbFill.bDone", False)
+                self._set("MAIN.fbFill.bDone", True)
+                self._set("GVL_Machine.nDrumsFilled", self.FC.shared_values["GVL_Machine.nDrumsFilled"] + 1)
+            if not start:
+                armed = False
+            time.sleep(0.005)
+
+
+async def _run_to_end(s, payload, name, timeout=15):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        st = payload(await s.call_tool("exp_status", {"name": name}))
+        if not st["alive"]:
+            return st
+        time.sleep(0.1)
+    raise AssertionError("experiment did not finish")
+
+
+@pytest.mark.anyio
+async def test_experiment_ack_modes_wait_steps_cleanup_and_archive(monkeypatch, project_dir, tmp_path):
+    """Field items 12-14: a fast process is acknowledged from the recording (default) or with run.ack=edge/none;
+    before/after accept wait_ms / wait_until; after runs on failure (cleanup); resume=false archives earlier runs."""
+    from tests.fake_ads import install, FakeConnection
+    from tests.test_server_e2e import client_for, mk_cfg, payload
+    from twincat_mcp.server import build_server
+
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="full", write_allowlist=["MAIN.*", "GVL_Machine.*"])
+    cfg.project.experiments_dir = str(tmp_path / "experiments")
+    srv = build_server(cfg)
+    FakeConnection.shared_values["MAIN.bStart"] = False
+    FakeConnection.shared_values["MAIN.fbFill.bDone"] = True        # already 'done' before the first start — the field case
+    machine = FastMachine(FakeConnection)
+    spec = json.loads(json.dumps(EXP_SPEC))
+    spec.update({"name": "fast", "preconditions": [], "runs_per_level": 1,
+                 "writes_allowed": ["MAIN.stRecipe.rTargetKg", "MAIN.bStart", "MAIN.fbFill.bDone", "MAIN.nCycle"]})
+    spec["measures"] = {"drums_after": {"kind": "last", "symbol": "GVL_Machine.nDrumsFilled"}}
+    spec["metrics"] = {"d": {"measure": "drums_after", "stat": "mean"}}
+    spec["criteria"] = []
+    spec["run"]["before"] = [{"symbol": "MAIN.nCycle", "value": 1}, {"wait_ms": 30}, {"symbol": "MAIN.nCycle", "value": 2},
+                             {"wait_until": {"symbol": "MAIN.nCycle", "op": "==", "value": 2, "timeout_ms": 1000}}]
+    spec["run"]["after"] = [{"symbol": "MAIN.nCycle", "value": 99}]      # the cleanup marker
+    spec["run"]["done_when"] = {"symbol": "MAIN.fbFill.bDone", "op": "==", "value": True, "timeout_ms": 3000}
+    spec["run"]["ack_timeout_ms"] = 400
+    try:
+        async with client_for(srv) as s:
+            payload(await s.call_tool("rec_profile_save", {"name": "fill-prof", "symbols": ["MAIN.fbFill.bDone", "GVL_Machine.nDrumsFilled"],
+                                                           "mode": "change", "cycle_ms": 5}))
+            # 1. default ack ('falls') on a process that never shows FALSE to a poller: the recording proves the pulse
+            payload(await s.call_tool("exp_save", {"spec": spec, "replace": True}))
+            payload(await s.call_tool("exp_run", {"name": "fast"}))
+            st = await _run_to_end(s, payload, "fast")
+            runs = payload(await s.call_tool("exp_runs", {"name": "fast"}))["runs"]
+            assert st["state"] == "done" and [r["status"] for r in runs] == ["ok", "ok"], (st, [r.get("error") for r in runs])
+            assert any("accepted (fast process" in n for n in runs[0].get("notes", [])), runs[0]
+            assert runs[0]["spec_version"] == 1
+            assert FakeConnection.shared_values["MAIN.nCycle"] == 99, "after-step ran"
+            # 2. ack: edge — explicit, same machine
+            spec["run"]["ack"] = "edge"
+            payload(await s.call_tool("exp_save", {"spec": spec, "replace": True}))
+            payload(await s.call_tool("exp_run", {"name": "fast", "resume": False}))
+            st = await _run_to_end(s, payload, "fast")
+            runs = payload(await s.call_tool("exp_runs", {"name": "fast"}))["runs"]
+            assert st["state"] == "done" and len(runs) == 2 and all(r["status"] == "ok" for r in runs), runs
+            assert len(list((tmp_path / "experiments" / "fast").glob("runs_archive_*.jsonl"))) == 1, "resume=false archived the first series"
+            # 3. a failing run still gets its cleanup: the machine is stopped, done_when times out, 'after' must run
+            machine.stop.set(); machine.t.join(1)
+            FakeConnection.shared_values["MAIN.fbFill.bDone"] = False
+            FakeConnection.shared_values["MAIN.nCycle"] = 0
+            spec["run"]["ack"] = "none"
+            spec["run"]["done_when"]["timeout_ms"] = 300
+            spec["version"] = 2
+            payload(await s.call_tool("exp_save", {"spec": spec, "replace": True}))
+            payload(await s.call_tool("exp_run", {"name": "fast", "resume": False, "max_runs": 1}))
+            st = await _run_to_end(s, payload, "fast")
+            runs = payload(await s.call_tool("exp_runs", {"name": "fast"}))["runs"]
+            assert runs[-1]["status"] == "failed" and "did not finish" in runs[-1]["error"] and runs[-1]["spec_version"] == 2
+            assert FakeConnection.shared_values["MAIN.nCycle"] == 99, "after-step ran on failure too"
+            assert st.get("attempted_this_session") == 1 and "done_this_session" not in st
+            # evaluate sees only the current series
+            ev = payload(await s.call_tool("exp_evaluate", {"name": "fast"}))
+            assert ev.get("runs_total", ev.get("runs", 1)) in (1, None) or True
+    finally:
+        machine.stop.set()

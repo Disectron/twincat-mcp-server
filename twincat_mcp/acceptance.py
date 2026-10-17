@@ -558,6 +558,14 @@ class Acceptance:
                 self.skip(ph, t, "needs ADS")
         await self.expect_refusal(ph, "ipc_reboot", {}, ("confirm", "elicitation", "readonly"))
         await self.expect_refusal(ph, "tc_allow_write", {"pattern": "ACCEPTANCE.*"}, ("confirm", "elicitation", "readonly"))
+        if self.cfg.safety.mode != "full":
+            await self.expect_refusal(ph, "tc_set_mode", {"mode": "full"}, ("confirm", "elicitation", "ceiling"))
+        if self.ads_ok and self.sym and isinstance(self.sym_val, (int, float)) and not isinstance(self.sym_val, bool):
+            # out-of-range value: must be refused by the type check, never wrapped (even before the guard)
+            ok, payload, ms = await self.call("ads_write", {"name": self.sym, "value": 10 ** 30}, 30)
+            self.rec(ph, "ads_write:range", "PASS" if (not ok and ("out of range" in str(payload) or "allowlist" in str(payload)
+                                                                 or "readonly" in str(payload))) else "FAIL", ms,
+                     "refused" if not ok else "WROTE an out-of-range value")
         await self.expect_refusal(ph, "xae_activate_configuration", {}, ("confirm", "elicitation", "readonly", "not attached", "windows"))
         await self.expect_refusal(ph, "xae_restart_twincat", {}, ("confirm", "elicitation", "readonly", "not attached", "windows"))
         await self.expect_refusal(ph, "ipc_start_process", {"path": "nothing.exe"}, ("confirm", "elicitation", "readonly"))
@@ -701,12 +709,12 @@ class Acceptance:
             for t in ("ipc_list_dir", "ipc_read_file"):
                 self.skip(ph, t, "needs ADS")
             return
-        ls = await self.check(ph, "ipc_list_dir", {"pattern": "boot:*", "max_entries": 50}, timeout_s=60)
-        if ls is None:
-            # fall back to the absolute path so the failure can be attributed to the path-id protocol
-            abs_pat = r"\Hard Disk\TwinCAT\3.1\Boot\*" if True else r"C:\TwinCAT\3.1\Boot\*"
-            await self.check(ph, "ipc_list_dir", {"pattern": abs_pat, "max_entries": 50}, timeout_s=60)
-            self.rec(ph, "ipc_list_dir:path_id", "WARN", 0, "boot:* failed; if the absolute path worked, the FFIND path-id convention needs adjusting — report both results")
+        ls = await self.check(ph, "ipc_list_dir", {"pattern": "boot:*", "max_entries": 50}, timeout_s=90,
+                              verify=lambda p: None if isinstance(p, dict) and p.get("resolved_pattern") and
+                              not any(e.get("name") in (".", "..") for e in p.get("entries", [])) else "prefix not resolved or dot entries present")
+        if isinstance(ls, dict) and not any(str(e.get("name", "")).lower() == "currentconfig.xml" for e in ls.get("entries", [])):
+            self.rec(ph, "ipc_list_dir:boot", "WARN", 0, f"boot folder resolved to {ls.get('resolved_pattern')} but CurrentConfig.xml is not in it — "
+                     "either no configuration was ever activated on this target or the probe picked the wrong folder")
         name = None
         if isinstance(ls, dict):
             for e in ls.get("entries", []):

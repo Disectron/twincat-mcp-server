@@ -73,7 +73,9 @@ def fb_interface(idx: ProjectIndex, name: str) -> dict[str, Any]:
             "locals": by_section.get("VAR", []) + by_section.get("VAR_STAT", []),
             "methods": methods, "properties": props,
             "actions": [x.name.split(".")[-1] for x in subs if x.kind == "ACTION"],
-            "ads_symbol_hint": f"<instance>.{{{', '.join(v['name'] for v in by_section.get('VAR_OUTPUT', [])[:4])}}}"}
+            "ads_symbol_hint": (f"{u.name}.<var>  e.g. {u.name}.{(by_section.get('VAR', []) or by_section.get('VAR_OUTPUT', []) or [{'name': 'x'}])[0]['name']}"
+                                if u.kind == "PROGRAM" else
+                                f"<instance>.{{{', '.join(v['name'] for v in by_section.get('VAR_OUTPUT', [])[:4])}}}")}
 
 
 # ----------------------------------------------------------------------------
@@ -223,7 +225,17 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
     counts: dict[str, int] = {}
     for f in findings:
         counts[f["rule"]] = counts.get(f["rule"], 0) + 1
-    return {"units": len(units), "findings": len(findings), "by_rule": counts, "items": findings[:1000]}
+    out: dict[str, Any] = {"units": len(units), "findings": len(findings), "by_rule": counts, "items": findings[:1000],
+                           "root": str(idx.root) if idx.root else None, "files_indexed": len(idx.files)}
+    parse_errors = [u.name for u in idx.units.values() if u.kind == "PARSE_ERROR"]
+    if parse_errors:
+        out["parse_errors"] = parse_errors[:20]
+    if not units:
+        out["note"] = (f"nothing to lint: the index under {idx.root} holds {len(idx.units)} units"
+                       + (f", all PARSE_ERROR ({parse_errors[:3]}…)" if parse_errors and len(parse_errors) == len(idx.units) else "")
+                       + ". proj_scan(root=<folder with the .plcproj>) if this is not the project you meant; the index is "
+                         "per server process and starts from project.root / xae.solution_path.")
+    return out
 
 
 def _base_type(type_str: str) -> str:
@@ -404,10 +416,19 @@ def call_graph(idx: ProjectIndex, root: str, depth: int = 4) -> dict[str, Any]:
         impl = strip_comments(u.implementation) + " " + " ".join(
             strip_comments(x.implementation) for x in idx.units.values() if x.parent == u.name)
         # FB instances (by declared type) that are actually invoked
+        scalar = set(DEFAULT_PREFIXES) | {"BOOL", "STRING", "WSTRING", "TIME", "LTIME", "DATE", "DT", "TOD"}
         for v in u.vars:
             tu = idx._unit_for_type(v.type)
+            called = re.search(rf"\b{re.escape(v.name)}\s*\(", impl) is not None
             if tu and tu.kind in ("FUNCTION_BLOCK", "PROGRAM") and re.search(rf"\b{re.escape(v.name)}\b", impl):
                 visit(tu, lvl + 1, f"{u.name}.{v.name}")
+            elif tu is None and called:
+                # an FB from a library (Tc2_Standard.CTU, TON …): the project has no body to descend into,
+                # but the call is part of what runs when this POU runs
+                base = idx._base_type_name(v.type)
+                if base.upper() not in scalar and not re.match(r"^(ARRAY|POINTER|REFERENCE)\b", v.type.strip(), re.I):
+                    nodes.append({"name": base, "kind": "library", "depth": lvl + 1, "via": f"{u.name}.{v.name}",
+                                  "file": None, "type": v.type, "note": "library FB — body not in the project; infosys_declaration for its interface"})
         # direct function / FB-type calls
         for m in _RE_CALL.finditer(impl):
             tu = idx.units.get(m.group(1).lower())
@@ -536,19 +557,19 @@ def validate_xml(idx: ProjectIndex, name: str | None = None, fix: bool = False,
                     new = new.replace(m.group(0), _lineids_block(lname, want), 1)
                     fixed.append({"file": f, "fix": "regenerated LineIds", "for": lname})
         missing_lineids = [k for k in impl_lines if f'<LineIds Name="{k}">' not in txt]
-        for k in missing_lineids:
-            findings.append({"file": f, "rule": "lineids_missing", "severity": "info", "message": f"no <LineIds> for {k} (XAE regenerates them)"})
+        # XAE itself writes files without LineIds for items that were never opened in the editor (and 4026 writes
+        # none for properties/empty bodies): only an *inconsistent* file — some items with, some without — is worth a word
+        if missing_lineids and len(missing_lineids) < len(impl_lines):
+            for k in missing_lineids:
+                findings.append({"file": f, "rule": "lineids_missing", "severity": "info",
+                                 "message": f"no <LineIds> for {k} while other items in the file have them (XAE regenerates them)"})
         if fix and regenerate_lineids and missing_lineids:
             close = f"  </{kind}>"
             blocks = "".join("    " + _lineids_block(k, impl_lines[k]) + "\n" for k in missing_lineids)
             if close in new:
                 new = new.replace(close, blocks + close, 1)
                 fixed.append({"file": f, "fix": "added LineIds", "for": missing_lineids})
-        if not txt.endswith("\n"):
-            findings.append({"file": f, "rule": "eof_newline", "severity": "info", "message": "file does not end with a newline"})
-            if fix:
-                new += "\n"
-                fixed.append({"file": f, "fix": "eof newline"})
+        # (no eof_newline rule: XAE writes its files without a trailing newline — flagging that flagged every file)
         if fix and new != txt:
             p.with_suffix(p.suffix + ".bak").write_bytes(raw)
             p.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))

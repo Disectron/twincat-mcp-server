@@ -42,3 +42,20 @@ def test_decode_unknown_type_falls_back_to_name():
     assert ts.decode_tree(struct.pack("<I", 2500), "TIME")["text"] == "T#2s500ms"
     lv = ts.leaves("Z", "LREAL")
     assert lv[0].size == 8 and lv[0].note == "type not in datatype table"
+
+
+def test_leaves_keep_declared_alias_name():
+    """4026 datatype tables alias BOOL to BYTE/BIT; the leaf must still say BOOL (field item 19), and a
+    STRING alias keeps its name while taking the base storage."""
+    tbl = {
+        "byte": DtEntry("BYTE", "", 1, 0, 16, 0, ""),
+        "bool": DtEntry("BOOL", "BYTE", 1, 0, 16, 0, ""),
+        "string(255)": DtEntry("STRING(255)", "", 256, 0, 30, 0, ""),
+        "t_maxstring": DtEntry("T_MaxString", "STRING(255)", 256, 0, 30, 0, ""),
+        "st_io": DtEntry("ST_IO", "", 258, 0, 65, 0, "", [], [
+            DtEntry("bEnable", "BOOL", 1, 0, 16, 0, ""), DtEntry("sName", "T_MaxString", 256, 1, 30, 0, "")], {}, {}),
+    }
+    ts = TypeSystem(tbl)
+    lv = ts.leaves("MAIN.stIo", "ST_IO")
+    assert [(l.path, l.type, l.offset, l.size) for l in lv] == [("MAIN.stIo.bEnable", "BOOL", 0, 1), ("MAIN.stIo.sName", "T_MaxString", 1, 256)]
+    assert ts.leaves("MAIN.bEnable", "BOOL")[0].type == "BOOL"

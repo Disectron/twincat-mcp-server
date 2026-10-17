@@ -796,6 +796,7 @@ class Recorder:
         ev = self._events_for(rid, [from_symbol, to_symbol])
         f_prev = t_prev = False
         pending: list[float] = []
+        absorbed = 0
         pairs: list[dict[str, Any]] = []
         for e in ev:
             v = _raw_val(e["value"])
@@ -809,13 +810,17 @@ class Recorder:
                 if now and not t_prev and pending:
                     t_from = pending.pop(0)
                     pairs.append({"t_from_ms": round(t_from, 3), "t_to_ms": round(e["t_ms"], 3), "latency_ms": round(e["t_ms"] - t_from, 3)})
+                    absorbed += len(pending)        # further from-edges before this to-edge: no response of their own
                     pending.clear()
                 t_prev = now
             if len(pairs) >= max_pairs:
                 break
         lat = [p["latency_ms"] for p in pairs]
         return {"id": rid, "from": f"{from_symbol} {from_op} {from_value}", "to": f"{to_symbol} {to_op} {to_value}",
-                "pairs": len(pairs), "unmatched_from_edges": len(pending), "latency_ms": _stat(lat), "samples": pairs[:100]}
+                "pairs": len(pairs), "unmatched_from_edges": len(pending) + absorbed,
+                "from_edges_total": len(pairs) + len(pending) + absorbed, "absorbed_from_edges": absorbed,
+                "note": "a from-edge that occurs again before the to-condition fires is 'absorbed' — one response for several stimuli",
+                "latency_ms": _stat(lat), "samples": pairs[:100]}
 
     def compare(self, rid_a: str, rid_b: str, symbols: list[str] | None = None) -> dict[str, Any]:
         """Before/after comparison of two recordings over their common symbols: stats deltas

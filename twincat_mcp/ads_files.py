@@ -47,7 +47,7 @@ PATH_IDS = {"generic": 1, "bootprj": 2, "bootdata": 3, "boot": 4, "target": 5, "
 
 def split_path(path: str) -> tuple[int, str]:
     """``'boot:TcUnit_xUnit_testresults.xml'`` -> (PATH_BOOTPATH, 'TcUnit_xUnit_testresults.xml');
-    anything without a known ``<id>:`` prefix (incl. ``C:\...``) is PATH_GENERIC with the string as given."""
+    anything without a known ``<id>:`` prefix (incl. a drive letter) is PATH_GENERIC with the string as given."""
     m = re.match(r"^([A-Za-z][A-Za-z0-9]*):(?![\\/])(.*)$", path or "")
     if m and m.group(1).lower() in PATH_IDS:
         return PATH_IDS[m.group(1).lower()], m.group(2)
@@ -169,20 +169,49 @@ class SystemServiceFiles:
             raise AdsError(f"FDELETE {path!r}: {_fmt_exc(exc)}") from exc
         return {"deleted": path}
 
-    def list_dir(self, pattern: str, max_entries: int = 500) -> dict[str, Any]:
-        """Directory listing via FFILEFIND. ``pattern`` like ``C:\\TwinCAT\\3.1\\Boot\\*`` or, OS-independent,
-        ``boot:*`` (see PATH_IDS)."""
+    # FFILEFIND ignores the path id in the index offset (observed on 3.1.4026: 'boot:*' listed System32, the
+    # service's working directory). So a prefixed *listing* pattern is resolved to an absolute folder by
+    # probing the known locations once per target; FOPEN honours the path id and needs no resolution.
+    _PREFIX_DIRS: dict[str, list[str]] = {
+        "boot": [r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
+        "bootprj": [r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
+        "bootdata": [r"C:\TwinCAT\3.1\Boot", r"\Hard Disk\TwinCAT\3.1\Boot", "/usr/local/etc/TwinCAT/3.1/Boot"],
+        "config": [r"C:\TwinCAT\3.1\Config", r"\Hard Disk\TwinCAT\3.1\Config", "/usr/local/etc/TwinCAT/3.1/Config"],
+        "target": [r"C:\TwinCAT\3.1\Target", r"\Hard Disk\TwinCAT\3.1\Target", "/usr/local/etc/TwinCAT/3.1/Target"],
+        "install": [r"C:\TwinCAT\3.1", r"\Hard Disk\TwinCAT\3.1", "/usr/local/etc/TwinCAT/3.1"],
+    }
+
+    def resolve_prefix_dir(self, prefix: str) -> str:
+        """Absolute folder behind 'boot:' etc. on the connected target, probed once and cached."""
+        key = (prefix.lower(), self.ads.target_label())
+        cache = getattr(self, "_prefix_cache", None)
+        if cache is None:
+            cache = self._prefix_cache = {}
+        if key in cache:
+            return cache[key]
+        cands = self._PREFIX_DIRS.get(prefix.lower())
+        if not cands:
+            raise AdsError(f"no folder is known for the prefix {prefix!r}: ipc_list_dir needs an absolute path here "
+                           f"(ipc_read_file accepts the prefix; the target resolves it for FOPEN)")
+        for d in cands:
+            sep = "/" if d.startswith("/") else "\\"
+            try:
+                probe = self._ffind_raw(d + sep + "*", 1)
+            except AdsError:
+                continue
+            if probe:
+                cache[key] = d
+                return d
+        raise AdsError(f"none of the known folders for {prefix!r} exist on the target: {cands}. Pass the absolute path.")
+
+    def _ffind_raw(self, pattern: str, max_entries: int) -> list[dict[str, Any]]:
         c = self._c()
-        entries = []
-        handle = 0
-        pid, name = split_path(pattern)
-        # first FFIND call: handle 0 in the low word, path id in the high word (0 for generic — the pre-4022
-        # protocol — so absolute paths behave exactly as before); later calls pass the handle
+        entries: list[dict[str, Any]] = []
         try:
-            data = _raw_rw(c, IG_FFIND, 0 if pid == PATH_GENERIC else pid << 16, 4 + 320, name.encode("latin-1") + b"\x00")
+            data = _raw_rw(c, IG_FFIND, 0, 4 + 320, pattern.encode("latin-1") + b"\x00")
         except pyads.ADSError as exc:
-            if exc.err_code in (1804, 0x70C):  # ERR_... no more files / not found
-                return {"pattern": pattern, "entries": []}
+            if exc.err_code in (1804, 0x70C):  # no more files / not found
+                return []
             raise AdsError(f"FFILEFIND {pattern!r}: {_fmt_exc(exc)}") from exc
         while True:
             if len(data) < 4 + 44:
@@ -193,14 +222,11 @@ class SystemServiceFiles:
             ctime, atime, wtime = struct.unpack_from("<QQQ", fd, 4)
             size_hi, size_lo = struct.unpack_from("<II", fd, 28)
             name = fd[44:44 + 260].split(b"\x00", 1)[0].decode("latin-1", "replace")
-            entries.append({
-                "name": name,
-                "is_dir": bool(attrs & 0x10),
-                "size": (size_hi << 32) | size_lo,
-                "modified": _filetime_iso(wtime),
-                "attributes": f"0x{attrs:X}",
-            })
+            if name not in (".", ".."):
+                entries.append({"name": name, "is_dir": bool(attrs & 0x10), "size": (size_hi << 32) | size_lo,
+                                "modified": _filetime_iso(wtime), "attributes": f"0x{attrs:X}"})
             if len(entries) >= max_entries:
+                entries.append({"_truncated": True})
                 break
             try:
                 data = _raw_rw(c, IG_FFIND, handle, 4 + 320, b"")
@@ -208,7 +234,26 @@ class SystemServiceFiles:
                 if exc.err_code in (1804, 0x70C, 18, 1812):
                     break
                 raise AdsError(f"FFILEFIND next: {_fmt_exc(exc)}") from exc
-        return {"pattern": pattern, "entries": entries, "count": len(entries)}
+        return entries
+
+    def list_dir(self, pattern: str, max_entries: int = 500) -> dict[str, Any]:
+        """Directory listing via FFILEFIND. ``pattern`` like ``C:\\TwinCAT\\3.1\\Boot\\*`` or, OS-independent,
+        ``boot:*`` — the prefix is resolved to the target's real folder (probed once), '.'/'..' are dropped,
+        ``truncated`` says whether ``max_entries`` cut the list."""
+        pid, name = split_path(pattern)
+        resolved = None
+        if pid != PATH_GENERIC:
+            prefix = pattern.split(":", 1)[0]
+            folder = self.resolve_prefix_dir(prefix)
+            sep = "/" if folder.startswith("/") else "\\"
+            resolved = folder + sep + (name or "*")
+        raw = self._ffind_raw(resolved or pattern, max_entries)
+        truncated = bool(raw and raw[-1].get("_truncated"))
+        entries = [e for e in raw if not e.get("_truncated")]
+        out = {"pattern": pattern, "entries": entries, "count": len(entries), "truncated": truncated}
+        if resolved:
+            out["resolved_pattern"] = resolved
+        return out
 
     def start_process(self, path: str, directory: str = "", command_line: str = "") -> dict[str, Any]:
         """NT_StartProcess equivalent: launches ``path`` on the target."""

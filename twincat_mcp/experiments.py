@@ -81,7 +81,7 @@ DOSING_TEMPLATE: dict[str, Any] = {
     "version": 1,
     "hypothesis": "With lambda=0.95 the preact controller holds |bias| <= 2 g and sigma <= 3 g at 1000 g targets.",
     "machine": {"serial": "DFM-0001", "target": None},
-    "profile": "preact-fill",
+    "profile": "preact-fill",            # <- a capture profile saved with rec_profile_save BEFORE exp_save; the name is yours
     "preconditions": [
         {"symbol": "MAIN.fbScale.bStable", "op": "==", "value": True, "timeout_ms": 30000},
         {"symbol": "MAIN.fbDispense.ePhase", "op": "==", "value": "IDLE", "timeout_ms": 10000},
@@ -169,7 +169,7 @@ def levels_of(spec: dict[str, Any]) -> list[dict[str, Any]]:
 def writes_in_spec(spec: dict[str, Any]) -> list[str]:
     syms = [f["symbol"] for f in spec.get("factors") or []]
     run = spec.get("run") or {}
-    syms += [w["symbol"] for w in run.get("before") or []] + [w["symbol"] for w in run.get("after") or []]
+    syms += [w["symbol"] for w in (list(run.get("before") or []) + list(run.get("after") or [])) if "symbol" in w and "value" in w]
     if run.get("start"):
         syms.append(run["start"]["symbol"])
     out: list[str] = []
@@ -230,6 +230,14 @@ def validate_spec(spec: dict[str, Any], resolve: Callable[[str], str | None] | N
     for w in list(run.get("on_abort") or []):
         if not w.get("symbol") or "value" not in w:
             problems.append("run.on_abort entries need symbol and value")
+    for where in ("before", "after"):
+        for w in list(run.get(where) or []):
+            if "wait_ms" in w or isinstance(w.get("wait_until"), dict):
+                continue
+            if not w.get("symbol") or "value" not in w:
+                problems.append(f"run.{where} entries need symbol+value, or wait_ms, or wait_until{{symbol,op,value}}")
+    if str(run.get("ack", "falls")).lower() not in ("falls", "edge", "none"):
+        problems.append("run.ack must be falls | edge | none")
     for f in spec.get("factors") or []:
         if not f.get("name") or not f.get("symbol") or not isinstance(f.get("levels"), list) or not f["levels"]:
             problems.append(f"factor {f!r}: needs name, symbol, non-empty levels")
@@ -624,6 +632,20 @@ class ExperimentStore:
         with open(self.dir(name) / "runs.jsonl", "a", encoding="utf-8") as fh:
             fh.write(json.dumps(run, default=str) + "\n")
 
+    def archive_runs(self, name: str) -> int:
+        """exp_run(resume=false): earlier runs are not part of the new series. They are kept (evidence is never
+        deleted) in runs_archive_<timestamp>.jsonl and no longer counted by exp_evaluate / exp_report."""
+        p = self.dir(name) / "runs.jsonl"
+        if not p.is_file():
+            return 0
+        n = sum(1 for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip())
+        if n == 0:
+            p.unlink()
+            return 0
+        import time as _t
+        p.rename(self.dir(name) / f"runs_archive_{_t.strftime('%Y%m%d-%H%M%S')}.jsonl")
+        return n
+
     def status(self, name: str) -> dict[str, Any]:
         p = self.dir(name) / "status.json"
         if not p.is_file():
@@ -676,6 +698,7 @@ class Runner:
         self._lock = threading.Lock()
         self._start_lock = threading.Lock()
         self._live_recs: list[str] = []
+        self._archived_note: str | None = None
         self._scope0 = ""
         self._types: dict[str, Any] = {}        # symbol -> SymbolEntry (resolved at start)
 
@@ -690,7 +713,13 @@ class Runner:
             if v["problems"]:
                 raise ExperimentError("spec invalid: " + "; ".join(v["problems"]))
             self._resolve_types()
-            done = self.store.runs(self.name) if resume else []
+            self._archived_note = None
+            if resume:
+                done = self.store.runs(self.name)
+            else:
+                archived = self.store.archive_runs(self.name)
+                done = []
+                self._archived_note = f"{archived} earlier run(s) moved to runs_archive_*.jsonl" if archived else None
             plan = self._plan(done)
             if max_runs is not None:
                 plan = plan[:max_runs]
@@ -703,12 +732,15 @@ class Runner:
             self._set(state="running", planned=len(plan), done=len([r for r in done if r.get("status") == "ok"]), failed=0,
                       current=None, started=sessions[0]["started"], finished=None, error=None, consecutive_failures=0,
                       dry_run=False, levels=len(levels_of(self.spec)), sessions=sessions, scope=self._scope0,
-                      done_this_session=0, restore_warning=None, abort_reason=None)
+                      attempted_this_session=0, restore_warning=None, abort_reason=None)
             self._abort.clear()
             self._thread = threading.Thread(target=self._main, args=(plan,), name=f"exp-{self.name}", daemon=True)
             self._thread.start()
-        return {"experiment": self.name, "state": "running", "planned_runs": len(plan), "already_done": len(done),
-                "estimated_duration_min": v["estimated_duration_min"], "scope": self._scope0}
+        out = {"experiment": self.name, "state": "running", "planned_runs": len(plan), "already_done": len(done),
+               "estimated_duration_min": v["estimated_duration_min"], "scope": self._scope0}
+        if getattr(self, "_archived_note", None):
+            out["archived"] = self._archived_note
+        return out
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread:
@@ -728,7 +760,7 @@ class Runner:
         sess = (st.get("sessions") or [{}])[-1]
         if sess.get("started") and st.get("planned"):
             el = (sess.get("finished") or time.time()) - sess["started"]
-            n = st.get("done_this_session", 0)
+            n = st.get("attempted_this_session", 0)
             st["elapsed_min"] = round(el / 60, 1)
             st["eta_min"] = round((st["planned"] - n) * (el / n) / 60, 1) if n else None
         return st
@@ -873,11 +905,11 @@ class Runner:
                 n_done += 1
                 if rec_run["status"] == "ok":
                     consecutive = 0
-                    self._set(done=self.state.get("done", 0) + 1, done_this_session=n_done)
+                    self._set(done=self.state.get("done", 0) + 1, attempted_this_session=n_done)
                 else:
                     consecutive += 1
                     self._set(failed=self.state.get("failed", 0) + 1, consecutive_failures=consecutive,
-                              last_error=rec_run.get("error"), done_this_session=n_done)
+                              last_error=rec_run.get("error"), attempted_this_session=n_done)
                     if rec_run.get("fatal"):
                         self._set(state="failed", error=rec_run.get("error"), finished=time.time())
                         break
@@ -965,7 +997,8 @@ class Runner:
         t0 = time.time()
         rec_ids: list[str] = []
         record: dict[str, Any] = {"run_no": len(self.store.runs(self.name)) + 1, "level": lv, "rep": rep,
-                                  "started": t0, "status": "ok", "recordings": [], "measures": {}, "error": None}
+                                  "spec_version": self.spec.get("version"), "started": t0, "status": "ok",
+                                  "recordings": [], "measures": {}, "error": None}
         try:
             for pc in self.spec.get("preconditions") or []:
                 r = self._wait(pc, 60_000)
@@ -974,8 +1007,7 @@ class Runner:
             factor_syms = {f["name"]: f["symbol"] for f in self.spec.get("factors") or []}
             for fname, sym in factor_syms.items():
                 self._write(sym, lv[fname])
-            for w in run.get("before") or []:
-                self._write(w["symbol"], w["value"])
+            self._steps(run.get("before") or [], "before")
             if self.spec.get("snapshot_prefix"):
                 snap = self.d.slow_call(self.d.bench.snapshot_save, f"exp-{self.name}-{record['run_no']}-pre", None,
                                         self.spec["snapshot_prefix"], None, timeout=120)
@@ -996,22 +1028,42 @@ class Runner:
             # stimulus
             st = run.get("start")
             if st:
+                t_stim_ms = self._rec_elapsed_ms(rec_ids)
                 self._write(st["symbol"], st["value"])
                 if "reset_value" in st:
                     self._abort.wait(float(st.get("reset_after_ms") or 0) / 1000)
                     self._write(st["symbol"], st["reset_value"])
-                # the machine must leave the "done" state: otherwise a rejected start would "complete" instantly
-                ack = self._wait({**dw, "timeout_ms": int(run.get("start_timeout_ms") or 10_000)}, invert=True)
-                if not ack.get("met"):
-                    raise ExperimentError(f"start not acknowledged: {dw['symbol']} still {dw['op']} {dw['value']} "
-                                          f"{int(run.get('start_timeout_ms') or 10_000)} ms after the stimulus")
+                # Acknowledgement: did the machine actually start?  run.ack:
+                #   falls (default) — done_when must stop holding after the stimulus, then hold again
+                #   edge             — the done symbol must change after the stimulus (fast processes that are
+                #                      done again within one cycle; judged from the PLC-timestamped recording)
+                #   none             — trust the stimulus
+                mode = str(run.get("ack") or "falls").lower()
+                ack_to = int(run.get("ack_timeout_ms") or run.get("start_timeout_ms")
+                             or min(10_000, int(dw.get("timeout_ms") or 10_000)))
+                if mode == "falls":
+                    ack = self._wait({**dw, "timeout_ms": ack_to}, invert=True)
+                    if not ack.get("met"):
+                        # the process may have run and finished inside the poll interval: accept a change seen by the recorder
+                        if self._changed_after(rec_ids, dw.get("symbol"), t_stim_ms):
+                            record.setdefault("notes", []).append("ack: done_when never observed false, but the recording shows the "
+                                                                  "done symbol changing after the stimulus — accepted (fast process; set run.ack: edge)")
+                        else:
+                            raise ExperimentError(f"start not acknowledged: {dw['symbol']} still {dw['op']} {dw['value']} "
+                                                  f"{ack_to} ms after the stimulus and it never changed (run.ack: none to skip this check)")
+                elif mode == "edge":
+                    deadline = time.time() + ack_to / 1000
+                    while not self._changed_after(rec_ids, dw.get("symbol"), t_stim_ms):
+                        if time.time() >= deadline or self._abort.is_set():
+                            raise ExperimentError(f"start not acknowledged: {dw['symbol']} did not change within {ack_to} ms after the stimulus")
+                        self._abort.wait(0.05)
+                elif mode != "none":
+                    raise ExperimentError(f"run.ack must be falls | edge | none, got {mode!r}")
             r = self._wait(dw)
             if not r.get("met"):
                 raise ExperimentError(f"run did not finish: {dw['symbol']} {dw['op']} {dw['value']} within {dw.get('timeout_ms', 600000)} ms")
             if run.get("settle_ms"):
                 self._abort.wait(float(run["settle_ms"]) / 1000)
-            for w in run.get("after") or []:
-                self._write(w["symbol"], w["value"])
         except FatalRunError as exc:
             record["status"] = "failed"
             record["error"] = str(exc)[:300]
@@ -1020,6 +1072,20 @@ class Runner:
             record["status"] = "failed"
             record["error"] = str(exc)[:300]
         finally:
+            # 'after' has cleanup semantics: it runs on failure too, so state does not leak into the next run
+            # (not after a fatal error or an abort — run.on_abort is the cleanup for those)
+            if not record.get("fatal") and not self._abort.is_set():
+                try:
+                    self._steps(run.get("after") or [], "after")
+                except FatalRunError as exc:       # guard refusal / abort / target change during cleanup: stop the series
+                    record["status"] = "failed"
+                    record["error"] = f"after: {str(exc)[:280]}"
+                    record["fatal"] = True
+                except Exception as exc:  # noqa: BLE001
+                    record.setdefault("notes", []).append(f"after-step failed: {str(exc)[:200]}")
+                    if record["status"] == "ok":
+                        record["status"] = "failed"
+                        record["error"] = f"after: {str(exc)[:280]}"
             for rid in list(rec_ids):
                 if self._stop_rec(rid, "run ended"):
                     pass
@@ -1032,6 +1098,55 @@ class Runner:
         record["finished"] = time.time()
         record["duration_s"] = round(record["finished"] - t0, 2)
         return record
+
+    def _steps(self, items: list[dict[str, Any]], where: str) -> None:
+        """before/after items: {symbol, value} writes a value; {wait_ms: N} pauses (so a 10 ms task sees a pulse);
+        {wait_until: {symbol, op, value, timeout_ms}} waits for a condition."""
+        for w in items:
+            if self._abort.is_set():
+                raise FatalRunError("aborted")
+            if "wait_ms" in w:
+                self._abort.wait(float(w["wait_ms"]) / 1000)
+            elif "wait_until" in w:
+                c = w["wait_until"]
+                r = self._wait(c, int(c.get("timeout_ms") or 10_000))
+                if not r.get("met"):
+                    raise ExperimentError(f"{where}: {c.get('symbol')} {c.get('op')} {c.get('value')} not met in {c.get('timeout_ms', 10000)} ms")
+            elif "symbol" in w and "value" in w:
+                self._write(w["symbol"], w["value"])
+            else:
+                raise ExperimentError(f"{where} item {w!r}: needs symbol+value, wait_ms or wait_until")
+
+    def _rec_elapsed_ms(self, rec_ids: list[str]) -> float | None:
+        """Where the first live recording's clock stands now (ms since its first sample), or None."""
+        for rid in rec_ids:
+            try:
+                st = self.d.rec.status(rid)
+            except Exception:  # noqa: BLE001
+                continue
+            if st.get("elapsed_s") is not None:
+                return float(st["elapsed_s"]) * 1000.0
+        return 0.0
+
+    def _changed_after(self, rec_ids: list[str], symbol: str | None, t_ms: float | None) -> bool:
+        """Did ``symbol`` change value after recording time ``t_ms``? Uses the recorder's value runs (PLC
+        timestamps), so a change that lasted a single cycle still counts."""
+        if not symbol:
+            return False
+        for rid in rec_ids:
+            try:
+                st = self.d.rec.stats(rid, [symbol], True, 100_000)
+            except Exception:  # noqa: BLE001
+                continue
+            src = st.get("symbols") or {}
+            d = src.get(symbol) or next((v for k, v in src.items() if k.lower() == symbol.lower()), None)
+            if not isinstance(d, dict):
+                continue
+            runs = d.get("runs") or []
+            # a value run that started at or after the stimulus, other than the very first sample
+            if any(r.get("t_start_ms", 0) >= (t_ms or 0) for r in runs[1:]):
+                return True
+        return False
 
     def _place_measure_symbols(self, groups: dict[tuple[str, float], list[str]], done_symbol: str | None) -> None:
         """Symbols a single measure needs together (latency from/to, settle value+anchor, done_when)

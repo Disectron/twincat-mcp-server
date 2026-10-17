@@ -21,6 +21,7 @@ class FakeFS:
         self.next = 1
         self.calls = []
         self.find_entries = []
+        self.find_patterns = []
 
     def rw(self, conn, igrp, ioffs, read_len, write_bytes):
         self.calls.append((igrp, ioffs, read_len, len(write_bytes)))
@@ -60,10 +61,17 @@ class FakeFS:
             del self.files[path]
             return b""
         if igrp == F.IG_FFIND:
-            if ioffs & 0xFFFF == 0:                     # first call: path id in the high word, no handle yet
-                self._iter = iter(self.find_entries)
+            if ioffs == 0:                               # first call carries the pattern; the real service ignores path ids here
+                pattern = write_bytes.rstrip(b"\x00").decode()
+                self.find_patterns.append(pattern)
+                # a CE7 box: only the \Hard Disk\... boot folder exists; '.'/'..' come first like Windows returns them
+                if pattern.startswith(self.boot_dir):
+                    self._iter = iter([(".", 0, True), ("..", 0, True)] + list(self.find_entries))
+                elif pattern.startswith(("C:\\TwinCAT\\3.1\\Boot", "/usr/local")):   # not on a CE7 box
+                    raise pyads.ADSError(1804)
+                else:
+                    self._iter = iter(self.find_entries)
                 handle = 77
-                self.last_find_pid = ioffs >> 16
             else:
                 handle = ioffs
             try:
@@ -160,10 +168,18 @@ def test_split_path():
 
 def test_list_dir_boot_relative(files):
     svc, fs = files
-    fs.find_entries = [("TcUnit_xUnit_testresults.xml", 10, False)]
-    r = svc.list_dir("boot:*")
-    assert [e["name"] for e in r["entries"]] == ["TcUnit_xUnit_testresults.xml"]
-    assert fs.last_find_pid == F.PATH_IDS["boot"]
+    fs.find_entries = [("TcUnit_xUnit_testresults.xml", 10, False)] + [(f"f{i}.txt", 1, False) for i in range(5)]
+    r = svc.list_dir("boot:*", max_entries=3)
+    # resolved by probing: C:\TwinCAT\3.1\Boot does not exist on this (CE7) target, \Hard Disk\... does
+    assert fs.find_patterns[0].startswith("C:\\TwinCAT") and fs.find_patterns[1].startswith(fs.boot_dir)
+    assert r["resolved_pattern"] == fs.boot_dir + "\\*"
+    assert [e["name"] for e in r["entries"]] == ["TcUnit_xUnit_testresults.xml", "f0.txt", "f1.txt"], "'.' and '..' dropped, cap applied"
+    assert r["truncated"] is True and r["count"] == 3
+    # second call: cached folder, no probe
+    n = len(fs.find_patterns)
+    r2 = svc.list_dir("boot:*.xml", max_entries=50)
+    assert fs.find_patterns[n:] == [fs.boot_dir + "\\*.xml"] and r2["truncated"] is False
+    # absolute patterns go through untouched
     fs.find_entries = [("x", 1, False)]
-    svc.list_dir(r"C:\TwinCAT\3.1\*")
-    assert fs.last_find_pid == 0                      # generic keeps the pre-4022 offset 0
+    r3 = svc.list_dir(r"C:\TwinCAT\3.1\*")
+    assert fs.find_patterns[-1] == r"C:\TwinCAT\3.1\*"

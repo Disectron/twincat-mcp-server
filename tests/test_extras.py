@@ -38,12 +38,20 @@ def test_dialog_rules_and_watchdog():
 def test_hmi_index_and_compare():
     h = HmiIndex()
     r = h.scan(str(FIX / "sample_hmi"))
-    assert r["bindings"] == 5 and r["servers"] == ["PLC1"]
+    assert r["bindings"] == 11 and r["servers"] == ["PLC1"] and r["files"] == 3
+    # TF1800 .TcVIS: VisualElemMember ids -> read bindings; ST input-action snippets -> write (lhs) / read (rhs)
+    tv = h.find("*", kind="tcvis")
+    tcvis = {(b["plc_symbol"], b["control_type"]) for b in tv["bindings"] if b["file"].lower().endswith(".tcvis")}
+    assert ("MAIN.bStart", "lamp_variable") in tcvis and ("MAIN.nCycle", "text_variable") in tcvis
+    assert ("MAIN.fbFill.eState", "toggle_color_variable") in tcvis
+    w = h.find("*", kind="tcvis_write")
+    assert sorted(b["plc_symbol"] for b in w["bindings"]) == ["MAIN.bStart", "MAIN.nCycle"]
+    assert all(b["line"] == 16 for b in w["bindings"])  # located at the snippet, not the first mention of the symbol
     f = h.find("MAIN.stRecipe.*")
     assert f["total"] == 1 and f["bindings"][0]["control_id"] == "TcHmiTextblock_Weight" and f["bindings"][0]["attribute"] == "data-tchmi-text"
     assert h.find("Internal*", kind="internal")["total"] == 1
     assert "GVL_Machine.nDrumsFilled" in h.symbols()
-    online = {"main.bstart", "main.strecipe.rtargetkg", "gvl_machine.ndrumsfilled", "main.fbfill.bdone"}
+    online = {"main.bstart", "main.strecipe.rtargetkg", "gvl_machine.ndrumsfilled", "main.fbfill.bdone", "main.ncycle", "main.fbfill.estate"}
     declared = online | {"main.fbfill.berror"}
     c = h.compare(online, declared)
     assert c["broken"] == 1 and c["broken_bindings"][0]["symbol"] == "MAIN.fbFill.rGhostValue" and not c["broken_bindings"][0]["declared_in_source"]
@@ -98,12 +106,15 @@ def test_validate_xml_and_fixes(project_dir):
     idx.scan()
     r = cc.validate_xml(idx, "FB_Valve")
     rules = r["by_rule"]
-    assert rules.get("guid_duplicate") == 1 and rules.get("property_var") == 1 and rules.get("eof_newline") == 1
+    assert rules.get("guid_duplicate") == 1 and rules.get("property_var") == 1
+    assert "eof_newline" not in rules, "XAE writes files without a trailing newline; that is not a finding"
+    # the fixture has LineIds for FB_Valve but none for Open / IsOpen.Get: an inconsistent file → reported
+    assert rules.get("lineids_missing", 0) >= 1
     r2 = cc.validate_xml(idx, "FB_Valve", fix=True, regenerate_lineids=True)
     fixes = {f["fix"] for f in r2["fixed"]}
-    assert {"new GUID", "eof newline", "added LineIds"} <= fixes
+    assert {"new GUID", "added LineIds"} <= fixes
     after = fv.read_text()
-    assert after.endswith("\n") and "{aaaaaaaa-0000-0000-0000-000000000001}" not in after
+    assert "{aaaaaaaa-0000-0000-0000-000000000001}" not in after
     assert fv.with_suffix(".TcPOU.bak").exists()
     r3 = cc.validate_xml(idx, "FB_Valve")
     assert "guid_duplicate" not in r3["by_rule"] and "lineids_count" not in r3["by_rule"]

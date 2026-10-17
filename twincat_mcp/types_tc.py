@@ -239,16 +239,39 @@ def encode(tt: TcType, value: Any) -> Any:
             return [encode(tt.elem, v) for v in flat]
         return flat
     if k == "bool":
+        if isinstance(value, bool):
+            return value
         if isinstance(value, str):
-            return value.strip().lower() in ("1", "true", "on", "yes")
-        return bool(value)
+            low = value.strip().lower()
+            if low in ("1", "true", "on", "yes"):
+                return True
+            if low in ("0", "false", "off", "no"):
+                return False
+            raise ValueError(f"not a BOOL: {value!r} (use true/false or 0/1)")
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        raise ValueError(f"not a BOOL: {value!r} (use true/false or 0/1; -1 and other numbers are refused rather than coerced)")
     if k in ("int", "uint", "enum", "pointer"):
-        if isinstance(value, str):
+        if isinstance(value, bool):
+            iv = int(value)
+        elif isinstance(value, str):
             v = value.strip().replace("16#", "0x").replace("2#", "0b")
-            return int(v, 0)
-        return int(value)
+            iv = int(v, 0)
+        elif isinstance(value, float):
+            if value != int(value):
+                raise ValueError(f"{value!r} is not an integer; {tt.name} takes whole numbers")
+            iv = int(value)
+        else:
+            iv = int(value)
+        lo, hi = int_range(tt)
+        if lo is not None and not (lo <= iv <= hi):
+            raise ValueError(f"{iv} is out of range for {tt.name} ({lo}..{hi}); the PLC would silently wrap it")
+        return iv
     if k == "float":
-        return float(value)
+        fv = float(value)
+        if tt.name.upper() == "REAL" and abs(fv) > 3.4028235e38:
+            raise ValueError(f"{fv!r} is out of range for REAL")
+        return fv
     if k in ("string", "wstring"):
         return str(value)
     if k == "time":
@@ -277,6 +300,27 @@ def encode(tt: TcType, value: Any) -> Any:
             return int((d - _EPOCH).total_seconds()) * 1_000_000_000
         return int(value)
     raise ValueError(f"cannot encode value for type {tt.name!r} (kind {k})")
+
+
+def int_range(tt: TcType) -> tuple[int | None, int | None]:
+    """Representable range of an integer-like TwinCAT type (None, None when the size is unknown)."""
+    size = tt.size
+    if size is None and tt.ctype is not None:
+        try:
+            size = ctypes.sizeof(tt.ctype)
+        except TypeError:
+            size = None
+    if not size or size > 8:
+        return None, None
+    bits = 8 * size
+    if tt.kind in ("uint", "pointer"):
+        return 0, (1 << bits) - 1
+    if tt.kind == "int":
+        return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    if tt.kind == "enum":
+        # TwinCAT enums default to INT; a 2-byte enum is signed, larger ones follow their base type (unknown here)
+        return (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if size == 2 else (-(1 << (bits - 1)), (1 << bits) - 1)
+    return None, None
 
 
 def _flatten(v: Any) -> list[Any]:

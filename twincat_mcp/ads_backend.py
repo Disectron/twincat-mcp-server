@@ -323,10 +323,23 @@ class AdsBackend:
         if ts is None:
             raise AdsError(f"datatype table unavailable: {self._dtcache.get(self._key(port, None), (0, None, '?'))[2]}")
         e = ts.get(type_name)
+        resolved_as = None
+        if e is None:
+            # unqualified or differently-cased name: unique match on the part after the last '.' wins (CTU → Tc2_Standard.CTU)
+            want = type_name.strip().lower()
+            exact = [k for k in ts.table if k.lower() == want or k.lower().rsplit(".", 1)[-1] == want]
+            if len(exact) == 1:
+                e = ts.table[exact[0]]
+                resolved_as = e.name
+            elif len(exact) > 1:
+                raise AdsError(f"type {type_name!r} is ambiguous in the datatype table: {sorted(ts.table[k].name for k in exact)}; use the qualified name")
         if e is None:
             cands = [k for k in ts.table if type_name.lower() in k][:20]
             raise AdsError(f"type {type_name!r} not in datatype table; similar: {cands}")
-        return e.summary()
+        d = e.summary()
+        if resolved_as:
+            d["resolved_as"] = resolved_as
+        return d
 
     def list_types(self, pattern: str | None, limit: int, port: int | None = None) -> dict[str, Any]:
         ts = self.typesystem(False, port)
@@ -603,8 +616,12 @@ class AdsBackend:
         r = self.read_raw(igrp, offset, size, port)
         raw = bytes.fromhex(r["hex"])
         bits = " ".join(f"{b:08b}" for b in raw[:64])
-        return {"area": area.upper(), "offset": offset, "size": len(raw), "hex": r["hex"], "bits_msb_first": bits,
-                "note": "offset/size are bytes of the PLC process image (%IB/%QB); map via the TMC or xae_tree_get on TIID"}
+        out = {"area": area.upper(), "offset": offset, "size": len(raw), "hex": r["hex"], "bits_msb_first": bits,
+               "note": "offset/size are bytes of the PLC process image (%IB/%QB); map via the TMC or xae_tree_get on TIID"}
+        if raw and not any(raw):
+            out["note"] += " — all zero: either nothing is mapped at this offset, or no I/O is mapped at all (no terminals, " \
+                           "or the process image is empty on a PC runtime)"
+        return out
 
     def read_raw(self, index_group: int, index_offset: int, size: int, port: int | None = None,
                  net_id: str | None = None) -> dict[str, Any]:
@@ -705,6 +722,11 @@ class AdsBackend:
             out["master_state"] = {1: "INIT", 2: "PREOP", 3: "BOOT", 4: "SAFEOP", 8: "OP"}.get(code & 0x0F, code)
             out["master_state_raw"] = code
         except AdsError as exc:
+            if "(6)" in str(exc) or "port not found" in str(exc).lower() or "0x6" in str(exc):
+                return {"master_port": p, "master": None,
+                        "note": f"no EtherCAT master answers on ADS port {p} — this target has no EtherCAT master configured "
+                                f"(an engineering PC with the local runtime, or a CX without an EtherCAT device in TIID). "
+                                f"Nothing is wrong unless you expected terminals here."}
             out["master_state_error"] = str(exc)
         try:
             cnt = self.read_raw(0x00000006, 0x00000000, 2, p)

@@ -174,3 +174,23 @@ def test_incremental_refresh_and_git_changes(project_dir):
     ch = p.changed_units()
     st = {u["name"]: u["status"] for u in ch["units"]}
     assert st == {"MAIN": "modified", "FB_Extra": "untracked"}
+
+
+def test_read_file_confined_to_project(project_dir, tmp_path):
+    idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
+    idx.scan()
+    assert "MAIN" in idx.read_file("Plc/POUs/MAIN.TcPOU")["text"]
+    outside = tmp_path / "secret.ini"
+    outside.write_text("[x]\nkey=1\n")
+    with pytest.raises(ProjectError, match="outside the project"):
+        idx.read_file(str(outside))
+    with pytest.raises(ProjectError, match="outside the project"):
+        idx.read_file("../secret.ini")
+    # a symlink pointing out of the tree is followed and refused
+    link = project_dir / "Plc" / "escape.ini"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        return
+    with pytest.raises(ProjectError, match="outside the project"):
+        idx.read_file("Plc/escape.ini")

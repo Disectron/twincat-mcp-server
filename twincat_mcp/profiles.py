@@ -82,8 +82,14 @@ class CaptureProfile:
         return out
 
     def to_dict(self) -> dict[str, Any]:
+        import datetime as _dt
         d = asdict(self)
         d["count"] = len(self.items)
+        for k in ("created", "updated"):
+            if isinstance(d.get(k), (int, float)):
+                d[k] = _dt.datetime.fromtimestamp(d[k], _dt.timezone.utc).isoformat()
+        if any(i.get("type") is None for i in d.get("items", [])):
+            d["note"] = "type/size are filled from the runtime when the profile is started (rec_profile_start) or saved while the target is reachable"
         d["groups"] = [{"mode": m, "cycle_ms": c, "symbols": len(v), "bytes_per_s": sum(estimate_bytes_per_s(i.size or 8, m, c) for i in v)}
                        for (m, c), v in self.groups().items()]
         return d

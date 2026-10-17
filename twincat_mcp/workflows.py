@@ -26,7 +26,11 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
         res = await app.proj_call(app.proj.resolve_symbol, symbol)
         rep["resolution"] = res
         leaf = symbol.split(".")[-1].split("[")[0]
-        writers = await app.proj_call(app.proj.search, rf"\b{leaf}\b\s*:=", None, 50, True)
+        # a write is `x :=`, an output binding `Q => x` in an FB call, or `x` passed as VAR_IN_OUT (approximated by
+        # a bare `, x)` / `(x,` inside a call — reported separately as possible writes)
+        writers = await app.proj_call(app.proj.search, rf"(\b{leaf}\b\s*:=|=>\s*{leaf}\b)", None, 50, True)
+        for h in writers["hits"]:
+            h["kind"] = "output_binding" if "=>" in h["text"] else "assignment"
         mentions = await app.proj_call(app.proj.search, rf"\b{leaf}\b", ["PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "ACTION", "GET", "SET"], 200, True)
         impl_mentions = [h for h in mentions["hits"] if h["part"] == "implementation"]
         rep["writers"] = writers["hits"][:30]

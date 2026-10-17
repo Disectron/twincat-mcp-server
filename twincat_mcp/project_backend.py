@@ -84,6 +84,16 @@ class CodeUnit:
                 "return_type": self.return_type, "impl_lines": self.implementation.count("\n") + (1 if self.implementation else 0)}
 
 
+_RE_LINE_COMMENT = re.compile(r"//.*$")
+_RE_BLOCK_COMMENT = re.compile(r"\(\*.*?\*\)")
+_RE_STR_LIT = re.compile(r"'[^']*'")
+
+
+def _strip_comments_line(text: str) -> str:
+    """Code part of one line: block comments, // comments and string literals removed."""
+    return _RE_LINE_COMMENT.sub("", _RE_STR_LIT.sub("''", _RE_BLOCK_COMMENT.sub("", text or "")))
+
+
 class ProjectError(RuntimeError):
     pass
 
@@ -368,7 +378,10 @@ class ProjectIndex:
             parts = parts[1:]
         for seg in parts:
             if cur is None:
-                hops.append({"segment": seg, "error": "previous hop type is not in the project (library type or basic type)"})
+                prev_type = hops[-1].get("type") if hops else None
+                hops.append({"segment": seg, "library_member": True,
+                             "note": f"inside {prev_type!r}, a type the project does not define (library FB/struct) — the "
+                                     f"runtime datatype table knows its layout (ads_symbol_info / ads_types), infosys_declaration its meaning"})
                 break
             base = re.sub(r"\[.*\]$", "", seg)
             var = self._find_var(cur, base)
@@ -385,7 +398,10 @@ class ProjectIndex:
             hops.append({"segment": seg, "declared_in": unit_of_var.name, "file": unit_of_var.file, "line": v.line,
                          "type": v.type, "section": v.section, "comment": v.comment})
             cur = self._unit_for_type(v.type)
-        return {"symbol": symbol, "hops": hops, "resolved": all("error" not in h for h in hops)}
+        library_tail = [h["segment"] for h in hops if h.get("library_member")]
+        return {"symbol": symbol, "hops": hops, "resolved": all("error" not in h for h in hops),
+                "resolved_to_library_type": bool(library_tail),
+                "library_type": next((h.get("type") for h in reversed(hops) if h.get("type") and not h.get("library_member")), None) if library_tail else None}
 
     def _find_var(self, u: CodeUnit, name: str) -> tuple[CodeUnit, VarDecl] | None:
         seen = set()
@@ -448,13 +464,38 @@ class ProjectIndex:
         self._ensure()
         rx = re.compile(rf"\b{re.escape(name)}\b", re.I)
         res = self.search(rx.pattern, None, max_hits, True)
-        decl_hits = [h for h in res["hits"] if h["unit"].lower() != name.lower()]
+        decl_hits = []
+        for h in res["hits"]:
+            if h["unit"].lower() == name.lower():
+                continue
+            # a hit inside a comment or string is a mention of the word, not a use of the type
+            code_part = _strip_comments_line(h["text"])
+            h = dict(h)
+            h["in_comment"] = not rx.search(code_part)
+            decl_hits.append(h)
         instances = []
         for u in self.units.values():
             for v in u.vars:
-                if self._unit_for_type(v.type) and self._unit_for_type(v.type).name.lower() == name.lower():  # type: ignore[union-attr]
-                    instances.append({"unit": u.name, "var": v.name, "type": v.type, "file": u.file, "line": v.line})
-        return {"name": name, "instances": instances, "mentions": decl_hits, "truncated": res["truncated"]}
+                base = self._base_type_name(v.type)
+                tu = self._unit_for_type(v.type)
+                if (tu is not None and tu.name.lower() == name.lower()) or (tu is None and base.lower() == name.lower()):
+                    instances.append({"unit": u.name, "var": v.name, "type": v.type, "file": u.file, "line": v.line,
+                                      "declared_in_project": tu is not None})   # False = library type (Tc2_Standard.CTU …)
+        return {"name": name, "instances": instances,
+                "mentions": [h for h in decl_hits if not h["in_comment"]],
+                "mentions_in_comments": [h for h in decl_hits if h["in_comment"]][:50], "truncated": res["truncated"]}
+
+    def _base_type_name(self, type_str: str) -> str:
+        """The bare type name behind ARRAY OF / POINTER TO / STRING(n) / library qualification."""
+        t = type_str.strip()
+        if m := _RE_ARRAY_OF.match(t):
+            t = m.group(1).strip()
+        if m := _RE_PTR.match(t):
+            t = m.group(1).strip()
+        t = t.split("(")[0].strip()
+        if "." in t:
+            t = t.split(".")[-1]
+        return t
 
     # ------------------------------------------------------------ instances
     def variables(self, scope: str | None = None, max_array: int = 64, max_items: int = 200_000,
@@ -600,13 +641,44 @@ class ProjectIndex:
         return {"file": u.file, "changed": changed, "backup": str(bak), "eol": "CRLF" if eol == "\r\n" else "LF", "bom": bom}
 
     def read_file(self, rel_or_abs: str, max_chars: int = 200_000) -> dict[str, Any]:
+        """Read a file inside the project root (or an allowed extra root). Anything outside is refused: this
+        tool exists to read .TcPOU/.plcproj/.tsproj/HMI files, not C:\\Windows\\win.ini."""
         p = Path(rel_or_abs)
         if not p.is_absolute() and self.root:
             p = self.root / p
+        self.assert_inside(p)
         if not p.is_file():
             raise ProjectError(f"file not found: {p}")
         txt = p.read_text(encoding="utf-8-sig", errors="replace")
         return {"file": str(p), "chars": len(txt), "text": txt[:max_chars], "truncated": len(txt) > max_chars}
+
+    def allowed_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        for r in (self.root, getattr(self.cfg, "hmi_root", None), getattr(self.cfg, "experiments_dir", None)):
+            if r:
+                try:
+                    roots.append(Path(r).resolve())
+                except OSError:
+                    pass
+        return roots
+
+    def assert_inside(self, p: Path) -> Path:
+        """Resolve ``p`` (following links) and require it under one of the allowed roots."""
+        roots = self.allowed_roots()
+        if not roots:
+            raise ProjectError("no project root configured (xae.solution_path / project.root); file access is refused without one")
+        try:
+            rp = p.resolve()
+        except OSError as exc:
+            raise ProjectError(f"cannot resolve {p}: {exc}") from exc
+        for r in roots:
+            try:
+                rp.relative_to(r)
+                return rp
+            except ValueError:
+                continue
+        raise ProjectError(f"{p} is outside the project ({', '.join(str(r) for r in roots)}); refused. "
+                           f"Project tools only read and write under the solution folder (plus hmi_root / experiments_dir).")
 
 
 # ----------------------------------------------------------------------------

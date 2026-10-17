@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.0">
+  <Visu Name="Visu1" Id="{a1b2c3d4-0000-0000-0000-000000000001}">
+    <XmlArchive>
+      <Data>
+        <o xml:space="preserve" t="VisualizationElement">
+          <VisualElement Id="12345L">
+            <ElementType>Lamp</ElementType>
+            <VisualElemMember Id="743958181L"><v>MAIN.bStart</v></VisualElemMember>
+            <VisualElemMember Id="1999528970L"><v>MAIN.fbFill.eState</v></VisualElemMember>
+          </VisualElement>
+          <VisualElement Id="12346L">
+            <ElementType>Rectangle</ElementType>
+            <VisualElemMember Id="2477733581L"><v>MAIN.nCycle</v></VisualElemMember>
+            <InputActions>
+              <STSnippetInputAction><Code>MAIN.bStart := TRUE; MAIN.nCycle := MAIN.nCycle + 1;</Code></STSnippetInputAction>
+            </InputActions>
+          </VisualElement>
+        </o>
+      </Data>
+    </XmlArchive>
+  </Visu>
+</TcPlcObject>

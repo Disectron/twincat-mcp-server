@@ -305,7 +305,8 @@ class TestBench:
         ts = _raw(out.get("AppTimestamp"))
         if isinstance(ts, int):
             import datetime as dt
-            out["AppTimestamp_text"] = dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat()
+            # DT on the PLC is a wall-clock value with no zone; present it as such, not as UTC
+            out["AppTimestamp_text"] = dt.datetime.fromtimestamp(ts, dt.timezone.utc).replace(tzinfo=None).isoformat() + " (PLC local time, no zone)"
         return out
 
     def task_stats(self, task_index: int = 1, samples: int = 1, interval_ms: int = 50) -> dict[str, Any]:

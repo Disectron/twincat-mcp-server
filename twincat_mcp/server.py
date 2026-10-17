@@ -23,6 +23,7 @@ import json
 import logging
 import platform
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -258,9 +259,16 @@ class App:
         try:
             res = await asyncio.wait_for(asyncio.to_thread(fn, *a, **kw), timeout)
         except InfosysError as exc:
-            raise ToolError(str(exc)) from exc
+            raise ToolError(str(exc) or f"{type(exc).__name__} (no message)") from exc
+        except sqlite3.OperationalError as exc:
+            st = self.docs_index_status()
+            busy = st.get("started") and not st.get("finished")
+            raise ToolError(f"Infosys index busy ({exc})" + (f" — the default books are being indexed in the background "
+                            f"({st.get('running_for_s', 0):.0f} s so far); retry in a moment or search with web_fallback=true" if busy else "")) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError(f"Infosys call exceeded {timeout:.0f} s (slow network? smaller max_pages?)") from exc
+        except Exception as exc:  # noqa: BLE001 — never an empty error message to the client
+            raise ToolError(f"Infosys lookup failed: {type(exc).__name__}: {exc}") from exc
         st = self.docs_bg
         if isinstance(res, dict) and st.get("started") and not st.get("finished"):
             res["index_status"] = (f"default books are being indexed in the background ({round(time.time() - st['started'])} s so far); "
@@ -357,12 +365,17 @@ class App:
 
     # --- safety ------------------------------------------------------------
     async def permit(self, ctx: Context | None, op: OpClass, action: str, target: str = "",
-                     confirm_token: str | None = None) -> None:
+                     confirm_token: str | None = None, mode_gate: bool = True) -> None:
         """Check the guard; for CONTROL/DESTRUCTIVE without a token, try to
-        ask the human through elicitation before failing."""
+        ask the human through elicitation before failing. ``mode_gate=False`` skips the
+        readonly/guarded gating and only demands the confirmation — for tc_set_mode, which must be
+        able to leave readonly mode with a human's consent."""
         scope = self.scope()
         try:
-            self.guard.check(op, action=action, target=target, confirm_token=confirm_token, scope=scope)
+            if mode_gate:
+                self.guard.check(op, action=action, target=target, confirm_token=confirm_token, scope=scope)
+            else:
+                self.guard.consume_token(confirm_token, action, target, scope)
             return
         except SafetyError as exc:
             # elicitation only replaces a *missing* token; a wrong/stale/foreign token is a hard error
@@ -399,6 +412,17 @@ class App:
     def audit(self, tool: str, args: dict[str, Any], op: OpClass, outcome: str, detail: Any = None) -> None:
         self.guard.audit(tool, args, op, outcome, detail)
 
+    async def confirmed(self, tool: str, args: dict[str, Any], op: OpClass, coro: Any) -> Any:
+        """Run the body of a confirmed action and audit its *final* outcome — ok with the result, or error
+        with the message — so the trail never ends at 'human-confirmed' for a command that then failed."""
+        try:
+            res = await coro
+        except BaseException as exc:
+            self.guard.audit(tool, args, op, "error", str(exc)[:400])
+            raise
+        self.guard.audit(tool, args, op, "ok", res)
+        return res
+
 
 async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str, Any]:
     proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False)
@@ -406,6 +430,7 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
     roots = {p.split(".")[0] for p in declared}
     online: set[str] = set()
     online_types: dict[str, str] = {}
+    online_names: dict[str, str] = {}
     for r in roots:
         try:
             groups = await app.ads_call(app.ads.leaves_under, r, max_items, timeout=300)
@@ -415,18 +440,27 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
             for lf in leaves:
                 online.add(lf.path.lower())
                 online_types[lf.path.lower()] = lf.type
+                online_names[lf.path.lower()] = lf.path          # keep the PLC's spelling in the report
     missing = [declared[k] for k in sorted(set(declared) - online)]
-    extra = sorted(online - set(declared))
-    # declared composite (library type) items match if any online leaf starts with them
+    # declared composite (library type) items match if any online leaf starts with them — and those leaves
+    # (CTU.CV, TON.Q, …) are then *expected*, not "extra": the project cannot see inside a library FB
     missing_final = []
+    composite_prefixes: list[str] = []
     for it in missing:
         pre = it["path"].lower() + "."
         if any(o.startswith(pre) or o.startswith(it["path"].lower() + "[") for o in online):
+            composite_prefixes.append(it["path"].lower())
             continue
         missing_final.append(it)
+    extra = []
+    for o in sorted(online - set(declared)):
+        if any(o.startswith(cp + ".") or o.startswith(cp + "[") for cp in composite_prefixes):
+            continue
+        extra.append(o)
     return {"declared": len(declared), "online_under_same_roots": len(online),
             "matched": len(declared) - len(missing_final), "missing_online": missing_final[:500],
-            "extra_online": [{"path": e, "type": online_types.get(e)} for e in extra[:500]],
+            "extra_online": [{"path": online_names.get(e, e), "type": online_types.get(e)} for e in extra[:500]],
+            "library_instances": [declared[cp]["path"] for cp in composite_prefixes][:200],
             "roots": sorted(roots)}
 
 
@@ -501,15 +535,22 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Current safety mode, ceiling, allow/deny lists, pending confirmation tokens."""
         return app.guard.status()
 
-    @mcp.tool(annotations=EDIT)
-    async def tc_set_mode(mode: str) -> dict[str, Any]:
-        """Switch safety mode: readonly | guarded | full. Escalation is capped at the
-        configured max_mode (TCMCP_MAX_MODE); lowering is always allowed."""
+    @mcp.tool(annotations=CONTROL)
+    async def tc_set_mode(mode: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Switch safety mode: readonly | guarded | full. Lowering is free. Escalating (guarded→full,
+        readonly→guarded) is capped at max_mode AND needs a confirmation (prompt or confirm_token) —
+        an agent must not be able to widen its own permissions silently."""
+        from .config import MODE_RANK
+        new_rank, cur_rank = MODE_RANK.get(mode, -1), MODE_RANK.get(app.guard.mode, 0)
+        if new_rank < 0:
+            raise ToolError(f"mode must be one of readonly | guarded | full, got {mode!r}")
+        if new_rank > cur_rank:
+            await app.permit(ctx, OpClass.CONTROL, "tc_set_mode", target=mode, confirm_token=confirm_token, mode_gate=False)
         try:
             old = app.guard.set_mode(mode)
         except SafetyError as exc:
             raise ToolError(str(exc)) from exc
-        return {"previous": old, "mode": app.guard.mode}
+        return {"previous": old, "mode": app.guard.mode, "escalated": new_rank > cur_rank}
 
     @mcp.tool(annotations=CONTROL)
     async def tc_allow_write(pattern: str, remove: bool = False, confirm_token: str | None = None,
@@ -578,8 +619,28 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def tc_request_confirmation(action: str, target: str = "") -> dict[str, Any]:
         """Issue a single-use confirm_token for a control/destructive tool. Use the exact
-        action name of the tool (e.g. 'xae_activate_configuration') and its target."""
-        return app.guard.request_token(action, target, app.scope())
+        action name of the tool (e.g. 'xae_activate_configuration') and its target. For the XAE
+        actions that act on the shell's target (activate, restart, deploy, tree_delete) the target
+        must be the NetId XAE currently targets — a token for any other NetId is refused here, not
+        merely rejected later, so the agent cannot talk itself into a stale target."""
+        act = (action or "").strip()
+        if act in ("xae_activate_configuration", "xae_restart_twincat", "xae_deploy", "xae_tree_delete"):
+            try:
+                real = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
+            except ToolError as exc:
+                raise ToolError(f"cannot issue a token for {act}: the XAE target is unknown ({exc}). Attach first (xae_attach).") from exc
+            if not target:
+                target = real
+            elif target.strip() != real:
+                raise ToolError(f"{act} acts on the shell's current target {real!r}, not {target!r}. "
+                                f"Request the token for {real!r} — or change the target first with xae_target.")
+            tok = app.guard.request_token(act, real, app.scope())
+            tok["xae_target"] = real
+            if app.ads.net_id and app.ads.net_id != real:
+                tok["warning"] = (f"ADS side targets {app.ads.net_id} while XAE targets {real}: the deploy/restart will hit the XAE "
+                                  f"target and the ADS tools will keep reading the other machine. ads_connect(ams_net_id={real!r}) to align.")
+            return tok
+        return app.guard.request_token(act, target, app.scope())
 
     @mcp.tool(annotations=READ)
     async def tc_audit_tail(n: int = 50) -> list[dict[str, Any]]:
@@ -599,8 +660,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         configured = {cfg.ads.ams_net_id, None, "local"}
         if ams_net_id not in configured and ams_net_id != app.ads.net_id:
             await app.permit(ctx, OpClass.CONTROL, "ads_connect", ams_net_id or "local", confirm_token)
-        res = await app.ads_call(app.ads.connect, ams_net_id, ams_port, ip_address, timeout=20)
-        app.audit("ads_connect", {"ams_net_id": ams_net_id, "port": ams_port}, OpClass.CONTROL, "ok")
+        res = await app.confirmed("ads_connect", {"ams_net_id": ams_net_id, "port": ams_port}, OpClass.CONTROL, app.ads_call(app.ads.connect, ams_net_id, ams_port, ip_address, timeout=20))
         return res
 
     @mcp.tool(annotations=READ)
@@ -717,10 +777,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             raise ToolError("raw writes go to the connected target only; ads_connect first")
         size = len(bytes.fromhex(hex_data))
         tgt = f"raw:{port}/0x{index_group:X}/0x{index_offset:X}"
-        await app.permit(ctx, OpClass.WRITE, "ads_write_raw", tgt)
         overlapped = await app.ads_call(app.ads.symbols_overlapping, index_group, index_offset, size, port, timeout=60)
+        # two gates: every symbol the bytes overlap must be writable, AND the raw address itself must be allowed
+        # ('raw:851/*' in the allow list) — a raw write can straddle a symbol boundary and reach memory no symbol names
         for nm in overlapped:
             await app.permit(ctx, OpClass.WRITE, "ads_write_raw", nm)
+        try:
+            await app.permit(ctx, OpClass.WRITE, "ads_write_raw", tgt)
+        except ToolError as exc:
+            raise ToolError(f"{exc} — raw writes need their own allow-list entry even when every overlapped symbol "
+                            f"({overlapped or 'none'}) is allowed: add 'raw:{port}/*' (or this exact {tgt}) with tc_allow_write "
+                            f"or in [safety] write_allowlist. Prefer ads_write by symbol name.") from exc
         res = await app.ads_call(app.ads.write_raw, index_group, index_offset, hex_data, port, ams_net_id, timeout=30)
         res["overlapping_symbols"] = overlapped
         app.audit("ads_write_raw", {"target": tgt, "hex": hex_data[:64]}, OpClass.WRITE, "ok", res)
@@ -731,7 +798,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         change_only: bool = True) -> dict[str, Any]:
         """Sample symbols for duration_ms every interval_ms (polling trace). change_only keeps
         only rows where a value changed. Caps: 60 s, ≥10 ms, 5000 rows. Use for timing
-        questions: 'does bDone pulse?', 'how long is the valve open?'."""
+        questions: 'does bDone pulse?', 'how long is the valve open?'. Runs on the slow ADS
+        worker, so ads_write calls issued *concurrently* interleave with it — but a client that
+        sends tool calls one after another will see the writes land after the watch ends; for a
+        stimulus-response measurement use test_response or rec_start + the write + rec_stop."""
         return await app.ads_call(app.ads.watch, names, duration_ms, interval_ms, change_only,
                                   timeout=cfg.ads.max_watch_duration_ms / 1000 + 30, slow=True)
 
@@ -748,8 +818,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         non-persistent data lost). Control-class: confirmation in guarded mode."""
         op = OpClass.DESTRUCTIVE if action == "reset" else OpClass.CONTROL
         await app.permit(ctx, op, "ads_plc_state", action, confirm_token)
-        res = await app.ads_call(app.ads.set_plc_state, action, timeout=30)
-        app.audit("ads_plc_state", {"action": action}, op, "ok", res)
+        res = await app.confirmed("ads_plc_state", {"action": action}, op, app.ads_call(app.ads.set_plc_state, action, timeout=30))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -757,8 +826,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Switch TwinCAT on the target between 'run' and 'config' mode (restarts the
         runtime, I/O goes down). Destructive-class."""
         await app.permit(ctx, OpClass.DESTRUCTIVE, "ads_system_mode", action, confirm_token)
-        res = await app.ads_call(app.ads.set_system_mode, action, timeout=30)
-        app.audit("ads_system_mode", {"action": action}, OpClass.DESTRUCTIVE, "ok", res)
+        res = await app.confirmed("ads_system_mode", {"action": action}, OpClass.DESTRUCTIVE, app.ads_call(app.ads.set_system_mode, action, timeout=30))
         return res
 
     @mcp.tool(annotations=READ)
@@ -780,8 +848,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Create the PLC-side route back to this PC (UDP discovery protocol, needs the target's
         Windows/TC-BSD credentials). Control-class."""
         await app.permit(ctx, OpClass.CONTROL, "ads_add_route_to_plc", plc_ip, confirm_token)
-        res = await app.ads_call(app.ads.add_route_to_plc, plc_ip, plc_username, plc_password, route_name, local_net_id, hostname, timeout=30)
-        app.audit("ads_add_route_to_plc", {"plc_ip": plc_ip, "route_name": route_name}, OpClass.CONTROL, "ok", res)
+        res = await app.confirmed("ads_add_route_to_plc", {"plc_ip": plc_ip, "route_name": route_name}, OpClass.CONTROL, app.ads_call(app.ads.add_route_to_plc, plc_ip, plc_username, plc_password, route_name, local_net_id, hostname, timeout=30))
         return res
 
 
@@ -1150,8 +1217,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         {attribute 'TcRpcEnable'}. inputs: [{type:'LREAL', value: 12.5}, …] in VAR_INPUT order
         (use base types: INT not E_Enum); outputs: ['BOOL', …] in VAR_OUTPUT order. Write-class."""
         await app.permit(ctx, OpClass.WRITE, "ads_call_method", f"{instance}#{method}")
-        res = await app.ads_call(app.bench.call_method, instance, method, inputs, return_type, outputs, timeout=60)
-        app.audit("ads_call_method", {"instance": instance, "method": method, "inputs": inputs}, OpClass.WRITE, "ok", res)
+        res = await app.confirmed("ads_call_method", {"instance": instance, "method": method, "inputs": inputs}, OpClass.WRITE, app.ads_call(app.bench.call_method, instance, method, inputs, return_type, outputs, timeout=60))
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -1223,8 +1289,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         method per public method, arranged from the FB interface, and register it in the
         .plcproj. Assertions are left as TODO stubs."""
         await app.permit(None, OpClass.EDIT, "tcunit_scaffold", fb_name)
-        res = await app.proj_call(codecheck.tcunit_scaffold, app.proj, fb_name, out_dir, add_to_plcproj, overwrite)
-        app.audit("tcunit_scaffold", {"fb": fb_name, "file": res.get("file")}, OpClass.EDIT, "ok")
+        res = await app.confirmed("tcunit_scaffold", {"fb": fb_name}, OpClass.EDIT, app.proj_call(codecheck.tcunit_scaffold, app.proj, fb_name, out_dir, add_to_plcproj, overwrite))
         return res
 
 
@@ -1360,8 +1425,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Set/clear the Disabled flag on I/O devices under TIID (all, or the named ones) so a
         configuration activates without the hardware present — TcUnit on a PC, dry runs."""
         await app.permit(None, OpClass.EDIT, "xae_io_disable", "TIID")
-        res = await app.xae_call(app.xae.io_disable, disable, only, timeout=120)
-        app.audit("xae_io_disable", {"disable": disable, "only": only}, OpClass.EDIT, "ok", res)
+        res = await app.confirmed("xae_io_disable", {"disable": disable, "only": only}, OpClass.EDIT, app.xae_call(app.xae.io_disable, disable, only, timeout=120))
         return res
 
     @mcp.tool(annotations=READ)
@@ -1381,8 +1445,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # ======================================================================
     @mcp.tool(annotations=READ)
     async def hmi_scan(root: str | None = None) -> dict[str, Any]:
-        """Index HMI symbol bindings: TE2000 .view/.content/.usercontrol/.json (%s%PLC1.X%/s%) and
-        TcVIS files. root defaults to project.hmi_root, else the project root."""
+        """Index HMI symbol bindings: TE2000 .view/.content/.usercontrol/.json (%s%PLC1.X%/s%) and TF1800 .TcVIS
+        (VisualElemMember paths -> kind 'tcvis'; ST input-action assignments -> kind 'tcvis_write').
+        root defaults to project.hmi_root, else the project root (which is where .TcVIS files live)."""
         r = root or cfg.project.hmi_root or cfg.project.root
         if not r:
             raise ToolError("no HMI root: pass root= or set TCMCP_HMI_ROOT")
@@ -1437,7 +1502,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if kind != "dosing_fill":
             raise ToolError("kinds: dosing_fill")
         return {"yaml": X.dump_spec(X.DOSING_TEMPLATE), "spec": X.DOSING_TEMPLATE,
-                "measure_kinds": X.MEASURE_KINDS, "stats": X.STATS, "criterion_ops": X.CRIT_OPS}
+                "measure_kinds": X.MEASURE_KINDS, "stats": X.STATS, "criterion_ops": X.CRIT_OPS,
+                "before_you_save": ["the symbols are an example dosing machine's — replace them with yours (ads_list_symbols)",
+                                    "'profile' names a capture profile that must already exist: rec_profile_save it first, "
+                                    "with every symbol the measures read",
+                                    "'writes_allowed' must list every symbol the spec writes (factors, start, before/after)",
+                                    "run.ack: falls (default) | edge (process done again within a cycle) | none; "
+                                    "before/after accept {wait_ms: N} and {wait_until: {...}} items"],
+                "run_options": {"ack": "falls | edge | none", "ack_timeout_ms": "default min(10000, done_when.timeout_ms)",
+                                "before/after items": "{symbol, value} | {wait_ms} | {wait_until: {symbol, op, value, timeout_ms}}"}}
 
     @mcp.tool(annotations=READ)
     async def exp_validate(spec: str | dict[str, Any] | None = None, name: str | None = None,
@@ -1645,7 +1718,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         whether they are indexed locally. pattern is a glob on the slug ('tcplclib_*', '*json*');
         category: plc-library | function-tf | engineering-te | twincat-system | hardware | other.
         TwinCAT 2 books are excluded. First call downloads the sitemap (a few MB, cached 7 days)."""
-        return await app.docs_call(app.docs.books, pattern, category, limit, timeout=300)
+        res = await app.docs_call(app.docs.books, pattern, category, limit, timeout=300)
+        st = app.docs_index_status()
+        if isinstance(res, dict) and st.get("started") and not st.get("finished"):
+            for b in res.get("books", []):
+                if not b.get("indexed") and b.get("book") in (st.get("books") or []):
+                    b["indexed"] = "indexing"
+        return res
 
     @mcp.tool(annotations=READ)
     async def infosys_index(book: str, force: bool = False, max_pages: int | None = None) -> dict[str, Any]:
@@ -1843,16 +1922,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Write a file on the target IPC (text or base64). Control-class."""
         await app.permit(ctx, OpClass.CONTROL, "ipc_write_file", path, confirm_token)
         data = base64.b64decode(base64_data) if base64_data else (text or "").encode("utf-8")
-        res = await app.ads_call(app.files.write_file, path, data, append, timeout=300)
-        app.audit("ipc_write_file", {"path": path, "bytes": len(data)}, OpClass.CONTROL, "ok", res)
+        res = await app.confirmed("ipc_write_file", {"path": path, "bytes": len(data)}, OpClass.CONTROL, app.ads_call(app.files.write_file, path, data, append, timeout=300))
         return res
 
     @mcp.tool(annotations=DESTR)
     async def ipc_delete_file(path: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Delete a file on the target IPC. Destructive-class."""
         await app.permit(ctx, OpClass.DESTRUCTIVE, "ipc_delete_file", path, confirm_token)
-        res = await app.ads_call(app.files.delete_file, path, timeout=30)
-        app.audit("ipc_delete_file", {"path": path}, OpClass.DESTRUCTIVE, "ok", res)
+        res = await app.confirmed("ipc_delete_file", {"path": path}, OpClass.DESTRUCTIVE, app.ads_call(app.files.delete_file, path, timeout=30))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -1860,8 +1937,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                 confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Start a process on the target IPC (NT_StartProcess equivalent). Destructive-class."""
         await app.permit(ctx, OpClass.DESTRUCTIVE, "ipc_start_process", path, confirm_token)
-        res = await app.ads_call(app.files.start_process, path, directory, command_line, timeout=30)
-        app.audit("ipc_start_process", {"path": path, "cmd": command_line}, OpClass.DESTRUCTIVE, "ok", res)
+        res = await app.confirmed("ipc_start_process", {"path": path, "cmd": command_line}, OpClass.DESTRUCTIVE, app.ads_call(app.files.start_process, path, directory, command_line, timeout=30))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -1869,8 +1945,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                          ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Reboot (or shut down) the target IPC via the System Service. Destructive-class."""
         await app.permit(ctx, OpClass.DESTRUCTIVE, "ipc_reboot", "target", confirm_token)
-        res = await app.ads_call(app.files.reboot, delay_s, not shutdown_only, timeout=30)
-        app.audit("ipc_reboot", {"delay_s": delay_s, "shutdown_only": shutdown_only}, OpClass.DESTRUCTIVE, "ok", res)
+        res = await app.confirmed("ipc_reboot", {"delay_s": delay_s, "shutdown_only": shutdown_only}, OpClass.DESTRUCTIVE, app.ads_call(app.files.reboot, delay_s, not shutdown_only, timeout=30))
         return res
 
     # ======================================================================
@@ -1885,15 +1960,22 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def xae_status() -> dict[str, Any]:
-        """Shell version, open solution, projects, TwinCAT project name, target NetId, started flag."""
-        return await app.xae_call(app.xae.status, timeout=60)
+        """Shell version, open solution, projects, TwinCAT project name, target NetId, started flag.
+        Attaches to the shell first if not attached yet (as every xae_* tool does)."""
+        def _st():
+            if app.xae.dte is None:
+                try:
+                    app.xae.attach()
+                except XaeError as exc:
+                    return {"attached": False, "reason": str(exc)}
+            return app.xae.status()
+        return await app.xae_call(_st, timeout=120)
 
     @mcp.tool(annotations=EDIT)
     async def xae_open_solution(path: str) -> dict[str, Any]:
         """Open a .sln in the attached shell."""
         await app.permit(None, OpClass.EDIT, "xae_open_solution", path)
-        res = await app.xae_call(app.xae.open_solution, path, timeout=180)
-        app.audit("xae_open_solution", {"path": path}, OpClass.EDIT, "ok")
+        res = await app.confirmed("xae_open_solution", {"path": path}, OpClass.EDIT, app.xae_call(app.xae.open_solution, path, timeout=180))
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -1932,8 +2014,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         contains download/reset/activate/restart/delete/remove/shutdown are destructive-class."""
         op = OpClass.DESTRUCTIVE if re.search(r"download|reset|activate|restart|delete|remove|shutdown|clean", name, re.I) else OpClass.CONTROL
         await app.permit(ctx, op, "xae_command", name, confirm_token)
-        res = await app.xae_call(app.xae.command, name, args, timeout=120)
-        app.audit("xae_command", {"name": name, "args": args}, op, "ok")
+        res = await app.confirmed("xae_command", {"name": name, "args": args}, op, app.xae_call(app.xae.command, name, args, timeout=120))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -1943,8 +2024,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         download/reset_cold/reset_origin are destructive-class, the rest control-class."""
         op = OpClass.DESTRUCTIVE if action in ("download", "reset_origin", "reset_cold") else OpClass.CONTROL
         await app.permit(ctx, op, "xae_plc", action, confirm_token)
-        res = await app.xae_call(app.xae.plc_action, action, timeout=300)
-        app.audit("xae_plc", {"action": action}, op, "ok", res)
+        res = await app.confirmed("xae_plc", {"action": action}, op, app.xae_call(app.xae.plc_action, action, timeout=300))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -1955,8 +2035,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if net_id is None:
             return await app.xae_call(app.xae.target_get, timeout=60)
         await app.permit(ctx, OpClass.CONTROL, "xae_target", net_id, confirm_token)
-        res = await app.xae_call(app.xae.target_set, net_id, timeout=60)
-        app.audit("xae_target", {"net_id": net_id}, OpClass.CONTROL, "ok", res)
+        res = await app.confirmed("xae_target", {"net_id": net_id}, OpClass.CONTROL, app.xae_call(app.xae.target_set, net_id, timeout=60))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -2029,8 +2108,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def xae_tree_get(path: str, depth: int = 0, xml: bool = False, max_items: int = 2000) -> dict[str, Any]:
         """System Manager tree item: properties, children to `depth`, and ProduceXml when xml=true.
-        Path syntax 'TIPC^Plc^Plc Project^POUs^MAIN'. Roots: TIID (I/O), TIPC (PLC), TIRC
-        (real-time/tasks), TIRR (routes), TINC (NC)."""
+        Path syntax 'TIPC^Plc^Plc Project^POUs^MAIN' (xae_plc_projects gives the '<Name> Project' path;
+        its children POUs/DUTs/GVLs are walked even though the node itself reports no ChildCount).
+        Roots: TIID (I/O), TIPC (PLC), TIRT (tasks), TIRC (real-time settings), TIRR (routes), TINC (NC)."""
         out = await app.xae_call(app.xae.tree_item, path, timeout=60)
         if depth > 0:
             out["children"] = (await app.xae_call(app.xae.tree_children, path, min(depth, 6), max_items, timeout=300))["items"]
@@ -2044,8 +2124,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (add I/O boxes, link variables, set task cycle time, add project routes on TIRR …)."""
         app.guard_safety_path(path, "xae_tree_consume_xml")
         await app.permit(None, OpClass.EDIT, "xae_tree_consume_xml", path)
-        res = await app.xae_call(app.xae.tree_consume_xml, path, xml, timeout=300)
-        app.audit("xae_tree_consume_xml", {"path": path, "xml_bytes": len(xml)}, OpClass.EDIT, "ok")
+        res = await app.confirmed("xae_tree_consume_xml", {"path": path, "xml_bytes": len(xml)}, OpClass.EDIT, app.xae_call(app.xae.tree_consume_xml, path, xml, timeout=300))
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -2054,8 +2133,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         {'TaskDef/CycleTime': '10000'} (unit 100 ns)."""
         app.guard_safety_path(path, "xae_tree_set_values")
         await app.permit(None, OpClass.EDIT, "xae_tree_set_values", path)
-        res = await app.xae_call(app.xae.tree_set_values, path, assignments, timeout=300)
-        app.audit("xae_tree_set_values", {"path": path, "assignments": assignments}, OpClass.EDIT, "ok", res)
+        res = await app.confirmed("xae_tree_set_values", {"path": path, "assignments": assignments}, OpClass.EDIT, app.xae_call(app.xae.tree_set_values, path, assignments, timeout=300))
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -2065,8 +2143,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         xae_pou_create."""
         app.guard_safety_path(parent_path, "xae_tree_create_child")
         await app.permit(None, OpClass.EDIT, "xae_tree_create_child", f"{parent_path}^{name}")
-        res = await app.xae_call(app.xae.tree_create_child, parent_path, name, subtype, before, info, timeout=120)
-        app.audit("xae_tree_create_child", {"parent": parent_path, "name": name, "subtype": subtype}, OpClass.EDIT, "ok", res)
+        res = await app.confirmed("xae_tree_create_child", {"parent": parent_path, "name": name, "subtype": subtype}, OpClass.EDIT, app.xae_call(app.xae.tree_create_child, parent_path, name, subtype, before, info, timeout=120))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -2076,8 +2153,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         tgt = f"{parent_path}^{name}"
         app.guard_safety_path(parent_path, "xae_tree_delete")
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_tree_delete", tgt, confirm_token)
-        res = await app.xae_call(app.xae.tree_delete_child, parent_path, name, timeout=120)
-        app.audit("xae_tree_delete", {"target": tgt}, OpClass.DESTRUCTIVE, "ok", res)
+        res = await app.confirmed("xae_tree_delete", {"target": tgt}, OpClass.DESTRUCTIVE, app.xae_call(app.xae.tree_delete_child, parent_path, name, timeout=120))
         return res
 
     # ---- PLC objects -----------------------------------------------------
@@ -2098,8 +2174,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (no file round-trip, XAE keeps LineIds consistent). Build afterwards."""
         app.guard_safety_path(path, "xae_pou_set")
         await app.permit(None, OpClass.EDIT, "xae_pou_set", path)
-        res = await app.xae_call(app.xae.pou_set, path, declaration, implementation, timeout=120)
-        app.audit("xae_pou_set", {"path": path, "decl": declaration is not None, "impl": implementation is not None}, OpClass.EDIT, "ok", res)
+        res = await app.confirmed("xae_pou_set", {"path": path, "decl": declaration is not None, "impl": implementation is not None}, OpClass.EDIT, app.xae_call(app.xae.pou_set, path, declaration, implementation, timeout=120))
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -2123,8 +2198,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         option: none | rename | replace | skip (conflict handling)."""
         app.guard_safety_path(plc_project_path, "xae_plcopen_import")
         await app.permit(None, OpClass.EDIT, "xae_plcopen_import", xml_file)
-        res = await app.xae_call(app.xae.plcopen_import, plc_project_path, xml_file, option, timeout=300)
-        app.audit("xae_plcopen_import", {"project": plc_project_path, "file": xml_file, "option": option}, OpClass.EDIT, "ok", res)
+        res = await app.confirmed("xae_plcopen_import", {"project": plc_project_path, "file": xml_file, "option": option}, OpClass.EDIT, app.xae_call(app.xae.plcopen_import, plc_project_path, xml_file, option, timeout=300))
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -2142,8 +2216,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         op = OpClass.DESTRUCTIVE if activate_after_generate else OpClass.EDIT
         app.guard_safety_path(plc_project_path, "xae_boot_project")
         await app.permit(ctx, op, "xae_boot_project", plc_project_path, confirm_token)
-        res = await app.xae_call(app.xae.boot_project, plc_project_path, autostart, generate, activate_after_generate, timeout=300)
-        app.audit("xae_boot_project", {"project": plc_project_path, "autostart": autostart, "generate": generate}, op, "ok", res)
+        res = await app.confirmed("xae_boot_project", {"project": plc_project_path, "autostart": autostart, "generate": generate}, op, app.xae_call(app.xae.boot_project, plc_project_path, autostart, generate, activate_after_generate, timeout=300))
         return res
 
     # ======================================================================
@@ -2178,8 +2251,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def proj_resolve_symbol(symbol: str) -> dict[str, Any]:
         """Map an ADS symbol path (MAIN.fbFill.fbValve.bOpen) to the file:line where each hop is
-        declared, following variable types through FB/STRUCT definitions."""
-        return await app.proj_call(app.proj.resolve_symbol, symbol)
+        declared, following variable types through FB/STRUCT definitions. Hops inside a library type
+        (Tc2_Standard.CTU.CV) are completed from the runtime's datatype table when the target is reachable."""
+        res = await app.proj_call(app.proj.resolve_symbol, symbol)
+        if res.get("resolved_to_library_type"):
+            try:
+                info = (await app.ads_call(app.ads.symbol_info, symbol, timeout=30)).to_dict()
+                res["runtime"] = {k: info.get(k) for k in ("name", "type", "size", "comment", "index_group", "index_offset") if k in info}
+                res["resolved"] = True
+            except ToolError as exc:
+                res["runtime"] = {"error": str(exc)[:200]}
+        return res
 
     @mcp.tool(annotations=READ)
     async def proj_search(regex: str, kinds: list[str] | None = None, max_hits: int = 200,
@@ -2204,8 +2286,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         rest of the XML byte-identical, writes a .bak, drops the object's stale <LineIds>).
         Use when XAE is closed or for batch edits; otherwise prefer xae_pou_set."""
         await app.permit(None, OpClass.EDIT, "proj_set_code", name)
-        res = await app.proj_call(app.proj.set_code, name, declaration, implementation, strip_lineids, regenerate_lineids)
-        app.audit("proj_set_code", {"name": name, "changed": res.get("changed")}, OpClass.EDIT, "ok", res)
+        res = await app.confirmed("proj_set_code", {"name": name}, OpClass.EDIT, app.proj_call(app.proj.set_code, name, declaration, implementation, strip_lineids, regenerate_lineids))
         return res
 
     # ======================================================================

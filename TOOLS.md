@@ -1,4 +1,4 @@
-# twincat-mcp 0.6.1 — tool reference
+# twincat-mcp 0.6.2 — tool reference
 
 141 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
@@ -6,10 +6,10 @@
 
 - `tc_doctor` [R] — Environment check: platform, pyads/router, local AMS NetId, XAE ProgIDs in the registry, running XAE shells, project root, safety mode. Run this first.
 - `tc_safety_status` [R] — Current safety mode, ceiling, allow/deny lists, pending confirmation tokens.
-- `tc_set_mode` [E] — Switch safety mode: readonly | guarded | full. Escalation is capped at the configured max_mode (TCMCP_MAX_MODE); lowering is always allowed.
+- `tc_set_mode` [C] — Switch safety mode: readonly | guarded | full. Lowering is free. Escalating (guarded→full, readonly→guarded) is capped at max_mode AND needs a confirmation (prompt or confirm_token) — an agent must not be able to widen its own permissions silently.
 - `tc_allow_write` [C] — Add (or remove) a write allow-list pattern for THIS session only — the in-session alternative to editing twincat_mcp.toml and reconnecting. fnmatch, case-insensitive: 'GVL_Test.*', 'MAIN.fbDispense.rSetpoint'. Control-class: needs a confirmation (prompt or confirm_token). The deny list still wins; the change is…
 - `tc_reload_config` [E] — Re-read twincat_mcp.toml (and TCMCP_* env) without a restart. Applies: safety allow/deny lists, confirm_destructive, confirm_ttl_s, docs settings, naming prefixes, dialog rules, tcunit result path. Reports — but does not apply — changes that need a restart: ads target/port, solution path, project root, mode/max_mode…
-- `tc_request_confirmation` [R] — Issue a single-use confirm_token for a control/destructive tool. Use the exact action name of the tool (e.g. 'xae_activate_configuration') and its target.
+- `tc_request_confirmation` [R] — Issue a single-use confirm_token for a control/destructive tool. Use the exact action name of the tool (e.g. 'xae_activate_configuration') and its target. For the XAE actions that act on the shell's target (activate, restart, deploy, tree_delete) the target must be the NetId XAE currently targets — a token for any…
 - `tc_audit_tail` [R] — Last n audit records (mutating calls, confirmations, mode changes).
 - `tc_session_report` [R] — Markdown handover of this session: mode changes, writes, deploys and other mutating calls from the audit log, recordings, snapshots and dumps produced. Written to ~/.twincat_mcp/reports/<ts>.md (or out_path).
 
@@ -33,7 +33,7 @@
 - `ads_io_read` [R] — Raw process image of the PLC: area 'I' (%IB inputs) or 'Q' (%QB outputs) at a byte offset — what the task actually sees/wrote, independent of symbol names (link checks).
 - `ads_read_raw` [R] — Raw ADS read by index group/offset on any port (hex + little-endian uint).
 - `ads_write_raw` [W] — Raw ADS write by index group/offset — PLC runtime ports (851-859) only. Every symbol whose memory overlaps the written range is checked against the write allow/deny lists; the raw target itself is 'raw:<port>/<igrp hex>/<ioffs hex>'.
-- `ads_watch` [R] — Sample symbols for duration_ms every interval_ms (polling trace). change_only keeps only rows where a value changed. Caps: 60 s, ≥10 ms, 5000 rows. Use for timing questions: 'does bDone pulse?', 'how long is the valve open?'.
+- `ads_watch` [R] — Sample symbols for duration_ms every interval_ms (polling trace). change_only keeps only rows where a value changed. Caps: 60 s, ≥10 ms, 5000 rows. Use for timing questions: 'does bDone pulse?', 'how long is the valve open?'. Runs on the slow ADS worker, so ads_write calls issued *concurrently* interleave with it —…
 - `ads_wait_until` [R] — Block until symbol <op> value (==, !=, >, >=, <, <=) or timeout. Returns met/elapsed.
 - `ads_plc_state` [C/D] — PLC runtime control via ADS: run | stop | reset. 'reset' is a cold reset (all non-persistent data lost). Control-class: confirmation in guarded mode.
 - `ads_system_mode` [D] — Switch TwinCAT on the target between 'run' and 'config' mode (restarts the runtime, I/O goes down). Destructive-class.
@@ -103,7 +103,7 @@
 - `xae_io_disable` [E] — Set/clear the Disabled flag on I/O devices under TIID (all, or the named ones) so a configuration activates without the hardware present — TcUnit on a PC, dry runs.
 - `xae_links` [R] — Variable links of the PLC instance: every AT %I*/%Q* variable with its link target; lists the unlinked ones (the usual reason an output never moves).
 - `xae_attach` [E] — Attach to the running XAE shell / Visual Studio (Running Object Table). Picks the instance holding solution_path when given. launch=true starts a new shell (slow).
-- `xae_status` [R] — Shell version, open solution, projects, TwinCAT project name, target NetId, started flag.
+- `xae_status` [R] — Shell version, open solution, projects, TwinCAT project name, target NetId, started flag. Attaches to the shell first if not attached yet (as every xae_* tool does).
 - `xae_open_solution` [E] — Open a .sln in the attached shell.
 - `xae_build` [E] — Build the solution (File.SaveAll first by default). Returns success, error/warning items with file:line (VS error list, or parsed from the Build output pane) and the output tail. check_all_objects=true runs PLC 'Check all objects' instead (compiles unused POUs).
 - `xae_diagnostics` [R] — Current error list (errors/warnings/messages with file:line) plus the tail of the Build output pane, without rebuilding.
@@ -114,7 +114,7 @@
 - `xae_activate_configuration` [D] — ActivateConfiguration on the current target (overwrites the boot project on the IPC). Destructive-class. Follow with xae_restart_twincat.
 - `xae_restart_twincat` [D] — StartRestartTwinCAT on the current target (runtime restarts in RUN mode). Destructive-class.
 - `xae_deploy` [D] — Save → build → (boot project autostart on) → activate → restart, in one call. Stops at the first build error. Destructive-class (one confirmation covers all steps). Refuses when the XAE target and the ADS target of this server differ.
-- `xae_tree_get` [R] — System Manager tree item: properties, children to `depth`, and ProduceXml when xml=true. Path syntax 'TIPC^Plc^Plc Project^POUs^MAIN'. Roots: TIID (I/O), TIPC (PLC), TIRC (real-time/tasks), TIRR (routes), TINC (NC).
+- `xae_tree_get` [R] — System Manager tree item: properties, children to `depth`, and ProduceXml when xml=true. Path syntax 'TIPC^Plc^Plc Project^POUs^MAIN' (xae_plc_projects gives the '<Name> Project' path; its children POUs/DUTs/GVLs are walked even though the node itself reports no ChildCount). Roots: TIID (I/O), TIPC (PLC), TIRT…
 - `xae_tree_consume_xml` [E] — ConsumeXml on a tree item — the generic write path for any configuration (add I/O boxes, link variables, set task cycle time, add project routes on TIRR …).
 - `xae_tree_set_values` [E] — Set element texts in a tree item's XML by relative XPath, e.g. {'TaskDef/CycleTime': '10000'} (unit 100 ns).
 - `xae_tree_create_child` [E] — Generic CreateChild (tree item types/subtypes per Infosys). For PLC objects prefer xae_pou_create.
@@ -154,7 +154,7 @@
 - `proj_changed` [R] — Units whose source differs from a git revision (default: uncommitted work) plus untracked files — 'what did I change?'; pair with proj_vs_runtime for 'is it deployed?'.
 - `proj_list` [R] — List indexed objects. kind: PROGRAM | FUNCTION_BLOCK | FUNCTION | STRUCT | ENUM | UNION | ALIAS | GVL | INTERFACE | METHOD | PROPERTY | ACTION (case-insensitive).
 - `proj_get_code` [R] — Source of an object ('FB_Valve', 'FB_Valve.Open', 'MAIN'): declaration/implementation with file line numbers, parsed VAR declarations, sub-items.
-- `proj_resolve_symbol` [R] — Map an ADS symbol path (MAIN.fbFill.fbValve.bOpen) to the file:line where each hop is declared, following variable types through FB/STRUCT definitions.
+- `proj_resolve_symbol` [R] — Map an ADS symbol path (MAIN.fbFill.fbValve.bOpen) to the file:line where each hop is declared, following variable types through FB/STRUCT definitions. Hops inside a library type (Tc2_Standard.CTU.CV) are completed from the runtime's datatype table when the target is reachable.
 - `proj_search` [R] — Regex search over all declarations/implementations → unit, file, line, text.
 - `proj_references` [R] — Where a type/object is instantiated (variables of that type) and mentioned.
 - `proj_read_file` [R] — Raw text of a project file (relative to project root or absolute).
@@ -162,7 +162,7 @@
 
 ## HMI bindings (3)
 
-- `hmi_scan` [R] — Index HMI symbol bindings: TE2000 .view/.content/.usercontrol/.json (%s%PLC1.X%/s%) and TcVIS files. root defaults to project.hmi_root, else the project root.
+- `hmi_scan` [R] — Index HMI symbol bindings: TE2000 .view/.content/.usercontrol/.json (%s%PLC1.X%/s%) and TF1800 .TcVIS (VisualElemMember paths -> kind 'tcvis'; ST input-action assignments -> kind 'tcvis_write'). root defaults to project.hmi_root, else the project root (which is where .TcVIS files live).
 - `hmi_bindings` [R] — Which HMI files/controls bind a PLC symbol (fnmatch on the symbol path).
 - `hmi_vs_runtime` [R] — Broken HMI bindings: symbols bound in the HMI that do not exist on the running PLC (and, with check_source, whether the source declares them), plus declared variables with no HMI.
 

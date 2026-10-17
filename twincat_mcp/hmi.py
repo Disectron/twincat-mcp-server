@@ -4,8 +4,10 @@ TE2000 (TF2000 web HMI) projects are HTML/JSON: ``*.view``, ``*.content``,
 ``*.usercontrol`` carry control attributes like
 ``data-tchmi-value="%s%PLC1.MAIN.fbFill.bDone%/s%"``; ``*.json`` files
 (symbol lists, configs) and themes may reference symbols the same way.
-TF1800 ``.TcVIS`` (classic PLC HMI) is XML with ``%s%``-free expressions —
-we grab anything that looks like an instance path.
+TF1800 ``.TcVIS`` (classic PLC HMI) is an XML archive: element properties are
+``<VisualElemMember Id="…L">`` nodes whose text is an instance path (read
+bindings, kind ``tcvis``), and ST input actions (``STSnippetInputAction``)
+carry ``x := …`` assignments (write bindings, kind ``tcvis_write``).
 
 Index → every symbol binding with file, control id/type and attribute, so the
 agent can answer "which screens show this variable", "which bindings are
@@ -115,16 +117,79 @@ class HmiIndex:
             if _RE_PATH.fullmatch(key) and "." in key and not key.startswith("%"):
                 self._add(key, p, 0, None, None, "json-key", "json")
 
+    # TF1800 member ids seen in the wild (TcVIS stores element properties as <VisualElemMember Id="…L">)
+    _TCVIS_MEMBER = {"2477733581": "text_variable", "1999528970": "toggle_color_variable", "743958181": "lamp_variable"}
+
     def _scan_tcvis(self, p: Path, txt: str) -> None:
-        for m in re.finditer(r"<(Variable|Expression|Text|Tooltip)[^>]*>([^<]{1,200})</\1>", txt):
-            val = m.group(2).strip()
-            if _RE_PATH.fullmatch(val):
-                self._add(val, p, txt[:m.start()].count("\n") + 1, None, m.group(1), None, "tcvis")
+        """TF1800 .TcVIS: every <VisualElemMember Id="…"> whose text (or a descendant's) is an instance path is a
+        read binding, tagged with the member id (and a name when known); ST snippets of input actions
+        (STSnippetInputAction) are scanned for ``x := …`` assignments, which are *write* bindings."""
+        import xml.etree.ElementTree as ET
+        found = 0
+        try:
+            root = ET.fromstring(txt.encode("utf-8") if isinstance(txt, str) else txt)
+        except ET.ParseError:
+            root = None
+        if root is not None:
+            # line numbers are not available from ET; locate by text search
+            def line_of(needle: str) -> int:
+                i = txt.find(needle)
+                return txt[:i].count("\n") + 1 if i >= 0 else 0
+
+            def is_snippet(e) -> bool:
+                t = e.tag.split("}")[-1]
+                return "STSnippet" in t or "InputAction" in t or t.endswith("Snippet")
+
+            seen: set[tuple[str, str, str]] = set()
+
+            def add_once(sym: str, ctype: str, attr: str, kind: str, line: int) -> None:
+                key = (sym.lower(), attr, kind)
+                if key in seen:
+                    return
+                seen.add(key)
+                self._add(sym, p, line or line_of(sym), None, ctype, attr, kind)
+
+            for el in root.iter():
+                tag = el.tag.split("}")[-1]
+                elem_id = el.get("Id") or el.get("id")
+                if tag == "VisualElemMember":
+                    mid = (elem_id or "").rstrip("L")
+                    mname = self._TCVIS_MEMBER.get(mid, f"member:{mid}" if mid else "member")
+                    texts = [t for t in el.itertext() if t and t.strip()]
+                    for t in texts:
+                        for cand in _RE_PATH.findall(t):
+                            if "." in cand and not cand.replace(".", "").isdigit():
+                                self._add(cand, p, line_of(cand), None, mname, "VisualElemMember", "tcvis")
+                                found += 1
+                elif is_snippet(el) and not any(is_snippet(c) for c in el.iter() if c is not el):
+                    # innermost snippet element only (InputActions > STSnippetInputAction > Code all carry the same text)
+                    code = " ".join(t for t in el.itertext() if t)
+                    code_line = line_of(code.strip()[:60]) if code.strip() else 0
+                    for stmt in code.split(";"):
+                        lhs, sep, rhs = stmt.partition(":=")
+                        if sep:
+                            for m in re.finditer(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\[\d+\])*)\s*$", lhs.strip()):
+                                add_once(m.group(1), "st_input_action", "write", "tcvis_write", code_line)
+                                found += 1
+                            reads = rhs
+                        else:
+                            reads = stmt
+                        for cand in _RE_PATH.findall(reads):
+                            if "." in cand and not cand.replace(".", "").isdigit():
+                                add_once(cand, "st_input_action", "read", "tcvis", code_line)
+        if not found:
+            # older/other layouts: fall back to the text scan
+            for m in re.finditer(r"<(Variable|Expression|Text|Tooltip)[^>]*>([^<]{1,200})</\1>", txt):
+                val = m.group(2).strip()
+                if _RE_PATH.fullmatch(val):
+                    self._add(val, p, txt[:m.start()].count("\n") + 1, None, m.group(1), None, "tcvis")
 
     # --------------------------------------------------------------- queries
     def _ensure(self) -> None:
         if self.scanned_at is None:
-            raise ValueError("HMI index empty; call hmi_scan(root) first")
+            raise ValueError("no HMI bindings indexed: hmi_scan has not run yet, or it scanned a folder with no .view/.content/.json/.TcVIS "
+                             "binding files (hmi_scan reports files and bindings — check project.hmi_root points at the TE2000 project "
+                             "or at the PLC project folder holding the .TcVIS visualizations)")
 
     def find(self, pattern: str | None, kind: str | None = None, limit: int = 500) -> dict[str, Any]:
         self._ensure()

@@ -588,6 +588,8 @@ class InfosysIndex:
         self.web_fallback = web_fallback
         self._sitemap: dict[str, str] | None = None     # url -> lastmod
         self._lock = threading.RLock()
+        self._index_lock = threading.RLock()   # one book indexes at a time: a background default index and an explicit
+                                               # infosys_index of the same book must not both write (SQLite busy → 30 s stalls)
         self._fts: bool | None = None
         self._init_db()
 
@@ -705,7 +707,13 @@ class InfosysIndex:
 
     def index_book(self, book: str, force: bool = False, max_pages: int | None = None,
                    progress: Callable[[int, int], None] | None = None) -> dict[str, Any]:
-        """Fetch every page of a book that is new or whose sitemap lastmod changed."""
+        """Fetch every page of a book that is new or whose sitemap lastmod changed. Serialised: a second
+        caller for the same book waits and then finds the pages unchanged."""
+        with self._index_lock:
+            return self._index_book(book, force, max_pages, progress)
+
+    def _index_book(self, book: str, force: bool, max_pages: int | None,
+                    progress: Callable[[int, int], None] | None) -> dict[str, Any]:
         if not self.book_allowed(book):
             raise InfosysError(f"book {book!r} is excluded (TwinCAT 2 or docs.exclude_books)")
         sm = self.sitemap()
@@ -1027,6 +1035,12 @@ class _Conn:
     def __enter__(self) -> sqlite3.Connection:
         self.con = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
+        try:
+            # WAL: a background index (writer) never blocks a search (reader) and vice versa
+            self.con.execute("PRAGMA journal_mode=WAL")
+            self.con.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            pass
         return self.con
 
     def __exit__(self, et, ev, tb):
