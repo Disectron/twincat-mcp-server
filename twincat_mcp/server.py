@@ -161,6 +161,8 @@ class App:
         self.xae = XaeBackend(cfg.xae)
         self.xae_worker = SerialWorker("tcmcp-xae-sta", init=sta_init, teardown=sta_teardown)
         self.proj = ProjectIndex(cfg.project)
+        # D44: code set in the shell (xae_pou_set / xae_pou_create) until it is proven on disk
+        self.pending_edits: dict[str, dict[str, Any]] = {}
         self.ads.write_guard = self.constant_reason       # every write path: CONSTANT / no-source checks
         self.ads.interface_hint = self.is_source_interface
         from .config import _home
@@ -532,6 +534,66 @@ class App:
                          "ads_status for the runtime; the XAE Error List for 'Target system reports a fatal error'.")
         if hints:
             out["hint"] = " ".join(hints)
+        return out
+
+    def note_edit(self, path: str, declaration: str | None, implementation: str | None) -> None:
+        cur = self.pending_edits.setdefault(path, {"path": path, "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        if declaration is not None:
+            cur["declaration"] = declaration
+        if implementation is not None:
+            cur["implementation"] = implementation
+        cur["at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    def _edits_not_on_disk(self) -> list[dict[str, Any]]:
+        """Pending shell edits whose text is not (yet) in the source files."""
+        def norm(t: str | None) -> str:
+            return re.sub(r"\s+", " ", (t or "").replace("\r", "")).strip()
+        self.proj.ensure_fresh()
+        units = self.proj.units
+        bad: list[dict[str, Any]] = []
+        for path, e in self.pending_edits.items():
+            segs = [x for x in path.split("^") if x]
+            keys = ([f"{segs[-2]}.{segs[-1]}".lower()] if len(segs) >= 2 else []) + ([segs[-1].lower()] if segs else [])
+            u = next((units[k] for k in keys if k in units), None)
+            if u is None:
+                bad.append({"path": path, "edited_at": e["at"], "why": "not in any source file under the project root"})
+                continue
+            for part in ("declaration", "implementation"):
+                if part in e and norm(e[part]) != norm(getattr(u, part)):
+                    bad.append({"path": path, "edited_at": e["at"], "file": u.file,
+                                "why": f"{part} on disk differs from the text set in the shell"})
+                    break
+        return bad
+
+    async def save_verified(self, tool: str) -> dict[str, Any]:
+        """D44: File.SaveAll, unsaved documents/projects saved one by one, then every edit made through this server
+        (xae_pou_set / xae_pou_create) checked in the source files. A build/deploy/test on unsaved text is refused:
+        an external reload of the project discards what is only in the shell's memory."""
+        r = await self.xae_call(self.xae.save_all, timeout=120)
+        out: dict[str, Any] = dict(r)
+        if not self.pending_edits:
+            out["edits_checked"] = 0
+            return out
+        if self.proj.root is None:
+            out["edits_checked"] = 0
+            out["edits_on_disk"] = ("not checked: no project source (project.root / xae.solution_path) — "
+                                    f"{len(self.pending_edits)} shell edit(s) unverified")
+            return out
+        bad = await self.proj_call(self._edits_not_on_disk)
+        if bad:
+            await asyncio.sleep(1.5)                       # the shell may still be writing
+            r = await self.xae_call(self.xae.save_all, timeout=120)
+            out.update(r)
+            bad = await self.proj_call(self._edits_not_on_disk)
+        out["edits_checked"] = len(self.pending_edits)
+        if bad:
+            out["edits_not_on_disk"] = bad
+            raise ToolError(f"{tool}: File.SaveAll ran but {len(bad)} edit(s) made in the shell are not in the source files "
+                            f"({'; '.join(b['path'] + ': ' + b['why'] for b in bad[:5])}). Nothing was built — an external "
+                            "reload would discard them. Save in XAE (File > Save All) or xae_command('File.SaveAll') and "
+                            f"retry. Still unsaved in the shell: {out.get('dirty_after') or 'none reported'}.")
+        out["edits_on_disk"] = sorted(self.pending_edits)
+        self.pending_edits.clear()
         return out
 
     def is_source_interface(self, type_name: str) -> bool:
@@ -2923,15 +2985,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def xae_build(clean: bool = False, rebuild: bool = False, save_first: bool = True,
                         check_all_objects: bool = False) -> dict[str, Any]:
-        """Build the solution (File.SaveAll first by default). Returns success, error/warning
+        """Build the solution. save_first (default) runs File.SaveAll, saves whatever the shell still reports
+        unsaved, and checks that every xae_pou_set / xae_pou_create edit of this session is in the source files —
+        it refuses to build otherwise (an external reload would discard the edits). Returns success, error/warning
         items with file:line (VS error list, or parsed from the Build output pane) and the output
         tail. check_all_objects=true runs PLC 'Check all objects' instead (compiles unused POUs)."""
         await app.permit(None, OpClass.EDIT, "xae_build")
-        if save_first:
-            await app.xae_call(app.xae.save_all, timeout=60)
+        saved = await app.save_verified("xae_build") if save_first else {"skipped": "save_first=false"}
         if check_all_objects:
-            return await app.xae_call(app.xae.check_all_objects, timeout=600)
+            res = await app.xae_call(app.xae.check_all_objects, timeout=600)
+            res["save"] = saved
+            return res
         res = await app.xae_call(app.xae.build, clean, rebuild, timeout=cfg.xae.build_timeout_s + 60)
+        res["save"] = saved
         app.audit("xae_build", {"clean": clean, "rebuild": rebuild}, OpClass.EDIT,
                   "ok" if res.get("success") else "build-failed", {"errors": res.get("errors")})
         return res
@@ -3034,7 +3100,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         await app.check_targets(tgt, allow_target_mismatch)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_deploy", tgt, confirm_token)
         steps: dict[str, Any] = {}
-        steps["save"] = await app.xae_call(app.xae.save_all, timeout=60)
+        steps["save"] = await app.save_verified("xae_deploy")
         if not skip_build:
             b = await app.xae_call(app.xae.build, False, False, timeout=cfg.xae.build_timeout_s + 60)
             steps["build"] = {k: b[k] for k in ("success", "errors", "warnings", "duration_s")}
@@ -3131,6 +3197,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         app.guard_safety_path(path, "xae_pou_set")
         await app.permit(None, OpClass.EDIT, "xae_pou_set", path)
         res = await app.confirmed("xae_pou_set", {"path": path, "decl": declaration is not None, "impl": implementation is not None}, OpClass.EDIT, app.xae_call(app.xae.pou_set, path, declaration, implementation, timeout=120))
+        app.note_edit(path, declaration, implementation)
+        res["saved"] = False
+        res["note"] = "in the shell only — xae_build / xae_deploy / tcunit_run save and check it on disk first"
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -3145,6 +3214,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         await app.permit(None, OpClass.EDIT, "xae_pou_create", f"{parent_path}^{name}")
         res = await app.xae_call(app.xae.pou_create, parent_path, name, kind, language, return_type,
                                  extends, implements, access, declaration, implementation, timeout=120)
+        if kind.lower() != "folder":
+            app.note_edit(f"{parent_path}^{name}", declaration, implementation)
         app.audit("xae_pou_create", {"parent": parent_path, "name": name, "kind": kind}, OpClass.EDIT, "ok", res)
         return res
 
@@ -3268,7 +3339,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=DESTR)
     async def tcunit_run(plc_project_path: str, timeout_s: int = 600, skip_build: bool = False,
                          remote_result_path: str | None = None, allow_target_mismatch: bool = False,
-                         disable_io: bool = False, confirm_token: str | None = None,
+                         disable_io: bool = False, save_first: bool = True, confirm_token: str | None = None,
                          ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Full TcUnit cycle: build → boot project autostart+generate → activate → restart →
         delete old result → wait for the xUnit file on the target → parse. Destructive-class
@@ -3280,6 +3351,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         await app.check_targets(tgt, allow_target_mismatch)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "tcunit_run", f"{tgt} {rp}", confirm_token)
         steps: dict[str, Any] = {"target": tgt}
+        if save_first:
+            steps["save"] = await app.save_verified("tcunit_run")        # D44: tcunit_run did not save at all
         if not skip_build:
             b = await app.xae_call(app.xae.build, False, False, timeout=cfg.xae.build_timeout_s + 60)
             steps["build"] = {k: b[k] for k in ("success", "errors", "warnings")}

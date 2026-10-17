@@ -819,3 +819,51 @@ async def test_n4_restart_is_verified_only_after_the_target_left_run(monkeypatch
 
     script("RUN")                                                    # activation keeps the old contract
     assert (await app.verify_target_after("xae_activate_configuration", expect_run=False))["verified"]
+
+
+@pytest.mark.anyio
+async def test_d44_build_refuses_until_shell_edits_are_on_disk(monkeypatch, project_dir):
+    """D44: xae_build(save_first) ran File.SaveAll but the xae_pou_set text never reached MAIN.TcPOU; an external
+    reload then discarded it. The save is now checked against the source files."""
+    import os
+    from twincat_mcp.server import App, ToolError
+    app = App(mk_cfg(project_dir))
+    main = project_dir / "Plc" / "POUs" / "MAIN.TcPOU"
+    new_impl = "nCycle := nCycle + 2;\nfbFill(bEnable := bStart, stRecipe := stRecipe);"
+    writes = {"on": False, "calls": 0}
+
+    async def xae_call(fn, *a, **kw):
+        assert fn.__name__ == "save_all"
+        writes["calls"] += 1
+        if writes["on"]:
+            txt = main.read_text(encoding="utf-8")
+            start = txt.index("<ST><![CDATA[") + len("<ST><![CDATA[")
+            end = txt.index("]]></ST>")
+            main.write_text(txt[:start] + new_impl + txt[end:], encoding="utf-8")
+            st = main.stat()
+            os.utime(main, (st.st_atime, st.st_mtime + 5))
+        return {"saved": True, "dirty_before": ["MAIN.TcPOU"], "dirty_after": []}
+    monkeypatch.setattr(app, "xae_call", xae_call)
+    monkeypatch.setattr("twincat_mcp.server.asyncio.sleep", lambda d: _noop())
+
+    assert (await app.save_verified("xae_build"))["edits_checked"] == 0        # nothing edited → nothing to prove
+    app.note_edit("TIPC^Plc^Plc Project^POUs^MAIN", None, new_impl)
+    with pytest.raises(ToolError, match=r"1 edit\(s\) made in the shell are not in the source files.*MAIN: implementation"):
+        await app.save_verified("xae_build")
+    assert writes["calls"] == 3 and app.pending_edits                         # retried once, edit still pending
+    writes["on"] = True
+    r = await app.save_verified("xae_build")
+    assert r["edits_on_disk"] == ["TIPC^Plc^Plc Project^POUs^MAIN"] and not app.pending_edits
+    # a created object that never reached a file
+    app.note_edit("TIPC^Plc^Plc Project^POUs^FB_New", None, None)
+    with pytest.raises(ToolError, match="FB_New: not in any source file"):
+        await app.save_verified("tcunit_run")
+    # a method is found as <FB>.<method>; unchanged text on disk passes
+    app.pending_edits.clear()
+    start = app.proj.units["fb_fill.start"].implementation
+    app.note_edit("TIPC^Plc^Plc Project^POUs^FB_Fill^Start", None, start + "\n")
+    assert (await app.save_verified("xae_deploy"))["edits_checked"] == 1
+
+
+async def _noop():
+    return None

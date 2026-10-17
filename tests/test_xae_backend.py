@@ -370,3 +370,22 @@ def test_stale_system_manager_refreshed(xae, monkeypatch):
         return orig()
     monkeypatch.setattr(be, "_find_sysman", counting)
     assert be._retry(flaky, "LookupTreeItem") == "ok" and calls["found"] == 1
+
+
+def test_d44_save_all_saves_what_saveall_left_and_reports_it(xae):
+    be, dte, sm = xae
+
+    class Doc:
+        def __init__(self, name, stuck=False):
+            self.FullName, self.Saved, self.stuck = name, False, stuck
+
+        def Save(self):
+            if not self.stuck:
+                self.Saved = True
+    d1, d2 = Doc(r"C:\P\Plc\POUs\MAIN.TcPOU"), Doc(r"C:\P\Plc\POUs\FB_Test.TcPOU", stuck=True)
+    dte.Documents = FakeProjects([d1, d2])
+    r = be.save_all()
+    assert ("File.SaveAll", "") in dte.commands
+    assert r["dirty_before"] == [d1.FullName, d2.FullName] and r["dirty_after"] == [d2.FullName] and r["saved"] is False
+    d2.stuck = False
+    assert be.save_all() == {"saved": True, "dirty_before": [d2.FullName], "dirty_after": []}

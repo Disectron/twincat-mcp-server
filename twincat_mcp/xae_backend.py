@@ -381,10 +381,89 @@ class XaeBackend:
             time.sleep(0.5)
         return self.status()
 
-    def save_all(self) -> dict[str, Any]:
+    def _dirty(self, save: bool = False) -> list[str]:
+        """Unsaved documents and projects the shell reports (Document.Saved / Project.Saved == False); with
+        ``save`` each one is saved on its own (the second route when File.SaveAll left some, D44)."""
         dte = self._need()
+        out: list[str] = []
+
+        def name_of(x: Any) -> str:
+            for a in ("FullName", "UniqueName", "Name"):
+                try:
+                    v = str(getattr(x, a))
+                    if v:
+                        return v
+                except Exception:  # noqa: BLE001
+                    continue
+            return "?"
+
+        def check(x: Any) -> None:
+            try:
+                if bool(x.Saved):
+                    return
+            except Exception:  # noqa: BLE001
+                return
+            if save:
+                try:
+                    x.Save()
+                    if bool(x.Saved):
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
+            out.append(name_of(x))
+        try:
+            docs = dte.Documents
+            for i in range(1, int(docs.Count) + 1):
+                try:
+                    check(docs.Item(i))
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+
+        budget = [3000]                                   # COM calls are slow: cap the walk
+
+        def walk(coll: Any, depth: int) -> None:
+            try:
+                n = int(coll.Count)
+            except Exception:  # noqa: BLE001
+                return
+            for i in range(1, n + 1):
+                if budget[0] <= 0:
+                    return
+                budget[0] -= 1
+                try:
+                    x = coll.Item(i)
+                except Exception:  # noqa: BLE001
+                    continue
+                check(x)                                  # Project or ProjectItem (both have Saved)
+                try:
+                    sub = x.SubProject                    # a nested project (the PLC project in a .tsproj)
+                except Exception:  # noqa: BLE001
+                    sub = None
+                if sub is not None:
+                    check(sub)
+                if depth < 6:
+                    try:
+                        walk((sub or x).ProjectItems, depth + 1)
+                    except Exception:  # noqa: BLE001
+                        pass
+        try:
+            walk(dte.Solution.Projects, 0)
+        except Exception:  # noqa: BLE001
+            pass
+        return list(dict.fromkeys(out))
+
+    def save_all(self) -> dict[str, Any]:
+        """File.SaveAll, then whatever the shell still reports unsaved is saved one by one (D44: SaveAll from the
+        Automation Interface did not always persist text set through DeclarationText/ImplementationText)."""
+        dte = self._need()
+        before = self._dirty()
         self._retry(lambda: dte.ExecuteCommand("File.SaveAll"), "File.SaveAll")
-        return {"saved": True}
+        after = self._dirty()
+        if after:
+            after = self._dirty(save=True)
+        return {"saved": not after, "dirty_before": before, "dirty_after": after}
 
     def close_solution(self, save: bool = True) -> dict[str, Any]:
         dte = self._need()
