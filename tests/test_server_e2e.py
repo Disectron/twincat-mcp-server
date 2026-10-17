@@ -236,7 +236,10 @@ async def test_whole_project_variable_tools(monkeypatch, project_dir, tmp_path):
         assert "MAIN.fbFill.fbValve.bOpen" in missing and "GVL_Machine.bEStop" in missing and "MAIN.fbFill.arrWeights[7]" in missing
         assert "MAIN.fbFill.arrWeights[2]" not in missing and "MAIN.nCycle" not in missing
         extra_l = {e.lower() for e in extra}
-        assert "main.slabel" in extra_l and "main.arrsteps[1].nid" in extra_l and "main.fbvalve2.bopen" in extra_l   # PLC spelling kept
+        assert "main.slabel" in extra_l and "main.fbvalve2.bopen" in extra_l   # PLC spelling kept
+        # array elements are collapsed into one line per member with a count (#57: ~70 KB of aAlarms[1..32].* before)
+        steps = next(e for e in cmp_["extra_online"] if e["path"].lower() == "main.arrsteps[*].nid")
+        assert steps["count"] == 2 and steps["example"] == "MAIN.arrSteps[1].nId"
         assert cmp_["matched"] >= 10
 
 
@@ -460,3 +463,19 @@ async def test_ipc_eventlog_token_provider_cleanup(monkeypatch, project_dir):
         assert deleted == [r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot\tcmcp_eventlog.txt"] and not fs
         bad = await s.call_tool("ipc_eventlog", {"provider": "x' & del C:\\*", "confirm_token": "t"})
         assert bad.is_error and "only letters" in text(bad) and len(started) == 1
+
+
+@pytest.mark.anyio
+async def test_vs_runtime_array_templates(monkeypatch, project_dir):
+    """#57: arrays with constant bounds are declared as x[*] in source; their online elements must match, not be 'extra'."""
+    install(monkeypatch)
+    main = project_dir / "Plc" / "POUs" / "MAIN.TcPOU"
+    main.write_text(main.read_text().replace("\tnCycle      : UDINT;", "\tnCycle      : UDINT;\n\tarrSteps    : ARRAY[1..GVL_Machine.MAX_MODULES] OF ST_Step;"))
+    srv = build_server(mk_cfg(project_dir, mode="readonly"))
+    async with client_for(srv) as s:
+        v = payload(await s.call_tool("proj_variables", {"scope": "MAIN"}))
+        assert any("[*]" in it["path"] and it["path"].startswith("MAIN.arrSteps") for it in v["items"]), [it["path"] for it in v["items"]]
+        cmp_ = payload(await s.call_tool("proj_vs_runtime", {}))
+        assert not any(e["path"].lower().startswith("main.arrsteps") for e in cmp_["extra_online"])
+        assert cmp_["array_elements_matched"] >= 8 and cmp_["array_templates_matched"] >= 1
+        assert not any(m["path"].lower().startswith("main.arrsteps") for m in cmp_["missing_online"])

@@ -192,3 +192,41 @@ def test_default_rule_set_includes_new_rules(oop_dir):
     idx.scan()
     rep = codecheck.lint(idx)
     assert {"interface_contract", "unsigned_loop", "new_delete", "extends_cycle", "abstract_instantiation", "shadowed_member"} <= set(rep["by_rule"])
+
+
+def test_round2_interface_dispatch_inheritance_scaffold(oop_dir):
+    """Field report round 2: #58 interface calls reach the implementing FBs (incl. inherited / overridden methods),
+    #59 proj_interface merges the EXTENDS chain and inherited IMPLEMENTS, #67 interface methods are not
+    'empty_method', #66 scaffold keeps declared defaults, the project's ProductVersion and inherited methods."""
+    d = oop_dir / "Plc" / "POUs"
+    (d / "FB_Machine.TcPOU").write_text(_pou(
+        "FB_Machine", "FUNCTION_BLOCK FB_Machine", "FOR i := 1 TO 2 DO\n\taModules[i].Start(rTarget := 1.0);\nEND_FOR",
+        decl_vars="VAR\n\taModules : ARRAY[1..2] OF I_Thing;\n\ti : INT;\nEND_VAR"))
+    (d / "FB_Hooked.TcPOU").write_text(_pou(
+        "FB_Hooked", "FUNCTION_BLOCK FB_Hooked IMPLEMENTS I_Thing", ";",
+        decl_vars="VAR_INPUT\n\tnPreset : INT := 10;\nEND_VAR",
+        members=_method("Start", "METHOD Start : BOOL", "THIS^.OnRunning();\nStart := TRUE;", "VAR_INPUT\n\trTarget : LREAL;\nEND_VAR")
+        + _method("Stop", "METHOD Stop : BOOL", "Stop := TRUE;")
+        + _method("OnRunning", "METHOD PROTECTED OnRunning", ";")).replace("3.1.4024.12", "3.1.4026.12"))
+    (d / "FB_Counter.TcPOU").write_text(_pou(
+        "FB_Counter", "FUNCTION_BLOCK FB_Counter EXTENDS FB_Hooked", ";",
+        decl_vars="VAR_OUTPUT\n\tnCount : INT;\nEND_VAR",
+        members=_method("OnRunning", "METHOD PROTECTED OnRunning", "nCount := nCount + 1;")).replace("3.1.4024.12", "3.1.4026.12"))
+    idx = ProjectIndex(ProjectConfig(root=str(oop_dir)))
+    idx.scan()
+    g = codecheck.call_graph(idx, "FB_Machine", 4)
+    names = {n["name"] for n in g["nodes"]}
+    assert {"FB_Child.Start", "FB_Good.Start", "FB_Hooked.Start"} <= names, names
+    assert "FB_Counter.OnRunning" in names and "FB_Hooked.OnRunning" in names      # THIS^ dispatch reaches the override
+    assert any("via I_Thing" in (n.get("via") or "") for n in g["nodes"])
+    itf = codecheck.fb_interface(idx, "FB_Counter")
+    assert itf["implements"] == ["I_Thing"] and itf["implements_own"] == []
+    meths = {m["name"]: m for m in itf["methods"]}
+    assert meths["Start"]["inherited_from"] == "FB_Hooked" and "inherited_from" not in meths["OnRunning"]
+    assert any(v["name"] == "nPreset" and v["inherited_from"] == "FB_Hooked" for v in itf["inputs"])
+    lint = codecheck.lint(idx, None, ["empty_method"])
+    assert not any(str(f.get("unit") or f.get("name") or "").startswith("I_") for f in lint["items"]), lint["items"]
+    sc = codecheck.tcunit_scaffold(idx, "FB_Counter", add_to_plcproj=False)
+    body = Path(sc["file"]).read_text()
+    assert 'ProductVersion="3.1.4026.12"' in body and "fbUut.nPreset := 10;" in body
+    assert "Test_Start" in sc["tests"] and "Test_Stop" in sc["tests"] and "inherited from FB_Hooked" in body

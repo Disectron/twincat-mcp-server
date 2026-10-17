@@ -27,7 +27,7 @@ _RE_IDENT = re.compile(r"[A-Za-z_]\w*")
 _RE_TODO = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b", re.I)
 _RE_REAL_EQ = re.compile(r"(\b[rf]\w*|\w*(?:Real|REAL)\w*)\s*(=|<>)\s*[\d\.]+|[\d]+\.\d+\s*(=|<>)", re.I)
 _RE_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
-_RE_METHOD_CALL = re.compile(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(")
+_RE_METHOD_CALL = re.compile(r"\b([A-Za-z_]\w*\^?)(?:\[[^\]]*\])?\.([A-Za-z_]\w*)\s*\(")
 _RE_COMMENT = re.compile(r"\(\*.*?\*\)|//[^\n]*", re.S)
 _RE_STRING = re.compile(r"'[^']*'")
 _RE_FOR = re.compile(r"\bFOR\s+(?P<var>[A-Za-z_]\w*)\s*:=\s*(?P<start>.+?)\s+TO\s+(?P<end>.+?)(?:\s+BY\s+(?P<step>.+?))?\s+DO\b", re.I | re.S)
@@ -42,40 +42,84 @@ def strip_comments(code: str) -> str:
 
 
 # ----------------------------------------------------------------------------
+def _method_sig(idx: ProjectIndex, s: CodeUnit) -> dict[str, Any]:
+    m = re.search(r"METHOD\s+((?:PUBLIC|PRIVATE|PROTECTED|INTERNAL|ABSTRACT|FINAL|\s)*)(\w+)(?:\s*:\s*([\w\.\(\)\[\] ]+?))?\s*$",
+                  s.declaration, re.M | re.I)
+    return {
+        "name": s.name.split(".")[-1],
+        "access": (m.group(1).strip().upper() or "PUBLIC") if m else "PUBLIC",
+        "return_type": (m.group(3).strip() if m and m.group(3) else None),
+        "inputs": [{"name": v.name, "type": v.type, "comment": v.comment} for v in s.vars if v.section == "VAR_INPUT"],
+        "outputs": [{"name": v.name, "type": v.type} for v in s.vars if v.section == "VAR_OUTPUT"],
+        "in_out": [{"name": v.name, "type": v.type} for v in s.vars if v.section == "VAR_IN_OUT"],
+        "file": s.file, "line": s.decl_line0,
+    }
+
+
 def fb_interface(idx: ProjectIndex, name: str) -> dict[str, Any]:
+    """Own members plus everything inherited through EXTENDS (tagged inherited_from); an override in the
+    FB hides the base's member of the same name; implements lists the FB's own and inherited interfaces."""
+    idx._ensure()
     u = idx.get_unit(name)
-    subs = [x for x in idx.units.values() if x.parent == u.name]
-    methods, props = [], []
-    for s in subs:
-        if s.kind == "METHOD":
-            m = re.search(r"METHOD\s+((?:PUBLIC|PRIVATE|PROTECTED|INTERNAL|ABSTRACT|FINAL|\s)*)(\w+)(?:\s*:\s*([\w\.\(\)\[\] ]+?))?\s*$",
-                          s.declaration, re.M | re.I)
-            methods.append({
-                "name": s.name.split(".")[-1],
-                "access": (m.group(1).strip().upper() or "PUBLIC") if m else "PUBLIC",
-                "return_type": (m.group(3).strip() if m and m.group(3) else None),
-                "inputs": [{"name": v.name, "type": v.type, "comment": v.comment} for v in s.vars if v.section == "VAR_INPUT"],
-                "outputs": [{"name": v.name, "type": v.type} for v in s.vars if v.section == "VAR_OUTPUT"],
-                "in_out": [{"name": v.name, "type": v.type} for v in s.vars if v.section == "VAR_IN_OUT"],
-                "file": s.file, "line": s.decl_line0,
-            })
-        elif s.kind == "PROPERTY":
-            m = re.search(r"PROPERTY\s+(?:(?:PUBLIC|PRIVATE|PROTECTED|INTERNAL)\s+)?(\w+)\s*:\s*([\w\.\(\)\[\] ]+)", s.declaration, re.I)
-            acc = [x.kind for x in idx.units.values() if x.parent == s.name]
-            props.append({"name": s.name.split(".")[-1], "type": m.group(2).strip() if m else None,
-                          "get": "GET" in acc, "set": "SET" in acc, "file": s.file, "line": s.decl_line0})
+    chain = [u] + (_ancestors(idx, u) if u.kind == "FUNCTION_BLOCK" else [])
+    methods: list[dict[str, Any]] = []
+    props: list[dict[str, Any]] = []
+    actions: list[str] = []
+    seen_m: set[str] = set()
+    seen_p: set[str] = set()
+    for owner in chain:
+        tag = None if owner is u else owner.name
+        for s in [x for x in idx.units.values() if x.parent == owner.name]:
+            short = s.name.split(".")[-1]
+            if s.kind == "METHOD" and short.lower() not in seen_m:
+                seen_m.add(short.lower())
+                sig = _method_sig(idx, s)
+                if tag:
+                    sig["inherited_from"] = tag
+                    if sig["access"].startswith("PRIVATE"):
+                        continue          # not visible in the derived FB
+                methods.append(sig)
+            elif s.kind == "PROPERTY" and short.lower() not in seen_p:
+                seen_p.add(short.lower())
+                m = re.search(r"PROPERTY\s+(?:(?:PUBLIC|PRIVATE|PROTECTED|INTERNAL)\s+)?(\w+)\s*:\s*([\w\.\(\)\[\] ]+)", s.declaration, re.I)
+                acc = [x.kind for x in idx.units.values() if x.parent == s.name]
+                d = {"name": short, "type": m.group(2).strip() if m else None,
+                     "get": "GET" in acc, "set": "SET" in acc, "file": s.file, "line": s.decl_line0}
+                if tag:
+                    d["inherited_from"] = tag
+                props.append(d)
+            elif s.kind == "ACTION" and owner is u:
+                actions.append(short)
     by_section: dict[str, list[dict[str, Any]]] = {}
-    for v in u.vars:
-        by_section.setdefault(v.section, []).append({"name": v.name, "type": v.type, "init": v.init, "at": v.at, "comment": v.comment, "line": v.line})
-    return {"name": u.name, "kind": u.kind, "file": u.file, "extends": u.extends, "implements": u.implements,
-            "return_type": u.return_type, "inputs": by_section.get("VAR_INPUT", []),
-            "outputs": by_section.get("VAR_OUTPUT", []), "in_out": by_section.get("VAR_IN_OUT", []),
-            "locals": by_section.get("VAR", []) + by_section.get("VAR_STAT", []),
-            "methods": methods, "properties": props,
-            "actions": [x.name.split(".")[-1] for x in subs if x.kind == "ACTION"],
-            "ads_symbol_hint": (f"{u.name}.<var>  e.g. {u.name}.{(by_section.get('VAR', []) or by_section.get('VAR_OUTPUT', []) or [{'name': 'x'}])[0]['name']}"
-                                if u.kind == "PROGRAM" else
-                                f"<instance>.{{{', '.join(v['name'] for v in by_section.get('VAR_OUTPUT', [])[:4])}}}")}
+    seen_v: set[str] = set()
+    for owner in chain:
+        for v in owner.vars:
+            if v.name.lower() in seen_v:
+                continue
+            seen_v.add(v.name.lower())
+            d = {"name": v.name, "type": v.type, "init": v.init, "at": v.at, "comment": v.comment, "line": v.line}
+            if owner is not u:
+                d["inherited_from"] = owner.name
+            by_section.setdefault(v.section, []).append(d)
+    implements: list[str] = []
+    for owner in chain:
+        for i in owner.implements:
+            if i.lower() not in (x.lower() for x in implements):
+                implements.append(i)
+    lib_base = chain[-1].extends[0] if chain[-1].extends and idx.units.get(chain[-1].extends[0].lower()) is None else None
+    out = {"name": u.name, "kind": u.kind, "file": u.file, "extends": u.extends,
+           "extends_chain": [c.name for c in chain[1:]] + ([lib_base] if lib_base else []),
+           "implements": implements, "implements_own": u.implements,
+           "return_type": u.return_type, "inputs": by_section.get("VAR_INPUT", []),
+           "outputs": by_section.get("VAR_OUTPUT", []), "in_out": by_section.get("VAR_IN_OUT", []),
+           "locals": by_section.get("VAR", []) + by_section.get("VAR_STAT", []),
+           "methods": methods, "properties": props, "actions": actions,
+           "ads_symbol_hint": (f"{u.name}.<var>  e.g. {u.name}.{(by_section.get('VAR', []) or by_section.get('VAR_OUTPUT', []) or [{'name': 'x'}])[0]['name']}"
+                               if u.kind == "PROGRAM" else
+                               f"<instance>.{{{', '.join(v['name'] for v in by_section.get('VAR_OUTPUT', [])[:4])}}}")}
+    if lib_base:
+        out["note"] = f"the chain ends in {lib_base}, which the project does not define (library): its members are not listed"
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -167,7 +211,10 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
                     # `fb(input := x)` named-parameter calls do not match
                     if re.search(rf"(?:^|;|\bTHEN\b|\bELSE\b|\bDO\b)\s*{re.escape(nm)}\s*:=", ln, re.I):
                         add("assign_input", u, u.impl_line0 + i, f"VAR_INPUT {nm} is assigned inside the body", "warning")
-        if "empty_method" in enabled and u.kind in ("METHOD", "ACTION") and not impl.strip(" \t\r\n;"):
+        owner_u = idx.units.get((_fb_owner(u) or "").lower()) if u.parent else None
+        abstract_m = bool(_RE_ABSTRACT.search(u.declaration or ""))
+        if "empty_method" in enabled and u.kind in ("METHOD", "ACTION") and not impl.strip(" \t\r\n;") \
+                and not (owner_u is not None and owner_u.kind == "INTERFACE") and not abstract_m:
             add("empty_method", u, u.impl_line0, "empty implementation", "info")
         if "qualified_only" in enabled and u.kind in ("GVL", "ENUM") and "qualified_only" not in u.declaration:
             add("qualified_only", u, u.decl_line0, "missing {attribute 'qualified_only'}", "info")
@@ -396,6 +443,79 @@ def _expected_prefixes(type_str: str, pref: dict[str, list[str]]) -> list[str]:
 
 
 # ----------------------------------------------------------------------------
+def _method_in_chain(idx: ProjectIndex, fb: CodeUnit, meth: str) -> CodeUnit | None:
+    """FB.meth or the nearest ancestor's (EXTENDS chain within the project)."""
+    seen: set[str] = set()
+    cur: CodeUnit | None = fb
+    while cur is not None and cur.name.lower() not in seen:
+        seen.add(cur.name.lower())
+        mu = idx.units.get(f"{cur.name}.{meth}".lower())
+        if mu:
+            return mu
+        cur = idx.units.get(cur.extends[0].lower()) if cur.extends else None
+    return None
+
+
+def _ancestors(idx: ProjectIndex, fb: CodeUnit) -> list[CodeUnit]:
+    out, seen = [], {fb.name.lower()}
+    cur = fb
+    while cur.extends:
+        nxt = idx.units.get(cur.extends[0].lower())
+        if nxt is None or nxt.name.lower() in seen:
+            break
+        seen.add(nxt.name.lower())
+        out.append(nxt)
+        cur = nxt
+    return out
+
+
+def _implementers(idx: ProjectIndex, itf: str) -> list[CodeUnit]:
+    """Concrete FBs implementing an interface directly or through a base FB (abstract bases left out when a
+    derived FB exists — the call lands in the derived instance)."""
+    want = itf.lower()
+
+    def itf_closure(name: str, seen: set[str]) -> set[str]:
+        """An interface and every interface it EXTENDS (I_Named EXTENDS I_Thing → implementing I_Named implements I_Thing)."""
+        key = name.lower()
+        if key in seen:
+            return seen
+        seen.add(key)
+        iu = idx.units.get(key)
+        for e in (iu.extends if iu is not None else []):
+            itf_closure(e, seen)
+        return seen
+    out = []
+    for u in idx.units.values():
+        if u.kind != "FUNCTION_BLOCK":
+            continue
+        chain = [u] + _ancestors(idx, u)
+        provided: set[str] = set()
+        for c in chain:
+            for i in c.implements:
+                itf_closure(i, provided)
+        if want in provided:
+            out.append(u)
+    bases = {a.name.lower() for u in out for a in _ancestors(idx, u)}
+    return [u for u in out if not (u.name.lower() in bases and _RE_ABSTRACT.search(u.declaration or ""))] or out
+
+
+def _subclasses(idx: ProjectIndex, fb: CodeUnit) -> list[CodeUnit]:
+    want = fb.name.lower()
+    return [u for u in idx.units.values() if u.kind == "FUNCTION_BLOCK" and any(a.name.lower() == want for a in _ancestors(idx, u))]
+
+
+def _var_in_scope(idx: ProjectIndex, u: CodeUnit, owner: CodeUnit | None, name: str):
+    """A variable visible in u: its own vars (method locals/inputs), then the owning FB and its EXTENDS chain."""
+    v = next((x for x in u.vars if x.name.lower() == name.lower()), None)
+    if v:
+        return v
+    if owner is not None:
+        hit = idx._find_var(owner, name)
+        if hit:
+            return hit[1]
+    return None
+
+
 def call_graph(idx: ProjectIndex, root: str, depth: int = 4) -> dict[str, Any]:
     idx._ensure()
     start = idx.get_unit(root)
@@ -434,19 +554,47 @@ def call_graph(idx: ProjectIndex, root: str, depth: int = 4) -> dict[str, Any]:
             tu = idx.units.get(m.group(1).lower())
             if tu and tu.kind in ("FUNCTION", "FUNCTION_BLOCK") and tu.name.lower() != key:
                 visit(tu, lvl + 1, f"{u.name} → {m.group(1)}()")
+        owner = idx.units.get((u.parent or u.name).split(".")[0].lower()) if u.parent else u
         for m in _RE_METHOD_CALL.finditer(impl):
             inst, meth = m.group(1), m.group(2)
-            v = next((x for x in u.vars if x.name.lower() == inst.lower()), None)
-            if v:
-                tu = idx._unit_for_type(v.type)
-                if tu:
-                    mu = idx.units.get(f"{tu.name}.{meth}".lower())
-                    if mu:
-                        visit(mu, lvl + 1, f"{u.name}.{inst}.{meth}()")
-            elif inst.upper() == "THIS^":
-                mu = idx.units.get(f"{u.parent or u.name}.{meth}".lower())
+            if inst.upper() in ("THIS^", "SUPER^"):
+                fb = owner if inst.upper() == "THIS^" else (idx.units.get(owner.extends[0].lower()) if owner and owner.extends else None)
+                if fb is None:
+                    continue
+                mu = _method_in_chain(idx, fb, meth)
                 if mu:
-                    visit(mu, lvl + 1, f"{u.name} → THIS^.{meth}()")
+                    visit(mu, lvl + 1, f"{u.name} → {inst}.{meth}()")
+                if inst.upper() == "THIS^":
+                    # dynamic dispatch: a derived FB's override runs when the instance is of that type
+                    for sub in _subclasses(idx, fb):
+                        ov = idx.units.get(f"{sub.name}.{meth}".lower())
+                        if ov and ov is not mu:
+                            visit(ov, lvl + 1, f"{u.name} → THIS^.{meth}() (override in {sub.name})")
+                continue
+            hit = _var_in_scope(idx, u, owner, inst)
+            if hit is None:
+                continue
+            tname = idx._base_type_name(hit.type)
+            tu = idx.units.get(tname.lower())
+            if tu is None:
+                continue
+            if tu.kind == "INTERFACE":
+                impls = _implementers(idx, tu.name)
+                for fb in impls:
+                    mu = _method_in_chain(idx, fb, meth)
+                    if mu:
+                        visit(mu, lvl + 1, f"{u.name}.{inst}.{meth}() via {tu.name} → {fb.name}")
+                    for ov in [idx.units.get(f"{sub.name}.{meth}".lower()) for sub in _subclasses(idx, fb)]:
+                        if ov and ov is not mu:
+                            visit(ov, lvl + 1, f"{u.name}.{inst}.{meth}() via {tu.name} (override)")
+                if not impls:
+                    nodes.append({"name": f"{tu.name}.{meth}", "kind": "interface_call", "depth": lvl + 1,
+                                  "via": f"{u.name}.{inst}.{meth}()", "file": tu.file,
+                                  "note": "no FB in the project implements this interface"})
+            elif tu.kind == "FUNCTION_BLOCK":
+                mu = _method_in_chain(idx, tu, meth)
+                if mu:
+                    visit(mu, lvl + 1, f"{u.name}.{inst}.{meth}()")
 
     visit(start, 0, None)
     return {"root": start.name, "depth": depth, "nodes": nodes, "unique": len(seen)}
@@ -590,7 +738,7 @@ def _lineids_block(name: str, lines: int) -> str:
 
 
 _TCPOU_TMPL = """<?xml version="1.0" encoding="utf-8"?>
-<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+<TcPlcObject Version="1.1.0.1" ProductVersion="{product_version}">
   <POU Name="{name}" Id="{{{guid}}}" SpecialFunc="None">
     <Declaration><![CDATA[{decl}]]></Declaration>
     <Implementation>
@@ -624,7 +772,17 @@ def tcunit_scaffold(idx: ProjectIndex, fb_name: str, out_dir: str | None = None,
     if dest.exists() and not overwrite:
         raise ProjectError(f"{dest} exists; pass overwrite=true")
     tests: list[tuple[str, str, str]] = []
-    inputs_arrange = "\n".join(f"\tfbUut.{v['name']} := {_default_for(v['type'])};  // {v['comment'] or v['type']}" for v in iface["inputs"])
+    # Arrange restates each input's declared initial value (fbUut.nPreset := 10, not 0) — a test that silently
+    # overrides the FB's defaults tests a different FB
+    inputs_arrange = "\n".join(f"\tfbUut.{v['name']} := {v['init'] if v.get('init') else _default_for(v['type'])};  // "
+                               f"{v['comment'] or v['type']}{' (declared default)' if v.get('init') else ''}"
+                               f"{' — inherited from ' + v['inherited_from'] if v.get('inherited_from') else ''}"
+                               for v in iface["inputs"])
+    try:
+        mpv = re.search(r'ProductVersion="([^"]+)"', src.read_text(encoding="utf-8-sig", errors="replace")[:400])
+    except OSError:
+        mpv = None
+    product_version = mpv.group(1) if mpv else "3.1.4024.12"
     out_asserts = "\n".join(f"\tAssertEquals_{_assert_suffix(v['type'])}(Expected := {_default_for(v['type'])}, Actual := fbUut.{v['name']}, Message := '{v['name']} initial');"
                             for v in iface["outputs"] if _assert_suffix(v["type"]))
     tests.append(("Test_InitialState",
@@ -641,13 +799,15 @@ def tcunit_scaffold(idx: ProjectIndex, fb_name: str, out_dir: str | None = None,
         else:
             decl_extra = ""
             act = f"{call};"
+        inh = f"  // inherited from {m['inherited_from']}" if m.get("inherited_from") else ""
         tests.append((f"Test_{m['name']}",
                       f"METHOD PRIVATE Test_{m['name']}\nVAR\n\tfbUut : {fb};\n{decl_extra}END_VAR\n",
-                      f"TEST('Test_{m['name']}');\n\n// Arrange\n{inputs_arrange}\n\n// Act\n{act}\nfbUut();\n\n// Assert\n\tAssertTrue(Condition := FALSE, Message := 'Test_{m['name']}: write the assertion');\n\nTEST_FINISHED();"))
+                      f"TEST('Test_{m['name']}');{inh}\n\n// Arrange\n{inputs_arrange}\n\n// Act\n{act}\nfbUut();\n\n// Assert\n\tAssertTrue(Condition := FALSE, Message := 'Test_{m['name']}: write the assertion');\n\nTEST_FINISHED();"))
     decl = f"FUNCTION_BLOCK {suite} EXTENDS TcUnit.FB_TestSuite\n// Generated by twincat-mcp for {fb} — fill in the assertions.\nVAR\nEND_VAR\n"
     impl = "\n".join(f"{t[0]}();" for t in tests)
     methods_xml = "".join(_METHOD_TMPL.format(name=t[0], guid=uuid.uuid4(), decl=t[1], impl=t[2]) for t in tests)
-    dest.write_text(_TCPOU_TMPL.format(name=suite, guid=uuid.uuid4(), decl=decl, impl=impl, methods=methods_xml), encoding="utf-8")
+    dest.write_text(_TCPOU_TMPL.format(name=suite, guid=uuid.uuid4(), decl=decl, impl=impl, methods=methods_xml,
+                                       product_version=product_version), encoding="utf-8")
     result: dict[str, Any] = {"suite": suite, "file": str(dest), "tests": [t[0] for t in tests]}
     if add_to_plcproj:
         result["plcproj"] = _register_in_plcproj(idx, dest)

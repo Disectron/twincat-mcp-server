@@ -464,7 +464,14 @@ class App:
 async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str, Any]:
     proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False)
     declared = {it["path"].lower(): it for it in proj["items"] if "[*]" not in it["path"]}
-    roots = {p.split(".")[0] for p in declared}
+    # source arrays are declared once as x[*].y — the runtime has one leaf per element: match by pattern
+    templates = {it["path"].lower(): it for it in proj["items"] if "[*]" in it["path"]}
+    tmpl_keys = list(templates)
+    tmpl_re = None
+    if tmpl_keys:
+        alts = "|".join("(" + re.escape(k).replace(r"\[\*\]", r"\[[0-9, ]+\]") + ")" for k in tmpl_keys)
+        tmpl_re = re.compile(r"^(?:" + alts + r")(?=$|[.\[])")
+    roots = {p.split(".")[0] for p in list(declared) + tmpl_keys}
     online: set[str] = set()
     online_types: dict[str, str] = {}
     online_names: dict[str, str] = {}
@@ -478,9 +485,17 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
                 online.add(lf.path.lower())
                 online_types[lf.path.lower()] = lf.type
                 online_names[lf.path.lower()] = lf.path          # keep the PLC's spelling in the report
+    tmpl_hit: set[str] = set()
+    via_template: set[str] = set()
+    if tmpl_re is not None:
+        for o in online:
+            m = tmpl_re.match(o)
+            if m:
+                tmpl_hit.add(tmpl_keys[m.lastindex - 1])
+                via_template.add(o)
     missing = [declared[k] for k in sorted(set(declared) - online)]
     # declared composite (library type) items match if any online leaf starts with them — and those leaves
-    # (CTU.CV, TON.Q, …) are then *expected*, not "extra": the project cannot see inside a library FB
+    # (CTU.CV, TON.Q, R_TRIG.CLK …) are then *expected*, not "extra": the project cannot see inside a library FB
     missing_final = []
     composite_prefixes: list[str] = []
     for it in missing:
@@ -489,16 +504,30 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
             composite_prefixes.append(it["path"].lower())
             continue
         missing_final.append(it)
-    extra = []
-    for o in sorted(online - set(declared)):
+    missing_final += [templates[k] for k in tmpl_keys if k not in tmpl_hit]
+    extra_raw = []
+    for o in sorted(online - set(declared) - via_template):
         if any(o.startswith(cp + ".") or o.startswith(cp + "[") for cp in composite_prefixes):
             continue
-        extra.append(o)
-    return {"declared": len(declared), "online_under_same_roots": len(online),
-            "matched": len(declared) - len(missing_final), "missing_online": missing_final[:500],
-            "extra_online": [{"path": online_names.get(e, e), "type": online_types.get(e)} for e in extra[:500]],
-            "library_instances": [declared[cp]["path"] for cp in composite_prefixes][:200],
-            "roots": sorted(roots)}
+        extra_raw.append(o)
+    # collapse array elements: aAlarms[1..32].x → one line with a count
+    collapsed: dict[str, dict[str, Any]] = {}
+    for e in extra_raw:
+        name = online_names.get(e, e)
+        key = re.sub(r"\[[0-9, ]+\]", "[*]", name)
+        c = collapsed.setdefault(key.lower(), {"path": key, "type": online_types.get(e), "count": 0, "example": name})
+        c["count"] += 1
+    extra = list(collapsed.values())
+    cap = 300
+    out = {"declared": len(declared) + len(templates), "online_under_same_roots": len(online),
+           "matched": len(declared) + len(templates) - len(missing_final), "missing_online": missing_final[:cap],
+           "extra_online": extra[:cap], "extra_online_leaves": len(extra_raw),
+           "array_templates_matched": len(tmpl_hit), "array_elements_matched": len(via_template),
+           "library_instances": [declared[cp]["path"] for cp in composite_prefixes][:200],
+           "roots": sorted(roots)}
+    if len(missing_final) > cap or len(extra) > cap:
+        out["truncated"] = f"lists capped at {cap}; narrow with scope="
+    return out
 
 
 

@@ -146,3 +146,26 @@ def test_snapshot_apply(monkeypatch, tmp_path):
     res = bench.snapshot_apply("recipeA", symbols=["MAIN.stRecipe.rTargetKg"])
     assert res["written"] == ["MAIN.stRecipe.rTargetKg"] and FakeConnection.shared_values["MAIN.stRecipe.rTargetKg"] == 180.5
     assert FakeConnection.shared_values["MAIN.nCycle"] == 0
+
+
+
+def test_debug_symbol_writer_classification():
+    """#60: fb(eCmd := GVL.eCmd) passes GVL.eCmd *into* fb (a read); only real targets are writers."""
+    from twincat_mcp.workflows import _classify_write as c
+    segs = ["GVL_Machine", "eCmd"]
+    assert c("fbMachine(eCmd := GVL_Machine.eCmd);", "eCmd", segs) == "named_input_parameter"
+    assert c("fb(a := 1, eCmd := x);", "eCmd", segs) == "named_input_parameter"
+    assert c("GVL_Machine.eCmd := E_Cmd.Start;", "eCmd", segs) == "assignment"
+    assert c("fbMachine(bOk => GVL_Machine.eCmd);", "eCmd", segs) == "output_binding"
+    assert c("other.eCmd := 1;", "eCmd", segs) is None
+    assert c("// eCmd := 1;", "eCmd", segs) is None
+
+
+def test_csharp_enum_uses_declared_base():
+    """#65: E_State ... ) UDINT; must export as `: uint`, values unsigned."""
+    from twincat_mcp.ads_types import DtEntry, TypeSystem
+    from twincat_mcp.exporters import to_csharp
+    e = DtEntry("E_State", "UDINT", 4, 0, 19, 0x2000, "", enum={0: "Idle", -1: "Fault"})
+    ts = TypeSystem({"e_state": e})
+    cs = to_csharp(ts, ["E_State"])
+    assert "public enum E_State : uint" in cs and "Fault = 4294967295" in cs

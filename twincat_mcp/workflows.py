@@ -6,6 +6,7 @@ other backends; gating of writes/destructive steps stays in the server.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -13,6 +14,30 @@ from . import codecheck
 from .ads_backend import AdsError
 from .project_backend import ProjectError
 from .safety import OpClass
+
+
+def _classify_write(line: str, leaf: str, segs: list[str]) -> str | None:
+    """'assignment' / 'output_binding' / 'named_input_parameter' (fb(x := y) — a read of y) / None (a different
+    variable with the same leaf name, e.g. other.x := … when the symbol is MAIN.fb.x)."""
+    import re as _re
+    code = _re.sub(r"//.*$|\(\*.*?\*\)", "", line)
+    if _re.search(rf"=>\s*([\w.\[\]^]*\.)?{_re.escape(leaf)}\b", code, _re.I):
+        return "output_binding"
+    for m in _re.finditer(rf"([\w\[\]^]+\.)*\b{_re.escape(leaf)}\b(\[[^\]]*\])?\s*:=", code, _re.I):
+        start = m.start()
+        qual = code[start:m.start() + len(m.group(0))].split(":=")[0].strip()
+        parts = [x.split("[")[0].rstrip("^") for x in qual.split(".")]
+        before = code[:start].rstrip()
+        if len(parts) == 1 and before.endswith(("(", ",")):
+            return "named_input_parameter"
+        if len(parts) > 1:
+            # qualified: the qualifier must be a suffix of the symbol's own path (fbFill.bDone for MAIN.fbFill.bDone)
+            want = [x.lower() for x in segs]
+            got = [x.lower() for x in parts]
+            if got != want[-len(got):] and got[0] not in ("this", "super"):
+                continue
+        return "assignment"
+    return None
 
 
 async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: int = 12) -> dict[str, Any]:
@@ -29,8 +54,28 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
         # a write is `x :=`, an output binding `Q => x` in an FB call, or `x` passed as VAR_IN_OUT (approximated by
         # a bare `, x)` / `(x,` inside a call — reported separately as possible writes)
         writers = await app.proj_call(app.proj.search, rf"(\b{leaf}\b\s*:=|=>\s*{leaf}\b)", None, 50, True)
+        segs = [x.split("[")[0] for x in symbol.split(".")]
+        kept, input_bindings = [], []
         for h in writers["hits"]:
-            h["kind"] = "output_binding" if "=>" in h["text"] else "assignment"
+            kind = _classify_write(h.get("text", ""), leaf, segs)
+            if kind is None:
+                continue
+            h["kind"] = kind
+            (input_bindings if kind == "named_input_parameter" else kept).append(h)
+        writers["hits"] = kept
+        if input_bindings:
+            rep["passed_as_input"] = [{**h, "note": f"'{leaf} := …' here names an FB/method input — it reads the right-hand side, "
+                                                    "it does not write this symbol"} for h in input_bindings[:20]]
+        try:
+            if app.hmi.scanned_at is None and (app.cfg.project.hmi_root or app.cfg.project.root):
+                await asyncio.to_thread(app.hmi.scan, app.cfg.project.hmi_root or app.cfg.project.root)
+            hw = app.hmi.find(symbol, "tcvis_write", 50)["bindings"] + app.hmi.find(symbol, "symbol", 50)["bindings"]
+            hw = [b for b in hw if b["plc_symbol"].lower() == symbol.lower() and (b["kind"] == "tcvis_write" or
+                                                                                   (b.get("attribute") or "").lower().endswith(("value", "write")))]
+            if hw:
+                rep["hmi_writers"] = hw[:20]
+        except Exception:  # noqa: BLE001 — no HMI/visu in this project
+            pass
         mentions = await app.proj_call(app.proj.search, rf"\b{leaf}\b", ["PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "ACTION", "GET", "SET"], 200, True)
         impl_mentions = [h for h in mentions["hits"] if h["part"] == "implementation"]
         rep["writers"] = writers["hits"][:30]
