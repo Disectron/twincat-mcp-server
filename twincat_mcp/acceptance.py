@@ -464,7 +464,7 @@ class Acceptance:
         self.log("[4] recorder round trip")
         tools = ("rec_scan", "rec_profile_save", "rec_profile_list", "rec_profile_get", "rec_profile_start", "rec_list", "rec_status",
                  "rec_snapshot", "rec_stats", "rec_read", "rec_profile_stop", "rec_export", "rec_pulses", "rec_latency", "rec_start",
-                 "rec_stop", "rec_compare", "rec_delete", "rec_profile_delete")
+                 "rec_stop", "rec_compare", "rec_delete", "rec_profile_delete", "rec_verify")
         if not self.ads_ok or not self.sym:
             for t in tools:
                 self.skip(ph, t, "needs ADS and a discovered symbol")
@@ -517,6 +517,29 @@ class Acceptance:
             for t in ("rec_stop", "rec_compare", "rec_delete"):
                 self.skip(ph, t, "poll recording did not start")
         await self.check(ph, "rec_profile_delete", {"name": "acceptance"})
+        await self._recording_accuracy(ph)
+
+    async def _recording_accuracy(self, ph: str) -> None:
+        """Ground truth: record the PLC task's own cycle counter at the task cycle for 3 s and prove that every
+        cycle is in the file (rec_verify counter=…). This is the check that matters for timing analysis."""
+        counter = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"
+        ct = await self.check(ph, "ads_read", {"name": "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleTime"}, optional=True)
+        if not isinstance(ct, dict) or not isinstance(ct.get("value"), (int, float)) or not ct["value"]:
+            self.skip(ph, "rec_verify", "task info not readable on this target (TwinCAT_SystemInfoVarList._TaskInfo)")
+            return
+        cycle_ms = ct["value"] / 10_000.0                     # CycleTime is in 100 ns units
+        r = await self.check(ph, "rec_start", {"symbols": [counter], "mode": "cycle", "cycle_ms": cycle_ms, "duration_s": 3.0,
+                                               "name": "acceptance-accuracy"}, timeout_s=60)
+        rid = r.get("id") if isinstance(r, dict) else None
+        if not rid:
+            self.skip(ph, "rec_verify", "accuracy recording did not start")
+            return
+        await asyncio.sleep(4.0)
+        await self.check(ph, "rec_stop", {"id": rid}, optional=True)
+        await self.check(ph, "rec_verify", {"id": rid, "counter": counter},
+                         lambda p: None if isinstance(p, dict) and p.get("verdict") == "PASS" else
+                         f"recording at the task cycle ({cycle_ms} ms) is NOT lossless: "
+                         f"{(p or {}).get('counter')} / {(p or {}).get('timeline', {}).get('missing')} missing")
 
     async def phase_snapshots_and_tests(self) -> None:
         ph = "5 snapshots/tests"

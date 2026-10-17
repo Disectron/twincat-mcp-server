@@ -60,13 +60,15 @@ def test_expand_symbols(rec):
 
 
 def test_change_mode_capture_stats_export_read(rec, tmp_path):
+    # the runtime's values at subscription time (a change notification delivers them first)
+    FakeConnection.shared_values.update({"MAIN.fbFill.eState": 0, "MAIN.fbFill.bDone": False, "MAIN.fbFill.tSettle": 500})
     st = rec.start(symbols=["MAIN.fbFill.eState", "MAIN.fbFill.bDone", "MAIN.fbFill.tSettle"], prefix=None, pattern=None,
                    mode="change", cycle_ms=10, duration_s=None, max_events=None, start_when=None, stop_when=None,
                    pre_trigger_ms=0, name="fill-cycle", max_symbols=500)
     rid = st["id"]
     assert st["active"] and st["symbols"] == 3
     c = _conn()
-    assert len(c.notifications) == 3
+    assert len(c.notifications) == 1          # three neighbouring leaves → one block notification
     seq = [(0, "MAIN.fbFill.eState", 0), (0, "MAIN.fbFill.bDone", False), (0, "MAIN.fbFill.tSettle", 500),
            (100, "MAIN.fbFill.eState", 1), (350, "MAIN.fbFill.eState", 2), (350.5, "MAIN.fbFill.tSettle", 750),
            (900, "MAIN.fbFill.eState", 3), (900, "MAIN.fbFill.bDone", True), (1200, "MAIN.fbFill.bDone", False)]
@@ -102,8 +104,8 @@ def test_change_mode_capture_stats_export_read(rec, tmp_path):
     # export
     e = rec.export(rid, "csv_wide", None, None)
     csv_lines = Path(e["file"]).read_text().splitlines()
-    assert csv_lines[0] == "t_ms,MAIN.fbFill.eState,MAIN.fbFill.bDone,MAIN.fbFill.tSettle"
-    assert csv_lines[-1].startswith("1200.0,3,False,750")
+    assert csv_lines[0] == "t_ms,plc_filetime,MAIN.fbFill.eState,MAIN.fbFill.bDone,MAIN.fbFill.tSettle"
+    assert csv_lines[-1] == f"1200.0,{ft(1200)},3,False,750"      # the PLC's own FILETIME of the sample
     e2 = rec.export(rid, "csv_long", None, ["MAIN.fbFill.eState"])
     assert e2["rows"] == 4
     lst = rec.list()
@@ -113,6 +115,7 @@ def test_change_mode_capture_stats_export_read(rec, tmp_path):
 
 
 def test_triggers_pre_and_stop(rec):
+    FakeConnection.shared_values.update({"MAIN.bStart": False, "MAIN.fbFill.bDone": False})
     st = rec.start(symbols=["MAIN.nCycle", "MAIN.bStart", "MAIN.fbFill.bDone"], prefix=None, pattern=None, mode="cycle",
                    cycle_ms=10, duration_s=None, max_events=None, start_when="MAIN.bStart == TRUE",
                    stop_when="MAIN.fbFill.bDone == true", pre_trigger_ms=50, name=None, max_symbols=500)
@@ -255,3 +258,92 @@ def test_post_trigger_window(rec):
     assert s["stop_reason"].startswith("post_trigger 0.1s")
     r = rec.read(st["id"], None, None, ["MAIN.nCycle"], 1000, False)
     assert max(x["t_ms"] for x in r["rows"]) <= 100 + 10.01   # nothing recorded past the window (+1 sample)
+
+
+# ---------------------------------------------------------------- recording accuracy (field report A1–A7)
+def _cycle_rec(rec, **kw):
+    args = dict(symbols=["MAIN.nCycle", "MAIN.bStart", "MAIN.fbFill.bDone"], prefix=None, pattern=None, mode="cycle",
+                cycle_ms=1, duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0,
+                name=None, max_symbols=50)
+    args.update(kw)
+    return rec.start(**args)
+
+
+def test_block_notification_gaps_are_counted_and_file_is_provable(rec):
+    """A1/A7: one notification per contiguous block; holes in the PLC timeline are counted (never 'dropped: 0' with
+    holes); rec_verify proves the file and checks a per-cycle counter."""
+    st = _cycle_rec(rec)
+    c = _conn()
+    assert st["notifications"] == 1 and len(c.notifications) == 1 and st["time_source"] == "plc"
+    sent = [i for i in range(1000) if not (300 <= i < 320) and i != 777]       # 21 cycles never arrive
+    for i in sent:
+        c.fire("MAIN.nCycle", 10_000 + i, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == len(sent))
+    s = rec.status(st["id"])
+    assert s["missing_samples"] == 21 and s["dropped"] == 0 and abs(s["completeness"] - len(sent) / 1000) < 1e-6
+    assert s["blocks"][0]["first_gaps"][0] == [299.0, 20] and any("missing" in w for w in s["warnings"])
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    assert out["missing_samples"] == 21
+    v = rec.verify(st["id"], counter="MAIN.nCycle")
+    assert v["integrity"] == "intact" and v["timeline"]["missing"] == 21 and v["verdict"] == "FAIL"
+    assert v["counter"]["missing_samples"] == 21 and v["counter"]["step"] == 1 and not v["counter"]["lossless"]
+    assert v["t0"]["source"] == "plc" and v["t0"]["filetime"] == ft(0)
+    # every sample carries the PLC's FILETIME exactly: t0 + t_ms * 1e4
+    rows = rec.read(st["id"], None, None, ["MAIN.nCycle"], 5, False)["rows"]
+    assert [v["t0"]["filetime"] + round(r["t_ms"] * 1e4) for r in rows] == [ft(i) for i in range(5)]
+    # tampering is detected
+    p = Path(out["file"])
+    lines = p.read_text().splitlines(keepends=True)
+    i = next(k for k, ln in enumerate(lines) if ln.startswith("[500"))
+    lines[i] = lines[i].replace("[500", "[501", 1)
+    p.write_text("".join(lines))
+    assert rec.verify(st["id"])["integrity"].startswith("MODIFIED")
+
+
+def test_lossless_run_passes_verification(rec):
+    st = _cycle_rec(rec)
+    c = _conn()
+    for i in range(2000):
+        c.fire("MAIN.nCycle", i, ft(i))
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    # the stop drained the backlog instead of discarding it (A2)
+    assert out["samples"] == 2000 and out["dropped"] == 0 and out["dropped_on_stop"] == 0
+    v = rec.verify(st["id"], counter="MAIN.nCycle")
+    assert v["verdict"] == "PASS" and v["counter"]["lossless"] and v["timeline"]["completeness"] == 1.0
+    # exact statistics from the file match the live ones
+    live = rec.stats(st["id"], ["MAIN.nCycle"], False, 0)
+    exact = rec.stats(st["id"], ["MAIN.nCycle"], False, 0, exact=True)
+    assert exact["source"] == "file" and exact["symbols"]["MAIN.nCycle"]["count"] == 2000
+    assert live["symbols"]["MAIN.nCycle"]["max"] == exact["symbols"]["MAIN.nCycle"]["max"] == 1999
+
+
+def test_partial_subscription_fails_unless_allowed(rec):
+    """A3: a notification that cannot be registered fails the start instead of leaving a silent hole.
+    MAIN.nCycle (offset 0) and MAIN.fbFill.bDone (offset 320) are too far apart to share a block."""
+    FakeConnection.fail_offsets = {5 * 64}
+    try:
+        kw = dict(symbols=["MAIN.nCycle", "MAIN.fbFill.bDone"], prefix=None, pattern=None, mode="cycle", cycle_ms=1,
+                  duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=50)
+        with pytest.raises(AdsError, match="1 of 2 notifications could not be registered"):
+            rec.start(**kw)
+        st = rec.start(**kw, allow_partial=True)
+    finally:
+        FakeConnection.fail_offsets = None
+    assert st["unsubscribed_symbols"] == ["MAIN.fbFill.bDone"] and any("could not be subscribed" in w for w in st["warnings"])
+    rec.stop(st["id"])
+
+
+def test_duration_cut_by_plc_time_and_pattern_expands(rec):
+    """A2: duration is PLC time — samples queued within it are written, later ones are not part of the recording.
+    A5: a pattern that matches a composite records its leaves (as rec_scan lists them)."""
+    st = _cycle_rec(rec, duration_s=0.5)
+    c = _conn()
+    for i in range(1000):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: not rec.status(st["id"])["active"])
+    s = rec.status(st["id"])
+    assert s["stop_reason"] == "duration 0.5s" and s["samples"] == 501 and s["plc_span_s"] == 0.5
+    st2 = rec.start(symbols=None, prefix=None, pattern="MAIN.arrSteps", mode="change", cycle_ms=10, duration_s=None,
+                    max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=50)
+    assert st2["leaves"] == 8 and st2["notifications"] == 1
+    rec.stop(st2["id"])

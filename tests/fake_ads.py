@@ -8,6 +8,8 @@ from typing import Any
 import pyads
 from pyads import constants as C
 
+from pyads.structs import SAdsNotificationHeader
+
 from twincat_mcp.ads_types import DtEntry, encode_entry
 
 
@@ -192,9 +194,7 @@ class FakeConnection:
         import time as _t
         ts = int(_t.time() * 1e7) + 116444736000000000
         for inst in list(cls.instances):
-            for h, (n, attr, cb) in getattr(inst, "notifications", {}).items():
-                if n == name:
-                    cb(type("N", (), {"h": h, "ts": ts, "value": value})(), name)
+            inst._deliver(name, value, ts)
 
     def read_write(self, index_group, index_offset, plc_read_datatype, value, plc_write_datatype, return_ctypes=False, check_length=True):
         # RPC emulation: handle by name for "inst#method", then VALBYHND = call
@@ -221,12 +221,20 @@ class FakeConnection:
         return {n: self.values[n] for n in names}
 
     # notifications
-    def add_device_notification(self, name, attr, callback, user_handle=None):
-        if name not in self.values:
-            raise pyads.ADSError(1808)
+    def add_device_notification(self, data, attr, callback, user_handle=None):
+        """By name (legacy callers) or by (index_group, index_offset) — the recorder's block notifications."""
+        if isinstance(data, tuple):
+            igrp, ioffs = data
+            if getattr(FakeConnection, "fail_offsets", None) and ioffs in FakeConnection.fail_offsets:
+                raise pyads.ADSError(1861)
+            key = ("blk", igrp, ioffs, attr.length)
+        else:
+            if data not in self.values:
+                raise pyads.ADSError(1808)
+            key = data
         self.notifications = getattr(self, "notifications", {})
         h = len(self.notifications) + 1
-        self.notifications[h] = (name, attr, callback)
+        self.notifications[h] = (key, attr, callback)
         return (h, h)
 
     def del_device_notification(self, nh, uh):
@@ -235,11 +243,43 @@ class FakeConnection:
     def parse_notification(self, notification, plc_datatype, timestamp_as_filetime=False):
         return notification.h, notification.ts, notification.value
 
+    def _deliver(self, name, value, ts):
+        off = _SYM_OFFSET.get(name)
+        for h, (key, attr, cb) in list(getattr(self, "notifications", {}).items()):
+            if key == name:
+                cb(type("N", (), {"h": h, "ts": ts, "value": value})(), name)
+            elif isinstance(key, tuple) and key[0] == "blk" and key[1] == 0x4040 and off is not None \
+                    and key[2] <= off < key[2] + key[3]:
+                data = memory_image(key[2], key[3])
+                buf = ctypes.create_string_buffer(struct.pack("<IQI", h, ts, len(data)) + data)
+                ptr = ctypes.cast(buf, ctypes.POINTER(SAdsNotificationHeader))
+                cb(ptr, (key[1], key[2]))
+
     def fire(self, name, value, ts_filetime):
-        """Test helper: deliver a notification for `name` as the DLL would."""
-        for h, (n, attr, cb) in self.notifications.items():
-            if n == name:
-                cb(type("N", (), {"h": h, "ts": ts_filetime, "value": value})(), name)
+        """Test helper: deliver a notification for `name` as the DLL would (block subscribers get the whole block)."""
+        self.values[name] = value
+        self._deliver(name, value, ts_filetime)
+
+
+_SYM_OFFSET = {n: i * 64 for i, (n, t, s, v, f) in enumerate(SYMBOLS)}
+
+
+def memory_image(start: int, length: int) -> bytes:
+    """PLC memory (index group 0x4040) as the fake lays it out: symbol i at offset i*64."""
+    buf = bytearray(b"\x00" * length)
+    for i, (n, t, size, v0, f) in enumerate(SYMBOLS):
+        off = i * 64
+        if off + 64 <= start or off >= start + length:
+            continue
+        raw = RAW_IMAGES.get(n)
+        if raw is None:
+            raw = _scalar_bytes(t, size, FakeConnection.shared_values.get(n, v0))
+        raw = bytes(raw[:64])
+        for j, b in enumerate(raw):
+            k = off + j - start
+            if 0 <= k < length:
+                buf[k] = b
+    return bytes(buf)
 
 
 def _scalar_bytes(typ, size, v):
@@ -260,6 +300,15 @@ def _scalar_bytes(typ, size, v):
         return b"".join(struct.pack("<d", x) for x in v)
     if t == "E_FillState":
         return struct.pack("<h", v)
+    try:
+        from twincat_mcp import types_tc as _T
+        tt = _T.parse_type(typ, size)
+        if tt.kind == "array" and isinstance(v, list) and tt.ctype is not None:
+            return bytes(tt.ctype(*v))
+        if tt.ctype is not None and tt.kind in ("int", "uint", "enum", "bool", "float", "pointer"):
+            return bytes(tt.ctype(v))
+    except Exception:  # noqa: BLE001
+        pass
     return b"\x11" * size
 
 

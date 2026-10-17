@@ -999,7 +999,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         mode: str = "change", cycle_ms: float = 10, duration_s: float | None = None,
                         max_events: int | None = 5_000_000, start_when: str | None = None,
                         stop_when: str | None = None, pre_trigger_ms: float = 0, name: str | None = None,
-                        max_symbols: int = 500, post_trigger_s: float | None = None) -> dict[str, Any]:
+                        max_symbols: int = 500, post_trigger_s: float | None = None, allow_partial: bool = False,
+                        max_delay_ms: float = 0) -> dict[str, Any]:
         """Start a continuous real-time recording of online PLC variables (runs in the background
         until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or
         struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it)
@@ -1008,12 +1009,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         changes (checked every cycle_ms); 'poll' = sum-read every cycle_ms from this PC.
         Triggers: start_when='MAIN.bStart == TRUE' with pre_trigger_ms keeps the events before the
         trigger (scope-style); stop_when='MAIN.fbFill.bDone == TRUE'. Events stream to a JSONL file.
-        duration_s counts from the first sample (also while waiting for start_when); post_trigger_s ends the
-        recording that long after the start_when trigger fired (scope-style post-trigger window)."""
+        duration_s is PLC time from the first sample (also while waiting for start_when); post_trigger_s ends the
+        recording that long after the start_when trigger fired (scope-style post-trigger window).
+        Timestamps (cycle/change) are the TwinCAT runtime's own, stored exactly with the raw bytes it sent; neighbouring
+        variables share ONE notification (a block), which is what keeps 1 ms recordings lossless — select whole FBs,
+        structs or arrays rather than hundreds of scattered globals. Any notification that cannot be registered fails
+        the start (allow_partial=true records the rest and lists unsubscribed_symbols). max_delay_ms > 0 lets the
+        runtime batch samples (fewer ADS frames; each sample keeps its own timestamp). After stopping: rec_verify."""
         res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
                                  cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
                                  start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
-                                 name=name, max_symbols=max_symbols, post_trigger_s=post_trigger_s, timeout=120)
+                                 name=name, max_symbols=max_symbols, post_trigger_s=post_trigger_s,
+                                 allow_partial=allow_partial, max_delay_ms=max_delay_ms, timeout=120)
         app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode}, OpClass.EDIT, "ok")
         return res
 
@@ -1232,13 +1239,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return {"profile": name, "stopped": out}
 
     @mcp.tool(annotations=READ)
-    async def rec_list() -> dict[str, Any]:
-        """Recordings of this session (live status) and recording files on disk."""
-        return await app.mem_call(app.rec.list)
+    async def rec_list(limit: int = 30, offset: int = 0) -> dict[str, Any]:
+        """Recordings of this session (compact status) and recording files on disk, newest first
+        (paged: limit/offset; on_disk_total says how many exist)."""
+        return await app.mem_call(app.rec.list, max(1, min(limit, 500)), max(0, offset))
 
     @mcp.tool(annotations=READ)
     async def rec_status(id: str) -> dict[str, Any]:
-        """Live status of one recording: events, rate, drops, armed/triggered, last value per symbol."""
+        """Live status of one recording: samples, events, rate, missing_samples (holes in the PLC timeline, cycle
+        mode), completeness, dropped (lost on this PC), backlog, stats_coverage, per-block report, warnings,
+        armed/triggered, last value per symbol."""
         return await app.mem_call(app.rec.status, id)
 
     @mcp.tool(annotations=READ)
@@ -1248,11 +1258,22 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def rec_stats(id: str, symbols: list[str] | None = None, include_runs: bool = True,
-                        max_runs: int = 200) -> dict[str, Any]:
+                        max_runs: int = 200, exact: bool = False) -> dict[str, Any]:
         """Per-symbol statistics over the whole recording so far: count, first/last, min/max/mean,
         change count, BOOL rising/falling edges with timestamps, and value runs (state timeline
-        with dwell times) — computed incrementally, no re-read of the file."""
-        return await app.mem_call(app.rec.stats, id, symbols, include_runs, min(max_runs, 5000))
+        with dwell times). Live (incremental) while complete; recomputed from the file when the ingest had
+        to skip statistics under load, for recordings of earlier sessions, or with exact=true."""
+        return await app.mem_call(app.rec.stats, id, symbols, include_runs, min(max_runs, 5000), exact or None)
+
+    @mcp.tool(annotations=READ)
+    async def rec_verify(id: str, counter: str | None = None, step: int | None = None) -> dict[str, Any]:
+        """Prove a finished recording. integrity: the file is byte-for-byte what the recorder wrote (sha256 of every
+        line, signed with this install's key) — 'MODIFIED' if anything was edited. timeline (cycle mode): per
+        notification block, holes between the PLC's own sample timestamps. counter (optional): a PLC variable that
+        increments every cycle and was recorded with the rest (your nCycleCount, or
+        TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount) must step by exactly `step` per sample — ground truth
+        for 'no sample lost'. verdict PASS only if all checks hold."""
+        return await app.mem_call(app.rec.verify, id, counter, step)
 
     @mcp.tool(annotations=READ)
     async def rec_read(id: str, t_from_ms: float | None = None, t_to_ms: float | None = None,
