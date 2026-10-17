@@ -128,7 +128,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **"Absolute control" setting:** `TCMCP_MODE=full TCMCP_MAX_MODE=full TCMCP_CONFIRM=0`. In that configuration a single mis-aimed tool call can stop the PLC, activate a half-built configuration or reboot the IPC. The server will do exactly what it is told; the only remaining gate is the MCP client's own tool-permission prompt. Keep a denylist for E-stop/safety symbols regardless.
 
-## Tools (143) + 5 prompts
+## Tools (151) + 5 prompts
 
 **Workflows (one call = a whole chain)** `wf_debug_symbol` · `wf_fb_profile` · `wf_release_check` · `wf_project_overview`
 
@@ -153,6 +153,8 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 **TcUnit** `tcunit_results` · `tcunit_run[disable_io]` · `tcunit_scaffold`
 
 **Experiments** `exp_template` · `exp_validate` · `exp_save` · `exp_list` · `exp_get` · `exp_runs` · `exp_run[dry_run]` · `exp_status` · `exp_abort` · `exp_evaluate` · `exp_report` · `exp_compare`
+
+**Knowledge base** `kb_set_location` · `kb_status` · `kb_add_project` · `kb_remove_project` · `kb_reindex` · `kb_search` · `hw_lookup` · `proj_libraries` — the database lives in a folder you name; only project folders you add are indexed
 
 **Capture profiles** `rec_scan` · `rec_profile_save` · `rec_profile_list` · `rec_profile_get` · `rec_profile_delete` · `rec_profile_start` · `rec_profile_stop`
 
@@ -432,6 +434,8 @@ The XAE and System-Service paths are written against Beckhoff's Infosys document
 Anything that fails: the tool error text contains the ADS/HRESULT code; paste it back and the fix is usually one constant.
 
 ## Changelog
+
+**0.7.2** — knowledge base and the 0.7.1 retest. Knowledge base (decisions of 2026-10-17): the database lives in a folder the user names (`kb_set_location`; checked: local fixed drive, not cloud-synced, not the plugin folder, writable, ≥ 1 GB; `D:\TwinCAT-MCP\knowledge` only when the user agrees); `kb_add_project` / `kb_search` over folders the user adds (nothing by default); `hw_lookup` (PDOs, CoE objects from TwinCAT's ESI files); `proj_libraries` (what each library reference resolves to on this PC); known causes/fixes attached to tool errors. Recorder: above 20,000 values/s nothing is decoded on the ingest thread (300 leaves × 1 ms lost samples because decoding starved the ADS callback); the GIL switch interval is 0.5 ms while recording; the missing tail up to the window end is counted (N11); responses trim long arrays; triggers on elements of recorded arrays and `edge_triggers`. `rec_delete` needs a confirmation and the audit keeps the file's SHA-256 (R11). Interfaces are recognised from the project source when the datatype table does not mark them: reads as `0x…`, writes refused (#52/#64). `tc_allow_write` tokens for the pattern as typed (N1); session allow-list kept over `tc_reload_config` (N6); writers scoped to the declaring unit (N3); System Manager refreshed after a solution reopen (N9); env overrides of TOML values reported (N10); external `tcunit_scaffold` not gated (N12); restart `duration_s` until RUN (N5); Check all objects selects the PLC project node and reports the real refusal (#45). 151 tools.
 
 **0.7.1** — decisions of 2026-10-17. The CONSTANT check runs on every write path (`snap_apply`, `test_*`, `exp_*` too); with no project source loaded, guarded mode refuses writes and full mode allows them. Recordings carry a manifest (AppTimestamp, OnlineChangeCnt, tasks and cycle times, TwinCAT build, symbol version) and, in cycle mode, the task's per-cycle counter as ground truth that `rec_verify` uses automatically. `csv_wide` is one row per PLC sample time with array elements as columns; empty cell = not sampled then (`fill=true` for charts). The example config carries the agreed machine-PC settings (`allow_elicitation = false`, `edit_requires_config_mode = true`, tool groups, narrow allow-list). 143 tools.
 

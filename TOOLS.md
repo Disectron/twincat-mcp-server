@@ -1,13 +1,13 @@
-# twincat-mcp 0.7.1 — tool reference
+# twincat-mcp 0.7.2 — tool reference
 
-143 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
+151 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
 ## Meta & safety (8)
 
 - `tc_doctor` [R] — Environment check: platform, pyads/router, local AMS NetId, XAE ProgIDs in the registry, running XAE shells, project root, safety mode. Run this first. Starts with a one-line `summary`; verbose=true adds the full loaded configuration.
-- `tc_safety_status` [R] — Current safety mode, ceiling, allow/deny lists, pending confirmation tokens.
+- `tc_safety_status` [R] — Current safety mode (and where it came from), ceiling, allow/deny lists, pending confirmation tokens.
 - `tc_set_mode` [C] — Switch safety mode: readonly | guarded | full. Lowering is free. Escalating (guarded→full, readonly→guarded) is capped at max_mode AND needs a confirmation (prompt or confirm_token) — an agent must not be able to widen its own permissions silently.
-- `tc_allow_write` [C] — Add (or remove) a write allow-list pattern for THIS session only — the in-session alternative to editing twincat_mcp.toml and reconnecting. fnmatch, case-insensitive: 'GVL_Test.*', 'MAIN.fbDispense.rSetpoint'. Control-class: needs a confirmation (prompt or confirm_token). The deny list still wins; the change is…
+- `tc_allow_write` [C] — Add (or remove) a write allow-list pattern for THIS session only — the in-session alternative to editing twincat_mcp.toml and reconnecting. fnmatch, case-insensitive: 'GVL_Test.*', 'MAIN.fbDispense.rSetpoint'. Control-class: needs a confirmation (prompt or confirm_token from…
 - `tc_reload_config` [E] — Re-read twincat_mcp.toml (and TCMCP_* env) without a restart. Applies: safety allow/deny lists, confirm_destructive, confirm_ttl_s, docs settings, naming prefixes, dialog rules, tcunit result path. Reports — but does not apply — changes that need a restart: ads target/port, solution path, project root, mode/max_mode…
 - `tc_request_confirmation` [R] — Issue a single-use confirm_token for a control/destructive tool. Use the exact action name of the tool (e.g. 'xae_activate_configuration') and its target. For the XAE actions that act on the shell's target (activate, restart, deploy, tree_delete) the target must be the NetId XAE currently targets — a token for any…
 - `tc_audit_tail` [R] — Last n audit records (mutating calls, confirmations, mode changes).
@@ -69,7 +69,7 @@
 - `rec_read` [R] — Read a time window of a recording from its file. wide=true pivots to one row per event with all selected symbols forward-filled (what you want for 'what else was true when X happened'). Works on finished recordings from earlier sessions too.
 - `rec_stop` [E] — Stop a recording, release the ADS notifications, finalize the file; returns status + stats.
 - `rec_export` [R] — Export a recording to CSV. csv_wide: one row per PLC sample time, one column per variable and per array element (name[i]); an empty cell means no sample of that variable at that time (fill=true forward-fills — handy for charts, but a cell then no longer means "sampled now"). csv_long: t_ms,symbol,value. Both include…
-- `rec_delete` [E] — Stop (if running) and delete a recording and its exports from disk.
+- `rec_delete` [D] — Stop (if running) and delete a recording and its exports from disk. Destructive-class (field report R11): a recording is evidence — guarded mode needs tc_request_confirmation(action='rec_delete', target=<id>); the audit keeps the deleted file's size and SHA-256 so its content stays identifiable.
 - `rec_pulses` [R] — Pulse / dwell analysis of one recorded symbol: for BOOL → pulse count, high/low widths, period, frequency, duty (fine-dosing valve pulses); for other types → state timeline with dwell times.
 - `rec_latency` [R] — Edge-to-edge latency in a recording: from each time `from_symbol from_op from_value` becomes true to the next time `to_symbol to_op to_value` becomes true (PLC timestamps). E.g. bOpenCmd == TRUE → rFlow > 0.5.
 - `rec_compare` [R] — Before/after comparison of two recordings: per-symbol stat deltas (count, min, max, mean, changes, edges) and pulse width/period deltas for BOOLs — timing regression after a code change.
@@ -144,8 +144,9 @@
 - `exp_report` [E] — Write <experiments_dir>/<name>/report.md and report.html: identity (machine, TwinCAT version, project, git state, safety mode), criteria table, metrics per level, charts (primary measure per run; per-level mean/CI), run table, the spec, the audit log of writes during the run, and the interpretation — stored…
 - `exp_compare` [R] — Two experiments with the same levels side by side: metric deltas and whether their 95 % CIs separate (the before/after question with error bars).
 
-## Project files (offline) (15)
+## Project files (offline) (16)
 
+- `proj_libraries` [R] — Library versions (K3): every library reference of each PLC project — the version it asks for, the version it effectively resolves to on this PC ('*' = newest installed) and what is installed in TwinCAT's library repository. Flags a pinned version that is not installed. Reads the .plcproj and folder names only.
 - `proj_interface` [R] — Public interface of an FB/program: inputs/outputs/in-out with types and comments, methods (access, signature), properties (get/set), actions, extends/implements.
 - `proj_lint` [R] — Static checks over one object or the whole project: unused locals, naming prefixes (override map via `prefixes`), undocumented VAR_INPUT/OUTPUT, TODO markers, REAL compared with =, VAR_INPUT assigned inside an FB, empty methods, GVL/ENUM without qualified_only, magic numbers, FB_init/FB_exit without SUPER^;…
 - `proj_call_graph` [R] — Call graph from a program/FB: FB instances it invokes, functions and methods it calls, recursively to `depth` (what runs when this POU runs).
@@ -183,6 +184,16 @@
 - `infosys_search` [R] — Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]). When the local index has nothing, falls back to a DuckDuckGo site: query whose results are verified against the Infosys sitemap (TwinCAT 3 only) and fetched for title/excerpt; the 'backend' field says which path answered.
 - `infosys_search_code` [R] — Search the code examples (<pre> blocks) of indexed pages for a fragment — a call pattern, an attribute, a constant. language: st | xml | cpp | csharp. Returns the matching lines with context and the page URL.
 - `infosys_get_page` [R] — A documentation page as Markdown (headings, tables, fenced code). ref: full Infosys URL, 'book/pageid', a bare page id, or a symbol name ('ADSREAD'). Fetched live and cached; works for any page that exists on the site, indexed or not. refresh=true bypasses the cache.
+
+## Other (7)
+
+- `kb_status` [R] — Knowledge base: where it is stored (or the question to ask the user if no folder was chosen yet), the project folders indexed for kb_search, ESI devices indexed for hw_lookup, known-error entries.
+- `kb_set_location` [E] — Choose the folder for the knowledge database — ONLY with a path the user gave you (or use_fallback=true once the user agreed to D:\TwinCAT-MCP\knowledge). The folder is checked: local fixed drive (no network share / mapped drive / USB), not inside OneDrive/Dropbox/Google Drive/iCloud, not inside the plugin folder,…
+- `kb_add_project` [E] — Index a project folder for kb_search (cross-project pattern search) — ONLY a folder the user named. Reads .TcPOU/.TcDUT/.TcGVL/.TcIO beneath it into the knowledge database; nothing is indexed by default.
+- `kb_remove_project` [E] — Remove a project folder from the knowledge base (index entries only; the files are untouched).
+- `kb_reindex` [E] — Re-index one project folder (or every changed one) after edits.
+- `kb_search` [R] — Search the code of the project folders the user added ("alarm handler", "FB_Valve", "CONCAT"): unit, kind, file and the matching declaration/code excerpts, best first. kinds filters (FUNCTION_BLOCK, METHOD, DUT, GVL, …). Also returns the known cause/fix when the query is an error message.
+- `hw_lookup` [R] — EtherCAT terminal/box data from the installed ESI files (K4): name, product code, revisions, PDOs with their entries (index, subindex, bit length, type), CoE objects. query = type ('EL2008'), part of a name, or a product code ('#x07D83052'). The first call indexes TwinCAT's ESI folder into the knowledge database (can…
 
 ## Prompts (5)
 

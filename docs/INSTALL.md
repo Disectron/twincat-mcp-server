@@ -119,7 +119,7 @@ If `claude plugin configure` also refuses, the options are plain environment var
 **Pre-build the venv now** (optional but recommended — it removes the one-minute first-start wait from §5):
 
 ```powershell
-python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.7.1\scripts\launch.py" --no-run
+python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.7.2\scripts\launch.py" --no-run
 ```
 (the version folder changes with each plugin version; `dir $env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp` lists it.)
 
@@ -234,7 +234,7 @@ ran the pre-build command in §3.1, none of this happens.
 
 | `/mcp` shows | meaning | do |
 |---|---|---|
-| `twincat` connected, 143 tools | done | continue to §6 |
+| `twincat` connected, 151 tools | done | continue to §6 |
 | `twincat` failed, first start or after an update | background install running (exit code 5) | wait a minute, reconnect from `/mcp` or start a new session |
 | `twincat` failed, repeatedly | launcher could not start the server | `> claude --mcp-debug` and read the launcher's stderr; the common causes are the table below. Also read the install log named above |
 | no `twincat` entry at all | plugin not loaded | `> claude plugin list` shows load errors; `CLAUDE_CODE_SKIP_PLUGIN_MCP_SERVERS` in the environment disables plugin servers |

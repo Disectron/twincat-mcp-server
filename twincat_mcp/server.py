@@ -1233,7 +1233,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         max_events: int | None = 5_000_000, start_when: str | None = None,
                         stop_when: str | None = None, pre_trigger_ms: float = 0, name: str | None = None,
                         max_symbols: int = 500, post_trigger_s: float | None = None, allow_partial: bool = False,
-                        max_delay_ms: float = 0, cycle_counter: str | None = "auto") -> dict[str, Any]:
+                        max_delay_ms: float = 0, cycle_counter: str | None = "auto", edge_triggers: bool = False) -> dict[str, Any]:
         """Start a continuous real-time recording of online PLC variables (runs in the background
         until rec_stop, duration_s, max_events or stop_when). Select by explicit symbols (an FB or
         struct instance expands to all its leaves), prefix ('MAIN.fbFill' → every leaf under it)
@@ -1251,13 +1251,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         runtime batch samples (fewer ADS frames; each sample keeps its own timestamp). cycle mode also records a
         per-cycle counter as ground truth (cycle_counter='auto' = the matching task's _TaskInfo[n].CycleCount, or your
         own e.g. 'MAIN.nCycleCount', or null for none) and the header carries a manifest of what was recorded from
-        (AppTimestamp, OnlineChangeCnt, tasks, TwinCAT build, symbol version). After stopping: rec_verify."""
+        (AppTimestamp, OnlineChangeCnt, tasks, TwinCAT build, symbol version). Conditions are levels: a start_when that
+        already holds fires at once — edge_triggers=true fires only when it BECOMES true. A condition may name one
+        element of an array recorded as a whole (GVL_Test.aCounter[1] when GVL_Test.aCounter is recorded).
+        After stopping: rec_verify."""
         res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
                                  cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
                                  start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
                                  name=name, max_symbols=max_symbols, post_trigger_s=post_trigger_s,
                                  allow_partial=allow_partial, max_delay_ms=max_delay_ms, cycle_counter=cycle_counter,
-                                 timeout=120)
+                                 edge_triggers=edge_triggers, timeout=120)
         app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode}, OpClass.EDIT, "ok")
         return res
 
@@ -1312,6 +1315,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             raise ToolError("source must be runtime | project")
         if not leaves:
             raise ToolError("scan found no variables (prefix/pattern wrong, or not connected / not scanned)")
+        scan_note = ("array elements are listed one by one here; rec_start records an array of scalars as ONE variable "
+                     "(the same bytes, one notification) and exports its elements as name[i] — counts differ, data does not")
         by_type: dict[str, int] = {}
         by_group: dict[str, dict[str, Any]] = {}
         modes: dict[str, int] = {}
@@ -1334,6 +1339,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             await asyncio.to_thread(path.write_text, capture.build_checklist(leaves, cycle_ms, preselect), "utf-8")
             res["checklist"] = str(path)
             res["next"] = f"mark 'x' in the select column, then rec_profile_save(name={checklist!r}, from_checklist={checklist!r})"
+        if any("[" in lf["path"] for lf in leaves):
+            res["note"] = scan_note
         return res
 
     @mcp.tool(annotations=EDIT)

@@ -403,3 +403,32 @@ def test_long_array_values_are_trimmed_in_responses(rec):
     from twincat_mcp.recorder import trim_value
     assert trim_value(list(range(300))) == {"len": 300, "first": [0, 1, 2, 3, 4], "last": [298, 299]}
     assert trim_value([1, 2]) == [1, 2]
+
+
+def test_trigger_on_array_element_and_edge(rec):
+    """Retest 0.7.1: a trigger may name one element of an array recorded as a whole; edge_triggers fires only on the
+    transition, not on a condition that already holds when the recording starts."""
+    FakeConnection.shared_values.update({"MAIN.fbFill.arrWeights": [1.0, 2.5, 0.0, -1.0]})
+    st = rec.start(symbols=["MAIN.fbFill.arrWeights"], prefix=None, pattern=None, mode="change", cycle_ms=1,
+                   duration_s=None, max_events=None, start_when="MAIN.fbFill.arrWeights[2] > 0.5", stop_when=None,
+                   pre_trigger_ms=0, name=None, max_symbols=10, edge_triggers=True)
+    c = _conn()
+    c.fire("MAIN.fbFill.arrWeights", [1.0, 2.5, 0.0, -1.0], ft(0))      # element [2] = 0.0: not yet
+    c.fire("MAIN.fbFill.arrWeights", [1.0, 2.5, 0.9, -1.0], ft(10))     # becomes > 0.5 → trigger
+    assert wait_until(lambda: not rec.status(st["id"])["armed"])
+    assert abs(rec.status(st["id"])["triggered_at_ms"] - 10) < 0.01
+    rec.stop(st["id"])
+    # level (default): already true → fires on the first sample; edge: never fires while it stays true
+    st2 = rec.start(symbols=["MAIN.fbFill.arrWeights"], prefix=None, pattern=None, mode="change", cycle_ms=1,
+                    duration_s=None, max_events=None, start_when="MAIN.fbFill.arrWeights[2] > 0.5", stop_when=None,
+                    pre_trigger_ms=0, name=None, max_symbols=10, edge_triggers=True)
+    c = _conn()
+    c.fire("MAIN.fbFill.arrWeights", [1.0, 2.5, 0.9, -1.0], ft(20))
+    c.fire("MAIN.fbFill.arrWeights", [1.0, 2.5, 0.95, -1.0], ft(30))
+    time.sleep(0.3)
+    assert rec.status(st2["id"])["armed"]
+    rec.stop(st2["id"])
+    with pytest.raises(RecorderError, match="index outside"):
+        rec.start(symbols=["MAIN.fbFill.arrWeights"], prefix=None, pattern=None, mode="change", cycle_ms=1, duration_s=None,
+                  max_events=None, start_when="MAIN.fbFill.arrWeights[9] > 0", stop_when=None, pre_trigger_ms=0, name=None,
+                  max_symbols=10)

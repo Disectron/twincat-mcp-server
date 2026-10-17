@@ -90,24 +90,55 @@ class Condition:
     symbol: str
     op: str
     value: Any
+    index: int | None = None        # element of a recorded array (flat, row-major), e.g. GVL_Test.aCounter[1]
+    edge: bool = False              # True: fires only when the condition BECOMES true (not if it already holds)
+    _prev: bool | None = None
 
     @classmethod
-    def parse(cls, text: str, types: dict[str, T.TcType]) -> "Condition":
+    def parse(cls, text: str, types: dict[str, T.TcType], edge: bool = False) -> "Condition":
         m = _RE_COND.match(text)
         if not m:
             raise RecorderError(f"condition {text!r} must look like 'MAIN.bDone == TRUE' or 'MAIN.nStep >= 4'")
         sym = m.group("sym")
         key = next((k for k in types if k.lower() == sym.lower()), None)
+        index = None
+        tt = types.get(key) if key else None
+        if key is None:
+            # an element of an array that is recorded as a whole: MAIN.aCounter[3] / MAIN.aGrid[1,2]
+            em = re.match(r"^(?P<base>.+)\[(?P<idx>[\d,\s]+)\]$", sym)
+            base = next((k for k in types if em and k.lower() == em.group("base").lower()), None) if em else None
+            if base is not None and types[base].kind == "array" and types[base].dims:
+                tb = types[base]
+                idx = [int(x) for x in em.group("idx").split(",")]
+                if len(idx) != len(tb.dims) or any(not (lo <= i <= hi) for i, (lo, hi) in zip(idx, tb.dims)):
+                    raise RecorderError(f"{sym!r}: index outside {tb.name}")
+                flat = 0
+                for i, (lo, hi) in zip(idx, tb.dims):
+                    flat = flat * (hi - lo + 1) + (i - lo)
+                key, index, tt = base, flat, tb.elem
         if key is None:
             raise RecorderError(f"condition symbol {sym!r} is not part of the recording; add it to symbols")
         raw = m.group("val").strip().strip("'\"")
         try:
-            val = T.encode(types[key], raw)
+            val = T.encode(tt, raw) if tt is not None else raw
         except Exception:  # noqa: BLE001
             val = raw
-        return cls(key, m.group("op"), val)
+        return cls(key, m.group("op"), val, index, edge)
+
+    def fires(self, value: Any) -> bool:
+        """test() for levels; with edge=True only the transition false → true (the first evaluation never fires)."""
+        now = self.test(value)
+        if not self.edge:
+            return now
+        prev, self._prev = self._prev, now
+        return bool(now and prev is False)
 
     def test(self, value: Any) -> bool:
+        if self.index is not None:
+            flat = _flatten_values(value) if isinstance(value, list) else None
+            if not flat or self.index >= len(flat):
+                return False
+            value = flat[self.index]
         try:
             v = value["raw_ms"] if isinstance(value, dict) and "raw_ms" in value else value
             v = v["raw"] if isinstance(v, dict) and "raw" in v else v
@@ -531,7 +562,7 @@ class Recording:
                 self.pre.popleft()
             sw = self.start_when
             if sw is not None and sw.symbol in self.slot_of and self.slot_of[sw.symbol][0] is b:
-                if sw.test(self.slot_of[sw.symbol][1].decode(data)):
+                if sw.fires(self.slot_of[sw.symbol][1].decode(data)):
                     self.armed = False
                     self.triggered_at = t
                     pre, self.pre = list(self.pre), deque()
@@ -557,7 +588,7 @@ class Recording:
                 for s in changed:
                     self._ingest_value(t, s.name, s.decode(data))
         if ew is not None and ew.symbol in self.slot_of and self.slot_of[ew.symbol][0] is b:
-            if ew.test(self.slot_of[ew.symbol][1].decode(data)):
+            if ew.fires(self.slot_of[ew.symbol][1].decode(data)):
                 self.stop_reason = f"stop_when {ew.symbol} {ew.op} {ew.value}"
                 self._cut_now = True
                 self._stop.set()
@@ -572,7 +603,7 @@ class Recording:
             while self.pre and t - self.pre[0][0] > self.pre_trigger_ms:
                 self.pre.popleft()
             sw = self.start_when
-            if sw is not None and sw.symbol in row and sw.test(self._dec(sw.symbol, row[sw.symbol])):
+            if sw is not None and sw.symbol in row and sw.fires(self._dec(sw.symbol, row[sw.symbol])):
                 self.armed = False
                 self.triggered_at = t
                 pre, self.pre = list(self.pre), deque()
@@ -600,7 +631,7 @@ class Recording:
                 self.events += 1
                 if not light:
                     self._ingest_value(t, name, dec)
-                if ew is not None and name == ew.symbol and ew.test(dec):
+                if ew is not None and name == ew.symbol and ew.fires(dec):
                     self.stop_reason = f"stop_when {ew.symbol} {ew.op} {ew.value}"
                     self._cut_now = True
                     self._stop.set()
@@ -1027,7 +1058,7 @@ class Recorder:
               cycle_ms: float, duration_s: float | None, max_events: int | None, start_when: str | None,
               stop_when: str | None, pre_trigger_ms: float, name: str | None, max_symbols: int,
               port: int | None = None, post_trigger_s: float | None = None, allow_partial: bool = False,
-              max_delay_ms: float = 0.0, cycle_counter: str | None = "auto") -> dict[str, Any]:
+              max_delay_ms: float = 0.0, cycle_counter: str | None = "auto", edge_triggers: bool = False) -> dict[str, Any]:
         if mode not in ("cycle", "change", "poll"):
             raise RecorderError("mode must be cycle | change | poll")
         cycle_ms = max(float(cycle_ms), 0.1)
@@ -1041,8 +1072,8 @@ class Recorder:
         rid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
         path = self.root / f"{rid}.jsonl"
         types = {s.name: T.parse_type(s.type, s.size) for s in syms}
-        sw = Condition.parse(start_when, types) if start_when else None
-        ew = Condition.parse(stop_when, types) if stop_when else None
+        sw = Condition.parse(start_when, types, edge_triggers) if start_when else None
+        ew = Condition.parse(stop_when, types, edge_triggers) if stop_when else None
         if post_trigger_s and not sw:
             raise RecorderError("post_trigger_s needs start_when (it counts from the trigger)")
         meta = {"ams_net_id": self.ads.net_id, "port": port or self.ads.port, "start_when": start_when,
@@ -1070,6 +1101,19 @@ class Recorder:
         notifs = len(rec.blocks) if mode != "poll" else 0
         rate = (notifs or 1) * 1000.0 / cycle_ms
         st["leaves"] = len(syms)
+        vals = 0
+        arrays = []
+        for x in syms:
+            tt = T.parse_type(x.type, x.size)
+            n = T.array_count(tt) if tt.kind == "array" else None
+            vals += n or 1
+            if n:
+                arrays.append(f"{x.name} ({n} values)")
+        st["values_per_sample"] = vals
+        if arrays:
+            st["arrays"] = arrays[:20]
+            st["note"] = ("arrays of scalars are recorded as one variable each (one block of bytes, elements decoded on "
+                          "read/export as name[i]); rec_scan lists the same elements individually")
         if counter is not None:
             st["cycle_counter"] = counter.name
         st["notifications_per_s"] = round(rate, 1) if mode == "cycle" else f"≤{round(rate, 1)}"
