@@ -329,7 +329,13 @@ def index_state(final: Path) -> dict:
         rb = {"file": str(building), "pages_done": int(bm.get("pages_done") or 0), "pages_total": int(bm.get("pages_total") or 0),
               "started": bm.get("started"), "seconds_since_progress": round(now - beat) if beat else None}
         if bm.get("state") == "complete":
-            rb["state"] = "waiting_to_replace"   # finished, but the live file was held open by a reader
+            # finished. While its builder still holds the lock it is swapping the file in (or retrying while a reader
+            # has the live index open): running. Only once the builder is gone does the finished file WAIT — 'run
+            # index again' was said for a build that was just being put in place
+            alive = lock.is_file() and now - lock.stat().st_mtime < HEARTBEAT_STALE_S
+            rb["state"] = "running" if alive else "waiting_to_replace"
+            if alive:
+                rb["phase"] = "replacing the live index"
         elif beat and now - beat < HEARTBEAT_STALE_S:
             rb["state"] = "running"
         else:

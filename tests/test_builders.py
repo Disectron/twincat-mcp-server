@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -148,18 +149,23 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
     proc = subprocess.Popen([sys.executable, str(B / "infosys_local.py"), "--kb", str(kb), "index", "--mshc", str(pkg), "--force"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     building = db.with_name(db.name + ".building")
+    # synchronise on the builder's own progress line (written right after it stored pages_done), then hold it there:
+    # polling `stats` (a subprocess each time) could first look when the build was already finished — the CI runner
+    # saw it complete and swapping in
+    first = b""
     t0 = time.time()
-    running: dict = {}
-    while time.time() - t0 < 60:
-        st = state(kb)
-        if st.get("rebuild", {}).get("pages_done", 0) >= 2000:
-            running = st                     # the state seen while it ran (a fast runner may finish soon after)
+    while time.time() - t0 < 120:
+        line = proc.stdout.readline()
+        if not line:
             break
-        time.sleep(0.2)
+        if re.match(rb"\s+\d+/\d+ pages", line):
+            first = line
+            break
     if hasattr(signal, "SIGSTOP"):
         os.kill(proc.pid, signal.SIGSTOP)    # hold the build where it is (its lock stays fresh for 120 s)
-    assert running, "the rebuild never reported progress"
-    assert running["rebuild"]["state"] == "running" and running["state"] == "outdated"
+    assert first, "the rebuild never reported progress"
+    running = state(kb)
+    assert running["rebuild"]["state"] == "running" and running["state"] == "outdated", running
     assert "RUNNING" in running["message"] and running["pages"] == 8          # the complete index is still the one in use
     # a second build while one runs is refused
     second = build(kb, pkg)
@@ -549,3 +555,27 @@ def test_pymupdf_space_in_its_own_font_run_is_kept(tmp_path):
     assert any(s.blank for s in spans), [s.text for s in spans]          # the space is its own span here
     _used, _n, _toc, texts, _title, _running = m._open_pdf(pdf)
     assert all("Note that the bridge is balanced" in t for t in texts), texts[0][:200]
+
+
+def test_finished_rebuild_is_running_while_its_builder_swaps_it_in(kb, tmp_path):
+    """CI 0.8.10: a rebuild that had finished and was being put in place read as 'waiting_to_replace … run index
+    again' — the state of a build whose builder gave up. With the builder's lock alive it is running (replacing)."""
+    import shutil
+    pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
+    assert build(kb, pkg).returncode == 0
+    db = kb / "helpviewer" / "infosys_en.db"
+    building, lock = db.with_name(db.name + ".building"), db.with_name(db.name + ".lock")
+    shutil.copyfile(db, building)
+    c = sqlite3.connect(building)
+    c.execute("INSERT OR REPLACE INTO meta VALUES('state', 'complete')")
+    c.execute("INSERT OR REPLACE INTO meta VALUES('heartbeat', ?)", (f"{time.time():.0f}",))
+    c.commit()
+    c.close()
+    lock.write_text(json.dumps({"pid": 1, "started": "now"}), encoding="utf-8")
+    st = state(kb)
+    assert st["rebuild"]["state"] == "running" and st["rebuild"]["phase"] == "replacing the live index", st
+    assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "running"
+    lock.unlink()                                          # the builder is gone: the finished file waits
+    st = state(kb)
+    assert st["rebuild"]["state"] == "waiting_to_replace" and "run index again" in st["message"], st
+    assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "waiting_to_replace"
