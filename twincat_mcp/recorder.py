@@ -68,6 +68,7 @@ from pyads import constants as C
 
 from . import types_tc as T
 from .ads_backend import ADSIGRP_SYM_VERSION, AdsBackend, AdsError, ProgramChanged, SymbolEntry, _fmt_exc
+from .ads_types import POINTER_NOTE
 
 FILETIME_EPOCH_OFFSET_100NS = 116444736000000000  # 1601 → 1970
 MERGE_GAP_BYTES = 256          # leaves closer than this share one notification
@@ -569,7 +570,8 @@ class Recording:
         self.id, self.name, self.mode, self.cycle_ms, self.path = rid, name, mode, cycle_ms, path
         self.symbols = symbols
         self.sids: dict[str, int] = {s.name: i for i, s in enumerate(symbols)}
-        self.types: dict[str, T.TcType] = {s.name: T.parse_type(s.type, s.size) for s in symbols}
+        self.types: dict[str, T.TcType] = {s.name: T.parse_type(s.type, s.size, getattr(s, "data_type", 0))
+                                           for s in symbols}
         self.blocks: list[Block] = []
         self.slot_of: dict[str, tuple[Block, Slot]] = {}
         self.time_source = "pc" if mode == "poll" else "plc"
@@ -1711,6 +1713,9 @@ def iter_events(path: Path, want: set[str] | None = None) -> Iterator[tuple[floa
     # block that ran ahead can have rows past an end set later) are in the file but not in the recording
     ft = read_footer(path)
     wend = _ticks(ft["window_end_ms"]) if ft and isinstance(ft.get("window_end_ms"), (int, float)) else None
+    # N84: rows before the window (a block that delivered before every block had) are in the file, not the recording
+    wstart = (_ticks(ft["window_start_ms"]) if ft and ft.get("rows_before_window")
+              and isinstance(ft.get("window_start_ms"), (int, float)) else None)
     with open(path, encoding="utf-8") as fh:
         for ln in fh:
             if not ln.strip():
@@ -1731,6 +1736,8 @@ def iter_events(path: Path, want: set[str] | None = None) -> Iterator[tuple[floa
             except json.JSONDecodeError:
                 continue
             t, k, v = ev[0], ev[1], ev[2]
+            if wstart is not None and isinstance(t, (int, float)) and _ticks(t) < wstart:
+                continue
             if wend is not None and isinstance(t, (int, float)) and _ticks(t) > wend:
                 continue
             if isinstance(k, str) and k.startswith("#") and blocks:
@@ -1973,17 +1980,20 @@ class Recorder:
 
         def add_leaves(root: SymbolEntry, leaves) -> None:
             for leaf in leaves:
-                if leaf.size <= 0 or leaf.note in ("reference/pointer",) or leaf.note and "not expanded" in leaf.note:
+                # pointers / references / interfaces are addresses, not values (the note was never matched: an alias
+                # pointer was recorded as a signed integer, N50); values not expanded are not recorded either
+                if leaf.size <= 0 or leaf.not_expanded or leaf.note == POINTER_NOTE:
                     continue
-                tt = T.parse_type(leaf.type, leaf.size)
-                if tt.ctype is None or tt.opaque:
+                tt = T.parse_type(leaf.type, leaf.size, leaf.data_type)
+                if tt.ctype is None or tt.opaque or tt.kind == "pointer":
                     continue
                 chosen[leaf.path] = SymbolEntry(leaf.path, leaf.type, leaf.size, root.index_group,
-                                                root.index_offset + leaf.offset, 0, "")
+                                                root.index_offset + leaf.offset, 0, "", leaf.data_type)
 
         def add(s: SymbolEntry) -> None:
             tt = T.parse_type(s.type, s.size)
-            if tt.ctype is None or tt.opaque:
+            if not T.is_elementary(tt):
+                # the datatype table decides what it is (enum with its base type, pointer alias, struct …)
                 root, leaves = self.ads.leaves(s.name, max_symbols + 1, port)
                 add_leaves(root, leaves)
             elif tt.kind != "pointer":
@@ -2165,7 +2175,7 @@ class Recorder:
                 syms = syms + [counter]
         rid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
         path = self.root / f"{rid}.jsonl"
-        types = {s.name: T.parse_type(s.type, s.size) for s in syms}
+        types = {s.name: T.parse_type(s.type, s.size, s.data_type) for s in syms}
         er = (lambda tname, raw: self.ads.enum_literal(tname, raw, port))
         sw = Condition.parse(start_when, types, edge_triggers, er) if start_when else None
         ew = Condition.parse(stop_when, types, edge_triggers, er) if stop_when else None
@@ -3056,11 +3066,16 @@ class Recorder:
                 blocks.pop(k, None)
             wend = (footer or {}).get("window_end_ms")
             wend_t = _ticks(wend) if isinstance(wend, (int, float)) else None
-            rows_after = 0
+            ws0 = (footer or {}).get("window_start_ms")
+            wstart_t = _ticks(ws0) if (footer or {}).get("rows_before_window") and isinstance(ws0, (int, float)) else None
+            rows_after = rows_before = 0
             for ev in _iter_raw_rows(path):
                 t, k = ev[0], ev[1]
                 if wend_t is not None and isinstance(t, (int, float)) and _ticks(t) > wend_t:
                     rows_after += 1            # in the file, past the window: not part of the recording (readers skip)
+                    continue
+                if wstart_t is not None and isinstance(t, (int, float)) and _ticks(t) < wstart_t:
+                    rows_before += 1           # N84: before every block had delivered: not part of the recording
                     continue
                 if isinstance(k, str) and k.startswith("#"):
                     b = blocks.get(int(k[1:]))
@@ -3119,6 +3134,12 @@ class Recorder:
                 out["timeline"]["unprovable_blocks"] = unprovable[:50]
             if unreg:
                 out["timeline"]["unregistered_blocks"] = unreg[:50]
+            if rows_before:
+                out["timeline"]["rows_before_window"] = rows_before
+                out["timeline"]["rows_before_window_note"] = (
+                    "rows before window_start_ms: a block delivered before every block had (the window starts when "
+                    "all have); in the file as delivered, not part of the recording — rec_read / rec_stats / rec_export "
+                    "skip them")
             if rows_after:
                 out["timeline"]["rows_after_window"] = rows_after
                 out["timeline"]["rows_after_window_note"] = (

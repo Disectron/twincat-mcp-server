@@ -729,6 +729,22 @@ void Engine::process(size_t b, int64_t ft, const uint8_t* d, uint32_t n) {
     }
     // a block's sample from before the window, delivered after the trigger (skew): outside the recording
     if (ws_from_trigger_ && have_ws_ && ft < ws_) return;
+    if (!ws_from_trigger_ && have_ws_ && ft < ws_) {
+        // N84: the window starts when every block has delivered; a block that started earlier delivered rows before
+        // it. They stay in the file as delivered, counted apart (rows_before_window) and not in any block's count —
+        // the readers take the footer's window as the recording
+        row_.clear();
+        row_ += '[';
+        row_ += ms(ft);
+        row_ += ",\"#";
+        row_ += std::to_string(blocks_[b]->spec.id);
+        row_ += "\",\"";
+        base64_append(row_, d, std::min<uint32_t>(n, blocks_[b]->spec.size));
+        row_ += "\"]\n";
+        write_line(row_);
+        ++rows_before_window_;
+        return;
+    }
     commit(b, ft, d, n);
 }
 
@@ -1157,6 +1173,7 @@ void Engine::finish() {
     }
     if (!rebuild_note_.empty()) f.str("program_rebuilt_in_outage", rebuild_note_);
     if (watch_lost_) f.b("program_watch_lost", true);
+    if (rows_before_window_) f.u("rows_before_window", rows_before_window_);
     if (unverified_rows_) {
         f.u("unverified_rows", unverified_rows_);
         f.str("unverified_note", "samples delivered after the last verified one (" +

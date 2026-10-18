@@ -725,7 +725,7 @@ def validate_xml(idx: ProjectIndex, name: str | None = None, fix: bool = False,
             p.with_suffix(p.suffix + ".bak").write_bytes(raw)
             p.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
             try:
-                idx._index_file(p)
+                idx.reindex_file(p)
             except Exception:  # noqa: BLE001
                 p.write_bytes(raw)
                 fixed.append({"file": f, "fix": "REVERTED (result not parseable)"})
@@ -823,7 +823,7 @@ def tcunit_scaffold(idx: ProjectIndex, fb_name: str, out_dir: str | None = None,
                       "Reference the TcUnit library in the PLC project if not already",
                       "proj_scan to refresh the index, then xae_build / tcunit_run"]
     try:
-        idx._index_file(dest)
+        idx.reindex_file(dest)
     except Exception:  # noqa: BLE001
         pass
     return result

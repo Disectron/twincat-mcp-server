@@ -36,7 +36,7 @@ from pyads.structs import AmsAddr
 
 from .config import AdsConfig
 from . import types_tc as T
-from .ads_types import TypeSystem, Leaf, WalkCancelled, parse_table
+from .ads_types import POINTER_NOTE, TypeSystem, Leaf, WalkCancelled, parse_table
 
 SYSTEM_SERVICE_PORT = 10000
 ROUTER_PORT = 1
@@ -106,6 +106,7 @@ class SymbolEntry:
     index_offset: int
     flags: int
     comment: str
+    data_type: int = 0          # ADS data type id the runtime gives the symbol (ADST_*)
 
     def flag_names(self) -> list[str]:
         return [n for bit, n in SYMFLAG.items() if self.flags & bit]
@@ -307,7 +308,7 @@ class AdsBackend:
             name = raw[p:p + nlen].decode("latin-1", "replace"); p += nlen + 1
             typ = raw[p:p + tlen].decode("latin-1", "replace"); p += tlen + 1
             com = raw[p:p + clen].decode("latin-1", "replace")
-            out.append(SymbolEntry(name, typ, size, igrp, ioffs, flags, com))
+            out.append(SymbolEntry(name, typ, size, igrp, ioffs, flags, com, dtype))
             ptr += entry_len
         return out, {s.name.lower(): s for s in out}
 
@@ -395,7 +396,8 @@ class AdsBackend:
                 e = pyads.pyads_ex.adsGetSymbolInfo(c._port, c._adr, name)  # type: ignore[attr-defined]
             except Exception as exc:  # noqa: BLE001
                 raise AdsError(f"symbol {name!r} not found: {_fmt_exc(exc)}") from exc
-            s = SymbolEntry(e.name, e.symbol_type, e.size, e.iGroup, e.iOffs, e.flags, e.comment)
+            s = SymbolEntry(e.name, e.symbol_type, e.size, e.iGroup, e.iOffs, e.flags, e.comment,
+                            int(getattr(e, "dataType", 0) or 0))
         return s
 
     def members(self, name: str, port: int | None = None) -> list[SymbolEntry]:
@@ -480,13 +482,20 @@ class AdsBackend:
         s = self.symbol_info(name, port)
         ts = self.typesystem(False, port)
         if ts is None or ts.get(s.type) is None:
-            tt = T.parse_type(s.type, s.size)
+            tt = T.parse_type(s.type, s.size, s.data_type)
             if tt.ctype is not None and not tt.opaque:
-                return s, [Leaf(s.name, s.type, 0, s.size, 0)]
+                return s, [Leaf(s.name, s.type, 0, s.size, s.data_type,
+                                None, None if T.is_elementary(tt) or not tt.guessed else "type not in datatype table")]
             # fallback: published member symbols
             mem = self.members(s.name, port)
             return s, [Leaf(m.name, m.type, m.index_offset - s.index_offset, m.size, 0, None, "from symbol table") for m in mem]
         return s, ts.leaves(s.name, s.type, max_leaves, size=s.size)
+
+    def root_names(self, port: int | None = None) -> set[str]:
+        """N92: the first name segment (lower case) of every symbol of the runtime's table — the PROGRAMs, GVLs and
+        library roots the target has (a GVL without symbols is not there)."""
+        lst, _ = self.symbols_cached(False, port)
+        return {s.name.split(".")[0].split("[")[0].lower() for s in lst}
 
     def roots(self, pattern: str | None = None, include_system: bool = False, port: int | None = None) -> list[SymbolEntry]:
         """Top-level symbols: those not nested under another symbol in the table."""
@@ -583,9 +592,12 @@ class AdsBackend:
             raise AdsError(f"read {s.name!r} ({s.size} B): {exc}") from exc
         ts = self.typesystem(False, port)
         out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
-        if ts is not None and ts.get(s.type) is not None:
+        tt = T.parse_type(s.type, s.size)
+        if ts is not None and (ts.get(s.type) is not None or (tt.kind == "array" and not T.is_elementary(tt))):
             out["value"] = ts.decode_tree(raw, s.type, size=s.size)
             out["decoder"] = "datatype-table"
+            if ts.is_indirect(ts.get(s.type), s.type):
+                out["note"] = POINTER_NOTE
         else:
             tt = T.parse_type(s.type, s.size)
             if tt.ctype is not None and not tt.opaque:
@@ -688,6 +700,8 @@ class AdsBackend:
         ts = table if table is not None else TypeSystem({})
         listed = self.roots(pattern, include_system, port)
         roots = _dump_order(listed, own_roots)
+        # N92: counted on the target, not in the source (a GVL nothing references is declared but has no symbol)
+        own_listed = len({r.name.split(".")[0].split("[")[0].lower() for r in listed} & (own_roots or set()))
         stamp = time.strftime("%Y%m%d-%H%M%S")
         n_leaves = 0
         n_read = 0
@@ -926,7 +940,7 @@ class AdsBackend:
                "datatype_table": table is not None, "complete": complete, "truncated": bool(truncated),
                "errors": errors[:50], "errors_total": len(errors),
                "largest_roots": sorted(sizes, key=lambda x: -(x["csv_bytes"] + x["json_bytes"]))[:10],
-               "order": (f"the project's own programs and GVLs first ({len(own_roots)} known), then the rest"
+               "order": (f"the project's own programs and GVLs first ({own_listed} of them in this dump), then the rest"
                          if own_roots else "alphabetical — the project's own programs/GVLs are unknown (no project "
                          "configured), so library roots are not put last"),
                "preview": preview}
@@ -983,9 +997,13 @@ class AdsBackend:
         c = self.conn(port)
         s = self.symbol_info(name, port)
         tt0 = T.parse_type(s.type, s.size)
-        if expand_struct and (tt0.ctype is None or tt0.opaque):
+        el_name = tt0.elem.name if tt0.kind == "array" and tt0.elem is not None else s.type
+        if (not T.is_elementary(tt0) and (expand_struct or tt0.ctype is not None)
+                and not (tt0.ctype is not None and self.is_interface_type(el_name, port))):
+            # N50 / D5: everything but an elementary type is decoded by the datatype table — one decoder for the read,
+            # read_many and the dump (enums with their names, POINTER / REFERENCE aliases as addresses, BOOL as BOOL)
             ts = self.typesystem(False, port)
-            if ts is not None and ts.get(s.type) is not None:
+            if ts is not None and (ts.get(s.type) is not None or tt0.kind == "array"):
                 return self.read_full(s.name, None, port)
         tt, val = self._typed_read(c, s)
         out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
@@ -1008,6 +1026,7 @@ class AdsBackend:
                     out["value"] = {m.name[len(s.name) + 1:]: self.read(m.name, True, max_members, port).get("value", None)
                                     for m in mem}
                     out["members"] = len(mem)
+                    out["decoder"] = "members"        # D5: which path decoded it (datatype-table / scalar / members)
                 else:
                     out["value"] = None
                     out["note"] = "opaque type with no published members; see raw_hex"
@@ -1015,6 +1034,10 @@ class AdsBackend:
                 out["value"] = None
         else:
             out["value"] = T.decode(tt, val)
+            out["decoder"] = "scalar"
+            if tt.guessed:
+                out["note"] = (f"type {s.type} is not in the datatype table: read as a signed integer of its "
+                               f"{s.size} bytes, which it may not be")
         if s.comment:
             out["comment"] = s.comment
         return out
@@ -1045,10 +1068,10 @@ class AdsBackend:
                 results[n] = {"error": str(exc)}
                 continue
             tt = T.parse_type(s.type, s.size)
-            if tt.ctype is not None and not tt.opaque and tt.kind not in ("string", "wstring"):
+            if T.is_elementary(tt) and tt.ctype is not None and not tt.opaque and tt.kind not in ("string", "wstring"):
                 simple[s.name] = tt
                 syms[s.name] = s
-            else:
+            else:                              # the datatype table decodes it, as ads_read does (N50 / D5)
                 try:
                     results[n] = self.read(n, True, 50, port)["value"]
                 except AdsError as exc:
@@ -1366,6 +1389,10 @@ class AdsBackend:
         self._write_by_handle(c, s, data)
         read_back = self.read(name, expand_struct=False, port=port).get("value")
         written = T.decode(tt, enc)
+        if not T.is_elementary(T.parse_type(s.type, s.size)):
+            ts = self.typesystem(False, port)
+            if ts is not None and ts.get(s.type) is not None:
+                written = ts.decode_tree(data, s.type, size=s.size)     # the shape ads_read gives (enum + name)
         out = {"name": s.name, "type": s.type, "before": before, "written": written, "read_back": read_back}
         if not _same_value(written, read_back):
             out["note"] = ("read_back differs from the written value: the PLC changed it after the write (a one-shot it "

@@ -47,7 +47,7 @@ def test_read_decodes_types(ads):
     assert ads.read("MAIN.nCycle")["value"] == 42
     t = ads.read("MAIN.fbFill.tSettle")
     assert t["value"] == {"raw_ms": 1500, "text": "T#1s500ms"}
-    assert ads.read("MAIN.fbFill.eState")["value"] == 1
+    assert ads.read("MAIN.fbFill.eState")["value"] == {"value": 1, "name": "Bulk"}     # the table decodes enums (N50)
     assert ads.read("MAIN.fbFill.arrWeights")["value"] == [1.0, 2.5, 0.0, -1.0]
     assert ads.read("MAIN.sLabel")["value"] == "hello"
 
@@ -397,6 +397,23 @@ def test_n76_the_limit_is_the_bytes_on_disk_for_any_limit(ads, tmp_path, monkeyp
             assert r["complete"] and not r["truncated"]
         elif lim < need:
             assert r["truncated"]
+
+
+def test_n47_a_cut_dump_fills_the_limit_not_two_thirds_of_it(ads, tmp_path, monkeypatch):
+    """N47 (0.8.10 retest): files on disk were 64–67 % of max_total_mb — the cut root's JSON was estimated as large as
+    its CSV (real: 20–32 %). Exact accounting: a cut dump is short of the limit by at most the ending it had to keep
+    room for (the footer naming the roots left out, one row) — never by an estimate."""
+    _big_root(monkeypatch)
+    ads._symcache.clear()
+    ads._dtcache.clear()
+    full = ads.dump(None, False, str(tmp_path / "full"))
+    need = full["csv_bytes"] + full["json_bytes"]
+    assert need > 100_000, need
+    for k, frac in enumerate((0.35, 0.5, 0.66, 0.8, 0.95)):
+        lim = int(need * frac)
+        r = ads.dump(None, False, str(tmp_path / f"d{k}"), max_total_bytes=lim)
+        total = sum(Path(r[x]).stat().st_size for x in ("csv", "json"))
+        assert r["truncated"] and 0.97 * lim <= total <= lim, (frac, lim, total, total / lim)
 
 
 @pytest.mark.anyio
@@ -768,3 +785,12 @@ def test_leaf_values_reads_the_head_of_a_value_that_is_not_expanded_and_never_pa
     assert res["complete"] is False and res["unreadable_total"] == 1 and "outside their symbol" in res["hint"], res
     assert doc["complete"] is False and doc["unreadable_total"] == 1
     assert "outside GVL_R.aRing" in str(doc["values"]["GVL_R.aRing"]), doc["values"]
+
+
+def test_n50_an_alias_pointer_reads_as_an_address_everywhere(ads):
+    """N50 (live 0.8.10): TYPE PT_X : POINTER TO … read as the signed integer -114343571583168 by ads_read and
+    ads_read_many; the datatype table says it is an address."""
+    from twincat_mcp.ads_types import POINTER_NOTE
+    r = ads.read("PRG_Test.pAlias")
+    assert r["value"] == "0xFFFF980150088F40" and r["note"] == POINTER_NOTE, r
+    assert ads.read_many(["PRG_Test.pAlias"])["PRG_Test.pAlias"] == "0xFFFF980150088F40"

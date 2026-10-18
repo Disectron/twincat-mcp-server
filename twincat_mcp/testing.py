@@ -76,6 +76,8 @@ def _raw(v: Any) -> Any:
         for k in ("raw_ms", "raw", "raw_ns"):
             if k in v:
                 return v[k]
+        if "value" in v and "name" in v and len(v) == 2:       # an enum: {"value": 1, "name": "Bulk"}
+            return v["value"]
     return v
 
 

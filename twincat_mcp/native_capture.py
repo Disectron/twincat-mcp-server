@@ -380,7 +380,8 @@ class NativeRecording:
                   "resubscriptions", "resubscribe_error", "label_reason", "stall_s",
                   # R43: the program the addresses belong to
                   "program_watch", "program_watch_error", "program_changed", "program_rebuilt_in_outage",
-                  "program_watch_lost", "unverified_rows", "unverified_note", "verified_to_ms", "version_read_error"):
+                  "program_watch_lost", "unverified_rows", "unverified_note", "verified_to_ms", "version_read_error",
+                  "rows_before_window"):
             if k in src:
                 st[k] = src[k]
         st.setdefault("warnings", []).extend(program_warnings(src))

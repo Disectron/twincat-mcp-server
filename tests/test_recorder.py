@@ -1404,3 +1404,10 @@ def test_r43_python_poll_reads_the_version_with_each_poll(rec):
     f = _footer(out)
     assert f["program_changed"]["symbol_version"] == [1, 2] and "PLC program changed" in f["stop_reason"], f
     assert f["program_watch"]["checked"] and "per_read" in f["program_watch"]
+
+
+def test_n50_pointers_are_not_recorded_as_numbers(rec):
+    """The leaf filter compared the note with a text the walker never wrote: pointer leaves (an alias pointer, a
+    pointer member) were recorded and decoded as signed integers."""
+    s = rec.expand_symbols(["PRG_Test.pAlias", "PRG_Test.pData", "MAIN.nCycle", "MAIN.fbFill.eState"], None, None, 50)
+    assert sorted(x.name for x in s) == ["MAIN.fbFill.eState", "MAIN.nCycle"]

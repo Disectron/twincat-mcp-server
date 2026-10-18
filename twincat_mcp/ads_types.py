@@ -60,6 +60,7 @@ MAX_ARRAY_ELEMENTS = 4096                # per expansion of a single array (guar
 MAX_LEAF_BYTES = 65536                   # a single leaf larger than this is not decoded (N47): its head is shown
 HEAD_BYTES = 64                          # how much of a value that is not expanded is shown (hex)
 _RE_INDIRECT = re.compile(r"^\s*(POINTER|REFERENCE)\s+TO\b", re.I)
+POINTER_NOTE = "pointer/reference: the address, not the target"     # one text: the dump, ads_read, the recorder
 
 
 class WalkCancelled(Exception):
@@ -307,12 +308,11 @@ class TypeSystem:
             # unknown to the table: treat as scalar by name; the declared size (member / element / symbol) wins over
             # the size the name implies (pointer width depends on the runtime)
             tt = T.parse_type(type_name, size_hint)
-            note = "pointer/reference: the address, not the target" if _RE_INDIRECT.match(type_name or "") else "type not in datatype table"
+            note = POINTER_NOTE if _RE_INDIRECT.match(type_name or "") else "type not in datatype table"
             out.append(Leaf(path, type_name, off, size_hint or tt.size or 0, 0, None, note))
             return
         if self.is_indirect(e, type_name):
-            out.append(Leaf(path, type_name if entry is None else e.type, off, e.size, e.data_type, None,
-                            "pointer/reference: the address, not the target"))
+            out.append(Leaf(path, type_name if entry is None else e.type, off, e.size, e.data_type, None, POINTER_NOTE))
             return
         if e.dims:
             if entry is not None:
@@ -380,8 +380,31 @@ class TypeSystem:
         if e is None and _RE_INDIRECT.match(type_name or ""):
             n = size or T.parse_type(type_name, None).size or 8
             return T.fmt_pointer(int.from_bytes(buf[off:off + n], "little"), n) if n in (4, 8) and len(buf) >= off + n else None
+        if e is None and depth <= 32:
+            m = T._RE_ARRAY.match(type_name or "")
+            if m:
+                # an array type the table does not list (ARRAY [0..9] OF E_State): each element by ITS type, through the
+                # table — never the size guess for an enum / alias element (N50)
+                dims = []
+                for part in m.group(1).split(","):
+                    lo, hi = part.split("..")
+                    dims.append((int(lo.strip()), int(hi.strip())))
+                count = 1
+                for lo, hi in dims:
+                    count *= hi - lo + 1
+                if count <= 0:
+                    return []
+                if count > max_array:
+                    return not_expanded_value(buf[off:off + HEAD_BYTES], size or 0, count,
+                                              f"array with {count} elements (limit {max_array}); read it directly")
+                elem_size = (size // count) if size else (T.parse_type(m.group(2), None).size or 0)
+                flat = [self.decode_tree(buf, m.group(2).strip(), off + i * elem_size, None, max_array, depth + 1,
+                                         elem_size or None) for i in range(count)]
+                return T._reshape(flat, dims) if len(dims) > 1 else flat
         if e is None or depth > 32:
-            return self._decode_scalar(buf, off, type_name, None, None)
+            # not in the table: by its name, at the size the caller knows (a member / element / symbol)
+            return self._decode_scalar(buf, off, type_name,
+                                       DtEntry(type_name, "", size, 0, 0, 0, "") if size else None, None)
         if self.is_indirect(e, type_name if entry is None else e.type):
             return T.fmt_pointer(int.from_bytes(buf[off:off + e.size], "little"), e.size) if e.size in (4, 8) else None
         if e.dims:
@@ -414,6 +437,12 @@ class TypeSystem:
                 d[s.name] = self.decode_tree(buf, s.type, off + s.offs, sub_entry, max_array, depth + 1, s.size or None)
             return d
         if e.type and e.type.lower() != e.name.lower() and self.get(e.type) is not None and not e.enum:
+            tgt = self.get(e.type)
+            if tgt is not None and not tgt.subitems and not tgt.dims and not tgt.enum:
+                # D5: a scalar alias is the leaf the dump decodes — the declared name (BOOL; on 4026 the table carries
+                # BOOL -> BYTE), the base type's storage. Following the alias read BOOL as a BYTE: 1 / 0
+                return self.decode_leaf(buf, Leaf("", e.name if entry is None else e.type, off, e.size or tgt.size,
+                                                  tgt.data_type or e.data_type, None))
             return self.decode_tree(buf, e.type, off, None, max_array, depth + 1)
         if (e.size or 0) > MAX_LEAF_BYTES:
             return not_expanded_value(buf[off:off + HEAD_BYTES], e.size, None, f"larger than {MAX_LEAF_BYTES} bytes")

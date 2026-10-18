@@ -54,7 +54,7 @@ import pyads
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeBackend, XaeError, sta_init, sta_teardown
-from .project_backend import ProjectIndex, ProjectError, parse_tcunit_xml
+from .project_backend import ProjectIndex, ProjectError, not_on_target, parse_tcunit_xml
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
 from . import codecheck
@@ -236,6 +236,37 @@ def restart_proven(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool 
 _TRANSITION_KEYS = ("transition_seen", "transition_by", "mode_before", "witness_before", "witness_after", "witness")
 
 
+def _app_ts_text(v: Any) -> str | None:
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    try:
+        return dt.datetime.fromtimestamp(int(v), dt.timezone.utc).strftime("DT#%Y-%m-%d-%H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def plc_application(before: dict[str, Any] | None, after: dict[str, Any] | None) -> dict[str, Any]:
+    """Which PLC application runs after an activation + restart, compared with the one before (AppTimestamp = the
+    application's compile time). Field test 0.8.10: an activation without a freshly generated boot project kept the
+    old application while every step reported success."""
+    b = (before or {}).get("app_timestamp")
+    a = (after or {}).get("app_timestamp")
+    out: dict[str, Any] = {"compiled_before": _app_ts_text(b) or b, "compiled_now": _app_ts_text(a) or a}
+    if a is None:
+        out["changed"] = None
+        out["note"] = "the running application's compile time was not readable after the restart"
+    elif b is None:
+        out["changed"] = None
+        out["note"] = "no compile time from before (TwinCAT was not in RUN then): nothing to compare"
+    else:
+        out["changed"] = a != b
+        if a == b:
+            out["note"] = ("the target runs the same PLC application as before (same compile time). Expected when the PLC "
+                           "code did not change; if it did, the target did not get it — the boot project was not "
+                           "regenerated: xae_boot_project(generate=true) or xae_deploy, then activate again")
+    return out
+
+
 def _restart_timing(t_cmd: float, ver: dict[str, Any]) -> dict[str, Any]:
     """N5: how long a restart took — from its command until a poll saw the target running again after a proven
     transition. Not seen running again (timeout, an error dialog, no transition): no duration, and why."""
@@ -308,6 +339,11 @@ class App:
         self.ads_bulk_worker = SerialWorker("tcmcp-ads-bulk")                                  # ads_dump (R6)
         self.xae = XaeBackend(cfg.xae)
         self.xae_worker = SerialWorker("tcmcp-xae-sta", init=sta_init, teardown=sta_teardown)
+        # N85: an XAE call held by a dialog it opened (the call is still inside the shell's modal loop) and what such
+        # calls returned once their dialog was answered
+        self.xae_held: dict[str, Any] | None = None
+        self.xae_late: list[dict[str, Any]] = []
+        self.last_activation: dict[str, Any] | None = None     # witness before the last xae_activate_configuration
         self.proj = ProjectIndex(cfg.project)
         # D44: code set in the shell (xae_pou_set / xae_pou_create) until it is proven on disk
         self.pending_edits: dict[str, dict[str, Any]] = {}
@@ -611,9 +647,90 @@ class App:
         return " Open dialog(s): " + "; ".join(f"'{d.get('title')}' [{', '.join(d.get('buttons') or [])}] {str(d.get('text', ''))[:160]}"
                                             for d in live[:3]) + " — answer it with xae_dialog_resolve(button=...)."
 
-    async def xae_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
+    # --- XAE dialogs (N85 / N87) ----------------------------------------------
+    def dialogs_now(self) -> list[dict[str, Any]]:
+        """The shell's open dialogs right now (Windows; [] elsewhere or without a known shell process)."""
         try:
-            return await self.xae_worker.run(fn, *a, timeout=timeout or self.cfg.xae.build_timeout_s + 60, **kw)
+            from . import dialogs as _dlg
+            return [d.to_dict() for d in _dlg.list_dialogs(self.xae.pid)]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _held_check(self, job: str) -> None:
+        held = self.xae_held
+        if held is None:
+            return
+        if held["future"].done():
+            self.xae_held = None
+            return
+        d = held["dialog"]
+        raise ToolError(f"{job} NOT started: XAE is held by the dialog '{d.get('title')}' that {held['job']} opened "
+                        f"{time.monotonic() - held['since']:.0f} s ago (buttons {d.get('buttons')}; text "
+                        f"{str(d.get('text', ''))[:200]!r}). Answer it with xae_dialog_resolve(button=...) — the held "
+                        "call's own result is then listed by xae_dialogs (late_results).")
+
+    def _hold(self, job: str, dialog: dict[str, Any], fut: Any) -> None:
+        self.xae_held = {"job": job, "dialog": dialog, "since": time.monotonic(),
+                         "since_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "future": fut}
+
+        def done(f: Any) -> None:            # worker thread: the dialog was answered and the call came back
+            ent: dict[str, Any] = {"job": job, "dialog": dialog.get("title"),
+                                   "returned_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
+            if f.cancelled():
+                ent["outcome"] = "cancelled"
+            elif f.exception() is not None:
+                ent["outcome"] = "error"
+                ent["error"] = str(f.exception())[:500]
+            else:
+                ent["outcome"] = "ok"
+                txt = json.dumps(f.result(), default=str)
+                ent["result"] = json.loads(txt) if len(txt) <= 8000 else txt[:8000] + " …"
+            self.xae_late.append(ent)
+            del self.xae_late[:-20]
+            if self.xae_held is not None and self.xae_held.get("future") is f:
+                self.xae_held = None
+        fut.add_done_callback(done)
+
+    def refuse_if_dialog(self, action: str) -> None:
+        """N87: the shell answers COM inside a modal loop, so an open dialog does not stop a call — but nothing that
+        changes the machine runs while one waits for an answer."""
+        live = self.dialogs_now()
+        if live:
+            d = live[0]
+            raise ToolError(f"{action} refused: the XAE shell has a dialog open — '{d.get('title')}' (buttons "
+                            f"{d.get('buttons')}; text {str(d.get('text', ''))[:200]!r}). Answer it first "
+                            "(xae_dialog_resolve(button=...)), then retry. Nothing was done.")
+
+    async def xae_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
+        job = getattr(fn, "__name__", "XAE call")
+        self._held_check(job)
+        before = {d.get("hwnd") for d in self.dialogs_now()}
+        first_seen: dict[Any, float] = {}
+
+        def watch(running_s: float) -> BaseException | None:
+            # N85: a dialog the running call opened holds it inside the shell's modal loop; COM is never rejected, so
+            # only the dialog says so. 2 s of it (rules auto-answer within 0.5 s; a progress window offers no answer)
+            now = time.monotonic()
+            live = [d for d in self.dialogs_now() if d.get("hwnd") not in before and _dialog_awaits(d)]
+            for h in [h for h in first_seen if h not in {d.get("hwnd") for d in live}]:
+                first_seen.pop(h)
+            for d in live:
+                t = first_seen.setdefault(d.get("hwnd"), now)
+                if now - t >= 2.0 and running_s >= 2.0:
+                    return _BlockedByDialog(job, d)
+            return None
+        try:
+            res = await self.xae_worker.run_watched(fn, *a, timeout=timeout or self.cfg.xae.build_timeout_s + 60,
+                                                    watch=watch, **kw)
+        except _BlockedByDialog as b:
+            self._hold(job, b.dialog, b.job_future)  # type: ignore[attr-defined]
+            d = b.dialog
+            raise ToolError(f"{job}: BLOCKED BY DIALOG '{d.get('title')}' — the shell opened it during this call and "
+                            f"waits for an answer (buttons {d.get('buttons')}; text {str(d.get('text', ''))[:300]!r}). "
+                            "The call is still pending inside XAE: what it does depends on the answer. Answer with "
+                            "xae_dialog_resolve(button=...); the call's own result is then listed by xae_dialogs "
+                            "(late_results). Until then every XAE call is refused at once. blocked_by_dialog: "
+                            + json.dumps({k: d.get(k) for k in ("hwnd", "title", "text", "buttons")}, default=str)) from None
         except XaeError as exc:
             msg = str(exc)
             low = msg.lower()
@@ -634,6 +751,12 @@ class App:
             hint = (" Open dialog(s): " + "; ".join(f"'{d['title']}' buttons {d['buttons']}" for d in pend[:3])
                     + " — xae_dialog_resolve(button=...)") if pend else " (xae_dialogs shows open prompts)"
             raise ToolError("XAE call timed out; a modal dialog in the shell is the usual cause." + hint) from exc
+        if isinstance(res, dict):
+            live = self.dialogs_now()
+            if live:                       # N87: the call ran, but the shell has a dialog waiting — say so
+                res = {**res, "open_dialogs": [{k: d.get(k) for k in ("hwnd", "title", "text", "buttons")}
+                                               for d in live[:5]]}
+        return res
 
     def guard_safety_path(self, path: str, action: str) -> None:
         """TwinSAFE (TISC / Safety) projects are never edited unless explicitly enabled."""
@@ -1364,6 +1487,16 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
                              "reason": "; ".join(why) + ". Raise max_items or narrow with scope= for a full verdict."}
     if len(missing_final) > cap or len(extra) > cap:
         out["truncated"] = f"lists capped at {cap}; narrow with scope="
+    # N92: a root of the source with no symbol at all on the target — one line with its cause, not only its items
+    try:
+        decl = await app.proj_call(app.proj.declared_roots)
+        gone = not_on_target({k: d for k, d in decl.items() if k in roots}, await app.ads_call(app.ads.root_names,
+                                                                                              timeout=60))
+    except ToolError as exc:
+        out["roots_not_on_target_error"] = f"not checked: {exc}"
+    else:
+        if gone:
+            out["roots_not_on_target"] = gone
     return out
 
 
@@ -1409,6 +1542,59 @@ def _apply_tool_groups(mcp: MCPServer, cfg: Config) -> None:
         grp = t.name.split("_", 1)[0]
         if grp not in want:
             mcp.remove_tool(t.name)
+
+
+# R30: each Infosys tool describes the source this server is configured for — a client reads the description to decide
+# what to call; "falls back to a DuckDuckGo site: query" / "fetched live" / "indexes the default libraries on first
+# use" were read on a server that has none of that (the local Help Viewer index)
+_DOCS_LOCAL = {
+    "infosys_books": "List the Infosys books (documentation sets) of the Help Viewer package installed with TwinCAT, "
+                     "with page counts — offline, one index of every book. pattern is a glob on the slug ('tcplclib_*', "
+                     "'*json*'); category: plc-library | function-tf | engineering-te | twincat-system | hardware | other. "
+                     "TwinCAT 2 books are excluded.",
+    "infosys_index": "The local Help Viewer index holds every book and is built as a whole (the first time by itself, "
+                     "later only with kb_rebuild(index='infosys') once the user approves) — this tool changes nothing "
+                     "here and says so; kb_status / tc_doctor show the index state.",
+    "infosys_search_symbols": "Find library symbols (function blocks, functions, structs, enums, aliases, interfaces, "
+                              "GVLs) by name fragment in the local Help Viewer index; exact > prefix > contains. kind: "
+                              "FunctionBlock | Function | Program | Method | Property | Action | Enum | Struct | Union | "
+                              "Alias | Interface | GlobalVariable | Library. library: 'Tc2_System' or the book slug. "
+                              "Offline; while the index is still being built the answer says so.",
+    "infosys_search": "Full-text search over the local Help Viewer index (FTS5, bm25-ranked, excerpt with [hits]); "
+                      "\"quoted phrases\" stay together, limit 1..50. Offline — no web search (web_fallback is ignored "
+                      "and said so); results carry the page's doc version and the package date.",
+    "infosys_get_page": "A documentation page as Markdown (headings, tables, fenced code), read from the local Help "
+                        "Viewer package — any page in it, indexed or not; doc version + breadcrumb included. ref: full "
+                        "Infosys URL, 'book/pageid', a bare page id, or a symbol name ('ADSREAD'). Offline. Use "
+                        "max_chars to keep it short.",
+}
+_DOCS_WEB = {
+    "infosys_books": "List Infosys books (documentation sets) from infosys.beckhoff.com's sitemap with page counts and "
+                     "whether they are indexed. pattern is a glob on the slug ('tcplclib_*', '*json*'); category: "
+                     "plc-library | function-tf | engineering-te | twincat-system | hardware | other. TwinCAT 2 books are "
+                     "excluded.",
+    "infosys_index": "Index a book (or glob, e.g. 'tcplclib_tc3_*') from infosys.beckhoff.com — pages new or changed "
+                     "since the last run (Tc2_System ≈ 300 pages ≈ 30-60 s).",
+    "infosys_search_symbols": "Find library symbols (function blocks, functions, structs, enums, aliases, interfaces, "
+                              "GVLs) by name fragment in the indexed books; exact > prefix > contains. kind: "
+                              "FunctionBlock | Function | Program | Method | Property | Action | Enum | Struct | Union | "
+                              "Alias | Interface | GlobalVariable | Library. library: 'Tc2_System' or the book slug. "
+                              "Indexes the default libraries in the background on first use if nothing is indexed.",
+    "infosys_search": "Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]); "
+                      "\"quoted phrases\" stay together, limit 1..50. When the index has nothing: a DuckDuckGo site: query "
+                      "verified against the sitemap (web_fallback); the 'backend' field says which path answered.",
+    "infosys_get_page": "A documentation page as Markdown (headings, tables, fenced code), fetched live from "
+                        "infosys.beckhoff.com and cached. ref: full Infosys URL, 'book/pageid', a bare page id, or a "
+                        "symbol name ('ADSREAD'). Use max_chars to keep it short.",
+}
+
+
+def _describe_docs_tools(mcp: MCPServer, source: str) -> None:
+    texts = _DOCS_WEB if str(source or "local").lower() == "web" else _DOCS_LOCAL
+    for name, text in texts.items():
+        t = mcp._tool_manager.get_tool(name)
+        if t is not None:
+            t.description = text
 
 
 def dump_timeout_message(p: dict[str, Any], limit_s: float) -> str:
@@ -1477,6 +1663,19 @@ def _tool_boundary(fn: Any) -> Any:
                             f"defect in twincat-mcp, not in the call; its traceback is in the server log as crash "
                             f"{cid}") from exc
     return run
+
+
+class _BlockedByDialog(Exception):
+    def __init__(self, job: str, dialog: dict[str, Any]) -> None:
+        super().__init__(f"{job} blocked by dialog {dialog.get('title')!r}")
+        self.job = job
+        self.dialog = dialog
+
+
+def _dialog_awaits(d: dict[str, Any]) -> bool:
+    """A dialog the shell waits on: a push button other than Cancel / Abort (a progress window offers only those)."""
+    from .dialogs import _NOT_AN_ANSWER
+    return any(str(c).lower() not in _NOT_AN_ANSWER for c in (d.get("buttons") or []))
 
 
 class TcMcpServer(MCPServer):
@@ -3028,25 +3227,42 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         not counted): a row is written only when it, the root's JSON with it and the ending still to be written (the
         footer naming what is left out) fit — nothing is estimated. complete=false names
         every root that is missing or cut (skipped_roots) and every root that could not be read (failed_roots, also
-        in the CSV note column and the JSON footer). Returns counts, largest_roots, file paths and a 50-leaf
-        preview."""
+        in the CSV note column and the JSON footer). not_on_target names the programs/GVLs of the source that have no
+        symbol on the target, with the cause (not linked, or another program on the target). Returns counts,
+        largest_roots, file paths and a 50-leaf preview."""
         od = str(app.out_path(out_dir, what="dump folder", is_dir=True)) if out_dir else str(Path(cfg.safety.audit_log).parent / "dumps")
         if not 1 <= max_total_mb <= 4096 or not 1 <= max_leaves <= 5_000_000:
             raise ToolError("max_total_mb must be 1..4096 and max_leaves 1..5,000,000")
         own: set[str] | None = None
+        declared: dict[str, dict[str, Any]] | None = None
         try:
             if app.proj.root is not None:
                 await asyncio.to_thread(app.proj.ensure_fresh)
-                own = {u.name.lower() for u in app.proj.units.values() if u.kind in ("PROGRAM", "GVL")} or None
+                own = await asyncio.to_thread(app.proj.unit_names, "PROGRAM", "GVL") or None    # N88: under the lock
+                declared = await asyncio.to_thread(app.proj.declared_roots)
         except Exception:  # noqa: BLE001 — ordering is a nicety; without the project the order is alphabetical
-            own = None
+            own = declared = None
 
         def on_timeout() -> str:
             # N52: the verdict is read under the dump's commit lock — "kept" only if it was renamed into place
             return dump_timeout_message(app.ads.dump_outcome(), 900)
-        return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * MIB, max_leaves,
-                                  cancel=app.ads_bulk_worker.cancel_event, own_roots=own, timeout=900, bulk=True,
-                                  timeout_msg=on_timeout)
+        res = await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * MIB, max_leaves,
+                                 cancel=app.ads_bulk_worker.cancel_event, own_roots=own, timeout=900, bulk=True,
+                                 timeout_msg=on_timeout)
+        if declared:
+            # N92: a root of the source with no symbol on the target is named, with its cause (the same symbol table)
+            try:
+                missing = not_on_target(declared, await app.ads_call(app.ads.root_names, timeout=60), pattern)
+            except ToolError as exc:
+                res["not_on_target_error"] = f"not checked: {exc}"
+            else:
+                if missing:
+                    res["not_on_target"] = missing
+                    res["not_on_target_warning"] = (
+                        f"{len(missing)} program/GVL root(s) of the source have no symbol on the target "
+                        f"({', '.join(m['root'] for m in missing[:5])}{' …' if len(missing) > 5 else ''}): not in this "
+                        "dump — not_on_target says why")
+        return res
 
     @mcp.tool(annotations=READ)
     async def ads_leaves(name: str, max_leaves: int = 5000, with_values: bool = False) -> dict[str, Any]:
@@ -3101,7 +3317,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Cross-check the source against the running PLC: variables declared in the project but
         not present online (not compiled / not activated / optimised away) and online variables
         under the same programs/GVLs that the source does not declare (stale boot project, library
-        internals). Use after a deploy to prove the target runs this source."""
+        internals); roots_not_on_target names a program/GVL of which the target has no symbol at all, with the cause
+        (a GVL nothing references is not linked). Use after a deploy to prove the target runs this source."""
         return await _vs_runtime(app, scope, max_items)
 
     # ======================================================================
@@ -3150,7 +3367,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_dialogs() -> dict[str, Any]:
         """Modal dialogs currently open in the attached XAE shell (title, text, buttons), the
         watchdog's auto-answer rules and its recent log. A pending dialog blocks every COM call."""
-        return await asyncio.to_thread(lambda: {**app.xae.watchdog.status(), "live": [d.to_dict() for d in __import__("twincat_mcp.dialogs", fromlist=["list_dialogs"]).list_dialogs(app.xae.pid)]})
+        out = await asyncio.to_thread(lambda: {**app.xae.watchdog.status(), "live": app.dialogs_now()})
+        held = app.xae_held
+        if held is not None and not held["future"].done():
+            out["held_by_dialog"] = {"job": held["job"], "dialog": held["dialog"], "since_utc": held["since_utc"],
+                                     "note": "that call is still inside the shell's modal loop; every XAE call is "
+                                             "refused until the dialog is answered (xae_dialog_resolve)"}
+        if app.xae_late:
+            out["late_results"] = list(app.xae_late)
+        return out
 
     @mcp.tool(annotations=DESTR)
     async def xae_dialog_resolve(button: str, hwnd: int | None = None, remember: bool = False,
@@ -3788,6 +4013,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 except XaeError as exc:
                     return {"attached": False, "reason": str(exc)}
             return app.xae.status()
+        held = app.xae_held
+        if held is not None and not held["future"].done():
+            # N85: no COM call while a dialog holds the shell — say what holds it
+            return {"attached": app.xae.dte is not None, "held_by_dialog": held["dialog"], "held_job": held["job"],
+                    "held_since_utc": held["since_utc"],
+                    "note": "answer the dialog (xae_dialog_resolve); the held call's result then shows in xae_dialogs"}
         return await app.xae_call(_st, timeout=120)
 
     @mcp.tool(annotations=EDIT)
@@ -3804,7 +4035,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         unsaved, and checks that every xae_pou_set / xae_pou_create edit of this session is in the source files —
         it refuses to build otherwise (an external reload would discard the edits). Returns success, error/warning
         items with file:line (VS error list, or parsed from the Build output pane) and the output
-        tail. check_all_objects=true runs PLC 'Check all objects' instead (compiles unused POUs)."""
+        tail. check_all_objects=true runs PLC 'Check all objects' instead (compiles unused POUs). After a build of 0
+        errors, link_check names the GVLs nothing in the source references (TwinCAT does not link them: no symbol on
+        the target) unless they carry {attribute 'linkalways'}."""
         await app.permit(None, OpClass.EDIT, "xae_build")
         saved = await app.save_verified("xae_build") if save_first else {"skipped": "save_first=false"}
         if check_all_objects:
@@ -3813,6 +4046,25 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             return res
         res = await app.xae_call(app.xae.build, clean, rebuild, timeout=cfg.xae.build_timeout_s + 60)
         res["save"] = saved
+        if res.get("success") and app.proj.root is not None:
+            # N92: a build of 0 errors says nothing about what is linked — a GVL nothing uses is not, and gets no symbol
+            try:
+                ul = await app.proj_call(app.proj.unreferenced_gvls)
+            except ToolError as exc:
+                res["link_check_error"] = f"not checked: {exc}"
+            else:
+                if ul["not_linked"] or ul["with_io_not_judged"]:
+                    res["link_check"] = {**ul, "note": (
+                        "nothing in the source names these GVLs: TwinCAT does not link an object nothing uses — the "
+                        "build reports 0 errors and the target gets no symbol of them. Reference them or add "
+                        "{attribute 'linkalways'} on the line above VAR_GLOBAL; after a download ads_dump / "
+                        "proj_vs_runtime show what the target has. with_io_not_judged: GVLs with AT %I*/%Q* variables "
+                        "(whether an I/O mapping keeps one linked is not checked)")}
+                    if ul["not_linked"]:
+                        res["link_warning"] = (f"{len(ul['not_linked'])} GVL(s) no code references will not be linked "
+                                               "(no symbol on the target): "
+                                               + ", ".join(x["gvl"] for x in ul["not_linked"][:5])
+                                               + (" …" if len(ul["not_linked"]) > 5 else ""))
         app.audit("xae_build", {"clean": clean, "rebuild": rebuild}, OpClass.EDIT,
                   "ok" if res.get("success") else "build-failed", {"errors": res.get("errors")})
         return res
@@ -3849,6 +4101,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         Automation Interface (ConsumeXml online commands on '<Name> Project' — no active project needed;
         plc_project_path when there are several PLC projects), then the shell's DTE commands (names vary by build).
         download/reset_cold/reset_origin are destructive-class, the rest control-class."""
+        app.refuse_if_dialog(f"xae_plc {action}")
         op = OpClass.DESTRUCTIVE if action in ("download", "reset_origin", "reset_cold") else OpClass.CONTROL
         tgt = await app.guarded_target("xae_plc", {"action": action, "plc_project_path": plc_project_path}, op, confirm_token)
         await app.permit(ctx, op, "xae_plc", tgt, confirm_token)
@@ -3870,9 +4123,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_activate_configuration(confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """ActivateConfiguration on the current target (overwrites the boot project on the IPC).
         Destructive-class. Follow with xae_restart_twincat."""
+        app.refuse_if_dialog("xae_activate_configuration")
         tgt = await app.xae_target_for("xae_activate_configuration", OpClass.DESTRUCTIVE, confirm_token)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_activate_configuration", tgt, confirm_token)
+        before = await app.restart_witness()     # the application running before: compared after the restart
         res = await app.xae_call(app.xae.activate_configuration, timeout=600)
+        app.last_activation = {"witness": before, "mono": time.monotonic()}
+        res["plc_application_before"] = _app_ts_text(before.get("app_timestamp")) or before.get("app_timestamp")
         await app.ads_call(app.ads.disconnect, timeout=10)
         ver = await app.verify_target_after("xae_activate_configuration", expect_run=False, timeout_s=30)
         res.update({"target_mode": ver["target_mode"], "dialogs": ver["dialogs"]})
@@ -3889,6 +4146,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=DESTR)
     async def xae_restart_twincat(confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """StartRestartTwinCAT on the current target (runtime restarts in RUN mode). Destructive-class."""
+        app.refuse_if_dialog("xae_restart_twincat")
         tgt = await app.xae_target_for("xae_restart_twincat", OpClass.DESTRUCTIVE, confirm_token)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_restart_twincat", tgt, confirm_token)
         before = await app.restart_witness()                  # R40: what a restart must change, read before it
@@ -3902,6 +4160,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         res.update({k: ver[k] for k in _TRANSITION_KEYS if k in ver})
         if ver.get("hint"):
             res["hint"] = ver["hint"]
+        if ver["verified"]:
+            # the application before the activation that preceded this restart (within 30 min), else before the restart
+            act = app.last_activation if app.last_activation and time.monotonic() - app.last_activation["mono"] < 1800 else None
+            app.last_activation = None
+            after = ver.get("witness_after") or await app.restart_witness("RUN")
+            res["plc_application"] = plc_application(act["witness"] if act else before, after)
         app.audit("xae_restart_twincat", {"target": tgt}, OpClass.DESTRUCTIVE,
                   "ok" if ver["verified"] else _restart_outcome(ver), res)
         if not ver["verified"]:
@@ -3919,6 +4183,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         'poll' (another state seen after the commands), 'mode_change' (it was not in RUN before the activation),
         'witness' (task 1's cycle counter went back, or the PLC application's compile timestamp changed). In RUN
         without such proof is reported as that, not as 'not in RUN'."""
+        app.refuse_if_dialog("xae_deploy")
         tgt = await app.xae_target_for("xae_deploy", OpClass.DESTRUCTIVE, confirm_token)
         await app.check_targets(tgt, allow_target_mismatch)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_deploy", tgt, confirm_token)
@@ -3948,6 +4213,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if ver.get("hint"):
             steps["verify"]["hint"] = ver["hint"]
         ok = bool(ver["verified"])
+        if ok:
+            app.last_activation = None
+            steps["verify"]["plc_application"] = plc_application(before, ver.get("witness_after")
+                                                                 or await app.restart_witness("RUN"))
         app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "ok" if ok else _restart_outcome(ver), steps)
         if not ok:
             raise ToolError("xae_deploy: activated and restarted, but " + _restart_failure(ver))
@@ -3959,7 +4228,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """System Manager tree item: properties, children to `depth`, and ProduceXml when xml=true.
         Path syntax 'TIPC^Plc^Plc Project^POUs^MAIN' (xae_plc_projects gives the '<Name> Project' path;
         its children POUs/DUTs/GVLs are walked even though the node itself reports no ChildCount).
-        Roots: TIID (I/O), TIPC (PLC), TIRT (tasks), TIRC (real-time settings), TIRR (routes), TINC (NC)."""
+        Roots (ITcSysManager::LookupTreeItem shortcuts): TIIC (I/O Configuration), TIID (its I/O Devices), TIRC (Real-Time
+        Configuration), TIRT (its Additional Tasks), TIRS (its Real-Time Settings), TIRR (its Route Settings), TIPC (PLC
+        Configuration), TINC (NC Configuration)."""
         out = await app.xae_call(app.xae.tree_item, path, timeout=60)
         if depth > 0:
             out["children"] = (await app.xae_call(app.xae.tree_children, path, min(depth, 6), max_items, timeout=300))["items"]
@@ -4034,14 +4305,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_pou_create(parent_path: str, name: str, kind: str, language: str = "st",
                              return_type: str | None = None, extends: str | None = None,
                              implements: str | None = None, access: str | None = None,
-                             declaration: str | None = None, implementation: str | None = None) -> dict[str, Any]:
-        """Create a PLC object under a folder/POU: kind = program | fb | function | method |
-        property | action | transition | struct | enum | union | alias | gvl | interface |
-        itf_method | itf_property | folder | parameter_list. Optional code is set after creation."""
+                             declaration: str | None = None, implementation: str | None = None,
+                             accessors: str = "get,set") -> dict[str, Any]:
+        """Create a PLC object under a folder/POU. kind = program | fb | function | method | property | action |
+        transition | struct | enum | union | alias | gvl | interface | itf_method | itf_property | folder |
+        parameter_list, and accessors on their own: property_get | property_set (under a property) | itf_property_get |
+        itf_property_set (under an interface property). A property / itf_property is created with its accessors
+        (accessors='get,set' default, 'get' or 'set'): without one it does not compile (C0373). return_type: function,
+        method, property; access: PUBLIC | PRIVATE | PROTECTED | INTERNAL. Optional code is set after creation."""
         app.guard_safety_path(parent_path, "xae_pou_create")
         await app.permit(None, OpClass.EDIT, "xae_pou_create", f"{parent_path}^{name}")
         res = await app.xae_call(app.xae.pou_create, parent_path, name, kind, language, return_type,
-                                 extends, implements, access, declaration, implementation, timeout=120)
+                                 extends, implements, access, declaration, implementation, accessors, timeout=120)
         if kind.lower() != "folder":
             app.note_edit(f"{parent_path}^{name}", declaration, implementation)
         app.audit("xae_pou_create", {"parent": parent_path, "name": name, "kind": kind}, OpClass.EDIT, "ok", res)
@@ -4076,6 +4351,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Boot project settings: set Autostart and/or GenerateBootProject (local, no activate
         unless activate_after_generate=true, which is then destructive-class)."""
         op = OpClass.DESTRUCTIVE if activate_after_generate else OpClass.EDIT
+        if activate_after_generate:
+            app.refuse_if_dialog("xae_boot_project (activate_after_generate)")
         app.guard_safety_path(plc_project_path, "xae_boot_project")
         tgt = (await app.guarded_target("xae_boot_project", {"plc_project_path": plc_project_path,
                                                              "activate_after_generate": True}, op, confirm_token)
@@ -4185,6 +4462,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         XAE targets>). plc_project_path from xae_plc_projects. TcUnit writes the result file only with its library
         parameter GVL_Param_TcUnit.xUnitEnablePublish = TRUE (default FALSE): the run is refused before anything
         is activated when the project source says FALSE, and stops waiting when the PLC reports FALSE (D40)."""
+        app.refuse_if_dialog("tcunit_run")
         tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
         rp = remote_result_path or cfg.project.tcunit_remote_result
         if not rp.lower().endswith(".xml"):
@@ -4297,5 +4575,6 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     atexit.register(app.rec.stop_all)
     atexit.register(app.stop_experiments)   # registered after → runs first: restore factors, then close recordings
     mcp._tcmcp_app = app  # type: ignore[attr-defined]  (tests)
+    _describe_docs_tools(mcp, cfg.docs.source)
     _apply_tool_groups(mcp, cfg)
     return mcp

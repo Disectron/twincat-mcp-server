@@ -31,6 +31,49 @@ from .config import ProjectConfig
 
 SRC_EXT = {".tcpou": "POU", ".tcdut": "DUT", ".tcgvl": "GVL", ".tcio": "Itf"}
 
+# N92: the variables of a PROGRAM / GVL that become symbols of the runtime (VAR_TEMP never does; CONSTANT is replaced)
+_SYMBOL_SECTIONS = {"PROGRAM": {"VAR", "VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_STAT", "VAR_INST"},
+                    "GVL": {"VAR_GLOBAL"}}
+_RE_LINKALWAYS = re.compile(r"\{\s*attribute\s+'linkalways'\s*\}", re.I)
+_RE_ST_COMMENT = re.compile(r"\(\*.*?\*\)|//[^\n]*", re.S)
+_RE_ST_STRING = re.compile(r"'(?:\$.|[^'$])*'|\"(?:\$.|[^\"$])*\"")
+
+
+def _no_comments(code: str) -> str:
+    """ST without comments; string literals kept (an attribute pragma is quoted: {attribute 'linkalways'})."""
+    return _RE_ST_COMMENT.sub(" ", code or "")
+
+
+def not_on_target(declared: dict[str, dict[str, Any]], on_target: set[str],
+                  pattern: str | None = None) -> list[dict[str, Any]]:
+    """N92: source roots (declared_roots) that hold symbols but have none on the target (on_target: the lower-case
+    first name segments of the runtime's symbol table). pattern (ads_dump's) limits it to the roots it selects. The
+    cause is named, never guessed past what is known: linkalways in the source rules out 'not linked'."""
+    import fnmatch
+    head = None
+    if pattern:
+        pat = pattern.lower() if ("*" in pattern or "?" in pattern) else pattern.lower() + "*"
+        head = pat.split(".", 1)[0]
+    out: list[dict[str, Any]] = []
+    for key, d in sorted(declared.items()):
+        if not d["symbol_vars"] or key in on_target or (head is not None and not fnmatch.fnmatchcase(key, head)):
+            continue
+        if d["linkalways"]:
+            cause = ("declared with {attribute 'linkalways'} but not on the target: the target runs another program "
+                     "than this source (an older download, or another project)")
+        elif d["kind"] == "GVL":
+            cause = ("not linked: TwinCAT links only what the program uses — a GVL nothing references builds with 0 "
+                     "errors and gets no symbol. Reference it, or add {attribute 'linkalways'} on the line above "
+                     "VAR_GLOBAL ('Always link' in its properties, Advanced; Infosys tc3_plc_intro/2529686923); or the "
+                     "target runs an older program than this source (download it)")
+        else:
+            cause = ("not linked: a PROGRAM that no task and no code calls gets no symbol — or the target runs an older "
+                     "program than this source (download it)")
+        out.append({"root": d["name"], "kind": d["kind"], "file": d["file"], "symbol_vars": d["symbol_vars"],
+                    "cause": cause})
+    return out
+
+
 _RE_VAR_BLOCK = re.compile(
     r"^[ \t]*(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR_STAT|VAR_TEMP|VAR_INST|VAR_EXTERNAL|VAR|STRUCT|UNION)\b"
     r"(?P<quals>(?:[ \t]+(?:CONSTANT|RETAIN|PERSISTENT|NON_RETAIN))*)[ \t]*$(.*?)^[ \t]*END_(?:VAR|STRUCT|UNION)",
@@ -109,6 +152,15 @@ class ProjectError(RuntimeError):
     pass
 
 
+@dataclass
+class _Index:
+    """What a scan or refresh builds before it is published (N88: copy-on-write — readers outside the lock iterate
+    the published dicts, which are never changed in place; a scan swaps in complete new ones)."""
+    units: dict[str, CodeUnit]
+    files: dict[str, float]
+    duplicates: dict[str, list[str]]
+
+
 class ProjectIndex:
     def __init__(self, cfg: ProjectConfig):
         self.cfg = cfg
@@ -121,7 +173,9 @@ class ProjectIndex:
         self.plcproj: list[dict[str, Any]] = []
         self.scanned_at: float | None = None
         # N26: tools run in worker threads; parallel first calls must not scan concurrently (each scan clears
-        # and re-appends → duplicated plcproj/units). Re-entrant: refresh() may fall back to scan().
+        # and re-appends → duplicated plcproj/units). Re-entrant: refresh() may fall back to scan(). N88: scans and
+        # refreshes build new containers and publish them at the end (one assignment each): a reader that holds
+        # self.units sees a complete index, never one being cleared or re-filled.
         self._scan_lock = threading.RLock()
 
     # ------------------------------------------------------------ scan
@@ -136,22 +190,24 @@ class ProjectIndex:
             raise ProjectError(f"project root not set or not a directory: {self.root}. "
                                "Pass root= or set TCMCP_PROJECT_ROOT / TCMCP_SOLUTION.")
         t0 = time.time()
-        self.units.clear(); self.files.clear(); self.plcproj.clear(); self.duplicates.clear()
-        self.solutions = [str(p) for p in self.root.rglob("*.sln")]
-        self.tsproj = [str(p) for p in self.root.rglob("*.tsproj")]
-        for pp in self.root.rglob("*.plcproj"):
-            self.plcproj.append(self._parse_plcproj(pp))
+        ix = _Index({}, {}, {})
+        solutions = [str(p) for p in self.root.rglob("*.sln")]
+        tsproj = [str(p) for p in self.root.rglob("*.tsproj")]
+        plcproj = [self._parse_plcproj(pp) for pp in self.root.rglob("*.plcproj")]
         n_files = 0
         for p in self.root.rglob("*"):
             if p.suffix.lower() in SRC_EXT and p.is_file():
                 if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
                     continue
                 try:
-                    self._index_file(p)
+                    self._index_file(p, ix)
                     n_files += 1
                 except ET.ParseError as exc:
-                    self.files[str(p)] = -1
-                    self.units[f"__parse_error__{p.name}".lower()] = CodeUnit(p.name, "PARSE_ERROR", str(p), "", str(exc))
+                    ix.files[str(p)] = -1
+                    ix.units[f"__parse_error__{p.name}".lower()] = CodeUnit(p.name, "PARSE_ERROR", str(p), "", str(exc))
+        # published whole (N88): the units first, so a reader that sees the new plcproj never pairs it with old units
+        self.units, self.files, self.duplicates = ix.units, ix.files, ix.duplicates
+        self.solutions, self.tsproj, self.plcproj = solutions, tsproj, plcproj
         self.scanned_at = time.time()
         kinds: dict[str, int] = {}
         for u in self.units.values():
@@ -179,13 +235,80 @@ class ProjectIndex:
                 pass
 
     def ensure_fresh(self) -> dict[str, Any] | None:
-        """Public: scan or refresh now (no throttle); returns the refresh delta, or None when no root is set."""
+        """Public: scan or refresh now (no throttle); returns the refresh delta, or None when no root is set. N88: the
+        first-scan check is made under the lock — two parallel first calls scanned twice, the second clearing the units
+        while the first caller was reading them ('no project configured')."""
         if self.root is None:
             return None
-        if self.scanned_at is None:
-            r = self.scan()
-            return {"scanned": True, "units": r["units"]}
-        return self.refresh()
+        with self._scan_lock:
+            if self.scanned_at is None:
+                r = self._scan(None)
+                return {"scanned": True, "units": r["units"]}
+            return self._refresh()
+
+    def unit_names(self, *kinds: str) -> set[str]:
+        """Names (lower case) of the units of these kinds, read under the scan lock: never a half-built index."""
+        with self._scan_lock:
+            return {u.name.lower() for u in self.units.values() if not kinds or u.kind in kinds}
+
+    def declared_roots(self) -> dict[str, dict[str, Any]]:
+        """N92: the PROGRAMs and GVLs of the source with what the target's symbol table should hold for them —
+        {lower name: {name, kind, file, symbol_vars, linkalways, io_vars}}. symbol_vars counts the variables that
+        become symbols (not CONSTANT, not VAR_TEMP, not {attribute 'hide'}); a root without any has no symbol to
+        expect. linkalways: {attribute 'linkalways'} in its declaration."""
+        self._ensure()
+        return self._declared(self.units)            # a published snapshot (N88): complete, never changed in place
+
+    @staticmethod
+    def _declared(units: dict[str, CodeUnit]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for u in units.values():
+            if u.parent or u.kind not in _SYMBOL_SECTIONS:
+                continue
+            syms = [v for v in u.vars if v.section in _SYMBOL_SECTIONS[u.kind] and not v.constant
+                    and "hide" not in {k.lower() for k in v.attrs}]
+            out[u.name.lower()] = {"name": u.name, "kind": u.kind, "file": u.file, "symbol_vars": len(syms),
+                                   "linkalways": bool(_RE_LINKALWAYS.search(_no_comments(u.declaration))),
+                                   "io_vars": sum(1 for v in syms if v.at and re.match(r"%[IQ]", v.at, re.I))}
+        return out
+
+    def unreferenced_gvls(self) -> dict[str, Any]:
+        """N92, before a download: GVLs that hold symbols, carry no {attribute 'linkalways'} and that nothing else in
+        the source names — not the GVL, not (unless qualified_only) one of its variables. TwinCAT does not link an
+        object nothing uses (live: build 0 errors, no symbol on the target). A name found anywhere counts as a
+        reference (a local variable of the same name too), so this only names GVLs nothing can be using; GVLs with
+        AT %I*/%Q* variables are listed apart — whether an I/O mapping keeps one linked is not checked here.
+        Visualisations and task configurations are searched as text."""
+        self._ensure()
+        units = self.units                           # one snapshot for the roots and the texts searched (N88)
+        decl = self._declared(units)
+        texts: list[tuple[str, str]] = [(u.name.lower(), _no_comments(u.declaration) + "\n" + _no_comments(u.implementation))
+                                        for u in units.values() if u.kind != "PARSE_ERROR"]
+        other = ""
+        if self.root is not None and self.root.is_dir():
+            for p in self.root.rglob("*"):
+                if p.suffix.lower() in (".tcvis", ".tcvmo", ".tctto", ".tcgtlo") and p.is_file():
+                    try:
+                        other += p.read_text(encoding="utf-8-sig", errors="replace") + "\n"
+                    except OSError:
+                        pass
+        found: list[dict[str, Any]] = []
+        io: list[dict[str, Any]] = []
+        for key, d in sorted(decl.items()):
+            if d["kind"] != "GVL" or not d["symbol_vars"] or d["linkalways"]:
+                continue
+            u = units[key]
+            names = [re.escape(u.name)]
+            if not re.search(r"\{\s*attribute\s+'qualified_only'\s*\}", u.declaration, re.I):
+                names += [re.escape(v.name) for v in u.vars if v.section == "VAR_GLOBAL"]
+            rx = re.compile(r"(?<![\w.])(?:" + "|".join(names) + r")\b", re.I)
+            own = key
+            if any(rx.search(t) for k, t in texts if k != own and not k.startswith(own + ".")) or \
+                    re.search(r"\b" + re.escape(u.name) + r"\.", other, re.I):
+                continue
+            row = {"gvl": u.name, "file": u.file, "symbol_vars": d["symbol_vars"]}
+            (io if d["io_vars"] else found).append(row if not d["io_vars"] else {**row, "io_vars": d["io_vars"]})
+        return {"not_linked": found, "with_io_not_judged": io}
 
     def refresh(self) -> dict[str, Any]:
         """Incremental rescan: re-index files whose mtime changed, pick up new files, drop deleted ones."""
@@ -197,6 +320,7 @@ class ProjectIndex:
             return self.scan()
         changed, added, removed = [], [], []
         seen: set[str] = set()
+        ix = _Index(dict(self.units), dict(self.files), {k: list(v) for k, v in self.duplicates.items()})
         for p in self.root.rglob("*"):
             if p.suffix.lower() in SRC_EXT and p.is_file():
                 if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
@@ -204,29 +328,41 @@ class ProjectIndex:
                 sp = str(p)
                 seen.add(sp)
                 mt = p.stat().st_mtime
-                if sp not in self.files:
+                if sp not in ix.files:
                     added.append(sp)
-                elif self.files[sp] != mt:
+                elif ix.files[sp] != mt:
                     changed.append(sp)
                 else:
                     continue
                 try:
-                    self._drop_file(sp)
-                    self._index_file(p)
+                    self._drop_file(sp, ix)
+                    self._index_file(p, ix)
                 except ET.ParseError as exc:
-                    self.files[sp] = -1
-                    self.units[f"__parse_error__{p.name}".lower()] = CodeUnit(p.name, "PARSE_ERROR", sp, "", str(exc))
-        for sp in list(self.files):
+                    ix.files[sp] = -1
+                    ix.units[f"__parse_error__{p.name}".lower()] = CodeUnit(p.name, "PARSE_ERROR", sp, "", str(exc))
+        for sp in list(ix.files):
             if sp not in seen:
                 removed.append(sp)
-                self._drop_file(sp)
-                self.files.pop(sp, None)
+                self._drop_file(sp, ix)
+                ix.files.pop(sp, None)
+        if changed or added or removed:
+            self.units, self.files, self.duplicates = ix.units, ix.files, ix.duplicates     # published whole (N88)
         self.scanned_at = time.time()
         return {"changed": changed, "added": added, "removed": removed, "units": len(self.units)}
 
-    def _drop_file(self, path: str) -> None:
-        for k in [k for k, u in self.units.items() if u.file == path]:
-            self.units.pop(k, None)
+    def reindex_file(self, p: Path) -> None:
+        """Re-index one file now (after an edit): its old units dropped, the new ones published whole (N88). Raises
+        ET.ParseError — and publishes nothing — when the file does not parse."""
+        with self._scan_lock:
+            ix = _Index(dict(self.units), dict(self.files), {k: list(v) for k, v in self.duplicates.items()})
+            self._drop_file(str(p), ix)
+            self._index_file(p, ix)
+            self.units, self.files, self.duplicates = ix.units, ix.files, ix.duplicates
+
+    @staticmethod
+    def _drop_file(path: str, ix: _Index) -> None:
+        for k in [k for k, u in ix.units.items() if u.file == path]:
+            ix.units.pop(k, None)
 
     def changed_units(self, since: str = "HEAD") -> dict[str, Any]:
         """Units whose files differ from a git revision (default: uncommitted changes), plus
@@ -284,9 +420,9 @@ class ProjectIndex:
             d["project_guid"] = g.text
         return d
 
-    def _index_file(self, p: Path) -> None:
+    def _index_file(self, p: Path, ix: _Index) -> None:
         text = p.read_text(encoding="utf-8-sig", errors="replace")
-        self.files[str(p)] = p.stat().st_mtime
+        ix.files[str(p)] = p.stat().st_mtime
         root = ET.fromstring(text)
         kind_tag = SRC_EXT[p.suffix.lower()]
         obj = root.find(kind_tag)
@@ -301,10 +437,10 @@ class ProjectIndex:
         unit = CodeUnit(name, kind, str(p), kind_tag, decl, impl, dl, il)
         self._fill_header(unit)
         unit.vars = parse_vars(decl, unit.decl_line0)
-        prev = self.units.get(name.lower())
+        prev = ix.units.get(name.lower())
         if prev is not None and prev.file != str(p):
-            self.duplicates.setdefault(name.lower(), [prev.file]).append(str(p))
-        self.units[name.lower()] = unit
+            ix.duplicates.setdefault(name.lower(), [prev.file]).append(str(p))
+        ix.units[name.lower()] = unit
         # sub-items
         for tag, k in (("Method", "METHOD"), ("Property", "PROPERTY"), ("Action", "ACTION"), ("Transition", "TRANSITION")):
             for i, sub in enumerate(obj.findall(tag)):
@@ -317,7 +453,7 @@ class ProjectIndex:
                               sdl, sil, parent=name)
                 self._fill_header(su)
                 su.vars = parse_vars(sdecl, su.decl_line0)
-                self.units[full.lower()] = su
+                ix.units[full.lower()] = su
                 if tag == "Property":
                     for acc in ("Get", "Set"):
                         a = sub.find(acc)
@@ -327,7 +463,7 @@ class ProjectIndex:
                             au = CodeUnit(f"{full}.{acc}", acc.upper(), str(p),
                                           f"{kind_tag}/{tag}[@Name='{sname}']/{acc}",
                                           _cdata(a, "Declaration"), _cdata_impl(a), adl, ail, parent=full)
-                            self.units[au.name.lower()] = au
+                            ix.units[au.name.lower()] = au
 
     def _fill_header(self, u: CodeUnit) -> None:
         m = _RE_HEADER.search(u.declaration or "")
@@ -369,7 +505,7 @@ class ProjectIndex:
             if not cands and key in self.duplicates:
                 for f in self.duplicates[key]:
                     if pin.lower() in f.lower():
-                        self._index_file(Path(f))
+                        self.reindex_file(Path(f))
                         cands = [x for x in self.units.values() if x.name.lower() == key and pin.lower() in x.file.lower()]
             if len(cands) != 1:
                 raise ProjectError(f"'{pin}@{name}' matches {len(cands)} units")
@@ -678,7 +814,7 @@ class ProjectIndex:
         p.write_bytes(out)
         # re-index this file
         try:
-            self._index_file(p)
+            self.reindex_file(p)
         except ET.ParseError as exc:
             p.write_bytes(raw)
             raise ProjectError(f"edit produced invalid XML, reverted: {exc}") from exc

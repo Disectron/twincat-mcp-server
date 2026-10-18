@@ -453,9 +453,9 @@ def test_builder_copies_become_stubs_once_and_are_reported(kb, tmp_path, monkeyp
     assert K.builder_kind(loc / "tools" / "infosys_local.py", "infosys_local.py") == ("other", None)
     # every later start: nothing to do; the pointer for the stubs is written once per plugin location/version
     up = k.builder_upkeep("9.9.9")
-    assert up["tools"]["manuals_db.py"] == {"state": "stub", "stub_version": "1"} and up["pointer_written"] is True
+    assert up["tools"]["manuals_db.py"] == {"state": "stub", "stub_version": "1"} and up["pointer"] == "written"
     assert up["tools"]["infosys_local.py"]["state"] == "left alone"
-    assert k.builder_upkeep("9.9.9")["pointer_written"] is False
+    assert k.builder_upkeep("9.9.9")["pointer"] == "unchanged"
     ptr = json.loads((k.home / "plugin_location.json").read_text(encoding="utf-8"))
     assert Path(ptr["builders"]) == K.builders_dir() and ptr["version"] == "9.9.9"
     d = k.docs_layout(loc)

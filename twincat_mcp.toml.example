@@ -15,6 +15,7 @@ attach_only = true                 # never launch a shell unless xae_attach(laun
 # progids = ["TcXaeShell.DTE.15.0"]  # 4024 32-bit shell first, if that is what you run
 build_timeout_s = 900
 dialog_watchdog = true             # poll XAE modal dialogs; auto-answer only by the rules below
+silent_mode = false                # TE1000 SilentMode only during confirmed machine commands (answers undocumented)
 dialog_rules = [                   # never applied to activate/run/download/login/delete/safety prompts
   { title_contains = "Microsoft Visual Studio", text_contains = "save changes", button = "No" },
 ]

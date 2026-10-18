@@ -426,7 +426,7 @@ async def test_write_refusals_round2(monkeypatch, project_dir):
             r = await s.call_tool("ads_write", {"name": name, "value": val})
             assert r.is_error and why in text(r), (name, text(r))
         ok = payload(await s.call_tool("ads_write", {"name": "PRG_Test.eCmd", "value": "E_FillState.Fine"}))   # #61
-        assert ok["read_back"] == 2 and ok["written"] == 2
+        assert ok["read_back"] == ok["written"] == {"value": 2, "name": "Fine"}      # ads_read's shape (N50 / D5)
         r = payload(await s.call_tool("ads_read", {"name": "PRG_Test.ipModule"}))                              # #64
         assert r["value"] == "0x0000000000000000" and "INTERFACE" in r["note"]           # N51: unassigned = address 0
         # #54: one bad item → nothing written, every problem named
@@ -1281,3 +1281,55 @@ async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, proje
         assert d["offline_docs"]["infosys_rebuild"] == "interrupted" and "INTERRUPTED" in d["summary"]
         st = payload(await s.call_tool("kb_status", {}))
         assert st["docs"]["infosys"]["rebuild"]["state"] == "interrupted" and "command" in st["docs"]["infosys"]
+
+
+def _gvl(project_dir, name: str, decl: str) -> None:
+    (project_dir / "Plc" / "GVLs" / f"{name}.TcGVL").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">\n'
+        f'  <GVL Name="{name}" Id="{{aaaaaaaa-0000-0000-0000-0000000000{len(name):02d}}}">\n'
+        f"    <Declaration><![CDATA[{decl}]]></Declaration>\n  </GVL>\n</TcPlcObject>\n", encoding="utf-8")
+
+
+@pytest.mark.anyio
+async def test_n92_a_gvl_of_the_source_without_symbols_on_the_target_is_named(monkeypatch, project_dir):
+    """N92 (live): a GVL nothing references is not linked — build 0 errors, no symbol on the target — and ads_dump
+    still counted it among the project's 'known' roots. Now ads_dump, proj_vs_runtime and xae_build name it."""
+    install(monkeypatch)
+    _gvl(project_dir, "GVL_Unused", "VAR_GLOBAL\n\tnSpare : INT;\nEND_VAR\n")
+    _gvl(project_dir, "GVL_Pinned", "{attribute 'linkalways'}\nVAR_GLOBAL\n\tnKeep : INT;\nEND_VAR\n")
+    _gvl(project_dir, "GVL_Consts", "VAR_GLOBAL CONSTANT\n\tcN : INT := 3;\nEND_VAR\n")     # nothing to expect
+    _gvl(project_dir, "GVL_Io", "VAR_GLOBAL\n\tbIn AT %I* : BOOL;\nEND_VAR\n")
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        d = payload(await s.call_tool("ads_dump", {"out_dir": str(project_dir / "dumps")}))
+        cmp_ = payload(await s.call_tool("proj_vs_runtime", {}))
+        only = payload(await s.call_tool("ads_dump", {"out_dir": str(project_dir / "dumps"), "pattern": "MAIN.*"}))
+    got = {m["root"]: m for m in d["not_on_target"]}
+    assert set(got) == {"GVL_Unused", "GVL_Pinned", "GVL_Io"}, got
+    assert "not linked" in got["GVL_Unused"]["cause"] and "linkalways" in got["GVL_Unused"]["cause"]
+    assert "another program than this source" in got["GVL_Pinned"]["cause"]
+    assert "GVL_Unused" in d["not_on_target_warning"]
+    # the order counts what the target has: MAIN and GVL_Machine of the source, not the 6 names it declares
+    assert "(2 of them in this dump)" in d["order"], d["order"]
+    assert {m["root"] for m in cmp_["roots_not_on_target"]} == {"GVL_Unused", "GVL_Pinned", "GVL_Io"}
+    assert "not_on_target" not in only                                          # pattern MAIN.*: none of them asked for
+
+    # xae_build: before any download, from the source alone
+    srv = build_server(mk_cfg(project_dir))
+    app = srv._tcmcp_app
+
+    async def xae_call(fn, *a, **kw):
+        assert fn.__name__ == "build", fn
+        return {"success": True, "errors": [], "warnings": 0}
+    monkeypatch.setattr(app, "xae_call", xae_call)
+    async with client_for(srv) as s:
+        b = payload(await s.call_tool("xae_build", {"save_first": False}))
+    assert b["success"] and b["warnings"] == 0 and "GVL_Unused" in b["link_warning"], b
+    assert [x["gvl"] for x in b["link_check"]["not_linked"]] == ["GVL_Unused"]   # GVL_Pinned: linkalways; Machine: used
+    assert [x["gvl"] for x in b["link_check"]["with_io_not_judged"]] == ["GVL_Io"]
+    main = project_dir / "Plc" / "POUs" / "MAIN.TcPOU"
+    main.write_text(main.read_text(encoding="utf-8").replace(
+        "GVL_Machine.nDrumsFilled := GVL_Machine.nDrumsFilled + 1;",
+        "GVL_Machine.nDrumsFilled := GVL_Machine.nDrumsFilled + 1;\n\tnSpare := 1;"), encoding="utf-8")
+    app.proj.refresh()
+    assert app.proj.unreferenced_gvls()["not_linked"] == []                   # an unqualified use is a use

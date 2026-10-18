@@ -66,6 +66,11 @@ class XaeConfig:
     dialog_watchdog: bool = True           # poll XAE modal dialogs while attached
     dialog_rules: list[dict] = field(default_factory=list)   # [{title_contains|text_contains, button, force?}]
     allow_safety: bool = False             # permit edits under TwinSAFE (TISC) paths
+    # TE1000 ITcAutomationSettings.SilentMode (TC 3.1.4020+, "suppresses message box dialogs"), switched on only for
+    # the duration of a machine command this server already confirmed (PLC online actions, activate, restart) and
+    # switched back after. Off by default: what a suppressed box answers is not documented — with it off, a dialog the
+    # command opens is reported (blocked_by_dialog) and answered with xae_dialog_resolve
+    silent_mode: bool = False
 
 
 @dataclass

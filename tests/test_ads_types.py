@@ -248,3 +248,34 @@ def test_write_guard_follows_the_alias_chain_like_the_dump():
     assert "INTERFACE" in (ads.unwritable_reason("T_Run", 8) or "")
     assert "POINTER" in (ads.unwritable_reason("ARRAY [1..4] OF PT_X", 32) or "")
     assert ads.unwritable_reason("UDINT", 4) is None and ads.unwritable_reason("FB_X", 400) is None
+
+
+def test_d5_a_bool_member_reads_as_bool_on_every_path():
+    """D5: 4026 tables carry BOOL -> BYTE; decode_tree followed the alias and read BOOL members as the BYTE 1 / 0, while
+    the dump (leaves + decode_leaf) said true / false. One rule: a scalar alias decodes as its declared name."""
+    tbl = {
+        "byte": DtEntry("BYTE", "", 1, 0, 17, 0, ""),
+        "bool": DtEntry("BOOL", "BYTE", 1, 0, 17, 0, ""),
+        "st_visu": DtEntry("ST_Visu", "", 2, 0, 65, 0, "", [], [
+            DtEntry("bReady", "BOOL", 1, 0, 17, 0, ""), DtEntry("nMode", "BYTE", 1, 1, 17, 0, "")], {}, {}),
+    }
+    ts = TypeSystem(tbl)
+    raw = bytes([1, 7])
+    assert ts.decode_tree(raw, "ST_Visu", size=2) == {"bReady": True, "nMode": 7}
+    assert [ts.decode_leaf(raw, lf) for lf in ts.leaves("GVL.stVisu", "ST_Visu")] == [True, 7]
+
+
+def test_n50_unknown_names_are_not_guessed_when_the_table_knows_them():
+    """N50: parse_type read any unknown name of 1/2/4/8 bytes as a signed integer: TYPE PT_X : POINTER TO FB_X came out
+    as -114343571583168. It is flagged as a guess, and the table decodes it (an address); arrays of such elements
+    element by element."""
+    from twincat_mcp import types_tc as T
+    tt = T.parse_type("PT_X", 8)
+    assert tt.guessed and not T.is_elementary(tt) and T.is_elementary(T.parse_type("ARRAY [0..1] OF INT"))
+    assert not T.parse_type("E_X", 2, 18).guessed and T.parse_type("E_X", 2, 18).ctype is T.C.PLCTYPE_UINT
+    tbl = {"fb_x": DtEntry("FB_X", "", 64, 0, 65, 0, "", [], [DtEntry("n", "INT", 2, 0, 2, 0, "")], {}, {}),
+           "pt_x": DtEntry("PT_X", "POINTER TO FB_X", 8, 0, 21, 0, "")}
+    ts = TypeSystem(tbl)
+    raw = (0xFFFF980150088F40).to_bytes(8, "little") + bytes(8)
+    assert ts.decode_tree(raw, "PT_X", size=8) == "0xFFFF980150088F40"
+    assert ts.decode_tree(raw, "ARRAY [0..1] OF PT_X", size=16) == ["0xFFFF980150088F40", "0x0000000000000000"]

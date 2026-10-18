@@ -84,20 +84,57 @@ class SerialWorker:
             af.add_done_callback(lambda f: f.cancelled() or f.exception())    # retrieved: no "never retrieved" noise
             return await asyncio.wait_for(asyncio.shield(af), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
-            # R6: a job that never started is withdrawn (it must not run later, unobserved) and the caller learns
-            # what the worker is busy with; only a job that is running gets the cooperative stop request — a queued
-            # job's timeout used to cancel whatever else was running
-            if fut.cancel():
-                cur = self.current
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
-                raise WorkerBusy(self.name, getattr(fn, "__name__", "job"), cur[0] if cur else None,
-                                 (time.monotonic() - cur[1]) if cur else None, self._q.qsize()) from None
-            if fut.done() and not isinstance(exc, asyncio.CancelledError):
-                return fut.result()          # finished right at the timeout: the answer (or its error) is there
-            if not fut.done():
-                self.cancel_event.set()
-            raise
+            return self._given_up(fn, fut, exc)
+
+    def _given_up(self, fn: Callable[..., Any], fut: cf.Future, exc: BaseException) -> Any:
+        # R6: a job that never started is withdrawn (it must not run later, unobserved) and the caller learns
+        # what the worker is busy with; only a job that is running gets the cooperative stop request — a queued
+        # job's timeout used to cancel whatever else was running
+        if fut.cancel():
+            cur = self.current
+            if isinstance(exc, asyncio.CancelledError):
+                raise exc
+            raise WorkerBusy(self.name, getattr(fn, "__name__", "job"), cur[0] if cur else None,
+                             (time.monotonic() - cur[1]) if cur else None, self._q.qsize()) from None
+        if fut.done() and not isinstance(exc, asyncio.CancelledError):
+            return fut.result()          # finished right at the timeout: the answer (or its error) is there
+        if not fut.done():
+            self.cancel_event.set()
+        raise exc
+
+    async def run_watched(self, fn: Callable[..., Any], *args: Any, timeout: float | None = None,
+                          watch: Callable[[float], BaseException | None] | None = None, interval: float = 0.5,
+                          **kwargs: Any) -> Any:
+        """run(), and every `interval` s while the job RUNS (not while it waits behind another), watch(seconds it has
+        been running): an exception watch returns is raised at once with the job left running — nothing asks it to
+        stop — and its future on the exception as ``job_future`` (N85: a modal dialog the call opened holds it)."""
+        if watch is None:
+            return await self.run(fn, *args, timeout=timeout, **kwargs)
+        started: list[float] = []
+
+        def job() -> Any:
+            started.append(time.monotonic())
+            return fn(*args, **kwargs)
+        job.__name__ = getattr(fn, "__name__", "job")
+        fut = self.submit(job)
+        af = asyncio.wrap_future(fut)
+        af.add_done_callback(lambda f: f.cancelled() or f.exception())
+        t0 = time.monotonic()
+        try:
+            while True:
+                left = None if timeout is None else timeout - (time.monotonic() - t0)
+                if left is not None and left <= 0:
+                    raise asyncio.TimeoutError()
+                done, _pending = await asyncio.wait({af}, timeout=interval if left is None else min(interval, left))
+                if done:
+                    return af.result()
+                if started and not fut.done():
+                    stop = watch(time.monotonic() - started[0])
+                    if stop is not None:
+                        stop.job_future = fut  # type: ignore[attr-defined]
+                        raise stop
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            return self._given_up(fn, fut, exc)
 
     def call(self, fn: Callable[..., Any], *args: Any, timeout: float | None = None,
              **kwargs: Any) -> Any:

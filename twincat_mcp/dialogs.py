@@ -32,8 +32,22 @@ if IS_WIN:  # pragma: no cover
     import win32process  # type: ignore
 
 DIALOG_CLASS = "#32770"
+BS_TYPEMASK = 0x0F
+# N86: what answers a dialog. BS_PUSHBUTTON, BS_DEFPUSHBUTTON, BS_OWNERDRAW (drawn by the dialog, pressed like a
+# button), BS_SPLITBUTTON, BS_DEFSPLITBUTTON, BS_COMMANDLINK, BS_DEFCOMMANDLINK. Checkboxes, radio buttons and group
+# boxes are class "Button" too — clicking "Show status bar" would toggle an IDE setting, not answer the dialog.
+_PUSH_TYPES = frozenset({0x0, 0x1, 0xB, 0xC, 0xD, 0xE, 0xF})
+_OPTION_TYPES = frozenset({0x2, 0x3, 0x4, 0x5, 0x6, 0x9})      # check boxes, 3-state, radio buttons
+_NOT_AN_ANSWER = frozenset({"cancel", "abort", "stop", "close", "abbrechen"})
 NEVER_AUTO = ("activate", "run mode", "restart", "download", "login", "online change", "logout",
               "delete", "remove", "overwrite", "safety", "twinsafe", "reset", "boot project", "license")
+
+
+def button_kind(style: int) -> str:
+    """'push' (answers the dialog), 'option' (check box / radio button) or 'other' (group box …), from the
+    Button control's window style."""
+    t = style & BS_TYPEMASK
+    return "push" if t in _PUSH_TYPES else "option" if t in _OPTION_TYPES else "other"
 
 
 @dataclass
@@ -42,15 +56,24 @@ class Dialog:
     pid: int
     title: str
     text: str
-    buttons: list[tuple[int, str]] = field(default_factory=list)   # (hwnd, caption)
+    buttons: list[tuple[int, str]] = field(default_factory=list)   # (hwnd, caption) — push buttons only (N86)
+    options: list[str] = field(default_factory=list)               # check boxes / radio buttons: never clicked
 
     def to_dict(self) -> dict[str, Any]:
-        return {"hwnd": self.hwnd, "title": self.title, "text": self.text[:1000],
-                "buttons": [c for _, c in self.buttons], "machine_affecting": self.machine_affecting()}
+        d = {"hwnd": self.hwnd, "title": self.title, "text": self.text[:1000],
+             "buttons": [c for _, c in self.buttons], "machine_affecting": self.machine_affecting()}
+        if self.options:
+            d["options"] = self.options[:30]
+        return d
 
     def machine_affecting(self) -> bool:
         blob = f"{self.title} {self.text}".lower()
         return any(k in blob for k in NEVER_AUTO)
+
+    def awaits_answer(self) -> bool:
+        """A question or a message the shell waits on: a push button other than Cancel / Abort (a progress window
+        offers only those)."""
+        return any(c.lower() not in _NOT_AN_ANSWER for _h, c in self.buttons)
 
 
 def _clean(caption: str) -> str:
@@ -75,18 +98,23 @@ def list_dialogs(pid: int | None) -> list[Dialog]:  # pragma: no cover - needs W
             title = win32gui.GetWindowText(hwnd)
             texts: list[str] = []
             buttons: list[tuple[int, str]] = []
+            options: list[str] = []
 
             def on_child(ch: int, _a: Any) -> bool:
                 cls = win32gui.GetClassName(ch)
                 txt = win32gui.GetWindowText(ch)
                 if cls == "Button" and txt:
-                    buttons.append((ch, _clean(txt)))
+                    kind = button_kind(win32gui.GetWindowLong(ch, win32con.GWL_STYLE))
+                    if kind == "push":
+                        buttons.append((ch, _clean(txt)))
+                    elif kind == "option":
+                        options.append(_clean(txt))
                 elif cls in ("Static", "RichEdit20W", "Edit", "SysLink") and txt:
                     texts.append(txt)
                 return True
 
             win32gui.EnumChildWindows(hwnd, on_child, None)
-            found.append(Dialog(hwnd, wpid, title, "\n".join(texts), buttons))
+            found.append(Dialog(hwnd, wpid, title, "\n".join(texts), buttons, options))
         except Exception:  # noqa: BLE001
             pass
         return True

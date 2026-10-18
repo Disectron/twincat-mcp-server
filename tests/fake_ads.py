@@ -47,6 +47,7 @@ SYMBOLS: list[tuple[str, str, int, Any, int]] = [
     ("PRG_Test.eCmd", "E_FillState", 2, 0, 0),
     ("PRG_Test.ipThing", "I_Thing", 8, -114343974404328, 0),          # interface NOT recognisable in the datatype table
     ("PRG_Test.aThings", "ARRAY [1..2] OF I_Thing", 16, [0, -114343974404328], 0),
+    ("PRG_Test.pAlias", "PT_Int", 8, -114343571583168, 0),           # N50: TYPE PT_Int : POINTER TO INT (0xFFFF980150088F40)
 ]
 
 
@@ -70,6 +71,7 @@ DATATYPES = [
     _dt("ARRAY [0..1] OF INT", "INT", 4, dtype=2, dims=[(0, 2)]),
     _dt("I_Module", "", 8, dtype=65, flags=0x800),                 # METHODINFOS, no members, pointer-sized → interface
     _dt("POINTER TO INT", "INT", 8, dtype=21),
+    _dt("PT_Int", "POINTER TO INT", 8, dtype=21),
     _dt("ARRAY [0..7] OF BOOL", "BOOL", 8, dtype=33, dims=[(0, 8)]),
 ]
 DATATYPE_BLOB = b"".join(encode_entry(e) for e in DATATYPES)

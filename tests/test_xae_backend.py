@@ -298,15 +298,58 @@ def test_pou_get_set_create(xae):
         be.pou_create("TIPC^Plc^Plc Project^POUs", "X", "thing")
 
 
+def test_n80_a_property_is_created_with_its_accessors(xae):
+    """N80: kind='property' made a property without Get/Set (C0373); property_get with vInfo 1 (Int32) was refused
+    ("vInfo (Type: Int32) is not supported for creating TREEITEMTYPE_PLCPROPGET"): the language goes as text."""
+    be, dte, sm = xae
+    fb = sm.items["TIPC^Plc^Plc Project^POUs"]
+    r = be.pou_create("TIPC^Plc^Plc Project^POUs", "Speed", "property", return_type="LREAL", access="PUBLIC")
+    assert fb.created[-1][1:] == (611, "", ["1", "LREAL", "PUBLIC"])
+    prop = fb._children[-1]
+    assert [(c[0], c[1], c[3]) for c in prop.created] == [("Get", 613, ["1"]), ("Set", 614, ["1"])]
+    assert r["accessors"] == ["TIPC^Plc^Plc Project^POUs^Speed^Get", "TIPC^Plc^Plc Project^POUs^Speed^Set"]
+    be.pou_create("TIPC^Plc^Plc Project^POUs", "Ro", "property", return_type="INT", accessors="get")
+    assert [c[1] for c in fb._children[-1].created] == [613]
+    sm.items["TIPC^Plc^Plc Project^POUs^Speed"] = prop
+    be.pou_create("TIPC^Plc^Plc Project^POUs^Speed", "Set", "property_set", access="PROTECTED")
+    assert prop.created[-1][1:] == (614, "", ["1", "PROTECTED"])
+    be.pou_create("TIPC^Plc^Plc Project^POUs", "Pos", "itf_property", return_type="LREAL")
+    assert [(c[1], c[3]) for c in fb._children[-1].created] == [(654, None), (655, None)]
+    with pytest.raises(X.XaeError, match="accessors must name get and/or set"):
+        be.pou_create("TIPC^Plc^Plc Project^POUs", "Bad", "property", accessors="")
+    # an accessor that cannot be created: the half-made property goes again (all or nothing)
+    real = X.XaeBackend._create_child
+
+    def flaky(self, parent, name, sub, before, info):
+        if sub == 614:
+            raise X.XaeError("CreateChild Set: refused")
+        return real(self, parent, name, sub, before, info)
+    import types as _t
+    be._create_child = _t.MethodType(flaky, be)
+    with pytest.raises(X.XaeError, match="creating its Set accessor failed.*was deleted again"):
+        be.pou_create("TIPC^Plc^Plc Project^POUs", "Half", "property", return_type="BOOL")
+    assert fb.deleted[-1] == "Half"
+
+
 def test_plcopen_and_boot(xae, tmp_path):
     be, dte, sm = xae
     f = tmp_path / "x.xml"; f.write_text("<project/>")
-    be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
-    assert sm.items["TIPC^Plc^Plc Project"].imported == [(str(f), 2)]
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    # TE1000 PLCIMPORTOPTIONS: REPLACE 1 (2 is RENAME — what produced the renamed copies of R15 / N38); a test double
+    # has no type library, so the enum page decides and the result says so
+    assert sm.items["TIPC^Plc^Plc Project"].imported == [(str(f), 1)]
+    assert r["option_value"]["value"] == 1 and "enum page" in r["option_value"]["from"]
+    be.plcopen_import("TIPC^Plc^Plc Project", str(f), "rename")
+    assert sm.items["TIPC^Plc^Plc Project"].imported[-1] == (str(f), 2)
     with pytest.raises(X.XaeError, match="not found"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(tmp_path / "missing.xml"))
     be.plcopen_export("TIPC^Plc^Plc Project", ["POUs.MAIN", "POUs.FB_Fill"], str(tmp_path / "out.xml"))
     assert sm.items["TIPC^Plc^Plc Project"].exported[1] == "POUs.MAIN;POUs.FB_Fill"
+    (tmp_path / "exists.xml").write_text("x")           # TE1000: PlcOpenExport refuses an existing file / missing folder
+    with pytest.raises(X.XaeError, match="does not overwrite"):
+        be.plcopen_export("TIPC^Plc^Plc Project", ["POUs.MAIN"], str(tmp_path / "exists.xml"))
+    with pytest.raises(X.XaeError, match="does not exist"):
+        be.plcopen_export("TIPC^Plc^Plc Project", ["POUs.MAIN"], str(tmp_path / "nope" / "o.xml"))
     # R14: the boot project belongs to ITcPlcProject = 'TIPC^Plc' (Beckhoff AI docs); either path form is accepted
     r = be.boot_project("TIPC^Plc^Plc Project", True, True)
     assert r["path"] == "TIPC^Plc" and r["autostart"] and sm.items["TIPC^Plc"].generated == [False]
@@ -865,3 +908,74 @@ def test_n10_retest_outer_and_nested_node_are_one_plc_project(xae):
     assert pj["projects"][0]["plc_project_path"] == "TIPC^Plc^Plc Project"           # the nested node's fields kept
     r = be.plc_action("login")
     assert r["method"] == "ConsumeXml LoginCmd" and dte.commands == []               # no DTE fallback, no wait
+
+
+def test_te1000_itcplconline_is_the_first_route_and_its_state_is_read_back(xae):
+    """TE1000 ITcPlcOnline: Login(PLC_LOGIN_FLAGS) / Logoff / Start / Stop / Reset(PLC_RESET_TYPE) on the nested
+    project — documented, acts on this project, no shell command; IsLoggedIn / OnlineApplicationState read back."""
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    calls = []
+    proj.IsLoggedIn, proj.OnlineApplicationState = False, 2
+
+    def login(flags):
+        calls.append(("Login", flags))
+        proj.IsLoggedIn = True
+    proj.Login = login
+    proj.Logoff = lambda: calls.append(("Logoff",)) or setattr(proj, "IsLoggedIn", False)
+    proj.Start = lambda: calls.append(("Start",)) or setattr(proj, "OnlineApplicationState", 1)
+    proj.Stop = lambda: calls.append(("Stop",))                 # returns, but the application keeps running
+    proj.Reset = lambda t: calls.append(("Reset", t))
+    r = be.plc_action("download")
+    assert r["method"] == "ITcPlcOnline" and calls[-1] == ("Login", 4) and r["after"]["logged_in"] is True
+    assert be.plc_action("start")["after"]["application_state"] == "run"
+    be.plc_action("reset_origin")
+    assert calls[-1] == ("Reset", 2)
+    r = be.plc_action("stop")                                   # not proven: the next route, and why
+    assert r.get("method") != "ITcPlcOnline" and "the application is run" in str(r.get("automation_interface"))
+    assert be.plc_action("logout")["after"]["logged_in"] is False
+
+
+def test_n82_check_all_objects_reads_only_its_own_messages_and_its_result(xae):
+    """N82: the items came from the whole Output pane (2000 lines) and an Error List never cleared: a deleted
+    property's warning stayed, a recurring warning grew by one per run. Now: Error List cleared, only the Build pane
+    lines after a marker, CheckAllObjects' own result; a failed check (E_FAIL) is a result, not a reason to rerun."""
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    old = "1>C:\\P\\Plc\\POUs\\FB_X.TcPOU(12,3): warning C0373: Property 'Position' defines neither a get nor a set accessor"
+    dte._output = old
+    proj.CheckAllObjects = lambda: (setattr(dte, "_output", old + "\nnew line: no issues") or True)
+    r = be.check_all_objects()
+    assert r["passed"] is True and not any("Position" in str(i) for i in r["items"]), r
+
+    def fail():
+        dte._output += "\n1>C:\\P\\Plc\\POUs\\FB_Y.TcPOU(3,1): error C0046: Identifier 'x' not defined"
+        raise ComError(-2147467259, "Check all objects failed")
+    proj.CheckAllObjects = fail
+    dte.commands.clear()
+    r = be.check_all_objects()
+    assert r["passed"] is False and dte.commands == [] and [i["description"][:5] for i in r["items"]] == ["Ident"]
+
+
+def test_n81_a_graphical_body_is_named_from_the_language_before_any_text(xae):
+    be, dte, sm = xae
+    tree = {"_it": type("I", (), {"Language": 1})(), "kids": {
+        "Act": {"_it": type("I", (), {"Language": 5})(), "kids": {}}}}
+    assert X.XaeBackend._non_st_language(tree, "POUs^FB_A") == "POUs^FB_A^Act (CFC)"
+    assert X.XaeBackend._non_st_language({"_it": type("I", (), {"Language": 0})(), "kids": {}}, "GVL") is None
+
+
+def test_silent_mode_is_on_only_during_a_confirmed_command(xae):
+    be, dte, sm = xae
+    settings = type("S", (), {"SilentMode": False})()
+    seen = []
+    dte.GetObject = lambda name: settings if name == "TcAutomationSettings" else None
+    be.cfg.silent_mode = True
+    real = sm.ActivateConfiguration
+    sm.ActivateConfiguration = lambda: seen.append(settings.SilentMode) or real()
+    r = be.activate_configuration()
+    assert seen == [True] and settings.SilentMode is False and r["silent_mode"] is True
+    be.cfg.silent_mode = False
+    seen.clear()
+    be.activate_configuration()
+    assert seen == [False]

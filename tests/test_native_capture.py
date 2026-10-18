@@ -869,3 +869,17 @@ def test_r43_recorder_passes_the_table_version_and_reports_a_change(rec):
         rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=1,
                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10,
                   cycle_counter=None)
+
+
+def test_n84_rows_before_the_window_are_counted_apart_and_skipped_by_readers(capture_exe, tmp_path):
+    """N84 (live 0.8.10): blocks started at 0 / 1 / 2 ms, the window at 2 ms; the rows before it were counted in their
+    blocks (5,003 / 5,002 / 5,001) under a COMPLETE label. They stay in the file, counted apart; readers skip them."""
+    r, f = _run(capture_exe, tmp_path, "n84", TWO, duration_s=1, sim={"speed": 20, "late": [[1, 2]]})
+    assert r["ok"], r
+    assert f["window_start_ms"] == 2.0 and f["rows_before_window"] == 2, f
+    blocks = {b["id"]: b["samples"] for b in f["blocks"]}
+    assert blocks[0] == blocks[1] and f["samples"] == 2 * blocks[0] and f["missing_samples"] == 0, f
+    path = tmp_path / "n84.jsonl"
+    assert sum(1 for t, _k, _b in _rows(path) if t < 2.0) == 2          # in the file as delivered
+    ts = [t for t, _n, _v in R.iter_events(path, None)]
+    assert ts and min(ts) == 2.0                                        # not part of the recording

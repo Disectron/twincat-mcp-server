@@ -18,19 +18,21 @@ matches ``cfg.solution_path``; else the first one. Launching a new shell is
 opt-in (``attach_only=False`` or ``xae_attach(launch=True)``).
 
 Tree paths use Beckhoff syntax: ``TIPC^PlcName^PlcName Project^POUs^MAIN``.
-Common roots: TIID (I/O), TIPC (PLC), TIRT (tasks), TIRC (real-time settings), TIRR (routes),
-TINC (NC), TIRS (safety).
+Common roots (LookupTreeItem shortcuts): TIIC (I/O Configuration), TIID (I/O Devices), TIRC (Real-Time Configuration),
+TIRT (its Additional Tasks), TIRS (its Real-Time Settings), TIRR (its Route Settings), TIPC (PLC Configuration),
+TINC (NC Configuration).
 """
 from __future__ import annotations
 
 import logging
+import contextlib
 import os
 import re
 import sys
 import time
 from pathlib import Path
 import xml.etree.ElementTree as ET
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .config import XaeConfig
 from .dialogs import DialogWatchdog
@@ -70,9 +72,23 @@ POU_SUBTYPE = {
     "itf_method": 610, "property": 611, "itf_property": 612, "property_get": 613,
     "property_set": 614, "gvl": 615, "transition": 616, "interface": 618,
     "visualization": 619, "alias": 623, "parameter_list": 629,
+    "itf_property_get": 654, "itf_property_set": 655,
 }
+# N80: CreateChild(611 / 612) makes a property with no accessor (C0373 "defines neither a get nor a set accessor");
+# the accessors are children of their own sub types (Infosys tc3_automationinterface "Creating PLC objects")
+_ACCESSOR_SUBTYPE = {("property", "get"): 613, ("property", "set"): 614,
+                     ("itf_property", "get"): 654, ("itf_property", "set"): 655}
 
-TREEITEMTYPE_PLCAPP = 56          # the nested "<Name> Project" node of a PLC project (ITcPlcIECProject)
+TREEITEMTYPE_PLCPROJECTDEF = 56   # the nested "<Name> Project" node of a PLC project (ITcPlcIECProject); TE1000 name
+TREEITEMTYPE_PLCAPP = TREEITEMTYPE_PLCPROJECTDEF   # the name this module used before (600 is TREEITEMTYPE_PLCAPP)
+# TE1000 PLCIMPORTOPTIONS enum page (tc3_automationinterface/21842779147): REPLACE 1, RENAME 2. The older article
+# (242732427) lists Rename 1 / Replace 2 — and 2 gave renamed copies at the project root in the field (R15 / N38),
+# which is rename. The live type library decides when it is readable (_import_options).
+_DOC_IMPORT_OPTIONS = {"none": 0, "replace": 1, "rename": 2, "skip": 3}
+# ITcPlcOnline (TE1000 21841270795): PLC_LOGIN_FLAGS, PLC_RESET_TYPE, PLC_APPSTATE
+_LOGIN_FLAGS = {"login": 1, "online_change": 2, "download": 4}      # REGULAR, FORCEONLINECHANGE, FORCEDOWNLOAD
+_RESET_TYPE = {"reset_cold": 1, "reset_origin": 2}
+_APP_STATE = {1: "run", 2: "stop", 3: "halted on breakpoint", -1: "unknown"}
 PLC_PROJECT_FOLDERS = ("POUs", "DUTs", "GVLs", "VISUs", "References", "External Types", "PlcTask")
 
 PLC_LOGIN_COMMANDS = {
@@ -537,7 +553,7 @@ class XaeBackend:
             pass
         return None
 
-    def _error_items(self, view_copy: bool = False) -> tuple[list[dict[str, Any]], str]:
+    def _error_items(self, view_copy: bool = False, pane_from: int | None = None) -> tuple[list[dict[str, Any]], str]:
         """Return (items, source). D20: the Error List is what the operator sees, so it is read first and by every
         route there is — DTE2.ToolWindows.ErrorList (late-bound: the cached 7.0 gen_py wrapper has no ToolWindows),
         the ErrorList window object, and when those report nothing a copy of the Error List view itself (its
@@ -573,7 +589,14 @@ class XaeBackend:
             except Exception:  # noqa: BLE001
                 pass
         try:
-            out = _parse_build_output(self.build_output(tail_lines=2000)["text"])
+            bo = self.build_output(tail_lines=2000)
+            text = bo["text"]
+            if pane_from is not None and bo.get("total_lines") is not None:
+                # only what was written after the marker (the tail holds the last min(total, 2000) lines)
+                lines = text.splitlines()
+                new = max(0, int(bo["total_lines"]) - int(pane_from))
+                text = "\n".join(lines[-new:]) if new else ""
+            out = _parse_build_output(text)
         except Exception:  # noqa: BLE001
             out = []
         seen = {(i.get("description", "").strip(), str(i.get("file", "")).lower(), int(i.get("line") or 0)) for i in found}
@@ -638,9 +661,16 @@ class XaeBackend:
             "project": g("Project"),
         }
 
-    def errors(self, view_copy: bool = False) -> dict[str, Any]:
-        items, source = self._error_items(view_copy)
+    def errors(self, view_copy: bool = False, pane_from: int | None = None) -> dict[str, Any]:
+        items, source = self._error_items(view_copy, pane_from)
         return {"count": len(items), "source": source, "items": items}
+
+    def _pane_lines(self) -> int | None:
+        """How many lines the Build output pane holds now (a marker: what comes after is the next command's)."""
+        try:
+            return int(self.build_output(tail_lines=1).get("total_lines"))
+        except Exception:  # noqa: BLE001
+            return None
 
     def build_output(self, tail_lines: int = 200) -> dict[str, Any]:
         dte = self._need()
@@ -774,6 +804,63 @@ class XaeBackend:
     _PLC_ONLINE_XML = {"login": "LoginCmd", "logout": "LogoutCmd", "start": "StartCmd", "stop": "StopCmd",
                        "reset_cold": "ResetColdCmd", "reset_origin": "ResetOriginCmd"}
 
+    @contextlib.contextmanager
+    def silent(self, what: str) -> Iterator[dict[str, Any]]:
+        """xae.silent_mode: TcAutomationSettings.SilentMode on for one confirmed machine command, back after it."""
+        note: dict[str, Any] = {}
+        settings = prev = None
+        if self.cfg.silent_mode and self.dte is not None:
+            try:
+                settings = self.dte.GetObject("TcAutomationSettings")
+                prev = bool(settings.SilentMode)
+                settings.SilentMode = True
+                note["silent_mode"] = True
+            except Exception as exc:  # noqa: BLE001
+                settings = None
+                note["silent_mode"] = f"not available ({_com_msg(exc) if hasattr(exc, 'hresult') else exc})"
+        try:
+            yield note
+        finally:
+            if settings is not None:
+                try:
+                    settings.SilentMode = prev
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s: SilentMode could not be switched back to %s: %s", what, prev, exc)
+
+    def _online_state(self, it: Any) -> dict[str, Any]:
+        st = _try(lambda: int(it.OnlineApplicationState))
+        return {"logged_in": _try(lambda: bool(it.IsLoggedIn)),
+                "application_state": _APP_STATE.get(st, st) if st is not None else None}
+
+    def _plc_online(self, target: str, action: str) -> dict[str, Any] | None:
+        """ITcPlcOnline on the nested project (TE1000): Login(flags) / Logoff / Start / Stop / Reset(type), the state
+        read back after it. None when the project does not offer it (older XAE) — the other routes then apply."""
+        it = self._item(target)
+        if not _has_prop(it, "IsLoggedIn"):
+            return None
+        before = self._online_state(it)
+        if action in _LOGIN_FLAGS:
+            if before["logged_in"] and action == "download":
+                return None              # logged in already: a download is the shell's PLC.Download (DTE route)
+            self._retry(lambda: _com_call(it, "Login", _LOGIN_FLAGS[action]), f"ITcPlcOnline.Login({action})")
+        elif action == "logout":
+            self._retry(lambda: _com_call(it, "Logoff"), "ITcPlcOnline.Logoff")
+        elif action in ("start", "stop"):
+            self._retry(lambda: _com_call(it, action.capitalize()), f"ITcPlcOnline.{action.capitalize()}")
+        elif action in _RESET_TYPE:
+            self._retry(lambda: _com_call(it, "Reset", _RESET_TYPE[action]), f"ITcPlcOnline.Reset({action})")
+        else:
+            return None
+        after = self._online_state(it)
+        want_in = {"login": True, "online_change": True, "download": True, "logout": False}.get(action)
+        if want_in is not None and after["logged_in"] is not None and after["logged_in"] != want_in:
+            raise XaeError(f"ITcPlcOnline: {action} returned, but IsLoggedIn is {after['logged_in']} afterwards")
+        want_state = {"start": "run", "stop": "stop"}.get(action)
+        if want_state and after["application_state"] not in (None, want_state):
+            raise XaeError(f"ITcPlcOnline: {action} returned, but the application is {after['application_state']}")
+        return {"action": action, "method": "ITcPlcOnline", "project": target, "ok": True, "before": before,
+                "after": after}
+
     def plc_action(self, action: str, plc_project_path: str | None = None) -> dict[str, Any]:
         """login/logout/start/stop/reset_cold/reset_origin/download. N41: the PLC project is resolved ONCE — the
         named one, or the only one — and every route acts on exactly that project; with several and none named
@@ -806,16 +893,27 @@ class XaeBackend:
         # for a call (and a token) about PlcB
         single = len(all_projects) == 1 and all_projects[0].lower() == target.lower()
         ai_note = ""
+        # TE1000 ITcPlcOnline first: documented for every action here, acts on this project, no shell command
+        try:
+            with self.silent(f"xae_plc {action}") as sn:
+                r = self._plc_online(target, action)
+            if r is not None:
+                return {**r, **sn}
+        except XaeError as exc:
+            ai_note = f"ITcPlcOnline on {target}: {str(exc)[:200]}"
         tag = self._PLC_ONLINE_XML.get(action)
         if tag:
             xml = (f"<TreeItem><IECProjectDef><OnlineSettings><Commands><{tag}>true</{tag}></Commands>"
                    "</OnlineSettings></IECProjectDef></TreeItem>")
             try:
                 it = self._item(target)
-                self._retry(lambda: it.ConsumeXml(xml), f"ConsumeXml {tag}")
-                return {"action": action, "method": f"ConsumeXml {tag}", "project": target, "ok": True}
+                self._consume(it, xml, f"ConsumeXml {tag}")
+                out = {"action": action, "method": f"ConsumeXml {tag}", "project": target, "ok": True}
+                if ai_note:
+                    out["automation_interface"] = ai_note
+                return out
             except XaeError as exc:
-                ai_note = f"ConsumeXml {tag} on {target}: {str(exc)[:200]}"
+                ai_note = (ai_note + "; " if ai_note else "") + f"ConsumeXml {tag} on {target}: {str(exc)[:200]}"
         key = _cmd_key(target_name)
         tried: list[dict[str, str]] = []
         selected = None
@@ -892,14 +990,16 @@ class XaeBackend:
     def activate_configuration(self) -> dict[str, Any]:
         sm = self._sm()
         t0 = time.time()
-        self._retry(lambda: sm.ActivateConfiguration(), "ActivateConfiguration")
+        with self.silent("ActivateConfiguration") as sn:
+            self._retry(lambda: sm.ActivateConfiguration(), "ActivateConfiguration")
         return {"activated": True, "target": sm.GetTargetNetId(), "duration_s": round(time.time() - t0, 1),
-                "note": "Configuration is on the target. Call xae_restart_twincat to switch it to RUN."}
+                "note": "Configuration is on the target. Call xae_restart_twincat to switch it to RUN.", **sn}
 
     def restart_twincat(self) -> dict[str, Any]:
         sm = self._sm()
         t0 = time.time()
-        self._retry(lambda: sm.StartRestartTwinCAT(), "StartRestartTwinCAT")
+        with self.silent("StartRestartTwinCAT"):      # TE1000: "in UI builds a confirmation dialog appears first"
+            self._retry(lambda: sm.StartRestartTwinCAT(), "StartRestartTwinCAT")
         started = None
         for _ in range(60):
             try:
@@ -1002,9 +1102,19 @@ class XaeBackend:
         xml = self._retry(lambda: it.ProduceXml(False), f"ProduceXml {path}")
         return {"path": path, "xml": xml}
 
+    def _consume(self, it: Any, xml: str, what: str) -> None:
+        """ConsumeXml; a refusal carries ITcSmTreeItem.GetLastXmlError (TE1000), which says what in the XML failed."""
+        try:
+            self._retry(lambda: it.ConsumeXml(xml), what)
+        except XaeError as exc:
+            detail = _try(lambda: str(_com_call(it, "GetLastXmlError") or "")) if _has_member(it, "GetLastXmlError") else None
+            if detail:
+                raise XaeError(f"{exc} — GetLastXmlError: {detail[:600]}") from exc
+            raise
+
     def tree_consume_xml(self, path: str, xml: str) -> dict[str, Any]:
         it = self._item(path)
-        self._retry(lambda: it.ConsumeXml(xml), f"ConsumeXml {path}")
+        self._consume(it, xml, f"ConsumeXml {path}")
         return {"path": path, "consumed_bytes": len(xml)}
 
     def tree_set_values(self, path: str, assignments: dict[str, str]) -> dict[str, Any]:
@@ -1106,10 +1216,18 @@ class XaeBackend:
     def pou_create(self, parent_path: str, name: str, kind: str, language: str = "st",
                    return_type: str | None = None, extends: str | None = None,
                    implements: str | None = None, access: str | None = None,
-                   declaration: str | None = None, implementation: str | None = None) -> dict[str, Any]:
+                   declaration: str | None = None, implementation: str | None = None,
+                   accessors: str = "get,set") -> dict[str, Any]:
         kind_l = kind.lower()
         if kind_l not in POU_SUBTYPE:
             raise XaeError(f"kind must be one of {sorted(POU_SUBTYPE)}")
+        want_acc: list[str] = []
+        if kind_l in ("property", "itf_property"):
+            want_acc = [a.strip().lower() for a in (accessors or "").replace(";", ",").split(",") if a.strip()]
+            bad = [a for a in want_acc if a not in ("get", "set")]
+            if bad or not want_acc:
+                raise XaeError(f"accessors must name get and/or set (got {accessors!r}): a property without an accessor "
+                               "does not compile (C0373)")
         sub = POU_SUBTYPE[kind_l]
         lang = IEC_LANG.get(language.lower(), 1)
         info: Any
@@ -1128,8 +1246,13 @@ class XaeBackend:
             info = [str(lang), return_type or "", access or "PUBLIC"]
         elif kind_l == "property":
             info = [str(lang), return_type or "BOOL", access or "PUBLIC"]
-        elif kind_l in ("action", "transition", "property_get", "property_set"):
-            info = lang
+        elif kind_l in ("action", "transition"):
+            info = [str(lang)]                 # [0] IEC language as text, like every other vInfo array
+        elif kind_l in ("property_get", "property_set"):
+            # an Int32 here is refused: "vInfo (Type: Int32) is not supported for creating TREEITEMTYPE_PLCPROPGET"
+            info = [str(lang)] + ([access] if access else [])
+        elif kind_l in ("itf_property_get", "itf_property_set"):
+            info = None
         elif kind_l in ("enum", "struct", "union", "alias", "gvl", "parameter_list"):
             info = declaration if declaration else None
         elif kind_l == "interface":
@@ -1142,6 +1265,22 @@ class XaeBackend:
         child = self._create_child(parent, name, sub, "", info)
         created = self._item_dict(child)
         path = created.get("PathName") or f"{parent_path}^{name}"
+        if want_acc:
+            made: list[str] = []
+            try:
+                for acc in want_acc:
+                    acc_info = [str(lang)] if kind_l == "property" else None
+                    ach = self._create_child(child, acc.capitalize(), _ACCESSOR_SUBTYPE[(kind_l, acc)], "", acc_info)
+                    made.append(self._item_dict(ach).get("PathName") or f"{path}^{acc.capitalize()}")
+            except XaeError as exc:
+                # all or nothing: the property this call made goes again rather than stay without accessors
+                try:
+                    self._retry(lambda: parent.DeleteChild(name), f"DeleteChild {name}")
+                    undo = f"the property {path} this call created was deleted again"
+                except XaeError as exc2:
+                    undo = f"the property {path} is left WITHOUT accessors (deleting it failed: {exc2}) — delete it"
+                raise XaeError(f"{kind_l} {name}: creating its {acc.capitalize()} accessor failed ({exc}); {undo}") from exc
+            created["accessors"] = made
         if declaration is not None and kind_l not in ("enum", "struct", "union", "alias", "gvl", "parameter_list"):
             self._set_text(child, declaration, None)
         if implementation is not None:
@@ -1159,14 +1298,25 @@ class XaeBackend:
                 it.ImplementationText = implementation
             self._retry(_si, "ImplementationText set")
 
+    def _import_options(self, it: Any) -> tuple[dict[str, int], str]:
+        """PLCIMPORTOPTIONS as the live type library defines them; else the TE1000 enum page (see _DOC_IMPORT_OPTIONS)."""
+        vals = _typelib_enum(it, "PLCIMPORTOPTIONS")
+        if vals:
+            m = {k.upper().removeprefix("PLCIMPORTOPTIONS_").lower(): int(v) for k, v in vals.items()}
+            m = {k: v for k, v in m.items() if k in _DOC_IMPORT_OPTIONS}
+            if len(m) == 4:
+                return m, "type library (PLCIMPORTOPTIONS)"
+        return dict(_DOC_IMPORT_OPTIONS), ("TE1000 enum page PLCIMPORTOPTIONS (REPLACE 1, RENAME 2; the type library "
+                                           "was not readable)")
+
     def plcopen_import(self, plc_project_path: str, xml_file: str, option: str = "none") -> dict[str, Any]:
-        opts = {"none": 0, "rename": 1, "replace": 2, "skip": 3}
-        if option not in opts:
-            raise XaeError(f"option must be one of {list(opts)}")
+        if option not in _DOC_IMPORT_OPTIONS:
+            raise XaeError(f"option must be one of {list(_DOC_IMPORT_OPTIONS)}")
         if not os.path.isfile(xml_file):
             raise XaeError(f"PLCopen XML not found: {xml_file}")
         plc_project_path = _plc_split(plc_project_path)[1]          # R14: PLCopen lives on '<Name> Project'
         it = self._item(plc_project_path)
+        opts, opt_src = self._import_options(it)
         names = _plcopen_names(xml_file)
 
         def snapshot() -> dict[str, str] | None:
@@ -1189,7 +1339,8 @@ class XaeBackend:
         except XaeError:
             self._retry(lambda: it.PlcOpenImport(xml_file, opts[option]), "PlcOpenImport")
         after = snapshot()
-        res: dict[str, Any] = {"imported": xml_file, "into": plc_project_path, "option": option, "objects_in_file": names}
+        res: dict[str, Any] = {"imported": xml_file, "into": plc_project_path, "option": option, "objects_in_file": names,
+                               "option_value": {"value": opts[option], "from": opt_src}}
         if after is None and option == "replace":
             # N44: a normal result here read as success while renamed copies (PRG_X_1) may sit at the project root
             raise XaeError(f"PlcOpenImport(replace) ran, but the objects of {plc_project_path} could not be listed "
@@ -1289,6 +1440,12 @@ class XaeBackend:
             dst = self._text_tree(self._item(orig_path), orig_path)
         except XaeError as exc:
             raise _ReplaceError(f"could not read the texts ({exc}) — nothing written") from exc
+        graphic = self._non_st_language(src, orig_path)
+        if graphic:
+            # N81: ITcPlcImplementation.Language (TE1000) says it before any text is compared: a graphical body is not
+            # in ImplementationText (for those it returns the XML archive), so it cannot be moved as text
+            raise _ReplaceError(f"{graphic}: a body that is not ST text cannot be moved from the copy as text, nor "
+                                "checked — nothing written; the copy holds the imported version")
         diff = _tree_diff(src, dst, orig_path)
         if diff:
             raise _ReplaceError(f"{diff} — nothing written")
@@ -1371,6 +1528,21 @@ class XaeBackend:
                 out["kids"][nm] = self._text_tree(c, f"{where}^{nm}", depth + 1)
         return out
 
+    @staticmethod
+    def _non_st_language(tree: dict[str, Any], where: str) -> str | None:
+        """'<path> (CFC)' for the first object of a text tree whose ITcPlcImplementation.Language is neither none nor
+        ST, or None (also when the property is not offered)."""
+        it = tree.get("_it")
+        lang = _try(lambda: int(it.Language)) if it is not None and _has_prop(it, "Language") else None
+        if lang not in (None, 0, 1):
+            names = {v: k.upper() for k, v in IEC_LANG.items()}
+            return f"{where} ({names.get(lang, 'UML' if lang in (7, 8, 9) else f'language {lang}')})"
+        for nm, sub in (tree.get("kids") or {}).items():
+            m = XaeBackend._non_st_language(sub, f"{where}^{nm}")
+            if m:
+                return m
+        return None
+
     def _write_tree(self, src: dict[str, Any], dst: dict[str, Any]) -> None:
         """Write src's texts into dst's items, every level (same child names, checked before)."""
         self._set_text(dst["_it"], src["decl"], src["impl"])
@@ -1381,6 +1553,12 @@ class XaeBackend:
         plc_project_path = _plc_split(plc_project_path)[1]          # R14: 'TIPC^X' raised AttributeError
         it = self._item(plc_project_path)
         sel = ";".join(items)
+        # TE1000 PlcOpenExport: an existing file or a missing folder is an ArgumentException — said here, plainly
+        if os.path.exists(xml_file):
+            raise XaeError(f"{xml_file} exists: PlcOpenExport does not overwrite — choose another file name")
+        folder = os.path.dirname(os.path.abspath(xml_file))
+        if not os.path.isdir(folder):
+            raise XaeError(f"the folder {folder} does not exist: create it first (PlcOpenExport does not)")
         self._retry(lambda: it.PlcOpenExport(xml_file, sel), "PlcOpenExport")
         return {"exported": items, "file": xml_file}
 
@@ -1465,13 +1643,25 @@ class XaeBackend:
             nested = self._nested_projects(plc_project_path)
         except Exception as exc:  # noqa: BLE001
             nested, ai_err = [], str(exc)[:160]
+        # N82: the items came from the whole Output pane and an Error List never cleared — a deleted object's warning
+        # was still reported, a recurring one counted once more per run. The Error List is cleared (as before a build)
+        # and only the Build pane lines written after this point are read
+        self._clear_error_list()
+        mark = self._pane_lines()
         if len(nested) == 1:
             it = self._item(nested[0])
             try:
-                self._retry(lambda: _com_call(it, "CheckAllObjects"), "ITcPlcIECProject2.CheckAllObjects")
+                ok = self._retry(lambda: _com_call(it, "CheckAllObjects"), "ITcPlcIECProject2.CheckAllObjects")
                 time.sleep(0.5)
-                return {"method": "ITcPlcIECProject2.CheckAllObjects", "project": nested[0], **self.errors()}
+                return {"method": "ITcPlcIECProject2.CheckAllObjects", "project": nested[0],
+                        "passed": bool(ok) if ok is not None else None, **self.errors(pane_from=mark)}
             except XaeError as exc:
+                if "0x80004005" in str(exc) or "E_FAIL" in str(exc):
+                    # TE1000: the check reports a failed check as an exception (Error_CheckAllObjectsFailed, E_FAIL) —
+                    # the check RAN: its findings are the result, not a reason to run it again through the shell
+                    time.sleep(0.5)
+                    return {"method": "ITcPlcIECProject2.CheckAllObjects", "project": nested[0], "passed": False,
+                            "check_error": str(exc)[:300], **self.errors(pane_from=mark)}
                 ai_err = str(exc)[:200]
         elif len(nested) > 1:
             ai_err = f"{len(nested)} PLC projects — name one with plc_project_path: {nested}"
@@ -1492,7 +1682,7 @@ class XaeBackend:
                 try:
                     self.command(c)
                     time.sleep(1.0)
-                    out = {"command": c, **self.errors()}
+                    out = {"command": c, **self.errors(pane_from=mark)}
                     if selected:
                         out["selected_node"] = selected
                     return out
@@ -1681,6 +1871,38 @@ def _measurement_scope(obj: Any) -> Any:
     except Exception:  # noqa: BLE001 — not a Scope node (data pool, chart, …) or no pywin32
         return None
     return ms if _has_member(ms, "StartRecord") else None
+
+
+def _typelib_enum(obj: Any, enum_name: str) -> dict[str, int] | None:
+    """{name: value} of an enum in the type library that defines this late-bound COM object's interface (what makepy
+    reads); None when it cannot be read (no type info, not Windows, a test double)."""
+    ole = getattr(obj, "_oleobj_", None)
+    if ole is None:
+        return None
+    try:
+        import pythoncom  # type: ignore
+        tlib, _ = ole.GetTypeInfo().GetContainingTypeLib()
+        for i in range(tlib.GetTypeInfoCount()):
+            if tlib.GetTypeInfoType(i) != pythoncom.TKIND_ENUM:
+                continue
+            if str(tlib.GetDocumentation(i)[0]).upper() != enum_name.upper():
+                continue
+            ti = tlib.GetTypeInfo(i)
+            out: dict[str, int] = {}
+            for j in range(ti.GetTypeAttr().cVars):
+                vd = ti.GetVarDesc(j)
+                out[str(ti.GetNames(vd.memid)[0])] = int(vd.value)
+            return out
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _has_prop(obj: Any, name: str) -> bool:
+    """Late-bound COM object exposes the property ``name``; a plain Python object has the attribute (tests)."""
+    if getattr(obj, "_oleobj_", None) is None:
+        return hasattr(obj, name)
+    return _has_member(obj, name)
 
 
 def _has_member(obj: Any, name: str) -> bool:

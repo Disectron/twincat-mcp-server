@@ -158,3 +158,20 @@ async def test_nothing_is_advertised_that_is_never_published(monkeypatch, projec
     assert res is None or not getattr(res, "subscribe", False)
     tools = getattr(caps, "tools", None)
     assert tools is None or not getattr(tools, "list_changed", False)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("source", ["local", "web"])
+async def test_r30_infosys_tools_describe_the_configured_source(monkeypatch, project_dir, source):
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir)
+    cfg.docs.source = source
+    srv = build_server(cfg)
+    async with Client(srv) as c:
+        desc = {t.name: t.description for t in (await c.list_tools()).tools if t.name.startswith("infosys_")}
+    text = " ".join(desc.values())
+    if source == "local":
+        assert "DuckDuckGo" not in text and "fetched live" not in text.lower() and "on first use" not in text
+        assert "local Help Viewer" in desc["infosys_search"] and "changes nothing" in desc["infosys_index"]
+    else:
+        assert "DuckDuckGo" in desc["infosys_search"] and "fetched live" in desc["infosys_get_page"]

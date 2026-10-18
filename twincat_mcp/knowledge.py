@@ -1352,18 +1352,19 @@ def builder_kind(f: Path, name: str) -> tuple[str, str | None]:
     return "other", None
 
 
-def record_plugin_location(home: Path, version: str) -> bool:
+def record_plugin_location(home: Path, version: str) -> str:
     """Write <home>/plugin_location.json (the shipped builders' folder and the plugin version) when it changed. The
-    builder stubs in <kb>\\tools find the current builders through it after every plugin update. -> written?"""
+    builder stubs in <kb>\\tools find the current builders through it after every plugin update. -> 'written',
+    'unchanged' (it already names these builders and this version) or why nothing was written."""
     b = builders_dir()
     if b is None:
-        return False
+        return "not written: the plugin's builders folder was not found"
     p = home / PLUGIN_POINTER
     data = {"builders": str(b), "version": version}
     try:
         cur = json.loads(p.read_text(encoding="utf-8"))
         if {k: cur.get(k) for k in data} == data:
-            return False
+            return "unchanged"
     except (OSError, ValueError):
         pass
     home.mkdir(parents=True, exist_ok=True)
@@ -1372,7 +1373,7 @@ def record_plugin_location(home: Path, version: str) -> bool:
                                "note": "read by the builder stubs in <kb>\\tools — written by the twincat MCP server"},
                               indent=1), encoding="utf-8")
     os.replace(tmp, p)
-    return True
+    return "written"
 
 
 def install_builder_stubs(loc: Path) -> dict[str, Any]:
@@ -1419,7 +1420,8 @@ def install_builder_stubs(loc: Path) -> dict[str, Any]:
 def sync_builder_stubs(home: Path, loc: Path | None, version: str) -> dict[str, Any]:
     """N68: the pointer first, then the stubs — a stub installed before the pointer is written would run whatever an
     old pointer (or the plugin cache) names. Used at every server start and by kb_set_location."""
-    res: dict[str, Any] = {"pointer_written": record_plugin_location(home, version)}
+    # 'unchanged' when it already names this version's builders (an info line of the 0.8.10 retest read false as a fault)
+    res: dict[str, Any] = {"pointer": record_plugin_location(home, version)}
     if loc is not None and (loc / "tools").is_dir():
         res["tools"] = install_builder_stubs(loc)
     return res

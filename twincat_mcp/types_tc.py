@@ -74,6 +74,7 @@ class TcType:
     dims: list[tuple[int, int]] | None = None   # array bounds
     elem: "TcType | None" = None
     opaque: bool = False      # True -> read raw bytes
+    guessed: bool = False     # N50: a name parse_type does not know, read by its size — not from the datatype table
 
     def describe(self) -> str:
         return self.name
@@ -107,9 +108,26 @@ def plc_string_bytes(text: str, size: int) -> bytes:
     return b.ljust(size, b"\x00")
 
 
-def parse_type(type_str: str, size: int | None = None) -> TcType:
+# ADS data type ids (ADST_*) → the ctype of a value of that id: what the runtime itself says a scalar is
+ADST_CTYPE = {2: (C.PLCTYPE_INT, "int"), 3: (C.PLCTYPE_DINT, "int"), 16: (C.PLCTYPE_SINT, "int"),
+              17: (C.PLCTYPE_USINT, "int"), 18: (C.PLCTYPE_UINT, "int"), 19: (C.PLCTYPE_UDINT, "int"),
+              20: (C.PLCTYPE_LINT, "int"), 21: (C.PLCTYPE_ULINT, "int"), 4: (C.PLCTYPE_REAL, "float"),
+              5: (C.PLCTYPE_LREAL, "float"), 33: (C.PLCTYPE_BOOL, "bool")}
+
+
+def is_elementary(tt: TcType) -> bool:
+    """A type parse_type decodes from its name alone: IEC elementary types, STRING/WSTRING, POINTER/REFERENCE TO,
+    arrays of those. Everything else (enums, aliases, structs, FBs, a name it does not know) is the datatype
+    table's to decode (N50: a size guess read TYPE PT_X : POINTER TO FB_X as a signed integer)."""
+    if tt.kind == "array":
+        return tt.elem is not None and is_elementary(tt.elem)
+    return tt.kind not in ("enum", "struct") and not tt.guessed
+
+
+def parse_type(type_str: str, size: int | None = None, data_type: int | None = None) -> TcType:
     """Resolve a TwinCAT type string. ``size`` (bytes, from symbol info) is
-    used for enums and to size opaque structs."""
+    used for enums and to size opaque structs. ``data_type``: the ADS data type id the runtime gives the symbol (or
+    the datatype table its leaf) — for a name parse_type does not know, the value is read as THAT, not guessed."""
     t = type_str.strip()
     up = t.upper()
     if up in _SCALARS:
@@ -140,12 +158,14 @@ def parse_type(type_str: str, size: int | None = None) -> TcType:
             # arrays of strings/structs: read raw and slice per element
             return TcType(t, None, "array", size, dims, elem, opaque=True)
         return TcType(t, elem.ctype * count, "array", (elem.size or 0) * count, dims, elem)
-    # enum or struct/alias: decide by size
+    # enum or struct/alias: the runtime's data type id when given, else by size (a guess, flagged)
+    if data_type in ADST_CTYPE and size in (1, 2, 4, 8) and ctypes.sizeof(ADST_CTYPE[data_type][0]) == size:
+        return TcType(t, ADST_CTYPE[data_type][0], "enum", size)
     if size in (1, 2, 4, 8) and not up.startswith("ST_") and not up.startswith("FB_"):
         # Most likely an enum (TwinCAT reports the enum type name). Base type
         # is INT unless declared otherwise; we read by size, signed.
         ct = {1: C.PLCTYPE_SINT, 2: C.PLCTYPE_INT, 4: C.PLCTYPE_DINT, 8: C.PLCTYPE_LINT}[size]
-        return TcType(t, ct, "enum", size)
+        return TcType(t, ct, "enum", size, guessed=True)
     return TcType(t, None, "struct", size, opaque=True)
 
 

@@ -212,3 +212,67 @@ def test_read_file_confined_to_project(project_dir, tmp_path):
         return
     with pytest.raises(ProjectError, match="outside the project"):
         idx.read_file("Plc/escape.ini")
+
+
+def test_n88_parallel_first_calls_see_one_complete_index(tmp_path, project_dir):
+    """N88: two ads_dump calls started together — one said 'no project configured' (alphabetical order): both scanned,
+    the second clearing the units while the first read them. One scan, read under the lock."""
+    import threading
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex
+    idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
+    scans = []
+    real = idx._scan
+    idx._scan = lambda root=None: (scans.append(1), real(root))[1]
+    got: list[set] = []
+
+    def call():
+        idx.ensure_fresh()
+        got.append(idx.unit_names("PROGRAM", "GVL"))
+    ts = [threading.Thread(target=call) for _ in range(6)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(scans) == 1 and len(got) == 6 and all(g == got[0] and g for g in got), (len(scans), got)
+
+
+def test_n88_readers_never_see_an_index_being_rebuilt(tmp_path, project_dir):
+    """N88 root: a scan cleared the published dict and re-filled it; refreshes changed it in place. A reader outside
+    the lock (codecheck, ads_dump, every proj_* tool) saw it empty, partial, or 'changed size during iteration'.
+    Scans and refreshes now build new containers and publish them whole."""
+    import os
+    import threading
+    import time as _t
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex
+    idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
+    full = idx.scan()["units"]
+    src = next(p for p in project_dir.rglob("*.TcPOU"))
+    stop = threading.Event()
+    bad: list[str] = []
+
+    def rescan():
+        n = 0
+        while not stop.is_set():
+            idx.scan() if n % 2 else (os.utime(src, (_t.time(), _t.time() + n)), idx.refresh())
+            n += 1
+
+    def read():
+        while not stop.is_set():
+            try:
+                k = sum(1 for _ in idx.units.values())
+            except RuntimeError as exc:
+                bad.append(str(exc))
+                return
+            if k != full:
+                bad.append(f"{k} of {full} units")
+                return
+    ts = [threading.Thread(target=rescan)] + [threading.Thread(target=read) for _ in range(3)]
+    for t in ts:
+        t.start()
+    _t.sleep(1.5)
+    stop.set()
+    for t in ts:
+        t.join()
+    assert not bad, bad[:3]
