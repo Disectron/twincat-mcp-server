@@ -289,7 +289,8 @@ class Acceptance:
             if not self.ads_ok:
                 self.log("      !! ADS not usable — router/target phases will be skipped. Fix this first (INSTALL.md §6 step 1).")
         await self.check(ph, "tc_safety_status", {}, lambda p: None if isinstance(p, dict) and p.get("mode") else "no mode")
-        await self.check(ph, "tc_request_confirmation", {"action": "acceptance_probe", "target": "none"},
+        # R2: tokens are only issued for real tool names — a token for deleting a recording that does not exist is harmless
+        await self.check(ph, "tc_request_confirmation", {"action": "rec_delete", "target": "acceptance-probe-none"},
                          lambda p: None if isinstance(p, dict) and p.get("confirm_token") else "no token")
         await self.check(ph, "tc_set_mode", {"mode": self.cfg.safety.mode})     # no-op: same mode, audited
         await self.check(ph, "tc_audit_tail", {"n": 20}, lambda p: None if isinstance(p, list) else "not a list")
@@ -504,7 +505,18 @@ class Acceptance:
         else:
             rid = rids[0]
             stt = await self.check(ph, "rec_status", {"id": rid}, lambda p: None if isinstance(p, dict) and "events" in p else "no events field")
-            if isinstance(stt, dict):
+            # D29: an aligned profile waits for a shared start cycle — give its trigger a moment before judging events
+            for _ in range(20):
+                if not (isinstance(stt, dict) and stt.get("armed")):
+                    break
+                await asyncio.sleep(0.25)
+                ok_, p_, _ms = await self.call("rec_status", {"id": rid}, 30)
+                stt = p_ if ok_ else stt
+            if isinstance(stt, dict) and stt.get("armed"):
+                trig = (st.get("aligned") or {}).get("trigger") if isinstance(st, dict) else None
+                self.rec(ph, "rec_status:armed", "FAIL", 0,
+                         f"still armed 5 s later — the start trigger never fired ({trig or 'start_when'}): is the PLC task running?")
+            elif isinstance(stt, dict):
                 if stt.get("dropped"):
                     self.rec(ph, "rec_status:dropped", "WARN", 0, f"dropped={stt['dropped']} on a 3-symbol profile — thin profiles before trusting timings")
                 if not stt.get("events"):
@@ -853,8 +865,13 @@ def render_markdown(rep: dict[str, Any]) -> str:
 async def run_acceptance(cfg: Config, out_dir: Path, *, allow_writes: bool = False, write_symbol: str | None = None,
                          with_xae: bool = True, with_infosys: bool = True, with_build: bool = False,
                          log: Callable[[str], None] = lambda s: print(s, file=sys.stderr)) -> dict[str, Any]:
+    import copy
+
     from .server import build_server
     out_dir.mkdir(parents=True, exist_ok=True)
+    # R4: tools only write inside known roots — the acceptance output folder is one for this run
+    cfg = copy.deepcopy(cfg)
+    cfg.server.output_dirs = list(cfg.server.output_dirs or []) + [str(out_dir)]
     server = build_server(cfg)
     result: dict[str, Any] = {}
     async with create_client_server_memory_streams() as (client_streams, server_streams):

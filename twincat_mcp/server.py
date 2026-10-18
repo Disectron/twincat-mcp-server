@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 from . import __version__
 from .config import Config, load as load_config, is_windows
 from .safety import Guard, OpClass, SafetyError
-from .worker import SerialWorker
+from .worker import SerialWorker, WorkerBusy
 import pyads
 
 from .ads_backend import AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
@@ -94,8 +94,8 @@ question instead of comparing two fills by eye.
 
 Reference: infosys_declaration <FB|struct|enum> gives the library symbol's declaration with
 descriptions; infosys_search_symbols / infosys_search / infosys_search_code / infosys_get_page
-look up Beckhoff Infosys (TwinCAT 3 only, locally indexed per library, verified against the
-site's sitemap). Use it before guessing a library FB's inputs.
+look up Beckhoff Infosys (TwinCAT 3 only) from the Help Viewer package installed with XAE — indexed
+locally, no network (docs.source='web' uses the website instead). Use it before guessing a library FB's inputs.
 
 Safety: tc_safety_status shows the mode. readonly blocks all changes;
 guarded needs a write allowlist and confirmations; full is unrestricted except
@@ -185,7 +185,8 @@ class App:
         self.files = SystemServiceFiles(self.ads)
         import threading
         self.ads_worker = SerialWorker("tcmcp-ads", cancel_event=threading.Event())       # quick calls
-        self.ads_slow_worker = SerialWorker("tcmcp-ads-slow", cancel_event=self.ads.cancel)  # watch/wait/scenario/dump
+        self.ads_slow_worker = SerialWorker("tcmcp-ads-slow", cancel_event=self.ads.cancel)  # watch/wait/scenario/recorder
+        self.ads_bulk_worker = SerialWorker("tcmcp-ads-bulk")                                  # ads_dump (R6)
         self.xae = XaeBackend(cfg.xae)
         self.xae_worker = SerialWorker("tcmcp-xae-sta", init=sta_init, teardown=sta_teardown)
         self.proj = ProjectIndex(cfg.project)
@@ -234,7 +235,19 @@ class App:
             except Exception as exc:  # noqa: BLE001 — a broken cache dir / missing package must not take the server down
                 self.docs_error = str(exc)
                 log.warning("infosys index disabled: %s", exc)
+        # R18: the first Infosys query after a start read a cold 372 MB database (9–17 s); warm it in the background
+        self.docs_warm: dict[str, Any] = {"state": "off"}
+        if self.docs is not None:
+            self.docs_warm = {"state": "warming", "started": time.time()}
+            threading.Thread(target=self._warm_docs, name="tcmcp-infosys-warm", daemon=True).start()
         self.started = time.time()
+
+    def _warm_docs(self) -> None:
+        try:
+            r = self.docs.warm()
+            self.docs_warm = {"state": "warm", **r}
+        except Exception as exc:  # noqa: BLE001
+            self.docs_warm = {"state": "failed", "error": str(exc)[:160]}
 
     def _seal_sweep(self) -> None:
         """N27: recordings that finished while no server was there to seal them get their manifest now."""
@@ -246,22 +259,37 @@ class App:
             log.warning("seal sweep failed: %s", exc)
 
     # --- runners -----------------------------------------------------------
-    async def ads_call(self, fn, *a, timeout: float | None = None, slow: bool = False, **kw) -> Any:
-        """Run on the quick ADS worker, or on the slow one (``slow=True``) for anything that
-        blocks for seconds — so a long watch never stalls an ads_read."""
-        worker = self.ads_slow_worker if slow else self.ads_worker
+    async def ads_call(self, fn, *a, timeout: float | None = None, slow: bool = False, bulk: bool = False, **kw) -> Any:
+        """Run on the quick ADS worker, on the slow one (``slow=True``) for anything that blocks for seconds — so a
+        long watch never stalls an ads_read — or on the bulk worker (``bulk=True``: whole-PLC dumps) so a dump
+        never stalls recordings and watches (R6)."""
+        worker = self.ads_bulk_worker if bulk else self.ads_slow_worker if slow else self.ads_worker
         try:
             return await worker.run(fn, *a, timeout=timeout or (self.cfg.ads.max_watch_duration_ms / 1000 + 30), **kw)
         except (AdsError, RecorderError, TestError) as exc:
             raise ToolError(await self._ads_explain(str(exc), _call_port(fn, a, kw))) from exc
+        except WorkerBusy as exc:
+            raise ToolError(f"{exc} — the call was NOT started (nothing was read or written). Wait for it to finish, or "
+                            "stop it (rec_stop / a smaller ads_dump), then retry.") from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise ToolError("ADS call timed out (router/route/firewall? run tc_doctor)") from exc
+            raise ToolError("ADS call timed out after it started (router/route/firewall? run tc_doctor)") from exc
         except (pyads.ADSError, OSError) as exc:
             # safety net for a backend path that did not translate the pyads/socket error itself
             raise ToolError(await self._ads_explain(f"ADS error: {_fmt_ads_exc(exc)}", _call_port(fn, a, kw))) from exc
 
+    async def _config_hint(self) -> str:
+        """' — TwinCAT is in CONFIG …' when it is (R5), else ''."""
+        try:
+            mode = (await self.ads_worker.run(self.ads.system_state, timeout=5)).get("twincat_mode")
+        except Exception:  # noqa: BLE001
+            return ""
+        return (" — TwinCAT is in CONFIG: the PLC runtime (and its symbol and datatype tables) is not running. "
+                "ads_system_mode('run') or activate + restart, then retry") if mode == "CONFIG" else ""
+
     async def _ads_explain(self, msg: str, port: Any) -> str:
         """Known cause/fix for an ADS error; ADSError 6 is explained from the real port and TwinCAT mode (N17)."""
+        if "datatype table unavailable" in msg:
+            return K.annotate(msg + await self._config_hint())
         if re.search(r"ADSError 6 \(0x6\)", msg):
             p = port if isinstance(port, int) else self.ads.port
             mode = None
@@ -304,6 +332,9 @@ class App:
             if lic:
                 msg += " " + lic
             raise ToolError(K.annotate(msg)) from exc
+        except WorkerBusy as exc:
+            raise ToolError(f"{exc} — the XAE call was NOT started; the shell is still busy with the earlier call "
+                            "(a build, an activation or a modal dialog — xae_dialogs).") from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
             pend = self.xae.watchdog.status().get("pending") or []
             hint = (" Open dialog(s): " + "; ".join(f"'{d['title']}' buttons {d['buttons']}" for d in pend[:3])
@@ -573,6 +604,40 @@ class App:
         if hints:
             out["hint"] = " ".join(hints)
         return out
+
+    def output_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        for r in ([Path(self.cfg.safety.audit_log).parent if self.cfg.safety.audit_log else None, self.rec.root,
+                   Path(self.cfg.project.root) if self.cfg.project.root else None,
+                   Path(self.cfg.xae.solution_path).parent if self.cfg.xae.solution_path else None,
+                   Path(self.cfg.scope.export_dir) if self.cfg.scope.export_dir else None,
+                   Path(self.cfg.project.experiments_dir) if getattr(self.cfg.project, "experiments_dir", None) else None]
+                  + [Path(d) for d in (self.cfg.server.output_dirs or [])]):
+            if r is None:
+                continue
+            try:
+                rr = r.expanduser().resolve()
+            except OSError:
+                continue
+            if rr not in roots:
+                roots.append(rr)
+        return roots
+
+    def out_path(self, path: str, overwrite: bool = False, what: str = "file", is_dir: bool = False) -> Path:
+        """R4: a caller-chosen output path must lie in a folder this server writes to (plugin data, recordings,
+        project, solution, [server] output_dirs) and must not silently replace an existing file."""
+        p = Path(path).expanduser()
+        try:
+            rp = p.resolve()
+        except OSError as exc:
+            raise ToolError(f"{what} path {path!r} cannot be resolved: {exc}") from exc
+        roots = self.output_roots()
+        if not any(rp == r or r in rp.parents for r in roots):
+            raise ToolError(f"{what} path {str(rp)!r} is outside the folders this server writes to: "
+                            f"{[str(r) for r in roots]}. Write there, or add the folder to [server] output_dirs.")
+        if not is_dir and rp.exists() and not overwrite:
+            raise ToolError(f"{str(rp)!r} exists — pass overwrite=true to replace it (nothing was written)")
+        return rp
 
     def note_edit(self, path: str, declaration: str | None, implementation: str | None) -> None:
         cur = self.pending_edits.setdefault(path, {"path": path, "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
@@ -1013,7 +1078,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                   "complete": await asyncio.to_thread(app.docs.index_complete) if app.docs.local is not None else None,
                                   "indexed_books": len(await asyncio.to_thread(app.docs.indexed_books))
                                   if app.docs.local is not None else await asyncio.to_thread(app.docs.indexed_books),
-                                  "background_index": app.docs_index_status(),
+                                  "background_index": app.docs_index_status(), "warm": app.docs_warm,
                                   "default_books": cfg.docs.books}
             except ToolError as exc:
                 rep["infosys"] = f"FAIL: {exc}"
@@ -1196,6 +1261,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         merely rejected later, so the agent cannot talk itself into a stale target. tcunit_run also takes the
         NetId (D43). xae_tree_delete is a project edit: its target is the item path '<parent_path>^<name>' (D42)."""
         act = (action or "").strip()
+        # R2: a token for an action no tool performs ('format_c_drive') is noise at best, a decoy at worst
+        known = {t.name for t in await mcp.list_tools()} | {"tcunit_scaffold_external"}
+        if act not in known:
+            import difflib
+            near = difflib.get_close_matches(act, sorted(known), n=5, cutoff=0.5)
+            raise ToolError(f"no tool performs {act!r}; a token is only issued for the name of the tool that will use it"
+                            + (f" — did you mean {near}?" if near else ""))
         if act in ("xae_activate_configuration", "xae_restart_twincat", "xae_deploy", "tcunit_run"):
             try:
                 real = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
@@ -1587,6 +1659,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         with a signed link file. What Scope records (channels, sample time) is set in that configuration. With
         recorder.also_scope = 'ask' (default) and a Scope configuration open, leaving also_scope unset asks the user
         (prompt, or an error that tells you to ask and call again with true/false)."""
+        # R6: arguments that can never work are refused here, before the call queues behind a long job on the worker
+        if mode not in ("cycle", "change", "poll"):
+            raise ToolError("mode must be cycle | change | poll")
+        if engine is not None and str(engine).lower() not in ("auto", "native", "python"):
+            raise ToolError("engine must be auto | native | python")
         want_scope = await _scope_decide(also_scope, scope, ctx)
         res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
                                  cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
@@ -1876,15 +1953,40 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=EDIT)
     async def rec_profile_start(name: str, start_when: str | None = None, stop_when: str | None = None,
-                                duration_s: float | None = None, max_events: int | None = 5_000_000) -> dict[str, Any]:
+                                duration_s: float | None = None, max_events: int | None = 5_000_000,
+                                align: bool = True) -> dict[str, Any]:
         """Start recording a saved profile: one recording per (mode, cycle_ms) group, all named
         '<profile>/<mode>@<cycle>'. Triggers given here override the profile's. Returns the recording
-        ids; rec_profile_stop(name) stops them together, rec_stats/rec_export work per id."""
+        ids; rec_profile_stop(name) stops them together, rec_stats/rec_export work per id.
+        align (default, several groups, no start_when): every group starts on the same PLC cycle — a shared start
+        trigger on the task's cycle counter a moment ahead — and duration_s then counts from that cycle, so all files
+        cover the same window (D29: groups started ≈ 160 ms apart)."""
         try:
             prof = await asyncio.to_thread(app.profiles.get, name)
         except capture.ProfileError as exc:
             raise ToolError(str(exc)) from exc
         started: list[dict[str, Any]] = []
+        aligned_on = None
+        dur = duration_s or prof.duration_s
+        post = None
+        if align and len(prof.groups()) > 1 and not (start_when or prof.start_when):
+            counter = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"
+            try:
+                vals = await app.ads_call(app.ads.read_many, [counter, "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleTime"], timeout=15)
+                now_c = vals.get(counter)
+                ct = vals.get("TwinCAT_SystemInfoVarList._TaskInfo[1].CycleTime")
+                ct_ms = (ct / 10_000.0) if isinstance(ct, (int, float)) and ct > 0 else None
+                if isinstance(now_c, int) and ct_ms:
+                    ahead_ms = 400 * len(prof.groups()) + 500          # time to subscribe every group
+                    target = now_c + max(1, int(ahead_ms / ct_ms))
+                    start_when = f"{counter} >= {target}"
+                    aligned_on = {"trigger": start_when, "cycles_ahead": target - now_c, "task_cycle_ms": ct_ms}
+                    if dur:
+                        # the window counts from the shared start cycle; duration_s stays as the outer limit (a stopped
+                        # PLC never reaches the trigger cycle — the recordings must still end)
+                        post, dur = dur, dur + ahead_ms / 1000.0 + 5.0
+            except ToolError as exc:
+                aligned_on = {"error": f"could not read the task counter, groups start unaligned: {str(exc)[:120]}"}
         # a trigger's symbol must be inside each recording that uses the trigger
         cond_syms = [m.group(1) for c in (start_when or prof.start_when, stop_when or prof.stop_when) if c
                      for m in [re.match(r"\s*([A-Za-z_][\w\.\[\]]*)", c)] if m]
@@ -1893,10 +1995,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 syms = [i.symbol for i in its]
                 low = {x.lower() for x in syms}
                 syms += [c for c in cond_syms if c.lower() not in low]
+                if aligned_on and "trigger" in aligned_on:
+                    c = aligned_on["trigger"].split(" ")[0]
+                    if c.lower() not in {x.lower() for x in syms}:
+                        syms.append(c)
                 res = await app.rec_call(app.rec.start, symbols=syms, prefix=None, pattern=None,
-                                         mode=mode, cycle_ms=cyc, duration_s=duration_s or prof.duration_s,
+                                         mode=mode, cycle_ms=cyc, duration_s=dur,
                                          max_events=max_events, start_when=start_when or prof.start_when,
-                                         stop_when=stop_when or prof.stop_when, pre_trigger_ms=prof.pre_trigger_ms,
+                                         stop_when=stop_when or prof.stop_when,
+                                         pre_trigger_ms=0 if aligned_on and "trigger" in aligned_on else prof.pre_trigger_ms,
+                                         post_trigger_s=post,
                                          name=f"{name}/{mode}@{cyc:g}", max_symbols=max(len(its), 1) + 50, timeout=180)
                 nsym = res.get("symbols")
                 started.append({"id": res["id"], "mode": mode, "cycle_ms": cyc,
@@ -1911,7 +2019,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             raise
         app.audit("rec_profile_start", {"profile": name, "recordings": [s0["id"] for s0 in started]}, OpClass.EDIT, "ok")
         out = {"profile": name, "recordings": started, "groups": len(started)}
-        if len(started) > 1 and not (start_when or prof.start_when):
+        if aligned_on:
+            out["aligned"] = aligned_on
+        if len(started) > 1 and not (start_when or prof.start_when) and not (aligned_on and "trigger" in aligned_on):
             # D29: groups are separate subscriptions and start one after another — say how far apart, from the PLC's
             # own timestamps of each group's first sample
             offs = await asyncio.to_thread(app.rec.start_offsets_ms, [s0["id"] for s0 in started], 3.0)
@@ -2064,7 +2174,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if tool is None:
             raise ToolError(S.status(app.cfg.scope.export_tool)["note"])
         src = Path(svd)
-        out = Path(target) if target else _scope_dir() / (src.stem + ".csv")
+        out = app.out_path(target, overwrite, "scope export") if target else _scope_dir() / (src.stem + ".csv")
         try:
             res = await asyncio.to_thread(S.export, src, out, tool=tool, overwrite=overwrite, key=app.rec.key,
                                           version=__version__)
@@ -2087,7 +2197,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if action in ("start", "stop"):
             r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
         elif action == "save":
-            base = Path(path).with_suffix("") if path else _scope_dir() / (
+            base = app.out_path(str(Path(path).with_suffix(".svdx")), False, "scope file").with_suffix("") if path else _scope_dir() / (
                 re.sub(r"[^\w.-]+", "_", scope or "scope") + "-" + time.strftime("%Y%m%d-%H%M%S"))
             r = {"save_svd": await app.xae_call(app.xae.scope_action, "save_svd", scope, str(base) + ".svdx", timeout=600)}
             try:
@@ -2101,11 +2211,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def rec_export(id: str, fmt: str = "csv_wide", out_path: str | None = None,
-                         symbols: list[str] | None = None, fill: bool = False) -> dict[str, Any]:
+                         symbols: list[str] | None = None, fill: bool = False, overwrite: bool = False) -> dict[str, Any]:
         """Export a recording to CSV. csv_wide: one row per PLC sample time, one column per variable and per array
         element (name[i]); an empty cell means no sample of that variable at that time (fill=true forward-fills —
         handy for charts, but a cell then no longer means "sampled now"). csv_long: t_ms,symbol,value. Both include
-        plc_filetime (the PLC's own sample timestamp) when available. Default path next to the JSONL."""
+        plc_filetime (the PLC's own sample timestamp) when available. Default path next to the JSONL (re-exported in
+        place). An out_path must be in a folder this server writes to ([server] output_dirs adds more) and an
+        existing file there is only replaced with overwrite=true."""
+        if out_path:
+            out_path = str(app.out_path(out_path, overwrite, "export"))
         return await app.mem_call(app.rec.export, id, fmt, out_path, symbols, fill)
 
     @mcp.tool(annotations=DESTR)
@@ -2296,6 +2410,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Generate <FB>_Tests.TcPOU (TcUnit.FB_TestSuite) with Test_InitialState and one test
         method per public method, arranged from the FB interface, and register it in the
         .plcproj. Assertions are left as TODO stubs."""
+        if out_dir:
+            out_dir = str(app.out_path(out_dir, what="scaffold folder", is_dir=True))       # R4
         touches_project = add_to_plcproj or out_dir is None
         if not touches_project and app.proj.root is not None:
             try:
@@ -2321,8 +2437,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         JSON tree plus a flat CSV (path,type,value). pattern limits the roots ('MAIN.*', 'GVL_*');
         system/library symbols excluded unless include_system. Returns counts, file paths and a
         50-leaf preview; use proj_read_file / rec-style tooling on the files for detail."""
-        od = out_dir or str(Path(cfg.safety.audit_log).parent / "dumps")
-        return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * 1024 * 1024, max_leaves, timeout=900, slow=True)
+        od = str(app.out_path(out_dir, what="dump folder", is_dir=True)) if out_dir else str(Path(cfg.safety.audit_log).parent / "dumps")
+        return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * 1024 * 1024, max_leaves,
+                                  cancel=app.ads_bulk_worker.cancel_event, timeout=900, bulk=True)
 
     @mcp.tool(annotations=READ)
     async def ads_leaves(name: str, max_leaves: int = 5000, with_values: bool = False) -> dict[str, Any]:
@@ -2775,18 +2892,21 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def infosys_search(query: str, library: str | None = None, limit: int = 10,
                              web_fallback: bool | None = None) -> dict[str, Any]:
-        """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]). Local Help Viewer
-        package (default): no network, results carry the page's doc version and the package date ('source').
-        docs.source='web': when the index has nothing, a DuckDuckGo site: query verified against the sitemap; the
-        'backend' field says which path answered."""
+        """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]); "quoted phrases"
+        stay together, limit 1..50. Local Help Viewer package (default): no network (web_fallback is ignored and said
+        so), results carry the page's doc version and the package date. docs.source='web': when the index has nothing,
+        a DuckDuckGo site: query verified against the sitemap; the 'backend' field says which path answered."""
         return await app.docs_call("search", query, library, limit, web_fallback, timeout=300)
 
     @mcp.tool(annotations=READ)
-    async def infosys_search_code(query: str, language: str | None = None, limit: int = 10) -> dict[str, Any]:
-        """Search the code examples (<pre> blocks) of indexed pages for a fragment — a call pattern,
-        an attribute, a constant. language: st | xml | cpp | csharp. Returns the matching lines
-        with context and the page URL."""
-        return await app.docs_call("search_code", query, language, limit, timeout=120)
+    async def infosys_search_code(query: str, language: str | None = None, limit: int = 10,
+                                  ignore_spacing: bool = False) -> dict[str, Any]:
+        """Search the code examples of the indexed pages for a fragment — a call pattern, an attribute, a constant
+        (case-insensitive substring of the code as written; non-breaking spaces count as spaces). language: one
+        that occurs in the index (an unknown one is refused with the list), '' / 'none' = samples without a label.
+        limit 1..50; total_matches says how many there are. ignore_spacing=true also matches when only the
+        spacing around punctuation differs. Returns the matching lines with context and the page URL."""
+        return await app.docs_call("search_code", query, language, limit, ignore_spacing, timeout=120)
 
     @mcp.tool(annotations=READ)
     async def infosys_get_page(ref: str, refresh: bool = False, max_chars: int = 60000) -> dict[str, Any]:
@@ -2800,14 +2920,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # ======================================================================
     @mcp.tool(annotations=READ)
     async def ads_export(types: list[str] | None = None, prefix: str | None = None, fmt: str = "csharp",
-                         namespace: str = "Transflo.Plc", out_path: str | None = None) -> dict[str, Any]:
+                         namespace: str = "Transflo.Plc", out_path: str | None = None,
+                         overwrite: bool = False) -> dict[str, Any]:
         """Generate code from the runtime: fmt=csharp (explicit-offset structs + enums for
         Beckhoff.TwinCAT.Ads ReadAny/WriteAny), typescript (interfaces), json (type descriptions),
         or csharp_symbols (const symbol paths under prefix). types = struct/enum names; prefix =
         take the types of every symbol under it."""
         ts = await app.ads_call(app.ads.typesystem, timeout=60)
         if ts is None and fmt != "csharp_symbols":
-            raise ToolError("datatype table unavailable on this target")
+            raise ToolError("datatype table unavailable on this target" + await app._config_hint())
         names = list(types or [])
         syms: list[dict[str, Any]] = []
         if prefix:
@@ -2830,8 +2951,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             raise ToolError("fmt must be csharp | typescript | json | csharp_symbols")
         res: dict[str, Any] = {"fmt": fmt, "types": names, "chars": len(text)}
         if out_path:
-            Path(out_path).write_text(text, encoding="utf-8")
-            res["file"] = out_path
+            op = app.out_path(out_path, overwrite, "export")
+            op.write_text(text, encoding="utf-8")
+            res["file"] = str(op)
         else:
             res["text"] = text
         return res
@@ -2939,7 +3061,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return res
 
     @mcp.tool(annotations=READ)
-    async def tc_session_report(out_path: str | None = None) -> dict[str, Any]:
+    async def tc_session_report(out_path: str | None = None, overwrite: bool = False, inline: bool = False) -> dict[str, Any]:
         """Markdown handover of this session: mode changes, writes, deploys and other mutating
         calls from the audit log, recordings, snapshots and dumps produced. Written to
         ~/.twincat_mcp/reports/<ts>.md (or out_path)."""
@@ -2965,10 +3087,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if dumps:
             lines += ["", "## Dumps"] + [f"- {d}" for d in dumps[-10:]]
         text = "\n".join(lines) + "\n"
-        p = Path(out_path) if out_path else Path(cfg.safety.audit_log).parent / "reports" / f"{time.strftime('%Y%m%d-%H%M%S')}.md"
+        p = app.out_path(out_path, overwrite, "report") if out_path else Path(cfg.safety.audit_log).parent / "reports" / f"{time.strftime('%Y%m%d-%H%M%S')}.md"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
-        return {"file": str(p), "mutating_calls": sum(1 for r in mine if r.get("op") != "read"), "markdown": text[:8000]}
+        out = {"file": str(p), "mutating_calls": sum(1 for r in mine if r.get("op") != "read"),
+               "lines": text.count("\n"), "bytes": len(text.encode("utf-8"))}
+        # R12: the report is the file; the response carries its head unless inline=true asks for all of it
+        if inline:
+            out["markdown"] = text
+        else:
+            out["preview"] = "\n".join(text.splitlines()[:25])
+            out["note"] = "full report in the file (proj_read_file / open it), or inline=true"
+        return out
 
     # ======================================================================
     # ipc_* target OS via System Service
@@ -3099,13 +3229,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return res
 
     @mcp.tool(annotations=DESTR)
-    async def xae_plc(action: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """PLC online actions through the shell: login | logout | start | stop | reset_cold |
-        reset_origin | download. Command names vary by shell version; all candidates are tried.
+    async def xae_plc(action: str, plc_project_path: str | None = None, confirm_token: str | None = None,
+                      ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """PLC online actions: login | logout | start | stop | reset_cold | reset_origin | download. First the
+        Automation Interface (ConsumeXml online commands on '<Name> Project' — no active project needed;
+        plc_project_path when there are several PLC projects), then the shell's DTE commands (names vary by build).
         download/reset_cold/reset_origin are destructive-class, the rest control-class."""
         op = OpClass.DESTRUCTIVE if action in ("download", "reset_origin", "reset_cold") else OpClass.CONTROL
         await app.permit(ctx, op, "xae_plc", action, confirm_token)
-        res = await app.confirmed("xae_plc", {"action": action}, op, app.xae_call(app.xae.plc_action, action, timeout=300))
+        res = await app.confirmed("xae_plc", {"action": action}, op, app.xae_call(app.xae.plc_action, action, plc_project_path, timeout=300))
         return res
 
     @mcp.tool(annotations=DESTR)

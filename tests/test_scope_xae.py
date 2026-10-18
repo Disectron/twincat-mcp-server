@@ -120,3 +120,27 @@ async def test_never_policy_refuses_and_record_tool(monkeypatch, project_dir, fa
         sv = payload(await s.call_tool("scope_record", {"action": "save"}))
         assert Path(sv["save_svd"]["path"]).is_file() and Path(sv["export_csv"]["path"]).is_file()
         assert fake_xae.calls == ["start", "stop", "save", "csv"]
+
+
+def test_r11_com_methods_are_invoked_not_read_as_properties():
+    """R11: on a late-bound dispatch getattr(obj, 'StartRecord') already runs the member as a property get and returns
+    its int; calling that int raised "'int' object is not callable"."""
+    from twincat_mcp import xae_backend as X
+    calls = []
+
+    class Ole:
+        def GetIDsOfNames(self, name):
+            return {"StartRecord": 7, "SaveSVD": 9}[name]
+
+        def Invoke(self, dispid, lcid, flags, want, *args):
+            calls.append((dispid, flags, args))
+            return 0
+
+    class LateBound:
+        _oleobj_ = Ole()
+
+        def __getattr__(self, name):               # what win32com's dynamic dispatch does for a no-arg member
+            return 0
+    assert X._com_call(LateBound(), "StartRecord") == 0 and calls == [(7, 1, ())]
+    X._com_call(LateBound(), "SaveSVD", "C:/x.svdx")
+    assert calls[-1] == (9, 1, ("C:/x.svdx",))

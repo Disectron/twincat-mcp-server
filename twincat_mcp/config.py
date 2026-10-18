@@ -171,6 +171,9 @@ class ServerConfig:
     # tool groups exposed to the agent (by name prefix); None = all. 'tc' (doctor, safety, audit) is always on.
     # e.g. ["ads", "rec", "proj"] on a machine where XAE is never driven — fewer tool descriptions to load.
     tool_groups: list[str] | None = None
+    # R4: extra folders tools may write exports / dumps / reports into (besides the plugin's data folder, the
+    # recordings, the project and the solution folder) — e.g. ["D:/TwinCAT-MCP/exports"]
+    output_dirs: list[str] | None = None
 
 
 @dataclass

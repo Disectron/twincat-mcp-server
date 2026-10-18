@@ -140,14 +140,26 @@ DOSING_TEMPLATE: dict[str, Any] = {
 def load_spec(text_or_obj: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(text_or_obj, dict):
         return json.loads(json.dumps(text_or_obj))
-    txt = text_or_obj.strip()
+    txt = (text_or_obj or "").strip()
+    if not txt:
+        raise ExperimentError("spec is empty")
     if txt.startswith("{"):
-        return json.loads(txt)
-    if yaml is None:
-        raise ExperimentError("spec is not JSON and PyYAML is not installed (pip install pyyaml)")
-    data = yaml.safe_load(txt)
+        try:
+            data = json.loads(txt)
+        except json.JSONDecodeError as exc:
+            raise ExperimentError(f"spec is not valid JSON: {exc.msg} at line {exc.lineno}, column {exc.colno}") from exc
+    else:
+        if yaml is None:
+            raise ExperimentError("spec is not JSON and PyYAML is not installed (pip install pyyaml)")
+        try:
+            data = yaml.safe_load(txt)
+        except yaml.YAMLError as exc:      # R1: surfaced as "Error executing tool exp_validate" with no message
+            mark = getattr(exc, "problem_mark", None)
+            where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+            problem = getattr(exc, "problem", None) or str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            raise ExperimentError(f"spec is not valid YAML: {problem}{where}") from exc
     if not isinstance(data, dict):
-        raise ExperimentError("spec must be a mapping")
+        raise ExperimentError(f"spec must be a mapping (got {type(data).__name__})")
     return data
 
 

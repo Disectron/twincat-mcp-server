@@ -1,4 +1,5 @@
 """End-to-end through a real MCP client session on in-memory streams."""
+import asyncio
 import json
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -218,7 +219,7 @@ async def test_whole_project_variable_tools(monkeypatch, project_dir, tmp_path):
     install(monkeypatch)
     srv = build_server(mk_cfg(project_dir))
     async with client_for(srv) as s:
-        d = payload(await s.call_tool("ads_dump", {"out_dir": str(tmp_path / "dumps")}))
+        d = payload(await s.call_tool("ads_dump", {"out_dir": str(project_dir / "dumps")}))   # R4: inside a known folder
         assert d["leaves"] >= 25 and d["datatype_table"] and Path(d["csv"]).exists()
         lv = payload(await s.call_tool("ads_leaves", {"name": "MAIN.arrSteps", "with_values": True}))
         assert lv["count"] == 8 and lv["leaves"][1]["value"]["text"] == "T#1s500ms" and lv["leaves"][3]["value"]["name"] == "Bulk"
@@ -302,7 +303,7 @@ async def test_safety_guard_hmi_export_report(monkeypatch, project_dir, tmp_path
         assert d["pending"] == [] and d["live"] == []
         val = payload(await s.call_tool("proj_validate_xml", {}))
         assert val["files"] == 5
-        rep = payload(await s.call_tool("tc_session_report", {"out_path": str(tmp_path / "r.md")}))
+        rep = payload(await s.call_tool("tc_session_report", {"out_path": str(project_dir / "r.md"), "inline": True}))
         assert Path(rep["file"]).exists() and "# twincat-mcp session report" in rep["markdown"]
         disc = await s.call_tool("ads_discover", {"timeout_s": 0.2})
         assert not disc.is_error  # no targets on this network, but the call must work
@@ -925,3 +926,102 @@ async def test_d42_tree_delete_token_names_the_item(monkeypatch, project_dir):
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_tree_delete",
                                                                     "target": "TIPC^Plc^Plc Project^POUs^FB_Old"}))
         assert tok["target"] == "TIPC^Plc^Plc Project^POUs^FB_Old" and "xae_target" not in tok
+
+
+@pytest.mark.anyio
+async def test_r4_outputs_stay_in_known_folders_and_never_overwrite_silently(monkeypatch, project_dir, tmp_path):
+    """R4: rec_export(out_path='C:\\\\Windows\\\\System32\\\\…') was accepted and an existing file silently replaced."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir)
+    async with client_for(build_server(cfg)) as s:
+        rid = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change"}))["id"]
+        await s.call_tool("rec_stop", {"id": rid})
+        bad = await s.call_tool("rec_export", {"id": rid, "out_path": str(tmp_path / "elsewhere" / "x.csv")})
+        assert bad.is_error and "outside the folders this server writes to" in text(bad)
+        target = project_dir / "exports" / "x.csv"
+        target.parent.mkdir()
+        target.write_text("keep me")
+        r = await s.call_tool("rec_export", {"id": rid, "out_path": str(target)})
+        assert r.is_error and "overwrite=true" in text(r) and target.read_text() == "keep me"
+        ok = payload(await s.call_tool("rec_export", {"id": rid, "out_path": str(target), "overwrite": True}))
+        assert Path(ok["file"]).resolve() == target.resolve() and target.read_text() != "keep me"
+        again = payload(await s.call_tool("rec_export", {"id": rid}))                       # default path: re-export in place
+        assert again["file"]
+        sr = payload(await s.call_tool("tc_session_report", {}))                           # R12: preview, not the whole report
+        assert "markdown" not in sr and sr["preview"] and Path(sr["file"]).is_file()
+        bad = await s.call_tool("tc_session_report", {"out_path": str(tmp_path / "r.md")})
+        assert bad.is_error and "output_dirs" in text(bad)
+
+
+def test_r8_failed_dump_leaves_no_partial_files(monkeypatch, project_dir, tmp_path):
+    """R8: a failed whole-PLC dump left a 61 MB CSV and a 0-byte JSON behind, unreported."""
+    import threading
+    from tests.fake_ads import install
+    from twincat_mcp.ads_backend import AdsBackend, AdsError
+    from twincat_mcp.config import AdsConfig
+    install(monkeypatch)
+    ads = AdsBackend(AdsConfig(ams_net_id="5.1.2.3.1.1"))
+    out = tmp_path / "d"
+    ok = ads.dump(None, False, str(out))
+    assert Path(ok["csv"]).is_file() and Path(ok["json"]).is_file() and not list(out.glob("*.partial"))
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(AdsError, match=r"cancelled.*partial files removed"):
+        ads.dump(None, False, str(out), cancel=stop)
+    assert not list(out.glob("*.partial")) and len(list(out.glob("dump-*.csv"))) == 1
+
+
+@pytest.mark.anyio
+async def test_r6_a_call_queued_behind_a_long_job_says_so(monkeypatch, project_dir):
+    """R6: behind a 17-min ads_dump every call timed out with 'router/route/firewall?' — even rec_start(mode='bogus')."""
+    import time as _t
+    from twincat_mcp.worker import SerialWorker, WorkerBusy
+    w = SerialWorker("tcmcp-test")
+
+    def ads_dump_like():
+        _t.sleep(1.0)
+        return "dump done"
+    ran = []
+    long = asyncio.ensure_future(w.run(ads_dump_like, timeout=10))
+    await asyncio.sleep(0.1)
+    with pytest.raises(WorkerBusy, match=r"quick not started: tcmcp-test is busy with ads_dump_like for 0 s"):
+        await w.run(_named("quick", ran), timeout=0.2)
+    assert await long == "dump done"
+    await asyncio.sleep(0.1)
+    assert ran == [], "a job that timed out in the queue must not run later"
+    w.close()
+
+
+def _named(name, sink):
+    def f():
+        sink.append(1)
+    f.__name__ = name
+    return f
+
+
+@pytest.mark.anyio
+async def test_r2_no_tokens_for_actions_no_tool_performs(monkeypatch, project_dir):
+    install(monkeypatch)
+    async with client_for(build_server(mk_cfg(project_dir, mode="guarded"))) as s:
+        r = await s.call_tool("tc_request_confirmation", {"action": "format_c_drive", "target": "C:"})
+        assert r.is_error and "no tool performs 'format_c_drive'" in text(r)
+        r = await s.call_tool("tc_request_confirmation", {"action": "ads_wrte", "target": "MAIN.x"})
+        assert r.is_error and "ads_write" in text(r)
+        assert payload(await s.call_tool("tc_request_confirmation", {"action": "rec_delete", "target": "x"}))["confirm_token"]
+
+
+@pytest.mark.anyio
+async def test_r5_datatype_table_unavailable_names_config_mode(monkeypatch, project_dir):
+    from pyads import constants as C
+    from tests.fake_ads import FakeConnection
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    app = srv._tcmcp_app
+    monkeypatch.setattr(app.ads, "typesystem", lambda *a, **k: None)
+    FakeConnection.shared_state[10000] = (C.ADSSTATE_CONFIG, 0)
+    try:
+        async with client_for(srv) as s:
+            r = await s.call_tool("ads_export", {"types": ["ST_Recipe"]})
+            assert r.is_error and "TwinCAT is in CONFIG" in text(r), text(r)
+    finally:
+        FakeConnection.shared_state.pop(10000, None)

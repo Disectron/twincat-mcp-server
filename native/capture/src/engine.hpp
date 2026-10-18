@@ -142,6 +142,7 @@ private:
     int64_t cut_ = 0;                // duration / post-trigger end (inclusive)
     std::string cut_reason_;
     bool have_stop_ft_ = false;
+    std::atomic<bool> manual_stop_{false};   // R7: stopped by request — blocks end within an unsubscribe spread
     int64_t stop_ft_ = 0;            // stop_when / max_events sample
     bool armed_ = false;
     bool triggered_ = false;

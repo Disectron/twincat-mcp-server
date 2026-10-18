@@ -60,6 +60,43 @@ ALLOWED_HOSTS = {"infosys.beckhoff.com"}
 DDG_HOSTS = {"html.duckduckgo.com", "duckduckgo.com"}
 USER_AGENT = "twincat-mcp/0.6 (+https://github.com/; documentation lookup for an engineering tool)"
 CODE_SEP = "\n\x1e\n"
+DERIVED_VERSION = 1          # catalog / code_blocks layout; a bump rebuilds them from the stored pages (no re-parse)
+
+
+BOOK_CATEGORIES = ("plc-library", "function-tf", "engineering-te", "twincat-system", "hardware", "other")
+_SYMBOL_TITLE = re.compile(r"^(?:(?:FUNCTION_BLOCK|FUNCTION|PROGRAM|METHOD|PROPERTY|TYPE|INTERFACE|ACTION)\s+)?"
+                           r"([A-Za-z_][\w.]*)\s*(?:\(\s*\))?$", re.I)
+
+
+def _like(s: str) -> str:
+    """A LIKE pattern matching ``s`` literally (R27: '%' matched everything, 'ADS_EAD' matched ADSREAD)."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _check_limit(limit: Any, hi: int = 50, name: str = "limit") -> int:
+    """R31: limit=-1 dropped the last item, limit=0 returned one, limit=1000 had no cap."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= hi:
+        raise InfosysError(f"{name} {limit!r} must be 1..{hi}")
+    return limit
+
+
+_IMG = re.compile(r"!\[\d*\]\([^)]*\)|!\[\d+\]")
+_EMPTY_LINK = re.compile(r"\[\s*\]\([^)]*\)")
+_XHELP = re.compile(r"ms-xhelp:///?\?Id=([^)\s\"'&#]+)", re.I)
+
+
+def _clean_md(md: str) -> str:
+    """R32: image placeholders ('![1107452]', also in headings) and empty links are noise in a text answer."""
+    md = _IMG.sub("", md)
+    md = _EMPTY_LINK.sub("", md)
+    return re.sub(r"^(#+)\s{2,}", r"\1 ", md, flags=re.M)
+
+
+def _bump_gen(con: Any) -> None:
+    """The pages table changed: derived lookup tables are out of step until sync_derived()."""
+    r = con.execute("SELECT value FROM meta WHERE key = 'pages_gen'").fetchone()
+    n = int(r[0]) + 1 if r is not None and str(r[0]).isdigit() else 1
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('pages_gen', ?)", (str(n),))
 
 KINDS = ("FunctionBlock", "Function", "Program", "Method", "Property", "Action", "Enum", "Struct",
          "Union", "Alias", "Interface", "GlobalVariable", "Library", "Page")
@@ -558,7 +595,64 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
     return decl
 
 
+def _tidy_declaration(decl: dict[str, Any]) -> None:
+    """Output-time corrections of a stored declaration (no page is parsed again):
+    R24 a FUNCTION's return value is not a VAR_OUTPUT; R25 implicit enum values are numbered and the declaration's
+    (* … *) comments become descriptions; R32 the per-name 'description' dict repeats what the items carry."""
+    name = decl.get("name") or ""
+    if decl.get("kind") in ("Function", "Method"):
+        outs = decl.get("outputs") or []
+        ret = next((o for o in outs if str(o.get("name", "")).lower() == name.split(".")[-1].lower()), None)
+        if ret is not None:
+            decl["outputs"] = [o for o in outs if o is not ret]
+            decl["return_type"] = decl.get("return_type") or ret.get("type")
+            if ret.get("description") and not decl.get("return_description"):
+                decl["return_description"] = ret["description"]
+        text = decl.get("declaration") or ""
+        if decl.get("return_type") and text and not re.match(r"\s*(FUNCTION|METHOD)\b", text, re.I):
+            kw = "FUNCTION" if decl.get("kind") == "Function" else "METHOD"
+            text = re.sub(r"(?im)^\s*VAR_OUTPUT\s*\n\s*" + re.escape(name.split(".")[-1]) + r"\s*:\s*[^;\n]+;?\s*\n\s*END_VAR\s*\n?", "", text)
+            decl["declaration"] = f"{kw} {name.split('.')[-1]} : {decl['return_type']}\n" + text.lstrip()
+    if decl.get("kind") == "Enum" and decl.get("enum_values"):
+        comments: dict[str, str] = {}
+        body = decl.get("declaration") or ""
+        for m in re.finditer(r"([A-Za-z_]\w*)\s*(?::=\s*[^,()\n]+)?\s*,?\s*(?:\(\*\s*(.*?)\s*\*\)|//\s*([^\n]*))", body, re.S):
+            c = (m.group(2) or m.group(3) or "").strip()
+            if c:
+                comments.setdefault(m.group(1), c)
+        nxt = 0
+        for ev in decl["enum_values"]:
+            v = ev.get("value")
+            n = None
+            if v not in (None, ""):
+                vs = str(v).strip().replace("16#", "0x").replace("2#", "0b").replace("8#", "0o")
+                try:
+                    n = int(vs, 0)
+                except ValueError:
+                    n = None
+            else:
+                n = nxt
+                ev["value"] = str(n)
+                ev["implicit"] = True
+            if n is not None:
+                nxt = n + 1
+            if not ev.get("description") and comments.get(ev.get("name", "")):
+                ev["description"] = comments[ev["name"]]
+    desc = decl.get("description")
+    if isinstance(desc, dict) and desc:
+        carried = {it.get("name") for key in ("inputs", "outputs", "in_out", "members", "enum_values")
+                   for it in (decl.get(key) or []) if it.get("description")}
+        if decl.get("return_description"):
+            carried.add(name.split(".")[-1])
+        rest = {k: v for k, v in desc.items() if k not in carried}
+        if rest:
+            decl["description"] = rest
+        else:
+            decl.pop("description", None)
+
+
 # ---------------------------------------------------------------------------
+# book helpers# ---------------------------------------------------------------------------
 # book helpers
 # ---------------------------------------------------------------------------
 def book_of(url: str) -> tuple[str, str] | None:
@@ -615,12 +709,79 @@ class InfosysIndex:
         self.web_fallback = web_fallback
         self._sitemap: dict[str, str] | None = None     # url -> lastmod
         self._lock = threading.RLock()
+        self._derived_lock = threading.RLock()
         self._index_lock = threading.RLock()   # one book indexes at a time: a background default index and an explicit
                                                # infosys_index of the same book must not both write (SQLite busy → 30 s stalls)
         self._fts: bool | None = None
         self._init_db()
 
     # -- storage ----------------------------------------------------------------
+    # -- derived lookup tables (R17–R22): what is indexed, small enough to search cold -----------------------------
+    # catalog:     one row per page (rowid = pages.rowid): url, title, kind, library, book — the symbol search reads
+    #              this few-MB table instead of scanning the whole page store (R18: 16.9 s cold)
+    # code_blocks: one row per code sample, \xa0 normalised (R17), language stored as is ('' = unlabelled, R22);
+    #              searched in one pass over the samples alone, with the language filter in SQL (R19)
+    # Built from the stored pages — no page is parsed again; kept in step after every index run.
+    def _init_derived(self, con: Any) -> None:
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS catalog(rowid INTEGER PRIMARY KEY, url TEXT, title TEXT, kind TEXT,
+                                               library TEXT, book TEXT, fetched REAL);
+            CREATE INDEX IF NOT EXISTS catalog_kind ON catalog(kind);
+            CREATE TABLE IF NOT EXISTS code_blocks(id INTEGER PRIMARY KEY, page_rowid INTEGER, url TEXT, title TEXT,
+                                                   library TEXT, lang TEXT, code TEXT);
+            CREATE INDEX IF NOT EXISTS code_blocks_page ON code_blocks(page_rowid);
+            CREATE INDEX IF NOT EXISTS code_blocks_lang ON code_blocks(lang COLLATE NOCASE);
+            CREATE TABLE IF NOT EXISTS code_src(page_rowid INTEGER PRIMARY KEY, url TEXT, fetched REAL);
+        """)
+
+    def sync_derived(self) -> dict[str, Any]:
+        """Bring catalog / code_blocks in step with the pages table (cheap when nothing changed)."""
+        t0 = time.time()
+        with self._derived_lock, self._db() as con:
+            self._init_derived(con)
+            g = con.execute("SELECT value FROM meta WHERE key = 'pages_gen'").fetchone()
+            sig = g[0] if g is not None else "0"
+            r = con.execute("SELECT value FROM meta WHERE key = 'derived_sig'").fetchone()
+            if r is not None and r[0] == f"{DERIVED_VERSION}|{sig}":
+                return {"changed": False, "seconds": round(time.time() - t0, 3)}
+            # identity = rowid + url + fetched: a page stored again may get its old rowid back
+            same = "EXISTS (SELECT 1 FROM pages p WHERE p.rowid = {t}.{k} AND p.url = {t}.url AND p.fetched IS {t}.fetched)"
+            con.execute("DELETE FROM catalog WHERE NOT " + same.format(t="catalog", k="rowid"))
+            con.execute("INSERT INTO catalog SELECT rowid, url, title, kind, library, book, fetched FROM pages "
+                        "WHERE rowid NOT IN (SELECT rowid FROM catalog)")
+            gone = [x[0] for x in con.execute("SELECT page_rowid FROM code_src WHERE NOT " + same.format(t="code_src", k="page_rowid"))]
+            for pr in gone:
+                con.execute("DELETE FROM code_blocks WHERE page_rowid = ?", (pr,))
+                con.execute("DELETE FROM code_src WHERE page_rowid = ?", (pr,))
+            added = 0
+            cur = con.execute("SELECT rowid, url, title, library, code, fetched FROM pages WHERE rowid NOT IN "
+                              "(SELECT page_rowid FROM code_src)")
+            batch = cur.fetchall()
+            for row in batch:
+                for block in (row["code"] or "").split(CODE_SEP):
+                    if not block.strip():
+                        continue
+                    lang, _, code = block.partition("\n")
+                    code = code.replace("\xa0", " ")
+                    con.execute("INSERT INTO code_blocks(page_rowid, url, title, library, lang, code) VALUES (?,?,?,?,?,?)",
+                                (row["rowid"], row["url"], row["title"], row["library"], lang.strip(), code))
+                    added += 1
+                con.execute("INSERT OR REPLACE INTO code_src VALUES (?, ?, ?)", (row["rowid"], row["url"], row["fetched"]))
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('derived_sig', ?)", (f"{DERIVED_VERSION}|{sig}",))
+        return {"changed": True, "pages_added": len(batch), "pages_removed": len(gone), "code_blocks_added": added,
+                "seconds": round(time.time() - t0, 2)}
+
+    def warm(self) -> dict[str, Any]:
+        """R18 at start: bring the derived lookup tables up to date (the first search then reads only them), and
+        the ms-xhelp link map (R26) when the package is new."""
+        out = self.sync_derived()
+        if self.local is not None:
+            try:
+                out["links"] = self.build_link_map()
+            except Exception as exc:  # noqa: BLE001
+                out["links"] = {"error": str(exc)[:160]}
+        return out
+
     def _db(self):
         """Context manager: connection that commits and closes on exit."""
         return _Conn(self.dir / "index.sqlite")
@@ -664,6 +825,7 @@ class InfosysIndex:
                 con.execute("DELETE FROM meta WHERE key = 'source_stamp'")
                 if self._fts:
                     con.execute("INSERT INTO pages_fts(pages_fts) VALUES ('delete-all')")
+                _bump_gen(con)
             if r is None or r[0] != str(INDEXER_VERSION):
                 con.execute("INSERT OR REPLACE INTO meta VALUES ('indexer_version', ?)", (str(INDEXER_VERSION),))
 
@@ -718,6 +880,10 @@ class InfosysIndex:
         return not any(r.search(book) for r in self.exclude)
 
     def books(self, pattern: str | None = None, category: str | None = None, limit: int = 500) -> dict[str, Any]:
+        if category is not None and category not in BOOK_CATEGORIES:                       # R31
+            raise InfosysError(f"category {category!r} unknown; one of {list(BOOK_CATEGORIES)}")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            raise InfosysError(f"limit {limit!r} must be ≥ 0")
         sm = self.sitemap()
         counts: dict[str, int] = {}
         for url in sm:
@@ -810,13 +976,24 @@ class InfosysIndex:
 
     def _index_book(self, book: str, force: bool, max_pages: int | None,
                     progress: Callable[[int, int], None] | None) -> dict[str, Any]:
+        if max_pages is not None and (not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1):
+            raise InfosysError(f"max_pages {max_pages!r} must be ≥ 1 (or omitted)")                # R31
+        sm = self.sitemap()
+        all_books = sorted({b[0] for u in sm if (b := book_of(u))})
+        if book not in all_books:
+            # R31: the library name the other tools accept ('Tc2_System' → tcplclib_tc2_system)
+            by_lib = [b for b in all_books if (library_from_book(b) or "").lower() == book.lower() or b == book.lower()]
+            if len(by_lib) == 1:
+                book = by_lib[0]
         if not self.book_allowed(book):
             raise InfosysError(f"book {book!r} is excluded (TwinCAT 2 or docs.exclude_books)")
-        sm = self.sitemap()
         pages = {u: lm for u, lm in sm.items() if (b := book_of(u)) and b[0] == book}
         if not pages:
-            near = sorted({b[0] for u in sm if (b := book_of(u)) and book.split("_")[-1][:6] in b[0]})[:8]
-            raise InfosysError(f"no book {book!r} in the Infosys sitemap. Similar: {near}. Use infosys_books(pattern=...)")
+            import difflib
+            near = difflib.get_close_matches(book.lower(), all_books, n=6, cutoff=0.6)
+            where = "local Help Viewer package" if self.local is not None else "Infosys sitemap"
+            raise InfosysError(f"no book {book!r} in the {where}" + (f". Similar: {near}" if near else "")
+                               + ". infosys_books(pattern=...) lists them")
         cap = (max_pages or len(pages)) if self.local is not None else min(max_pages or self.max_index_pages, self.max_index_pages)
         with self._db() as con:
             have = {r["url"]: r["lastmod"] for r in con.execute("SELECT url, lastmod FROM pages WHERE book = ?", (book,))}
@@ -846,6 +1023,8 @@ class InfosysIndex:
                     progress(done, len(todo))
             con.execute("INSERT OR REPLACE INTO books VALUES (?,?,?)",
                         (book, time.time(), con.execute("SELECT COUNT(*) FROM pages WHERE book=?", (book,)).fetchone()[0]))
+            if done:
+                _bump_gen(con)
         return {"book": book, "library": library_from_book(book), "pages_in_sitemap": len(pages), "fetched": done,
                 "unchanged": skipped, "capped": len(pages) - skipped - len(todo) if len(todo) == cap else 0,
                 "failed": failed[:20], "kinds": kinds, "seconds": round(time.time() - t0, 1), "fts": self.has_fts}
@@ -894,6 +1073,8 @@ class InfosysIndex:
             # pages of books that are no longer in the package (or no longer allowed) leave the index
             keep = set(books)
             gone = [r[0] for r in con.execute("SELECT DISTINCT book FROM pages") if r[0] not in keep]
+            if gone:
+                _bump_gen(con)
             for bk in gone:
                 if self._fts:
                     con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code) "
@@ -905,6 +1086,10 @@ class InfosysIndex:
             if not book_errors:          # complete only when every book went in; otherwise the next start resumes
                 con.execute("INSERT OR REPLACE INTO meta VALUES ('source_stamp', ?)", (self.local.content_stamp(),))
             con.execute("INSERT OR REPLACE INTO meta VALUES ('indexer_version', ?)", (str(INDEXER_VERSION),))
+        try:
+            self.sync_derived()                 # the lookup tables follow the pages right away
+        except sqlite3.Error:
+            pass
         return {"books": len(books), "pages_indexed": fetched, "failed": failed, "book_errors": book_errors[:20],
                 "seconds": round(time.time() - t0, 1), "removed_books": gone, "source": self.source()}
 
@@ -960,32 +1145,42 @@ class InfosysIndex:
         if library:
             where.append("(library = ? COLLATE NOCASE OR book = ? COLLATE NOCASE)")
             params += [library, library]
-        where.append("(title LIKE ? COLLATE NOCASE)")
-        params.append(f"%{q}%")
+        _check_limit(limit)
+        where.append("(title LIKE ? ESCAPE '\\' COLLATE NOCASE)")
+        params.append(f"%{_like(q)}%")
+        # R18: the catalog (a few MB) instead of the page store (hundreds of MB, cold: 16.9 s); markdown only for the hits
+        self.sync_derived()
         with self._db() as con:
-            rows = con.execute(f"SELECT url, title, kind, library, book, markdown FROM pages WHERE {' AND '.join(where)}",
+            rows = con.execute(f"SELECT url, title, kind, library, book FROM catalog WHERE {' AND '.join(where)}",
                                params).fetchall()
-        ql = q.lower()
+            ql = q.lower()
 
-        def rank(r):
-            t = r["title"].lower()
-            return (0 if t == ql else 1 if t.startswith(ql) else 2 if re.search(rf"\b{re.escape(ql)}\b", t) else 3, len(t), t)
+            def rank(r):
+                t = r["title"].lower()
+                return (0 if t == ql else 1 if t.startswith(ql) else 2 if re.search(rf"\b{re.escape(ql)}\b", t) else 3, len(t), t)
 
-        rows.sort(key=rank)
-        items = [{"name": r["title"], "kind": r["kind"], "library": r["library"], "book": r["book"], "url": r["url"],
-                  "summary": _summary(r["markdown"])} for r in rows[:limit]]
+            # R28: a 'symbol' page whose title is a sentence ('Use of function blocks', 'Example: …') is a help topic
+            rows = [r for r in rows if _SYMBOL_TITLE.match(r["title"] or "")]
+            rows.sort(key=rank)
+            top = rows[:limit]
+            md = {r["url"]: r["markdown"] for r in con.execute(
+                f"SELECT url, markdown FROM pages WHERE url IN ({','.join('?' * len(top))})", [r["url"] for r in top])} if top else {}
+        items = [{"name": _SYMBOL_TITLE.match(r["title"]).group(1), "kind": r["kind"], "library": r["library"],
+                  "book": r["book"], "url": r["url"], "summary": _summary(md.get(r["url"]) or "")} for r in top]
         res = {"query": q, "count": len(rows), "items": items, **self._answer_meta()}
         if did:
             res["auto_indexed"] = did
         if not rows:
             res["hint"] = ("no indexed symbol matches. infosys_books(pattern='tcplclib_*') lists libraries; "
-                           "infosys_index(book=...) adds one; infosys_search(...) also tries the web fallback.")
+                           + ("infosys_search(...) searches the page text." if self.local is not None else
+                              "infosys_index(book=...) adds one; infosys_search(...) also tries the web fallback."))
         return res
 
     def search(self, query: str, library: str | None = None, limit: int = 10, web_fallback: bool | None = None) -> dict[str, Any]:
         q = query.strip()
         if not q:
             raise InfosysError("empty query")
+        _check_limit(limit)
         items = self._fts_search(q, library, limit) if self._fts else self._like_search(q, library, limit)
         backend = "local-fts5" if self._fts else "local-like"
         if not items and self.local is None and (self.web_fallback if web_fallback is None else web_fallback):
@@ -993,38 +1188,97 @@ class InfosysIndex:
             backend = "duckduckgo+sitemap"
         if self.local is not None:
             backend += "+helpviewer"
-        return {"query": q, "backend": backend, "count": len(items), "items": items, **self._answer_meta()}
-
-    def search_code(self, query: str, language: str | None = None, limit: int = 10) -> dict[str, Any]:
-        q = query.strip()
-        if not q:
-            raise InfosysError("empty query")
-        with self._db() as con:
-            rows = con.execute("SELECT url, title, library, code FROM pages WHERE code LIKE ? COLLATE NOCASE LIMIT 400",
-                               (f"%{q}%",)).fetchall()
-        out = []
-        ql = q.lower()
-        for r in rows:
-            for block in r["code"].split(CODE_SEP):
-                lang, _, code = block.partition("\n")
-                if language and lang.lower() != language.lower():
-                    continue
-                if ql in code.lower():
-                    lines = code.splitlines()
-                    hit = next((i for i, ln in enumerate(lines) if ql in ln.lower()), 0)
-                    lo, hi = max(0, hit - 6), min(len(lines), hit + 10)
-                    out.append({"url": r["url"], "title": r["title"], "library": r["library"], "language": lang or None,
-                                "line": hit + 1, "snippet": "\n".join(lines[lo:hi])})
-                    if len(out) >= limit:
-                        break
-            if len(out) >= limit:
-                break
-        res = {"query": q, "count": len(out), "items": out, **self._answer_meta()}
-        if not out:
-            res["hint"] = "code search covers indexed books only — infosys_index(book=...) first"
+        res = {"query": q, "backend": backend, "count": len(items), "items": items, **self._answer_meta()}
+        if web_fallback and self.local is not None:
+            res["note"] = "web_fallback is ignored with the local Help Viewer package (no network lookups)"   # R30
+        if not items and library:
+            with self._db() as con:
+                known = con.execute("SELECT 1 FROM catalog WHERE library = ? COLLATE NOCASE OR book = ? COLLATE NOCASE "
+                                    "LIMIT 1", (library, library)).fetchone() if self._has_catalog(con) else True
+            if not known:
+                res["hint"] = f"no indexed page belongs to library {library!r} — infosys_books lists the books"  # R32
         return res
 
+    @staticmethod
+    def _has_catalog(con: Any) -> bool:
+        return con.execute("SELECT 1 FROM sqlite_master WHERE name = 'catalog'").fetchone() is not None
+
+    def search_code(self, query: str, language: str | None = None, limit: int = 10,
+                    ignore_spacing: bool = False) -> dict[str, Any]:
+        """Code samples containing ``query`` (case-insensitive substring of the code as written; non-breaking spaces
+        count as spaces, R17). language filters in SQL before the limit (R19); '' / 'none' = unlabelled samples (R22).
+        ignore_spacing=true also matches when only the spacing around punctuation differs ('fbRead(READ:=FALSE)')."""
+        q = (query or "").replace("\xa0", " ").strip()
+        if not q:
+            raise InfosysError("empty query")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:      # R21
+            raise InfosysError(f"limit {limit!r} must be 1..50")
+        self.sync_derived()
+        langs = self.code_languages()
+        lang = None if language is None else language.strip()
+        if lang is not None:
+            low = lang.lower()
+            if low in ("none", "unlabelled", "unlabeled"):
+                lang = ""
+            elif lang and lang.lower() not in {x.lower() for x in langs if x}:
+                raise InfosysError(f"language {language!r} does not occur in the index; languages: "
+                                   f"{sorted(x for x in langs if x)} ('' or 'none' = samples without a label: "
+                                   f"{langs.get('', 0)})")                                        # R22
+        if ignore_spacing:
+            parts = re.findall(r"\w+|\S", q)
+            rx = re.compile(r"\s*".join(re.escape(x) for x in parts), re.I)
+            words = re.findall(r"\w{3,}", q)
+            needle = max(words, key=len) if words else None
+        else:
+            rx = re.compile(re.escape(q), re.I)
+            needle = q
+        where, params = [], []
+        if lang is not None:
+            where.append("b.lang = ? COLLATE NOCASE")
+            params.append(lang)
+        with self._db() as con:
+            # one pass over the code samples only (not the page store); the language filter is part of the query
+            like = "%" + (needle or q).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            sql = ("SELECT b.url, b.title, b.library, b.lang, b.code FROM code_blocks b WHERE b.code LIKE ? ESCAPE '\\'"
+                   + "".join(f" AND {w}" for w in where))
+            rows = con.execute(sql, [like] + params)
+            out: list[dict[str, Any]] = []
+            total = 0
+            for r in rows:
+                if not rx.search(r["code"]):
+                    continue
+                total += 1
+                if len(out) < limit:
+                    lines = r["code"].splitlines()
+                    hit = next((n for n, ln in enumerate(lines) if rx.search(ln)), 0)
+                    lo, hi = max(0, hit - 6), min(len(lines), hit + 10)
+                    out.append({"url": r["url"], "title": r["title"], "library": r["library"],
+                                "language": r["lang"] or None, "line": hit + 1, "snippet": "\n".join(lines[lo:hi])})
+                if total >= 2000:
+                    break
+        res = {"query": q, "count": len(out), "total_matches": total if total < 2000 else "2000+", "items": out,
+               **self._answer_meta()}
+        if language is not None:
+            res["language"] = lang or "(unlabelled)"
+        if not out:
+            complete = False
+            try:
+                complete = self.local is not None and self.index_complete()
+            except Exception:  # noqa: BLE001
+                complete = False
+            res["hint"] = ((f"no code sample in the complete index contains {q!r}"                    # R20
+                            + ("" if ignore_spacing else " — ignore_spacing=true also matches other spacing"))
+                           if complete else "code search covers indexed books only — infosys_index(book=...) first, "
+                           "or wait for the background index (tc_doctor → infosys)")
+        return res
+
+    def code_languages(self) -> dict[str, int]:
+        with self._db() as con:
+            return {r[0]: r[1] for r in con.execute("SELECT lang, COUNT(*) FROM code_blocks GROUP BY lang")}
+
     def get_page(self, ref: str, refresh: bool = False, max_chars: int = 60_000) -> dict[str, Any]:
+        if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:          # R31
+            raise InfosysError(f"max_chars {max_chars!r} must be ≥ 1")
         url = self.resolve(ref)
         try:
             sm = self.sitemap()
@@ -1040,8 +1294,9 @@ class InfosysIndex:
             doc = self._fetch_doc(url)
             with self._db() as con, self._lock:
                 self._store(con, url, lastmod, doc)
+                _bump_gen(con)
                 row = con.execute("SELECT * FROM pages WHERE url = ?", (url,)).fetchone()
-        md = row["markdown"] or ""
+        md = self._links_to_urls(_clean_md(row["markdown"] or ""))
         out = {"url": url, "title": row["title"], "kind": row["kind"], "library": row["library"], "book": row["book"],
                "lastmod": row["lastmod"] or None, "in_sitemap": url in sm,
                "markdown": md[:max_chars], "truncated": len(md) > max_chars, "chars": len(md)}
@@ -1060,18 +1315,29 @@ class InfosysIndex:
             if library:
                 where += " AND (library = ? COLLATE NOCASE OR book = ? COLLATE NOCASE)"
                 params += [library, library]
-            row = con.execute(f"SELECT url, title, kind, library, decl FROM pages WHERE {where}", params).fetchone()
+            rows = con.execute(f"SELECT url, title, kind, library, decl FROM pages WHERE {where} ORDER BY book", params).fetchall()
+        row = rows[0] if rows else None
         if row is None:
             found = self.search_symbols(s, library=library, limit=5)
             exact = [it for it in found["items"] if it["name"].lower() == s.lower()]
             if not exact:
+                complete = self.local is not None and self.index_complete()
                 raise InfosysError(f"no symbol page titled {s!r}" + (f" in {library}" if library else "") +
                                    (f"; near: {[it['name'] for it in found['items']]}" if found["items"] else
-                                    "; index the library first (infosys_index) or check infosys_books"))
+                                    (" in the complete index" if complete else
+                                     "; index the library first (infosys_index) or check infosys_books")))
             with self._db() as con:
                 row = con.execute("SELECT url, title, kind, library, decl FROM pages WHERE url = ?", (exact[0]["url"],)).fetchone()
+            rows = [row]
         decl = json.loads(row["decl"]) if row["decl"] else {"name": row["title"], "kind": row["kind"], "declaration": None}
         decl.update({"url": row["url"], "library": row["library"]})
+        others = sorted({r["library"] for r in rows[1:] if r["library"] and r["library"] != row["library"]})
+        if others and not library:
+            # R23: MC_MoveAbsolute exists in Tc2_MC2 and Tc3_DriveMotionControl with different parameters
+            decl["also_in"] = others
+            decl["ambiguous"] = (f"{s} is documented in {len(others) + 1} libraries — this is {row['library']}'s; "
+                                 f"pass library= for {others}")
+        _tidy_declaration(decl)
         if self.local is not None:
             with self._db() as con:
                 v = con.execute("SELECT version FROM pages WHERE url = ?", (row["url"],)).fetchone()
@@ -1080,9 +1346,70 @@ class InfosysIndex:
             decl.update(self._answer_meta())
         return decl
 
+    # -- ms-xhelp links (R26) ------------------------------------------------------
+    # Help Viewer pages link to each other as ms-xhelp:///?Id=<Microsoft.Help.Id>. The Id → page map is read once from
+    # the package (page meta only, nothing is indexed again) and kept in the database for that package content.
+    def _helpid_map(self, con: Any) -> bool:
+        if self.local is None:
+            return False
+        if getattr(self, "_helpids_ok", None) == id(self.local):
+            return True
+        con.execute("CREATE TABLE IF NOT EXISTS helpids(help_id TEXT PRIMARY KEY, url TEXT)")
+        stamp = self.local.content_stamp()
+        r = con.execute("SELECT value FROM meta WHERE key = 'helpids_stamp'").fetchone()
+        if r is not None and r[0] == stamp:
+            self._helpids_ok = id(self.local)
+            return True
+        with self._derived_lock:
+            from .helpviewer import page_meta
+            con.execute("DELETE FROM helpids")
+            for url in self.local.entries():
+                try:
+                    hid = page_meta(self.local.get(url)).get("Microsoft.Help.Id")
+                except Exception:  # noqa: BLE001
+                    continue
+                if hid:
+                    con.execute("INSERT OR IGNORE INTO helpids VALUES (?, ?)", (hid.strip().lower(), url))
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('helpids_stamp', ?)", (stamp,))
+        self._helpids_ok = id(self.local)
+        return True
+
+    def build_link_map(self) -> dict[str, Any]:
+        t0 = time.time()
+        with self._db() as con:
+            ok = self._helpid_map(con)
+            n = con.execute("SELECT COUNT(*) FROM helpids").fetchone()[0] if ok else 0
+        return {"help_ids": n, "seconds": round(time.time() - t0, 2)}
+
+    def _xhelp_url(self, hid: str) -> str | None:
+        hid = urllib.parse.unquote(hid).strip().lower()
+        with self._db() as con:
+            if not self._helpid_map(con):
+                return None
+            r = con.execute("SELECT url FROM helpids WHERE help_id = ?", (hid,)).fetchone()
+        return r[0] if r else None
+
+    def _links_to_urls(self, md: str) -> str:
+        if "ms-xhelp" not in md or self.local is None:
+            return md
+        cache: dict[str, str | None] = {}
+
+        def sub(m: re.Match) -> str:
+            hid = m.group(1)
+            if hid not in cache:
+                cache[hid] = self._xhelp_url(hid)
+            return cache[hid] or m.group(0)
+        return _XHELP.sub(sub, md)
+
     # -- resolution ----------------------------------------------------------------
     def resolve(self, ref: str) -> str:
         r = ref.strip()
+        if r.lower().startswith("ms-xhelp:"):
+            m = _XHELP.search(r)
+            u = self._xhelp_url(m.group(1)) if m else None
+            if u is None:
+                raise InfosysError(f"{ref!r}: no page with that Help Viewer Id in the local package")
+            return u
         if r.startswith("http://") or r.startswith("https://"):
             u = r.split("#", 1)[0]
             u = re.sub(r"\?id=\d+$", "", u)
@@ -1100,7 +1427,8 @@ class InfosysIndex:
             hits = [u for u in self.sitemap() if u.endswith(f"/{r}.html")]
             if hits:
                 return hits[0]
-            raise InfosysError(f"no page id {r} in the Infosys sitemap")
+            raise InfosysError(f"no page id {r} in the " + ("local Help Viewer package" if self.local is not None
+                                                             else "Infosys sitemap"))
         # a symbol name
         with self._db() as con:
             row = con.execute("SELECT url FROM pages WHERE title = ? COLLATE NOCASE AND kind != 'Page' ORDER BY book",
@@ -1116,11 +1444,17 @@ class InfosysIndex:
 
     # -- internals -------------------------------------------------------------------
     def _fts_search(self, q: str, library: str | None, limit: int) -> list[dict[str, Any]]:
-        toks = [t for t in re.findall(r"[\w\.]+", q) if t]
+        # R29: a quoted phrase stays one FTS phrase ("ADS error code" 1861 matched pages with 'error code' alone)
+        terms: list[str] = []
+        for phrase, bare in re.findall(r'"([^"]*)"|([^\s"]+)', q):
+            words = re.findall(r"[\w\.]+", phrase if phrase else bare)
+            if words:
+                terms.append('"' + " ".join(w.replace('"', '""') for w in words) + '"')
+        toks = terms
         if not toks:
             return []
         for joiner in (" AND ", " OR "):
-            match = joiner.join('"' + t.replace('"', '""') + '"' for t in toks)
+            match = joiner.join(toks)
             sql = (f"SELECT p.url, p.title, p.kind, p.library, p.book, p.version, "
                    f"snippet(pages_fts, 2, '[', ']', '…', 24) AS snip, bm25(pages_fts, 0.0, 10.0, 1.0, 0.5) AS score "
                    f"FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE pages_fts MATCH ?")

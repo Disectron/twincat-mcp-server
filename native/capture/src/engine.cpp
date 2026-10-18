@@ -754,7 +754,12 @@ int64_t Engine::tail_missing(const BState& s, int64_t end, bool have_end) const 
         return (end - ws_) / step_of(s) + 1;   // never delivered: the whole window is missing
     }
     if (end <= s.last_ft) return 0;
-    return std::max<int64_t>(0, (end - s.last_ft) / step_of(s) - 1);   // one period of slack, as the Python recorder
+    // one period of slack, as the Python recorder. R7: a stop on request (rec_stop, "run ended") unsubscribes the
+    // blocks one after another, so each block's last sample may lie a few cycles before the latest — that is the
+    // unsubscribe order, not a lost sample. The slack then covers the batching delay plus three cycles.
+    int64_t slack = 1;
+    if (manual_stop_.load() && !have_stop_ft_) slack = 3 + max_delay_ / std::max<int64_t>(1, step_of(s));
+    return std::max<int64_t>(0, (end - s.last_ft) / step_of(s) - slack);
 }
 
 int64_t Engine::window_end(bool& have) const {
@@ -947,6 +952,7 @@ std::string Engine::stop(const std::string& reason) {
             std::lock_guard<std::mutex> lk(mu_);
             if (stop_reason_.empty()) stop_reason_ = reason;
         }
+        manual_stop_.store(true);
         unsubscribe_once();        // no new samples; what the rings hold was taken before the stop
         stop_req_.store(true);
     }

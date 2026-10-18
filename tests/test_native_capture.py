@@ -367,6 +367,19 @@ def test_spec5_pre_trigger_exactly_500(rec):
     assert v["verdict"] == "PASS" and v["timeline"]["missing"] == 0
 
 
+def test_n29_native_not_armed_after_trigger(rec):
+    """N29 (native): status after the trigger fired and the recording ended must not say armed."""
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=None,
+                   max_events=None, start_when="MAIN.nCycle >= 300", stop_when=None, pre_trigger_ms=0, name="n29",
+                   max_symbols=50, post_trigger_s=0.3, cycle_counter=None)
+    assert st["engine"] == "native"
+    _wait_done(rec, st["id"])
+    s1 = rec.status(st["id"])
+    assert s1["armed"] is False and s1["triggered_at_ms"] is not None
+    fin = rec.stop(st["id"])
+    assert fin.get("armed", False) is False
+
+
 def test_pre_trigger_not_filled_is_missing_head(rec):
     st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=None,
                    max_events=None, start_when="MAIN.nCycle >= 100", stop_when=None, pre_trigger_ms=500, name="nh",
@@ -558,3 +571,16 @@ def test_d32_snapshot_of_a_finished_native_recording_counts_its_events(rec):
     nrec.events = 0                                   # nobody called status() since the start
     snap = rec.snapshot(st["id"], 10, None)
     assert snap["rows"] and snap["events"] > 0, snap
+
+
+def test_r7_manual_stop_of_a_lossless_native_recording_is_complete(rec):
+    """R7: rec_stop / 'run ended' on a native recording → missing_tail 1, INCOMPLETE/FAIL although the counter is
+    lossless: the blocks are unsubscribed one after another, the first stops a cycle or two before the last."""
+    st = rec.start(symbols=["MAIN.nCycle", "MAIN.stRecipe"], prefix=None, pattern=None, mode="cycle", cycle_ms=1,
+                   duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="r7",
+                   max_symbols=50, cycle_counter=None)
+    time.sleep(1.0)
+    fin = rec.stop(st["id"], "run ended")
+    assert fin["engine"] == "native" and fin["missing_samples"] == 0 and fin["verdict_hint"] == "PASS", fin
+    v = rec.verify(st["id"], counter="MAIN.nCycle")
+    assert v["verdict"] == "PASS" and v["counter"]["lossless"], v

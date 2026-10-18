@@ -180,6 +180,8 @@ tcunit_remote_result = 'boot:TcUnit_xUnit_testresults.xml'   # 'boot:' resolves 
 
 [server]
 tool_groups = ["ads", "rec", "snap", "test", "proj", "xae", "infosys", "wf"]   # only these groups (tc_* always); remove the line for all
+# output_dirs = ['D:\Exports']        # extra folders tools may write files to; the recordings, project, solution, scope-export,
+#                                    # experiments and audit-log folders are always allowed (existing files need overwrite=true)
 
 [safety]
 mode = "guarded"                     # readonly | guarded | full

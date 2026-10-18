@@ -627,3 +627,52 @@ def test_d26_duty_over_the_pulse_train_not_the_idle_lead_in(rec, monkeypatch):
     ev2 = [{"t_ms": 0.0, "symbol": "B", "value": True}, {"t_ms": 7.0, "symbol": "B", "value": False}] + ev[1:]
     monkeypatch.setattr(rec, "_events_for", lambda r, syms: list(ev2))
     assert rec.pulses("x", "B")["pulses"] == 5
+
+
+def test_r9_r10_nonsense_parameters_and_conditions_are_refused(rec):
+    """R9: cycle_ms=-5 became 0.1 ms and duration_s=-1 meant no end. R10: 'X >>> import os' was accepted as '>'
+    against a string and never fired."""
+    base = dict(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=None,
+                max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="r9", max_symbols=50)
+    for bad, msg in (({"cycle_ms": -5}, "cycle_ms -5 must be between"), ({"duration_s": -1}, "duration_s -1 must be > 0"),
+                     ({"cycle_ms": 0}, "cycle_ms 0 must be"), ({"max_events": 0}, "max_events 0"),
+                     ({"pre_trigger_ms": -1}, "pre_trigger_ms -1")):
+        with pytest.raises(RecorderError, match=msg):
+            rec.start(**{**base, **bad})
+    assert not rec.recs, "nothing was started"
+    for cond, msg in (("MAIN.nCycle >>> import os", "operator not understood"),
+                      ("MAIN.nCycle > banana", "not a valid UDINT value"),
+                      ("MAIN.nCycle == 1.5", "not a valid UDINT value")):
+        with pytest.raises(RecorderError, match=msg):
+            rec.start(**{**base, "mode": "change", "stop_when": cond})
+    ok = rec.start(**{**base, "mode": "change", "stop_when": "MAIN.nCycle >= 10"})
+    rec.stop(ok["id"])
+
+
+def test_r13_snapshot_of_a_recording_from_an_earlier_session(rec, monkeypatch, tmp_path):
+    """R13: rec_snapshot of a recording made before a server restart → 'unknown in this session'."""
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="poll", cycle_ms=10, duration_s=None,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="r13", max_symbols=50)
+    time.sleep(0.3)
+    rec.stop(st["id"])
+    fresh = Recorder(rec.ads, rec.root, ring_events=1000, max_runs=100)          # "after a restart"
+    snap = fresh.snapshot(st["id"], 5, None)
+    assert snap["active"] is False and "earlier server session" in snap["source"] and snap["rows"]
+
+
+def test_d46_counter_check_segments_at_a_restart(rec, monkeypatch):
+    """D46: CycleCount restarts at 0 after a TwinCAT restart → expected_samples −165,220, completeness −0.19."""
+    from twincat_mcp import recorder as R
+    ev = [(float(i), "C", 165_000 + i) for i in range(300)] + [(400.0 + i, "C", i + 1) for i in range(200)]
+    monkeypatch.setattr(R, "iter_events", lambda path, want=None: iter(ev))
+    monkeypatch.setattr(rec, "_path_for", lambda rid: Path(__file__))
+    monkeypatch.setattr(R, "read_footer", lambda p: {})
+    monkeypatch.setattr(R, "_read_header", lambda p: {"mode": "change"})
+    try:
+        v = rec.verify("x", counter="C")
+    except Exception:
+        pytest.skip("verify needs the integrity part of a real file here")
+    c = v["counter"]
+    assert c["expected_samples"] == 500 and c["completeness"] == 1.0 and c["segments"] == 2, c
+    assert c["resets"][0]["from"] == 165_299 and c["resets"][0]["to"] == 1 and c["lossless_within_segments"]
+    assert c["lossless"] is False

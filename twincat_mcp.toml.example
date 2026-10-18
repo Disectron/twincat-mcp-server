@@ -41,6 +41,9 @@ also_scope = "ask"                 # rec_start + a TwinCAT Scope configuration o
 
 [server]
 tool_groups = ["ads", "rec", "snap", "test", "proj", "xae", "infosys", "wf", "scope"]   # only these groups (tc_* always); remove the line for all
+# output_dirs = ['D:\Exports']      # extra folders the tools may write files to (exports, dumps, reports). Always allowed:
+#                                  # the recordings folder, the project and solution folders, the scope export folder,
+#                                  # the experiments folder and the audit-log folder. Existing files need overwrite=true.
 
 [safety]
 mode = "guarded"                   # readonly | guarded | full  (start mode)

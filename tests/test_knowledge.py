@@ -162,3 +162,10 @@ def test_d19_esi_namespaced_pdos_entries_and_coe():
     assert pdos[0]["index"] == "#x1A00" and pdos[0]["name"] == "AI Standard Channel 1"
     assert [(e["index"], e["sub"], e["bits"]) for e in pdos[0]["entries"]] == [("#x6000", 1, 1), ("#x6000", 17, 16)]
     assert coe == [{"index": "#x8000", "name": "AI Settings Ch.1", "type": "DT8000"}]
+
+
+def test_r16_rpc_size_error_points_at_the_argument_list():
+    """R16: ads_call_method with one input too few → ADS 0x705 with a hint about variable writes / arrays."""
+    m = K.annotate("RPC call 'P.fb#M' failed: ADSError 1797 (0x705) parameter size not correct (sent 1 input(s) = 4 bytes)")
+    assert "VAR_INPUT in declaration order" in m and "write elements by index" not in m
+    assert "write elements by index" in K.annotate("write MAIN.a failed: ADSError 1797 (0x705)")

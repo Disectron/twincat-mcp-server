@@ -98,7 +98,8 @@ class Condition:
     _prev: bool | None = None
 
     @classmethod
-    def parse(cls, text: str, types: dict[str, T.TcType], edge: bool = False) -> "Condition":
+    def parse(cls, text: str, types: dict[str, T.TcType], edge: bool = False,
+              enum_resolver: Callable[[str, str], Any] | None = None) -> "Condition":
         m = _RE_COND.match(text)
         if not m:
             raise RecorderError(f"condition {text!r} must look like 'MAIN.bDone == TRUE' or 'MAIN.nStep >= 4'")
@@ -121,11 +122,27 @@ class Condition:
                 key, index, tt = base, flat, tb.elem
         if key is None:
             raise RecorderError(f"condition symbol {sym!r} is not part of the recording; add it to symbols")
-        raw = m.group("val").strip().strip("'\"")
+        rawv = m.group("val").strip()
+        raw = rawv.strip("'\"")
+        # R10: 'GVL_Sim.nCycle >>> import os' parsed as '>' against the text '>> import os' and silently never fired —
+        # the value must be a literal of the symbol's type, else the condition is refused
+        if re.match(r"^[=<>!]", rawv):
+            raise RecorderError(f"condition {text!r}: operator not understood (use ==, !=, >, >=, <, <=)")
+        if tt is None:
+            raise RecorderError(f"condition {text!r}: the type of {sym!r} is unknown, so its value cannot be checked")
+        if tt.ctype is None and tt.kind not in ("string", "wstring"):
+            raise RecorderError(f"condition {text!r}: {sym!r} is a {tt.name} — conditions compare scalars")
+        lit: Any = raw
+        if tt.kind in ("enum", "int", "uint") and enum_resolver is not None \
+                and not re.fullmatch(r"[-+]?(\d+|0x[0-9a-fA-F]+|16#[0-9a-fA-F_]+|2#[01_]+)", raw):
+            try:
+                lit = enum_resolver(tt.name, raw)               # 'E_State.Running' → its integer
+            except Exception:  # noqa: BLE001
+                lit = raw
         try:
-            val = T.encode(tt, raw) if tt is not None else raw
-        except Exception:  # noqa: BLE001
-            val = raw
+            val = T.encode(tt, lit)
+        except Exception as exc:  # noqa: BLE001
+            raise RecorderError(f"condition {text!r}: {raw!r} is not a valid {tt.name} value ({exc})") from exc
         return cls(key, m.group("op"), val, index, edge)
 
     def fires(self, value: Any) -> bool:
@@ -1013,7 +1030,7 @@ class Recording:
                                   else "deferred (high rate: computed from the file by rec_stats)",
                 "events_per_s": round(self.events / elapsed, 1) if elapsed > 0 else 0.0,
                 "elapsed_s": round(elapsed, 2), "plc_span_s": round(self.last_t / 1000.0, 4),
-                "armed": self.armed and self.triggered_at is None,
+                "armed": bool(self.active and self.armed and self.triggered_at is None),
                 "triggered_at_ms": None if self.triggered_at is None else round(self.triggered_at, 3),
                 "stop_reason": self.stop_reason, "file": str(self.path),
                 "file_bytes": self.path.stat().st_size if self.path.exists() else 0,
@@ -1477,9 +1494,27 @@ class Recorder:
         want = (engine or (getattr(self.rcfg, "engine", "auto") if self.rcfg is not None else "auto")).lower()
         if want not in ("auto", "native", "python"):
             raise RecorderError("engine must be auto | native | python")
-        if mode not in ("cycle", "change", "poll"):
-            raise RecorderError("mode must be cycle | change | poll")
-        cycle_ms = max(float(cycle_ms), 0.1)
+        # R9: cycle_ms=-5 became 0.1 ms silently (20,000 notifications/s) and duration_s=-1 meant "no end"
+        bad = []
+        try:
+            cycle_ms = float(cycle_ms)
+        except (TypeError, ValueError):
+            bad.append(f"cycle_ms {cycle_ms!r} is not a number")
+            cycle_ms = 0.0
+        if not bad and not (0.05 <= cycle_ms <= 3_600_000):
+            bad.append(f"cycle_ms {cycle_ms:g} must be between 0.05 and 3,600,000 ms (TwinCAT's finest task is 50 µs)")
+        for nm, v, lo in (("duration_s", duration_s, 0.0), ("post_trigger_s", post_trigger_s, 0.0)):
+            if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool) or not v > lo):
+                bad.append(f"{nm} {v!r} must be > 0 (or omitted)")
+        if max_events is not None and (not isinstance(max_events, int) or isinstance(max_events, bool) or max_events <= 0):
+            bad.append(f"max_events {max_events!r} must be a positive integer (or omitted)")
+        for nm, v in (("pre_trigger_ms", pre_trigger_ms), ("max_delay_ms", max_delay_ms)):
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
+                bad.append(f"{nm} {v!r} must be ≥ 0")
+        if isinstance(max_symbols, bool) or not isinstance(max_symbols, int) or max_symbols <= 0:
+            bad.append(f"max_symbols {max_symbols!r} must be a positive integer")
+        if bad:
+            raise RecorderError("; ".join(bad) + " — nothing was started")
         syms = self.expand_symbols(symbols, prefix, pattern, max_symbols, port)
         manifest = self._manifest(port)
         counter = None
@@ -1490,8 +1525,9 @@ class Recorder:
         rid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
         path = self.root / f"{rid}.jsonl"
         types = {s.name: T.parse_type(s.type, s.size) for s in syms}
-        sw = Condition.parse(start_when, types, edge_triggers) if start_when else None
-        ew = Condition.parse(stop_when, types, edge_triggers) if stop_when else None
+        er = (lambda tname, raw: self.ads.enum_literal(tname, raw, port))
+        sw = Condition.parse(start_when, types, edge_triggers, er) if start_when else None
+        ew = Condition.parse(stop_when, types, edge_triggers, er) if stop_when else None
         if post_trigger_s and not sw:
             raise RecorderError("post_trigger_s needs start_when (it counts from the trigger)")
         meta = {"ams_net_id": self.ads.net_id, "port": port or self.ads.port, "start_when": start_when,
@@ -1810,7 +1846,20 @@ class Recorder:
         return self._get(rid).status()
 
     def snapshot(self, rid: str, last_n: int, symbols: list[str] | None) -> dict[str, Any]:
-        rec = self._get(rid)
+        try:
+            rec = self._get(rid)
+        except RecorderError:
+            # R13: a recording from an earlier server session — its tail comes from the file
+            path = self._path_for(rid)
+            want = {x.lower() for x in symbols} if symbols else None
+            ring: deque[dict[str, Any]] = deque(maxlen=max(1, last_n))
+            n = 0
+            for t, nm, v in iter_events(path, want):
+                n += 1
+                ring.append({"t_ms": round(t, 3), "symbol": nm, "value": v})
+            ft = read_footer(path) or {}
+            return {"id": path.stem, "active": False, "events": ft.get("events", n), "rows": list(ring),
+                    "source": "file (recording from an earlier server session)"}
         try:
             # D32: a native recording's counters are refreshed by status() (the service / its footer); a finished one
             # that nobody asked showed events: 0 next to its rows
@@ -2242,24 +2291,39 @@ class Recorder:
                     pos = [d for d in diffs if d > 0]
                     step = max(set(pos), key=pos.count) if pos else 1
                 gaps, dups, back, missing = [], 0, 0, 0
+                resets: list[dict[str, Any]] = []
+                seg_first = vals[0][1]
+                span = 0
                 for (ta, va), (tb, vb), d in zip(vals, vals[1:], diffs):
                     if d == 0:
                         dups += 1
                     elif d < 0:
+                        # D46: the counter restarted (TwinCAT restart / RUN after CONFIG): a new segment. Across it the
+                        # counter proves nothing — the restart time is checked by the timeline, not by the counter
                         back += 1
+                        span += (va - seg_first) // step + 1
+                        seg_first = vb
+                        if len(resets) < max_gaps:
+                            resets.append({"t_ms": tb, "from": va, "to": vb, "gap_ms": round(tb - ta, 4)})
                     elif d != step:
                         miss = d // step - 1 if d % step == 0 else None
                         missing += miss or 0
                         if len(gaps) < max_gaps:
                             gaps.append({"t_ms": tb, "from": va, "to": vb, "missing_samples": miss})
-                span = (vals[-1][1] - vals[0][1]) // step + 1 if step else None
+                span += (vals[-1][1] - seg_first) // step + 1
                 # D12: completeness = distinct counter values present / expected — repeated values (a stopped PLC
                 # keeps sending the same CycleCount) are duplicates, never more than 100 %
                 distinct = len(vals) - dups
                 out["counter"] = {"symbol": counter, "samples": len(vals), "step": step, "expected_samples": span,
                                   "missing_samples": missing, "duplicates": dups, "backwards": back,
-                                  "completeness": round(min(1.0, distinct / span), 6) if span else None,
+                                  "segments": back + 1,
+                                  "completeness": round(min(1.0, distinct / span), 6) if span > 0 else None,
                                   "lossless": missing == 0 and dups == 0 and back == 0, "first_gaps": gaps}
+                if resets:
+                    out["counter"]["resets"] = resets
+                    out["counter"]["lossless_within_segments"] = missing == 0 and dups == 0
+                    out["counter"]["reset_note"] = (f"the counter restarted {back} time(s) (TwinCAT restart): checked per "
+                                                    "segment; what happened during a restart is in the timeline check")
                 if dups:
                     out["counter"]["note"] = (f"{dups} samples repeat the previous counter value: the task did not run "
                                               "between them (PLC stopped / breakpoint) — frozen values, not new data")

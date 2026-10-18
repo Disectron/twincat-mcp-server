@@ -614,3 +614,15 @@ def test_d36_d34_ci_of_counts_and_quantised_latencies():
     # the criterion is no longer a certain pass: the limit 1.2 lies inside ±0.5 ms of the grid
     assert ev["levels"][0]["criteria"][0]["verdict"] == "inconclusive"
     assert ev["levels"][0]["measures"]["count"]["ci95_mean"][0] == 0.0
+
+
+def test_r1_broken_yaml_or_json_spec_says_where():
+    """R1: broken YAML → 'Error executing tool exp_validate' with an empty message."""
+    with pytest.raises(X.ExperimentError, match=r"not valid YAML: .* at line 2"):
+        X.load_spec("name: x\n  bad: [unclosed\n")
+    with pytest.raises(X.ExperimentError, match=r"not valid JSON: .* line 1"):
+        X.load_spec('{"name": ')
+    with pytest.raises(X.ExperimentError, match="spec is empty"):
+        X.load_spec("  ")
+    with pytest.raises(X.ExperimentError, match=r"must be a mapping \(got list\)"):
+        X.load_spec("- a\n- b\n")

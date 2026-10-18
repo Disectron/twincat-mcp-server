@@ -182,7 +182,8 @@ def test_code_search(idx):
     idx.index_book("tcplclib_tc2_system")
     r = idx.search_code("IDXGRP:=16#F005", language="st")
     assert r["count"] == 1 and r["items"][0]["title"] == "ADSREAD" and "PROGRAM MAIN" in r["items"][0]["snippet"]
-    assert idx.search_code("IDXGRP:=16#F005", language="xml")["count"] == 0
+    with pytest.raises(InfosysError, match="language 'xml' does not occur in the index"):      # R22
+        idx.search_code("IDXGRP:=16#F005", language="xml")
 
 
 def test_get_page_resolution_forms(idx):
@@ -255,3 +256,90 @@ def test_declaration_shipped_as_div_br_instead_of_pre():
         ("bStart", "BOOL", None, "go"), ("tDelay", "TIME", "T#1S", None), ("a", "INT", None, None), ("b", "INT", None, None)]
     assert dec["inputs"][0]["description"] == "Starts. Really."
     assert "Does things." in d.markdown and d.markdown.count("\n|") >= 2, "tables stay multi-line"
+
+
+def test_r17_to_r22_code_search(idx):
+    """R17: code stored with non-breaking spaces never matched a query with a space. R19: LIMIT before the language
+    filter. R21: limit 0 / -1 / 1000. R22: unknown language → 0 and a wrong hint; unlabelled samples unreachable."""
+    idx.index_book("tcplclib_tc2_system")
+    assert idx.search_code("fbAdsRead(")["count"] == 1
+    assert idx.search_code("fbAdsRead ( NETID := ''")["count"] == 0                    # exact by default
+    assert idx.search_code("fbAdsRead ( NETID := ''", ignore_spacing=True)["count"] == 1
+    for bad in (0, -1, 1000):
+        with pytest.raises(InfosysError, match="limit"):
+            idx.search_code("fbAdsRead", limit=bad)
+    r = idx.search_code("NoSuchThing(")
+    assert r["count"] == 0 and "hint" in r
+    # \xa0 in a stored sample (the Help Viewer pages: 21,166 of 24,960)
+    with idx._db() as con:
+        con.execute("UPDATE pages SET code = replace(code, 'READ:=TRUE', 'READ\u00a0:=\u00a0TRUE'), fetched = fetched + 1")
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('pages_gen', '99')")
+    assert idx.search_code("READ := TRUE")["count"] == 1
+    langs = idx.code_languages()
+    assert idx.search_code("fbAdsRead", language="ST")["count"] == 1 and set(langs) == {"st"}
+    with idx._db() as con:                                         # the derived blocks were replaced, not duplicated
+        assert con.execute("SELECT COUNT(*) FROM code_blocks").fetchone()[0] == langs["st"]
+        assert con.execute("SELECT COUNT(*) FROM code_src").fetchone()[0] == con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+
+
+
+def test_r24_r25_r32_declaration_tidy():
+    from twincat_mcp.infosys import _tidy_declaration
+    f = {"name": "F_GetSystemTime", "kind": "Function", "return_type": None,
+         "declaration": "VAR_OUTPUT\n  F_GetSystemTime : ULINT;\nEND_VAR\nVAR_INPUT\n  bX : BOOL;\nEND_VAR",
+         "outputs": [{"name": "F_GetSystemTime", "type": "ULINT", "description": "system time"}],
+         "inputs": [{"name": "bX", "type": "BOOL", "description": "x"}], "description": {"bX": "x", "F_GetSystemTime": "system time"}}
+    _tidy_declaration(f)
+    assert f["return_type"] == "ULINT" and f["outputs"] == [] and f["declaration"].startswith("FUNCTION F_GetSystemTime : ULINT")
+    assert "description" not in f                                    # every entry was carried by an item
+    e = {"name": "E_OpenPath", "kind": "Enum",
+         "declaration": "TYPE E_OpenPath :\n(\n  PATH_GENERIC := 1, (* search/open/create files in selected/generic folder *)\n"
+                        "  PATH_BOOTPRJ, (* boot project folder *)\n  PATH_BOOTDATA,\n  PATH_MAX := 16#10\n);\nEND_TYPE",
+         "enum_values": [{"name": "PATH_GENERIC", "value": "1"}, {"name": "PATH_BOOTPRJ", "value": None},
+                         {"name": "PATH_BOOTDATA", "value": None}, {"name": "PATH_MAX", "value": "16#10"}]}
+    _tidy_declaration(e)
+    vals = {v["name"]: v for v in e["enum_values"]}
+    assert vals["PATH_BOOTPRJ"]["value"] == "2" and vals["PATH_BOOTPRJ"]["implicit"] and vals["PATH_BOOTDATA"]["value"] == "3"
+    assert vals["PATH_BOOTPRJ"]["description"] == "boot project folder" and vals["PATH_MAX"]["value"] == "16#10"
+
+
+def test_r27_r28_r29_r31_infosys_queries(idx):
+    idx.index_book("tcplclib_tc2_system")
+    assert idx.search_symbols("%", auto_index=False)["count"] == 0                     # R27: no wildcard
+    assert idx.search_symbols("ADS_EAD", auto_index=False)["count"] == 0
+    assert idx.search_symbols("ADSREAD", auto_index=False)["count"] >= 1
+    with idx._db() as con:                                                            # R28: help topic typed as FB
+        con.execute("INSERT INTO pages(url, book, title, kind, library, markdown, text, code, fetched) VALUES "
+                    "('https://infosys.beckhoff.com/content/1033/tcplclib_tc2_system/1.html', 'tcplclib_tc2_system', "
+                    "'Use of function blocks', 'FunctionBlock', 'Tc2_System', '', '', '', 1)")
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('pages_gen', '77')")
+    assert idx.search_symbols("Use of", kind="FunctionBlock", auto_index=False)["count"] == 0
+    for bad in (dict(limit=-1), dict(limit=0), dict(limit=1000)):
+        with pytest.raises(InfosysError, match="limit"):
+            idx.search_symbols("ADSREAD", auto_index=False, **bad)
+        with pytest.raises(InfosysError, match="limit"):
+            idx.search("ADSREAD", **bad)
+    with pytest.raises(InfosysError, match="category 'bogus' unknown"):
+        idx.books(category="bogus")
+    with pytest.raises(InfosysError, match="max_pages"):
+        idx.index_book("tcplclib_tc2_system", max_pages=-5)
+    assert idx.index_book("Tc2_System")["book"] == "tcplclib_tc2_system"            # R31: library name accepted
+    one = idx._fts_search('"read the value"', None, 10)                              # R29: phrase kept
+    many = idx._fts_search("read the value", None, 10)
+    assert len(one) <= len(many)
+
+
+def test_r23_ambiguous_declaration_names_the_other_libraries(idx):
+    """R23: MC_MoveAbsolute (Tc2_MC2 and Tc3_DriveMotionControl, different inputs) silently returned one of them."""
+    import json as _j
+    with idx._db() as con:
+        for lib, book in (("Tc2_MC2", "tcplclib_tc2_mc2"), ("Tc3_DriveMotionControl", "tcplclib_tc3_drivemotioncontrol")):
+            d = {"name": "MC_MoveAbsolute", "kind": "FunctionBlock", "declaration": "FUNCTION_BLOCK MC_MoveAbsolute",
+                 "inputs": [], "outputs": [], "in_out": [], "members": [], "enum_values": [], "description": {}}
+            con.execute("INSERT INTO pages(url, book, title, kind, library, markdown, text, code, decl, fetched) VALUES "
+                        "(?,?,?,?,?,?,?,?,?,?)", (f"https://infosys.beckhoff.com/content/1033/{book}/1.html", book,
+                                                  "MC_MoveAbsolute", "FunctionBlock", lib, "", "", "", _j.dumps(d), 1))
+    r = idx.declaration("MC_MoveAbsolute")
+    assert r["library"] == "Tc2_MC2" and r["also_in"] == ["Tc3_DriveMotionControl"] and "pass library=" in r["ambiguous"]
+    r = idx.declaration("MC_MoveAbsolute", library="Tc3_DriveMotionControl")
+    assert r["library"] == "Tc3_DriveMotionControl" and "also_in" not in r

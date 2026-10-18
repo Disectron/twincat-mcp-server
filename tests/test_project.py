@@ -118,11 +118,29 @@ def test_parse_vars_multi_name_and_sections():
 def test_tcunit_parse(project_dir):
     txt = (project_dir / "TcUnit_xUnit_testresults.xml").read_text()
     r = parse_tcunit_xml(txt)
-    assert r["summary"] == {"tests": 3, "failures": 1, "skipped": 0}
+    assert r["summary"] == {"tests": 3, "failures": 1, "errors": 0, "skipped": 0}
     assert r["passed"] == 2 and not r["all_passed"]
     assert r["failed_tests"] == ["FB_Fill_Test::Test_CutoffApplied: EXP: 0.9, ACT: 0.85"]
     with pytest.raises(ProjectError):
         parse_tcunit_xml("<not xml")
+
+
+def test_r3_tcunit_counts_cases_not_suite_attributes():
+    """R3: a <failure> in a suite whose 'failures' attribute is missing (or 0) came out as all_passed: true."""
+    xml = ('<testsuites><testsuite name="x" tests="2">'
+           '<testcase name="a" classname="x"/><testcase name="b" classname="x"><failure message="boom"/></testcase>'
+           '</testsuite></testsuites>')
+    r = parse_tcunit_xml(xml)
+    assert r["all_passed"] is False and r["passed"] == 1 and r["failed_tests"] == ["x::b: boom"]
+    lie = xml.replace('tests="2"', 'tests="2" failures="0"')
+    r = parse_tcunit_xml(lie)
+    assert not r["all_passed"] and r["attribute_mismatch"] == ["x: attribute failures=0, counted 1"]
+    r = parse_tcunit_xml('<testsuites><testsuite name="y" tests="3" failures="0"><testcase name="a"/></testsuite></testsuites>')
+    assert not r["all_passed"] and "tests=3, counted 1" in r["attribute_mismatch"][0]
+    err = parse_tcunit_xml('<testsuites><testsuite name="z"><testcase name="a"><error message="exc"/></testcase></testsuite></testsuites>')
+    assert err["summary"]["errors"] == 1 and not err["all_passed"]
+    ok = parse_tcunit_xml('<testsuites><testsuite name="w" tests="1" failures="0"><testcase name="a"/></testsuite></testsuites>')
+    assert ok["all_passed"] and "attribute_mismatch" not in ok
 
 
 def test_unknown_root(tmp_path):

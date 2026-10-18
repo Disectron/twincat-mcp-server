@@ -305,7 +305,7 @@ class FakeConnection:
         return notification.h, notification.ts, notification.value
 
     def _deliver(self, name, value, ts):
-        off = _SYM_OFFSET.get(name)
+        off = _SYM_OFFSET.get(name, _EXTRA_OFFSET.get(name))
         for h, (key, attr, cb) in list(getattr(self, "notifications", {}).items()):
             if key == name:
                 cb(type("N", (), {"h": h, "ts": ts, "value": value})(), name)
@@ -323,6 +323,8 @@ class FakeConnection:
 
 
 _SYM_OFFSET = {n: i * 64 for i, (n, t, s, v, f) in enumerate(SYMBOLS)}
+# the runtime-only symbols sit apart from the table (each its own 64-byte slot), so block notifications on them work
+_EXTRA_OFFSET = {n: 0x9000 + k * 64 for k, n in enumerate(EXTRA_SYMBOLS)}
 
 
 def memory_image(start: int, length: int) -> bytes:
@@ -336,6 +338,15 @@ def memory_image(start: int, length: int) -> bytes:
         if raw is None:
             raw = _scalar_bytes(t, size, FakeConnection.shared_values.get(n, v0))
         raw = bytes(raw[:64])
+        for j, b in enumerate(raw):
+            k = off + j - start
+            if 0 <= k < length:
+                buf[k] = b
+    for n, off in _EXTRA_OFFSET.items():
+        if off + 64 <= start or off >= start + length:
+            continue
+        t, size, v0 = EXTRA_SYMBOLS[n]
+        raw = bytes(_scalar_bytes(t, size, FakeConnection.shared_values.get(n, v0))[:64])
         for j, b in enumerate(raw):
             k = off + j - start
             if 0 <= k < length:
@@ -384,7 +395,7 @@ def install(monkeypatch):
     def fake_symbol_info(port, adr, name):
         if name in EXTRA_SYMBOLS:
             t, size, v = EXTRA_SYMBOLS[name]
-            return type("E", (), {"name": name, "symbol_type": t, "size": size, "iGroup": 0x4040, "iOffs": 0x9000,
+            return type("E", (), {"name": name, "symbol_type": t, "size": size, "iGroup": 0x4040, "iOffs": _EXTRA_OFFSET[name],
                                   "flags": 0, "comment": ""})()
         raise pyads.ADSError(1808)
     monkeypatch.setattr(pyads.pyads_ex, "adsGetSymbolInfo", fake_symbol_info)

@@ -138,12 +138,15 @@ class HelpViewerSource:
         return dict(self._crc)
 
     def content_stamp(self) -> str:
-        """Identity of the whole package content, independent of file name and modification time."""
+        """Identity of the whole package content, independent of file name and modification time (computed once)."""
+        if getattr(self, "_stamp_cache", None):
+            return self._stamp_cache
         self.entries()
         h = hashlib.sha256()
         for u in sorted(self._crc):
             h.update(f"{u}={self._crc[u]}\n".encode())
-        return "content:" + h.hexdigest()[:24]
+        self._stamp_cache = "content:" + h.hexdigest()[:24]
+        return self._stamp_cache
 
     def has(self, url: str) -> bool:
         return url in self.entries()

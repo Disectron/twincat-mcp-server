@@ -539,17 +539,42 @@ class AdsBackend:
         return out
 
     def dump(self, pattern: str | None, include_system: bool, out_dir: str, max_total_bytes: int = 64 * 1024 * 1024,
-             max_leaves: int = 500_000, port: int | None = None) -> dict[str, Any]:
-        """Read every variable (every root symbol, fully expanded) and write JSON + CSV."""
-        import csv, json, os
+             max_leaves: int = 500_000, port: int | None = None, cancel: Any = None) -> dict[str, Any]:
+        """Read every variable (every root symbol, fully expanded) and write JSON + CSV. Written as *.partial and
+        renamed when complete; a failed or cancelled dump leaves no file behind and says so (R8)."""
+        import os
         from pathlib import Path
-        c = self.conn(port)
-        ts = self.typesystem(False, port)
-        roots = self.roots(pattern, include_system, port)
-        os.makedirs(out_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         jpath = Path(out_dir) / f"dump-{stamp}.json"
         cpath = Path(out_dir) / f"dump-{stamp}.csv"
+        jpart, cpart = jpath.with_name(jpath.name + ".partial"), cpath.with_name(cpath.name + ".partial")
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            res = self._dump(pattern, include_system, cpart, jpart, max_total_bytes, max_leaves, port, cancel)
+        except BaseException as exc:
+            removed = []
+            for p in (cpart, jpart):
+                try:
+                    if p.exists():
+                        size = p.stat().st_size
+                        p.unlink()
+                        removed.append(f"{p.name} ({size} bytes)")
+                except OSError:
+                    pass
+            msg = f"ads_dump failed: {_fmt_exc(exc) if not isinstance(exc, AdsError) else exc}"
+            raise AdsError(msg + (f" — partial files removed: {removed}" if removed else "")) from exc
+        os.replace(cpart, cpath)
+        os.replace(jpart, jpath)
+        res.update({"json": str(jpath), "csv": str(cpath)})
+        return res
+
+    def _dump(self, pattern: str | None, include_system: bool, cpath: Any, jpath: Any, max_total_bytes: int,
+              max_leaves: int, port: int | None, cancel: Any) -> dict[str, Any]:
+        import csv, json
+        c = self.conn(port)
+        ts = self.typesystem(False, port)
+        roots = self.roots(pattern, include_system, port)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
         tree: dict[str, Any] = {}
         n_leaves = 0
         n_bytes = 0
@@ -560,6 +585,8 @@ class AdsBackend:
             w = csv.writer(fh)
             w.writerow(["path", "type", "value"])
             for r in roots:
+                if cancel is not None and cancel.is_set():
+                    raise AdsError("cancelled (the call timed out or was stopped)")
                 if n_bytes + r.size > max_total_bytes or n_leaves >= max_leaves:
                     errors.append({"symbol": r.name, "error": "skipped: dump size/leaf limit reached"})
                     continue
@@ -588,7 +615,7 @@ class AdsBackend:
         jpath.write_text(json.dumps({"target": self.target_label(), "taken": stamp, "roots": len(roots), "leaves": n_leaves,
                                      "values": tree}, indent=1, default=str), encoding="utf-8")
         return {"roots": len(roots), "leaves": n_leaves, "bytes_read": n_bytes, "duration_s": round(time.time() - t0, 2),
-                "json": str(jpath), "csv": str(cpath), "datatype_table": ts is not None, "errors": errors[:50],
+                "datatype_table": ts is not None, "errors": errors[:50], "errors_total": len(errors),
                 "preview": preview}
 
     # ------------------------------------------------------------ read / write

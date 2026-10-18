@@ -58,6 +58,11 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, str]] = [(re.compile(p, re.I), c,
     (r"logged into|logged in",
      "XAE is logged in to the PLC; the project cannot be changed online",
      "xae_plc('logout'), make the change, build, log in again"),
+    (r"rpc call .*(adserror 1797\b|0x705\b|parameter size not correct)",
+     "the RPC parameter block does not match the method's signature: an input missing or extra, a wrong base type, "
+     "or outputs / return_type that differ from the declaration",
+     "pass every VAR_INPUT in declaration order with its exact base type (inputs=[{type, value}, …]), every "
+     "VAR_OUTPUT in outputs and the method's return type in return_type; check the method in proj_interface"),
     (r"adserror 1797\b|0x705\b|parameter size not correct",
      "the value does not fit the variable (string too long, wrong array length or type size)",
      "check the declared type (ads_symbol_info); write elements by index for arrays"),
@@ -511,6 +516,10 @@ class Knowledge:
                              "pdo": json.loads(r["pdo"] or "[]"), "coe_objects": json.loads(r["coe"] or "[]"),
                              "file": r["file"]})
         res: dict[str, Any] = {"query": q, "matches": len(rows), "types": types[:30], "devices": out_rows}
+        bad = sum(1 for d in out_rows for p in d["pdo"] if p.get("unparsed"))
+        if bad:
+            res["parse_note"] = (f"{bad} PDO(s) could not be read from the ESI file (index or entries missing) — their raw "
+                                 "layout is under 'unparsed'; send it (or the ESI file) to get the parser fixed")
         if idx:
             res["indexed_now"] = idx
         if not rows:
@@ -624,7 +633,7 @@ def _tree_stamp(root: Path) -> str:
     return h.hexdigest()
 
 
-ESI_PARSER_VERSION = 2       # bump when _parse_esi's output changes: every ESI file is read again once
+ESI_PARSER_VERSION = 3       # bump when _parse_esi's output changes: every ESI file is read again once
 
 
 def _ln(tag: Any) -> str:
@@ -646,6 +655,20 @@ def _text(el: Any, name: str, prefer_lcid: str = "1033") -> str:
     if best is None:
         best = next((c for c in cs if c.get("LcId") is None), cs[0])
     return " ".join("".join(best.itertext()).split())
+
+
+def _deep_text(el: Any, name: str, skip: str = "") -> str:
+    """First descendant `name` whose path does not run through a `skip` element (a PDO's own Index, not an Entry's)."""
+    stack = [c for c in el]
+    while stack:
+        c = stack.pop(0)
+        ln = _ln(c.tag)
+        if skip and ln == skip:
+            continue
+        if ln == name:
+            return " ".join("".join(c.itertext()).split())
+        stack.extend(list(c))
+    return ""
 
 
 def _parse_esi(path: Path):
@@ -670,10 +693,16 @@ def _parse_esi(path: Path):
                     entries.append({"index": f"#x{idx:04X}", "sub": _hexint(_text(e, "SubIndex")) or 0,
                                     "bits": _hexint(_text(e, "BitLen")), "name": _text(e, "Name"),
                                     "type": _text(e, "DataType")})
-                pi = _hexint(_text(pdo, "Index"))
-                pdos.append({"dir": "out (RxPdo)" if kind == "RxPdo" else "in (TxPdo)", "index": f"#x{pi:04X}" if pi else None,
-                             "name": _text(pdo, "Name"), "fixed": pdo.get("Fixed") in ("1", "true"),
-                             "mandatory": pdo.get("Mandatory") in ("1", "true"), "sm": pdo.get("Sm"), "entries": entries[:64]})
+                pi = _hexint(_text(pdo, "Index") or _deep_text(pdo, "Index", skip="Entry"))
+                row = {"dir": "out (RxPdo)" if kind == "RxPdo" else "in (TxPdo)", "index": f"#x{pi:04X}" if pi else None,
+                       "name": _text(pdo, "Name") or _deep_text(pdo, "Name", skip="Entry"),
+                       "fixed": pdo.get("Fixed") in ("1", "true"),
+                       "mandatory": pdo.get("Mandatory") in ("1", "true"), "sm": pdo.get("Sm"), "entries": entries[:64]}
+                if pi is None or not entries:
+                    # D19 (still empty on the real files): keep what the element holds so the layout can be fixed
+                    row["unparsed"] = {"attrs": dict(pdo.attrib), "children": sorted({_ln(c.tag) for c in pdo})[:20],
+                                       "text": " ".join("".join(pdo.itertext()).split())[:160]}
+                pdos.append(row)
         coe = []
         objs = [o for prof in _kids(dev, "Profile") for dic in _kids(prof, "Dictionary")
                 for ob in _kids(dic, "Objects") for o in _kids(ob, "Object")]

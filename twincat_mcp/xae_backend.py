@@ -764,14 +764,37 @@ class XaeBackend:
         except Exception:  # noqa: BLE001
             return None
 
-    def plc_action(self, action: str) -> dict[str, Any]:
-        """login/logout/start/stop/reset_cold/reset_origin/download via DTE commands. Command names
-        differ between shells (4024: PLC.Login; 4026: PLC.Loginto<ActiveProject>): the static names are
-        tried first, then the shell's own PLC.* list; a '…none' variant means no PLC project is active,
-        so the project node is selected in Solution Explorer and the list re-read."""
+    # ITcSmTreeItem.ConsumeXml on the nested PLC project (Automation Interface ≥ 3.1.4010, "Handling online
+    # functionalities"): no active project, no Solution Explorer, no UI language involved
+    _PLC_ONLINE_XML = {"login": "LoginCmd", "logout": "LogoutCmd", "start": "StartCmd", "stop": "StopCmd",
+                       "reset_cold": "ResetColdCmd", "reset_origin": "ResetOriginCmd"}
+
+    def plc_action(self, action: str, plc_project_path: str | None = None) -> dict[str, Any]:
+        """login/logout/start/stop/reset_cold/reset_origin/download. #10: first the documented Automation Interface
+        route — ConsumeXml(<IECProjectDef><OnlineSettings><Commands><LoginCmd>true…) on '<Name> Project' — which needs
+        no active PLC project; then the DTE commands as before (4024: PLC.Login; 4026: PLC.Loginto<ActiveProject>),
+        selecting the project node when the shell only offers '…none'."""
         cands = list(PLC_LOGIN_COMMANDS.get(action) or [])
         if not cands:
             raise XaeError(f"unknown PLC action {action!r}; valid: {list(PLC_LOGIN_COMMANDS)}")
+        ai_note = ""
+        tag = self._PLC_ONLINE_XML.get(action)
+        if tag:
+            try:
+                nested = self._nested_projects(plc_project_path)
+            except Exception as exc:  # noqa: BLE001
+                nested, ai_note = [], f"PLC projects not listed: {str(exc)[:120]}"
+            if len(nested) == 1:
+                xml = (f"<TreeItem><IECProjectDef><OnlineSettings><Commands><{tag}>true</{tag}></Commands>"
+                       "</OnlineSettings></IECProjectDef></TreeItem>")
+                try:
+                    it = self._item(nested[0])
+                    self._retry(lambda: it.ConsumeXml(xml), f"ConsumeXml {tag}")
+                    return {"action": action, "method": f"ConsumeXml {tag}", "project": nested[0], "ok": True}
+                except XaeError as exc:
+                    ai_note = f"ConsumeXml {tag} on {nested[0]}: {str(exc)[:200]}"
+            elif len(nested) > 1:
+                ai_note = f"{len(nested)} PLC projects — name one with plc_project_path: {nested}"
         tried: list[dict[str, str]] = []
         selected = None
         for attempt in range(2):
@@ -784,13 +807,17 @@ class XaeBackend:
             for c in cands + real:
                 try:
                     self.command(c)
-                    return {"action": action, "command": c, "ok": True, "tried": tried, "selected_node": selected}
+                    out = {"action": action, "command": c, "ok": True, "tried": tried, "selected_node": selected}
+                    if ai_note:
+                        out["automation_interface"] = ai_note
+                    return out
                 except XaeError as exc:
                     tried.append({"command": c, "error": str(exc)[:200]})
             break
         offered = self._dynamic_plc_commands(action)
         raise XaeError(
-            f"no working DTE command for {action!r}: tried {[t['command'] for t in tried]}; this shell offers {offered or 'nothing matching'}. "
+            (f"Automation Interface route failed ({ai_note}); " if ai_note else "")
+            + f"no working DTE command for {action!r}: tried {[t['command'] for t in tried]}; this shell offers {offered or 'nothing matching'}. "
             + ("A '…none' command means no PLC project is active: click the PLC project node once in Solution Explorer, then retry. "
                if any(o.lower().endswith("none") for o in offered) else "")
             + "ads_plc_state covers run/stop/reset via ADS without the shell."
@@ -974,10 +1001,15 @@ class XaeBackend:
         for it in res["items"]:
             name = str(it.get("Name", ""))
             if str(it.get("ItemType")) == str(TREEITEMTYPE_PLCAPP) or name.endswith(" Project"):
+                outer, nested = _plc_split(str(it.get("PathName")))
+                base = outer.split("^")[-1]
                 projs.append({"name": name, "path": it.get("PathName"), "item_type": it.get("ItemType"),
-                              "plc_project_path": it.get("PathName")})
+                              "plc_project_path": it.get("PathName"),
+                              "plc_path": outer, "iec_project_path": nested, "instance_path": f"{outer}^{base} Instance"})
         return {"count": len(projs), "projects": projs, "raw": res["items"],
-                "note": "plc_project_path is what xae_deploy / xae_links / tcunit_run take; POUs live at <path>^POUs"}
+                "note": ("every tool takes any of these paths (R14): boot project / autostart act on plc_path "
+                         "(ITcPlcProject), PLCopen import/export and Check all objects on iec_project_path "
+                         "(ITcPlcIECProject), links on instance_path; POUs live at <iec_project_path>^POUs")}
 
     def pou_get(self, path: str, include_subitems: bool = True) -> dict[str, Any]:
         it = self._item(path)
@@ -1071,11 +1103,40 @@ class XaeBackend:
             raise XaeError(f"option must be one of {list(opts)}")
         if not os.path.isfile(xml_file):
             raise XaeError(f"PLCopen XML not found: {xml_file}")
+        plc_project_path = _plc_split(plc_project_path)[1]          # R14: PLCopen lives on '<Name> Project'
         it = self._item(plc_project_path)
-        self._retry(lambda: it.PlcOpenImport(xml_file, opts[option]), "PlcOpenImport")
-        return {"imported": xml_file, "into": plc_project_path, "option": option}
+        names = _plcopen_names(xml_file)
+
+        def snapshot() -> dict[str, str]:
+            try:
+                items = self.tree_children(plc_project_path, depth=8, max_items=20000)["items"]
+            except Exception:  # noqa: BLE001
+                return {}
+            return {str(x.get("PathName")): str(x.get("Name")) for x in items if x.get("PathName")}
+        before = snapshot()
+        # all four arguments: the folder structure from the XML is kept (bFolderStructure, default TRUE in the docs)
+        try:
+            self._retry(lambda: it.PlcOpenImport(xml_file, opts[option], "", True), "PlcOpenImport")
+        except XaeError:
+            self._retry(lambda: it.PlcOpenImport(xml_file, opts[option]), "PlcOpenImport")
+        after = snapshot()
+        added = {p: n for p, n in after.items() if p not in before}
+        res: dict[str, Any] = {"imported": xml_file, "into": plc_project_path, "option": option,
+                               "objects_in_file": names, "added": sorted(added)[:200]}
+        # R15: 'replace' replaces an object at the SAME place; when the XML carries no folder for it, TwinCAT puts it at
+        # the project root and renames it (PRG_X_1) because the name exists elsewhere — a silent duplicate
+        dup = [p for p, n in added.items() if any(re.fullmatch(re.escape(o) + r"_\d+", n, re.I) for o in names)]
+        if dup:
+            res["duplicates_created"] = dup
+            if option == "replace":
+                raise XaeError(f"PlcOpenImport(replace) did not replace — it created {dup} next to the existing object(s): "
+                               "the XML has no folder for them, so TwinCAT imported them at the project root and renamed them. "
+                               "Delete the copies (xae_tree_delete), then export the object together with its folder (or "
+                               "import into the folder that holds it) and import again.")
+        return res
 
     def plcopen_export(self, plc_project_path: str, items: list[str], xml_file: str) -> dict[str, Any]:
+        plc_project_path = _plc_split(plc_project_path)[1]          # R14: 'TIPC^X' raised AttributeError
         it = self._item(plc_project_path)
         sel = ";".join(items)
         self._retry(lambda: it.PlcOpenExport(xml_file, sel), "PlcOpenExport")
@@ -1083,6 +1144,7 @@ class XaeBackend:
 
     def boot_project(self, plc_project_path: str, autostart: bool | None, generate: bool,
                      activate_after_generate: bool = False) -> dict[str, Any]:
+        plc_project_path = _plc_split(plc_project_path)[0]          # R14: boot project lives on 'TIPC^X'
         it = self._item(plc_project_path)
         res: dict[str, Any] = {"path": plc_project_path}
         if autostart is not None:
@@ -1117,7 +1179,8 @@ class XaeBackend:
     def links(self, plc_project_path: str) -> dict[str, Any]:
         """Variable links of the PLC instance (inputs/outputs groups) from their XML:
         name, type, link target; lists unlinked AT %I*/%Q* variables."""
-        inst_path = plc_project_path.replace(" Project", " Instance")
+        outer = _plc_split(plc_project_path)[0]
+        inst_path = f"{outer}^{outer.split('^')[-1]} Instance"
         inst = self._item(inst_path)
         groups = []
         unlinked = []
@@ -1142,8 +1205,30 @@ class XaeBackend:
             groups.append({"group": gname, "variables": vars_, "count": len(vars_)})
         return {"instance": inst_path, "groups": groups, "unlinked": unlinked, "unlinked_count": len(unlinked)}
 
-    def check_all_objects(self) -> dict[str, Any]:
-        """PLC 'Check all objects' (compile every POU incl. unused) via command."""
+    def _nested_projects(self, plc_project_path: str | None = None) -> list[str]:
+        if plc_project_path:
+            return [_plc_split(plc_project_path)[1]]
+        return [p["iec_project_path"] for p in (self.plc_projects().get("projects") or [])]
+
+    def check_all_objects(self, plc_project_path: str | None = None) -> dict[str, Any]:
+        """PLC 'Check all objects' (compile every POU incl. unused). #45: first the documented Automation Interface call
+        ITcPlcIECProject2.CheckAllObjects() on the nested project — no UI, no active project needed — then the
+        shell commands as before."""
+        ai_err = ""
+        try:
+            nested = self._nested_projects(plc_project_path)
+        except Exception as exc:  # noqa: BLE001
+            nested, ai_err = [], str(exc)[:160]
+        if len(nested) == 1:
+            it = self._item(nested[0])
+            try:
+                self._retry(lambda: _com_call(it, "CheckAllObjects"), "ITcPlcIECProject2.CheckAllObjects")
+                time.sleep(0.5)
+                return {"method": "ITcPlcIECProject2.CheckAllObjects", "project": nested[0], **self.errors()}
+            except XaeError as exc:
+                ai_err = str(exc)[:200]
+        elif len(nested) > 1:
+            ai_err = f"{len(nested)} PLC projects — name one with plc_project_path: {nested}"
         cands = ["PLC.CheckAllObjects", "OtherContextMenus.PlcProject.CheckAllObjects"]
         # the name varies by shell and UI language (4026: PLC.CheckAllObjects<Project>, localised shells differ):
         # take whatever the shell lists under 'Check' that is not a plain syntax check
@@ -1174,6 +1259,7 @@ class XaeBackend:
                     break
         listed_hits = [t for t in tried if t["command"] in listed]
         raise XaeError("Check all objects did not run. "
+                       + (f"Automation Interface: {ai_err}. " if ai_err else "")
                        + (f"The shell has {[t['command'] for t in listed_hits]} but refused it: {listed_hits[-1]['error']}. "
                           if listed_hits else f"No such command in this shell (looked for {cands}; it lists {listed[:10]}). ")
                        + ("Selecting the PLC project node did not help. " if selected else "The PLC project node could not be selected. ")
@@ -1251,7 +1337,7 @@ class XaeBackend:
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         t0 = time.monotonic()
-        rc = self._retry(lambda: getattr(obj, meth)(*args), f"Scope {meth}")
+        rc = self._retry(lambda: _com_call(obj, meth, *args), f"Scope {meth}")
         out: dict[str, Any] = {"scope": f"{d['project']}\\{d['name']}", "action": action, "method": meth,
                                "result_code": rc, "elapsed_s": round(time.monotonic() - t0, 3)}
         if path:
@@ -1355,6 +1441,44 @@ def _has_member(obj: Any, name: str) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _plc_split(path: str) -> tuple[str, str]:
+    """('TIPC^X', 'TIPC^X^X Project') from either form (R14: tools took one form each and failed on the other).
+    Anything else (a deeper path, another root) comes back unchanged in both places."""
+    segs = [x for x in (path or "").split("^") if x]
+    if len(segs) >= 2 and segs[0].upper() == "TIPC":
+        outer = "^".join(segs[:2])
+        nested = f"{outer}^{segs[1]} Project"
+        if len(segs) == 2 or (len(segs) == 3 and segs[2].lower() == f"{segs[1]} project".lower()):
+            return outer, nested
+    return path, path
+
+
+def _plcopen_names(xml_file: str) -> list[str]:
+    """Names of the POUs / DUTs / GVLs a PLCopen XML file holds."""
+    try:
+        txt = Path(xml_file).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return []
+    found = re.findall(r"<(?:pou|dataType|globalVars)\b[^>]*\bname=\"([^\"]+)\"", txt)
+    return list(dict.fromkeys(found))
+
+
+def _com_call(obj: Any, name: str, *args: Any) -> Any:
+    """Call a COM *method*. On a late-bound dispatch ``getattr(obj, 'StartRecord')`` already invokes a parameterless
+    member as a property get and returns its int result — calling that result raised "'int' object is not callable"
+    (R11). IDispatch::Invoke with DISPATCH_METHOD calls the method exactly once."""
+    ole = getattr(obj, "_oleobj_", None)
+    if ole is None:
+        return getattr(obj, name)(*args)                  # plain Python objects (tests)
+    try:
+        import pythoncom  # type: ignore
+        method_flag = pythoncom.DISPATCH_METHOD
+    except ImportError:
+        method_flag = 1                                   # DISPATCH_METHOD
+    dispid = ole.GetIDsOfNames(name)
+    return ole.Invoke(dispid, 0, method_flag, True, *args)
 
 
 def _try(fn: Callable[[], Any]) -> Any:

@@ -473,7 +473,8 @@ class TestBench:
                                 return_ctypes=True, check_length=False)
             raw = bytes(data) if data is not None else b""
         except Exception as exc:  # noqa: BLE001
-            raise AdsError(f"RPC call {rpc_name!r} failed: {_fmt_exc(exc)}") from exc
+            raise AdsError(f"RPC call {rpc_name!r} failed: {_fmt_exc(exc)} (sent {len(inputs or [])} input(s) = "
+                           f"{len(in_bytes)} bytes, expecting {len(out_types)} output value(s) = {out_size} bytes)") from exc
         finally:
             try:
                 c.write(C.ADSIGRP_SYM_RELEASEHND, 0, handle, C.PLCTYPE_UDINT)

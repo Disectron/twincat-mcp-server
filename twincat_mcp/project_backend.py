@@ -849,30 +849,63 @@ def _replace_cdata(block: str, tag: str, new_text: str) -> tuple[str, bool]:
 # TcUnit xUnit parsing
 # ----------------------------------------------------------------------------
 def parse_tcunit_xml(xml_text: str) -> dict[str, Any]:
+    """Results counted from the <testcase> elements themselves (R3: a <failure> in a suite without a 'failures'
+    attribute came out as all_passed). Suite attributes are only compared, never trusted: a disagreement is
+    reported and blocks all_passed."""
     try:
         root = ET.fromstring(xml_text.strip())
     except ET.ParseError as exc:
         raise ProjectError(f"TcUnit result is not valid XML: {exc}") from exc
+
+    def num(v: Any) -> int | None:
+        try:
+            return int(str(v).strip())
+        except (TypeError, ValueError):
+            return None
     suites = []
-    tot = {"tests": 0, "failures": 0, "skipped": 0}
+    tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    mismatches: list[str] = []
     for ts in root.iter("testsuite"):
-        s = {"name": ts.get("name"), "tests": int(ts.get("tests", 0)), "failures": int(ts.get("failures", 0)),
-             "skipped": int(ts.get("skipped", 0) or 0), "cases": []}
+        s: dict[str, Any] = {"name": ts.get("name"), "cases": []}
         for tc in ts.findall("testcase"):
-            c: dict[str, Any] = {"name": tc.get("name"), "class": tc.get("classname"), "status": tc.get("status") or "PASS"}
+            c: dict[str, Any] = {"name": tc.get("name"), "class": tc.get("classname")}
+            st = (tc.get("status") or "").strip().upper()
             f = tc.find("failure")
-            if f is not None:
-                c["status"] = "FAIL"
-                c["message"] = f.get("message")
-                c["type"] = f.get("type")
-                if f.text:
-                    c["detail"] = f.text.strip()[:500]
-            if tc.find("skipped") is not None:
+            e = tc.find("error")
+            if f is not None or e is not None:
+                el = f if f is not None else e
+                c["status"] = "FAIL" if f is not None else "ERROR"
+                c["message"] = el.get("message")
+                c["type"] = el.get("type")
+                if el.text:
+                    c["detail"] = el.text.strip()[:500]
+            elif tc.find("skipped") is not None or st in ("SKIPPED", "SKIP", "IGNORED"):
                 c["status"] = "SKIPPED"
+            elif st in ("FAIL", "FAILED", "FAILURE", "ERROR"):
+                c["status"] = "FAIL"
+                c["message"] = "status attribute says " + st
+            else:
+                c["status"] = "PASS"
             s["cases"].append(c)
+        counted = {"tests": len(s["cases"]),
+                   "failures": sum(c["status"] == "FAIL" for c in s["cases"]),
+                   "errors": sum(c["status"] == "ERROR" for c in s["cases"]),
+                   "skipped": sum(c["status"] == "SKIPPED" for c in s["cases"])}
+        s.update(counted)
+        attrs = {k: num(ts.get(k)) for k in counted}
+        s["attributes"] = {k: v for k, v in attrs.items() if v is not None}
+        for k, v in s["attributes"].items():
+            if v != counted[k]:
+                mismatches.append(f"{s['name']}: attribute {k}={v}, counted {counted[k]}")
         suites.append(s)
         for k in tot:
-            tot[k] += s[k]
-    failed = [f"{s['name']}::{c['name']}: {c.get('message','')}" for s in suites for c in s["cases"] if c["status"] == "FAIL"]
-    return {"summary": tot, "passed": tot["tests"] - tot["failures"] - tot["skipped"],
-            "all_passed": tot["failures"] == 0 and tot["tests"] > 0, "failed_tests": failed, "suites": suites}
+            tot[k] += counted[k]
+    failed = [f"{s['name']}::{c['name']}: {c.get('message') or ''}" for s in suites for c in s["cases"]
+              if c["status"] in ("FAIL", "ERROR")]
+    out: dict[str, Any] = {"summary": tot, "passed": tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"],
+                           "all_passed": tot["failures"] == 0 and tot["errors"] == 0 and tot["tests"] > 0 and not mismatches,
+                           "failed_tests": failed, "suites": suites}
+    if mismatches:
+        out["attribute_mismatch"] = mismatches
+        out["note"] = "the suite attributes disagree with the test cases in the file — counts are from the cases; not a pass"
+    return out

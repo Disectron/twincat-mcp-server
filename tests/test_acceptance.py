@@ -30,6 +30,10 @@ async def test_acceptance_runs_against_fakes(monkeypatch, project_dir, tmp_path)
             i += 1
             FakeConnection.broadcast("MAIN.nCycle", 42 + (i % 3))
             FakeConnection.broadcast("MAIN.bStart", bool(i % 2))
+            # the task's cycle counter (10 ms task, 5 cycles per 50 ms) — aligned profiles start on it (D29)
+            c = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"
+            FakeConnection.shared_values[c] = FakeConnection.shared_values.get(c, 123456) + 5
+            FakeConnection.broadcast(c, FakeConnection.shared_values[c])
             await asyncio.sleep(0.05)
     task = asyncio.create_task(pump())
     try:

@@ -364,7 +364,11 @@ class NativeRecording:
             "stats_coverage": "from the file (native engine): rec_stats computes exact statistics",
             "events_per_s": round(self.events / elapsed, 1) if elapsed > 0 else 0.0,
             "elapsed_s": round(elapsed, 2), "plc_span_s": src.get("plc_span_s") or self._last.get("plc_span_s"),
-            "armed": self._last.get("armed", False), "triggered_at_ms": src.get("triggered_at_ms", self._last.get("triggered_at_ms")),
+            # N29: the last progress line may predate the trigger (or the stop) — never report armed once the
+            # trigger fired or the recording ended
+            "armed": bool(self.active and self._last.get("armed", False)
+                          and src.get("triggered_at_ms", self._last.get("triggered_at_ms")) is None),
+            "triggered_at_ms": src.get("triggered_at_ms", self._last.get("triggered_at_ms")),
             "stop_reason": self.stop_reason, "file": str(self.path),
             "file_bytes": self.path.stat().st_size if self.path.exists() else 0,
             "ring": {"seconds": self.start_reply.get("ring", {}).get("seconds"), "bytes": self.start_reply.get("ring", {}).get("bytes")},

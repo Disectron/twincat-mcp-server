@@ -51,8 +51,10 @@ class FakeItem:
     def GenerateBootProject(self, activate):
         self.generated.append(activate)
 
-    def PlcOpenImport(self, f, opt):
+    def PlcOpenImport(self, f, opt, selection="", folders=True):
         self.imported.append((f, opt))
+        if getattr(self, "on_import", None):
+            self.on_import()
 
     def PlcOpenExport(self, f, items):
         self.exported = (f, items)
@@ -305,12 +307,24 @@ def test_plcopen_and_boot(xae, tmp_path):
         be.plcopen_import("TIPC^Plc^Plc Project", str(tmp_path / "missing.xml"))
     be.plcopen_export("TIPC^Plc^Plc Project", ["POUs.MAIN", "POUs.FB_Fill"], str(tmp_path / "out.xml"))
     assert sm.items["TIPC^Plc^Plc Project"].exported[1] == "POUs.MAIN;POUs.FB_Fill"
+    # R14: the boot project belongs to ITcPlcProject = 'TIPC^Plc' (Beckhoff AI docs); either path form is accepted
     r = be.boot_project("TIPC^Plc^Plc Project", True, True)
-    assert r["autostart"] and sm.items["TIPC^Plc^Plc Project"].generated == [False]
+    assert r["path"] == "TIPC^Plc" and r["autostart"] and sm.items["TIPC^Plc"].generated == [False]
+    assert X._plc_split("TIPC^Plc") == ("TIPC^Plc", "TIPC^Plc^Plc Project") == X._plc_split("TIPC^Plc^Plc Project")
+    assert X._plc_split("TIPC^Plc^Plc Project^POUs") == ("TIPC^Plc^Plc Project^POUs",) * 2
+    be.plcopen_export("TIPC^Plc", ["POUs.MAIN"], str(tmp_path / "o2.xml"))          # was AttributeError
+    assert sm.items["TIPC^Plc^Plc Project"].exported[0].endswith("o2.xml")
+
+
+def _no_consume_xml(sm):
+    def refuse(xml):
+        raise ComError(-2147467259, "ConsumeXml not supported here")
+    sm.items["TIPC^Plc^Plc Project"].ConsumeXml = refuse
 
 
 def test_plc_action_fallback_and_commands(xae):
     be, dte, sm = xae
+    _no_consume_xml(sm)                                    # the DTE-command route (fallback)
     r = be.plc_action("login")
     assert r["command"] == "PLC.Login" and dte.commands[-1][0] == "PLC.Login"
     with pytest.raises(X.XaeError, match="no working DTE command"):
@@ -431,6 +445,7 @@ def test_n10_logout_selects_the_plc_project_without_toolwindows(xae, monkeypatch
     """#10: 4026 offers only PLC.Logoutfromnone until a PLC project is active; the node selection went through
     dte.ToolWindows, which the cached 7.0 DTE wrapper does not have — so it never happened."""
     be, dte, sm = xae
+    _no_consume_xml(sm)                                    # the Solution Explorer route (fallback since 0.8.7)
     Cmd = lambda n: type("C", (), {"Name": n})()                                   # noqa: E731
     dte.Commands = FakeProjects([Cmd("PLC.Logoutfromnone"), Cmd("File.SaveAll")])
 
@@ -468,3 +483,43 @@ def test_xae_status_without_a_solution_says_so(xae):
     dte.Solution.FullName = ""                     # the shell's empty start state: IsOpen may still say True
     info = be.status()
     assert info["solution_open"] is False and info["note"].startswith("no solution open") and "sysman_error" not in info
+
+
+def test_r15_plcopen_replace_that_duplicates_is_an_error(xae, tmp_path):
+    """R15: import(option='replace') of PRG_TcUnitRunner (living in 95_UnitTests) created PRG_TcUnitRunner_1 at the root."""
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    f = tmp_path / "r.xml"
+    f.write_text('<project><types><pous><pou name="PRG_TcUnitRunner" pouType="program"/></pous></types></project>')
+
+    def dup():
+        it = FakeItem("PRG_TcUnitRunner_1", "TIPC^Plc^Plc Project^PRG_TcUnitRunner_1")
+        proj._children.append(it)
+        sm.items[it.PathName] = it
+    proj.on_import = dup
+    with pytest.raises(X.XaeError, match=r"did not replace — it created \['TIPC\^Plc\^Plc Project\^PRG_TcUnitRunner_1'\]"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    proj.on_import = None
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert r["objects_in_file"] == ["PRG_TcUnitRunner"] and "duplicates_created" not in r
+
+
+def test_n10_n45_online_commands_and_check_all_objects_via_the_automation_interface(xae):
+    """#10: login/logout needed an active PLC project (UI selection never took); #45 Check all objects never ran.
+    Both now go through the documented Automation Interface first: ConsumeXml online commands and
+    ITcPlcIECProject2.CheckAllObjects on the nested project."""
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    checked = []
+    proj.CheckAllObjects = lambda: checked.append(1) or 0
+    r = be.plc_action("logout")
+    assert r["method"] == "ConsumeXml LogoutCmd" and r["project"] == "TIPC^Plc^Plc Project"
+    assert "<LogoutCmd>true</LogoutCmd>" in proj.consumed[-1] and dte.commands == []
+    r = be.check_all_objects()
+    assert r["method"] == "ITcPlcIECProject2.CheckAllObjects" and checked == [1]
+
+    def refuse(xml):
+        raise ComError(-2147467259, "online command refused")
+    proj.ConsumeXml = refuse
+    r = be.plc_action("login")                                  # falls back to the shell command, says why
+    assert r["command"] == "PLC.Login" and "online command refused" in r["automation_interface"]

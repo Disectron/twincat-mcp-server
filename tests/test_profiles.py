@@ -5,6 +5,8 @@ import csv
 import io
 import json
 
+import time
+
 import pytest
 
 from twincat_mcp import profiles as P
@@ -173,3 +175,30 @@ def test_d28_updated_is_iso_for_old_epoch_profiles():
     from twincat_mcp.profiles import _iso
     assert _iso(0).startswith("1970-01-01T00:00:00") and _iso("2026-10-18T04:00:00+00:00") == "2026-10-18T04:00:00+00:00"
     assert _iso(None) is None
+
+
+@pytest.mark.anyio
+async def test_d29_profile_groups_start_on_the_same_plc_cycle(monkeypatch, project_dir):
+    """D29: the change and cycle groups of a profile started ≈ 163 ms apart; files covered different windows. Now every
+    group gets the same start trigger on the task's cycle counter (a moment ahead) and the duration counts from it."""
+    import json as _j
+    from pathlib import Path as _P
+    from tests.fake_ads import install
+    from tests.test_server_e2e import client_for, mk_cfg, payload
+    from twincat_mcp.server import build_server
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        payload(await s.call_tool("rec_profile_save", {"name": "mix", "symbols": ["MAIN.nCycle", "MAIN.fbFill.tSettle"],
+                                                       "mode": "auto", "cycle_ms": 10}))
+        st = payload(await s.call_tool("rec_profile_start", {"name": "mix", "duration_s": 1.0}))
+        al = st["aligned"]
+        assert st["groups"] == 2 and al["trigger"] == "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount >= 123586", st
+        assert al["cycles_ahead"] == 130 and "start_offsets_ms" not in st
+        recs = [app.rec.recs[r["id"]] for r in st["recordings"]]
+        assert {r.meta.get("start_when") for r in recs} == {al["trigger"]} and {r.post_trigger_s for r in recs} == {1.0}
+        payload(await s.call_tool("rec_profile_stop", {"name": "mix"}))
+        un = payload(await s.call_tool("rec_profile_start", {"name": "mix", "align": False}))
+        assert "aligned" not in un
+        payload(await s.call_tool("rec_profile_stop", {"name": "mix"}))

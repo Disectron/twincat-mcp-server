@@ -222,3 +222,24 @@ async def test_server_without_package_says_how_to_fix(monkeypatch, tmp_path):
     async with client_for(srv) as s:
         res = await s.call_tool("infosys_search", {"query": "ADSREAD"})
         assert res.is_error and "BKINFOSYS3" in res.content[0].text and "docs.source = 'web'" in res.content[0].text
+
+
+def test_r26_ms_xhelp_links_resolve_to_pages(tmp_path):
+    """R26: pages link to each other as ms-xhelp:///?Id=…; get_page refused those links from its own output."""
+    d = tmp_path / "Microsoft" / "HelpLibrary2" / "Catalogs" / "VisualStudio15" / "ContentStore" / "EN-US"
+    d.mkdir(parents=True)
+    target = F.ADSREAD
+    link_page = ('<html><head><meta name="Title" content="Overview" /><meta name="Microsoft.Help.Id" content="ovw-1" />'
+                 '</head><body><article><h1>Overview</h1><p>See <a href="ms-xhelp:///?Id=' + str(abs(hash(target))) +
+                 '">ADSREAD</a> and <img src="1107452.png" alt="1107452"/> nothing.</p></article></body></html>')
+    pkg = make_mshc(d / "BKINFOSYS3_VS_100_EN-US.2.mshc", {"tcplclib_tc2_system/1033/99999901.html": link_page})
+    ix = InfosysIndex(tmp_path / "idx", fetcher=NoNetwork(), books=["tcplclib_tc2_system"], local=HV.HelpViewerSource(pkg))
+    p = ix.get_page(C + "tcplclib_tc2_system/99999901.html")
+    assert target in p["markdown"] and "ms-xhelp" not in p["markdown"], p["markdown"]
+    assert "![" not in p["markdown"]                                                    # R32: image placeholder gone
+    assert ix.get_page(f"ms-xhelp:///?Id={abs(hash(target))}")["url"] == target
+    with pytest.raises(InfosysError, match="no page with that Help Viewer Id"):
+        ix.get_page("ms-xhelp:///?Id=nope")
+    with pytest.raises(InfosysError, match="max_chars"):
+        ix.get_page(target, max_chars=-1)
+    assert ix.warm()["links"]["help_ids"] >= 2
