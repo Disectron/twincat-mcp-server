@@ -1,7 +1,7 @@
 {
   "name": "twincat-mcp",
   "displayName": "TwinCAT MCP",
-  "version": "0.8.9",
+  "version": "0.8.10",
   "description": "Beckhoff TwinCAT 3 for Claude Code: live PLC variables over ADS, real-time recording, XAE build/activate/deploy, .TcPOU editing, TcUnit, HMI bindings \u2014 151 audited tools, 5 workflow prompts, two skills (tool chains; offline Beckhoff documentation).",
   "author": {
     "name": "Ryan Harris / Transflo Pumps"
