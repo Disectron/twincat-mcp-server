@@ -911,6 +911,8 @@ async def test_r40_restart_proven_by_a_witness_taken_before_the_commands(monkeyp
     assert restart_proven({"t": 0, "cycle_count": 0xFFFFFFF0, "cycle_time_100ns": 10000},
                           {"t": 1, "cycle_count": 500, "cycle_time_100ns": 10000})[0] is None              # wrapped
     assert restart_proven({"t": 0, "cycle_count": 10}, {"t": 5, "cycle_count": 20})[0] is None
+    assert restart_proven({"t": 0, "cycle_count": 0xFFFFFFF0}, {"t": 1, "cycle_count": 500})[0] is None   # may wrap
+    assert restart_proven({"t": 0, "cycle_count": 900_000}, {"t": 1, "cycle_count": 500})[0] is True
 
 
 @pytest.mark.anyio

@@ -573,9 +573,9 @@ void Engine::process(size_t b, int64_t ft, const uint8_t* d, uint32_t n) {
                     have_warm_true_ = true;        // N61: true before every block delivered — remembered, reported
                     warm_true_ft_ = ft;
                 }
-            } else if (all_live && have_warm_true_) {
-                // false once every block delivered: the warm-up truth is over. A later fire is a new truth, not the
-                // warm-up's delayed (reporting it as "delayed by" the whole quiet time was false)
+            } else if (have_warm_true_) {
+                // false after the warm-up truth (also still within the warm-up): that truth is over. A later fire is a
+                // new truth, not the warm-up's delayed (reporting it as "delayed by" the whole quiet time was false)
                 warm_lapsed_ = true;
             }
         }

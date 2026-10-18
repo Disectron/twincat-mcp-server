@@ -469,7 +469,20 @@ def test_partial_subscription_fails_unless_allowed(rec):
     finally:
         FakeConnection.fail_offsets = None
     assert st["unsubscribed_symbols"] == ["MAIN.fbFill.bDone"] and any("could not be subscribed" in w for w in st["warnings"])
-    rec.stop(st["id"])
+    c = _conn()
+    for i in range(0, 50):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 50)
+    t0 = time.monotonic()
+    out = rec.stop(st["id"])
+    # review: the block that was never registered is not part of the timeline — it was counted as a block that never
+    # delivered (the whole window missing) and every stop waited out its timeout for it
+    assert time.monotonic() - t0 < 0.9 and out["missing_samples"] == 0, out
+    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer["unregistered_blocks"] and footer["label"] == "INCOMPLETE" and footer["missing_samples"] == 0, footer
+    v = rec.verify(st["id"])
+    assert v["timeline"]["missing"] == 0 and v["timeline"]["unregistered_blocks"] == footer["unregistered_blocks"]
+    assert v["verdict"] == "FAIL" and "unprovable_blocks" not in v["timeline"], v      # requested symbols missing
 
 
 def test_duration_cut_by_plc_time_and_pattern_expands(rec):
@@ -802,6 +815,43 @@ def test_python_stop_when_ends_at_the_firing_sample_and_waits_for_the_other_bloc
     assert v["verdict"] == "PASS" and "tail_rule" not in v, v
 
 
+def test_python_post_trigger_end_waits_for_a_block_still_in_transit(rec):
+    """Review: post_trigger_s cut the queue at once (stop → unsubscribe) while another block's samples up to the end
+    were still on their way — their tail was lost. Every end at a PLC time waits for every block (footer stop_at)."""
+    st = _two_blocks(rec, start_when="MAIN.nCycle >= 30", post_trigger_s=0.15)
+    c = _conn()
+    for k in range(0, 51):
+        c.fire("MAIN.nCycle", k, ft(10 * k))              # the trigger at 300 ms, the end at 450 ms …
+    assert wait_until(lambda: rec.recs[st["id"]].stop_at_cut), rec.status(st["id"])
+    for k in range(0, 51):
+        c.fire(CC, k, ft(10 * k))                         # … the counter block's samples arrive afterwards
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
+    out = rec.stop(st["id"])
+    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer["window_end_ms"] == 450.0 and footer["stop_at"]["by"] == "post_trigger", footer
+    assert footer["label"] == "COMPLETE" and footer["missing_samples"] == 0, footer
+    rows = [json.loads(ln) for ln in Path(out["file"]).read_text(encoding="utf-8").splitlines() if ln.startswith("[")]
+    cc = rec.recs[st["id"]].slot_of[CC][0].bid
+    got = sorted(r[0] for r in rows if r[1] == f"#{cc}")
+    assert got[0] == 300.0 and got[-1] == 450.0 and len(got) == 16, got
+    assert rec.verify(st["id"])["verdict"] == "PASS"
+
+
+def test_verify_of_a_change_recording_without_a_counter_is_inconclusive(rec):
+    """Review: a change / poll recording has no PLC timeline: rec_verify said PASS on integrity alone."""
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="change", cycle_ms=10, duration_s=None,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=50)
+    c = _conn()
+    for i in range(20):
+        c.fire("MAIN.nCycle", i, ft(10 * i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 20)
+    rec.stop(st["id"])
+    v = rec.verify(st["id"])
+    assert v["verdict"] == "INCONCLUSIVE" and "no PLC timeline" in v["inconclusive"], v
+    v = rec.verify(st["id"], counter="MAIN.nCycle")
+    assert v["verdict"] == "PASS" and v["counter"]["lossless"], v
+
+
 def test_n56_python_stop_on_request_ends_at_a_plc_time_and_a_block_that_stopped_early_fails(rec):
     """N56 (Python engine): rec_stop ends at the newest PLC time received; every block must reach it. A block that
     stopped delivering 100 ms before the stop has lost those samples — FAIL, in the footer and in rec_verify."""
@@ -959,6 +1009,17 @@ def test_n61_python_level_trigger_true_only_during_the_warmup_is_reported(rec):
     assert s["triggered_at_ms"] == 300.0 and "trigger_delayed_ms" not in s, s
     assert s["start_when_warmup_true_ms"] == 0.0 and "when it was true again" in s["trigger_note"], s
     rec.stop(st["id"])
+    # review: false WITHIN the warm-up and true again on the first cycle every block delivers — not 'delayed' either
+    st = _two_blocks(rec, start_when="MAIN.nCycle == 0")
+    c = _conn()
+    for k in range(0, 20):
+        c.fire("MAIN.nCycle", 1 if k == 1 else 0, ft(10 * k))
+        if k >= 3:
+            c.fire(CC, k, ft(10 * k))
+    assert wait_until(lambda: rec.status(st["id"]).get("triggered_at_ms") is not None)
+    s = rec.status(st["id"])
+    assert s["triggered_at_ms"] == 40.0 and "trigger_delayed_ms" not in s and "true again" in s["trigger_note"], s
+    rec.stop(st["id"])
 
 
 def test_n58_export_never_writes_over_the_recording_or_a_sidecar(rec, tmp_path):
@@ -1083,3 +1144,13 @@ def test_n62_tasks_of_two_plc_projects_with_the_same_task_name_are_both_kept(tmp
     assert [(t["name"], t["cycle_ms"]) for t in a] == [("PlcTask", 10.0)] and a[0]["plc_project"].endswith("PlcA.plcproj")
     assert [(t["name"], t["cycle_ms"]) for t in b] == [("PlcTask", 2.0)], b
     assert idx.tasks_of("MAIN") is None                      # in both projects: not known which one is recorded
+    # review: PRG_C reached only through MAIN — whose MAIN the index holds is one of the two: cannot tell, not []
+    for d in ("PlcA", "PlcB"):
+        (tmp_path / d / "POUs" / "PRG_C.TcPOU").write_text(
+            '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="PRG_C"><Declaration><![CDATA[PROGRAM PRG_C\n'
+            'END_VAR]]></Declaration><Implementation><ST><![CDATA[;]]></ST></Implementation></POU></TcPlcObject>',
+            encoding="utf-8") if d == "PlcA" else None
+        main = tmp_path / d / "POUs" / "MAIN.TcPOU"
+        main.write_text(main.read_text(encoding="utf-8").replace("<![CDATA[;]]>", "<![CDATA[PRG_C();]]>"), encoding="utf-8")
+    idx = ProjectIndex(ProjectConfig(root=str(tmp_path)))
+    assert idx.tasks_of("PRG_C") is None, idx.tasks_of("PRG_C")

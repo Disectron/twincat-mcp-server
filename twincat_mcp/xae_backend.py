@@ -1926,7 +1926,7 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
                     return str(d.get("name", "")).rsplit("/", 1)[-1].upper() or "addData"
                 continue
             return str(c.tag)
-        return "empty"
+        return None                     # <body/>: nothing in it that the texts could leave behind
 
     def node(el: Any) -> dict[str, Any]:
         kids: dict[str, Any] = {}

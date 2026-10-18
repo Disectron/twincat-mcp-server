@@ -745,20 +745,31 @@ class ProjectIndex:
             code = "\n".join(_strip_comments_line(ln) for ln in body.splitlines())
             calls[k] = {o for o in progs if o != k and re.search(r"\b" + re.escape(progs[o].name) + r"\s*[(.]", code, re.I)}
         owners = []
+        unsure = False
         for t in tasks.values():
             if t["plc_project"] != plc:
                 continue
             seen: set[str] = set()
+            dup_on_way = False
             todo = [p.lower() for p in t["programs"]]
             while todo:
                 p = todo.pop()
                 if p in seen:
                     continue
                 seen.add(p)
+                if p in self.duplicates:
+                    # a program of this name exists in several files and the index holds only one of them: what it
+                    # calls in THIS project is not known — not followed
+                    dup_on_way = True
+                    continue
                 todo.extend(calls.get(p, ()))
             if key in seen:
                 owners.append({"name": t["name"], "cycle_ms": t["cycle_ms"], "plc_project": t["plc_project"]})
-        return owners
+            elif dup_on_way:
+                unsure = True
+        # a task whose call chain could not be followed may run the program too: then the answer is not known (an
+        # incomplete list, or [] — read as 'a GVL, no program' — would compare with the wrong cycle)
+        return None if unsure else owners
 
     def read_file(self, rel_or_abs: str, max_chars: int = 200_000) -> dict[str, Any]:
         """Read a file inside the project root (or an allowed extra root). Anything outside is refused: this

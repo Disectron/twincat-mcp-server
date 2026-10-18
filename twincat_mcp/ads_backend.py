@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ctypes
 import fnmatch
+import os
 import re
 import struct
 import threading
@@ -601,17 +602,20 @@ class AdsBackend:
         with self._dump_lock:
             if cancel is not None and cancel.is_set():
                 raise fail("ads_dump cancelled: the call had already ended (timeout) — the files are not kept")
-            taken = [p.name for p in (cpath, jpath) if p.exists()]
-            if taken:                                  # the names were free when reserved; never overwrite a file
-                raise fail(f"ads_dump: {taken} appeared in {out_dir} while the dump ran (another program?) — not "
-                           "overwritten, nothing kept")
+            def taken(exc: BaseException | None = None) -> AdsError:
+                return fail(f"ads_dump: {', '.join(p.name for p in (cpath, jpath) if p.exists())} appeared in {out_dir} "
+                            "while the dump ran (another program?) — not overwritten, nothing kept")
+            if cpath.exists() or jpath.exists():       # the names were free when reserved; never overwrite a file
+                raise taken()
             try:
-                os.replace(cpart, cpath)
+                _move_new(cpart, cpath)                # fails, never replaces, if the name was taken meanwhile
+            except FileExistsError as exc:
+                raise taken(exc) from exc
             except OSError as exc:
                 raise fail(f"ads_dump: the finished files could not be moved into place (a file error, not an ADS "
                            f"error): {exc}") from exc
             try:
-                os.replace(jpart, jpath)
+                _move_new(jpart, jpath)
             except OSError as exc:
                 try:
                     os.replace(cpath, cpart)           # both or neither: the CSV goes back to .partial
@@ -653,6 +657,7 @@ class AdsBackend:
         errors: list[dict[str, str]] = []
         failed: list[dict[str, str]] = []
         skipped: list[dict[str, str]] = []
+        unreadable: list[dict[str, str]] = []
         sizes: list[dict[str, Any]] = []
         preview: list[dict[str, Any]] = []
         truncated: str | None = None
@@ -709,11 +714,13 @@ class AdsBackend:
                     except _OutsideRoot as exc:
                         val, outside = None, str(exc)      # this leaf only: the others are inside and readable
                         errors.append({"symbol": leaf.path, "error": outside})
+                        unreadable.append({"leaf": leaf.path, "error": outside})
                     except _ReadFailed as exc:
                         read_error = str(exc)
                         break
                     w.writerow([leaf.path, leaf.type, _csv_val(val), outside or _leaf_note(leaf, val)])
-                    vals[leaf.path] = val
+                    # the JSON says why too: a bare null there stood for a value that was never read
+                    vals[leaf.path] = {"_not_read": outside} if outside else val
                     if len(preview) < 50:
                         preview.append({"path": leaf.path, "type": leaf.type, "value": val})
                     # N47: the budget is checked after every row; the root's JSON (not written yet) is counted as
@@ -745,9 +752,10 @@ class AdsBackend:
                 first = False
                 sizes.append({"root": r.name, "leaves": len(vals), "bytes_read": reader.bytes_read,
                               "csv_bytes": cw.n - c0, "json_bytes": jw.n - j0})
-            complete = not truncated and not failed
+            complete = not truncated and not failed and not unreadable
             jw.write("\n}, " + json.dumps({"roots": len(roots), "leaves": n_leaves, "complete": complete,
                                            "truncated": bool(truncated), "truncated_reason": truncated,
+                                           "unreadable_leaves": unreadable[:200], "unreadable_total": len(unreadable),
                                            "failed_roots": failed[:200], "failed_total": len(failed),
                                            "skipped_roots": skipped[:200], "skipped_total": len(skipped)})[1:] + "\n")
         out = {"roots": len(roots), "leaves": n_leaves, "bytes_read": n_read, "csv_bytes": cw.n, "json_bytes": jw.n,
@@ -766,9 +774,14 @@ class AdsBackend:
             out["skipped_total"] = len(skipped)
         if truncated:
             out["truncated_reason"] = truncated
+        if unreadable:
+            out["unreadable_leaves"] = unreadable[:50]
+            out["unreadable_total"] = len(unreadable)
         if not complete:
             out["hint"] = ("the dump is not complete — skipped_roots says what is missing and why (cut by max_leaves / "
-                           "max_total_mb, or not readable); raise the limits or dump the rest with pattern=")
+                           "max_total_mb, or not readable); raise the limits or dump the rest with pattern="
+                           + ("; unreadable_leaves lie outside their symbol (datatype and symbol table disagree — "
+                              "online change in progress?): dump again after it" if unreadable else ""))
         return out
 
     # ------------------------------------------------------------ read / write
@@ -1489,6 +1502,26 @@ def _nest(root: str, vals: dict[str, Any]) -> Any:
                 return [fin(groups[g]) for g in sorted(groups)]
         return {(k if isinstance(k, str) else str(list(k))): fin(x) for k, x in n.items()}
     return fin(tree)
+
+
+def _move_new(src: Any, dst: Any) -> None:
+    """Move src to dst, never over an existing dst (FileExistsError): os.replace overwrote a file that appeared
+    between the check and the move. Windows: rename refuses an existing target. POSIX: a hard link refuses it, then the
+    old name goes; a file system without hard links falls back to check-then-rename (the narrow window again)."""
+    import errno
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError:
+        if os.path.lexists(dst):
+            raise FileExistsError(errno.EEXIST, "file exists", str(dst)) from None
+        os.rename(src, dst)
+        return
+    os.unlink(src)
 
 
 def _reserve_dump_names(out_dir: str) -> tuple[Any, Any, Any, Any]:

@@ -393,8 +393,9 @@ def test_n52_rename_is_both_or_neither_and_the_timeout_verdict_matches_the_files
     the files were being renamed left both files although the client was told nothing is kept."""
     import os
     import threading
+    from twincat_mcp import ads_backend as AB
     from twincat_mcp.server import dump_timeout_message
-    real = os.replace
+    real = AB._move_new
     calls = []
 
     def second_fails(a, b):
@@ -402,7 +403,7 @@ def test_n52_rename_is_both_or_neither_and_the_timeout_verdict_matches_the_files
         if len(calls) == 2:
             raise OSError("disk full")
         return real(a, b)
-    monkeypatch.setattr(os, "replace", second_fails)
+    monkeypatch.setattr(AB, "_move_new", second_fails)
     with pytest.raises(AdsError, match="a file error, not an ADS error"):
         ads.dump("MAIN.*", False, str(tmp_path / "a"))
     assert sorted(p.name for p in (tmp_path / "a").iterdir()) == []            # neither file, no .partial
@@ -412,13 +413,13 @@ def test_n52_rename_is_both_or_neither_and_the_timeout_verdict_matches_the_files
     def cancel_during_rename(a, b):
         ev.set()
         return real(a, b)
-    monkeypatch.setattr(os, "replace", cancel_during_rename)
+    monkeypatch.setattr(AB, "_move_new", cancel_during_rename)
     res = ads.dump("MAIN.*", False, str(tmp_path / "b"), cancel=ev)
     out = ads.dump_outcome()
     assert out["phase"] == "done" and os.path.isfile(res["csv"]) and os.path.isfile(res["json"])
     assert "WERE kept" in dump_timeout_message(out, 900) and res["csv"] in dump_timeout_message(out, 900)
     # cancelled before the commit: nothing kept, and the verdict says so
-    monkeypatch.setattr(os, "replace", real)
+    monkeypatch.setattr(AB, "_move_new", real)
     ev2 = threading.Event()
     realdump = ads._dump
 
@@ -502,19 +503,36 @@ def test_dump_names_are_unique_and_a_finished_file_is_never_overwritten(ads, tmp
     assert (out / "dump-20261018-101500-3.csv").read_text(encoding="utf-8") == "theirs"
     assert not list(out.glob("*.partial"))
     monkeypatch.setattr(ads, "_dump", real)
-    # the JSON rename fails and so does moving the CSV back: say what is where, remove nothing
-    rep = os.replace
-    calls = []
+    # a file that appears between the check and the move is not replaced either (the move itself refuses)
+    from twincat_mcp import ads_backend as AB
+    mv = AB._move_new
 
-    def json_and_back_fail(src, dst):
-        calls.append((src, dst))
-        if len(calls) >= 2:
+    def squat_at_move(src, dst):
+        if str(dst).endswith(".csv"):
+            with open(dst, "w", encoding="utf-8") as fh:
+                fh.write("theirs too")
+        return mv(src, dst)
+    monkeypatch.setattr(AB, "_move_new", squat_at_move)
+    with pytest.raises(AdsError, match="not overwritten"):
+        ads.dump("MAIN.*", False, str(tmp_path / "q"))
+    assert (tmp_path / "q" / "dump-20261018-101500.csv").read_text(encoding="utf-8") == "theirs too"
+    assert not list((tmp_path / "q").glob("*.partial"))
+    # the JSON move fails and so does moving the CSV back: say what is where, remove nothing
+    rep = os.replace
+
+    def json_fails(src, dst):
+        if str(dst).endswith(".json"):
             raise OSError("locked")
-        return rep(src, dst)
-    monkeypatch.setattr(os, "replace", json_and_back_fail)
+        return mv(src, dst)
+
+    def back_fails(src, dst):
+        raise OSError("locked")
+    monkeypatch.setattr(AB, "_move_new", json_fails)
+    monkeypatch.setattr(os, "replace", back_fails)
     with pytest.raises(AdsError, match="PARTIAL commit") as ei:
         ads.dump("MAIN.*", False, str(tmp_path / "p"))
     monkeypatch.setattr(os, "replace", rep)
+    monkeypatch.setattr(AB, "_move_new", mv)
     left = sorted(p.name for p in (tmp_path / "p").iterdir())
     assert left == ["dump-20261018-101500.csv", "dump-20261018-101500.json.partial"], left
     st = ads.dump_outcome()
@@ -554,3 +572,9 @@ def test_leaf_values_reads_the_head_of_a_value_that_is_not_expanded_and_never_pa
     rows = {r[0]: r for r in _csv.reader(open(res["csv"], encoding="utf-8"))}
     assert "outside GVL_R.aRing" in rows["GVL_R.aRing.x"][3] and rows["GVL_R.aRing.x"][2] == "", rows
     assert "not expanded" in rows["GVL_R.aRing"][3] and not res.get("failed_roots"), res
+    # review: such a leaf makes the dump incomplete — it was complete: true with a bare null in the JSON
+    import json as _json
+    doc = _json.loads(open(res["json"], encoding="utf-8").read())
+    assert res["complete"] is False and res["unreadable_total"] == 1 and "outside their symbol" in res["hint"], res
+    assert doc["complete"] is False and doc["unreadable_total"] == 1
+    assert "outside GVL_R.aRing" in str(doc["values"]["GVL_R.aRing"]), doc["values"]

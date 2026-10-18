@@ -238,8 +238,11 @@ def _builds(venv: Path) -> list[Path]:
 
 
 def _pending(venv: Path) -> list[Path]:
-    """Finished builds marked pending (newest last) — whether they are newer than `venv` is _supersedes'."""
-    return [b for b in _builds(venv) if (b / PENDING).is_file() and (b / STAMP_NAME).is_file() and venv_python(b).is_file()]
+    """Finished builds marked pending, oldest install first by the stamp's 'built' time (the name's time is when the
+    build STARTED: of two overlapping installs the later-started one can finish first) — whether one is newer than
+    `venv` is _supersedes'."""
+    pend = [b for b in _builds(venv) if (b / PENDING).is_file() and (b / STAMP_NAME).is_file() and venv_python(b).is_file()]
+    return sorted(pend, key=lambda b: (_built(b), b.name))
 
 
 def _built(v: Path) -> float:

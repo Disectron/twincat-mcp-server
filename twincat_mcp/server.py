@@ -202,8 +202,10 @@ def restart_proven(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool 
     elapsed = max(0.0, float(after.get("t", 0)) - float(before.get("t", 0)))
     ct = after.get("cycle_time_100ns") or before.get("cycle_time_100ns")
     if not isinstance(ct, (int, float)) or ct <= 0:
-        if a < b:
+        if a < b and b < 0x80000000:
             return True, f"task 1's CycleCount started again ({b} → {a})"
+        if a < b:          # without the cycle time the wrap window is unknown: a high counter may have wrapped
+            return None, f"CycleCount {b} → {a}: the counter may have wrapped (task cycle time unknown)"
         return None, f"CycleCount {b} → {a}, but the task cycle time is unknown"
     cycle_s = ct / 1e7
     window = elapsed / cycle_s                                  # cycles since the first witness
@@ -2418,7 +2420,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         notification block, holes between the PLC's own sample timestamps. counter (optional): a PLC variable that
         increments every cycle and was recorded with the rest (your nCycleCount, or
         TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount) must step by exactly `step` per sample — ground truth
-        for 'no sample lost'. verdict PASS only if all checks hold."""
+        for 'no sample lost'. verdict PASS only if all checks hold; INCONCLUSIVE when the file is intact but its
+        completeness cannot be shown (a change / poll recording without counter=, or a stop from an older version
+        whose blocks ended apart); FAIL on any loss, a block that never delivered, or symbols not subscribed."""
         return await app.mem_call(app.rec.verify, id, counter, step)
 
     @mcp.tool(annotations=READ)
