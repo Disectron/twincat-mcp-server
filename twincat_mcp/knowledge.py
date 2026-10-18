@@ -372,8 +372,9 @@ class Knowledge:
         with self._db():
             pass
         out["changed"] = old is None or norm_path(old) != norm_path(p)
-        stubs = install_builder_stubs(p)
-        if any(v.get("state") == "replaced" for v in stubs.values() if isinstance(v, dict)):
+        from . import __version__
+        stubs = sync_builder_stubs(self.home, p, __version__).get("tools") or {}
+        if any(isinstance(v, dict) and v.get("state") in ("replaced", "left alone", "error") for v in stubs.values()):
             out["builder_stubs"] = stubs
         out["docs"] = self.docs_layout(p, brief=True)
         return out
@@ -383,10 +384,7 @@ class Knowledge:
         <kb>\\tools into stubs. File-system only; never raises."""
         res: dict[str, Any] = {}
         try:
-            res["pointer_written"] = record_plugin_location(self.home, version)
-            loc, _src = self.location()
-            if loc is not None and (loc / "tools").is_dir():
-                res["tools"] = install_builder_stubs(loc)
+            res = sync_builder_stubs(self.home, self.location()[0], version)
         except Exception as exc:  # noqa: BLE001 — a convenience; the tools work without it
             res["error"] = f"{type(exc).__name__}: {exc}"
         self.last_upkeep = res
@@ -958,9 +956,26 @@ def _builder_version(f: Path) -> str | None:
 BUILDER_NAMES = ("infosys_local.py", "manuals_db.py")
 PLUGIN_POINTER = "plugin_location.json"
 _STUB_MARK = "twincat-mcp builder stub"
-# the first line of each builder, every version so far: what makes a file in <kb>\\tools a builder copy
-_BUILDER_HEADS = {"infosys_local.py": '"""Search the locally installed Beckhoff Infosys',
-                  "manuals_db.py": '"""Hardware manual bank:'}
+# N64: a file in <kb>\tools is replaced by the stub only when it IS a file this plugin shipped — identified by its
+# content (sha256 with CRLF read as LF: a git checkout on Windows converts line endings), never by how it looks.
+# Every version of the builders that ever left this repository (releases, and copies handed out from main):
+SHIPPED_BUILDERS: dict[str, dict[str, str]] = {
+    "infosys_local.py": {
+        "b59a40bc327b64171ca277bd313ae6994d08a76eebf9b2e6e3c0f9ee93783873": "2",   # e92f196
+        "1682c747a8359454625d65eeb2c4831802e46e6a562848d1491d37049b49cf53": "2",   # e7e5b3f = release 0.8.9
+        "864f9efc0bbebdde01ce54d6d47767f8d3c55eb11699a8971fb239550e8efdd0": "2",   # 1200fee (TCMCP_STUB_DIR)
+    },
+    "manuals_db.py": {
+        "530a0c81b2dab0e6580d183348017dfbb7c05d795b6ceeb3808af934da3ab33d": "2",   # e92f196
+        "5d9cc66b174fc88bbb30dfa84114c0de367f1e3de7aba9b2f22375c2f0ae688b": "2",   # e7e5b3f
+        "606fc4fc36cc0a86d79afaae59e6935311e0165246f5de975145b0fc94a772ea": "3",   # 570c533
+        "217756a3d65af0755cce0100680bd1cc77934077a542e99ebfdd00a6e2de289c": "3",   # 08d3a44 = release 0.8.9
+        "057677fad71344f574eaa97104d1e47ec8e556db5aa9341333abeab3e8990ebe": "3",   # 1200fee (TCMCP_STUB_DIR)
+    },
+}
+SHIPPED_STUBS: dict[str, str] = {
+    "6eb88af57099b2610da38becf909609829ed9c69d015cb98800e0740a86c9adf": "1",       # 1200fee
+}
 
 
 def builders_dir() -> Path | None:
@@ -970,17 +985,35 @@ def builders_dir() -> Path | None:
     return b if b is not None and b.is_dir() else None
 
 
-def builder_kind(f: Path, name: str) -> tuple[str, str | None]:
-    """('stub', stub version) | ('copy', builder version) | ('other', None) for a file in <kb>\\tools."""
+def _content_sha(f: Path) -> str | None:
+    """sha256 of a text file with CRLF read as LF — the identity of a shipped file on any checkout."""
+    import hashlib
     try:
-        text = f.read_text(encoding="utf-8", errors="replace")
+        return hashlib.sha256(f.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
     except OSError:
+        return None
+
+
+def builder_kind(f: Path, name: str) -> tuple[str, str | None]:
+    """What a file in <kb>\\tools is, by its content:
+    ('stub', version)  the stub the plugin ships now;
+    ('copy', version)  a builder or an older stub this plugin shipped (sha256 known) — the server may replace it;
+    ('other', None)    anything else: the user's own script, an edited copy, a newer one — never replaced."""
+    sha = _content_sha(f)
+    if sha is None:
         return "other", None
-    if _STUB_MARK in text[:400]:
-        m = re.search(r'^STUB_VERSION = "(\d+)"', text, re.M)
+    b = builders_dir()
+    current_stub = _content_sha(b / "stub.py") if b is not None and (b / "stub.py").is_file() else None
+    if sha == current_stub:
+        m = re.search(r'^STUB_VERSION = "(\d+)"', f.read_text(encoding="utf-8", errors="replace"), re.M)
         return "stub", m.group(1) if m else None
-    if text.lstrip("\ufeff").startswith(_BUILDER_HEADS.get(name, "\0")):
-        return "copy", _builder_version(f)
+    if sha in SHIPPED_STUBS:
+        return "copy", f"stub {SHIPPED_STUBS[sha]}"
+    if sha in SHIPPED_BUILDERS.get(name, {}):
+        return "copy", SHIPPED_BUILDERS[name][sha]
+    shipped_now = b / name if b is not None else None
+    if shipped_now is not None and shipped_now.is_file() and sha == _content_sha(shipped_now):
+        return "copy", _builder_version(shipped_now)        # a copy of the builder this plugin version ships
     return "other", None
 
 
@@ -1008,11 +1041,10 @@ def record_plugin_location(home: Path, version: str) -> bool:
 
 
 def install_builder_stubs(loc: Path) -> dict[str, Any]:
-    """<kb>\\tools\\infosys_local.py / manuals_db.py that are copies of a builder (any version) or an older stub are
-    replaced by the stub (skills/twincat-docs/builders/stub.py), which runs the plugin's current builder — so the
-    knowledge folder never needs a copy updated after a plugin update. The replaced file is kept beside it as
-    <name>.v<version>.bak; a file that is neither a builder copy nor a stub is left alone and reported; a missing one
-    is not created."""
+    """<kb>\\tools\\infosys_local.py / manuals_db.py that are a file this plugin shipped (a builder of any version, or
+    an older stub — known by its sha256) are replaced by the current stub, which runs the plugin's builders. The
+    replaced file is kept beside it as <name>.v<version>.bak. Anything else — the user's own script, an edited copy —
+    is left alone and reported with the command that switches it to the stub. A missing file is not created."""
     b = builders_dir()
     out: dict[str, Any] = {}
     if b is None or not (b / "stub.py").is_file():
@@ -1025,15 +1057,18 @@ def install_builder_stubs(loc: Path) -> dict[str, Any]:
         if not f.is_file():
             continue
         kind, ver = builder_kind(f, n)
-        if kind == "stub" and ver == stub_ver:
+        if kind == "stub":
             out[n] = {"state": "stub", "stub_version": ver}
             continue
         if kind == "other":
-            out[n] = {"state": "left alone", "reason": "not a copy of the builder nor a stub — not replaced"}
+            out[n] = {"state": "left alone", "sha256": _content_sha(f),
+                      "reason": "not a file this plugin shipped (your own script, or an edited copy) — not replaced",
+                      "to_use_the_plugin_builders": f'rename it, then: copy "{b / "stub.py"}" "{f}"'}
             continue
-        backup = f.with_name(f"{n}.{'stub' if kind == 'stub' else 'v'}{ver or '?'}.bak")
+        tag = (ver or "unknown").replace(" ", "")
+        backup = f.with_name(f"{n}.v{tag}.bak")
         if backup.exists():
-            backup = f.with_name(f"{n}.{'stub' if kind == 'stub' else 'v'}{ver or '?'}.{time.strftime('%Y%m%d-%H%M%S')}.bak")
+            backup = f.with_name(f"{n}.v{tag}.{time.strftime('%Y%m%d-%H%M%S')}.bak")
         try:
             shutil.copy2(f, backup)
             tmp = f.with_name(f.name + ".tmp")
@@ -1042,8 +1077,17 @@ def install_builder_stubs(loc: Path) -> dict[str, Any]:
         except OSError as exc:
             out[n] = {"state": "error", "error": str(exc)}
             continue
-        out[n] = {"state": "replaced", "was": f"{kind} version {ver}", "backup": str(backup), "stub_version": stub_ver}
+        out[n] = {"state": "replaced", "was": f"shipped version {ver}", "backup": str(backup), "stub_version": stub_ver}
     return out
+
+
+def sync_builder_stubs(home: Path, loc: Path | None, version: str) -> dict[str, Any]:
+    """N68: the pointer first, then the stubs — a stub installed before the pointer is written would run whatever an
+    old pointer (or the plugin cache) names. Used at every server start and by kb_set_location."""
+    res: dict[str, Any] = {"pointer_written": record_plugin_location(home, version)}
+    if loc is not None and (loc / "tools").is_dir():
+        res["tools"] = install_builder_stubs(loc)
+    return res
 
 
 def _builders(loc: Path) -> dict[str, Any]:
@@ -1061,11 +1105,13 @@ def _builders(loc: Path) -> dict[str, Any]:
             if kind == "stub":
                 e["note"] = (f"tools\\{n} is the builder stub: it runs the plugin's {n} (version {e['shipped_version']}) — "
                              "nothing to update")
-            else:
+            elif kind == "copy":
                 e["copy_version"] = ver
-                if plug and kind == "copy" and ver != e["shipped_version"]:
-                    e["note"] = (f"tools\\{n} is a copy of version {ver}, the plugin ships version {e['shipped_version']} — "
-                                 "the server replaces such copies with the builder stub at its next start")
+                e["note"] = (f"tools\\{n} is a copy the plugin shipped ({ver}); the server replaces it with the builder "
+                             "stub at its next start")
+            else:
+                e["note"] = (f"tools\\{n} is not a file the plugin shipped (your own script or an edited copy) — left "
+                             f"alone; the commands below use the plugin's own builder")
         out[n] = e
     return out
 
@@ -1074,7 +1120,7 @@ def _cmd(builders: dict[str, Any], name: str, loc: Path, sub: str) -> str:
     b = builders.get(name) or {}
     if b.get("copy_kind") == "stub":                      # the stable path in the knowledge folder
         return f'<Python 3.12+> "{b["copy_in_tools"]}" {sub} --kb "{loc}"'
-    script = b.get("shipped") or b.get("copy_in_tools") or name
+    script = b.get("shipped") or (b.get("copy_in_tools") if b.get("copy_kind") == "copy" else None) or name
     return f'<Python 3.12+> "{script}" {sub} --kb "{loc}"'
 
 
@@ -1108,6 +1154,22 @@ _PRODUCT = re.compile(r"^[A-Za-z]{1,4}\d{3,5}(?:-\d{4})?$")
 _PRODUCT_IN = re.compile(r"\b([A-Z]{1,4}\d{3,5}(?:-\d{4})?)\b")
 
 
+def _product_rows(con: sqlite3.Connection, code: str, limit: int) -> tuple[list[sqlite3.Row], str | None]:
+    """N67: a product is its base order code plus an optional variant (CX9020-0130 is a CX9020; EL3102-0010 an
+    EL3102). Look for the code itself (or its variants); a variant no manual names falls back to the base code — a
+    manual is written for the base product — labelled 'base product CX9020'. -> (rows, label or None)."""
+    def q(c: str) -> list[sqlite3.Row]:
+        like = c.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "-%"
+        return con.execute("SELECT d.name, d.id, GROUP_CONCAT(p.page) AS pages, SUM(p.n) AS hits FROM product p "
+                           "JOIN doc d ON d.id = p.doc WHERE p.code = ? OR p.code LIKE ? ESCAPE '\\' "
+                           "GROUP BY p.doc ORDER BY hits DESC LIMIT ?", (c, like, limit)).fetchall()
+    rows = q(code)
+    m = re.fullmatch(r"([A-Z]{1,4}\d{3,5})-\d{4}", code)
+    if rows or not m:
+        return rows, None
+    return q(m.group(1)), f"base product {m.group(1)} (no manual names the variant {code})"
+
+
 def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
     """Which indexed PDF manuals mention these product codes (manuals_db.py's product table: exact code or CODE-xxxx)."""
     if loc is None or not codes:
@@ -1122,13 +1184,11 @@ def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
         try:
             for code in codes[:3]:
                 c = code.strip().upper()
-                like = c.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "-%"
-                rows = con.execute("SELECT d.name, d.id, GROUP_CONCAT(p.page) AS pages, SUM(p.n) AS hits FROM product p "
-                                   "JOIN doc d ON d.id = p.doc WHERE p.code = ? OR p.code LIKE ? ESCAPE '\\' "
-                                   "GROUP BY p.doc ORDER BY hits DESC LIMIT 5", (c, like)).fetchall()
+                rows, via = _product_rows(con, c, 5)
                 if rows:
                     found[c] = [{"doc": r["name"], "doc_id": r["id"], "mentions": r["hits"],
-                                 "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})[:20]} for r in rows]
+                                 "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})[:20],
+                                 **({"matched_as": via} if via else {})} for r in rows]
         finally:
             con.close()
     except sqlite3.Error as exc:

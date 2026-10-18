@@ -208,34 +208,110 @@ def _run_quiet(cmd: list[str], **kw) -> int:
     return proc.returncode
 
 
-def venv_ok(venv: Path) -> bool:
-    """The venv's interpreter starts, has pip, and is new enough: a venv built by an older plugin on Python 3.10 / 3.11
-    is rebuilt with the current base Python instead of failing in pip (requires-python >= 3.12)."""
+def venv_health(venv: Path, timeout_s: float = 60) -> str:
+    """'ok': the interpreter starts, has pip and is new enough. 'unusable': it is missing, has no pip, or is older than
+    3.12 (a venv an earlier plugin built on 3.10 / 3.11) — a definite answer. 'unknown': it did not answer in time or
+    could not be started (cold disk, virus scanner) — no reason to rebuild anything (N46)."""
     vp = venv_python(venv)
     if not vp.is_file():
-        return False
+        return "unusable"
     check = f"import sys, pip; sys.exit(0 if sys.version_info >= {MIN_PY!r} else 3)"
     try:
-        return subprocess.call([str(vp), "-c", check], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=60) == 0
-    except (OSError, subprocess.TimeoutExpired):
+        rc = subprocess.call([str(vp), "-c", check], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return "unknown"
+    except OSError:
+        return "unknown"
+    return "ok" if rc == 0 else "unusable"
+
+
+def venv_ok(venv: Path) -> bool:
+    return venv_health(venv) == "ok"
+
+
+PENDING = ".twincat-mcp-swap-pending"
+
+
+def _builds(venv: Path) -> list[Path]:
+    return sorted(venv.parent.glob(venv.name + ".build-*"))
+
+
+def _pending(venv: Path) -> list[Path]:
+    """Finished builds that could not be put in place yet (newest last)."""
+    return [b for b in _builds(venv) if (b / PENDING).is_file() and (b / STAMP_NAME).is_file() and venv_python(b).is_file()]
+
+
+def active_venv(venv: Path) -> Path:
+    """The venv to run: normally `venv`; the newest finished build while its swap is pending (another window still
+    runs the old server from `venv`, so `venv` could not be renamed)."""
+    pend = _pending(venv)
+    return pend[-1] if pend else venv
+
+
+def _retire(path: Path) -> bool:
+    """Rename out of the way as `<venv>.old-…` (removed later); False when it is in use."""
+    import time
+    old = path.with_name(f"{path.name.split('.build-')[0]}.old-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-"
+                         f"{abs(hash(path.name)) % 10000}")
+    try:
+        os.rename(path, old)
+        return True
+    except OSError:
         return False
 
 
-def ensure_venv(venv: Path, base_python: str) -> Path:
-    if venv_ok(venv):
-        return venv_python(venv)
-    if venv.exists():
-        log(f"venv at {venv} is unusable (Python moved, upgraded, or older than {MIN_PY[0]}.{MIN_PY[1]}) — recreating")
-        import shutil
-        shutil.rmtree(venv, ignore_errors=True)
+def swap_in(venv: Path, build: Path) -> bool:
+    """Put a finished build in place of `venv`: `venv` → `venv.old-…`, build → `venv`. N46: a live venv is never
+    deleted or changed in place (rmtree of a venv another Claude window ran broke that server and the rebuild failed
+    at every start). When `venv` cannot be renamed (files in use on Windows) the build stays beside it, marked
+    pending, and is the one that runs until a later start can swap. -> swapped?"""
+    if venv.exists() and not _retire(venv):
+        (build / PENDING).write_text("venv in use\n", encoding="utf-8")
+        log(f"{venv} is in use (another window runs the server from it); the new build {build.name} is used until a "
+            "later start can put it in place")
+        return False
+    try:
+        os.rename(build, venv)
+    except OSError as exc:
+        (build / PENDING).write_text(f"{exc}\n", encoding="utf-8")
+        log(f"could not move {build} to {venv}: {exc}; {build.name} is used for now")
+        return False
+    try:
+        (venv / PENDING).unlink()
+    except OSError:
+        pass
+    return True
+
+
+def tidy(venv: Path, lock_free: bool) -> None:
+    """At every start: the newest pending build goes in place when it can; superseded pending builds, unfinished
+    builds (only when no install holds the lock) and replaced venvs (`.old-*`) are retired or removed — best effort,
+    anything in use stays for a later start."""
+    import shutil
+    pend = _pending(venv)
+    keep = pend[-1] if pend and not swap_in(venv, pend[-1]) else None
+    for b in _builds(venv):
+        if b == keep:
+            continue
+        # superseded pending builds always; anything else only while no install runs (it may be that install's own)
+        if b in pend or lock_free:
+            _retire(b)
+    for old in venv.parent.glob(venv.name + ".old-*"):
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def build_new_venv(venv: Path, base_python: str) -> Path:
+    """A fresh venv beside the live one (`venv.build-<time>-<pid>`); nothing that exists is touched. -> its python."""
+    import time
+    b = venv.with_name(f"{venv.name}.build-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}")
     venv.parent.mkdir(parents=True, exist_ok=True)
-    log(f"creating venv {venv} with {base_python}")
-    rc = _run_quiet([base_python, "-m", "venv", str(venv)])
-    if rc != 0 or not venv_python(venv).is_file():
+    log(f"creating venv {b} with {base_python}")
+    rc = _run_quiet([base_python, "-m", "venv", str(b)])
+    if rc != 0 or not venv_python(b).is_file():
         log("venv creation failed. On Debian/Ubuntu: apt install python3-venv. On Windows: reinstall Python 64-bit from python.org.")
         raise SystemExit(4)
-    return venv_python(venv)
+    return venv_python(b)
 
 
 def install(vpython: Path, src: Path, stamp: dict, venv: Path) -> None:
@@ -359,7 +435,13 @@ def main(argv: list[str] | None = None) -> int:
     venv = Path(args.venv).resolve() if args.venv else default_venv()
     base_python = args.python or sys.executable
     stamp = LazyStamp(src, base_python)
-    must_install = args.reinstall or not venv_ok(venv) or needs_install(venv, stamp)
+    tidy(venv, lock_free=lock_age_s(venv) is None)
+    run_from = active_venv(venv)
+    health = venv_health(run_from)
+    if health == "unknown":
+        log(f"the venv at {run_from} did not answer the health check in time — using it as it is (no rebuild on a "
+            "timeout)")
+    must_install = args.reinstall or health == "unusable" or needs_install(run_from, stamp)
 
     if must_install and not args.no_run and not args.sync_install:
         # started as the MCP server: do not make the client wait through pip
@@ -394,16 +476,21 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(5)
                 if lock_age_s(venv) is None:
                     break
-            if not needs_install(venv, make_stamp(src, base_python)) and venv_ok(venv):
+            run_from = active_venv(venv)
+            if not needs_install(run_from, make_stamp(src, base_python)) and venv_health(run_from) != "unusable":
                 must_install = False
         if must_install:
             try:
-                vpython = ensure_venv(venv, base_python)
-                install(vpython, src, stamp, venv)
+                vpython = build_new_venv(venv, base_python)
+                build = vpython.parent.parent
+                install(vpython, src, stamp, build)
+                swap_in(venv, build)
+                tidy(venv, lock_free=False)
             finally:
                 if own_lock:
                     release_lock(venv)
-    vpython = venv_python(venv)
+        run_from = active_venv(venv)
+    vpython = venv_python(run_from)
     if not vpython.is_file():
         log(f"no interpreter at {vpython} after install")
         return 4

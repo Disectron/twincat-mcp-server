@@ -1,7 +1,7 @@
 # Builders: infosys_local.py and manuals_db.py
 
 Two standalone scripts that build the offline documentation databases read by the `twincat-docs` skill
-(`kb_docs.py`) and by the twincat MCP server. `infosys_local.py` version 2, `manuals_db.py` version 3 (plugin 0.8.9). Standard library only, except that
+(`kb_docs.py`) and by the twincat MCP server. `infosys_local.py` version 2, `manuals_db.py` version 4 (plugin 0.8.10). Standard library only, except that
 PDF text needs PyMuPDF or pypdf (see section 5).
 
 | script | reads | writes |
@@ -172,31 +172,42 @@ python manuals_db.py stats --json
    - progress is kept: a file committed before an interruption is `unchanged` on the next run.
 4. `fts optimize` when anything changed. `meta.last_update`, `meta.last_result`
    (`N added, N updated, N removed, N unchanged, N failed`) and `meta.text_format` are written.
-5. **Page text format.** `TEXT_FORMAT` (currently `2`) names the page text and toc rules below. A database whose
-   `meta.text_format` differs (a version 1 or 2 database has none: format `1`) is reported as `outdated`, and the next
-   `update` reads every manual again (`page text format 1 -> 2: every manual is read again`). An interrupted run, or a re-read in which a manual failed (that manual keeps its old rows), leaves
+5. **Page text format.** `TEXT_FORMAT` (currently `3`) names the page text and toc rules below. A database whose
+   `meta.text_format` differs (a version 1 or 2 database has none: format `1`; version 3 wrote `2`) is reported as
+   `outdated`, and the next `update` reads every manual again (`page text format 2 -> 3: every manual is read again`). An interrupted run, or a re-read in which a manual failed (that manual keeps its old rows), leaves
    the old format in `meta`, so the next run reads all manuals again.
 
 ### Index logic per PDF
 
 - Backend: **PyMuPDF** (`import pymupdf`, else `import fitz`) if installed; otherwise **pypdf**; if neither, the command
   exits with `pip install pymupdf` (or `pypdf`) for the Python that runs the script. See section 5.
-- Page text: PyMuPDF `get_text("text", sort=True)` (reading order, also for two columns); pypdf `extract_text()`.
-  Cleaning: soft hyphens removed, `ﬁ/ﬂ` expanded, hyphenated line breaks joined (`exam-\nple` → `example`),
-  runs of spaces/tabs collapsed, blank lines collapsed.
-- Running headers, footers and margin labels (format 2): the first three and last three non-empty lines of every page
-  are candidates. A candidate is removed when its text (case and spacing ignored, digits as `#`) occurs among the
-  candidates of **3 pages and 5 % of the pages**, or of 2 pages when it is a chapter title (level 1–2, without its
-  number). Numbers that differ from page to page must behave like a page number (the last number grows with the
-  page); otherwise the line is kept (`Table 3 of 9`). Never removed: signal words (`NOTE`, `NOTICE`, `CAUTION`,
-  `WARNING`, `DANGER`, `ATTENTION`, `HINWEIS`, `VORSICHT`, `WARNUNG`, `GEFAHR`, `ACHTUNG`, `TIP`, `EXAMPLE`,
-  `BEISPIEL`), a numbered toc heading or its first line, the second line of a wrapped toc heading. A removed header of
-  8 or more characters glued to the start of a line is cut off when no space separates it and the rest starts with a
-  digit or a capital letter (`Calibration and compensation4.4 Calibration` → `4.4 Calibration`), or when a section
-  number follows (`Commissioning 4.4 Calibration`); a sentence such as `Commissioning EtherCAT slaves is …` is left
-  alone. Glued to the end of a line without a space, after a digit or punctuation (`79Commissioning`), it is cut off.
-  Limit: a table header row repeated at the top of 3+ pages (and 5 %) is removed from those pages too. The update prints
-  the number of removed header/footer texts per manual.
+- Page text, with the place of every piece: PyMuPDF `get_text("dict")` (spans with their baseline and size; a page's
+  text is its lines in reading order, lines on one baseline side by side, as `get_text("text", sort=True)` gives it);
+  pypdf `extract_text(visitor_text=…)` (every text operation with its text matrix; the visited pieces joined give
+  exactly `extract_text()`). Cleaning: soft hyphens removed, `ﬁ/ﬂ` expanded, hyphenated line breaks joined
+  (`exam-\nple` → `example`), runs of spaces/tabs collapsed, blank lines collapsed.
+- Running headers, footers and margin labels (format 3) are found by their **place**, not by their text — Beckhoff
+  prints the current *section* title in the header (`| Signal flow diagram`, a different text in every section, on
+  some pages on the same baseline as a heading) and a footer whose page number comes first on some pages
+  (`56 Version: 4.8.0 EL3356-00x0`). A piece is running when
+  1. it lies in the outer 15 % of the page (top or bottom), and
+  2. text of the **same size on the same baseline** (within 2 pt) is there on **at least 40 % of the pages** with
+     text (and on 3 pages), and
+  3. that baseline is **set apart from the body**: on at least 60 % of those pages the nearest line towards the middle
+     of the page is ≥ 1.6 line pitches away (the pitch is the document's median line distance). Evaluated from the
+     body outwards: a header line that passed is transparent for a second header line further out; one that failed
+     (the body's first line) is not.
+  The running pieces are left out of the page text and of the font-heading toc. What stays: the body's first line and a
+  table header row repeated at the top of continuation pages (`Index (hex) Name Meaning Data type Flags Default` — the
+  next row follows at one pitch), a heading that shares the header's baseline (another size). The update prints the
+  number of removed pieces per manual.
+- Fallback, only when the backend gives no positions (an old pypdf): the text-repetition rule of format 2 — the first
+  and last three lines of every page, text repeated (digits as `#`) on 3 pages and 5 % of the pages, or on 2 when it
+  is a chapter title; numbers that change must behave like a page number: **one** of them (first, last or any) grows
+  with the page, the others stay (`56 Version: 4.8.0 …` and `… Version: 4.8.0 57`; `Table 3 of 9` is kept); signal
+  words (`NOTE`, `NOTICE`, `WARNING` …), numbered toc headings and wrapped heading lines are kept; a removed header glued
+  to a heading is cut off. This rule cannot tell a table header row from a running header — the reason format 3 uses
+  positions.
 - Title: PDF metadata title; if empty, the largest text span on page 1.
 - Chapters (`toc`):
   1. the PDF **bookmarks** if there are any;
@@ -205,7 +216,9 @@ python manuals_db.py stats --json
      with the heading that follows; a number glued to the title in one span (`10Error handling`) is split; lines
      longer than 120 chars are ignored; level = depth of the number; unnumbered headings → level 1 when the manual
      uses numbers, else the font-size rank. A heading line directly below a heading line of the same size, on the same
-     page and without a number of its own, continues that heading (a heading wrapped over two lines, format 2).
+     page and without a number of its own, continues that heading (a heading wrapped over two lines, format 2). The
+     lines are read without the running pieces (format 3): a header on a heading's baseline was glued into the title
+     (`1.1 Product overview| Product overview`).
   3. both sources (format 2): in a manual that numbers its chapters, an unnumbered entry on the same page as the entry
      before it is that entry's second line when it starts in lower case or with `)`, `]`, `}`, or when the entry before
      ends with `-`, `,`, `(`, `/`, `&` or a joining word (`and`, `or`, `of`, `the`, `for`, `with`, `to`, `in`, `on`,
@@ -217,7 +230,7 @@ python manuals_db.py stats --json
   `\b((EL|ELM|ELX|ES|EK|EP|EPP|EPI|ER|EQ|EM|EJ|EZ|EX|KL|KM|KS|BK|BC|BX|CX|CP|CU|C6|C7|AX|AMP|AM|AG|AT|FC|IP|IL|IE|LC|TF|TE|TC|ZB|ZK|ZS)\d{3,5}(-\d{4})?)\b`
 - Pages with no text are stored. A PDF with no text at all is flagged `no text layer (scanned?)`. OCR is not included.
 
-### Schema (version 3; tables unchanged since version 2)
+### Schema (version 4; tables unchanged since version 2)
 
 ```sql
 doc(id PRIMARY KEY, path UNIQUE, name, size, mtime, sha256, title, pages, text_pages, indexed, backend)
@@ -227,8 +240,8 @@ toc(doc, level, title, page)
 product(code, doc, page, n)                          -- INDEX on code
 fts  USING fts5(text, section, doc UNINDEXED, page UNINDEXED, tokenize='unicode61 remove_diacritics 2')
 meta(key PRIMARY KEY, value)
-  -- state (updating | idle), pid, started, folder, builder ("manuals_db.py 3"), files_total, files_done, heartbeat,
-  -- last_update, last_result, text_format ("2")
+  -- state (updating | idle), pid, started, folder, builder ("manuals_db.py 4"), files_total, files_done, heartbeat,
+  -- last_update, last_result, text_format ("3")
 ```
 
 A version-1 database has no `meta` table; the next `update` creates it.
@@ -312,12 +325,15 @@ None found: one line saying what was tried, exit code 1. `TCMCP_STUB_VERBOSE=1` 
 sets `TCMCP_STUB_DIR` to its own folder, so the builder's "folder above the script" (section 1, step 4) is the folder
 above the stub — `<kb>`.
 
-**Installed by the server, once.** At every start (and on `kb_set_location`) the server replaces a file in
-`<kb>\tools\` with the stub when it is a copy of the builder (any version, recognised by its first line) or an older
-stub. The replaced file is kept beside it as `<name>.v<version>.bak`. A file that is neither (your own script under
-that name) is left alone and reported; a missing file is not created. `kb_status` → `docs.builders` shows
-`copy_kind` (`stub`, `copy` or `other`), `docs.builder_upkeep` what the last start did, and the commands it suggests
-use the stub path in `<kb>\tools\`.
+**Installed by the server, once.** At every start (and on `kb_set_location`) the server first records where its
+builders are (`plugin_location.json`), then replaces a file in `<kb>\tools\` with the stub **only when it is a file
+this plugin shipped**: its content (sha256, CRLF read as LF) is one of the builder or stub versions that ever left the
+repository (`SHIPPED_BUILDERS` / `SHIPPED_STUBS` in `twincat_mcp/knowledge.py`), or a copy of the builder the
+installed plugin ships. The replaced file is kept beside it as `<name>.v<version>.bak`. Anything else — your own
+script under that name, an edited copy, a newer one — is left alone and reported with the command that switches it
+to the stub; a missing file is not created. `kb_status` → `docs.builders` shows `copy_kind` (`stub`, `copy` = a
+shipped file the next start replaces, `other` = left alone), `docs.builder_upkeep` what the last start did; the
+commands it suggests use the stub in `<kb>\tools\`, else the plugin's own builder (never a file it left alone).
 
 Without the plugin (a PC that only has the knowledge folder): put the builders themselves into `tools\` instead of the
 stubs; they work there as before.
@@ -349,4 +365,6 @@ Stored PDF paths are absolute. Moving the knowledge folder makes the next `updat
 - Infosys: images are dropped; tables are flattened to pipe rows (merged cells are not reconstructed). Links are kept
   in the `link` table; the body text shows only their text.
 - A version-1 index answers searches but has no links. `docs_page` on it says so (`links_note`).
+- Running headers are found by position (format 3): a header that is not set apart from the body (no larger gap
+  to the first body line than between body lines) or that is on fewer than 40 % of the pages stays in the text.
 - The builders run on Python 3.12 and newer only. The test suite runs on 3.12 (Windows and Linux); the refusal message is tested by running each script with `sys.version_info` set to 3.11.

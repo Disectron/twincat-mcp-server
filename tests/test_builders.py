@@ -338,7 +338,7 @@ def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
     texts = [r[0] for r in con.execute("SELECT text FROM page ORDER BY page")]
     assert texts and all("Calibration and compensation" not in t and "Version" not in t for t in texts), texts
     assert all("strain gauge bridge" in t for t in texts)
-    assert con.execute("SELECT value FROM meta WHERE key='text_format'").fetchone()[0] == "2"
+    assert con.execute("SELECT value FROM meta WHERE key='text_format'").fetchone()[0] == "3"
     # an index written by the old builder (no text_format) is outdated, and update reads every manual again
     con.execute("DELETE FROM meta WHERE key='text_format'")
     con.commit()
@@ -368,7 +368,7 @@ def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
 def test_n37_font_headings_wrapped_over_two_lines_are_one_entry(tmp_path):
     """PDFs without bookmarks (PyMuPDF font headings): the second line of a wrapped heading was a level-1 chapter."""
     pytest.importorskip("reportlab")
-    pytest.importorskip("pymupdf")
+    pytest.importorskip("pymupdf", exc_type=ImportError)
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     pdf = tmp_path / "fonts.pdf"
@@ -385,9 +385,93 @@ def test_n37_font_headings_wrapped_over_two_lines_are_one_entry(tmp_path):
         c.showPage()
     c.save()
     m = _manuals_module()
-    backend, _n, toc, _texts, _t = m._open_pdf(pdf)
+    backend, _n, toc, _texts, _t, _running = m._open_pdf(pdf)
     assert backend == "pymupdf+font-headings"
     assert toc == [(2, "4.10 Notes on the measurement of the bridge capacity", 1), (2, "4.11 Settings", 2)], toc
+
+
+def _beckhoff_like_pdf(path: Path, bookmarks: bool) -> None:
+    """A manual laid out like the Beckhoff ones (EL3356 4.8.0): the running header is the current SECTION title
+    (it changes), on some pages a section heading sits on the header's baseline; the footer alternates between
+    '<page> Version: 4.8.0 EL3356-00x0' and 'EL3356-00x0 Version: 4.8.0 <page>'; a CoE table continues over six
+    pages, each starting with the same table header row; every page starts its body on the same line."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    sections = ["Product overview", "Product overview", "Signal flow diagram", "Signal flow diagram", "Commissioning",
+                "Commissioning", "Object description", "Object description", "Object description", "Object description",
+                "Object description", "Object description"]
+    c = canvas.Canvas(str(path), pagesize=A4)
+    for i, sec in enumerate(sections):
+        if bookmarks:
+            c.bookmarkPage(f"p{i}")
+            c.addOutlineEntry(f"{i + 1} {sec}", f"p{i}", level=0)
+        c.setFont("Helvetica", 8)
+        c.drawString(56, 812, f"| {sec}")                                  # running header: the section title
+        if i in (0, 2, 4, 6):                                               # a heading on the header's baseline
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(200, 812, f"{i // 2 + 1}.{i % 2 + 1} {sec}")
+        if 6 <= i:                                                          # the CoE table, continued
+            c.setFont("Helvetica", 10)
+            c.drawString(56, 760, "Index (hex) Name Meaning Data type Flags Default")
+            for k in range(1, 20):
+                c.drawString(56, 760 - 14 * k, f"8000:{k + i * 20:02X} Setting {k} of object {i} UINT16 RW 0x0000")
+        else:
+            c.setFont("Helvetica", 10)
+            for k in range(20):
+                c.drawString(56, 760 - 14 * k, f"Body of page {i + 1}, line {k}: strain gauge bridge value {k * 7 + i}")
+        c.setFont("Helvetica", 8)
+        if i % 2:
+            c.drawString(56, 30, f"{i + 50} Version: 4.8.0 EL3356-00x0")    # the page number comes first …
+        else:
+            c.drawString(380, 30, f"EL3356-00x0 Version: 4.8.0 {i + 50}")   # … or last
+        c.showPage()
+    c.save()
+
+
+@pytest.mark.parametrize("backend", ["pypdf", "pymupdf"])
+def test_n37_n66_running_headers_by_position_not_by_repeated_text(tmp_path, monkeypatch, backend):
+    """0.8.9 retest: N37 — the section-title header ('| Signal flow diagram4.2.2 Signal flow diagram', TOC '1.1
+    Product overview| Product overview') and the footer whose page number comes first ('56 Version: 4.8.0
+    EL3356-00x0') stayed in the text; N66 — real table header rows ('Index (hex) Name Meaning …') were removed.
+    Both came from finding headers by repeated TEXT; they are found by their PLACE now."""
+    pytest.importorskip("reportlab")
+    if backend == "pypdf":
+        pytest.importorskip("pypdf")
+        monkeypatch.setitem(sys.modules, "pymupdf", None)               # import pymupdf -> ImportError
+        monkeypatch.setitem(sys.modules, "fitz", None)
+    else:
+        pytest.importorskip("pymupdf", exc_type=ImportError)
+    m = _manuals_module()
+    pdf = tmp_path / "EL3356.pdf"
+    _beckhoff_like_pdf(pdf, bookmarks=(backend == "pypdf"))
+    used, n, toc, texts, _title, running = m._open_pdf(pdf)
+    assert used.startswith(backend) and n == 12 and running is not None and running >= 24
+    for i, t in enumerate(texts):
+        assert "| " not in t and "Version: 4.8.0" not in t and "EL3356-00x0" not in t, (i, t[:200])
+        assert ("Body of page" in t) or ("8000:" in t)
+    assert "Body of page 1, line 0" in texts[0]                            # the body's first line stays
+    assert "2.1 Signal flow diagram" in texts[2]                           # the heading on the header's baseline stays
+    hdr = "Index (hex) Name Meaning Data type Flags Default"
+    assert all(hdr in [ln.strip() for ln in texts[i].splitlines()] for i in range(6, 12)), texts[6][:300]
+    if backend == "pymupdf":                                               # font headings: no header glued in
+        titles = [t for _lvl, t, _pg in toc]
+        assert "1.1 Product overview" in titles and "2.1 Signal flow diagram" in titles
+        assert not any("|" in t for t in titles), titles
+    # the old text-repetition rule removed the table header row (it repeats at the page top on 6 of 12 pages)
+    old_out, _heads = m._strip_running([t for t in texts], set())
+    assert not old_out[7].lstrip().startswith("Index (hex)")
+
+
+def test_n37_fallback_page_number_may_come_first():
+    """The text-repetition fallback (a backend without positions): a footer whose page number is the FIRST number
+    ('56 Version: 4.8.0 …') is a page number too — only the last one counted before."""
+    m = _manuals_module()
+    body = lambda i: "\n".join(f"line {k} of page {i}: value {k * i + 7}" for k in range(8))  # noqa: E731
+    pages = [f"Header text\n{body(i)}\n{i + 50} Version: 4.8.0 EL3356-00x0" for i in range(8)]
+    out, heads = m._strip_running(pages, set())
+    assert "# version: #.#.# el#-#x#" in heads and all("Version: 4.8.0" not in t for t in out)
+    assert m._page_number_like([(0, (56, 4, 8, 0)), (1, (57, 4, 8, 0)), (2, (58, 4, 8, 0))], 1)
+    assert not m._page_number_like([(0, (3, 9)), (1, (5, 9)), (2, (8, 9))], 1)          # 'Table 3 of 9' …
 
 
 # ---------------------------------------------------------------------------------------------- builder stubs

@@ -97,13 +97,13 @@ def test_launch_main_installs_once_then_skips(tmp_path, monkeypatch):
     def fake_run_quiet(cmd, **kw):
         calls.append(cmd)
         if cmd[1:3] == ["-m", "venv"]:
-            vp = launch.venv_python(venv)
+            vp = launch.venv_python(Path(cmd[3]))          # the build folder beside the venv (N46)
             vp.parent.mkdir(parents=True, exist_ok=True)
             vp.write_text("")
         return 0
 
     monkeypatch.setattr(launch, "_run_quiet", fake_run_quiet)
-    monkeypatch.setattr(launch, "venv_ok", lambda v: launch.venv_python(v).exists())
+    monkeypatch.setattr(launch, "venv_health", lambda v, timeout_s=60: "ok" if launch.venv_python(v).exists() else "unusable")
     executed: list[tuple] = []
     monkeypatch.setattr(launch, "exec_server", lambda vp, args, env: executed.append((vp, args, env)) or 0)
     monkeypatch.setenv("TCMCP_MODE", "${user_config.mode}")
@@ -333,3 +333,76 @@ def test_mcpb_ships_the_docs_skill_builders_and_stub():
     names = {a for _src, a in mcpb_build.bundle_members()}
     for f in ("kb_docs.py", "builders/infosys_local.py", "builders/manuals_db.py", "builders/stub.py"):
         assert f"server/src/skills/twincat-docs/{f}" in names
+
+
+def _launch_env(tmp_path, monkeypatch, health):
+    script, src = _fake_src(tmp_path, "plugin")
+    venv = tmp_path / "venv"
+    calls: list[list[str]] = []
+
+    def fake_run_quiet(cmd, **kw):
+        calls.append(cmd)
+        if cmd[1:3] == ["-m", "venv"]:
+            vp = launch.venv_python(Path(cmd[3]))
+            vp.parent.mkdir(parents=True, exist_ok=True)
+            vp.write_text("new")
+        return 0
+    monkeypatch.setattr(launch, "_run_quiet", fake_run_quiet)
+    monkeypatch.setattr(launch, "venv_health", health)
+    executed: list[tuple] = []
+    monkeypatch.setattr(launch, "exec_server", lambda vp, args, env: executed.append((vp, args, env)) or 0)
+    return src, venv, calls, executed
+
+
+def test_n46_a_live_venv_is_never_deleted_the_new_one_is_built_beside_it(tmp_path, monkeypatch):
+    """0.8.9 review N46: an 'unusable' venv (built on 3.10/3.11) was rmtree'd while another Claude window still ran
+    the server from it; on Windows the locked files stayed, `python -m venv` failed and every start repeated it."""
+    import os as _os
+    src, venv, calls, executed = _launch_env(
+        tmp_path, monkeypatch,
+        lambda v, timeout_s=60: ("unusable" if launch.venv_python(v).read_text() == "old" else "ok")
+        if launch.venv_python(v).exists() else "unusable")
+    vp = launch.venv_python(venv)
+    vp.parent.mkdir(parents=True)
+    vp.write_text("old")                                  # an older Python's venv, still running in another window
+    (venv / "in-use.pyd").write_text("locked")
+    real_rename = _os.rename
+
+    def busy(a, b):
+        if Path(a) == venv:
+            raise PermissionError(32, "being used by another process")
+        return real_rename(a, b)
+    monkeypatch.setattr(launch.os, "rename", busy)
+    assert launch.main(["--src", str(src), "--venv", str(venv), "--no-run"]) == 0
+    assert (venv / "in-use.pyd").read_text() == "locked" and vp.read_text() == "old"     # untouched
+    act = launch.active_venv(venv)
+    assert act != venv and act.name.startswith("venv.build-") and (act / launch.PENDING).is_file()
+    assert launch.venv_python(act).read_text() == "new" and (act / launch.STAMP_NAME).is_file()
+    # the server meanwhile runs from the new build, and nothing is rebuilt
+    calls.clear()
+    assert launch.main(["--src", str(src), "--venv", str(venv)]) == 0
+    assert executed[-1][0] == launch.venv_python(act) and not any(c[1:3] == ["-m", "venv"] for c in calls)
+    # the other window closed: the next start puts the build in place and removes the old venv
+    monkeypatch.setattr(launch.os, "rename", real_rename)
+    assert launch.main(["--src", str(src), "--venv", str(venv)]) == 0
+    assert launch.venv_python(venv).read_text() == "new" and not (venv / "in-use.pyd").exists()
+    assert executed[-1][0] == launch.venv_python(venv)
+    assert not list(tmp_path.glob("venv.build-*")) and not list(tmp_path.glob("venv.old-*"))
+
+
+def test_n46_a_health_check_timeout_is_not_a_broken_venv(tmp_path, monkeypatch):
+    """A cold start or a virus scanner made the 60 s check time out — the venv was then declared broken and rebuilt."""
+    import subprocess as _sp
+    src, venv, calls, executed = _launch_env(tmp_path, monkeypatch, launch.venv_health)
+    vp = launch.venv_python(venv)
+    vp.parent.mkdir(parents=True)
+    vp.write_text("ok")
+    launch.write_stamp(venv, launch.make_stamp(src, sys.executable))
+
+    def slow(*a, **kw):
+        raise _sp.TimeoutExpired(a[0] if a else "python", 60)
+    monkeypatch.setattr(launch.subprocess, "call", slow)
+    assert launch.venv_health(venv) == "unknown"
+    assert launch.main(["--src", str(src), "--venv", str(venv), "--python", sys.executable]) == 0
+    assert executed and executed[-1][0] == vp and not any(c[1:3] == ["-m", "venv"] for c in calls)
+    assert vp.read_text() == "ok"

@@ -219,7 +219,7 @@ def ro_uri(db: Path) -> str:
 SCHEMA_VERSION = "2"
 HEARTBEAT_STALE_S = 120
 MANUALS_HEARTBEAT_STALE_S = 300
-MANUALS_TEXT_FORMAT = "2"          # manuals_db.py TEXT_FORMAT: page text / toc rules
+MANUALS_TEXT_FORMAT = "3"          # manuals_db.py TEXT_FORMAT: page text / toc rules
 
 
 def _meta_of(path: Path) -> dict[str, str]:
@@ -396,6 +396,10 @@ class Ctx:
                            "(the twincat server's kb_status shows the one it uses)")
         con = sqlite3.connect(ro_uri(p), uri=True, timeout=5)
         con.row_factory = sqlite3.Row
+        try:   # N65: the index's own term statistics (in memory, temp schema) — before the connection turns query-only
+            con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.fts_vocab USING fts5vocab(main, 'fts', 'row')")
+        except sqlite3.Error:
+            pass
         con.execute("PRAGMA query_only = 1")
         con.create_function("fnm", 2, lambda s, pat: int(fnmatch.fnmatch((s or "").lower(), (pat or "").lower())),
                             deterministic=True)
@@ -467,30 +471,124 @@ def natural(q: str) -> bool:
     return not _FTS_SYNTAX.search(q) and bool(re.fullmatch(r"[\w\s\-./,?!']+", q))
 
 
+# words that say nothing about a page: never searched alone, never a prefix (N65)
+STOP_WORDS = frozenset("""
+a an and are as at be but by can do does for from has have how i if in into is it its no not of on or so such that
+the their then there these this to was were what when where which while who why will with without you your
+der die das den dem des ein eine einer eines einem und oder ist sind wie was wann wo warum mit von zu zum zur im in
+am an auf aus bei für nicht kein keine ich es er sie wir ihr
+""".split())
+COMMON_SHARE = 0.2          # a word on more than this share of the pages does not pick a page in the some-words tier
+
+
+def _fold(w: str) -> str:
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", w.lower()) if not unicodedata.combining(c))
+
+
+def _term_df(con: sqlite3.Connection, word: str, prefix: bool) -> int | None:
+    """Pages holding the word (all its tokens: 'T_AmsNetId' is 't' + 'amsnetid'), from the index's own vocabulary;
+    prefix: whether any term starts with it. None when the vocabulary is not available."""
+    toks = [t for t in re.split(r"[^\w]|_", _fold(word)) if t]
+    if not toks:
+        return 0
+    try:
+        dfs = []
+        for i, t in enumerate(toks):
+            if prefix and i == len(toks) - 1:
+                r = con.execute("SELECT MAX(doc) FROM temp.fts_vocab WHERE term >= ? AND term < ?",
+                                (t, t + "\U0010ffff")).fetchone()
+            else:
+                r = con.execute("SELECT doc FROM temp.fts_vocab WHERE term = ?", (t,)).fetchone()
+            dfs.append(int(r[0] or 0) if r else 0)
+        return min(dfs)
+    except sqlite3.Error:
+        return None
+
+
+def _page_count(con: sqlite3.Connection) -> int:
+    try:
+        return int(con.execute("SELECT COUNT(*) FROM fts").fetchone()[0])
+    except sqlite3.Error:
+        return 0
+
+
 def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, extra: list[Any],
-                 limit: int) -> tuple[list[sqlite3.Row], int, str, str]:
-    """N36: a question in words (`LED diagnostics`, `microSD boot card`) that no page answers with every word falls
-    back as kb_search does: every word → every word as a prefix → some of the words (best first). Anything with
-    FTS5 syntax or code punctuation runs as written (run_fts, with the phrase retry). -> (rows, total, mode, expr)."""
+                 limit: int, title_key: str | None = None) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
+    """N36/N65: a question in words falls back in steps, and only on words that can pick a page:
+      1. every word as written (stop words included: a precise query stays precise);
+      2. every informative word that occurs in the index — stop words, 1-2 letter words and words on no page dropped;
+      3. those words as prefixes (a word is kept when some term starts with it: 'Diagnos' -> diagnostics);
+      4. some of them (OR) — without words that are on more than 20 % of the pages.
+    Nothing informative left: no hits (never 49,096 'some words' hits for 'how to zzqxv a the'). A page whose title
+    is one of the query words ranks first ('ADSREAD xyzqq' -> ADSREAD before AdsReadDeviceInfo). FTS5 syntax or code
+    punctuation runs as written (run_fts, with the phrase retry).
+    -> (rows, total, mode, expression, info: words used / ignored with the reason)."""
     q = clean(query).strip()
     if not natural(q):
         rows, mode, expr = run_fts(con, sql, query, extra + [limit])
-        return rows, con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr
+        return rows, con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr, {}
     words = [w for w in re.findall(r"[^\W_]+(?:_[^\W_]+)*", q)]
     if not words:
         raise Err("empty_query", f"the query {query!r} has no searchable word (punctuation is not indexed)")
 
     def ph(w: str) -> str:
         return '"' + w.replace('"', '""') + '"'
-    tiers = [("all words", " ".join(ph(w) for w in words)),
-             ("all words (as prefixes)", " ".join(ph(w) + "*" for w in words))]
-    if len(words) > 1:
-        tiers.append(("some words (no page has all of them)", " OR ".join(ph(w) + "*" for w in words)))
-    for label, expr in tiers:
-        rows = con.execute(sql, [expr, *extra, limit]).fetchall()
+    ignored: dict[str, str] = {}
+    informative = []
+    for w in words:
+        if _fold(w) in STOP_WORDS:
+            ignored[w] = "stop word"
+        elif len(w) < 3 and not w.isdigit():
+            ignored[w] = "shorter than 3 letters"
+        else:
+            informative.append(w)
+    pref = []                                  # informative words some term of the index starts with
+    for w in informative:
+        df = _term_df(con, w, True)
+        if df is None or df > 0:
+            pref.append(w)
+        else:
+            ignored[w] = "on no page"
+    n_pages = _page_count(con)
+    common = {w for w in pref if n_pages and (_term_df(con, w, False) or 0) > COMMON_SHARE * n_pages}
+    tiers = [("all words", " ".join(ph(w) for w in words), words)]
+    if pref and pref != words:                 # without the stop words / words on no page, exactly as written
+        tiers.append(("all words found in the index", " ".join(ph(w) for w in pref), pref))
+    if pref:
+        tiers.append(("all words (as prefixes)", " ".join(ph(w) + "*" for w in pref), pref))
+    if len(pref) > 1:
+        some = [w for w in pref if w not in common] or pref     # a word on most pages picks nothing — unless all are
+        tiers.append(("some words (no page has all of them)", " OR ".join(ph(w) + "*" for w in some), some))
+    lw = {w.lower() for w in words}
+    for label, expr, used in tiers:
+        fetch = min(max(limit * 3, limit), 150) if title_key else limit
+        rows = con.execute(sql, [expr, *extra, fetch]).fetchall()
         if rows:
-            return rows, con.execute(count_sql, [expr, *extra]).fetchone()[0], label, expr
-    return [], 0, tiers[-1][0], tiers[-1][1]
+            if title_key:     # a page titled exactly like a query word first, bm25 order otherwise
+                rows = sorted(rows, key=lambda r: 0 if str(r[title_key] or "").lower() in lw else 1)
+            info: dict[str, Any] = {"words_used": used}
+            if ignored:
+                info["words_ignored"] = ignored
+            if label.startswith("some words") and common and set(used) != set(pref):
+                info["words_too_common"] = sorted(common)
+            return rows[:limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], label, expr, info
+    info = {"words_used": []}
+    if ignored:
+        info["words_ignored"] = ignored
+    return [], 0, tiers[-1][0], tiers[-1][1], info
+
+
+def matched_words(con: sqlite3.Connection, rowid: int, words: list[str]) -> list[str]:
+    """Which of the words (as prefixes) the page with this fts rowid holds — shown per hit in the some-words tier."""
+    out = []
+    for w in words:
+        try:
+            if con.execute("SELECT 1 FROM fts WHERE rowid = ? AND fts MATCH ?", (rowid, '"' + w.replace('"', '""') + '"*')).fetchone():
+                out.append(w)
+        except sqlite3.Error:
+            pass
+    return out
 
 
 def run_fts(con: sqlite3.Connection, sql: str, query: str, extra: list[Any]) -> tuple[list[sqlite3.Row], str, str]:
@@ -639,17 +737,20 @@ def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     _check_book_glob(con, a["book"])
     where = "fts MATCH ?" + (" AND fnm(book, ?)" if a["book"] else "")
     extra = [a["book"]] if a["book"] else []
-    rows, total, mode, expr = search_tiers(
-        con, "SELECT book, pid, title, snippet(fts, 1, '[', ']', '…', 18) AS s, "
+    rows, total, mode, expr, info = search_tiers(
+        con, "SELECT fts.rowid AS rid, book, pid, title, snippet(fts, 1, '[', ']', '…', 18) AS s, "
              f"bm25(fts, 8.0, 1.0) AS r FROM fts WHERE {where} ORDER BY r LIMIT ?",
-        f"SELECT COUNT(*) FROM fts WHERE {where}", a["query"], extra, a["limit"])
+        f"SELECT COUNT(*) FROM fts WHERE {where}", a["query"], extra, a["limit"], title_key="title")
     items = []
     for r in rows:
         v = con.execute("SELECT version FROM page WHERE book = ? AND pid = ?", (r["book"], r["pid"])).fetchone()
-        items.append({"ref": f"{r['book']}/{r['pid']}", "title": r["title"], "book": r["book"],
-                      "version": (v[0] if v else None) or None, "excerpt": one_line(r["s"]),
-                      "url": WEB.format(lcid=ctx.lcid(), book=r["book"], pid=r["pid"]), "score": float(f"{-r['r']:.4g}")})
-    out: dict[str, Any] = {"query": a["query"], "query_mode": mode, "count": len(items), "total": total,
+        it = {"ref": f"{r['book']}/{r['pid']}", "title": r["title"], "book": r["book"],
+              "version": (v[0] if v else None) or None, "excerpt": one_line(r["s"]),
+              "url": WEB.format(lcid=ctx.lcid(), book=r["book"], pid=r["pid"]), "score": float(f"{-r['r']:.4g}")}
+        if mode.startswith("some words"):
+            it["matched"] = matched_words(con, r["rid"], info.get("words_used") or [])
+        items.append(it)
+    out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info, "count": len(items), "total": total,
                            "truncated": total > len(items), "items": items, "source": ctx.source("infosys")}
     if not items:
         out["hint"] = ("no page contains these words" + (f" in books {a['book']!r}" if a["book"] else "")
@@ -803,13 +904,18 @@ def cmd_manual_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
             _one_doc(con, a["doc"])                    # raises not_found with the list
         where += f" AND doc IN ({','.join('?' * len(ids))})"
         extra = ids
-    rows, total, mode, expr = search_tiers(
-        con, "SELECT doc, page, section, snippet(fts, 0, '[', ']', '…', 16) AS s, "
+    rows, total, mode, expr, info = search_tiers(
+        con, "SELECT fts.rowid AS rid, doc, page, section, snippet(fts, 0, '[', ']', '…', 16) AS s, "
              f"bm25(fts, 1.0, 4.0) AS r FROM fts WHERE {where} ORDER BY r LIMIT ?",
         f"SELECT COUNT(*) FROM fts WHERE {where}", a["query"], extra, a["limit"])
-    items = [{"doc": names.get(r["doc"], r["doc"]), "doc_id": r["doc"], "page": r["page"], "section": r["section"] or None,
-              "excerpt": one_line(r["s"]), "score": float(f"{-r['r']:.4g}")} for r in rows]
-    out: dict[str, Any] = {"query": a["query"], "query_mode": mode, "count": len(items), "total": total,
+    items = []
+    for r in rows:
+        it = {"doc": names.get(r["doc"], r["doc"]), "doc_id": r["doc"], "page": r["page"], "section": r["section"] or None,
+              "excerpt": one_line(r["s"]), "score": float(f"{-r['r']:.4g}")}
+        if mode.startswith("some words"):
+            it["matched"] = matched_words(con, r["rid"], info.get("words_used") or [])
+        items.append(it)
+    out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info, "count": len(items), "total": total,
                            "truncated": total > len(items), "items": items, "source": _msource(ctx)}
     if not items:
         out["hint"] = "no indexed manual page contains these words; a manual that is not indexed yet: " + BUILD_MANUALS
@@ -821,12 +927,20 @@ def cmd_manual_product(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     code = a["code"].strip().upper()
     if not code:
         raise Err("bad_param", "code is empty (e.g. EL3102, CX9020)")
-    rows = con.execute("SELECT d.name, p.doc, GROUP_CONCAT(p.page) AS pages, SUM(p.n) AS hits FROM product p "
-                       "JOIN doc d ON d.id = p.doc WHERE p.code = ? OR p.code LIKE ? ESCAPE '\\' GROUP BY p.doc "
-                       "ORDER BY hits DESC LIMIT ?", (code, like_escape(code) + "-%", a["limit"])).fetchall()
+    def q(c: str) -> list[sqlite3.Row]:
+        return con.execute("SELECT d.name, p.doc, GROUP_CONCAT(p.page) AS pages, SUM(p.n) AS hits FROM product p "
+                           "JOIN doc d ON d.id = p.doc WHERE p.code = ? OR p.code LIKE ? ESCAPE '\\' GROUP BY p.doc "
+                           "ORDER BY hits DESC LIMIT ?", (c, like_escape(c) + "-%", a["limit"])).fetchall()
+    rows = q(code)
+    out: dict[str, Any] = {"code": code}
+    base = re.fullmatch(r"([A-Z]{1,4}\d{3,5})-\d{4}", code)
+    if not rows and base:            # N67: a variant no manual names -> the base product the manual is written for
+        rows = q(base.group(1))
+        if rows:
+            out["matched_as"] = f"base product {base.group(1)} (no manual names the variant {code})"
     items = [{"doc": r["name"], "doc_id": r["doc"], "mentions": r["hits"],
               "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})} for r in rows]
-    out: dict[str, Any] = {"code": code, "count": len(items), "items": items, "source": _msource(ctx)}
+    out.update({"count": len(items), "items": items, "source": _msource(ctx)})
     if not items:
         out["hint"] = f"{code} is in no indexed manual — " + BUILD_MANUALS
     return out
