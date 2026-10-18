@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -129,12 +130,16 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     building = db.with_name(db.name + ".building")
     t0 = time.time()
+    running: dict = {}
     while time.time() - t0 < 60:
         st = state(kb)
         if st.get("rebuild", {}).get("pages_done", 0) >= 2000:
+            running = st                     # the state seen while it ran (a fast runner may finish soon after)
             break
         time.sleep(0.2)
-    running = state(kb)
+    if hasattr(signal, "SIGSTOP"):
+        os.kill(proc.pid, signal.SIGSTOP)    # hold the build where it is (its lock stays fresh for 120 s)
+    assert running, "the rebuild never reported progress"
     assert running["rebuild"]["state"] == "running" and running["state"] == "outdated"
     assert "RUNNING" in running["message"] and running["pages"] == 8          # the complete index is still the one in use
     # a second build while one runs is refused
@@ -261,6 +266,7 @@ def _manuals_module():
     return mod
 
 
+@needs312
 def test_n37_running_headers_and_wrapped_headings(tmp_path):
     """N37: running headers / footers in the page text, glued to a heading ('Calibration and compensation4.4
     Calibration'); a heading wrapped over two lines became a level-1 chapter ('capacity')."""
@@ -292,6 +298,7 @@ def test_n37_running_headers_and_wrapped_headings(tmp_path):
     assert m._mend_toc(unnumbered) == unnumbered                       # only manuals that number their chapters
 
 
+@needs312
 def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
     pytest.importorskip("reportlab")
     pytest.importorskip("pypdf")
@@ -345,6 +352,7 @@ def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
     con.close()
 
 
+@needs312
 def test_n37_font_headings_wrapped_over_two_lines_are_one_entry(tmp_path):
     """PDFs without bookmarks (PyMuPDF font headings): the second line of a wrapped heading was a level-1 chapter."""
     pytest.importorskip("reportlab")
