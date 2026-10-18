@@ -500,21 +500,22 @@ class AdsBackend:
         return out
 
     def leaf_values(self, root: SymbolEntry, leaves: list[Leaf], port: int | None = None) -> dict[str, Any]:
-        """Decode every leaf from one raw read of the root symbol → {path: value}."""
+        """Decode every leaf of the root symbol → {path: value}. Read through _RootReader like ads_dump (N39): bounded
+        chunks, only up to the last byte a leaf needs — a big root is never one ADS request (1802 out of memory)."""
         c = self.conn(port)
         ts = self.typesystem(False, port)
-        try:
-            raw = bytes(c.read(root.index_group, root.index_offset, ctypes.c_ubyte * max(root.size, 1), return_ctypes=True, check_length=False))
-        except Exception as exc:  # noqa: BLE001
-            raise AdsError(f"read {root.name!r}: {_fmt_exc(exc)}") from exc
+        need = max((lf.offset + lf.size for lf in leaves if lf.size > 0), default=0)
+        reader = _RootReader(c, root, lambda: False, need_end=need or None)
         out: dict[str, Any] = {}
         for lf in leaves:
-            if lf.size <= 0 or lf.offset + lf.size > len(raw):
+            if lf.size <= 0 or lf.offset + lf.size > max(root.size, 1):
                 continue
-            if ts is not None:
-                out[lf.path] = ts.decode_leaf(raw, lf)
-            else:
-                out[lf.path] = TypeSystem._decode_scalar(raw, lf.offset, lf.type, None, None)
+            try:
+                raw = reader.get(lf.offset, lf.size)
+            except _ReadFailed as exc:
+                raise AdsError(f"read {root.name!r}: {exc}") from exc
+            z = _at_zero(lf)
+            out[lf.path] = ts.decode_leaf(raw, z) if ts is not None else TypeSystem._decode_scalar(raw, 0, lf.type, None, None)
         return out
 
     def read_full(self, name: str, max_bytes: int | None = None, port: int | None = None) -> dict[str, Any]:
@@ -524,10 +525,11 @@ class AdsBackend:
         limit = max_bytes or self.cfg.max_file_bytes
         if s.size > limit:
             raise AdsError(f"{s.name} is {s.size} bytes; raise max_bytes or read members individually")
-        try:
-            raw = bytes(c.read(s.index_group, s.index_offset, ctypes.c_ubyte * max(s.size, 1), return_ctypes=True, check_length=False))
-        except Exception as exc:  # noqa: BLE001
-            raise AdsError(f"read {s.name!r} ({s.size} B): {_fmt_exc(exc)}") from exc
+        reader = _RootReader(c, s, lambda: False)
+        try:                                       # N39: in bounded chunks, never one request for a big variable
+            raw = b"".join(reader.get(o, min(_DUMP_CHUNK, max(s.size, 1) - o)) for o in range(0, max(s.size, 1), _DUMP_CHUNK))
+        except _ReadFailed as exc:
+            raise AdsError(f"read {s.name!r} ({s.size} B): {exc}") from exc
         ts = self.typesystem(False, port)
         out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
         if ts is not None and ts.get(s.type) is not None:

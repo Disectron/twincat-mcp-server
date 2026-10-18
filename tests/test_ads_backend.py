@@ -333,6 +333,23 @@ def test_n39_n49_big_root_is_read_in_pieces_and_an_unreadable_root_is_named(ads,
     assert vals["GVL_Bad.nX"][3].startswith("NOT READ") and vals["GVL_Bad.nX"][2] == ""
 
 
+def test_n39_ads_leaves_and_read_full_read_big_symbols_in_pieces(ads, monkeypatch):
+    """N39 had the same root in ads_leaves (leaf_values) and the full read: one ADS request for the whole symbol."""
+    from tests.fake_ads import FakeConnection, _dt
+    blk = _dt("ST_Blk", "", 80, subs=[_dt("sName", "STRING(79)", 80, 0, 30)])
+    arr = _dt("ARRAY [1..4000] OF ST_Blk", "ST_Blk", 320_000, dims=[(1, 4000)])
+    s79 = _dt("STRING(79)", "", 80, dtype=30)
+    image = b"".join(f"blk{i}".encode().ljust(80, b"\x00") for i in range(1, 4001))
+    _add_symbols(monkeypatch, [("GVL_Big.aBlk", arr.name, 320_000, image)], [blk, arr, s79])
+    FakeConnection.max_read_bytes = 300_000
+    s, lv = ads.leaves("GVL_Big.aBlk", 10_000)
+    vals = ads.leaf_values(s, lv)
+    assert vals["GVL_Big.aBlk[3277].sName"] == "blk3277" and vals["GVL_Big.aBlk[4000].sName"] == "blk4000"
+    full = ads.read_full("GVL_Big.aBlk", max_bytes=1_000_000)
+    assert full["size"] == 320_000
+    assert max(n for name, _o, n in FakeConnection.read_log if name == "GVL_Big.aBlk") <= 256 * 1024
+
+
 def test_n47_budget_holds_per_row_and_a_huge_leaf_is_never_read_whole(ads, tmp_path, monkeypatch):
     """N47: the budget was checked at root start and every 256 leaves → < 256 big rows, or one huge leaf (an 8 MiB
     ring buffer) was read into RAM and written whole."""
