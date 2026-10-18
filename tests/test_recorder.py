@@ -880,6 +880,80 @@ def test_python_block_silent_longer_than_the_horizon_does_not_hold_the_others(re
     assert footer["late_samples"] == 30 and footer["samples"] == 62, footer      # CC 0..290 came after nCycle 300
 
 
+def test_waiting_samples_cost_no_cpu(rec):
+    """Review: while samples waited for a slower block, the ingest thread polled its queue with a zero timeout — one
+    core at 100 % (1.00 s of CPU per second), the GIL taken from the ADS callbacks. It now waits for new input or for
+    the moment the horizon can move by time."""
+    st = _two_blocks(rec)
+    c = _conn()
+    for k in range(0, 31):
+        c.fire("MAIN.nCycle", k, ft(10 * k))              # the counter block is not here yet, not quiet yet either
+    time.sleep(0.05)
+    assert rec.recs[st["id"]]._pending_n > 0
+    t0, cpu0 = time.monotonic(), time.process_time()
+    time.sleep(0.3)
+    cpu = time.process_time() - cpu0
+    assert cpu < 0.1 * (time.monotonic() - t0) + 0.02, cpu
+    rec.stop(st["id"])
+
+
+def test_change_mode_a_late_stop_when_is_released_before_the_later_rows(rec, monkeypatch):
+    """Review: in change mode a block that had been quiet for silent_s no longer held the others back, so when its
+    stop_when change came late (ADS batching) the other block's rows past the end were in the file already — and the
+    footer no longer counted them. A quiet block still holds release back by the ADS bound (max_delay_ms + 50 ms of
+    PLC time behind 'now'); what comes later than that is counted (rows_after_window) and skipped by the readers."""
+    st = _two_blocks(rec, mode="change", stop_when=f"{CC} >= 5", max_delay_ms=100)
+    r = rec.recs[st["id"]]
+    r._silent_s = 0.05                                    # both blocks quiet almost at once
+    c = _conn()
+    c.fire(CC, 1, ft(0))
+    c.fire("MAIN.nCycle", 0, ft(0))
+    time.sleep(0.12)                                      # quiet now
+    for k in range(1, 8):
+        c.fire("MAIN.nCycle", k, ft(100 * k))             # up to 700 ms …
+    c.fire(CC, 5, ft(450))                                # … the stop_when change at 450 ms comes 'late' (within the bound)
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
+    out = rec.stop(st["id"])
+    lines = Path(out["file"]).read_text(encoding="utf-8").splitlines()
+    footer = json.loads(lines[-1])
+    rows = [json.loads(ln) for ln in lines if ln.startswith("[")]
+    assert footer["window_end_ms"] == 450.0 and max(r_[0] for r_ in rows) == 450.0, (footer, rows)
+    assert "rows_after_window" not in footer
+    # later than the bound: written before the end was known — counted
+    st = _two_blocks(rec, mode="change", stop_when=f"{CC} >= 5", max_delay_ms=0)
+    r = rec.recs[st["id"]]
+    r._silent_s = 0.05
+    c = _conn()                                           # this recording's own connection
+    c.fire(CC, 1, ft(0))
+    c.fire("MAIN.nCycle", 0, ft(0))
+    time.sleep(0.12)
+    for k in range(1, 8):
+        c.fire("MAIN.nCycle", k, ft(100 * k))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 9, timeout=3)      # all released after the bound
+    c.fire(CC, 5, ft(450))
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
+    out = rec.stop(st["id"])
+    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer["window_end_ms"] == 450.0 and footer["rows_after_window"] == 3, footer      # 500, 600, 700
+
+
+def test_poll_one_refused_symbol_does_not_cost_the_others_their_rows(rec):
+    """Review: one symbol the runtime refused on every cycle dropped the whole poll row — no symbol was recorded, the
+    only trace twenty error lines. The others are recorded; the refused one is counted per symbol and named."""
+    from tests.fake_ads import FakeConnection
+    FakeConnection.fail_reads = {"MAIN.bStart"}
+    st = rec.start(symbols=["MAIN.nCycle", "MAIN.bStart"], prefix=None, pattern=None, mode="poll", cycle_ms=5,
+                   duration_s=0.3, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None,
+                   max_symbols=50, cycle_counter=None)
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
+    out = rec.stop(st["id"])
+    lines = Path(out["file"]).read_text(encoding="utf-8").splitlines()
+    footer = json.loads(lines[-1])
+    rows = [json.loads(ln) for ln in lines if ln.startswith("[")]
+    assert len(rows) >= 10 and footer["poll_refused"]["MAIN.bStart"]["count"] >= 10, footer
+    assert "1802" in footer["poll_refused"]["MAIN.bStart"]["first_error"] and "MAIN.bStart" in footer["label_reason"]
+
+
 def test_readers_take_the_footer_window_as_the_recording(rec, monkeypatch):
     """Files written by 0.8.10's Python recorder could hold rows past window_end_ms: every reader takes the window
     the footer names (rec_verify counts what lies outside it)."""

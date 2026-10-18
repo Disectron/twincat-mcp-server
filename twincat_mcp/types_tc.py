@@ -79,6 +79,34 @@ class TcType:
         return self.name
 
 
+# TwinCAT STRING is single-byte text in Windows-1252 (WSTRING: UTF-16). One decoder and one encoder for every path —
+# ads_read, read_many, watch, the recorder, the dump, the writes (N91: pyads decoded STRING as UTF-8 and failed on 'ü',
+# and wrote 'ü' as two bytes; the dump used Latin-1, which differs from 1252 in 0x80–0x9F: '€' is 0x80 in the PLC)
+_CP1252_HOLES = frozenset({0x81, 0x8D, 0x8F, 0x90, 0x9D})   # bytes Windows-1252 leaves undefined: kept as Latin-1
+
+
+def plc_string(raw: bytes) -> str:
+    """A TwinCAT STRING's text: the bytes up to the first NUL, Windows-1252."""
+    b = bytes(raw).split(b"\x00", 1)[0]
+    try:
+        return b.decode("cp1252")
+    except UnicodeDecodeError:
+        return "".join(chr(x) if x in _CP1252_HOLES else bytes([x]).decode("cp1252") for x in b)
+
+
+def plc_string_bytes(text: str, size: int) -> bytes:
+    """The bytes of a STRING variable of `size` bytes (capacity size - 1, NUL-terminated): Windows-1252; a character
+    1252 cannot hold is refused, never replaced by '?'."""
+    try:
+        b = str(text).encode("cp1252")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{text!r}: {exc.object[exc.start:exc.end]!r} is not in the PLC's STRING character set "
+                         "(Windows-1252) — use a WSTRING for it") from None
+    if len(b) > size - 1:
+        raise ValueError(f"{text!r} is {len(b)} bytes; the STRING holds {size - 1}")
+    return b.ljust(size, b"\x00")
+
+
 def parse_type(type_str: str, size: int | None = None) -> TcType:
     """Resolve a TwinCAT type string. ``size`` (bytes, from symbol info) is
     used for enums and to size opaque structs."""

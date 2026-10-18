@@ -112,6 +112,9 @@ class AdsBackend:
         self._conns: dict[tuple[str | None, int], pyads.Connection] = {}
         self._symcache: dict[tuple[str | None, int], tuple[float, list[SymbolEntry], dict[str, SymbolEntry]]] = {}
         self._dtcache: dict[tuple[str | None, int], tuple[float, TypeSystem | None, str]] = {}
+        import weakref
+        # symbol handles per connection object, all of one symbol version (_get_handles)
+        self._handles: "weakref.WeakKeyDictionary[Any, dict[str, Any]]" = weakref.WeakKeyDictionary()
         self.net_id: str | None = cfg.ams_net_id
         self.ip: str | None = cfg.ip_address
         self.port: int = cfg.ams_port
@@ -554,7 +557,7 @@ class AdsBackend:
         limit = max_bytes or self.cfg.max_file_bytes
         if s.size > limit:
             raise AdsError(f"{s.name} is {s.size} bytes; raise max_bytes or read members individually")
-        reader = _RootReader(c, s, lambda: False)
+        reader = _RootReader(c, s, lambda: False, expect_version=self._table_version(c))
         try:                                       # N39: in bounded chunks, never one request for a big variable
             raw = b"".join(reader.get(o, min(_DUMP_CHUNK, max(s.size, 1) - o)) for o in range(0, max(s.size, 1), _DUMP_CHUNK))
         except _ReadFailed as exc:
@@ -769,7 +772,17 @@ class AdsBackend:
                 head = ("" if first else ",") + "\n" + json.dumps(r.name) + ": "
                 # bytes past the last one any leaf needs are never requested (a value that is not expanded needs
                 # only its head): an 8 MiB buffer costs one 64-byte read
-                reader = _RootReader(c, r, cancelled, need_end=max((x.offset + x.need for x in lv), default=0))
+                reader = _RootReader(c, r, cancelled, need_end=max((x.offset + x.need for x in lv), default=0),
+                                     expect_version=self._table_version(c))
+                # what the leaves after leaf k still need (N76): suffix bounds over the leaves that read anything
+                suf_lo, suf_hi = [0] * (len(lv) + 1), [0] * (len(lv) + 1)
+                lo_, hi_ = 1 << 62, -1
+                suf_lo[len(lv)], suf_hi[len(lv)] = lo_, hi_
+                for kk in range(len(lv) - 1, -1, -1):
+                    x = lv[kk]
+                    if x.size and x.need and 0 <= x.offset and x.offset + x.need <= reader.size:
+                        lo_, hi_ = min(lo_, x.offset), max(hi_, x.offset + x.need)
+                    suf_lo[kk], suf_hi[kk] = lo_, hi_
                 tree = _TreeStream(r.name)
                 c0, j0 = cw.n, jw.n
                 read_error: str | None = None
@@ -778,6 +791,13 @@ class AdsBackend:
                 # whether the root is readable is known before anything of it is written: its first bytes are read
                 # first (a root up to one chunk is then read completely — no later read, so no read error, can follow)
                 lead = next((x for x in lv if x.size and x.need), None)
+                # a leaf list that does not form the tree in order (it cannot be streamed) is known before anything is
+                # written: the root is reported like one that could not be read — within the limit (N76)
+                order = _tree_order_problem(r.name, [x.path for x in lv])
+                if order is not None:
+                    read_error_full = f"internal: the leaves of {r.name} are not in tree order ({order}) — not written"
+                    read_error = _err_text(read_error_full)
+                    lead = None
                 if lead is not None:
                     try:
                         reader.get(lead.offset, lead.need)
@@ -829,7 +849,7 @@ class AdsBackend:
                     # the endings still possible after this leaf: after the last one only the normal end; before it
                     # a cut — and a read error only while bytes of the root are still to be read
                     room = (res_done if k == len(lv) - 1 else
-                            res_cut if reader.all_read() else max(res_cut, res_err))
+                            res_cut if reader.covers(suf_lo[k + 1], suf_hi[k + 1]) else max(res_cut, res_err))
                     if cw.n + jw.n + blen(line) + len(head) + tree.size_after(cost, st) + room > max_total_bytes:
                         truncated = size_reason
                         if k == 0:
@@ -910,15 +930,34 @@ class AdsBackend:
 
     # ------------------------------------------------------------ read / write
     def _typed_read(self, c: pyads.Connection, s: SymbolEntry) -> tuple[T.TcType, Any]:
+        """One variable by its handle, the symbol version checked in the same request (_raw_many); bytes for an
+        opaque type, else the value as pyads gives it — STRING as the PLC's Windows-1252 text (N91: pyads decoded
+        UTF-8 and failed on 'ü'; the dump, the watch and the recorder already used one decoder, _ctype_value)."""
         tt = T.parse_type(s.type, s.size)
-        if tt.ctype is None or tt.opaque:
-            raw = bytes(c.read(s.index_group, s.index_offset, ctypes.c_ubyte * max(s.size, 1), return_ctypes=True, check_length=False))
-            return tt, raw
         try:
-            val = c.read_by_name(s.name, tt.ctype)
+            entries, got = self._raw_many(c, [(s, tt)])
+            e = entries[s.name]
+            if isinstance(e, str):
+                raise AdsError(f"read {s.name!r}: {e}")
+            s, tt = e
+            err, data = got[s.name]
+        except AdsError:
+            raise
+        except Exception:  # noqa: BLE001 — no sum commands: a fresh handle for this one read
+            try:
+                data, err = bytes(c.read_by_name(s.name, ctypes.c_ubyte * max(s.size, 1), return_ctypes=True)), 0
+            except pyads.ADSError as exc:
+                data, err = b"", int(exc.err_code or 1)
+            except Exception as exc:  # noqa: BLE001
+                raise AdsError(f"read {s.name!r} as {s.type}: {_fmt_exc(exc)}") from exc
+        if err:
+            raise AdsError(f"read {s.name!r} as {s.type}: {_fmt_exc(pyads.ADSError(err))}")
+        if tt.ctype is None or tt.opaque:
+            return tt, data
+        try:
+            return tt, _ctype_value(tt, data)
         except Exception as exc:  # noqa: BLE001
             raise AdsError(f"read {s.name!r} as {s.type}: {_fmt_exc(exc)}") from exc
-        return tt, val
 
     def read(self, name: str, expand_struct: bool = True, max_members: int = 200,
              port: int | None = None) -> dict[str, Any]:
@@ -999,28 +1038,139 @@ class AdsBackend:
             results.update(self.read_values(c, [(syms[n], tt) for n, tt in simple.items()]))
         return results
 
+    # ------------------------------------------------------------ access by name: handles + symbol version
+    # A variable is reached through a symbol handle (ADSIGRP_SYM_HNDBYNAME), never through an index group/offset kept
+    # from an earlier table: a handle names the variable, so a download or online change that moves it cannot make an
+    # access land on another variable — the runtime answers for the variable, or refuses the handle (0x710/0x711).
+    # Every sum read also reads the symbol version (0xF008) in the SAME request: values that belong to another
+    # version than the handles (and the symbol table whose types decode them) are never used — the table and the
+    # handles are renewed and the read is made again. pyads' read_list_by_name kept each name's address for the life
+    # of the connection, and a 2 s check of the table left a window: both read another variable's bytes with no error.
+    def _handle_cache(self, c: Any) -> dict[str, Any]:
+        hc = self._handles.get(c)
+        if hc is None:
+            hc = {"ver": None, "h": {}}
+            self._handles[c] = hc
+        return hc
+
+    def _drop_handles(self, c: Any) -> None:
+        """Forget (and release, best effort) every handle of this connection."""
+        hc = self._handles.pop(c, None)
+        if not hc or not hc["h"]:
+            return
+        hs = list(hc["h"].values())
+        try:
+            for k in range(0, len(hs), _SUM_MAX):
+                part = hs[k:k + _SUM_MAX]
+                payload = b"".join(struct.pack("<III", 0xF006, 0, 4) for _h in part) + b"".join(
+                    struct.pack("<I", h) for h in part)
+                c.read_write(0xF081, len(part), ctypes.c_uint32 * len(part), (ctypes.c_ubyte * len(payload))(*payload),
+                             ctypes.c_ubyte * len(payload), return_ctypes=True)
+        except Exception:  # noqa: BLE001 — handles of a runtime that restarted are gone anyway
+            pass
+
+    def _get_handles(self, c: Any, names: list[str], _depth: int = 0) -> tuple[int | None, dict[str, int], dict[str, int]]:
+        """(symbol version, {name: handle}, {name: ADS error}) — missing handles made in ONE sum read-write with the
+        symbol version read in the same request; all cached handles belong to one version (another version: all are
+        made again)."""
+        hc = self._handle_cache(c)
+        errors: dict[str, int] = {}
+        want = [n for n in dict.fromkeys(names) if n not in hc["h"]]
+        if want:
+            got = _sum_readwrite(c, [(ADSIGRP_SYM_VERSION, 0, 1, b"")]
+                                 + [(C.ADSIGRP_SYM_HNDBYNAME, 0, 4, n.encode("latin-1", "replace") + b"\x00")
+                                    for n in want])
+            verr, vb = got[0]
+            ver = vb[0] if not verr and vb else None
+            if hc["h"] and ver != hc["ver"] and _depth < 3:
+                fresh = [(n, (e, d)) for n, (e, d) in zip(want, got[1:]) if not e]
+                self._drop_handles(c)                    # the old handles are of another program version
+                hc = self._handle_cache(c)
+                for n, (_e, d) in fresh:
+                    hc["h"][n] = struct.unpack_from("<I", d, 0)[0]
+                hc["ver"] = ver
+                return self._get_handles(c, names, _depth + 1)
+            hc["ver"] = ver
+            for n, (err, data) in zip(want, got[1:]):
+                if err or len(data) < 4:
+                    errors[n] = err or 0x705
+                else:
+                    hc["h"][n] = struct.unpack_from("<I", data, 0)[0]
+        return hc["ver"], {n: hc["h"][n] for n in names if n in hc["h"]}, errors
+
+    def _table_version(self, c: Any) -> int | None:
+        """The symbol version of the symbol table this server decodes with (None: not readable / not loaded)."""
+        hit = self._symcache.get((c.ams_net_id, c.ams_net_port))
+        ident = hit[3] if hit and len(hit) > 3 else None
+        return ident[0] if ident else None
+
+    def _reresolve(self, c: Any, names: list[str]) -> dict[str, tuple["SymbolEntry", T.TcType] | str]:
+        """Each name in a freshly loaded symbol table: (entry, type), or why not."""
+        self.__dict__.setdefault("_symver", {}).pop((c.ams_net_id, c.ams_net_port), None)
+        _lst, idx = self.symbols_cached(True, c.ams_net_port)
+        out: dict[str, tuple[SymbolEntry, T.TcType] | str] = {}
+        for n in names:
+            s = idx.get(n.lower())
+            out[n] = (s, T.parse_type(s.type, s.size)) if s is not None else "no longer in the PLC program"
+        return out
+
+    def _raw_many(self, c: Any, items: list[tuple["SymbolEntry", T.TcType]]
+                  ) -> tuple[dict[str, tuple["SymbolEntry", T.TcType] | str], dict[str, tuple[int, bytes]]]:
+        """The bytes of each variable by its handle, the symbol version read in the same sum request. Values of
+        another version than the handles / the symbol table are never returned: renewed and read again (at most
+        twice more). -> ({name: (entry, type) it decodes with, or why not}, {name: (ADS error, bytes)})."""
+        names = [s.name for s, _t in items]
+        entries: dict[str, tuple[SymbolEntry, T.TcType] | str] = {s.name: (s, t) for s, t in items}
+        for attempt in range(3):
+            live = [n for n in names if isinstance(entries[n], tuple)]
+            ver, hs, herr = self._get_handles(c, live)
+            got = _sum_read(c, [(ADSIGRP_SYM_VERSION, 0, 1)]
+                            + [(0xF005, hs[n], max(entries[n][0].size, 1)) for n in live if n in hs])  # type: ignore[index]
+            verr, vb = got[0]
+            now = vb[0] if not verr and vb else None
+            codes = dict(zip([n for n in live if n in hs], got[1:]))
+            tv = self._table_version(c)
+            changed = ((ver is not None and now != ver) or (tv is not None and now is not None and tv != now)
+                       or any(e in _HANDLE_GONE for e, _d in codes.values())
+                       # a handle refused when made: the program changed — unless the table was just renewed and the
+                       # name is still in it (then the runtime simply does not resolve it: that item's error)
+                       or (attempt == 0 and any(e in _HANDLE_GONE for e in herr.values())))
+            if changed:
+                self._drop_handles(c)
+                entries = {**entries, **self._reresolve(c, names)}
+                continue
+            out = {n: codes[n] if n in codes else (herr.get(n, 0x710), b"") for n in live}
+            return entries, out
+        raise AdsError("the PLC program changed while reading (download / online change in progress) — read again")
+
     def read_values(self, c: pyads.Connection, items: list[tuple["SymbolEntry", T.TcType]],
                     decode: bool = True) -> dict[str, Any]:
-        """Values of simple symbols in ONE sum read (ADSIGRP_SUMUP_READ) at the addresses of this server's symbol
-        table, which follows the runtime's table identity. pyads's read_list_by_name keeps each name's address for
-        the life of the connection: after a download, an online change or a restart with another build it read the
-        old offsets — another variable's bytes, or an ADS error. A runtime without sum commands: one read per symbol
-        at the same address. An item the runtime refuses is {"error": …}, never decoded. decode=False: the raw value
-        (as pyads gives it) for callers that decode themselves (the recorder). -> {symbol name: value}."""
+        """Values of simple symbols in ONE sum read by their handles, the symbol version read in the same request
+        (_raw_many: a value of another program version is never decoded). A runtime without sum commands: a fresh
+        handle per symbol (pyads read by name). An item the runtime refuses is {"error": …}, never decoded.
+        decode=False: the raw value (as pyads gives it) for callers that decode themselves (the recorder).
+        -> {symbol name: value}."""
         out: dict[str, Any] = {}
         if not items:
             return out
         try:
-            got: list[tuple[int, bytes]] | None = _sum_read(c, [(s.index_group, s.index_offset, s.size) for s, _t in items])
+            entries, got = self._raw_many(c, items)
+        except AdsError:
+            raise
         except Exception:  # noqa: BLE001 — no sum commands on this runtime (ADS 1793 / 1794)
-            got = None
-        for j, (s, tt) in enumerate(items):
+            entries, got = {s.name: (s, t) for s, t in items}, None
+        for s0, _t0 in items:
+            e = entries.get(s0.name)
+            if isinstance(e, str):
+                out[s0.name] = {"error": f"{s0.name}: {e}"}
+                continue
+            s, tt = e  # type: ignore[misc]
             if got is not None:
-                err, data = got[j]
+                err, data = got[s.name]
             else:
                 try:
-                    data = bytes(c.read(s.index_group, s.index_offset, ctypes.c_ubyte * max(s.size, 1),
-                                        return_ctypes=True, check_length=False))
+                    # pyads by name with a type: a fresh handle for this one read (never a kept address)
+                    data = bytes(c.read_by_name(s.name, ctypes.c_ubyte * max(s.size, 1), return_ctypes=True))
                     err = 0
                 except pyads.ADSError as exc:
                     err, data = int(exc.err_code or 1), b""
@@ -1149,9 +1299,11 @@ class AdsBackend:
             value = self.enum_literal(s.type, value, port)
         try:
             enc = T.encode(tt, value)
+            chk = {"symbol": s, "tt": tt, "encoded": enc, "hex": None}
+            self._value_bytes(s, tt, chk)              # the exact bytes are known before anything is written
         except Exception as exc:  # noqa: BLE001
             raise AdsError(f"write {s.name!r}={value!r} as {s.type}: {_fmt_exc(exc)}") from exc
-        return {"symbol": s, "tt": tt, "encoded": enc, "hex": None}
+        return chk
 
     def write(self, name: str, value: Any, port: int | None = None) -> dict[str, Any]:
         c = self.conn(port)
@@ -1160,15 +1312,14 @@ class AdsBackend:
         before = self.read(name, expand_struct=False, port=port).get("value")
         if chk["hex"] is not None:
             data = bytes.fromhex(chk["hex"])
-            c.write(s.index_group, s.index_offset, (ctypes.c_ubyte * len(data))(*data), ctypes.c_ubyte * len(data))
+            self._write_by_handle(c, s, data)
             return {"name": s.name, "type": s.type, "before": before, "written_hex": chk["hex"]}
+        enc = chk["encoded"]
         try:
-            enc = chk["encoded"]
-            c.write_by_name(s.name, enc, tt.ctype)
-        except AdsError:
-            raise
+            data = self._value_bytes(s, tt, chk)       # the PLC's bytes (STRING: Windows-1252, N91)
         except Exception as exc:  # noqa: BLE001
             raise AdsError(f"write {s.name!r}={value!r} as {s.type}: {_fmt_exc(exc)}") from exc
+        self._write_by_handle(c, s, data)
         read_back = self.read(name, expand_struct=False, port=port).get("value")
         written = T.decode(tt, enc)
         out = {"name": s.name, "type": s.type, "before": before, "written": written, "read_back": read_back}
@@ -1177,6 +1328,22 @@ class AdsBackend:
                            "clears, or a variable the program assigns every cycle). The write itself was accepted.")
         return out
 
+    def _write_by_handle(self, c: Any, s: "SymbolEntry", data: bytes) -> None:
+        """Raw bytes into the variable by its handle — never at an index offset from a table that may be older than
+        the program (a handle names the variable; a refused handle is renewed once)."""
+        for attempt in range(2):
+            _ver, hs, herr = self._get_handles(c, [s.name])
+            if s.name not in hs:
+                raise AdsError(f"write {s.name!r}: no handle ({_fmt_exc(pyads.ADSError(herr.get(s.name, 0x710)))})")
+            try:
+                c.write(0xF005, hs[s.name], (ctypes.c_ubyte * len(data))(*data), ctypes.c_ubyte * len(data))
+                return
+            except pyads.ADSError as exc:
+                if attempt == 0 and int(exc.err_code or 0) in _HANDLE_GONE:
+                    self._drop_handles(c)
+                    continue
+                raise AdsError(f"write {s.name!r}: {_fmt_exc(exc)}") from exc
+
     @staticmethod
     def _value_bytes(s: "SymbolEntry", tt: T.TcType, chk: dict[str, Any]) -> bytes:
         """The exact bytes a write puts into the variable (what a sum-write sends)."""
@@ -1184,7 +1351,7 @@ class AdsBackend:
             return bytes.fromhex(chk["hex"])
         enc = chk["encoded"]
         if tt.kind == "string":
-            return enc.encode("latin-1", "replace")[: s.size - 1].ljust(s.size, b"\x00")
+            return T.plc_string_bytes(enc, s.size)
         if tt.kind == "wstring":
             return enc.encode("utf-16-le")[: s.size - 2].ljust(s.size, b"\x00")
         if tt.kind == "array":
@@ -1193,30 +1360,56 @@ class AdsBackend:
 
     def write_many(self, items: dict[str, Any], port: int | None = None) -> dict[str, Any]:
         """Pre-check every item (all refusals raised before anything is written), then ONE ADS sum-write
-        (ADSIGRP_SUMUP_WRITE): the runtime applies all sub-writes in one request, i.e. between the same two task
-        cycles — no cycle sees half of them. Falls back to sequential writes where sum commands are unsupported."""
+        (ADSIGRP_SUMUP_WRITE) by the variables' handles: the runtime applies all sub-writes in one request, i.e.
+        between the same two task cycles — no cycle sees half of them — and each lands on the variable it names, also
+        right after a download / online change (an index offset kept from an older table wrote another variable and
+        its read-back at the same offset confirmed it). Falls back to sequential writes where sum commands are
+        unsupported."""
         c = self.conn(port)
-        checks: list[tuple[str, Any, Any, T.TcType, dict[str, Any]]] = []
-        problems = {}
-        for name, value in items.items():
-            try:
-                chk = self.check_write(name, value, port)
-                checks.append((name, value, chk["symbol"], chk["tt"], chk))
-            except AdsError as exc:
-                problems[name] = str(exc)
-        if problems:
-            raise AdsError("nothing was written — " + "; ".join(f"{k}: {v}" for k, v in problems.items()))
+
+        def checks_for() -> list[tuple[str, Any, Any, T.TcType, dict[str, Any]]]:
+            out_: list[tuple[str, Any, Any, T.TcType, dict[str, Any]]] = []
+            problems = {}
+            for name, value in items.items():
+                try:
+                    chk = self.check_write(name, value, port)
+                    out_.append((name, value, chk["symbol"], chk["tt"], chk))
+                except AdsError as exc:
+                    problems[name] = str(exc)
+            if problems:
+                raise AdsError("nothing was written — " + "; ".join(f"{k}: {v}" for k, v in problems.items()))
+            return out_
+
+        checks = checks_for()
         before = self.read_many([s.name for _n, _v, s, _t, _c in checks], port)
-        payload_hdr = b"".join(struct.pack("<III", s.index_group, s.index_offset, s.size) for _n, _v, s, _t, _c in checks)
-        payload = payload_hdr + b"".join(self._value_bytes(s, tt, chk) for _n, _v, s, tt, chk in checks)
-        method = "sum-write (one ADS request: all values applied between the same two PLC cycles)"
+        method = "sum-write by handle (one ADS request: all values applied between the same two PLC cycles)"
         codes: list[int] | None = None
+        ver_before: int | None = None
         try:
-            res = c.read_write(0xF081, len(checks), ctypes.c_uint32 * len(checks), (ctypes.c_ubyte * len(payload))(*payload),
-                               ctypes.c_ubyte * len(payload), return_ctypes=True)
-            codes = [int(x) for x in res]
+            for attempt in range(2):
+                ver_before, hs, herr = self._get_handles(c, [s.name for _n, _v, s, _t, _c in checks])
+                tv = self._table_version(c)
+                if herr or (tv is not None and ver_before is not None and tv != ver_before):
+                    if attempt == 0:                # the program changed: the checks again, on the current table
+                        self._drop_handles(c)
+                        self._reresolve(c, [s.name for _n, _v, s, _t, _c in checks])
+                        checks = checks_for()
+                        continue
+                    raise AdsError("nothing was written — no handle for " + ", ".join(
+                        f"{n} ({_fmt_exc(pyads.ADSError(e))})" for n, e in herr.items()) if herr else
+                        "nothing was written — the PLC program changed while preparing the write; write again")
+                datas = [self._value_bytes(s, tt, chk) for _n, _v, s, tt, chk in checks]
+                payload = (b"".join(struct.pack("<III", 0xF005, hs[s.name], len(d))
+                                    for (_n, _v, s, _t, _c), d in zip(checks, datas)) + b"".join(datas))
+                res = c.read_write(0xF081, len(checks), ctypes.c_uint32 * len(checks),
+                                   (ctypes.c_ubyte * len(payload))(*payload), ctypes.c_ubyte * len(payload),
+                                   return_ctypes=True)
+                codes = [int(x) for x in res]
+                break
+        except AdsError:
+            raise
         except Exception as exc:  # noqa: BLE001 — sum commands unsupported here: one by one
-            method = f"sequential (sum-write unavailable: {_fmt_exc(exc)[:80]})"
+            method = f"sequential by handle (sum-write unavailable: {_fmt_exc(exc)[:80]})"
         results: dict[str, Any] = {}
         applied: list[str] = []
         if codes is not None:
@@ -1228,13 +1421,13 @@ class AdsBackend:
         else:
             for name, value, s, tt, chk in checks:
                 try:
-                    data = self._value_bytes(s, tt, chk)
-                    c.write(s.index_group, s.index_offset, (ctypes.c_ubyte * len(data))(*data), ctypes.c_ubyte * len(data))
+                    self._write_by_handle(c, s, self._value_bytes(s, tt, chk))
                     applied.append(s.name)
                 except Exception as exc:  # noqa: BLE001
                     results[s.name] = {"error": _fmt_exc(exc)}
                     break
         after = self.read_many(applied, port) if applied else {}
+        changed_during = (ver_before is not None and self._handle_cache(c)["ver"] not in (None, ver_before))
         for name, value, s, tt, chk in checks:
             if s.name in applied:
                 written = T.decode(tt, chk["encoded"]) if chk.get("encoded") is not None else chk.get("hex")
@@ -1243,9 +1436,14 @@ class AdsBackend:
                     d["note"] = "read_back differs: the PLC changed it after the write"
                 results[s.name] = d
         failed = [k for k, v in results.items() if "error" in v]
-        return {"method": method, "complete": not failed, "applied": applied, "failed": failed,
-                "not_attempted": [s.name for _n, _v, s, _t, _c in checks if s.name not in applied and s.name not in failed],
-                "results": results}
+        out = {"method": method, "complete": not failed, "applied": applied, "failed": failed,
+               "not_attempted": [s.name for _n, _v, s, _t, _c in checks if s.name not in applied and s.name not in failed],
+               "results": results}
+        if changed_during:
+            out["warning"] = ("the PLC program changed between the write and its read-back (download / online change): "
+                              "each value went to the variable it names, but a type that changed with it was written "
+                              "as the old type — check the read-back values")
+        return out
 
     def io_read(self, area: str, offset: int, size: int, port: int | None = None) -> dict[str, Any]:
         """Read the raw process image: area 'I' (inputs, ADSIGRP_IOIMAGE_RWIB) or 'Q' (outputs,
@@ -1336,7 +1534,10 @@ class AdsBackend:
         deadline = t0 + min(timeout_ms, 600_000) / 1000
         polls = 0
         while True:
-            cur = c.read_by_name(s.name, tt.ctype)
+            got = self.read_values(c, [(s, tt)], decode=False).get(s.name)
+            if isinstance(got, dict) and set(got) == {"error"}:
+                raise AdsError(f"wait_until {s.name}: {got['error']}")
+            cur = got
             polls += 1
             if ops[op](cur, target):
                 return {"met": True, "value": T.decode(tt, cur), "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1), "polls": polls}
@@ -1558,12 +1759,15 @@ class _RootReader:
     cancel event is checked before every request. The symbol's index offset is linear (PLC memory areas)."""
 
     def __init__(self, conn: Any, sym: "SymbolEntry", cancelled: Callable[[], bool], chunk: int = _DUMP_CHUNK,
-                 need_end: int | None = None):
+                 need_end: int | None = None, expect_version: int | None = None):
         self.c, self.s, self.cancelled, self.chunk = conn, sym, cancelled, chunk
         self.size = max(sym.size, 1)
         self.end = min(self.size, need_end) if need_end else self.size      # nothing beyond this is ever needed
         self.w0, self.buf = 0, b""
         self.bytes_read = 0
+        # the symbol version of the table these offsets come from: every chunk is read with the version in the same
+        # sum request, and bytes of another program version are never decoded (an online change during the dump)
+        self.expect_version = expect_version
 
     def get(self, off: int, n: int) -> bytes:
         if off < 0 or off + n > self.size:
@@ -1577,19 +1781,36 @@ class _RootReader:
             start, length = off, max(min(self.chunk, self.end - off), n)
         if self.cancelled():
             raise _DumpCancelled()
-        try:
-            data = bytes(self.c.read(self.s.index_group, self.s.index_offset + start, ctypes.c_ubyte * max(length, 1),
-                                     return_ctypes=True, check_length=False))
-        except Exception as exc:  # noqa: BLE001
-            where = f" (bytes {start}..{start + length} of {self.size})" if self.size > self.chunk else ""
-            raise _ReadFailed(_fmt_exc(exc) + where) from exc
+        where = f" (bytes {start}..{start + length} of {self.size})" if self.size > self.chunk else ""
+        data: bytes | None = None
+        if self.expect_version is not None:
+            try:
+                (verr, vb), (err, chunk) = _sum_read(self.c, [(ADSIGRP_SYM_VERSION, 0, 1),
+                                                              (self.s.index_group, self.s.index_offset + start, length)])
+            except Exception:  # noqa: BLE001 — no sum commands: plain reads from here on
+                self.expect_version = None
+            else:
+                now = vb[0] if not verr and vb else None
+                if now is not None and now != self.expect_version:
+                    raise _ReadFailed(f"the PLC program changed during the dump (symbol version {self.expect_version} → "
+                                      f"{now}: download / online change) — not read; dump again" + where)
+                if err:
+                    raise _ReadFailed(_fmt_exc(pyads.ADSError(err)) + where)
+                data = chunk
+        if data is None:
+            try:
+                data = bytes(self.c.read(self.s.index_group, self.s.index_offset + start, ctypes.c_ubyte * max(length, 1),
+                                         return_ctypes=True, check_length=False))
+            except Exception as exc:  # noqa: BLE001
+                raise _ReadFailed(_fmt_exc(exc) + where) from exc
         self.w0, self.buf = start, data
         self.bytes_read += len(data)
         return data[off - start:off - start + n]
 
-    def all_read(self) -> bool:
-        """Every byte any leaf still needs is in hand: no further request, so no read error, can follow (N76)."""
-        return self.end <= 0 or (self.w0 == 0 and len(self.buf) >= self.end)
+    def covers(self, lo: int, hi: int) -> bool:
+        """Are the bytes lo..hi (what the leaves still to come need) already in hand? Then no further request — so no
+        read error — can follow (N76). Nothing needed (lo >= hi): yes."""
+        return lo >= hi or (self.w0 <= lo and hi <= self.w0 + len(self.buf))
 
 
 def _at_zero(leaf: Leaf) -> Leaf:
@@ -1659,6 +1880,20 @@ def _nest(root: str, vals: dict[str, Any]) -> Any:
 
 class _TreeOrder(Exception):
     """A leaf that does not continue the tree depth first (a type walk never yields one)."""
+
+
+def _tree_order_problem(root: str, paths: list[str]) -> str | None:
+    """Do these leaf paths continue one tree depth first, as _TreeStream needs? None, or the first that does not."""
+    probe = _TreeStream(root)
+    for p in paths:
+        st = probe.steps(p)
+        try:
+            probe.plan(st, "0")
+        except _TreeOrder as exc:
+            return f"{p}: {exc}"
+        probe.apply(st, "0")
+        probe.parts.clear()
+    return None
 
 
 class _TreeStream:
@@ -1829,11 +2064,35 @@ def _sum_read(c: Any, items: list[tuple[int, int, int]]) -> list[tuple[int, byte
     return out
 
 
+ADSIGRP_SYM_VERSION = 0xF008      # the runtime's symbol version: +1 on every download / online change
+_HANDLE_GONE = frozenset({0x710, 0x711})   # symbol not found / symbol version invalid: the program changed
+
+
+def _sum_readwrite(c: Any, items: list[tuple[int, int, int, bytes]]) -> list[tuple[int, bytes]]:
+    """ADSIGRP_SUMUP_READWRITE (0xF082) over (index group, index offset, read length, write data), _SUM_MAX per request.
+    The answer holds an error code and the returned length per item, then each item's returned bytes.
+    -> [(ADS error code, bytes)] in the order asked."""
+    out: list[tuple[int, bytes]] = []
+    for k in range(0, len(items), _SUM_MAX):
+        part = items[k:k + _SUM_MAX]
+        req = (b"".join(struct.pack("<IIII", g, o, rl, len(wd)) for g, o, rl, wd in part)
+               + b"".join(wd for _g, _o, _rl, wd in part))
+        rlen = 8 * len(part) + sum(rl for _g, _o, rl, _wd in part)
+        raw = bytes(c.read_write(0xF082, len(part), ctypes.c_ubyte * rlen, (ctypes.c_ubyte * len(req))(*req),
+                                 ctypes.c_ubyte * len(req), return_ctypes=True, check_length=False))
+        pos = 8 * len(part)
+        for j in range(len(part)):
+            err, n = struct.unpack_from("<II", raw, 8 * j)
+            out.append((err, raw[pos:pos + n]))
+            pos += n
+    return out
+
+
 def _ctype_value(tt: T.TcType, data: bytes) -> Any:
     """The raw value of these bytes, as pyads' read_by_name gives it (get_value_from_ctype_data); STRING is the PLC's
     Windows-1252 text up to its NUL, WSTRING UTF-16 up to its double NUL."""
     if tt.kind == "string":
-        return bytes(data).split(b"\x00", 1)[0].decode("cp1252", "replace")
+        return T.plc_string(data)
     if tt.kind == "wstring":
         b = bytes(data)
         end = next((i for i in range(0, len(b) - 1, 2) if b[i] == 0 and b[i + 1] == 0), len(b) - len(b) % 2)

@@ -157,7 +157,10 @@ def test_pack_unpack():
     assert pack_value("INT", -3) == struct.pack("<h", -3)
     assert pack_value("BOOL", "true") == b"\x01"
     assert pack_value("TIME", "T#2s") == struct.pack("<I", 2000)
-    assert pack_value("STRING(5)", "hello world") == b"hello\x00"
+    assert pack_value("STRING(5)", "hello") == b"hello\x00"
+    with pytest.raises(ValueError, match="holds 5"):              # refused, never cut short (and Windows-1252, N91)
+        pack_value("STRING(5)", "hello world")
+    assert pack_value("STRING(5)", "Maß") == "Maß".encode("cp1252").ljust(6, b"\x00")
     assert pack_value("ARRAY [0..1] OF INT", [1, 2]) == struct.pack("<hh", 1, 2)
     buf = struct.pack("<d?h", 2.5, True, 7) + b"abc\x00\x00\x00"
     v, off = unpack_value("LREAL", buf, 0); assert v == 2.5 and off == 8

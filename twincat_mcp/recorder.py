@@ -73,6 +73,7 @@ FILETIME_EPOCH_OFFSET_100NS = 116444736000000000  # 1601 → 1970
 MERGE_GAP_BYTES = 256          # leaves closer than this share one notification
 MAX_BLOCK_BYTES = 16384        # one notification never carries more than this
 QUEUE_BYTES = 256 << 20        # in-memory backlog cap per recording
+HOLD_MARGIN_MS = 50.0            # transport margin on top of max_delay_ms for a block's late delivery
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
 TAIL_WAIT_S = 1.0             # after the duration: wait at most this long for in-flight samples up to the cut
 
@@ -287,7 +288,7 @@ class Slot:
             return None
         tt = self.tt
         if tt.kind == "string":
-            return chunk.split(b"\x00", 1)[0].decode("latin-1", "replace")
+            return T.plc_string(chunk)
         if tt.kind == "wstring":
             return chunk.decode("utf-16-le", "replace").split("\x00", 1)[0]
         try:
@@ -601,6 +602,12 @@ class Recording:
         self.dropped = 0            # samples lost because the backlog was full
         self.dropped_on_stop = 0    # samples still queued when the stop drain timed out
         self.after_limit = 0        # samples that arrived after a limit ended the recording (not part of it)
+        self._written_t: deque[float] = deque(maxlen=200_000)   # PLC times of the newest rows in the file
+        self._max_seen_t = 0.0                # the newest PLC time received from any block, and when it came
+        self._max_seen_mono: float | None = None
+        self.rows_after_window = 0  # rows in the file past the end, written before the end was known
+        self.rows_after_window_at_least = False
+        self.poll_refused: dict[str, dict[str, Any]] = {}   # poll mode: per symbol, reads the runtime refused
         self.unsubscribed: list[str] = []
         self.errors: list[str] = []
         self.created = time.time()
@@ -732,10 +739,14 @@ class Recording:
         return self.stalled_samples + (self._stall_rep if self._stall_open else 0)
 
     def label_reason(self) -> str | None:
-        if not self.stall_list:
-            return None
-        spans = ", ".join(f"{a:.4f}-{b:.4f} ms" for a, b in self.stall_list[:5])     # same text as the native engine
-        return f"PLC stopped (cycle counter frozen) {spans}"
+        parts = []
+        if self.stall_list:
+            spans = ", ".join(f"{a:.4f}-{b:.4f} ms" for a, b in self.stall_list[:5])     # same text as the native engine
+            parts.append(f"PLC stopped (cycle counter frozen) {spans}")
+        if self.poll_refused:
+            parts.append("reads refused by the runtime, those samples are missing: " + ", ".join(
+                f"{n} ×{v['count']} ({v['first_error']})" for n, v in list(self.poll_refused.items())[:5]))
+        return "; ".join(parts) or None
 
     def silent_missing_estimate(self) -> float:
         """D14: silence so far on this PC's clock, in sample periods, for blocks that stopped delivering (live only)."""
@@ -801,6 +812,7 @@ class Recording:
         block that is delivering has been seen at or past it (_horizon). Poll rows (one source, this PC's clock)
         go straight through."""
         released = False
+        released_last = False
         deadline = None
         while True:
             stopping = self._stop.is_set()
@@ -809,8 +821,18 @@ class Recording:
                 self._release()              # no new samples; what is queued was taken before the stop
                 deadline = time.monotonic() + DRAIN_TIMEOUT_S
             got = 0
+            # waiting samples that the horizon holds back move only with new input or when a block turns quiet: wait
+            # for either (review: a zero timeout here spun one core at 100 % while the slowest block lagged)
+            if stopping:
+                timeout = 0.0
+            elif self._pending_n and released_last:
+                timeout = 0.0
+            elif self._pending_n:
+                timeout = self._next_quiet_s()
+            else:
+                timeout = 0.25
             try:
-                item = self.q.get(timeout=0 if (stopping or self._pending_n) else 0.25)
+                item = self.q.get(timeout=timeout)
             except queue.Empty:
                 item = None
             while item is not None:
@@ -827,6 +849,7 @@ class Recording:
                 break
             final = stopping and self.q.empty()
             done = self._release_ordered(final)
+            released_last = bool(done)
             if final and not self._pending_n:
                 break
             if not stopping and not done:
@@ -856,6 +879,8 @@ class Recording:
         b.last_wall = time.monotonic()
         if b.seen_t is None or t > b.seen_t:
             b.seen_t = t
+        if self._max_seen_mono is None or t >= self._max_seen_t:
+            self._max_seen_t, self._max_seen_mono = t, b.last_wall
         q = self._pending.setdefault(b.bid, deque())
         if not q:
             heapq.heappush(self._heads, (t, b.bid))
@@ -880,14 +905,40 @@ class Recording:
         written as it comes and counted as late. None: wait."""
         now = time.monotonic()
         w = math.inf
+        any_quiet = False
         for b in self.timeline_blocks():
             quiet = now - (b.last_wall if b.last_wall is not None else self._ingest_mono) > self._silent_s
             if quiet:
+                any_quiet = True
                 continue
             if b.seen_t is None:
                 return None
             w = min(w, b.seen_t)
+        if any_quiet and self._max_seen_mono is not None:
+            # a quiet block can still deliver a sample stamped up to max_delay_ms (ADS batching, plus a margin for the
+            # transport) before the PLC's 'now': rows after that are held back for it — a change-mode block's late
+            # stop_when change is released in PLC order, before the other blocks' later rows (review). The PLC's now
+            # is the newest time received plus the wall time since it came, so nothing waits longer than the bound.
+            plc_now = self._max_seen_t + (now - self._max_seen_mono) * 1000.0
+            w = min(w, plc_now - (self.max_delay_ms + HOLD_MARGIN_MS))
         return w
+
+    def _next_quiet_s(self) -> float:
+        """Seconds until the horizon can move by time alone — a delivering block turning quiet, or the hold for a quiet
+        block passing the oldest waiting sample — at most 0.25."""
+        now = time.monotonic()
+        nxt = 0.25
+        for b in self.timeline_blocks():
+            last = b.last_wall if b.last_wall is not None else self._ingest_mono
+            left = last + self._silent_s - now
+            if left > 0:
+                nxt = min(nxt, left)
+        if self._heads and self._max_seen_mono is not None:
+            hold = self.max_delay_ms + HOLD_MARGIN_MS
+            left = (self._heads[0][0] + hold - self._max_seen_t) / 1000.0 - (now - self._max_seen_mono)
+            if left > 0:
+                nxt = min(nxt, left)
+        return max(0.001, nxt)
 
     def _release_ordered(self, final: bool) -> int:
         """Release the waiting block samples up to the horizon (everything when final), oldest PLC time first; the
@@ -985,6 +1036,7 @@ class Recording:
         else:
             b.samples += 1
         self.last_t = max(self.last_t, t)
+        self._written_t.append(t)
         self._write(f'[{t:.4f},"#{b.bid}","{base64.b64encode(data).decode("ascii")}"]\n')
         self.samples += 1
         if b is self._stall_block:
@@ -1034,6 +1086,7 @@ class Recording:
 
     def _commit_poll(self, t: float, row: dict[str, Any], light: bool) -> None:
         self.last_t = max(self.last_t, t)
+        self._written_t.append(t)
         self.samples += 1
         ew = self.stop_when
         with self._lock:
@@ -1188,6 +1241,19 @@ class Recording:
                 late = sum(b.late for b in self.blocks)
                 if late:
                     footer["late_samples"] = late          # written after a later stamp of another block (see _horizon)
+                if self._cut_t is not None:
+                    # rows in the file past the end (a block delivered later than the ADS bound, before the end was
+                    # known): counted here, in the ingest thread that wrote them; the readers skip them
+                    cut_k = _ticks(self._cut_t)
+                    self.rows_after_window = sum(1 for wt in self._written_t if _ticks(wt) > cut_k)
+                    self.rows_after_window_at_least = (len(self._written_t) == self._written_t.maxlen
+                                                       and _ticks(self._written_t[0]) > cut_k)
+                if self.rows_after_window:
+                    footer["rows_after_window"] = self.rows_after_window
+                    if self.rows_after_window_at_least:
+                        footer["rows_after_window_at_least"] = True
+                if self.poll_refused:
+                    footer["poll_refused"] = self.poll_refused
                 footer.update(self.stop_and_trigger_notes())
                 if self.stall_cfg:
                     footer["stall_counter_block"] = self.stall_cfg.get("block")
@@ -2169,12 +2235,16 @@ class Recorder:
                     time.sleep(min(1.0, interval * 5))
                     continue
                 bad = {n: v["error"] for n, v in got.items() if isinstance(v, dict) and set(v) == {"error"}}
-                if bad:
-                    if len(rec.errors) < 20:
-                        rec.errors.append("poll: " + "; ".join(f"{n}: {e}" for n, e in list(bad.items())[:5]))
-                    time.sleep(min(1.0, interval * 5))
-                    continue
-                rec.enqueue(ts, None, got)
+                for n, e in bad.items():
+                    # one symbol the runtime refuses no longer costs the others their rows (review): its samples are
+                    # missing, counted per symbol (footer poll_refused) and the recording is labelled for it
+                    r_ = rec.poll_refused.setdefault(n, {"count": 0, "first_error": e})
+                    r_["count"] += 1
+                good = {n: v for n, v in got.items() if n not in bad}
+                if good:
+                    rec.enqueue(ts, None, good)
+                elif len(rec.errors) < 20:
+                    rec.errors.append("poll: " + "; ".join(f"{n}: {e}" for n, e in list(bad.items())[:5]))
                 time.sleep(max(0.0, interval - (time.perf_counter() - t_cycle)))
             try:
                 conn.close()

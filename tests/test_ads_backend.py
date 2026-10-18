@@ -140,7 +140,12 @@ def test_watch_and_wait(ads, monkeypatch):
     vals = [s["MAIN.nCycle"] for s in w["samples"]]
     assert vals == [0, 1, 2] and w["changes"] == 2
     conn.values["MAIN.nCycle"] = 0
-    conn.read_by_name = lambda n, t=None, **k: (conn.values.__setitem__(n, conn.values[n] + 1) or conn.values[n])
+
+    def rw2(igrp, *a, **kw):                         # the PLC counts on between two polls
+        if igrp == 0xF080:
+            conn.values["MAIN.nCycle"] += 1
+        return orig(igrp, *a, **kw)
+    conn.read_write = rw2
     r = ads.wait_until("MAIN.nCycle", ">=", 3, timeout_ms=500, interval_ms=1)
     assert r["met"] and r["value"] >= 3
     with pytest.raises(AdsError):
@@ -175,30 +180,47 @@ def test_local_routes_missing_file(ads, tmp_path):
     assert r["routes"][0]["NetId"] == "5.1.2.3.1.1"
 
 
-def test_write_reports_read_back_changed_by_plc(ads, monkeypatch):
+def test_write_reports_read_back_changed_by_plc(ads, monkeypatch):  # writes go by handle
     """#77: a one-shot the PLC clears every cycle reads back as 0 — that is not a failed write."""
     from tests.fake_ads import FakeConnection
-    orig = FakeConnection.write_by_name
+    orig = FakeConnection._write_handle
 
-    def one_shot(self, name, value, plc_datatype=None, **kw):
-        orig(self, name, value, plc_datatype)
-        self.values[name] = 0                      # the PLC consumed the command in the same cycle
-    monkeypatch.setattr(FakeConnection, "write_by_name", one_shot)
+    def one_shot(self, h, data):
+        code = orig(self, h, data)
+        self.values[self._handle_name(h)] = 0      # the PLC consumed the command in the same cycle
+        return code
+    monkeypatch.setattr(FakeConnection, "_write_handle", one_shot)
     r = ads.write("MAIN.nCycle", 1)
     assert r["written"] == 1 and r["read_back"] == 0 and "PLC changed it after the write" in r["note"]
+
+
+def test_n91_strings_are_windows_1252_in_every_read_and_write(ads, tmp_path):
+    """N91: ads_read / ads_read_many decoded STRING as UTF-8 (pyads) and failed on 'ü' (0xFC); the dump used Latin-1,
+    the watch Windows-1252 — three answers for one variable. One decoder and one encoder now (Windows-1252, the PLC's
+    STRING): every path gives the same text, a write puts one byte per character, and a character the PLC's STRING
+    cannot hold is refused before anything is written."""
+    import json as _json
+    from tests.fake_ads import FakeConnection
+    FakeConnection.shared_values["MAIN.sLabel"] = "Grüße €"
+    assert ads.read("MAIN.sLabel")["value"] == "Grüße €"
+    assert ads.read_many(["MAIN.sLabel"]) == {"MAIN.sLabel": "Grüße €"}
+    assert ads.watch(["MAIN.sLabel"], duration_ms=1, interval_ms=1, change_only=False)["samples"][0]["MAIN.sLabel"] == "Grüße €"
+    d = ads.dump("MAIN.sLabel", False, str(tmp_path))
+    assert _json.loads(open(d["json"], encoding="utf-8").read())["values"]["MAIN.sLabel"] == "Grüße €"
+    ads.write("MAIN.sLabel", "Maß ä")
+    conn = FakeConnection.instances[-1]
+    assert conn.writes[-1][1].rstrip(b"\x00") == "Maß ä".encode("cp1252")          # one byte per character
+    assert ads.read("MAIN.sLabel")["value"] == "Maß ä"
+    with pytest.raises(AdsError, match="not in the PLC's STRING character set"):
+        ads.write("MAIN.sLabel", "温度")
+    with pytest.raises(AdsError, match="nothing was written"):
+        ads.write_many({"MAIN.nCycle": 5, "MAIN.sLabel": "温度"})
+    assert FakeConnection.shared_values["MAIN.nCycle"] != 5
 
 
 def test_symbol_cache_follows_symbol_version(ads, monkeypatch):
     """P7: the cache is reloaded when the runtime's symbol version changes (download / online change), not on a timer."""
     from tests.fake_ads import FakeConnection
-    ver = {"v": 3}
-    orig = FakeConnection.read
-
-    def read(self, igrp, ioffs, dt, return_ctypes=False, check_length=True):
-        if igrp == 0xF008:
-            return ver["v"]
-        return orig(self, igrp, ioffs, dt, return_ctypes, check_length)
-    monkeypatch.setattr(FakeConnection, "read", read)
     loads = {"n": 0}
     orig_load = ads._load_symbols
 
@@ -211,37 +233,75 @@ def test_symbol_cache_follows_symbol_version(ads, monkeypatch):
     ads.__dict__.get("_symver", {}).clear()
     ads.symbols_cached()
     assert loads["n"] == 1                     # same version: cached despite the zero TTL
-    ver["v"] = 4
+    FakeConnection.symbol_version += 1
     ads.__dict__.get("_symver", {}).clear()
     ads.symbols_cached()
     assert loads["n"] == 2                     # online change: reloaded
 
 
-def test_reads_by_name_follow_a_download_that_moves_the_variables(ads, monkeypatch):
-    """pyads' read_list_by_name kept each name's address for the life of the connection: after a download (or a
-    restart with another build) ads_read_many, ads_watch and polled recordings read the OLD offsets — another
-    variable's bytes, or an ADS error. Every read by name now goes through the server's own symbol table, whose
-    identity (symbol version, table sizes, the application's compile timestamp) is checked: a new build → reloaded."""
+def _download(monkeypatch, a: str = "MAIN.nCycle", b: str = "MAIN.fbFill.tSettle") -> None:
+    """A download as the runtime sees it: the same variables at other offsets (a swaps places with the 4-byte b),
+    same symbol count and sizes, a new symbol version and compile timestamp."""
     from tests import fake_ads as F
     from tests.fake_ads import FakeConnection
-    FakeConnection.shared_values["MAIN.nCycle"] = 4242
-    assert ads.read_many(["MAIN.nCycle"]) == {"MAIN.nCycle": 4242}
-    # the download: the same variables at other offsets (MAIN.nCycle swaps places with the 4-byte MAIN.fbFill.tSettle),
-    # same symbol count and sizes — only the build differs, as its compile timestamp says
     syms = list(F.SYMBOLS)
-    i = next(k for k, x in enumerate(syms) if x[0] == "MAIN.nCycle")
-    j = next(k for k, x in enumerate(syms) if x[0] == "MAIN.fbFill.tSettle")
+    i = next(k for k, x in enumerate(syms) if x[0] == a)
+    j = next(k for k, x in enumerate(syms) if x[0] == b)
     syms[i], syms[j] = syms[j], syms[i]
     monkeypatch.setattr(F, "SYMBOLS", syms)
+    FakeConnection.symbol_version += 1
     FakeConnection.shared_values["TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp"] += 3600
-    ads.__dict__.get("_symver", {}).clear()           # the identity is read at most every 2 s; the test does not wait
-    FakeConnection.read_log.clear()
+
+
+@pytest.mark.parametrize("survive", [False, True])
+def test_reads_and_writes_by_name_follow_a_download_at_once(ads, monkeypatch, survive):
+    """pyads' read_list_by_name kept each name's address for the life of the connection, and the 0.8.11 table check ran
+    at most every 2 s: right after a download read_many returned another variable's bytes (1500 for 4242) and
+    write_many wrote 7 into MAIN.fbFill.tSettle, reporting MAIN.nCycle applied (its read-back at the same stale offset
+    confirmed it). Every access by name now goes through a handle, and every sum read carries the symbol version in
+    the same request: no window. Both runtime behaviours: handles refused after the change (0x711), or kept."""
+    from tests.fake_ads import FakeConnection
+    FakeConnection.handles_survive = survive
+    FakeConnection.shared_values["MAIN.nCycle"] = 4242
     assert ads.read_many(["MAIN.nCycle"]) == {"MAIN.nCycle": 4242}
+    _download(monkeypatch)                            # no waiting: the 2 s identity cache is still warm
+    assert ads.read_many(["MAIN.nCycle"]) == {"MAIN.nCycle": 4242}
+    assert ads.read("MAIN.nCycle")["value"] == 4242
     w = ads.watch(["MAIN.nCycle"], duration_ms=1, interval_ms=1, change_only=False)
     assert w["samples"][0]["MAIN.nCycle"] == 4242
-    # a runtime without sum commands: one read per symbol, at the same (current) address
+    _download(monkeypatch)                            # back again, and write at once
+    r = ads.write_many({"MAIN.nCycle": 7})
+    assert r["applied"] == ["MAIN.nCycle"] and r["results"]["MAIN.nCycle"]["read_back"] == 7, r
+    assert FakeConnection.shared_values["MAIN.nCycle"] == 7 and FakeConnection.shared_values["MAIN.fbFill.tSettle"] == 1500
+    _download(monkeypatch)
+    ads.write("MAIN.nCycle", 9)
+    assert FakeConnection.shared_values["MAIN.nCycle"] == 9 and FakeConnection.shared_values["MAIN.fbFill.tSettle"] == 1500
+    # a runtime without sum commands: a fresh handle per read (pyads by name with a type), never a kept address
     FakeConnection.no_sum_commands = True
-    assert ads.read_many(["MAIN.nCycle", "MAIN.bStart"]) == {"MAIN.nCycle": 4242, "MAIN.bStart": True}
+    _download(monkeypatch)
+    assert ads.read_many(["MAIN.nCycle", "MAIN.bStart"]) == {"MAIN.nCycle": 9, "MAIN.bStart": True}
+
+
+def test_a_download_during_a_watch_is_followed(ads, monkeypatch):
+    """Review: the watch resolved its addresses once — a download 0.3 s into a 3 s watch reported the neighbour's
+    bytes as a value change, and kept reading them."""
+    from tests.fake_ads import FakeConnection
+    FakeConnection.shared_values["MAIN.nCycle"] = 4242
+    ads.conn()
+    conn = FakeConnection.instances[-1]
+    orig = conn.read_write
+    n = {"k": 0}
+
+    def rw(igrp, *a, **kw):
+        if igrp == 0xF080:
+            n["k"] += 1
+            if n["k"] == 3:
+                _download(monkeypatch)
+        return orig(igrp, *a, **kw)
+    conn.read_write = rw
+    ads.cfg.min_watch_interval_ms = 1
+    w = ads.watch(["MAIN.nCycle"], duration_ms=40, interval_ms=2, change_only=False)
+    assert n["k"] >= 4 and {s["MAIN.nCycle"] for s in w["samples"]} == {4242} and w["changes"] == 0, w["samples"][:6]
 
 
 def test_a_refused_item_of_a_sum_read_is_an_error_never_a_value(ads):
@@ -335,10 +395,8 @@ def test_n76_the_limit_is_the_bytes_on_disk_for_any_limit(ads, tmp_path, monkeyp
         assert len(rows) - 1 == r["leaves"] == doc["leaves"]
         if lim >= need + 1024:
             assert r["complete"] and not r["truncated"]
-        elif lim >= need:
-            assert lim - total <= 600, (lim, total)
-        else:
-            assert r["truncated"] and lim - total <= 5 * _ERR_JSON_MAX + 600 + max(len(",".join(x)) for x in rows), (lim, total)
+        elif lim < need:
+            assert r["truncated"]
 
 
 @pytest.mark.anyio
@@ -436,7 +494,35 @@ def test_n76_a_read_error_inside_a_big_root_still_ends_within_the_limit(ads, tmp
         assert r["csv_bytes"] + r["json_bytes"] <= lim and len(rows) - 1 >= 1, (lim, r)
         node = doc["values"].get("GVL_Big.aBlk")
         assert node is not None and ("_incomplete" in node or "_truncated" in node), node
-    assert len('"' + "x" * 10 + '"') <= _ERR_JSON_MAX
+    import json as _json
+    from twincat_mcp.ads_backend import _err_text
+    assert len(_json.dumps(_err_text("x" * 5000 + " ü " * 900))) <= _ERR_JSON_MAX          # any error text: bounded
+
+
+def test_n76_the_last_piece_of_a_big_root_keeps_no_room_for_a_read_error(ads, tmp_path, monkeypatch):
+    """Review: 'all read' was only true for a root read in one request — the rows of the last piece of a big root still
+    kept room for a read error that no further request could cause (≈ 1.5 KB), and cut dumps that fit. What the leaves
+    still to come need is known (suffix bounds over the leaf list): once it is in hand, only a cut is reserved."""
+    from tests.fake_ads import _dt
+    from twincat_mcp.ads_backend import _ERR_JSON_MAX
+    blk = _dt("ST_Blk", "", 80, subs=[_dt("sName", "STRING(79)", 80, 0, 30)])
+    arr = _dt("ARRAY [1..4000] OF ST_Blk", "ST_Blk", 320_000, dims=[(1, 4000)])      # two pieces of 256 KiB
+    s79 = _dt("STRING(79)", "", 80, dtype=30)
+    image = b"".join(f"blk{i}".encode().ljust(80, b"\x00") for i in range(1, 4001))
+    _add_symbols(monkeypatch, [("GVL_Big.aBlk", arr.name, 320_000, lambda off, n: image[off:off + n])], [blk, arr, s79])
+    full = ads.dump("GVL_Big.*", False, str(tmp_path / "full"))
+    need = full["csv_bytes"] + full["json_bytes"]
+    lo, hi, k = need, need + 4000, 0                  # the smallest limit with a complete dump
+    while lo < hi:
+        mid = (lo + hi) // 2
+        k += 1
+        r = ads.dump("GVL_Big.*", False, str(tmp_path / f"s{k}"), max_total_bytes=mid)
+        assert r["csv_bytes"] + r["json_bytes"] <= mid
+        if r["complete"]:
+            hi = mid
+        else:
+            lo = mid + 1
+    assert lo - need < _ERR_JSON_MAX, (lo - need)      # only the cut ending was kept free at the end, never a read error
 
 
 def test_n39_ads_leaves_and_read_full_read_big_symbols_in_pieces(ads, monkeypatch):

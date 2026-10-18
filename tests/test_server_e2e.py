@@ -809,6 +809,9 @@ async def test_n4_restart_is_verified_only_after_the_target_left_run(monkeypatch
     script("RUN", "RUN", "CONFIG")                                   # license fallback
     v = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True, timeout_s=30)
     assert not v["verified"] and v["transition_seen"] and v["target_mode"] == "CONFIG" and v["modes_seen"] == ["RUN", "CONFIG"]
+    from twincat_mcp.server import _restart_timing
+    t = _restart_timing(0.0, dict(v))                                # N5 (review): never seen running again —
+    assert t["duration_s"] is None and "not known" in t["duration_note"]       # no duration, not the timeout's
 
     script("RUN")                                                    # nothing happened
     v = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True, leave_timeout_s=5)
@@ -817,8 +820,12 @@ async def test_n4_restart_is_verified_only_after_the_target_left_run(monkeypatch
     assert v["verify_s"] >= 5 and v["polls"] >= 10                   # 0.5 s polls in the first phase
 
     script("RUN", "down", "CONFIG", "RUN")                           # a real restart
+    import time as _time
+    t_cmd = _time.monotonic()
     v = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True)
     assert v["verified"] and v["modes_seen"] == ["RUN", "unreachable", "CONFIG", "RUN"] and v["left_run_after_s"] == 0.5
+    t = _restart_timing(t_cmd, dict(v))
+    assert t["duration_s"] is not None and t["duration_s"] >= 0 and "polled every 2 s" in t["duration_note"]
 
     script("RUN")                                                    # activation keeps the old contract
     assert (await app.verify_target_after("xae_activate_configuration", expect_run=False))["verified"]

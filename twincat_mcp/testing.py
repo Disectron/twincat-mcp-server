@@ -542,8 +542,7 @@ _FMT = {"bool": "?", "int": {1: "b", 2: "h", 4: "i", 8: "q"}, "uint": {1: "B", 2
 def pack_value(type_str: str, value: Any) -> bytes:
     tt = T.parse_type(type_str, None)
     if tt.kind in ("string",):
-        s = str(value).encode("latin-1", "replace")[: (tt.size or 81) - 1]
-        return s.ljust(tt.size or 81, b"\x00")
+        return T.plc_string_bytes(str(value), tt.size or 81)        # the PLC's STRING: Windows-1252 (N91)
     if tt.kind == "wstring":
         s = str(value).encode("utf-16-le")[: (tt.size or 162) - 2]
         return s.ljust(tt.size or 162, b"\x00")

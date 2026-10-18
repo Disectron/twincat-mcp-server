@@ -230,6 +230,19 @@ def restart_proven(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool 
 _TRANSITION_KEYS = ("transition_seen", "transition_by", "mode_before", "witness_before", "witness_after", "witness")
 
 
+def _restart_timing(t_cmd: float, ver: dict[str, Any]) -> dict[str, Any]:
+    """N5: how long a restart took — from its command until a poll saw the target running again after a proven
+    transition. Not seen running again (timeout, an error dialog, no transition): no duration, and why."""
+    seen = ver.pop("_run_seen_mono", None)
+    poll_s = ver.pop("_poll_s", None)
+    if seen is None:
+        return {"duration_s": None, "duration_note": "the target was not seen running again after the restart — its "
+                                                     "duration is not known"}
+    return {"duration_s": round(seen - t_cmd, 1),
+            "duration_note": f"until a poll saw RUN again (polled every {poll_s:g} s: the restart may have ended up "
+                             "to one poll earlier)"}
+
+
 def _restart_outcome(ver: dict[str, Any]) -> str:
     """Audit outcome of a restart that was not verified — what was actually wrong."""
     if ver.get("dialogs"):
@@ -844,6 +857,7 @@ class App:
         witness_after: dict[str, Any] | None = None
         witness_verdict: tuple[bool | None, str] | None = None
         modes_seen: list[str] = []
+        run_seen: float | None = None
         while True:
             polls += 1
             try:
@@ -871,6 +885,8 @@ class App:
             err_dialogs = [d for d in dl if any(k in (str(d.get("title", "")) + " " + str(d.get("text", ""))).lower()
                                                  for k in ("error", "license", "licence", "fatal", "failed"))]
             reached = (mode == "RUN") if expect_run else (mode in ("RUN", "CONFIG"))
+            if left_run and reached and run_seen is None:
+                run_seen = time.monotonic()           # N5: the poll that saw it running again (after a transition)
             if err_dialogs or (left_run and reached):
                 break
             now = time.time()
@@ -888,7 +904,8 @@ class App:
                 left_run, left_at, transition_by = False, None, None
         ok = ((mode == "RUN") if expect_run else (mode in ("RUN", "CONFIG"))) and left_run and not err_dialogs
         out: dict[str, Any] = {"target_mode": mode, "verified": ok, "polls": polls, "dialogs": err_dialogs,
-                               "modes_seen": modes_seen, "verify_s": round(time.time() - t0, 1)}
+                               "modes_seen": modes_seen, "verify_s": round(time.time() - t0, 1),
+                               "_run_seen_mono": run_seen if ok else None, "_poll_s": poll_s}
         if require_transition:
             out["transition_seen"] = left_run
             out["transition_by"] = transition_by
@@ -3797,15 +3814,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """StartRestartTwinCAT on the current target (runtime restarts in RUN mode). Destructive-class."""
         tgt = await app.xae_target_for("xae_restart_twincat", OpClass.DESTRUCTIVE, confirm_token)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_restart_twincat", tgt, confirm_token)
-        t0 = time.monotonic()
         before = await app.restart_witness()                  # R40: what a restart must change, read before it
+        t0 = time.monotonic()
         res = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
         ver = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True, before=before)
         # N5: the shell returns as soon as the command is accepted; the restart is over when the target reports RUN
         res.update({"restarted": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
-                    "verification_polls": ver["polls"], "modes_seen": ver["modes_seen"],
-                    "duration_s": round(time.monotonic() - t0, 1)})
+                    "verification_polls": ver["polls"], "modes_seen": ver["modes_seen"], **_restart_timing(t0, ver)})
         res.update({k: ver[k] for k in _TRANSITION_KEYS if k in ver})
         if ver.get("hint"):
             res["hint"] = ver["hint"]
@@ -3848,7 +3864,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # P17: a deploy is done when the target runs it, not when the shell accepted the commands
         ver = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before)
         # N5: the restart lasted from its command until the target was seen running again (command_s: the shell part)
-        steps["restart"]["duration_s"] = round(time.monotonic() - t_restart, 1)
+        steps["restart"].update(_restart_timing(t_restart, ver))
         steps["verify"] = {"running": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
                            "polls": ver["polls"], "modes_seen": ver["modes_seen"]}
         steps["verify"].update({k: ver[k] for k in _TRANSITION_KEYS if k in ver})

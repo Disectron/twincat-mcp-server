@@ -446,7 +446,7 @@ class TypeSystem:
             return None
         try:
             if tt.kind == "string":
-                return chunk.split(b"\x00", 1)[0].decode("latin-1", "replace")
+                return T.plc_string(chunk)
             if tt.kind == "wstring":
                 return chunk.decode("utf-16-le", "replace").split("\x00", 1)[0]
             if tt.kind == "array":
@@ -469,7 +469,7 @@ def _decode_adst(buf: bytes, off: int, adst: int, size: int, enum: dict[int, str
     fmt = {2: "<h", 3: "<i", 16: "<b", 17: "<B", 18: "<H", 19: "<I", 20: "<q", 21: "<Q", 4: "<f", 5: "<d"}.get(adst)
     chunk = buf[off:off + size]
     if adst == 30:
-        return chunk.split(b"\x00", 1)[0].decode("latin-1", "replace")
+        return T.plc_string(chunk)
     if adst == 31:
         return chunk.decode("utf-16-le", "replace").split("\x00", 1)[0]
     if adst == 33:

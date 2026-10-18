@@ -107,6 +107,12 @@ class FakeConnection:
     fail_reads: set[str] = set()
     max_read_bytes: int | None = None
     read_log: list[tuple[str, int, int]] = []
+    # the runtime's symbol version (0xF008) and its symbol handles: a test that "downloads" (moves variables) bumps
+    # the version; a handle made before refuses with 0x711 (handles_survive = False) or follows its variable (True)
+    symbol_version: int = 1
+    handles: dict[int, tuple[str, int]] = {}
+    next_handle: int = 1000
+    handles_survive: bool = False
 
     def __init__(self, ams_net_id: str = None, ams_net_port: int = None, ip_address: str = None):
         self.ams_net_id, self.ams_net_port, self.ip_address = ams_net_id, ams_net_port, ip_address
@@ -157,7 +163,37 @@ class FakeConnection:
         if ads_state == C.ADSSTATE_RESET and (self.ams_net_port == 10000): self.state = (C.ADSSTATE_RUN, 0)
 
     # symbol table
+    @staticmethod
+    def _sym_index(name):
+        return next((k for k, x in enumerate(SYMBOLS) if x[0] == name), None)
+
+    def _handle_name(self, h):
+        if h not in FakeConnection.handles:
+            raise pyads.ADSError(0x710)
+        name, ver = FakeConnection.handles[h]
+        if ver != FakeConnection.symbol_version and not FakeConnection.handles_survive:
+            raise pyads.ADSError(0x711)                 # symbol version invalid: the program changed
+        return name
+
+    def _read_symbol(self, name, n):
+        """The current bytes of a variable by name (where the program has it NOW)."""
+        if name in EXTRA_SYMBOLS:
+            return memory_image(_EXTRA_OFFSET[name], n)
+        i = self._sym_index(name)
+        if i is None:
+            raise pyads.ADSError(0x710)
+        return bytes(self.read(0x4040, i * 64, ctypes.c_ubyte * n, return_ctypes=True))
+
     def read(self, index_group, index_offset, plc_datatype, return_ctypes=False, check_length=True):
+        if index_group == 0xF008:                        # ADSIGRP_SYM_VERSION
+            if plc_datatype is ctypes.c_ubyte:
+                return FakeConnection.symbol_version
+            n = ctypes.sizeof(plc_datatype)
+            return (ctypes.c_ubyte * n)(*bytes([FakeConnection.symbol_version & 0xFF]).ljust(n, b"\x00"))
+        if index_group == C.ADSIGRP_SYM_VALBYHND:
+            n = ctypes.sizeof(plc_datatype)
+            raw = self._read_symbol(self._handle_name(index_offset), n)
+            return (ctypes.c_ubyte * n)(*raw[:n].ljust(n, b"\x00"))
         if index_group == C.ADSIGRP_SYM_UPLOADINFO2:
             blob = b"".join(_entry(n, t, s, 0x4040, i * 64, f) for i, (n, t, s, v, f) in enumerate(SYMBOLS))
             self._blob = blob
@@ -203,8 +239,24 @@ class FakeConnection:
         raise pyads.ADSError(1793)  # service not supported
 
     def write(self, index_group, index_offset, value, plc_datatype):
+        if index_group == C.ADSIGRP_SYM_VALBYHND:
+            code = self._write_handle(index_offset, bytes(value))
+            if code:
+                raise pyads.ADSError(code)
+            return
         self.writes.append((f"raw:{index_group:X}/{index_offset:X}", bytes(value)))
         self._apply_raw(index_group, index_offset, bytes(value))
+
+    def _write_handle(self, h, data):
+        try:
+            name = self._handle_name(h)
+        except pyads.ADSError as exc:
+            return exc.err_code
+        i = self._sym_index(name)
+        if i is None:
+            return 0x710
+        self.writes.append((f"hnd:{name}", data))
+        return self._apply_raw(0x4040, i * 64, data)
 
     def _apply_raw(self, igrp, ioffs, data):
         """A raw write into PLC memory updates the symbol at that offset (scalars/arrays of the fake layout)."""
@@ -218,7 +270,7 @@ class FakeConnection:
         tt = _T.parse_type(typ, size)
         try:
             if tt.kind == "string":
-                val = data.split(b"\x00", 1)[0].decode("latin-1")
+                val = data.split(b"\x00", 1)[0].decode("cp1252")
             elif tt.ctype is not None and not tt.opaque:
                 obj = tt.ctype.from_buffer_copy(data[:ctypes.sizeof(tt.ctype)])
                 val = list(obj) if tt.kind == "array" else obj.value
@@ -233,6 +285,9 @@ class FakeConnection:
     def read_by_name(self, name, plc_datatype=None, **kw):
         if name not in self.values:
             raise pyads.ADSError(1808)  # symbol not found
+        if plc_datatype is not None and getattr(plc_datatype, "_type_", None) is ctypes.c_ubyte and kw.get("return_ctypes"):
+            n = ctypes.sizeof(plc_datatype)                 # raw bytes by name: a fresh handle, the current address
+            return (ctypes.c_ubyte * n)(*self._read_symbol(name, n)[:n].ljust(n, b"\x00"))
         return self.values[name]
 
     def write_by_name(self, name, value, plc_datatype=None, **kw):
@@ -278,10 +333,44 @@ class FakeConnection:
             codes = []
             self.sum_writes = getattr(self, "sum_writes", 0) + 1
             for igrp, ioffs, ln in hdr:
-                codes.append(self._apply_raw(igrp, ioffs, raw[pos:pos + ln]))
-                self.writes.append((f"sum:{igrp:X}/{ioffs:X}", raw[pos:pos + ln]))
+                if igrp == C.ADSIGRP_SYM_VALBYHND:
+                    codes.append(self._write_handle(ioffs, raw[pos:pos + ln]))
+                elif igrp == C.ADSIGRP_SYM_RELEASEHND:
+                    FakeConnection.handles.pop(struct.unpack_from("<I", raw, pos)[0], None)
+                    codes.append(0)
+                else:
+                    codes.append(self._apply_raw(igrp, ioffs, raw[pos:pos + ln]))
+                    self.writes.append((f"sum:{igrp:X}/{ioffs:X}", raw[pos:pos + ln]))
                 pos += ln
             return (ctypes.c_uint32 * n)(*codes)
+        if index_group == 0xF082:                     # ADSIGRP_SUMUP_READWRITE: n × (igrp, ioffs, rlen, wlen) then data
+            if getattr(FakeConnection, "no_sum_commands", False):
+                raise pyads.ADSError(1793)
+            raw = bytes(value)
+            n = index_offset
+            hdr = [struct.unpack_from("<IIII", raw, 16 * k) for k in range(n)]
+            pos = 16 * n
+            res, data = [], b""
+            for igrp, ioffs, rlen, wlen in hdr:
+                wd = raw[pos:pos + wlen]
+                pos += wlen
+                try:
+                    if igrp == C.ADSIGRP_SYM_HNDBYNAME:
+                        name = wd.rstrip(b"\x00").decode("latin-1")
+                        if name not in self.values and self._sym_index(name) is None:
+                            raise pyads.ADSError(0x710)
+                        h = FakeConnection.next_handle
+                        FakeConnection.next_handle += 1
+                        FakeConnection.handles[h] = (name, FakeConnection.symbol_version)
+                        part = struct.pack("<I", h)
+                    else:
+                        part = bytes(self.read(igrp, ioffs, ctypes.c_ubyte * rlen, return_ctypes=True))[:rlen]
+                    res.append((0, len(part)))
+                    data += part
+                except pyads.ADSError as exc:
+                    res.append((exc.err_code, 0))
+            out = b"".join(struct.pack("<II", e, ln) for e, ln in res) + data
+            return (ctypes.c_ubyte * len(out))(*out)
         # RPC emulation: handle by name for "inst#method", then VALBYHND = call
         if index_group == C.ADSIGRP_SYM_HNDBYNAME:
             if "#" not in value:
@@ -430,8 +519,8 @@ def _scalar_bytes(typ, size, v):
     if t == "LREAL":
         return struct.pack("<d", v)
     if t.startswith("STRING"):
-        return str(v).encode().ljust(size, b"\x00")
-    if t.startswith("ARRAY") and isinstance(v, list):
+        return str(v).encode("cp1252").ljust(size, b"\x00")      # the PLC's STRING: Windows-1252
+    if t.startswith("ARRAY") and isinstance(v, list) and t.endswith("LREAL"):
         return b"".join(struct.pack("<d", x) for x in v)
     if t == "E_FillState":
         return struct.pack("<h", v)
@@ -459,6 +548,10 @@ def install(monkeypatch):
     FakeConnection.max_read_bytes = None               # a read asking for more fails with ADS 1802, like the router
     FakeConnection.read_log = []                       # (symbol, offset inside it, bytes) of every raw 0x4040 read
     FakeConnection.initial_notification = False      # tests that model real ADS registration behaviour turn it on
+    FakeConnection.symbol_version = 1
+    FakeConnection.handles = {}
+    FakeConnection.next_handle = 1000
+    FakeConnection.handles_survive = False
 
     def fake_symbol_info(port, adr, name):
         if name in EXTRA_SYMBOLS:
