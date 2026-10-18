@@ -1236,12 +1236,11 @@ def builders_dir() -> Path | None:
 
 
 def _content_sha(f: Path) -> str | None:
-    """sha256 of a text file with every line end read as LF — the identity of a shipped file on any checkout. CR+LF
-    (a Windows checkout) and CR CR LF (a CRLF file converted to CRLF once more, e.g. by a copy tool) both count."""
+    """sha256 of a text file with CRLF read as LF — the identity of a shipped file on any checkout (a Windows checkout
+    converts line endings). Nothing else is normalised: a file that differs in any other way is not one we shipped."""
     import hashlib
-    import re
     try:
-        return hashlib.sha256(re.sub(rb"\r+\n", b"\n", f.read_bytes())).hexdigest()
+        return hashlib.sha256(f.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
     except OSError:
         return None
 

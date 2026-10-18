@@ -455,15 +455,16 @@ def test_builder_copies_become_stubs_once_and_are_reported(kb, tmp_path, monkeyp
     assert str(K.builders_dir() / "infosys_local.py") in d["infosys"]["command"]
 
 
-def test_content_sha_reads_every_line_end_as_lf(tmp_path):
-    """A shipped builder is recognised whatever its line ends: LF, CRLF (Windows checkout) or CR CR LF (a CRLF file
-    converted once more) — the Windows CI run of 0.8.10 failed on exactly that double conversion."""
+def test_content_sha_reads_crlf_as_lf_and_nothing_else(tmp_path):
+    """A shipped builder is recognised with LF or CRLF line ends (a Windows checkout); any other difference — CR CR LF
+    included — is a file we did not ship, left alone."""
     src = (K.builders_dir() / "manuals_db.py").read_bytes().replace(b"\r\n", b"\n")
     want = K._content_sha(K.builders_dir() / "manuals_db.py")
-    for i, data in enumerate((src, src.replace(b"\n", b"\r\n"), src.replace(b"\n", b"\r\r\n"))):
+    for i, (data, same) in enumerate(((src, True), (src.replace(b"\n", b"\r\n"), True),
+                                     (src.replace(b"\n", b"\r\r\n"), False))):
         f = tmp_path / f"m{i}.py"
         f.write_bytes(data)
-        assert K._content_sha(f) == want, i
+        assert (K._content_sha(f) == want) is same, i
 
 
 def test_n70_known_errors_in_every_notation_and_the_compiler_messages():
