@@ -36,7 +36,10 @@ tool wishlist (2026-10-18).
 | 0.8.10 | N64 / N68 stubs: only files the plugin shipped are replaced; your own scripts are left alone | `kb_status` → `docs.builders.*.copy_kind`; your `*OLD.py` untouched; pointer written before the stubs |
 | 0.8.10 | N56 stop on request: every block ends at one PLC time | `rec_stop` (cycle, max_delay_ms 100) → footer `stop_on_request`, `rec_verify` PASS with allowance 1, `block_ends` spread ≤ 1 cycle; independent `rec_verify_stream.py` LOSSLESS |
 | 0.8.10 | N39 / N47–N55 `ads_dump` on the TcUnit project | `GVL_TcUnit.TcUnitRunner` read in pieces (no 1802), or named in `failed_roots`, the CSV and the JSON footer; `AdsMessageQueue.ArrayBuffer` → `not expanded` in both files; NULL pointers `0x0000000000000000`; sizes in MiB |
-| 0.8.10 | N46 launcher: a plugin update while another Claude window runs the server | the new venv is built beside the live one and swapped on a later start; the running server keeps working |
+| 0.8.10 | N46 launcher: a plugin update while another Claude window runs the server | the new venv is built beside the live one and swapped on a later start; the running server keeps working; an older pending build never replaces a newer install |
+| 0.8.10 | Python recorder `stop_when` / `max_events` with two or more blocks (engine='python', max_delay_ms 100) | footer `stop_at` (by stop_when), `window_end_ms` = the firing sample's time, `label` COMPLETE, `rec_verify` PASS |
+| 0.8.10 | A recording where one block never delivers (a symbol on a task that is stopped) | `label` INCOMPLETE, block `period_note` "never delivered", `rec_verify` FAIL with `unprovable_blocks` |
+| 0.8.10 | PLCopen `replace` of a CFC / FBD POU, and of an FB with a property (real export) | graphical: refused, copy kept, original untouched; property: `checked_against: xml` and a changed Get body is caught. If the property is refused for a structure reason, send the export |
 | 0.8.9 | Python 3.12 only: the existing plugin venv (built by 0.8.8) on the engineering PC | after `/plugin` update, the first start rebuilds the venv if it was not 3.12 (background install, reconnect); `tc_doctor` → `python` 3.12.10 |
 | 0.8.9 | R42 `ads_dump` on the TcUnit project (`GVL_TcUnit.TestSuiteAddresses`, 1,000 × POINTER TO FB_TestSuite) | `ads_dump()` defaults → `TestSuiteAddresses` 1,000 rows of `0x…` addresses, `MAIN.*` / `GVL_Test.*` present, JSON < 64 MB, no `.partial` left; a forced timeout → no final files, message names the phase |
 | 0.8.9 | R15 `plcopen_import(option='replace')` of a POU living in a folder | `added` names the copy, `replaced` names the original, `copies_removed` the copy; the original has the new text after save + build |
@@ -51,7 +54,7 @@ tool wishlist (2026-10-18).
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
 - D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
-- Retest of 0.8.10 (N38, R40, N41, N42/N40/N69, R24, N37/N66, N64/N68, N65, N67, N46, N39/N47–N55, N56–N63; the hardware rows above).
+- Retest of 0.8.10 (N38, R40, N41, N42/N40/N69, R24, N37/N66, N64/N68, N65, N67, N46, N39/N47–N55, N56–N63, and the review fixes: recorder blocks with < 2 samples, Python stop_when end, dump names, restart proof without a counter reset = "cannot tell"; the hardware rows above).
 - D19 (ESI PDOs read empty): the PDOs are template references (`Ref="TxEL3xxNComplex10-10V"`, `Chn`); the template
   definition's format is unknown here — the ESI file that holds it (e.g. `C:\TwinCAT\3.1\Config\Io\EtherCAT\Beckhoff EL31xx.xml`).
 
@@ -86,6 +89,8 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 | D19 | ESI PDOs that are template references (`Ref=…`, `Chn`) are not resolved — waiting on the ESI file |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
+| launcher POSIX | on Linux / macOS a directory rename succeeds while a server runs from it, so a replaced venv (`.old-*`) can be removed under another window's server; on Windows the rename fails and the venv stays (N46). Windows is the target platform |
+| R40 back-to-back | a restart soon after another (task 1 had run for less than the time the command took) is "cannot tell" by the counter when the counter did not go back; the mode poll and the compile timestamp still prove most cases |
 
 ### From the 0.8.3 deep test
 
