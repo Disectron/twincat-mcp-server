@@ -365,7 +365,7 @@ class App:
             raise ToolError(f"knowledge base call timed out after {timeout:.0f} s (still running in the background)") from exc
         except sqlite3.Error as exc:
             # R37: never an empty "Error executing tool" — say what the database said
-            raise ToolError(f"knowledge database error ({type(exc).__name__}): {exc or 'no detail'}") from exc
+            raise ToolError(f"knowledge database error ({type(exc).__name__}): {str(exc) or 'no detail'}") from exc
 
     async def rec_call(self, fn, *a, timeout: float = 60, **kw) -> Any:
         return await self.ads_call(fn, *a, timeout=timeout, slow=True, **kw)

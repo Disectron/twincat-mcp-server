@@ -58,8 +58,10 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 
 ## Where the data is
 `<kb>` is the knowledge folder of the twincat plugin. It comes from `--kb PATH`, else the environment variable
-`TCMCP_KNOWLEDGE_DIR`, else the folder chosen with `kb_set_location`, else `D:\TwinCAT-MCP\knowledge`. The
-twincat server's `kb_status` shows the folder and both databases.
+`TCMCP_KNOWLEDGE_DIR`, else the folder chosen with `kb_set_location`, else `D:\TwinCAT-MCP\knowledge`. A folder
+set in `twincat_mcp.toml` (`[knowledge] location`) is not seen by the script: take the exact command from the twincat
+server's `kb_status` → `docs.call` (it carries `--kb`). `kb_status` also shows both databases and the PDFs not
+indexed yet.
 
 | Database | Content | Built by |
 |---|---|---|

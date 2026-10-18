@@ -408,6 +408,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     env = sanitize_env(dict(os.environ))
     env.pop("PYTHONHOME", None)  # a stray PYTHONHOME breaks the venv interpreter
+    # the server runs from the venv's site-packages; files beside the package (skills/) are only found from here
+    env["TCMCP_PLUGIN_SRC"] = str(src.resolve())
     return exec_server(vpython, server_args, env)
 
 

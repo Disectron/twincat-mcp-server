@@ -131,6 +131,8 @@ def test_launch_main_installs_once_then_skips(tmp_path, monkeypatch):
     assert launch.main(["--src", str(src), "--venv", str(venv), "--log", "DEBUG"]) == 0
     assert executed[0][1] == ["--log", "DEBUG"], "unknown args pass through to the server"
     assert "TCMCP_MODE" not in executed[0][2]
+    # the server runs from site-packages: the plugin folder (skills/twincat-docs) comes from the launcher
+    assert executed[0][2]["TCMCP_PLUGIN_SRC"] == str(src.resolve())
     assert not any("install" in c and str(src) in c for c in calls), "second start must not reinstall"
 
     # 4. --no-run bootstrap (pre-install step / CI) installs synchronously; --reinstall forces it

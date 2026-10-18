@@ -288,7 +288,7 @@ def test_status_reports_the_offline_documentation_layout(kb):
     loc = _kb_with_docs(tmp)
     k.set_location(str(loc))
     d = k.status()["docs"]
-    assert d["skill"] == "twincat-docs" and str(K.DOCS_SKILL) in d["call"] and str(loc) in d["call"]
+    assert d["skill"] == "twincat-docs" and str(K.docs_skill_path()) in d["call"] and str(loc) in d["call"]
     assert d["infosys"]["exists"] and d["infosys"]["pages"] == 8 and d["infosys"]["books"] == 6
     assert d["infosys"]["package"] == "BKINFOSYS3_FIXTURE_EN-US.mshc" and d["infosys"]["lcid"] == "1033"
     m = d["manuals"]
@@ -299,7 +299,7 @@ def test_status_reports_the_offline_documentation_layout(kb):
     assert d["sop"] == [str(Path("sop") / "scope" / "SOP-scope-display.md")]
     # read-only: nothing next to the databases was created
     assert sorted(p.name for p in (loc / "helpviewer").iterdir()) == ["infosys_en.db"]
-    assert K.DOCS_SKILL.is_file()
+    assert K.docs_skill_path().is_file()
 
 
 def test_set_location_names_the_docs_it_finds(kb):
@@ -320,3 +320,64 @@ def test_hw_lookup_adds_the_manuals_that_mention_the_product(kb):
     assert r["matches"] == 0 and r["manuals"]["EL3102"][0]["doc"] == "CX9020.pdf"
     assert r["manuals"]["EL3102"][0]["pages"] == [2, 4]
     assert "no indexed manual mentions EL2008" in k.hw_lookup("EL2008")["manuals_note"]
+
+
+def test_docs_skill_path_from_the_launcher_not_site_packages(tmp_path, monkeypatch):
+    """Review: the plugin server imports twincat_mcp from its venv's site-packages — skills/ is not beside it there."""
+    plug = tmp_path / "plugin"
+    (plug / "skills" / "twincat-docs").mkdir(parents=True)
+    (plug / "skills" / "twincat-docs" / "kb_docs.py").write_text("#", encoding="utf-8")
+    monkeypatch.setenv("TCMCP_PLUGIN_SRC", str(plug))
+    assert K.docs_skill_path() == plug / "skills" / "twincat-docs" / "kb_docs.py"
+    monkeypatch.setenv("TCMCP_PLUGIN_SRC", str(tmp_path / "nothing"))
+    monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+    monkeypatch.setattr(K, "_SKILL_REL", Path("no") / "such.py")
+    assert K.docs_skill_path() is None
+    k = K.Knowledge(tmp_path / "home")
+    k.set_location(str(tmp_path / "kb"))
+    assert "<twincat-docs skill folder>" in k.docs_layout()["call"]
+
+
+def test_review_relative_paths_shared_labels_low_space_and_configured_folder(kb, project_dir, tmp_path, monkeypatch):
+    k, tmp = kb
+    with pytest.raises(K.KnowledgeError, match="not an absolute path"):
+        k.set_location("kb")
+    k.set_location(str(tmp / "kbdata"))
+    with pytest.raises(K.KnowledgeError, match="not an existing absolute folder"):
+        k.add_project(".")
+    # one label on two folders: remove by label refuses instead of dropping both
+    other = tmp / "other" / "proj"
+    import shutil as _sh
+    _sh.copytree(project_dir, other)
+    k.add_project(str(project_dir))
+    k.add_project(str(other))
+    with pytest.raises(K.KnowledgeError, match="names 2 different folders.*nothing was removed"):
+        k.remove_project("proj")
+    assert len(k.status()["projects"]) == 2
+    # low free space: a warning, the status (and docs) still there
+    real = K.shutil.disk_usage
+    monkeypatch.setattr(K.shutil, "disk_usage", lambda p: type("U", (), {"free": 10 << 20, "total": 0, "used": 0})())
+    st = k.status()
+    assert "GB free" in st["warning"] and "docs" in st and len(st["projects"]) == 2
+    assert k.search("FB_Valve")["hits"]
+    monkeypatch.setattr(K.shutil, "disk_usage", real)
+    # a location configured in the TOML that does not exist yet is created on first use
+    k2 = K.Knowledge(tmp_path / "home2", str(tmp_path / "configured_kb"))
+    assert k2.status()["database"].endswith(K.DB_NAME) and (tmp_path / "configured_kb").is_dir()
+
+
+def test_ro_uri_quotes_and_handles_posix_paths(tmp_path):
+    d = tmp_path / "a b#c"
+    d.mkdir()
+    u = K.ro_uri(d / "x.db")
+    assert u.startswith("file:/") and u.endswith("?mode=ro") and "a%20b%23c" in u and not u.startswith("file://")
+
+
+def test_a_chosen_folder_that_was_deleted_is_reported_not_recreated(kb):
+    import shutil as _sh
+    k, tmp = kb
+    k.set_location(str(tmp / "kbgone"))
+    _sh.rmtree(tmp / "kbgone")
+    with pytest.raises(K.KnowledgeError, match="does not exist"):
+        k.search("x")
+    assert not (tmp / "kbgone").exists()

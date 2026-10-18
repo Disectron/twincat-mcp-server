@@ -204,3 +204,24 @@ def test_fixtures_have_the_builders_schema():
     assert [r[1] for r in m.execute("PRAGMA table_info(doc)")] == ["id", "path", "name", "size", "mtime", "sha256", "title",
                                                                      "pages", "text_pages", "indexed", "backend"]
     assert [r[1] for r in m.execute("PRAGMA table_info(product)")] == ["code", "doc", "page", "n"]
+
+
+def test_review_help_slash_titles_code_headings_and_check_order(kbdir, tmp_path):
+    rc, r = run(kbdir, "--help")
+    assert rc == 0 and "commands" in r
+    # a title with '/' is not mistaken for book/pageid; a '# ' line inside a code block is not a heading
+    import sqlite3
+    db = kbdir / "helpviewer" / "infosys_en.db"
+    c = sqlite3.connect(db)
+    body = "# Send/Receive\nIntro.\n\n## Sample\n```\n# not a heading\nx := 1;\n```\n\n## Notes\nend"
+    c.execute("INSERT INTO page VALUES (?,?,?,?,?,?,?,?)", ("50000001", "tf6310_tc3_tcpip", "Send/Receive", "h-sr", "", "TF6310", "", body))
+    c.execute("INSERT INTO fts(title, body, book, pid) VALUES (?,?,?,?)", ("Send/Receive", body, "tf6310_tc3_tcpip", "50000001"))
+    c.commit()
+    c.close()
+    rc, r = run(kbdir, "docs_page", "ref=Send/Receive")
+    assert rc == 0 and r["ref"] == "tf6310_tc3_tcpip/50000001" and r["outline"] == ["Send/Receive", "Sample", "Notes"]
+    rc, r = run(kbdir, "docs_page", "ref=Send/Receive", "section=Sample")
+    assert "# not a heading" in r["text"] and "end" not in r["text"]
+    # pages are checked before the manual is looked up
+    rc, r = run(kbdir, "manual_page", "doc=nope", "pages=5-40")
+    assert rc == 1 and r["error"] == "bad_param"

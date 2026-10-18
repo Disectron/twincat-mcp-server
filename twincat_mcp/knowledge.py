@@ -46,7 +46,18 @@ POINTER_NAME = "knowledge_location.json"
 # the offline documentation next to knowledge.db (built by the knowledge folder's own tools, read by twincat-docs)
 INFOSYS_DB = ("helpviewer", "infosys_en.db")
 MANUALS_DB = ("manualsdb", "manuals.db")
-DOCS_SKILL = Path(__file__).resolve().parents[1] / "skills" / "twincat-docs" / "kb_docs.py"
+_SKILL_REL = Path("skills") / "twincat-docs" / "kb_docs.py"
+
+
+def docs_skill_path() -> Path | None:
+    """kb_docs.py of the twincat-docs skill. The plugin server runs from its venv's site-packages, so the plugin folder
+    comes from the launcher (TCMCP_PLUGIN_SRC) or Claude Code (CLAUDE_PLUGIN_ROOT); a source checkout has it beside
+    the package."""
+    roots = [os.environ.get("TCMCP_PLUGIN_SRC"), os.environ.get("CLAUDE_PLUGIN_ROOT"), str(Path(__file__).resolve().parents[1])]
+    for r in roots:
+        if r and (Path(r) / _SKILL_REL).is_file():
+            return Path(r) / _SKILL_REL
+    return None
 # project unit kinds kb_search can filter on (aliases: DUT = every data type, FB = FUNCTION_BLOCK)
 UNIT_KINDS = ("PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "PROPERTY", "GET", "SET", "ACTION", "TRANSITION",
               "INTERFACE", "STRUCT", "UNION", "ENUM", "ALIAS", "GVL", "POU", "DUT")
@@ -301,11 +312,25 @@ class Knowledge:
         # R34: no write test on the way in (a read must not write; parallel calls raced on one probe file) and no
         # free-space test (a full disk is not a reason to move the knowledge base) — only a folder that is really
         # gone or became a network/sync/plugin path is reported as unusable
-        problems = check_location(loc, probe=False, space=False)
+        problems = self._usable(loc)
         if problems:
             raise KnowledgeError(f"the knowledge folder {loc} is no longer usable: {'; '.join(problems)}. "
                                  "Ask the user for another folder and call kb_set_location(path=…).")
         return loc
+
+    def _usable(self, loc: Path) -> list[str]:
+        """Problems that make the folder unusable for reading — no write test, no free-space test (R34). A folder
+        configured in the TOML / environment that does not exist yet is created, as the old write probe did; a folder
+        chosen earlier with kb_set_location that has gone is reported (moved or deleted — never silently re-created)."""
+        problems = check_location(loc, probe=False, space=False)
+        if (problems == ["the folder does not exist (moved or deleted?)"] and loc.is_absolute()
+                and self.configured and norm_path(self.configured) == norm_path(loc)):
+            try:
+                loc.mkdir(parents=True, exist_ok=True)
+                problems = check_location(loc, probe=False, space=False)
+            except OSError as exc:
+                problems = [f"it cannot be created ({exc})"]
+        return problems
 
     def ask_text(self) -> str:
         fb = FALLBACK_LOCATION if (os.name == "nt" and Path("D:\\").exists()) else None
@@ -327,6 +352,8 @@ class Knowledge:
             return {"location": str(cur), "database": str(cur / DB_NAME), "source": src, "changed": False,
                     "note": "the location is unchanged — pass path=… (a folder the user named) to choose another one",
                     "docs": self.docs_layout(cur, brief=True)}
+        if not Path(path).expanduser().is_absolute():
+            raise KnowledgeError(f"{path!r} is not an absolute path — give the full folder path the user named")
         p = Path(display_path(path))
         problems = check_location(p)
         if problems:
@@ -374,10 +401,13 @@ class Knowledge:
         if loc is None:
             out["action"] = self.ask_text()
             return out
-        problems = check_location(loc, probe=False)          # R34: a status call writes nothing
+        problems = self._usable(loc)          # R34: no write test on a status call
         if problems:
             out["problems"] = problems
             return out
+        low = [x for x in check_location(loc, probe=False, space=True) if "GB free" in x]
+        if low:
+            out["warning"] = low[0] + " — reads keep working; indexing may fail"
         with self._db() as con:
             out["database"] = str(loc / DB_NAME)
             out["projects"] = [dict(r) for r in con.execute("SELECT path, label, added, indexed, units FROM projects ORDER BY path")]
@@ -390,7 +420,7 @@ class Knowledge:
         twice = [v for v in dup.values() if len(v) > 1]
         if twice:
             out["duplicate_projects"] = (f"{twice} are the same folder (R35, added before 0.8.8 with another spelling) — "
-                                         "kb_add_project or kb_reindex on it merges them")
+                                         "kb_add_project on it merges them into one")
         out["known_errors"] = len(KNOWN_ERRORS)
         out["docs"] = self.docs_layout(loc)
         return out
@@ -403,8 +433,10 @@ class Knowledge:
         if loc is None:
             return {"note": "no knowledge folder chosen yet"}
         tools = loc / "tools"
+        script = docs_skill_path()
         out: dict[str, Any] = {"skill": "twincat-docs",
-                               "call": f'python "{DOCS_SKILL}" status --kb "{loc}"',
+                               "call": (f'python "{script}" status --kb "{loc}"' if script else
+                                        f'python "<twincat-docs skill folder>/kb_docs.py" status --kb "{loc}"'),
                                "infosys": _infosys_info(loc / INFOSYS_DB[0] / INFOSYS_DB[1], tools, brief),
                                "manuals": _manuals_info(loc / MANUALS_DB[0] / MANUALS_DB[1], loc / "manuals", tools, brief)}
         if not brief:
@@ -437,8 +469,10 @@ class Knowledge:
         return [f"{r['label']} ({r['path']})" for r in con.execute("SELECT path, label FROM projects ORDER BY path")]
 
     def add_project(self, path: str, label: str | None = None) -> dict[str, Any]:
-        p = Path(display_path(path)) if path else Path("")
-        if not path or not p.is_absolute() or not p.is_dir():
+        if not path or not Path(path).expanduser().is_absolute():
+            raise KnowledgeError(f"{path!r} is not an existing absolute folder")
+        p = Path(display_path(path))
+        if not p.is_dir():
             raise KnowledgeError(f"{path!r} is not an existing absolute folder")
         merged: list[str] = []
         with self._db() as con:
@@ -467,6 +501,10 @@ class Knowledge:
             hit = self._match_projects(con, path or "")
             if not hit:
                 raise KnowledgeError(f"{path!r} is not in the knowledge base; indexed: {self._project_list(con) or 'none'}")
+            by_folder = {norm_path(r["path"]) for r in hit}
+            if len(by_folder) > 1:
+                raise KnowledgeError(f"the label {path!r} names {len(by_folder)} different folders: "
+                                     f"{[r['path'] for r in hit]} — nothing was removed; pass the folder path")
             n = sum(self._drop_project(con, r["path"]) for r in hit)
         return {"removed": [r["path"] for r in hit], "units_removed": n,
                 "note": "only the index entries were removed; your files are untouched"}
@@ -825,9 +863,21 @@ def _tree_stamp(root: Path) -> str:
     return h.hexdigest()
 
 
+def ro_uri(db: Path) -> str:
+    """SQLite read-only URI: 'file:/C:/x.db', 'file:////server/share/x.db' (Path.as_uri gives a UNC host that SQLite
+    rejects as a URI authority)."""
+    from urllib.parse import quote
+    s = str(db.resolve()).replace("\\", "/")
+    if s.startswith("//"):
+        s = "//" + s
+    elif not s.startswith("/"):
+        s = "/" + s
+    return "file:" + quote(s, safe="/:") + "?mode=ro"
+
+
 def _ro(db: Path) -> sqlite3.Connection:
     """The documentation databases belong to the knowledge folder's own tools: opened read-only, never changed here."""
-    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5, check_same_thread=False)
+    con = sqlite3.connect(ro_uri(db), uri=True, timeout=5, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 

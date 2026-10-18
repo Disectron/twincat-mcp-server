@@ -103,7 +103,9 @@ def parse_argv(argv: list[str]) -> tuple[str | None, dict[str, str], str | None]
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a.startswith("--"):
+        if a in ("--help", "-h") and cmd is None:
+            cmd = "help"
+        elif a.startswith("--"):
             body = a[2:]
             if "=" in body:
                 k, v = body.split("=", 1)
@@ -190,6 +192,15 @@ def kb_root(arg: str | None) -> tuple[Path, str]:
     return Path(FALLBACK_KB), "default (no kb_set_location yet)"
 
 
+def ro_uri(db: Path) -> str:
+    """'file:/C:/kb/x.db?mode=ro' — and 'file:////server/share/x.db' for UNC paths, which Path.as_uri() turns into a
+    host part SQLite refuses."""
+    from urllib.parse import quote
+    s = str(db.resolve()).replace("\\", "/")
+    s = "//" + s if s.startswith("//") else (s if s.startswith("/") else "/" + s)
+    return "file:" + quote(s, safe="/:") + "?mode=ro"
+
+
 class Ctx:
     def __init__(self, kb: Path, kb_source: str):
         self.kb, self.kb_source = kb, kb_source
@@ -210,7 +221,7 @@ class Ctx:
                       f"(knowledge base {self.kb}, from {self.kb_source})",
                       hint=f"build it: {build}; another knowledge folder: --kb PATH "
                            "(the twincat server's kb_status shows the one it uses)")
-        con = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        con = sqlite3.connect(ro_uri(p), uri=True, timeout=5)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only = 1")
         con.create_function("fnm", 2, lambda s, pat: int(fnmatch.fnmatch((s or "").lower(), (pat or "").lower())),
@@ -344,7 +355,9 @@ def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref") -> tuple[sq
         rows = con.execute("SELECT * FROM page WHERE book = ? AND pid = ?", (b, p)).fetchall()
         if not rows:
             rows = con.execute("SELECT * FROM page WHERE book = ? COLLATE NOCASE AND pid = ?", (b, p)).fetchall()
-        return _pick(ctx, rows, ref, None, "book/pageid", what)
+        if rows or p.isdigit():
+            return _pick(ctx, rows, ref, None, "book/pageid", what)
+        # not book/pageid: a title with a slash ('Send/Receive') — go on to the title lookup
     if s.isdigit():
         rows = [r for r in con.execute("SELECT * FROM page WHERE pid = ?", (s,)).fetchall()
                 if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())]
@@ -408,14 +421,17 @@ def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sections(body: str) -> list[tuple[str, str]]:
-    """[(heading text, block text incl. the heading line)]; text before the first heading has heading ''."""
-    parts = re.split(r"(?m)^(#{1,4} .*)$", body)
-    out: list[tuple[str, str]] = []
-    if parts[0].strip():
-        out.append(("", parts[0]))
-    for i in range(1, len(parts), 2):
-        out.append((parts[i].lstrip("#").strip(), parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")))
-    return out
+    """[(heading text, block text incl. the heading line)]; text before the first heading has heading ''. A '# '
+    line inside a ``` block is code, not a heading."""
+    out: list[tuple[str, list[str]]] = [("", [])]
+    fence = False
+    for ln in body.splitlines(keepends=True):
+        if ln.startswith("```"):
+            fence = not fence
+        elif not fence and re.match(r"#{1,4} ", ln):
+            out.append((ln.lstrip("#").strip(), []))
+        out[-1][1].append(ln)
+    return [(h, "".join(b)) for h, b in out if h or "".join(b).strip()]
 
 
 def _intro(body: str) -> str:
@@ -583,8 +599,6 @@ def cmd_manual_toc(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 
 
 def cmd_manual_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
-    con = ctx.con("manuals")
-    d = _one_doc(con, a["doc"])
     m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", a["pages"])
     if not m:
         raise Err("bad_param", f"pages must be N or N-M (got {a['pages']!r})")
@@ -593,6 +607,8 @@ def cmd_manual_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         raise Err("bad_param", f"pages {a['pages']!r}: N >= 1 and M >= N")
     if hi - lo + 1 > 21:
         raise Err("bad_param", f"pages {a['pages']!r} is {hi - lo + 1} pages; at most 21 per call")
+    con = ctx.con("manuals")
+    d = _one_doc(con, a["doc"])
     if hi > (d["pages"] or 0):
         raise Err("bad_param", f"{d['name']} has {d['pages']} pages (asked for {lo}-{hi})")
     out_pages, used, cut = [], 0, None
