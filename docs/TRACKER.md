@@ -28,7 +28,15 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
-| next | builder stubs: the server turns the `tools\` copies into stubs at start; the stubs find the plugin's builders (pointer, else the plugin cache) | `kb_status` → `docs.builders.*.copy_kind: stub`, `tools\*.v1.bak` beside them; `tools\manuals_db.py stats` works; after the next plugin update it runs the new builder without any copy |
+| 0.8.10 | N38 `plcopen_import(option='replace')` on the real shell (A7): export `95_UnitTests.PRG_TcUnitRunner`, import `replace` | `replaced` + `header_renamed` (`PRG_TcUnitRunner_1` → `PRG_TcUnitRunner`), `checked_against: xml`; disk file `PROGRAM PRG_TcUnitRunner`; no `_1` in tree / `.plcproj`; `xae_build` 0 errors. If refused: the error names the differing line — that is TwinCAT's transformation, report it |
+| 0.8.10 | R40 restart proof (B6): `xae_deploy` from CONFIG ×3, from RUN ×3, `xae_restart_twincat` from RUN | `deployed` / `restarted` true every time; `steps.verify.transition_by` mode_change (from CONFIG) or witness/poll (from RUN); `ads_status` RUN |
+| 0.8.10 | N41 / N42 `xae_plc` with two PLC projects (or one) | without `plc_project_path` and two projects → refused; token via `tc_request_confirmation(action='xae_plc', args={...})` → `login:<project>@<NetId>`; a token for B never acts on A |
+| 0.8.10 | R24 / Infosys re-index (INDEXER_VERSION 3): the first lookup after the update re-reads the package in the background | `tc_doctor` → infosys rebuilding, then complete; `infosys_declaration F_GetTaskTime` → `FUNCTION F_GetTaskTime : ULINT`, no `VAR_OUTPUT`, no non-breaking spaces |
+| 0.8.10 | N37 / N66 positional running headers (TEXT_FORMAT 3, re-read once) on the four manuals | EL3356 p46 starts with the heading (no `\| Signal flow diagram`), toc titles without `\|`, p56 without the footer, p80 keeps `Index (hex) Name Meaning …`; CX9020 p23–26 keep `Document name` |
+| 0.8.10 | N64 / N68 stubs: only files the plugin shipped are replaced; your own scripts are left alone | `kb_status` → `docs.builders.*.copy_kind`; your `*OLD.py` untouched; pointer written before the stubs |
+| 0.8.10 | N56 stop on request: every block ends at one PLC time | `rec_stop` (cycle, max_delay_ms 100) → footer `stop_on_request`, `rec_verify` PASS with allowance 1, `block_ends` spread ≤ 1 cycle; independent `rec_verify_stream.py` LOSSLESS |
+| 0.8.10 | N39 / N47–N55 `ads_dump` on the TcUnit project | `GVL_TcUnit.TcUnitRunner` read in pieces (no 1802), or named in `failed_roots`, the CSV and the JSON footer; `AdsMessageQueue.ArrayBuffer` → `not expanded` in both files; NULL pointers `0x0000000000000000`; sizes in MiB |
+| 0.8.10 | N46 launcher: a plugin update while another Claude window runs the server | the new venv is built beside the live one and swapped on a later start; the running server keeps working |
 | 0.8.9 | Python 3.12 only: the existing plugin venv (built by 0.8.8) on the engineering PC | after `/plugin` update, the first start rebuilds the venv if it was not 3.12 (background install, reconnect); `tc_doctor` → `python` 3.12.10 |
 | 0.8.9 | R42 `ads_dump` on the TcUnit project (`GVL_TcUnit.TestSuiteAddresses`, 1,000 × POINTER TO FB_TestSuite) | `ads_dump()` defaults → `TestSuiteAddresses` 1,000 rows of `0x…` addresses, `MAIN.*` / `GVL_Test.*` present, JSON < 64 MB, no `.partial` left; a forced timeout → no final files, message names the phase |
 | 0.8.9 | R15 `plcopen_import(option='replace')` of a POU living in a folder | `added` names the copy, `replaced` names the original, `copies_removed` the copy; the original has the new text after save + build |
@@ -43,8 +51,7 @@ tool wishlist (2026-10-18).
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
 - D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
-- Retest of 0.8.9 (the 0.8.8 retest items R42, #10, R7, R41, R15, R23, R11, R24, R32, N31, N32, N34–N37; builders).
-- Knowledge folder: after the plugin update the server turns `tools\infosys_local.py` / `manuals_db.py` into stubs (old copies kept as `.bak`); the slim README.md (no builder internals) replaces the old one once.
+- Retest of 0.8.10 (N38, R40, N41, N42/N40/N69, R24, N37/N66, N64/N68, N65, N67, N46, N39/N47–N55, N56–N63; the hardware rows above).
 - D19 (ESI PDOs read empty): the PDOs are template references (`Ref="TxEL3xxNComplex10-10V"`, `Chn`); the template
   definition's format is unknown here — the ESI file that holds it (e.g. `C:\TwinCAT\3.1\Config\Io\EtherCAT\Beckhoff EL31xx.xml`).
 
@@ -74,7 +81,8 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 | #45 | Check all objects did not run — 0.8.7 calls `ITcPlcIECProject2.CheckAllObjects` first (unverified, above) |
 | infosys index twice | the `infosys_*` tools keep their own index of the Help Viewer package (`<kb>\infosys\helpviewer-1033`, ≈ 372 MB) next to `helpviewer\infosys_en.db`; one index (the tools reading `infosys_en.db`) is open — docs-skill spec §8 |
 | SOP indexing | `sop\*.md` listed by `kb_status`, not searchable yet (decided: index them; wishlist above) |
-| R32 (part) | Infosys "T_Ams NetId" table split — 0.8.9 joins it when a page is read (declared name or Type column); the cause in the real HTML is not seen yet (unverified, above) |
+| R32 (part) | Infosys "T_Ams NetId" table split — 0.8.9 joins it when a page is read (declared name or Type column), verified in the 0.8.9 retest; the cause in the raw HTML is still not seen |
+| infosys NBSP | the knowledge-folder index (`infosys_en.db`, builder) stores code with non-breaking spaces; `kb_docs.py` cleans them when it reads — the builder should store plain spaces (index format change, rebuild) |
 | D19 | ESI PDOs that are template references (`Ref=…`, `Chn`) are not resolved — waiting on the ESI file |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
