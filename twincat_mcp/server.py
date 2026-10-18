@@ -11,7 +11,8 @@ Tool prefixes
   infosys_* Beckhoff Infosys reference (TwinCAT 3 docs from the local Help Viewer package, offline)
 
 Confirmation for destructive operations: if the MCP client supports
-elicitation, the human is asked directly (``ctx.elicit``); otherwise the
+elicitation, the human is asked directly (prompting.ask: returned as an input_required
+result on MCP 2026-07-28, an elicitation request on earlier revisions); otherwise the
 two-step confirm_token flow applies (``tc_request_confirmation``).
 """
 from __future__ import annotations
@@ -34,6 +35,10 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+import functools
+import secrets
+
+from mcp import MCPError
 from mcp.server.mcpserver import MCPServer, Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -61,6 +66,7 @@ from . import profiles as capture
 from . import knowledge as K
 from .recorder import read_footer as K_footer
 from . import experiments as X
+from . import prompting as ASK
 from pathlib import Path
 
 INSTRUCTIONS = """\
@@ -1209,20 +1215,23 @@ class App:
                   f"Machine: {scope}   Mode: {self.guard.mode}\n"
                   f"Effect: {effect}\n"
                   f"Accept only if you intend this to happen now.")
-        t_prompt = time.monotonic()
+        # N89: on MCP 2026-07-28 the server cannot send elicitation/create — the question is returned to the client
+        # (input_required) and answered on the next round of this same call; earlier revisions get the request
         try:
-            res = await ctx.elicit(prompt, ConfirmSchema)
-        except Exception as exc:  # noqa: BLE001 — client has no elicitation support
-            self.guard.audit(action, {"target": target, "scope": scope}, op, "refused",
-                             f"needs confirm_token; client has no elicitation ({type(exc).__name__})")
+            res, answered_s = await ASK.ask(ctx, prompt, ConfirmSchema)
+        except ASK.AskUser:
+            self.guard.audit(action, {"target": target, "scope": scope}, op, "asked",
+                             "confirmation prompt returned to the client (input_required)")
+            raise
+        except ASK.NoPrompt as exc:
+            # N90: say what blocks the prompt (the client's declared capability, the transport) — not a guess
+            self.guard.audit(action, {"target": target, "scope": scope}, op, "refused", f"needs confirm_token: {exc}")
             raise ToolError(
-                f"{action} on {target!r} needs confirmation and this client does not support "
-                f"elicitation ({type(exc).__name__}). Call tc_request_confirmation(action={action!r}, "
-                f"target={target!r}) and pass the confirm_token."
-            ) from exc
-        answered_s = round(time.monotonic() - t_prompt, 2)
-        timing = {"prompt_open_s": answered_s}
-        if answered_s < 1.5:
+                f"{action} on {target!r} needs confirmation and no confirmation prompt can be shown in this session: "
+                f"{exc}. Call tc_request_confirmation(action={action!r}, target={target!r}) and pass the "
+                "confirm_token.") from exc
+        timing: dict[str, Any] = {"prompt_open_s": answered_s}
+        if answered_s is not None and answered_s < 1.5:
             timing["fast_answer"] = "answered in under 1.5 s — check that the operator saw and read the prompt"
         if res.action == "accept" and res.data is not None and res.data.confirm:
             self.guard.audit(action, {"target": target, "scope": scope}, op, "human-confirmed-elicitation", timing)
@@ -1243,6 +1252,13 @@ class App:
         with the message — so the trail never ends at 'human-confirmed' for a command that then failed."""
         try:
             res = await coro
+        except asyncio.CancelledError:
+            # mcp 2.x cancels the handler when the client gives up (stop / timeout): a job that had not started is
+            # withdrawn by its worker; one that had started runs on in its thread (asked to stop where it can)
+            self.guard.audit(tool, args, op, "cancelled",
+                             "the client gave up waiting: a command already running in TwinCAT / XAE may still "
+                             "complete — check the state (ads_status, xae_status) before repeating it")
+            raise
         except BaseException as exc:
             self.guard.audit(tool, args, op, "error", str(exc)[:400])
             raise
@@ -1426,22 +1442,79 @@ def connection_instructions(app: "App") -> str:
     return INSTRUCTIONS + line + "\n"
 
 
+def _exc_text(exc: BaseException) -> str:
+    return str(exc) or f"{type(exc).__name__} (no message)"
+
+
+def _deliberate(exc: BaseException) -> bool:
+    """An error this server raises on purpose, or one from the OS / database / ADS whose text is the explanation —
+    as opposed to a defect (KeyError, TypeError … from a bug)."""
+    return (type(exc).__module__.startswith("twincat_mcp")
+            or isinstance(exc, (OSError, sqlite3.Error, ValueError, pyads.ADSError)))
+
+
+def _tool_boundary(fn: Any) -> Any:
+    """What leaves a tool. mcp >= 2.1 passes only a ToolError's text to the client — any other exception arrives as a
+    bare "Error executing tool X" (R37: never an empty error): a deliberate error keeps its text; a defect says its
+    type and message and is logged with its traceback under a crash id. A question for the user (prompting.AskUser)
+    is this round's result. MCPError (a protocol error) and cancellation pass through."""
+    name = getattr(fn, "__name__", "tool")
+
+    @functools.wraps(fn)
+    async def run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await fn(*args, **kwargs)
+        except ASK.AskUser as ask:
+            return ask.result
+        except (ToolError, MCPError):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if _deliberate(exc):
+                raise ToolError(_exc_text(exc)) from exc
+            cid = secrets.token_hex(4)
+            log.error("tool %s: crash %s", name, cid, exc_info=exc)
+            raise ToolError(f"internal error in {name} ({type(exc).__name__}: {str(exc)[:300] or 'no message'}) — a "
+                            f"defect in twincat-mcp, not in the call; its traceback is in the server log as crash "
+                            f"{cid}") from exc
+    return run
+
+
+class TcMcpServer(MCPServer):
+    """MCPServer whose tools go through _tool_boundary."""
+
+    def tool(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        register = super().tool(*args, **kwargs)
+
+        def decorator(fn: Any) -> Any:
+            register(_tool_boundary(fn))
+            return fn                     # the closure keeps the plain function (tools that call each other)
+        return decorator
+
+
 def build_server(cfg: Config | None = None) -> MCPServer:
     cfg = cfg or load_config()
     app = App(cfg)
-    mcp = MCPServer("twincat-mcp", instructions=connection_instructions(app), version=__version__)
+    # subscriptions=False: nothing here publishes a change (resources are read on demand, the tool list is fixed at
+    # start), so subscribe / listChanged are not advertised (mcp 2.3)
+    mcp = TcMcpServer("twincat-mcp", instructions=connection_instructions(app), version=__version__,
+                      subscriptions=False)
 
     # ======================================================================
     # tc_* meta
     # ======================================================================
     @mcp.tool(annotations=READ)
-    async def tc_doctor(verbose: bool = False) -> dict[str, Any]:
+    async def tc_doctor(verbose: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Environment check: platform, pyads/router, local AMS NetId, XAE ProgIDs in the
-        registry, running XAE shells, project root, safety mode. Run this first. Starts with a one-line `summary`;
-        verbose=true adds the full loaded configuration."""
+        registry, running XAE shells, project root, safety mode, whether a confirmation prompt can reach the user
+        in this session (`elicitation`: the negotiated MCP revision and the client's declared capability). Run this
+        first. Starts with a one-line `summary`; verbose=true adds the full loaded configuration."""
         rep: dict[str, Any] = {"version": __version__, "python": sys.version.split()[0],
                                "platform": platform.platform(), "windows": is_windows(),
                                "safety": app.guard.status()}
+        el = ASK.report(ctx, cfg.safety.allow_elicitation)
+        rep["elicitation"] = el
+        infos_el = None if el["works"] or not cfg.safety.allow_elicitation else (
+            f"confirmation prompts cannot reach the user here ({el['why']}): confirmations need tc_request_confirmation")
         if cfg.warnings:
             rep["config_FIX_THESE"] = list(cfg.warnings)
         if cfg.overrides:
@@ -1523,6 +1596,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 infos.append("offline docs: manuals index " + ds["manuals"])
         except Exception as exc:  # noqa: BLE001
             rep["offline_docs"] = {"error": f"{type(exc).__name__}: {exc}"}
+        if infos_el:
+            infos.append(infos_el)
         problems = [k for k, v in rep.items() if isinstance(v, str) and v.startswith("FAIL")]
         if cfg.warnings:
             problems.append("config_FIX_THESE")
@@ -2209,11 +2284,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
              f"recording runs (saved as .svdx + CSV next to the recording)?")
         if ctx is not None and app.cfg.safety.allow_elicitation:
             try:
-                ans = await ctx.elicit(q, AlsoScopeSchema)
+                ans, _open_s = await ASK.ask(ctx, q, AlsoScopeSchema)     # AskUser: this round returns the question
                 if ans.action == "accept" and ans.data is not None:
                     return name if ans.data.also_scope else None
-            except Exception:  # noqa: BLE001 — no elicitation in this client: fall through to asking via the agent
-                pass
+            except ASK.NoPrompt:
+                pass                                   # no prompt in this session: the agent asks (below)
         raise ToolError(f"recorder.also_scope = 'ask': {q} Ask the user, then call rec_start again with also_scope=true "
                         f"(scope=<name> if several) or also_scope=false. Nothing was started. "
                         f"([recorder] also_scope = 'always' / 'never' makes this permanent.)")

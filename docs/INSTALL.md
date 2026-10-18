@@ -290,7 +290,9 @@ Behaviours that look like failures and are not (0.6.2 / 0.6.3):
   `ads_write_many` writes nothing if any item would be refused, and lists every problem.
 - A confirmation prompt now starts with `DESTRUCTIVE:` or `MACHINE CONTROL:` and names target, machine, mode and
   effect. `tc_audit_tail` shows `prompt_open_s`; `fast_answer` marks an accept under 1.5 s. If prompts get clicked
-  through, set `allow_elicitation = false` and approve with tokens instead.
+  through, set `allow_elicitation = false` and approve with tokens instead. Whether a prompt can reach you at all
+  depends on the client: `tc_doctor` → `elicitation` names the MCP revision in use, how the question travels
+  (`input_required` on 2026-07-28, `server_request` before) and whether the client declared the capability.
 - `ipc_eventlog` is confirmed as `tc_request_confirmation(action='ipc_eventlog', target='Application')`.
   An empty result with `note: … not registered` and `providers_on_target` means the default provider name does not
   exist on this TwinCAT build — pass one of the listed names.
