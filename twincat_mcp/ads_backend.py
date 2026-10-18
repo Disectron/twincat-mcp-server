@@ -35,7 +35,7 @@ from pyads.structs import AmsAddr
 
 from .config import AdsConfig
 from . import types_tc as T
-from .ads_types import TypeSystem, Leaf, parse_table, _RE_INDIRECT
+from .ads_types import TypeSystem, Leaf, WalkCancelled, parse_table
 
 SYSTEM_SERVICE_PORT = 10000
 ROUTER_PORT = 1
@@ -76,6 +76,10 @@ def _is_iface_name(ts: Any, type_name: str) -> bool:
     return is_interface(e)
 
 
+MIB = 1024 * 1024                 # ads_dump: max_total_mb and every size it reports are MiB (N53)
+_DUMP_CHUNK = 256 * 1024          # N39: one ADS read never asks for more (ADS 1802 'out of memory' on big symbols)
+
+
 class AdsError(RuntimeError):
     pass
 
@@ -111,6 +115,10 @@ class AdsBackend:
         self.ip: str | None = cfg.ip_address
         self.port: int = cfg.ams_port
         self.cancel = threading.Event()   # set by the worker when a tool call times out / is cancelled
+        self.dump_progress: dict[str, Any] = {}
+        # N52: the dump's commit (rename into place) and the timeout's verdict ("kept" / "not kept") are decided under
+        # this lock, so the client is never told "nothing is kept" for files that were renamed into place
+        self._dump_lock = threading.Lock()
 
     # ------------------------------------------------------------ connections
     def _key(self, port: int | None, net_id: str | None) -> tuple[str | None, int]:
@@ -538,14 +546,15 @@ class AdsBackend:
             out["comment"] = s.comment
         return out
 
-    def dump(self, pattern: str | None, include_system: bool, out_dir: str, max_total_bytes: int = 64 * 1024 * 1024,
+    def dump(self, pattern: str | None, include_system: bool, out_dir: str, max_total_bytes: int = 64 * MIB,
              max_leaves: int = 500_000, port: int | None = None, cancel: Any = None,
              own_roots: set[str] | None = None) -> dict[str, Any]:
         """Read every variable (every root symbol, fully expanded) and write JSON + CSV. Written as *.partial and
         renamed when complete; a failed or cancelled dump leaves no file behind and says so (R8). R42: pointers are
-        addresses (never the pointee), one leaf budget for CSV and JSON, max_total_bytes counts what is WRITTEN, the
-        JSON is streamed root by root, the project's own roots come first, and a dump whose call already ended (the
-        client's timeout set `cancel`) is never renamed into place."""
+        addresses (never the pointee), one leaf budget for CSV and JSON, max_total_bytes counts the bytes WRITTEN,
+        the JSON is streamed root by root. N52: the rename into place happens under _dump_lock after a last cancel
+        check, both renames or neither (rolled back on a file error); dump_outcome() gives the timeout its verdict
+        under the same lock."""
         import os
         from pathlib import Path
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -553,7 +562,8 @@ class AdsBackend:
         cpath = Path(out_dir) / f"dump-{stamp}.csv"
         jpart, cpart = jpath.with_name(jpath.name + ".partial"), cpath.with_name(cpath.name + ".partial")
         os.makedirs(out_dir, exist_ok=True)
-        self.dump_progress = {"phase": "listing the symbols", "started": time.time()}
+        with self._dump_lock:
+            self.dump_progress = {"phase": "listing the symbols", "started": time.time()}
 
         def drop() -> list[str]:
             removed = []
@@ -566,31 +576,58 @@ class AdsBackend:
                 except OSError:
                     pass
             return removed
-        try:
-            res = self._dump(pattern, include_system, cpart, jpart, max_total_bytes, max_leaves, port, cancel, own_roots)
-            if cancel is not None and cancel.is_set():
-                raise AdsError("cancelled: the call had already ended (timeout) — the files are not kept")
-        except BaseException as exc:
+
+        def fail(msg: str, exc: BaseException | None = None) -> AdsError:
             removed = drop()
             self.dump_progress["phase"] = "failed"
-            msg = f"ads_dump failed: {_fmt_exc(exc) if not isinstance(exc, AdsError) else exc}"
-            raise AdsError(msg + (f" — partial files removed: {removed}" if removed else "")) from exc
-        os.replace(cpart, cpath)
-        os.replace(jpart, jpath)
-        self.dump_progress["phase"] = "done"
+            self.dump_progress["error"] = msg
+            return AdsError(msg + (f" — partial files removed: {removed}" if removed else ""))
+        try:
+            res = self._dump(pattern, include_system, cpart, jpart, max_total_bytes, max_leaves, port, cancel, own_roots)
+        except BaseException as exc:
+            with self._dump_lock:
+                raise fail(f"ads_dump failed: {_fmt_exc(exc) if not isinstance(exc, AdsError) else exc}") from exc
+        with self._dump_lock:
+            if cancel is not None and cancel.is_set():
+                raise fail("ads_dump cancelled: the call had already ended (timeout) — the files are not kept")
+            try:
+                os.replace(cpart, cpath)
+                try:
+                    os.replace(jpart, jpath)
+                except OSError:
+                    os.replace(cpath, cpart)          # both or neither: the CSV goes back to .partial
+                    raise
+            except OSError as exc:
+                raise fail(f"ads_dump: the finished files could not be moved into place (a file error, not an ADS "
+                           f"error): {exc}") from exc
+            self.dump_progress.update(phase="done", files=[str(cpath), str(jpath)])
         res.update({"json": str(jpath), "csv": str(cpath)})
         return res
 
+    def dump_outcome(self) -> dict[str, Any]:
+        """The dump's state, read under the commit lock (N52): 'done' with the files when it was renamed into place,
+        anything else means it is not (and, once the cancel event is set, will not be) kept."""
+        with self._dump_lock:
+            return dict(self.dump_progress)
+
     def _dump(self, pattern: str | None, include_system: bool, cpath: Any, jpath: Any, max_total_bytes: int,
               max_leaves: int, port: int | None, cancel: Any, own_roots: set[str] | None = None) -> dict[str, Any]:
+        """One pass over the roots. CSV and JSON come from the SAME decoded leaves (N48/N50: the JSON tree is
+        nested from the leaf values, so the two files cannot disagree); a root is read in bounded chunks only where
+        a leaf needs bytes (N39/N47: never one read of a huge symbol, never a huge root in RAM); the byte budget is
+        checked after every row (N47) and the cancel event inside the leaf walk, the row loop and the chunk reads
+        (N55). A root that cannot be read is named in the result, the JSON footer and a CSV row (N49)."""
         import csv, json
         c = self.conn(port)
-        ts = self.typesystem(False, port)
-        roots = _dump_order(self.roots(pattern, include_system, port), own_roots)
+        table = self.typesystem(False, port)
+        ts = table if table is not None else TypeSystem({})
+        listed = self.roots(pattern, include_system, port)
+        roots = _dump_order(listed, own_roots)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         n_leaves = 0
-        n_bytes = 0
+        n_read = 0
         errors: list[dict[str, str]] = []
+        failed: list[dict[str, str]] = []
         skipped: list[dict[str, str]] = []
         sizes: list[dict[str, Any]] = []
         preview: list[dict[str, Any]] = []
@@ -601,92 +638,109 @@ class AdsBackend:
         def cancelled() -> bool:
             return cancel is not None and cancel.is_set()
 
-        with open(cpath, "w", newline="", encoding="utf-8") as fh, open(jpath, "w", encoding="utf-8") as jh:
-            cw = _Counting(fh)
-            jw = _Counting(jh)
+        def stop(where: str) -> AdsError:
+            return AdsError(f"cancelled {where} — the call timed out or was stopped")
+
+        with open(cpath, "wb") as fh, open(jpath, "wb") as jh:
+            cw, jw = _Counting(fh), _Counting(jh)
             w = csv.writer(cw)
-            w.writerow(["path", "type", "value"])
+            w.writerow(["path", "type", "value", "note"])
             jw.write('{"target": ' + json.dumps(self.target_label()) + ', "taken": ' + json.dumps(stamp) + ', "values": {')
             first = True
             for i, r in enumerate(roots):
                 if cancelled():
-                    raise AdsError(f"cancelled at root {i + 1} of {len(roots)} ({r.name}) — the call timed out or was stopped")
+                    raise stop(f"at root {i + 1} of {len(roots)} ({r.name})")
                 if truncated:
                     skipped.append({"root": r.name, "reason": truncated})
                     continue
                 if cw.n + jw.n >= max_total_bytes or n_leaves >= max_leaves:
-                    truncated = ("size limit: max_total_mb written" if cw.n + jw.n >= max_total_bytes
-                                 else f"leaf limit: max_leaves {max_leaves}")
+                    truncated = (f"size limit: max_total_mb ({max_total_bytes / MIB:g} MiB) written"
+                                 if cw.n + jw.n >= max_total_bytes else f"leaf limit: max_leaves {max_leaves}")
                     skipped.append({"root": r.name, "reason": truncated})
                     continue
-                prog.update(phase="reading", root=r.name, index=i + 1, of=len(roots), leaves=n_leaves,
-                            written_mb=round((cw.n + jw.n) / 1e6, 1))
+                prog.update(phase="listing leaves", root=r.name, index=i + 1, of=len(roots), leaves=n_leaves,
+                            written_mib=round((cw.n + jw.n) / MIB, 2))
+                left = max_leaves - n_leaves
                 try:
-                    raw = bytes(c.read(r.index_group, r.index_offset, ctypes.c_ubyte * max(r.size, 1), return_ctypes=True, check_length=False))
-                except Exception as exc:  # noqa: BLE001
-                    errors.append({"symbol": r.name, "error": _fmt_exc(exc)})
-                    continue
-                n_bytes += len(raw)
+                    lv = ts.leaves(r.name, r.type, left + 1, size=r.size, cancel=cancelled)
+                except WalkCancelled as exc:
+                    raise stop(f"while listing the leaves of {r.name}") from exc
+                cut = len(lv) > left
+                lv = lv[:left]
+                # bytes past the last one any leaf needs are never requested (a value that is not expanded needs
+                # only its head): an 8 MiB buffer costs one 64-byte read
+                reader = _RootReader(c, r, cancelled, need_end=max((x.offset + x.need for x in lv), default=0))
+                vals: dict[str, Any] = {}
                 c0, j0 = cw.n, jw.n
-                prog["phase"] = "decoding"
-                if ts is not None and ts.get(r.type) is not None:
-                    left = max_leaves - n_leaves
-                    lv = ts.leaves(r.name, r.type, left + 1, size=r.size)
-                    cut = len(lv) > left
-                    lv = lv[:left]
-                    prog["phase"] = "writing CSV"
-                    vals: dict[str, Any] = {}
-                    for k, leaf in enumerate(lv):
-                        val = ts.decode_leaf(raw, leaf) if leaf.size else None
-                        w.writerow([leaf.path, leaf.type, _csv_val(val)])
-                        if cut:
-                            vals[leaf.path] = val
-                        if len(preview) < 50:
-                            preview.append({"path": leaf.path, "type": leaf.type, "value": val})
-                        if k % 256 == 255:
-                            if k % 2048 == 2047 and cancelled():
-                                raise AdsError(f"cancelled while writing {r.name} — the call timed out or was stopped")
-                            # this root's JSON is not written yet: count it as large as its CSV rows (review: the
-                            # in-flight root could reach about twice max_total_mb)
-                            if cw.n + jw.n + (cw.n - c0) >= max_total_bytes:
-                                cut = True
-                                lv = lv[:k + 1]
-                                vals = {x.path: vals.get(x.path) for x in lv} if vals else {
-                                    x.path: (ts.decode_leaf(raw, x) if x.size else None) for x in lv}
-                                break
-                    n_leaves += len(lv)
-                    prog["phase"] = "writing JSON"
-                    if cut:
-                        # this root did not fit: its JSON is the leaves that were written, flat, and marked
-                        node: Any = {"_truncated": True, "_leaves": vals}
-                        truncated = truncated or (f"leaf limit: max_leaves {max_leaves}" if n_leaves >= max_leaves
-                                                  else "size limit: max_total_mb written")
-                    else:
-                        node = ts.decode_tree(raw, r.type, size=r.size)
-                else:
-                    node = (T.fmt_pointer(int.from_bytes(raw, "little"), len(raw))
-                            if _RE_INDIRECT.match(r.type or "") and len(raw) in (4, 8)
-                            else TypeSystem._decode_scalar(raw, 0, r.type, None, None))
-                    w.writerow([r.name, r.type, _csv_val(node)])
-                    n_leaves += 1
-                    lv = [None]
+                read_error: str | None = None
+                prog["phase"] = "reading and writing"
+                for k, leaf in enumerate(lv):
+                    if k % 256 == 255 and cancelled():
+                        raise stop(f"while writing {r.name} (leaf {k + 1} of {len(lv)})")
+                    try:
+                        val = ts.decode_leaf(reader.get(leaf.offset, leaf.need), _at_zero(leaf)) if leaf.size else None
+                    except _DumpCancelled as exc:
+                        raise stop(f"while reading {r.name}") from exc
+                    except _ReadFailed as exc:
+                        read_error = str(exc)
+                        break
+                    w.writerow([leaf.path, leaf.type, _csv_val(val), _leaf_note(leaf, val)])
+                    vals[leaf.path] = val
                     if len(preview) < 50:
-                        preview.append({"path": r.name, "type": r.type, "value": node})
+                        preview.append({"path": leaf.path, "type": leaf.type, "value": val})
+                    # N47: the budget is checked after every row; the root's JSON (not written yet) is counted as
+                    # large as its CSV rows
+                    if cw.n + jw.n + (cw.n - c0) >= max_total_bytes and k < len(lv) - 1:
+                        cut = True
+                        truncated = f"size limit: max_total_mb ({max_total_bytes / MIB:g} MiB) written"
+                        break
+                n_leaves += len(vals)
+                n_read += reader.bytes_read
+                tree = _nest(r.name, vals)
+                if read_error is not None:
+                    # N49: a root (or the rest of one) that could not be read is never silent
+                    errors.append({"symbol": r.name, "error": read_error})
+                    failed.append({"root": r.name, "error": read_error, "leaves_written": len(vals)})
+                    skipped.append({"root": r.name, "reason": f"not read: {read_error}" if not vals else
+                                    f"read stopped after {len(vals)} of {len(lv)} leaves: {read_error}"})
+                    w.writerow([r.name, r.type, "", f"NOT READ: {read_error}" if not vals else
+                                f"INCOMPLETE: read stopped after {len(vals)} of {len(lv)} leaves: {read_error}"])
+                    node: Any = {"_not_read": read_error} if not vals else {"_incomplete": read_error, "_partial": tree}
+                elif cut:
+                    truncated = truncated or (f"leaf limit: max_leaves {max_leaves}" if n_leaves >= max_leaves
+                                              else f"size limit: max_total_mb ({max_total_bytes / MIB:g} MiB) written")
+                    skipped.append({"root": r.name, "reason": f"cut after {len(vals)} leaves: {truncated}"})
+                    node = {"_truncated": True, "_reason": truncated, "_partial": tree}
+                else:
+                    node = tree
                 jw.write(("" if first else ",") + "\n" + json.dumps(r.name) + ": " + _json_strict(node))
                 first = False
-                sizes.append({"root": r.name, "leaves": len(lv), "csv_bytes": cw.n - c0, "json_bytes": jw.n - j0})
-            jw.write("\n}, " + json.dumps({"roots": len(roots), "leaves": n_leaves, "truncated": bool(truncated)})[1:] + "\n")
-        out = {"roots": len(roots), "leaves": n_leaves, "bytes_read": n_bytes, "csv_bytes": cw.n, "json_bytes": jw.n,
-               "duration_s": round(time.time() - t0, 2), "datatype_table": ts is not None, "truncated": bool(truncated),
+                sizes.append({"root": r.name, "leaves": len(vals), "bytes_read": reader.bytes_read,
+                              "csv_bytes": cw.n - c0, "json_bytes": jw.n - j0})
+            complete = not truncated and not failed
+            jw.write("\n}, " + json.dumps({"roots": len(roots), "leaves": n_leaves, "complete": complete,
+                                           "truncated": bool(truncated), "truncated_reason": truncated,
+                                           "failed_roots": failed[:200], "failed_total": len(failed),
+                                           "skipped_roots": skipped[:200], "skipped_total": len(skipped)})[1:] + "\n")
+        out = {"roots": len(roots), "leaves": n_leaves, "bytes_read": n_read, "csv_bytes": cw.n, "json_bytes": jw.n,
+               "limit_mib": round(max_total_bytes / MIB, 3), "duration_s": round(time.time() - t0, 2),
+               "datatype_table": table is not None, "complete": complete, "truncated": bool(truncated),
                "errors": errors[:50], "errors_total": len(errors),
                "largest_roots": sorted(sizes, key=lambda x: -(x["csv_bytes"] + x["json_bytes"]))[:10],
+               "order": (f"the project's own programs and GVLs first ({len(own_roots)} known), then the rest"
+                         if own_roots else "alphabetical — the project's own programs/GVLs are unknown (no project "
+                         "configured), so library roots are not put last"),
                "preview": preview}
-        if truncated:
-            out["truncated_reason"] = truncated
+        if failed:
+            out["failed_roots"] = failed[:50]
+        if truncated or failed:
             out["skipped_roots"] = skipped[:50]
             out["skipped_total"] = len(skipped)
-            out["hint"] = ("the dump was cut — raise max_leaves / max_total_mb, or dump the rest with pattern= "
-                           "(skipped_roots lists what is missing)")
+        if truncated:
+            out["truncated_reason"] = truncated
+        if not complete:
+            out["hint"] = ("the dump is not complete — skipped_roots says what is missing and why (cut by max_leaves / "
+                           "max_total_mb, or not readable); raise the limits or dump the rest with pattern=")
         return out
 
     # ------------------------------------------------------------ read / write
@@ -714,12 +768,12 @@ class AdsBackend:
         out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
         if tt.kind == "enum" and not isinstance(val, (bytes, bytearray)) and self.is_interface_type(s.type, port):
             out["value"] = T.fmt_pointer(val, s.size)
-            out["note"] = "INTERFACE variable: the value is the address of the assigned FB instance (null = unassigned)"
+            out["note"] = "INTERFACE variable: the value is the address of the assigned FB instance (0x0…0 = unassigned)"
             return out
         if tt.kind == "array" and tt.elem is not None and tt.elem.kind == "enum" and isinstance(val, (list, tuple)) \
                 and self.is_interface_type(tt.elem.name, port):
             out["value"] = [T.fmt_pointer(v, tt.elem.size) for v in val]
-            out["note"] = "ARRAY OF INTERFACE: each value is the address of the assigned FB instance (null = unassigned)"
+            out["note"] = "ARRAY OF INTERFACE: each value is the address of the assigned FB instance (0x0…0 = unassigned)"
             return out
         if isinstance(val, (bytes, bytearray)):
             out["raw_hex"] = val.hex()
@@ -1276,28 +1330,134 @@ def _json_strict(v: Any) -> str:
 
 
 class _Counting:
-    """File wrapper that counts the characters written (R42: max_total_mb bounds what is written, not what is read)."""
+    """Text writer over a binary file that counts the UTF-8 BYTES written (N53; R42: max_total_mb bounds what is
+    written, not what is read). csv.writer and the JSON stream write str; one encode per write."""
 
     def __init__(self, fh: Any):
         self.fh, self.n = fh, 0
 
     def write(self, s: str) -> int:
-        self.n += len(s)
-        return self.fh.write(s)
+        b = s.encode("utf-8")
+        self.n += len(b)
+        self.fh.write(b)
+        return len(s)
 
 
-_LIBRARY_GLOBALS = ("gvl_tcunit", "gvl_param_tcunit", "global_variables", "global_version", "constants", "tcunit",
-                    "param_", "gvl_param_")
+class _ReadFailed(Exception):
+    pass
+
+
+class _DumpCancelled(Exception):
+    pass
+
+
+class _RootReader:
+    """The bytes of one root symbol, read in bounded chunks only where a leaf needs them (N39/N47/N55): a root up to
+    one chunk is read in one request as before; a bigger one is never read whole, never held whole in RAM, and the
+    cancel event is checked before every request. The symbol's index offset is linear (PLC memory areas)."""
+
+    def __init__(self, conn: Any, sym: "SymbolEntry", cancelled: Callable[[], bool], chunk: int = _DUMP_CHUNK,
+                 need_end: int | None = None):
+        self.c, self.s, self.cancelled, self.chunk = conn, sym, cancelled, chunk
+        self.size = max(sym.size, 1)
+        self.end = min(self.size, need_end) if need_end else self.size      # nothing beyond this is ever needed
+        self.w0, self.buf = 0, b""
+        self.bytes_read = 0
+
+    def get(self, off: int, n: int) -> bytes:
+        if self.w0 <= off and off + n <= self.w0 + len(self.buf):
+            return self.buf[off - self.w0:off - self.w0 + n]
+        if self.end <= self.chunk:
+            start, length = 0, max(self.end, off + n)
+        else:
+            start, length = off, max(min(self.chunk, self.end - off), n)
+        if self.cancelled():
+            raise _DumpCancelled()
+        try:
+            data = bytes(self.c.read(self.s.index_group, self.s.index_offset + start, ctypes.c_ubyte * max(length, 1),
+                                     return_ctypes=True, check_length=False))
+        except Exception as exc:  # noqa: BLE001
+            where = f" (bytes {start}..{start + length} of {self.size})" if self.size > self.chunk else ""
+            raise _ReadFailed(_fmt_exc(exc) + where) from exc
+        self.w0, self.buf = start, data
+        self.bytes_read += len(data)
+        return data[off - start:off - start + n]
+
+
+def _at_zero(leaf: Leaf) -> Leaf:
+    """The same leaf with offset 0: _RootReader.get returns exactly the leaf's bytes."""
+    import dataclasses
+    return dataclasses.replace(leaf, offset=0)
+
+
+def _leaf_note(leaf: Leaf, val: Any) -> str:
+    """Why a CSV cell is what it is, in its own column (N51): an empty value never stands for two things."""
+    if leaf.not_expanded:
+        return leaf.note if leaf.note and "not expanded" in leaf.note else f"not expanded: {leaf.size} bytes"
+    if leaf.size == 0:
+        return "no storage (size 0)"
+    if val is None:
+        return "not decodable from the bytes read"
+    return leaf.note or ""
+
+
+_SEG = re.compile(r"\.([^.\[\]]+)|\[([^\]]+)\]")
+
+
+def _nest(root: str, vals: dict[str, Any]) -> Any:
+    """The JSON tree of one root built from its leaf values (N48/N50: CSV and JSON come from the same decode):
+    '.name' segments become object keys, '[i]' / '[i,j]' indices become (nested) lists in index order — the shape
+    decode_tree gives for a complete root."""
+    if list(vals) == [root]:
+        return vals[root]
+    tree: dict[Any, Any] = {}
+    for path, v in vals.items():
+        rest = path[len(root):] if path.startswith(root) else path
+        segs: list[Any] = []
+        for m in _SEG.finditer(rest):
+            if m.group(1) is not None:
+                segs.append(m.group(1))
+            else:
+                try:
+                    segs.append(tuple(int(x) for x in m.group(2).split(",")))
+                except ValueError:
+                    segs.append(m.group(2))
+        if not segs:
+            tree[""] = v
+            continue
+        node = tree
+        for sg in segs[:-1]:
+            node = node.setdefault(sg, {})
+            if not isinstance(node, dict):
+                break
+        else:
+            node[segs[-1]] = v
+
+    def fin(n: Any) -> Any:
+        if not isinstance(n, dict):
+            return n
+        if n and all(isinstance(k, tuple) for k in n):
+            dims = len(next(iter(n)))
+            if all(len(k) == dims for k in n):
+                if dims == 1:
+                    return [fin(n[k]) for k in sorted(n)]
+                groups: dict[int, dict[tuple, Any]] = {}
+                for k, x in n.items():
+                    groups.setdefault(k[0], {})[k[1:]] = x
+                return [fin(groups[g]) for g in sorted(groups)]
+        return {(k if isinstance(k, str) else str(list(k))): fin(x) for k, x in n.items()}
+    return fin(tree)
 
 
 def _dump_order(roots: list[SymbolEntry], own: set[str] | None) -> list[SymbolEntry]:
-    """R42 #5: the program's own roots first (MAIN, PRG_*, the project's GVLs), library globals last, so a budget is
-    spent on what the user wrote. own = PROGRAM / GVL names from the project source when one is configured."""
+    """R42 #5 / N54: the program's own roots (PROGRAM / GVL names from the project source) first, so a budget is
+    spent on what the user wrote. Without the project nothing is known about origin: no guessing from names
+    (Param_*, Constants* …) — alphabetical."""
+    if not own:
+        return sorted(roots, key=lambda s: s.name.lower())
+
     def rank(s: SymbolEntry) -> int:
-        head = s.name.split(".")[0].split("[")[0].lower()
-        if own:
-            return 0 if head in own else 2 if head.startswith(_LIBRARY_GLOBALS) else 1
-        return 2 if head.startswith(_LIBRARY_GLOBALS) else 0
+        return 0 if s.name.split(".")[0].split("[")[0].lower() in own else 1
     return sorted(roots, key=lambda s: (rank(s), s.name.lower()))
 
 

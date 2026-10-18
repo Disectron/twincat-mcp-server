@@ -104,6 +104,9 @@ EXTRA_SYMBOLS: dict[str, tuple[str, int, Any]] = {
 class FakeConnection:
     instances: list["FakeConnection"] = []
     shared_values: dict[str, Any] = {}
+    fail_reads: set[str] = set()
+    max_read_bytes: int | None = None
+    read_log: list[tuple[str, int, int]] = []
 
     def __init__(self, ams_net_id: str = None, ams_net_port: int = None, ip_address: str = None):
         self.ams_net_id, self.ams_net_port, self.ip_address = ams_net_id, ams_net_port, ip_address
@@ -167,15 +170,24 @@ class FakeConnection:
                 raise pyads.ADSError(1793)
             return (ctypes.c_ubyte * len(DATATYPE_BLOB))(*DATATYPE_BLOB)
         if index_group == 0x4040:
-            # raw read of a symbol by offset -> find by ioffs
-            i = index_offset // 64
+            # raw read of a symbol by offset -> find by ioffs (a read inside a big symbol: the symbol containing it)
+            i, rel = _symbol_at(index_offset)
             name = SYMBOLS[i][0]
             size = SYMBOLS[i][2]
             want = ctypes.sizeof(plc_datatype)
+            if name in FakeConnection.fail_reads:
+                raise pyads.ADSError(1802)                       # ADS 'out of memory' / not readable
+            if FakeConnection.max_read_bytes and want > FakeConnection.max_read_bytes:
+                raise pyads.ADSError(1802)
+            FakeConnection.read_log.append((name, rel, want))
             raw = RAW_IMAGES.get(name)
-            if raw is None:
-                v = self.values.get(name)
-                raw = _scalar_bytes(SYMBOLS[i][1], size, v)
+            if callable(raw):
+                raw = raw(rel, want)                             # big images generated on demand
+            else:
+                if raw is None:
+                    v = self.values.get(name)
+                    raw = _scalar_bytes(SYMBOLS[i][1], size, v)
+                raw = raw[rel:rel + want]
             raw = raw[:want].ljust(want, b"\x00")
             return (ctypes.c_ubyte * want)(*raw)
         if index_group in (C.ADSIGRP_IOIMAGE_RWIB, C.ADSIGRP_IOIMAGE_RWOB):
@@ -355,6 +367,19 @@ def memory_image(start: int, length: int) -> bytes:
     return bytes(buf)
 
 
+def _symbol_at(offset: int) -> tuple[int, int]:
+    """(symbol index, offset inside it) for a raw 0x4040 read: symbol i lives at i * 64; a big symbol appended last
+    extends past the next slots, so a read beyond the table's slots belongs to the symbol that contains it."""
+    i = offset // 64
+    if offset % 64 == 0 and i < len(SYMBOLS):
+        return i, 0
+    for k in range(len(SYMBOLS) - 1, -1, -1):
+        base = k * 64
+        if base <= offset < base + max(SYMBOLS[k][2], 64):
+            return k, offset - base
+    return min(i, len(SYMBOLS) - 1), 0
+
+
 def _scalar_bytes(typ, size, v):
     t = typ.upper()
     if v is None:
@@ -391,6 +416,9 @@ def install(monkeypatch):
     FakeConnection.shared_state = {}
     FakeConnection.reset_values()
     FakeConnection.no_datatypes = False
+    FakeConnection.fail_reads = set()                  # symbol names whose raw reads fail (ADS 1802)
+    FakeConnection.max_read_bytes = None               # a read asking for more fails with ADS 1802, like the router
+    FakeConnection.read_log = []                       # (symbol, offset inside it, bytes) of every raw 0x4040 read
     FakeConnection.initial_notification = False      # tests that model real ADS registration behaviour turn it on
 
     def fake_symbol_info(port, adr, name):

@@ -83,13 +83,13 @@ def test_r42_pointer_to_fb_is_an_address_not_the_fb():
     assert "address" in lv[0].note
     buf = (0x1F2E3D4C5B6A7980).to_bytes(8, "little") + bytes(8 * 999)
     tree = ts.decode_tree(buf, arr.name)
-    assert len(tree) == 1000 and tree[0] == "0x1F2E3D4C5B6A7980" and tree[1] is None
+    assert len(tree) == 1000 and tree[0] == "0x1F2E3D4C5B6A7980" and tree[1] == "0x0000000000000000"   # N51: NULL is address 0
     assert ts.decode_leaf(buf, lv[0]) == "0x1F2E3D4C5B6A7980"
     # members declared POINTER TO …, with and without a table entry for the pointer type
     hl = ts.leaves("MAIN.st", "ST_Holder")
     assert [(l.path, l.type) for l in hl] == [("MAIN.st.pCurrent", "POINTER TO FB_TestSuite"), ("MAIN.st.pRaw", "POINTER TO BYTE")]
     d = ts.decode_tree(bytes(16), "ST_Holder")
-    assert d == {"pCurrent": None, "pRaw": None}
+    assert d == {"pCurrent": "0x0000000000000000", "pRaw": "0x0000000000000000"}
     # review: a 32-bit runtime (CX9020) has 4-byte pointers — without a table entry the declared size is used
     h32 = DtEntry("ST_H32", "", 8, 0, 65, 0, "", [], [DtEntry("pRaw", "POINTER TO BYTE", 4, 0, 65, 0, ""),
                                                       DtEntry("nNext", "UDINT", 4, 4, 19, 0, "")])
@@ -106,3 +106,47 @@ def test_r42_pointer_to_fb_is_an_address_not_the_fb():
     alias = DtEntry("T_TestAlias", "ST_Test", 39, 0, 65, 0, "")
     ts.table["t_testalias"] = alias
     assert [l.path for l in ts.leaves("x", "T_TestAlias")] == ["x.Name", "x.Ok"]
+
+
+def test_n50_alias_of_a_pointer_type_is_an_address_in_every_decoder():
+    """N50: TYPE PT_X : POINTER TO FB_X was not seen as an indirection — CSV 4660, JSON '0x…1234'."""
+    from twincat_mcp.ads_types import DtEntry, TypeSystem
+    fb = DtEntry("FB_X", "", 400, 0, 65, 0, "", [], [DtEntry("n", "UDINT", 4, 0, 19, 0, "")])
+    ptr = DtEntry("POINTER TO FB_X", "FB_X", 8, 0, 21, 1, "")
+    alias = DtEntry("PT_X", "POINTER TO FB_X", 8, 0, 21, 0, "")
+    alias2 = DtEntry("PT_Y", "PT_X", 8, 0, 21, 0, "")                     # an alias of the alias
+    st = DtEntry("ST_H", "", 16, 0, 65, 0, "", [], [DtEntry("p", "PT_X", 8, 0, 21, 0, ""),
+                                                     DtEntry("q", "PT_Y", 8, 8, 21, 0, "")])
+    ts = TypeSystem({e.name.lower(): e for e in (fb, ptr, alias, alias2, st, DtEntry("UDINT", "", 4, 0, 19, 0, ""))})
+    buf = (0x1234).to_bytes(8, "little") + bytes(8)
+    lv = ts.leaves("MAIN.st", "ST_H")
+    assert [(l.path, l.note) for l in lv] == [("MAIN.st.p", "pointer/reference: the address, not the target"),
+                                              ("MAIN.st.q", "pointer/reference: the address, not the target")]
+    assert [ts.decode_leaf(buf, l) for l in lv] == ["0x0000000000001234", "0x0000000000000000"]
+    assert ts.decode_tree(buf, "ST_H") == {"p": "0x0000000000001234", "q": "0x0000000000000000"}
+    assert ts.is_indirect(alias) and ts.is_indirect(alias2) and not ts.is_indirect(fb)
+
+
+def test_n48_n55_one_not_expanded_form_and_a_cancellable_walk():
+    import pytest as _p
+    from twincat_mcp.ads_types import DtEntry, TypeSystem, WalkCancelled
+    arr = DtEntry("ARRAY [1..5000] OF UDINT", "UDINT", 20000, 0, 19, 0, "", [(1, 5000)])
+    big = DtEntry("ARRAY [1..2] OF ARRAY [1..4000] OF UDINT", "ARRAY [1..4000] OF UDINT", 32000, 0, 65, 0, "", [(1, 2)])
+    inner = DtEntry("ARRAY [1..4000] OF UDINT", "UDINT", 16000, 0, 19, 0, "", [(1, 4000)])
+    ts = TypeSystem({e.name.lower(): e for e in (arr, big, inner, DtEntry("UDINT", "", 4, 0, 19, 0, ""))})
+    buf = bytes(range(64)) + bytes(20000 - 64)
+    leaf = ts.leaves("GVL.a", arr.name)[0]
+    assert leaf.not_expanded and leaf.need == 64
+    assert ts.decode_leaf(buf[:64], leaf) == ts.decode_tree(buf, arr.name)                # one representation
+    assert ts.decode_tree(buf, arr.name)["elements"] == 5000
+    with _p.raises(WalkCancelled):
+        ts.leaves("GVL.b", big.name, 10_000, cancel=lambda: True)
+
+
+def test_nest_builds_the_decode_tree_shape_from_leaf_values():
+    """The dump's JSON is nested from the same leaf values the CSV holds (N48/N50): structs → objects, arrays →
+    lists in index order, multi-dimensional arrays → nested lists."""
+    from twincat_mcp.ads_backend import _nest
+    vals = {"G.a[1,1].x": 1, "G.a[1,2].x": 2, "G.a[2,1].x": 3, "G.a[2,2].x": 4, "G.s.t[-1]": "m", "G.s.t[0]": "z"}
+    assert _nest("G", vals) == {"a": [[{"x": 1}, {"x": 2}], [{"x": 3}, {"x": 4}]], "s": {"t": ["m", "z"]}}
+    assert _nest("G.n", {"G.n": 5}) == 5
