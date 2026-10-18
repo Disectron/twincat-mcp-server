@@ -997,15 +997,22 @@ class XaeBackend:
     def plc_projects(self) -> dict[str, Any]:
         """List PLC projects: TIPC children → each has one '<Name> Project' node."""
         res = self.tree_children("TIPC", depth=2)
-        projs = []
+        by_key: dict[str, dict[str, Any]] = {}
         for it in res["items"]:
             name = str(it.get("Name", ""))
             if str(it.get("ItemType")) == str(TREEITEMTYPE_PLCAPP) or name.endswith(" Project"):
                 outer, nested = _plc_split(str(it.get("PathName")))
+                # #10: the outer PLC node and its nested '<Name> Project' node are the SAME PLC project — listed once
+                # (it was listed twice, so every Automation Interface route saw "2 PLC projects" and gave up); the
+                # nested node's names are kept (the fields tools used before)
+                key = nested.lower()
+                if key in by_key and not name.endswith(" Project"):
+                    continue
                 base = outer.split("^")[-1]
-                projs.append({"name": name, "path": it.get("PathName"), "item_type": it.get("ItemType"),
-                              "plc_project_path": it.get("PathName"),
-                              "plc_path": outer, "iec_project_path": nested, "instance_path": f"{outer}^{base} Instance"})
+                by_key[key] = {"name": name, "path": it.get("PathName"), "item_type": it.get("ItemType"),
+                               "plc_project_path": it.get("PathName"),
+                               "plc_path": outer, "iec_project_path": nested, "instance_path": f"{outer}^{base} Instance"}
+        projs = list(by_key.values())
         return {"count": len(projs), "projects": projs, "raw": res["items"],
                 "note": ("every tool takes any of these paths (R14): boot project / autostart act on plc_path "
                          "(ITcPlcProject), PLCopen import/export and Check all objects on iec_project_path "
@@ -1129,11 +1136,68 @@ class XaeBackend:
         if dup:
             res["duplicates_created"] = dup
             if option == "replace":
-                raise XaeError(f"PlcOpenImport(replace) did not replace — it created {dup} next to the existing object(s): "
-                               "the XML has no folder for them, so TwinCAT imported them at the project root and renamed them. "
-                               "Delete the copies (xae_tree_delete), then export the object together with its folder (or "
-                               "import into the folder that holds it) and import again.")
+                return self._replace_from_copies(res, dup, added, before)
         return res
+
+    def _replace_from_copies(self, res: dict[str, Any], dup: list[str], added: dict[str, str],
+                             before: dict[str, str]) -> dict[str, Any]:
+        """R15: PlcOpenImport(replace) put objects that live in a folder at the project root as renamed copies
+        (PRG_X_1). Finish the replace ourselves: copy the copy's declaration / implementation — and those of its
+        methods, properties, actions, by name — into the existing object, then delete the copy. If an object cannot
+        be matched (no single original, or a different set of methods), every copy is still removed again and the
+        import is reported as not done, so the project is never left with duplicates."""
+        done: list[dict[str, str]] = []
+        failed: list[str] = []
+        for p in dup:
+            base = re.sub(r"_\d+$", "", added[p])
+            origs = [bp for bp, bn in before.items() if bn.lower() == base.lower()]
+            if len(origs) != 1:
+                failed.append(f"{added[p]}: {len(origs)} existing objects named {base}")
+                continue
+            try:
+                self._sync_texts(self._item(p), self._item(origs[0]), origs[0])
+                done.append({"object": origs[0], "from_copy": p})
+            except XaeError as exc:
+                failed.append(f"{added[p]}: {exc}")
+        removed, left = [], []
+        for p in dup:
+            parent, name = p.rsplit("^", 1)
+            try:
+                self.tree_delete_child(parent, name)
+                removed.append(p)
+            except XaeError as exc:
+                left.append(f"{p} ({exc})")
+        res["copies_removed"] = removed
+        if failed or left:
+            raise XaeError(f"PlcOpenImport(replace) could not replace {failed or ''} — TwinCAT imported the object(s) as "
+                           f"copies at the project root; "
+                           + (f"the copies were removed again ({removed}), " if removed else "")
+                           + (f"these copies could NOT be removed: {left} (xae_tree_delete them), " if left else "")
+                           + ("objects replaced by text before the failure: " + str([d['object'] for d in done]) + ", " if done else "")
+                           + "nothing else changed. Update the object with xae_pou_set, or delete it and import again.")
+        res["replaced"] = done
+        res.pop("duplicates_created", None)
+        res["note"] = ("PlcOpenImport put the object(s) at the project root as renamed copies (they live in a folder); "
+                       "their text was copied into the existing object(s) and the copies were deleted — save + build")
+        return res
+
+    def _sync_texts(self, src: Any, dst: Any, where: str, depth: int = 0) -> None:
+        def kids(it: Any) -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            try:
+                for i in range(1, int(it.ChildCount) + 1):
+                    c = it.Child(i)
+                    out[str(c.Name)] = c
+            except Exception:  # noqa: BLE001
+                pass
+            return out
+        sk, dk = kids(src), kids(dst)
+        if set(sk) != set(dk):
+            raise XaeError(f"{where} has other methods/properties than the imported one (differ: {sorted(set(sk) ^ set(dk))})")
+        self._set_text(dst, _try(lambda: src.DeclarationText), _try(lambda: src.ImplementationText))
+        if depth < 6:
+            for n in sk:
+                self._sync_texts(sk[n], dk[n], f"{where}^{n}", depth + 1)
 
     def plcopen_export(self, plc_project_path: str, items: list[str], xml_file: str) -> dict[str, Any]:
         plc_project_path = _plc_split(plc_project_path)[1]          # R14: 'TIPC^X' raised AttributeError
@@ -1208,7 +1272,11 @@ class XaeBackend:
     def _nested_projects(self, plc_project_path: str | None = None) -> list[str]:
         if plc_project_path:
             return [_plc_split(plc_project_path)[1]]
-        return [p["iec_project_path"] for p in (self.plc_projects().get("projects") or [])]
+        out: list[str] = []
+        for p in self.plc_projects().get("projects") or []:
+            if p["iec_project_path"].lower() not in {x.lower() for x in out}:
+                out.append(p["iec_project_path"])
+        return out
 
     def check_all_objects(self, plc_project_path: str | None = None) -> dict[str, Any]:
         """PLC 'Check all objects' (compile every POU incl. unused). #45: first the documented Automation Interface call
@@ -1347,8 +1415,14 @@ class XaeBackend:
             if not out["written"]:
                 raise XaeError(f"Scope {meth}({path!r}) returned {rc} but no file was written — is there recorded data "
                                "(stop the recording first)?")
-        if rc not in (0, None):
-            out["warning"] = f"{meth} returned {rc} (0 = success in the Automation Interface examples)"
+        # R11: IMeasurementScope declares `int StartRecord()` etc. without saying what the int means (Beckhoff's own
+        # sample ignores it); on 4026 StartRecord returns 1 and StopRecord 0 while both work. Only a negative value
+        # (an HRESULT error) is a warning; success shows in the file written / scope_status.
+        if isinstance(rc, int) and rc < 0:
+            out["warning"] = f"{meth} returned {rc} (0x{rc & 0xFFFFFFFF:08X}) — an error code; check scope_status"
+        elif rc not in (0, None):
+            out["result_note"] = (f"{meth} returned {rc}: the Automation Interface does not document this value "
+                                  "(StartRecord gives 1 while recording normally) — not an error")
         return out
 
 

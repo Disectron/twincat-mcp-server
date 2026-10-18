@@ -212,6 +212,7 @@ def ro_uri(db: Path) -> str:
 SCHEMA_VERSION = "2"
 HEARTBEAT_STALE_S = 120
 MANUALS_HEARTBEAT_STALE_S = 300
+MANUALS_TEXT_FORMAT = "2"          # manuals_db.py TEXT_FORMAT: page text / toc rules
 
 
 def _meta_of(path: Path) -> dict[str, str]:
@@ -337,10 +338,16 @@ def manuals_state(db: Path, folder: Path) -> dict[str, Any]:
         out["updating"] = {"state": "running" if time.time() - beat < MANUALS_HEARTBEAT_STALE_S else "interrupted",
                            "files_done": int(meta.get("files_done") or 0), "files_total": int(meta.get("files_total") or 0)}
     pending = len(new) + len(changed) + len(gone)
-    out["state"] = "up_to_date" if not pending else "pending"
+    fmt = meta.get("text_format") or "1"
+    old_text = bool(docs) and fmt != MANUALS_TEXT_FORMAT
+    out["text_format"] = fmt
+    out["state"] = "pending" if pending else "outdated" if old_text else "up_to_date"
     msg = f"{len(docs)} manuals, {out['pages']} pages indexed"
     if pending:
         msg += f"; {len(new)} new, {len(changed)} changed, {len(gone)} removed PDF(s) not reflected — run update"
+    if old_text:
+        msg += (f"; page text format {fmt}, the builder writes {MANUALS_TEXT_FORMAT} (running headers removed, "
+                "wrapped headings joined) — run update, it reads every manual again")
     if out.get("updating"):
         u = out["updating"]
         msg += (f"; an update is RUNNING ({u['files_done']} of {u['files_total']} files)" if u["state"] == "running" else
@@ -445,6 +452,40 @@ def has_words(q: str) -> bool:
     return bool(re.search(r"[^\W_]", q))
 
 
+_FTS_SYNTAX = re.compile(r'["*:()^]|\b(?:AND|OR|NOT|NEAR)\b')
+
+
+def natural(q: str) -> bool:
+    """Words only (no FTS5 operators, quotes, prefixes, column filters, code punctuation): a question in words."""
+    return not _FTS_SYNTAX.search(q) and bool(re.fullmatch(r"[\w\s\-./,?!']+", q))
+
+
+def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, extra: list[Any],
+                 limit: int) -> tuple[list[sqlite3.Row], int, str, str]:
+    """N36: a question in words (`LED diagnostics`, `microSD boot card`) that no page answers with every word falls
+    back as kb_search does: every word → every word as a prefix → some of the words (best first). Anything with
+    FTS5 syntax or code punctuation runs as written (run_fts, with the phrase retry). -> (rows, total, mode, expr)."""
+    q = clean(query).strip()
+    if not natural(q):
+        rows, mode, expr = run_fts(con, sql, query, extra + [limit])
+        return rows, con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr
+    words = [w for w in re.findall(r"[^\W_]+(?:_[^\W_]+)*", q)]
+    if not words:
+        raise Err("empty_query", f"the query {query!r} has no searchable word (punctuation is not indexed)")
+
+    def ph(w: str) -> str:
+        return '"' + w.replace('"', '""') + '"'
+    tiers = [("all words", " ".join(ph(w) for w in words)),
+             ("all words (as prefixes)", " ".join(ph(w) + "*" for w in words))]
+    if len(words) > 1:
+        tiers.append(("some words (no page has all of them)", " OR ".join(ph(w) + "*" for w in words)))
+    for label, expr in tiers:
+        rows = con.execute(sql, [expr, *extra, limit]).fetchall()
+        if rows:
+            return rows, con.execute(count_sql, [expr, *extra]).fetchone()[0], label, expr
+    return [], 0, tiers[-1][0], tiers[-1][1]
+
+
 def run_fts(con: sqlite3.Connection, sql: str, query: str, extra: list[Any]) -> tuple[list[sqlite3.Row], str, str]:
     """Run an FTS5 statement whose first parameter is the MATCH expression. -> (rows, mode, expression used).
     Invalid FTS5 syntax is retried once as a literal phrase (rule 7)."""
@@ -535,10 +576,17 @@ def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: st
         con = ctx.con("infosys")
         near = []
         word = clean(ref).strip()
-        if how == "title" and len(word) >= 3:
-            near = [_cand(ctx, r) for r in _order(con.execute(
-                "SELECT * FROM page WHERE title LIKE ? ESCAPE '\\' LIMIT 200", (f"%{like_escape(word)}%",)).fetchall())
-                if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())][:8]
+        if how == "title" and len(word) >= 3 and has_words(word):
+            # N35: the FTS title column, not a LIKE scan over every page body (9.6 s on the real package)
+            expr = "title : " + " ".join('"' + w.replace('"', '""') + '"*' for w in re.findall(r"[^\W_]+", word))
+            try:
+                hits = con.execute("SELECT book, pid FROM fts WHERE fts MATCH ? LIMIT 200", (expr,)).fetchall()
+            except sqlite3.OperationalError:
+                hits = []
+            rows_near = [con.execute("SELECT * FROM page WHERE book = ? AND pid = ?", (h["book"], h["pid"])).fetchone()
+                         for h in hits[:200]]
+            near = [_cand(ctx, r) for r in _order([r for r in rows_near if r is not None])
+                    if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())][:8]
         raise Err("not_found", f"no page for {what} {ref!r}" + (f" in books {book!r}" if book else "") + f" (looked up as {how})",
                   near=near, hint=f"docs_search query={word!r} finds pages by their text")
     cands = [_cand(ctx, r) for r in _order(rows)]
@@ -584,9 +632,10 @@ def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     _check_book_glob(con, a["book"])
     where = "fts MATCH ?" + (" AND fnm(book, ?)" if a["book"] else "")
     extra = [a["book"]] if a["book"] else []
-    rows, mode, expr = run_fts(con, "SELECT book, pid, title, snippet(fts, 1, '[', ']', '…', 18) AS s, "
-                               f"bm25(fts, 8.0, 1.0) AS r FROM fts WHERE {where} ORDER BY r LIMIT ?", a["query"], extra + [a["limit"]])
-    total = con.execute(f"SELECT COUNT(*) FROM fts WHERE {where}", [expr, *extra]).fetchone()[0]
+    rows, total, mode, expr = search_tiers(
+        con, "SELECT book, pid, title, snippet(fts, 1, '[', ']', '…', 18) AS s, "
+             f"bm25(fts, 8.0, 1.0) AS r FROM fts WHERE {where} ORDER BY r LIMIT ?",
+        f"SELECT COUNT(*) FROM fts WHERE {where}", a["query"], extra, a["limit"])
     items = []
     for r in rows:
         v = con.execute("SELECT version FROM page WHERE book = ? AND pid = ?", (r["book"], r["pid"])).fetchone()
@@ -747,9 +796,10 @@ def cmd_manual_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
             _one_doc(con, a["doc"])                    # raises not_found with the list
         where += f" AND doc IN ({','.join('?' * len(ids))})"
         extra = ids
-    rows, mode, expr = run_fts(con, "SELECT doc, page, section, snippet(fts, 0, '[', ']', '…', 16) AS s, "
-                               f"bm25(fts, 1.0, 4.0) AS r FROM fts WHERE {where} ORDER BY r LIMIT ?", a["query"], extra + [a["limit"]])
-    total = con.execute(f"SELECT COUNT(*) FROM fts WHERE {where}", [expr, *extra]).fetchone()[0]
+    rows, total, mode, expr = search_tiers(
+        con, "SELECT doc, page, section, snippet(fts, 0, '[', ']', '…', 16) AS s, "
+             f"bm25(fts, 1.0, 4.0) AS r FROM fts WHERE {where} ORDER BY r LIMIT ?",
+        f"SELECT COUNT(*) FROM fts WHERE {where}", a["query"], extra, a["limit"])
     items = [{"doc": names.get(r["doc"], r["doc"]), "doc_id": r["doc"], "page": r["page"], "section": r["section"] or None,
               "excerpt": one_line(r["s"]), "score": float(f"{-r['r']:.4g}")} for r in rows]
     out: dict[str, Any] = {"query": a["query"], "query_mode": mode, "count": len(items), "total": total,

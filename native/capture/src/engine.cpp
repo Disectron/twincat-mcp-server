@@ -548,8 +548,23 @@ void Engine::process(size_t b, int64_t ft, const uint8_t* d, uint32_t n) {
         uint32_t len = std::min<uint32_t>(n, s.spec.size);
         pre_.push_back(Pre{static_cast<uint32_t>(b), ft, n, std::vector<uint8_t>(d, d + len)});
         const int64_t pre100 = std::llround(pre_trigger_ms_ * 1e4);
-        while (!pre_.empty() && pre_.front().ft < ft - pre100) pre_.pop_front();
-        if (start_when_.block == b && start_when_.fires(d, n)) {
+        // R41: blocks are separate notifications and arrive with a skew — block 1's sample of cycle t+1 can come
+        // before block 0's (trigger) sample of cycle t. Purging against the newest stamp of ANY block dropped block
+        // 1's sample of the trigger cycle (missing_head 1 on a lossless capture). Keep the delivery skew as margin;
+        // only samples inside the window are committed below.
+        const int64_t margin = max_delay_ + 500000;   // + 50 ms
+        while (!pre_.empty() && pre_.front().ft < ft - pre100 - margin) pre_.pop_front();
+        if (armed_seen_.size() != blocks_.size()) armed_seen_.assign(blocks_.size(), 0);
+        if (!armed_seen_[b]) {
+            armed_seen_[b] = 1;
+            ++armed_seen_n_;
+        }
+        if (!have_armed_t0_) {
+            armed_t0_ = ft;
+            have_armed_t0_ = true;
+        }
+        const bool all_live = armed_seen_n_ >= blocks_.size() || ft - armed_t0_ > 2000000;
+        if (start_when_.block == b && (start_when_.edge || all_live) && start_when_.fires(d, n)) {
             armed_ = false;
             triggered_ = true;
             trig_ft_ = ft;
@@ -570,11 +585,14 @@ void Engine::process(size_t b, int64_t ft, const uint8_t* d, uint32_t n) {
             pre.swap(pre_);
             for (auto& p : pre) {
                 if (finish_req_.load()) break;
+                if (p.ft < ws_) continue;              // the skew margin, not the window
                 commit(p.b, p.ft, p.d.data(), p.n);   // p.d holds min(n, block size) bytes
             }
         }
         return;
     }
+    // a block's sample from before the window, delivered after the trigger (skew): outside the recording
+    if (ws_from_trigger_ && have_ws_ && ft < ws_) return;
     commit(b, ft, d, n);
 }
 
@@ -869,6 +887,8 @@ void Engine::finish() {
     if (duration_s_ > 0) f.d("requested_s", duration_s_);
     else f.null("requested_s");
     f.raw("plc_span_s", have_span && have_t0_ ? jnum(double(span_end - t0_) / 1e7, 12) : "null");
+    f.b("manual_stop", manual_stop_.load() && !have_stop_ft_);
+    f.raw("max_delay_ms", jnum(double(max_delay_) / 1e4, 6));
     f.raw("window_start_ms", have_ws_ && have_t0_ ? ms(ws_) : "null");
     f.raw("window_end_ms", have_end && have_t0_ ? ms(end) : "null");
     if (triggered_) f.raw("triggered_at_ms", ms(trig_ft_));

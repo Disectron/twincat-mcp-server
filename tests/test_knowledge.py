@@ -385,3 +385,16 @@ def test_a_chosen_folder_that_was_deleted_is_reported_not_recreated(kb):
     with pytest.raises(K.KnowledgeError, match="does not exist"):
         k.search("x")
     assert not (tmp / "kbgone").exists()
+
+
+def test_n34_hw_lookup_takes_the_order_code_out_of_the_esi_type(kb, monkeypatch):
+    """N34: hw_lookup CX9020 looked up the ESI device name 'CX9020 EtherCAT slave' in the manuals (no match)."""
+    k, tmp = kb
+    (tmp / "esi" / "Beckhoff CX.xml").write_text(
+        '<?xml version="1.0"?><EtherCATInfo><Vendor><Id>#x2</Id><Name>Beckhoff</Name></Vendor><Descriptions><Devices>'
+        '<Device><Type ProductCode="#x23446052" RevisionNo="#x1">CX9020 EtherCAT slave</Type>'
+        '<Name LcId="1033">CX9020 EtherCAT slave</Name></Device></Devices></Descriptions></EtherCATInfo>', encoding="utf-8")
+    k.set_location(str(_kb_with_docs(tmp)))
+    r = k.hw_lookup("CX9020")
+    assert r["types"] == ["CX9020 EtherCAT slave"]
+    assert r["manuals"]["CX9020"][0]["doc"] == "CX9020.pdf" and "manuals_note" not in r

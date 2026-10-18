@@ -211,3 +211,47 @@ def test_symbol_cache_follows_symbol_version(ads, monkeypatch):
     ads.__dict__.get("_symver", {}).clear()
     ads.symbols_cached()
     assert loads["n"] == 2                     # online change: reloaded
+
+
+def test_r42_dump_budget_order_streaming_and_no_rename_after_the_call_ended(ads, tmp_path):
+    import json, threading
+    out = tmp_path / "dumps"
+    full = ads.dump(None, False, str(out), own_roots={"prg_test"})
+    assert not full["truncated"] and full["largest_roots"][0]["json_bytes"] > 0
+    doc = json.loads(open(full["json"], encoding="utf-8").read())             # streamed root by root, still one JSON
+    names = list(doc["values"])
+    assert names[0].startswith("PRG_Test.") and doc["leaves"] == full["leaves"] and doc["truncated"] is False
+    assert doc["values"]["PRG_Test.pData"] is None                              # POINTER TO INT: the address (0)
+    # one leaf budget for CSV and JSON: a cut dump names what is missing
+    cut = ads.dump(None, False, str(out), max_leaves=5)
+    assert cut["truncated"] and cut["leaves"] == 5 and cut["skipped_total"] >= 1 and "max_leaves 5" in cut["truncated_reason"]
+    j = json.loads(open(cut["json"], encoding="utf-8").read())
+    assert j["truncated"] is True and sum(1 for _ in open(cut["csv"], encoding="utf-8")) == 6
+    # max_total_mb bounds what is written
+    tiny = ads.dump(None, False, str(out), max_total_bytes=200)
+    assert tiny["truncated"] and "size limit" in tiny["truncated_reason"] and tiny["csv_bytes"] + tiny["json_bytes"] < 2000
+    # the client's timeout set the cancel event while the dump was finishing: nothing is renamed into place
+    before = sorted(p.name for p in out.iterdir())
+    ev = threading.Event()
+    real = ads._dump
+
+    def late(*a, **kw):
+        r = real(*a, **kw)
+        ev.set()
+        return r
+    ads._dump = late
+    with pytest.raises(AdsError, match="call had already ended"):
+        ads.dump(None, False, str(out), cancel=ev)
+    assert sorted(p.name for p in out.iterdir()) == before
+
+
+@pytest.mark.anyio
+async def test_r42_timeout_names_the_phase_not_the_router(monkeypatch, project_dir):
+    import time as _t
+    from tests.test_server_e2e import mk_cfg
+    from twincat_mcp.server import App, ToolError
+    install(monkeypatch)
+    app = App(mk_cfg(project_dir))
+    with pytest.raises(ToolError, match="phase: writing JSON") as ei:
+        await app.ads_call(lambda: _t.sleep(1.5), timeout=0.2, bulk=True, timeout_msg=lambda: "phase: writing JSON")
+    assert "router" not in str(ei.value)

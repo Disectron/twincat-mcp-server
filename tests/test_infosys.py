@@ -292,6 +292,21 @@ def test_r24_r25_r32_declaration_tidy():
     _tidy_declaration(f)
     assert f["return_type"] == "ULINT" and f["outputs"] == [] and f["declaration"].startswith("FUNCTION F_GetSystemTime : ULINT")
     assert "description" not in f                                    # every entry was carried by an item
+    assert "VAR_OUTPUT" not in f["declaration"] and "bX : BOOL" in f["declaration"]
+    # R24 (0.8.8 retest): the header was already there (reconstructed from VAR blocks) → the VAR_OUTPUT stayed
+    g = {"name": "F_GetSystemTime", "kind": "Function", "return_type": None,
+         "declaration": "FUNCTION F_GetSystemTime  (* header reconstructed *)\nVAR_OUTPUT\n  F_GetSystemTime : ULINT; (* time *)\n"
+                        "END_VAR",
+         "outputs": [{"name": "F_GetSystemTime", "type": "ULINT"}], "inputs": []}
+    _tidy_declaration(g)
+    assert g["declaration"] == "FUNCTION F_GetSystemTime : ULINT  (* header reconstructed *)", g["declaration"]
+    # other outputs stay; only the return line goes; a typed header is not touched
+    h = {"name": "FB.M_Get", "kind": "Method", "return_type": "BOOL",
+         "declaration": "METHOD PUBLIC M_Get : BOOL\nVAR_OUTPUT\n  M_Get : BOOL;\n  nErr : UDINT;\nEND_VAR",
+         "outputs": [{"name": "M_Get", "type": "BOOL"}, {"name": "nErr", "type": "UDINT"}]}
+    _tidy_declaration(h)
+    assert h["declaration"] == "METHOD PUBLIC M_Get : BOOL\nVAR_OUTPUT\n  nErr : UDINT;\nEND_VAR", h["declaration"]
+    assert [o["name"] for o in h["outputs"]] == ["nErr"]
     e = {"name": "E_OpenPath", "kind": "Enum",
          "declaration": "TYPE E_OpenPath :\n(\n  PATH_GENERIC := 1, (* search/open/create files in selected/generic folder *)\n"
                         "  PATH_BOOTPRJ, (* boot project folder *)\n  PATH_BOOTDATA,\n  PATH_MAX := 16#10\n);\nEND_TYPE",
@@ -339,7 +354,32 @@ def test_r23_ambiguous_declaration_names_the_other_libraries(idx):
             con.execute("INSERT INTO pages(url, book, title, kind, library, markdown, text, code, decl, fetched) VALUES "
                         "(?,?,?,?,?,?,?,?,?,?)", (f"https://infosys.beckhoff.com/content/1033/{book}/1.html", book,
                                                   "MC_MoveAbsolute", "FunctionBlock", lib, "", "", "", _j.dumps(d), 1))
-    r = idx.declaration("MC_MoveAbsolute")
-    assert r["library"] == "Tc2_MC2" and r["also_in"] == ["Tc3_DriveMotionControl"] and "pass library=" in r["ambiguous"]
+    # R23 (0.8.8 retest): no default — the call is refused with both libraries and their pages
+    with pytest.raises(InfosysError, match=r"ambiguous: MC_MoveAbsolute is documented in 2 libraries.*Tc2_MC2.*"
+                                             r"Tc3_DriveMotionControl.*nothing was chosen"):
+        idx.declaration("MC_MoveAbsolute")
     r = idx.declaration("MC_MoveAbsolute", library="Tc3_DriveMotionControl")
-    assert r["library"] == "Tc3_DriveMotionControl" and "also_in" not in r
+    assert r["library"] == "Tc3_DriveMotionControl" and r["also_in"] == ["Tc2_MC2"]
+
+
+def test_r32_retest_type_names_broken_across_lines_in_table_cells():
+    """R32 (0.8.8 retest): 'T_Ams NetId' — a type wrapped in a narrow table column (<br>, two <p>, zero-width
+    space) came out with a space. Mended when a page is read (the stored index is not rebuilt for it): joined on
+    evidence (the page's code declares the name) or in a Type column at a camel-case boundary; IEC keywords and
+    prose keep their spaces."""
+    from twincat_mcp.infosys import _clean_md, html_to_doc
+    h = ("<html><body><h1>ADSREAD</h1><pre>VAR_INPUT\n NETID : T_AmsNetId;\n PORT : T_AmsPort;\nEND_VAR</pre>"
+         "<table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
+         "<tr><td>NETID</td><td>T_Ams<br/>NetId</td><td>AMS address as T_Ams NetId.</td></tr>"
+         "<tr><td>PORT</td><td><p>T_Ams</p><p>Port</p></td><td>Input<br>Output</td></tr>"
+         "<tr><td>X</td><td>ARRAY [1..2] OF<br/>BYTE</td><td>zero\u200bwidth soft\u00adhyphen</td></tr>"
+         "<tr><td>Y</td><td>POINTER TO<br>BYTE</td><td>ST_My<br>Struct</td></tr>"
+         "<tr><td>Z</td><td>ST_Axis<br>Ref</td><td>x a \\| b</td></tr></table></body></html>")
+    md = _clean_md(html_to_doc(h).markdown)
+    rows = {r.split(" | ")[0].lstrip("| "): r for r in md.splitlines() if r.startswith("| ")}
+    assert rows["NETID"] == "| NETID | T_AmsNetId | AMS address as T_AmsNetId. |"
+    assert rows["PORT"] == "| PORT | T_AmsPort | Input Output |"                  # prose keeps its break as a space
+    assert rows["X"] == "| X | ARRAY [1..2] OF BYTE | zerowidth softhyphen |"
+    assert rows["Y"] == "| Y | POINTER TO BYTE | ST_My Struct |"                  # no evidence outside a Type column
+    assert rows["Z"].startswith("| Z | ST_AxisRef |") and "\\|" in rows["Z"]      # Type column; escaped pipe kept
+    assert rows["Name"] == "| Name | Type | Description |"

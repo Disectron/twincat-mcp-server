@@ -945,8 +945,20 @@ async def test_r4_outputs_stay_in_known_folders_and_never_overwrite_silently(mon
         assert r.is_error and "overwrite=true" in text(r) and target.read_text() == "keep me"
         ok = payload(await s.call_tool("rec_export", {"id": rid, "out_path": str(target), "overwrite": True}))
         assert Path(ok["file"]).resolve() == target.resolve() and target.read_text() != "keep me"
-        again = payload(await s.call_tool("rec_export", {"id": rid}))                       # default path: re-export in place
-        assert again["file"]
+        again = payload(await s.call_tool("rec_export", {"id": rid}))                       # default path: first export
+        assert again["file"] and "replaced" not in again
+        same = payload(await s.call_tool("rec_export", {"id": rid}))                        # identical re-export: fine
+        assert "identical" in same["replaced"]
+        # N32: other parameters at the default path → the earlier export is not replaced silently
+        other = await s.call_tool("rec_export", {"id": rid, "fill": True})
+        assert other.is_error and "an earlier export (csv_wide, symbols all, fill False" in text(other) \
+            and "overwrite=true" in text(other)
+        forced = payload(await s.call_tool("rec_export", {"id": rid, "fill": True, "overwrite": True}))
+        assert forced["replaced"].startswith("an earlier export (csv_wide")
+        Path(forced["file"]).chmod(0o644)
+        Path(forced["file"]).write_text("edited by hand")                                   # changed since → refused
+        edited = await s.call_tool("rec_export", {"id": rid, "fill": True})
+        assert edited.is_error and "changed since it was written" in text(edited)
         sr = payload(await s.call_tool("tc_session_report", {}))                           # R12: preview, not the whole report
         assert "markdown" not in sr and sr["preview"] and Path(sr["file"]).is_file()
         bad = await s.call_tool("tc_session_report", {"out_path": str(tmp_path / "r.md")})

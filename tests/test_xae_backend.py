@@ -497,11 +497,50 @@ def test_r15_plcopen_replace_that_duplicates_is_an_error(xae, tmp_path):
         proj._children.append(it)
         sm.items[it.PathName] = it
     proj.on_import = dup
-    with pytest.raises(X.XaeError, match=r"did not replace — it created \['TIPC\^Plc\^Plc Project\^PRG_TcUnitRunner_1'\]"):
+    # no original to replace: the copy is removed again and the import reported as not done
+    with pytest.raises(X.XaeError, match=r"could not replace .*0 existing objects named PRG_TcUnitRunner.*copies were removed again"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert proj.deleted == ["PRG_TcUnitRunner_1"]
     proj.on_import = None
     r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
     assert r["objects_in_file"] == ["PRG_TcUnitRunner"] and "duplicates_created" not in r
+
+
+def test_r15_retest_replace_is_finished_by_copying_the_text(xae, tmp_path):
+    """R15 (0.8.8 retest): the duplicate was reported but left in the project. Now the replace is completed: the
+    copy's text (and its methods' text) goes into the existing object in its folder, the copy is deleted."""
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    meth = FakeItem("Run", "TIPC^Plc^Plc Project^95_UnitTests^PRG_TcUnitRunner^Run")
+    orig = FakeItem("PRG_TcUnitRunner", "TIPC^Plc^Plc Project^95_UnitTests^PRG_TcUnitRunner", [meth])
+    folder = FakeItem("95_UnitTests", "TIPC^Plc^Plc Project^95_UnitTests", [orig])
+    proj._children.append(folder)
+    for it in (folder, orig, meth):
+        sm.items[it.PathName] = it
+    f = tmp_path / "r.xml"
+    f.write_text('<project><types><pous><pou name="PRG_TcUnitRunner" pouType="program"/></pous></types></project>')
+
+    def dup(methods=("Run",)):
+        kids = [FakeItem(m, f"TIPC^Plc^Plc Project^PRG_TcUnitRunner_1^{m}") for m in methods]
+        for k in kids:
+            k.ImplementationText = f"// new {k.Name}"
+        it = FakeItem("PRG_TcUnitRunner_1", "TIPC^Plc^Plc Project^PRG_TcUnitRunner_1", kids)
+        it.DeclarationText, it.ImplementationText = "PROGRAM PRG_TcUnitRunner // new", "// new body"
+        proj._children.append(it)
+        sm.items[it.PathName] = it
+        for k in kids:
+            sm.items[k.PathName] = k
+    proj.on_import = dup
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert r["replaced"] == [{"object": orig.PathName, "from_copy": "TIPC^Plc^Plc Project^PRG_TcUnitRunner_1"}]
+    assert orig.DeclarationText == "PROGRAM PRG_TcUnitRunner // new" and orig.ImplementationText == "// new body"
+    assert meth.ImplementationText == "// new Run" and proj.deleted[-1] == "PRG_TcUnitRunner_1"
+    # a copy with other methods cannot be mapped: removed again, nothing else changed
+    proj._children = [c for c in proj._children if c.Name != "PRG_TcUnitRunner_1"]
+    proj.on_import = lambda: dup(("Run", "Extra"))
+    with pytest.raises(X.XaeError, match=r"other methods/properties.*Extra.*copies were removed again"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert proj.deleted[-1] == "PRG_TcUnitRunner_1" and orig.ImplementationText == "// new body"
 
 
 def test_n10_n45_online_commands_and_check_all_objects_via_the_automation_interface(xae):
@@ -523,3 +562,22 @@ def test_n10_n45_online_commands_and_check_all_objects_via_the_automation_interf
     proj.ConsumeXml = refuse
     r = be.plc_action("login")                                  # falls back to the shell command, says why
     assert r["command"] == "PLC.Login" and "online command refused" in r["automation_interface"]
+
+
+def test_n10_retest_outer_and_nested_node_are_one_plc_project(xae):
+    """#10 (0.8.8 retest): the outer PLC node (ItemType PLCAPP on the real tree) and its nested '<Name> Project' were
+    both listed → 'TIPC^Untitled1^Untitled1 Project' ×2 → 'ambiguous' → the DTE fallback and > 120 s."""
+    be, dte, sm = xae
+    real_children = be.tree_children
+
+    def with_outer(path, depth=1, **kw):
+        res = real_children(path, depth, **kw)
+        if path == "TIPC":
+            res["items"] = [{"Name": "Plc", "PathName": "TIPC^Plc", "ItemType": X.TREEITEMTYPE_PLCAPP}] + res["items"]
+        return res
+    be.tree_children = with_outer
+    pj = be.plc_projects()
+    assert pj["count"] == 1 and pj["projects"][0]["iec_project_path"] == "TIPC^Plc^Plc Project"
+    assert pj["projects"][0]["plc_project_path"] == "TIPC^Plc^Plc Project"           # the nested node's fields kept
+    r = be.plc_action("login")
+    assert r["method"] == "ConsumeXml LoginCmd" and dte.commands == []               # no DTE fallback, no wait

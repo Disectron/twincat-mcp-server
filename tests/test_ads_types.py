@@ -59,3 +59,38 @@ def test_leaves_keep_declared_alias_name():
     lv = ts.leaves("MAIN.stIo", "ST_IO")
     assert [(l.path, l.type, l.offset, l.size) for l in lv] == [("MAIN.stIo.bEnable", "BOOL", 0, 1), ("MAIN.stIo.sName", "T_MaxString", 1, 256)]
     assert ts.leaves("MAIN.bEnable", "BOOL")[0].type == "BOOL"
+
+
+def test_r42_pointer_to_fb_is_an_address_not_the_fb():
+    """R42: ARRAY[1..1000] OF POINTER TO FB_TestSuite (TcUnit) was expanded as 1,000 whole FBs at the pointers' 8 bytes."""
+    from twincat_mcp.ads_types import TypeSystem, DtEntry
+    fb = DtEntry("FB_TestSuite", "", 4000, 0, 65, 0, "", [], [
+        DtEntry("InstancePath", "STRING(80)", 81, 0, 30, 0, ""),
+        DtEntry("Tests", "ARRAY [1..100] OF ST_Test", 3900, 100, 65, 0, "", [(1, 100)]),
+    ])
+    st = DtEntry("ST_Test", "", 39, 0, 65, 0, "", [], [DtEntry("Name", "STRING(30)", 31, 0, 30, 0, ""),
+                                                        DtEntry("Ok", "BOOL", 1, 32, 33, 0, "")])
+    ptr = DtEntry("POINTER TO FB_TestSuite", "FB_TestSuite", 8, 0, 65, 1, "")
+    arr = DtEntry("ARRAY [1..1000] OF POINTER TO FB_TestSuite", "POINTER TO FB_TestSuite", 8000, 0, 65, 1, "", [(1, 1000)])
+    gvl_member = DtEntry("pCurrent", "POINTER TO FB_TestSuite", 8, 0, 65, 0, "")
+    holder = DtEntry("ST_Holder", "", 16, 0, 65, 0, "", [], [gvl_member, DtEntry("pRaw", "POINTER TO BYTE", 8, 8, 65, 0, "")])
+    ts = TypeSystem({e.name.lower(): e for e in (fb, st, ptr, arr, holder,
+                                                  DtEntry("STRING(80)", "", 81, 0, 30, 0, ""),
+                                                  DtEntry("STRING(30)", "", 31, 0, 30, 0, ""),
+                                                  DtEntry("BOOL", "", 1, 0, 33, 0, ""))})
+    lv = ts.leaves("GVL_TcUnit.TestSuiteAddresses", arr.name)
+    assert len(lv) == 1000 and {l.type for l in lv} == {"POINTER TO FB_TestSuite"} and lv[1].offset == 8
+    assert "address" in lv[0].note
+    buf = (0x1F2E3D4C5B6A7980).to_bytes(8, "little") + bytes(8 * 999)
+    tree = ts.decode_tree(buf, arr.name)
+    assert len(tree) == 1000 and tree[0] == "0x1F2E3D4C5B6A7980" and tree[1] is None
+    assert ts.decode_leaf(buf, lv[0]) == "0x1F2E3D4C5B6A7980"
+    # members declared POINTER TO …, with and without a table entry for the pointer type
+    hl = ts.leaves("MAIN.st", "ST_Holder")
+    assert [(l.path, l.type) for l in hl] == [("MAIN.st.pCurrent", "POINTER TO FB_TestSuite"), ("MAIN.st.pRaw", "POINTER TO BYTE")]
+    d = ts.decode_tree(bytes(16), "ST_Holder")
+    assert d == {"pCurrent": None, "pRaw": None}
+    # an ordinary alias of a struct (same size) is still expanded
+    alias = DtEntry("T_TestAlias", "ST_Test", 39, 0, 65, 0, "")
+    ts.table["t_testalias"] = alias
+    assert [l.path for l in ts.leaves("x", "T_TestAlias")] == ["x.Name", "x.Ok"]

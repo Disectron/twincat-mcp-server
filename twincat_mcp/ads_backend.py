@@ -539,9 +539,13 @@ class AdsBackend:
         return out
 
     def dump(self, pattern: str | None, include_system: bool, out_dir: str, max_total_bytes: int = 64 * 1024 * 1024,
-             max_leaves: int = 500_000, port: int | None = None, cancel: Any = None) -> dict[str, Any]:
+             max_leaves: int = 500_000, port: int | None = None, cancel: Any = None,
+             own_roots: set[str] | None = None) -> dict[str, Any]:
         """Read every variable (every root symbol, fully expanded) and write JSON + CSV. Written as *.partial and
-        renamed when complete; a failed or cancelled dump leaves no file behind and says so (R8)."""
+        renamed when complete; a failed or cancelled dump leaves no file behind and says so (R8). R42: pointers are
+        addresses (never the pointee), one leaf budget for CSV and JSON, max_total_bytes counts what is WRITTEN, the
+        JSON is streamed root by root, the project's own roots come first, and a dump whose call already ended (the
+        client's timeout set `cancel`) is never renamed into place."""
         import os
         from pathlib import Path
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -549,9 +553,9 @@ class AdsBackend:
         cpath = Path(out_dir) / f"dump-{stamp}.csv"
         jpart, cpart = jpath.with_name(jpath.name + ".partial"), cpath.with_name(cpath.name + ".partial")
         os.makedirs(out_dir, exist_ok=True)
-        try:
-            res = self._dump(pattern, include_system, cpart, jpart, max_total_bytes, max_leaves, port, cancel)
-        except BaseException as exc:
+        self.dump_progress = {"phase": "listing the symbols", "started": time.time()}
+
+        def drop() -> list[str]:
             removed = []
             for p in (cpart, jpart):
                 try:
@@ -561,62 +565,125 @@ class AdsBackend:
                         removed.append(f"{p.name} ({size} bytes)")
                 except OSError:
                     pass
+            return removed
+        try:
+            res = self._dump(pattern, include_system, cpart, jpart, max_total_bytes, max_leaves, port, cancel, own_roots)
+            if cancel is not None and cancel.is_set():
+                raise AdsError("cancelled: the call had already ended (timeout) — the files are not kept")
+        except BaseException as exc:
+            removed = drop()
+            self.dump_progress["phase"] = "failed"
             msg = f"ads_dump failed: {_fmt_exc(exc) if not isinstance(exc, AdsError) else exc}"
             raise AdsError(msg + (f" — partial files removed: {removed}" if removed else "")) from exc
         os.replace(cpart, cpath)
         os.replace(jpart, jpath)
+        self.dump_progress["phase"] = "done"
         res.update({"json": str(jpath), "csv": str(cpath)})
         return res
 
     def _dump(self, pattern: str | None, include_system: bool, cpath: Any, jpath: Any, max_total_bytes: int,
-              max_leaves: int, port: int | None, cancel: Any) -> dict[str, Any]:
+              max_leaves: int, port: int | None, cancel: Any, own_roots: set[str] | None = None) -> dict[str, Any]:
         import csv, json
         c = self.conn(port)
         ts = self.typesystem(False, port)
-        roots = self.roots(pattern, include_system, port)
+        roots = _dump_order(self.roots(pattern, include_system, port), own_roots)
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        tree: dict[str, Any] = {}
         n_leaves = 0
         n_bytes = 0
         errors: list[dict[str, str]] = []
+        skipped: list[dict[str, str]] = []
+        sizes: list[dict[str, Any]] = []
         preview: list[dict[str, Any]] = []
+        truncated: str | None = None
         t0 = time.time()
-        with open(cpath, "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
+        prog = self.dump_progress
+
+        def cancelled() -> bool:
+            return cancel is not None and cancel.is_set()
+
+        with open(cpath, "w", newline="", encoding="utf-8") as fh, open(jpath, "w", encoding="utf-8") as jh:
+            cw = _Counting(fh)
+            jw = _Counting(jh)
+            w = csv.writer(cw)
             w.writerow(["path", "type", "value"])
-            for r in roots:
-                if cancel is not None and cancel.is_set():
-                    raise AdsError("cancelled (the call timed out or was stopped)")
-                if n_bytes + r.size > max_total_bytes or n_leaves >= max_leaves:
-                    errors.append({"symbol": r.name, "error": "skipped: dump size/leaf limit reached"})
+            jw.write('{"target": ' + json.dumps(self.target_label()) + ', "taken": ' + json.dumps(stamp) + ', "values": {')
+            first = True
+            for i, r in enumerate(roots):
+                if cancelled():
+                    raise AdsError(f"cancelled at root {i + 1} of {len(roots)} ({r.name}) — the call timed out or was stopped")
+                if truncated:
+                    skipped.append({"root": r.name, "reason": truncated})
                     continue
+                if cw.n + jw.n >= max_total_bytes or n_leaves >= max_leaves:
+                    truncated = ("size limit: max_total_mb written" if cw.n + jw.n >= max_total_bytes
+                                 else f"leaf limit: max_leaves {max_leaves}")
+                    skipped.append({"root": r.name, "reason": truncated})
+                    continue
+                prog.update(phase="reading", root=r.name, index=i + 1, of=len(roots), leaves=n_leaves,
+                            written_mb=round((cw.n + jw.n) / 1e6, 1))
                 try:
                     raw = bytes(c.read(r.index_group, r.index_offset, ctypes.c_ubyte * max(r.size, 1), return_ctypes=True, check_length=False))
                 except Exception as exc:  # noqa: BLE001
                     errors.append({"symbol": r.name, "error": _fmt_exc(exc)})
                     continue
                 n_bytes += len(raw)
+                c0, j0 = cw.n, jw.n
+                prog["phase"] = "decoding"
                 if ts is not None and ts.get(r.type) is not None:
-                    tree[r.name] = ts.decode_tree(raw, r.type)
-                    lv = ts.leaves(r.name, r.type, max_leaves - n_leaves)
-                    for leaf in lv:
+                    left = max_leaves - n_leaves
+                    lv = ts.leaves(r.name, r.type, left + 1)
+                    cut = len(lv) > left
+                    lv = lv[:left]
+                    prog["phase"] = "writing CSV"
+                    vals: dict[str, Any] = {}
+                    for k, leaf in enumerate(lv):
                         val = ts.decode_leaf(raw, leaf) if leaf.size else None
                         w.writerow([leaf.path, leaf.type, _csv_val(val)])
+                        if cut:
+                            vals[leaf.path] = val
                         if len(preview) < 50:
                             preview.append({"path": leaf.path, "type": leaf.type, "value": val})
+                        if k % 2000 == 1999:
+                            if cancelled():
+                                raise AdsError(f"cancelled while writing {r.name} — the call timed out or was stopped")
+                            if cw.n + jw.n >= max_total_bytes:
+                                cut = True
+                                lv = lv[:k + 1]
+                                vals = {x.path: vals.get(x.path) for x in lv} if vals else {
+                                    x.path: (ts.decode_leaf(raw, x) if x.size else None) for x in lv}
+                                break
                     n_leaves += len(lv)
+                    prog["phase"] = "writing JSON"
+                    if cut:
+                        # this root did not fit: its JSON is the leaves that were written, flat, and marked
+                        node: Any = {"_truncated": True, "_leaves": vals}
+                        truncated = truncated or (f"leaf limit: max_leaves {max_leaves}" if n_leaves >= max_leaves
+                                                  else "size limit: max_total_mb written")
+                    else:
+                        node = ts.decode_tree(raw, r.type)
                 else:
-                    val = TypeSystem._decode_scalar(raw, 0, r.type, None, None)
-                    tree[r.name] = val
-                    w.writerow([r.name, r.type, _csv_val(val)])
+                    node = TypeSystem._decode_scalar(raw, 0, r.type, None, None)
+                    w.writerow([r.name, r.type, _csv_val(node)])
                     n_leaves += 1
+                    lv = [None]
                     if len(preview) < 50:
-                        preview.append({"path": r.name, "type": r.type, "value": val})
-        jpath.write_text(json.dumps({"target": self.target_label(), "taken": stamp, "roots": len(roots), "leaves": n_leaves,
-                                     "values": tree}, indent=1, default=str), encoding="utf-8")
-        return {"roots": len(roots), "leaves": n_leaves, "bytes_read": n_bytes, "duration_s": round(time.time() - t0, 2),
-                "datatype_table": ts is not None, "errors": errors[:50], "errors_total": len(errors),
-                "preview": preview}
+                        preview.append({"path": r.name, "type": r.type, "value": node})
+                jw.write(("" if first else ",") + "\n" + json.dumps(r.name) + ": " + json.dumps(node, default=str))
+                first = False
+                sizes.append({"root": r.name, "leaves": len(lv), "csv_bytes": cw.n - c0, "json_bytes": jw.n - j0})
+            jw.write("\n}, " + json.dumps({"roots": len(roots), "leaves": n_leaves, "truncated": bool(truncated)})[1:] + "\n")
+        out = {"roots": len(roots), "leaves": n_leaves, "bytes_read": n_bytes, "csv_bytes": cw.n, "json_bytes": jw.n,
+               "duration_s": round(time.time() - t0, 2), "datatype_table": ts is not None, "truncated": bool(truncated),
+               "errors": errors[:50], "errors_total": len(errors),
+               "largest_roots": sorted(sizes, key=lambda x: -(x["csv_bytes"] + x["json_bytes"]))[:10],
+               "preview": preview}
+        if truncated:
+            out["truncated_reason"] = truncated
+            out["skipped_roots"] = skipped[:50]
+            out["skipped_total"] = len(skipped)
+            out["hint"] = ("the dump was cut — raise max_leaves / max_total_mb, or dump the rest with pattern= "
+                           "(skipped_roots lists what is missing)")
+        return out
 
     # ------------------------------------------------------------ read / write
     def _typed_read(self, c: pyads.Connection, s: SymbolEntry) -> tuple[T.TcType, Any]:
@@ -1184,6 +1251,32 @@ def _parse_discovery(data: bytes) -> dict[str, Any] | None:
     if raw_tags:
         out["raw_tags"] = raw_tags
     return out
+
+
+class _Counting:
+    """File wrapper that counts the characters written (R42: max_total_mb bounds what is written, not what is read)."""
+
+    def __init__(self, fh: Any):
+        self.fh, self.n = fh, 0
+
+    def write(self, s: str) -> int:
+        self.n += len(s)
+        return self.fh.write(s)
+
+
+_LIBRARY_GLOBALS = ("gvl_tcunit", "gvl_param_tcunit", "global_variables", "global_version", "constants", "tcunit",
+                    "param_", "gvl_param_")
+
+
+def _dump_order(roots: list[SymbolEntry], own: set[str] | None) -> list[SymbolEntry]:
+    """R42 #5: the program's own roots first (MAIN, PRG_*, the project's GVLs), library globals last, so a budget is
+    spent on what the user wrote. own = PROGRAM / GVL names from the project source when one is configured."""
+    def rank(s: SymbolEntry) -> int:
+        head = s.name.split(".")[0].split("[")[0].lower()
+        if own:
+            return 0 if head in own else 2 if head.startswith(_LIBRARY_GLOBALS) else 1
+        return 2 if head.startswith(_LIBRARY_GLOBALS) else 0
+    return sorted(roots, key=lambda s: (rank(s), s.name.lower()))
 
 
 def _is_system_symbol(name: str) -> bool:

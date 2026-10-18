@@ -26,6 +26,7 @@ Layout (TcAdsDef.h ``AdsDatatypeEntry``):
 """
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any
@@ -56,6 +57,7 @@ def is_interface(e: "DtEntry | None") -> bool:
     return bool(e.flags & F_TCCOMIFACEPTR) or (bool(e.flags & F_METHODINFOS) and not e.subitems and not e.dims
                                                and not e.enum and e.size in (4, 8))
 MAX_ARRAY_ELEMENTS = 4096                # per expansion of a single array (guard)
+_RE_INDIRECT = re.compile(r"^\s*(POINTER|REFERENCE)\s+TO\b", re.I)
 
 
 @dataclass
@@ -216,6 +218,21 @@ class TypeSystem:
     def get(self, type_name: str) -> DtEntry | None:
         return self.table.get(type_name.strip().lower())
 
+    def is_indirect(self, e: DtEntry | None, type_name: str | None = None) -> bool:
+        """POINTER TO / REFERENCE TO / INTERFACE: the value is an address, never the pointee (R42: a POINTER TO
+        FB_TestSuite entry carries the pointee as its base type and was expanded as the whole FB at the pointer's
+        8 bytes — fabricated members, 4.7 GB of JSON for 1,000 pointers)."""
+        if e is not None and (e.flags & F_REFERENCETO or is_interface(e)):
+            return True
+        for n in (type_name, e.name if e is not None else None):
+            if n and _RE_INDIRECT.match(n):
+                return True
+        if e is not None and e.size in (4, 8) and e.type and not e.subitems and not e.dims and not e.enum:
+            tgt = self.get(e.type)
+            if tgt is not None and (tgt.size or 0) > e.size and (tgt.subitems or tgt.dims):
+                return True          # a pointer-sized "alias" of a bigger structured type is an indirection
+        return False
+
     # ---------------------------------------------------------------- expand
     def leaves(self, root_path: str, type_name: str, max_leaves: int = 200_000,
                base_offset: int = 0, max_array: int = MAX_ARRAY_ELEMENTS) -> list[Leaf]:
@@ -231,10 +248,12 @@ class TypeSystem:
         if e is None:
             # unknown to the table: treat as scalar by name
             tt = T.parse_type(type_name, None)
-            out.append(Leaf(path, type_name, off, tt.size or 0, 0, None, "type not in datatype table"))
+            note = "pointer/reference: the address, not the target" if _RE_INDIRECT.match(type_name or "") else "type not in datatype table"
+            out.append(Leaf(path, type_name, off, tt.size or 0, 0, None, note))
             return
-        if e.flags & F_REFERENCETO:
-            out.append(Leaf(path, e.name if entry is None else e.type, off, e.size, e.data_type, None, "reference/pointer"))
+        if self.is_indirect(e, type_name):
+            out.append(Leaf(path, type_name if entry is None else e.type, off, e.size, e.data_type, None,
+                            "pointer/reference: the address, not the target"))
             return
         if e.dims:
             if entry is not None:
@@ -295,9 +314,12 @@ class TypeSystem:
     def decode_tree(self, buf: bytes, type_name: str, off: int = 0, entry: DtEntry | None = None,
                     max_array: int = MAX_ARRAY_ELEMENTS, depth: int = 0) -> Any:
         e = entry or self.get(type_name)
+        if e is None and _RE_INDIRECT.match(type_name or ""):
+            size = T.parse_type(type_name, None).size or 8
+            return T.fmt_pointer(int.from_bytes(buf[off:off + size], "little"), size) if size in (4, 8) else None
         if e is None or depth > 32:
             return self._decode_scalar(buf, off, type_name, None, None)
-        if e.flags & F_REFERENCETO or is_interface(e):
+        if self.is_indirect(e, type_name if entry is None else e.type):
             return T.fmt_pointer(int.from_bytes(buf[off:off + e.size], "little"), e.size) if e.size in (4, 8) else None
         if e.dims:
             if entry is not None:
@@ -332,8 +354,8 @@ class TypeSystem:
 
     def decode_leaf(self, buf: bytes, leaf: "Leaf") -> Any:
         e = self.get(leaf.type)
-        if e is not None and (is_interface(e) or e.flags & F_REFERENCETO) and e.size == leaf.size:
-            return T.fmt_pointer(int.from_bytes(buf[leaf.offset:leaf.offset + e.size], "little"), e.size)
+        if self.is_indirect(e, leaf.type) and leaf.size in (4, 8):
+            return T.fmt_pointer(int.from_bytes(buf[leaf.offset:leaf.offset + leaf.size], "little"), leaf.size)
         if e is None or e.size != leaf.size:
             e = DtEntry(leaf.type, "", leaf.size, 0, leaf.data_type or (e.data_type if e else 0), 0, "", enum=dict(leaf.enum or {}))
         return self._decode_scalar(buf, leaf.offset, leaf.type, e, leaf.enum or (e.enum or None))

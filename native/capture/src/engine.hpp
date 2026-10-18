@@ -154,6 +154,12 @@ private:
         std::vector<uint8_t> d;
     };
     std::deque<Pre> pre_;
+    // R41: a level start_when waits until every block delivers (or 200 ms of PLC time): fired on block 0's first
+    // sample it put the window start before block 1's subscription began (missing_head 1 on a lossless capture)
+    std::vector<char> armed_seen_;
+    size_t armed_seen_n_ = 0;
+    int64_t armed_t0_ = 0;
+    bool have_armed_t0_ = false;
     uint64_t samples_ = 0, events_ = 0, after_limit_ = 0;
     int64_t last_emitted_ = 0;
     bool any_emitted_ = false;

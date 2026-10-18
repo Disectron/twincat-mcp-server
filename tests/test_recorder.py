@@ -649,6 +649,20 @@ def test_r9_r10_nonsense_parameters_and_conditions_are_refused(rec):
     rec.stop(ok["id"])
 
 
+def test_n31_cycle_below_the_fastest_task_is_flagged(rec):
+    """N31: cycle_ms=0.1 on a 1 ms task was accepted without a word ('20000 notifications/s'). The fake's task runs
+    every 10 ms."""
+    base = dict(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=None,
+                max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="n31", max_symbols=50)
+    st = rec.start(**base)
+    rec.stop(st["id"])
+    assert "below the fastest task of this runtime (10 ms)" in st["warning"] and st["fastest_task_ms"] == 10.0
+    assert "use cycle_ms=10" in st["warning"]
+    st = rec.start(**{**base, "cycle_ms": 10})
+    rec.stop(st["id"])
+    assert "fastest task" not in st.get("warning", "") and "fastest_task_ms" not in st
+
+
 def test_r13_snapshot_of_a_recording_from_an_earlier_session(rec, monkeypatch, tmp_path):
     """R13: rec_snapshot of a recording made before a server restart → 'unknown in this session'."""
     st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="poll", cycle_ms=10, duration_s=None,

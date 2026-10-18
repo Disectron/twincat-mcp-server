@@ -29,6 +29,9 @@ Version 2 (2026-10-18), changes against version 1:
   - knowledge folder found like the other knowledge tools (--kb, TCMCP_KNOWLEDGE_DIR, kb_set_location)
   - one update at a time (<db>.lock with a heartbeat); state and progress in a meta table; `stats` shows it
   - `search --doc` filters before the row limit (it used to filter the first limit × 10 hits only)
+Version 3 (2026-10-18): page text format 2 — running headers, footers and margin labels (lines at the top or bottom
+  of a page that repeat on many pages) are removed from the page text, also where glued to a heading; a heading
+  wrapped over two lines is one toc entry. An index of format 1 is reported as outdated and read again on update.
 Stored paths stay absolute (moving the knowledge folder re-indexes every manual on the next update).
 """
 from __future__ import annotations
@@ -53,7 +56,8 @@ import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 BUILDER = "manuals_db.py"
-BUILDER_VERSION = "2"
+BUILDER_VERSION = "3"
+TEXT_FORMAT = "2"                # page text / toc rules; an index written with another one is read again on update
 FALLBACK_KB = Path(r"D:\TwinCAT-MCP\knowledge")
 HEARTBEAT_STALE_S = 300          # one large PDF can take a while: an update silent for this long is gone
 
@@ -177,20 +181,28 @@ def _toc_from_fonts(d) -> list[tuple[int, str, int]]:
     raw: list[tuple[str | None, str, int, int]] = []          # (number, title, size rank, page)
     for pg, lines in enumerate(lines_per_page, 1):
         pending = None
+        last = None                                           # index in raw of the heading on the line just above
         for size, bold, txt in lines:
             if size not in rank or not bold:
-                pending = None
+                pending = last = None
                 continue
             if _NUM.match(txt):
                 pending = txt.rstrip(".")
+                last = None
                 continue
             if len(txt) > 120:
+                pending = last = None
                 continue
             num = pending
             glued = _GLUED.match(txt)                         # '10Error handling' (number and title in one span)
             if num is None and glued:
                 num, txt = glued.group(1), glued.group(2)
+            if num is None and last is not None and raw[last][2] == rank[size]:
+                n0, t0, r0, p0 = raw[last]                    # N37: the heading wrapped onto a second line
+                raw[last] = (n0, _join_wrapped(t0, txt), r0, p0)
+                continue
             raw.append((num, txt, rank[size], pg))
+            last = len(raw) - 1
             pending = None
     numbered = any(n for n, *_ in raw)
     # numbered manuals: level = number depth, unnumbered headings (contents, lists) = level 1
@@ -208,6 +220,97 @@ def _first_title(d) -> str:
         return best[0]
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _join_wrapped(head: str, tail: str) -> str:
+    if head.endswith("-") and tail[:1].islower():             # 'Brücken-' + 'kapazität'
+        return head[:-1] + tail
+    return f"{head} {tail}"
+
+
+_TOC_NUM = re.compile(r"^\d+(?:\.\d+)*\.?\s")
+
+
+def _mend_toc(toc: list[tuple[int, str, int]]) -> list[tuple[int, str, int]]:
+    """N37: a heading wrapped over two lines became two chapters — '4.10 Notes on the measurement of the bridge' and a
+    level-1 'capacity' (also from bookmarks generated per line). In a numbered manual an unnumbered entry on the same
+    page as the entry before it is that entry's second line when it starts in lower case or with a closing bracket,
+    or when the entry before ends mid-phrase (hyphen, comma, '(', 'and', 'of' …)."""
+    if not any(_TOC_NUM.match(t) for _, t, _ in toc):
+        return toc
+    out: list[tuple[int, str, int]] = []
+    for lvl, t, pg in toc:
+        if out and not _TOC_NUM.match(t) and t and pg == out[-1][2]:
+            prev = out[-1][1].rstrip()
+            if (t[:1].islower() or t[:1] in ")]}" or prev.endswith(("-", ",", "(", "/", "&"))
+                    or re.search(r"\b(?:and|or|of|the|for|with|to|in|on|und|oder|der|die|das|des|für|mit|zur|zum|von)$", prev, re.I)):
+                out[-1] = (out[-1][0], _join_wrapped(prev, t.strip()), pg)
+                continue
+        out.append((lvl, t, pg))
+    return out
+
+
+_SIGNAL_WORDS = {"note", "notice", "caution", "warning", "danger", "attention", "hinweis", "vorsicht", "warnung", "gefahr",
+                 "achtung", "tip", "example", "beispiel"}
+_HEAD_LINES = 3                       # lines at the top and at the bottom of a page that can be a running header/footer
+
+
+def _norm_line(s: str) -> str:
+    return re.sub(r"\d+", "#", " ".join(s.split())).strip().lower()
+
+
+def _strip_running(pages: list[str], chapter_titles: set[str],
+                   headings: frozenset[str] = frozenset()) -> tuple[list[str], list[str]]:
+    """N37: running headers, footers and margin labels ('Commissioning', 'EL3356 Version: 2.4  79') were part of the
+    page text and glued to headings ('Calibration and compensation4.4 Calibration'). A line among the first or last
+    three of a page whose text (digits as '#') repeats there on 3 pages and 5 % of the pages — or on 2 when it is a
+    chapter title — is removed (signal words like NOTE / WARNING are never); such a header glued to the start or end of a line is cut off when what remains starts like a
+    heading. -> (pages, the header texts removed)"""
+    from collections import Counter
+    split = [[ln for ln in t.split("\n")] for t in pages]
+    edge = lambda ls: [i for i, ln in enumerate(ls) if ln.strip()][:_HEAD_LINES] + \
+        [i for i, ln in enumerate(ls) if ln.strip()][-_HEAD_LINES:]            # noqa: E731
+    seen: Counter = Counter()
+    nums: dict[str, set] = {}
+    for pg, ls in enumerate(split):
+        for h, raw in {_norm_line(ls[i]): ls[i] for i in edge(ls)}.items():
+            seen[h] += 1
+            nums.setdefault(h, set()).add(tuple(int(x) - pg * (k == len(re.findall(r"\d+", raw)) - 1)
+                                                for k, x in enumerate(re.findall(r"\d+", raw))))
+    often = max(3, -(-len(pages) * 5 // 100))                                   # 3, or 5 % of the pages
+
+    def running(h: str, n: int) -> bool:
+        if not h or len(h) > 80 or h in _SIGNAL_WORDS or not (n >= often or (n >= 2 and h in chapter_titles)):
+            return False
+        if re.match(r"#(?:\.#)*\s", h) and any(t.startswith(h) for t in headings):
+            return False                                  # a numbered heading of the toc (or its first line)
+        if h not in chapter_titles and any(t.endswith(" " + h) for t in headings):
+            return False                                  # the second line of a wrapped heading
+        # numbers that differ from page to page: only a page number (its last number grows with the page) qualifies
+        return len(nums[h]) <= max(1, n // 5)
+    heads = {h for h, n in seen.items() if running(h, n)}
+    if not heads:
+        return pages, []
+    glue = [h for h in heads if len(h) >= 8 and re.search(r"[a-zäöü]", h)]
+    pats = [re.compile(r"\s*".join(r"\d+" if tok == "#" else re.escape(tok) for tok in re.split(r"(#)|\s+", h) if tok),
+                       re.I) for h in glue]
+    out = []
+    for ls in split:
+        for i in edge(ls):
+            if _norm_line(ls[i]) in heads:
+                ls[i] = ""
+                continue
+            for pat in pats:
+                m = pat.match(ls[i].lstrip())
+                if m and m.end() < len(ls[i].lstrip()) and re.match(r"\s*[\dA-ZÄÖÜ]", ls[i].lstrip()[m.end():]):
+                    ls[i] = ls[i].lstrip()[m.end():].lstrip()
+                    break
+                m = re.search(r"(?<=\S)\s*(?:" + pat.pattern + r")\s*$", ls[i], re.I)
+                if m:
+                    ls[i] = ls[i][:m.start()].rstrip()
+                    break
+        out.append("\n".join(ls))
+    return out, sorted(heads)
 
 
 def _clean(t: str) -> str:
@@ -268,10 +371,13 @@ def index_pdf(con, path: Path, sha: str) -> dict:
                       (str(path), path.name, st.st_size, int(st.st_mtime), sha, meta_title or path.stem, n, 0,
                        time.strftime("%Y-%m-%d %H:%M:%S"), backend))
     doc_id = cur.lastrowid
+    toc = _mend_toc(toc)
     secs = _sections(toc, n)
     con.executemany("INSERT INTO toc VALUES(?,?,?,?)", [(doc_id, lvl, t, pg) for lvl, t, pg in toc])
+    chapters = {_norm_line(_TOC_NUM.sub("", t)) for lvl, t, _ in toc if lvl <= 2}
+    pages, heads = _strip_running(list(texts), chapters, frozenset(_norm_line(t) for _, t, _ in toc))
     text_pages = 0
-    for pg, raw in enumerate(texts, 1):
+    for pg, raw in enumerate(pages, 1):
         t = _clean(raw)
         if t:
             text_pages += 1
@@ -282,7 +388,8 @@ def index_pdf(con, path: Path, sha: str) -> dict:
             counts[code] = counts.get(code, 0) + 1
         con.executemany("INSERT INTO product VALUES(?,?,?,?)", [(c, doc_id, pg, k) for c, k in counts.items()])
     con.execute("UPDATE doc SET text_pages=? WHERE id=?", (text_pages, doc_id))
-    return {"id": doc_id, "pages": n, "text_pages": text_pages, "toc": len(toc), "backend": backend}
+    return {"id": doc_id, "pages": n, "text_pages": text_pages, "toc": len(toc), "backend": backend,
+            "running_lines": len(heads)}
 
 
 class UpdateLock:
@@ -342,6 +449,11 @@ def _update(args, folder: Path, db: Path, lock: "UpdateLock") -> None:
     con = connect(db, create=True)
     known = {r["path"]: r for r in con.execute("SELECT * FROM doc")}
     found = {str(p): p for p in folder.rglob("*") if p.suffix.lower() == ".pdf" and p.is_file()}
+    fmt = (con.execute("SELECT value FROM meta WHERE key='text_format'").fetchone() or ["1"])[0]
+    reread = bool(known) and fmt != TEXT_FORMAT
+    if reread:
+        print(f"page text format {fmt} -> {TEXT_FORMAT}: every manual is read again "
+              "(running headers/footers removed, wrapped headings joined)")
     added = changed = unchanged = removed = failed = 0
     _meta(con, state="updating", pid=os.getpid(), started=time.strftime("%Y-%m-%d %H:%M:%S"), files_total=len(found),
           files_done=0, heartbeat=f"{time.time():.0f}", folder=str(folder), builder=f"{BUILDER} {BUILDER_VERSION}")
@@ -354,12 +466,13 @@ def _update(args, folder: Path, db: Path, lock: "UpdateLock") -> None:
         lock.beat()
         st = p.stat()
         old = known.get(path_s)
-        if old and not args.force and old["size"] == st.st_size and old["mtime"] == int(st.st_mtime):
+        force = args.force or reread
+        if old and not force and old["size"] == st.st_size and old["mtime"] == int(st.st_mtime):
             unchanged += 1
             continue
         t0 = time.time()
         sha = _sha256(p)
-        if old and not args.force and old["sha256"] == sha:      # touched, same content
+        if old and not force and old["sha256"] == sha:      # touched, same content
             con.execute("UPDATE doc SET mtime=? WHERE id=?", (int(st.st_mtime), old["id"])); unchanged += 1
             continue
         if old:
@@ -377,11 +490,11 @@ def _update(args, folder: Path, db: Path, lock: "UpdateLock") -> None:
             added += 1
         note = "  (no text layer: scanned?)" if r["text_pages"] == 0 else ""
         print(f"{'updated ' if old else 'added   '} {p.name}: {r['pages']} pages, {r['toc']} bookmarks, "
-              f"{time.time() - t0:.1f} s{note}")
+              f"{r['running_lines']} running header/footer lines, {time.time() - t0:.1f} s{note}")
     con.commit()
     if added or changed or removed:
         con.execute("INSERT INTO fts(fts) VALUES('optimize')"); con.commit()
-    _meta(con, state="idle", files_done=len(found), heartbeat=f"{time.time():.0f}",
+    _meta(con, state="idle", files_done=len(found), heartbeat=f"{time.time():.0f}", text_format=TEXT_FORMAT,
           last_update=time.strftime("%Y-%m-%d %H:%M:%S"),
           last_result=f"{added} added, {changed} updated, {removed} removed, {unchanged} unchanged, {failed} failed")
     print(f"done: {added} added, {changed} updated, {removed} removed, {unchanged} unchanged, {failed} failed "
@@ -518,10 +631,16 @@ def manuals_state(db: Path, folder: Path) -> dict:
         out["updating"] = {"state": "running" if time.time() - beat < HEARTBEAT_STALE_S else "interrupted",
                          "files_done": int(meta.get("files_done") or 0), "files_total": int(meta.get("files_total") or 0)}
     pending = len(new) + len(changed) + len(gone)
-    out["state"] = "up_to_date" if not pending else "pending"
+    fmt = meta.get("text_format") or "1"
+    old_text = bool(docs) and fmt != TEXT_FORMAT
+    out["text_format"] = fmt
+    out["state"] = "pending" if pending else "outdated" if old_text else "up_to_date"
     msg = f"{len(docs)} manuals, {out['pages']} pages indexed"
     if pending:
         msg += f"; {len(new)} new, {len(changed)} changed, {len(gone)} removed PDF(s) not reflected — run update"
+    if old_text:
+        msg += (f"; page text format {fmt}, this builder writes {TEXT_FORMAT} (running headers removed, wrapped "
+                "headings joined) — run update, it reads every manual again")
     if out.get("updating"):
         u = out["updating"]
         msg += (f"; an update is RUNNING ({u['files_done']} of {u['files_total']} files)" if u["state"] == "running" else

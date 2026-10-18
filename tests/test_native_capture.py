@@ -584,3 +584,44 @@ def test_r7_manual_stop_of_a_lossless_native_recording_is_complete(rec):
     assert fin["engine"] == "native" and fin["missing_samples"] == 0 and fin["verdict_hint"] == "PASS", fin
     v = rec.verify(st["id"], counter="MAIN.nCycle")
     assert v["verdict"] == "PASS" and v["counter"]["lossless"], v
+
+
+def test_r41_trigger_keeps_every_block_from_the_trigger_cycle(capture_exe, tmp_path):
+    """R41: a triggered capture had missing_head 1 on one block although lossless. `start_when nCycle > 0` is true
+    at block 0's first sample, which came one cycle before block 1's subscription delivered: the window started
+    before block 1 existed. A level condition now fires on the first cycle every block delivers (here cycle 1).
+    Arrival skew between blocks (block 1 a cycle ahead) must not lose the trigger-cycle sample either."""
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "r41", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 4, "leaves": 1},
+                                                {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4, "leaves": 1}],
+                              start_when={"block": 0, "off": 0, "type": "u32", "op": ">=", "value": 0},
+                              post_trigger_s=0.3, sim={"speed": 50, "late": [[1, 1]], "skew": [[1, 1]]}))
+        assert r["ok"], r
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    blocks = {b["id"]: b for b in f["blocks"]}
+    assert blocks[1]["missing_head"] == 0 and blocks[0]["missing_head"] == 0, f["blocks"]
+    rows = _rows(tmp_path / "r41.jsonl")
+    firsts = {}
+    for t, k, b64 in rows:
+        firsts.setdefault(k, (t, int.from_bytes(base64.b64decode(b64)[:4], "little")))
+    # both blocks start on the same cycle, the first one where every block delivers (here 2: block 1 starts at 1)
+    assert firsts["#0"] == firsts["#1"] and firsts["#0"][1] <= 2, firsts
+    assert f["verdict_hint"] == "PASS" and f["missing_samples"] == 0
+
+
+def test_r7_verify_uses_the_engines_tail_rule_for_a_stop_on_request(rec):
+    """R7: rec_stop said COMPLETE (the engine allows the unsubscribe order on a stop on request), rec_verify on the
+    same file said missing_tail 1 → FAIL although the counter was lossless."""
+    st = rec.start(symbols=["MAIN.nCycle", "MAIN.stRecipe"], prefix=None, pattern=None, mode="cycle", cycle_ms=1,
+                   duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="r7",
+                   max_symbols=50)
+    time.sleep(0.6)
+    fin = rec.stop(st["id"])
+    assert fin["missing_samples"] == 0, fin
+    v = rec.verify(st["id"])
+    assert v["timeline"]["missing"] == 0 and v["verdict"] == "PASS", v["timeline"]
+    footer = json.loads(Path(fin["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer.get("manual_stop") is True and "max_delay_ms" in footer

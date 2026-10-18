@@ -1,7 +1,7 @@
 # Builders: infosys_local.py and manuals_db.py
 
 Two standalone scripts that build the offline documentation databases read by the `twincat-docs` skill
-(`kb_docs.py`) and by the twincat MCP server. Version 2 (plugin 0.8.9). Standard library only, except that
+(`kb_docs.py`) and by the twincat MCP server. `infosys_local.py` version 2, `manuals_db.py` version 3 (plugin 0.8.9). Standard library only, except that
 PDF text needs PyMuPDF or pypdf (see section 5).
 
 | script | reads | writes |
@@ -165,11 +165,16 @@ python manuals_db.py stats --json
 3. **Each PDF on disk:**
    - known and **size + mtime unchanged** → skipped (`unchanged`); the file is not read.
    - otherwise SHA-256 of the file; known and **same hash** → mtime updated, skipped (`unchanged`).
-   - otherwise (new or changed; or everything with `--force`): old rows dropped, file indexed, committed **per file**.
+   - otherwise (new or changed; or everything with `--force`, or everything when the database was written with an
+     older page text format, see below): old rows dropped, file indexed, committed **per file**.
      An exception rolls back that file only and is reported as `FAILED`; the run continues.
    - progress is kept: a file committed before an interruption is `unchanged` on the next run.
-4. `fts optimize` when anything changed. `meta.last_update` and `meta.last_result` are written
-   (`N added, N updated, N removed, N unchanged, N failed`).
+4. `fts optimize` when anything changed. `meta.last_update`, `meta.last_result`
+   (`N added, N updated, N removed, N unchanged, N failed`) and `meta.text_format` are written.
+5. **Page text format.** `TEXT_FORMAT` (currently `2`) names the page text and toc rules below. A database whose
+   `meta.text_format` differs (a version 1 or 2 database has none: format `1`) is reported as `outdated`, and the next
+   `update` reads every manual again (`page text format 1 -> 2: every manual is read again`). An interrupted run leaves
+   the old format in `meta`, so the next run reads all manuals again.
 
 ### Index logic per PDF
 
@@ -178,6 +183,17 @@ python manuals_db.py stats --json
 - Page text: PyMuPDF `get_text("text", sort=True)` (reading order, also for two columns); pypdf `extract_text()`.
   Cleaning: soft hyphens removed, `ﬁ/ﬂ` expanded, hyphenated line breaks joined (`exam-\nple` → `example`),
   runs of spaces/tabs collapsed, blank lines collapsed.
+- Running headers, footers and margin labels (format 2): the first three and last three non-empty lines of every page
+  are candidates. A candidate is removed when its text (case and spacing ignored, digits as `#`) occurs among the
+  candidates of **3 pages and 5 % of the pages**, or of 2 pages when it is a chapter title (level 1–2, without its
+  number). Numbers that differ from page to page must behave like a page number (the last number grows with the
+  page); otherwise the line is kept (`Table 3 of 9`). Never removed: signal words (`NOTE`, `NOTICE`, `CAUTION`,
+  `WARNING`, `DANGER`, `ATTENTION`, `HINWEIS`, `VORSICHT`, `WARNUNG`, `GEFAHR`, `ACHTUNG`, `TIP`, `EXAMPLE`,
+  `BEISPIEL`), a numbered toc heading or its first line, the second line of a wrapped toc heading. A removed header of
+  8 or more characters glued to the start of a line is cut off when the rest starts with a digit or a capital letter
+  (`Calibration and compensation4.4 Calibration` → `4.4 Calibration`); glued to the end of a line, it is cut off.
+  Limit: a table header row repeated at the top of 3+ pages (and 5 %) is removed from those pages too. The update prints
+  the number of removed header/footer texts per manual.
 - Title: PDF metadata title; if empty, the largest text span on page 1.
 - Chapters (`toc`):
   1. the PDF **bookmarks** if there are any;
@@ -185,14 +201,20 @@ python manuals_db.py stats --json
      heading candidates = **bold** lines with size ≥ **1.5 × body size**; a line holding only a number (`4`, `4.2`) is joined
      with the heading that follows; a number glued to the title in one span (`10Error handling`) is split; lines
      longer than 120 chars are ignored; level = depth of the number; unnumbered headings → level 1 when the manual
-     uses numbers, else the font-size rank.
+     uses numbers, else the font-size rank. A heading line directly below a heading line of the same size, on the same
+     page and without a number of its own, continues that heading (a heading wrapped over two lines, format 2).
+  3. both sources (format 2): in a manual that numbers its chapters, an unnumbered entry on the same page as the entry
+     before it is that entry's second line when it starts in lower case or with `)`, `]`, `}`, or when the entry before
+     ends with `-`, `,`, `(`, `/`, `&` or a joining word (`and`, `or`, `of`, `the`, `for`, `with`, `to`, `in`, `on`,
+     `und`, `oder`, `der`, `die`, `das`, `des`, `für`, `mit`, `zur`, `zum`, `von`). A trailing hyphen before a lower-case
+     continuation is dropped (`Brücken-` + `kapazität`).
 - Section per page: the label is the **last two levels** active at the end of the page (`10 Error handling > 10.1 Diagnostic LEDs`).
   When two headings start on one page, the page carries the later one.
 - Product codes: regex over each page's text, counted per page:
   `\b((EL|ELM|ELX|ES|EK|EP|EPP|EPI|ER|EQ|EM|EJ|EZ|EX|KL|KM|KS|BK|BC|BX|CX|CP|CU|C6|C7|AX|AMP|AM|AG|AT|FC|IP|IL|IE|LC|TF|TE|TC|ZB|ZK|ZS)\d{3,5}(-\d{4})?)\b`
 - Pages with no text are stored. A PDF with no text at all is flagged `no text layer (scanned?)`. OCR is not included.
 
-### Schema (version 2)
+### Schema (version 3; tables unchanged since version 2)
 
 ```sql
 doc(id PRIMARY KEY, path UNIQUE, name, size, mtime, sha256, title, pages, text_pages, indexed, backend)
@@ -202,8 +224,8 @@ toc(doc, level, title, page)
 product(code, doc, page, n)                          -- INDEX on code
 fts  USING fts5(text, section, doc UNINDEXED, page UNINDEXED, tokenize='unicode61 remove_diacritics 2')
 meta(key PRIMARY KEY, value)
-  -- state (updating | idle), pid, started, folder, builder ("manuals_db.py 2"), files_total, files_done, heartbeat,
-  -- last_update, last_result
+  -- state (updating | idle), pid, started, folder, builder ("manuals_db.py 3"), files_total, files_done, heartbeat,
+  -- last_update, last_result, text_format ("2")
 ```
 
 A version-1 database has no `meta` table; the next `update` creates it.
@@ -247,7 +269,9 @@ The `stats` output also shows the package path and the counts (`links`, `links_r
 
 ### manuals.db (`manuals_db.py stats --json`)
 
-`state` is `up_to_date` or `pending`. `pending` lists the PDFs that are not reflected in the database:
+`state` is `up_to_date`, `pending` or `outdated`. `outdated`: every PDF is indexed, but with an older page text format
+(`text_format` in the output; `update` reads every manual again). `pending` lists the PDFs that are not reflected in
+the database:
 
 | field | meaning |
 |---|---|
@@ -257,7 +281,7 @@ The `stats` output also shows the package path and the counts (`links`, `links_r
 | `no_text_layer` | indexed, but no page has text (scanned?) |
 | `updating` | `state` `running` or `interrupted`, with `files_done` of `files_total`. Interrupted: run `update` again |
 
-Pending items are fixed by `update`.
+Pending and outdated items are fixed by `update`.
 
 ## 5. PyMuPDF and pypdf
 
@@ -270,7 +294,7 @@ Pending items are fixed by `update`.
 ## 6. Copies in `<kb>\tools\`
 
 The plugin ships both scripts in `skills\twincat-docs\builders\`. The copies in `<kb>\tools\` are optional: they make
-the commands short. Replace any older copy with the version 2 files. Copy **both** files:
+the commands short. Replace any older copy with the current files (`infosys_local.py` 2, `manuals_db.py` 3). Copy **both** files:
 
 ```
 copy "<plugin>\skills\twincat-docs\builders\infosys_local.py" "<kb>\tools\"

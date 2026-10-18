@@ -261,7 +261,8 @@ class App:
             log.warning("seal sweep failed: %s", exc)
 
     # --- runners -----------------------------------------------------------
-    async def ads_call(self, fn, *a, timeout: float | None = None, slow: bool = False, bulk: bool = False, **kw) -> Any:
+    async def ads_call(self, fn, *a, timeout: float | None = None, slow: bool = False, bulk: bool = False,
+                       timeout_msg: Any = None, **kw) -> Any:
         """Run on the quick ADS worker, on the slow one (``slow=True``) for anything that blocks for seconds — so a
         long watch never stalls an ads_read — or on the bulk worker (``bulk=True``: whole-PLC dumps) so a dump
         never stalls recordings and watches (R6)."""
@@ -274,6 +275,9 @@ class App:
             raise ToolError(f"{exc} — the call was NOT started (nothing was read or written). Wait for it to finish, or "
                             "stop it (rec_stop / a smaller ads_dump), then retry.") from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
+            if callable(timeout_msg):
+                # R42 #6: say what the call was doing — a long dump spends its time in Python, not on ADS
+                raise ToolError(timeout_msg()) from exc
             raise ToolError("ADS call timed out after it started (router/route/firewall? run tc_doctor)") from exc
         except (pyads.ADSError, OSError) as exc:
             # safety net for a backend path that did not translate the pyads/socket error itself
@@ -2256,12 +2260,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Export a recording to CSV. csv_wide: one row per PLC sample time, one column per variable and per array
         element (name[i]); an empty cell means no sample of that variable at that time (fill=true forward-fills —
         handy for charts, but a cell then no longer means "sampled now"). csv_long: t_ms,symbol,value. Both include
-        plc_filetime (the PLC's own sample timestamp) when available. Default path next to the JSONL (re-exported in
-        place). An out_path must be in a folder this server writes to ([server] output_dirs adds more) and an
-        existing file there is only replaced with overwrite=true."""
+        plc_filetime (the PLC's own sample timestamp) when available. Default path next to the JSONL. An out_path
+        must be in a folder this server writes to ([server] output_dirs adds more). An existing file — also an
+        earlier export at the default path with other symbols/fill, or of a recording that has grown since — is only
+        replaced with overwrite=true; an identical re-export (same source bytes and parameters) is not refused."""
         if out_path:
             out_path = str(app.out_path(out_path, overwrite, "export"))
-        return await app.mem_call(app.rec.export, id, fmt, out_path, symbols, fill)
+        return await app.mem_call(app.rec.export, id, fmt, out_path, symbols, fill, overwrite)
 
     @mcp.tool(annotations=DESTR)
     async def rec_delete(id: str, confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -2476,11 +2481,33 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Read EVERY variable on the PLC (all top-level symbols, fully expanded through the
         datatype table — structs, FB instances, arrays of structs) in one pass and write a nested
         JSON tree plus a flat CSV (path,type,value). pattern limits the roots ('MAIN.*', 'GVL_*');
-        system/library symbols excluded unless include_system. Returns counts, file paths and a
-        50-leaf preview; use proj_read_file / rec-style tooling on the files for detail."""
+        system symbols excluded unless include_system. The project's own programs and GVLs come first, library
+        globals (GVL_TcUnit …) last. POINTER TO / REFERENCE TO / INTERFACE values are addresses — the target is never
+        expanded. max_leaves bounds CSV and JSON together, max_total_mb what is written; a cut dump says
+        truncated with skipped_roots. Returns counts, largest_roots, file paths and a 50-leaf preview."""
         od = str(app.out_path(out_dir, what="dump folder", is_dir=True)) if out_dir else str(Path(cfg.safety.audit_log).parent / "dumps")
+        if not 1 <= max_total_mb <= 4096 or not 1 <= max_leaves <= 5_000_000:
+            raise ToolError("max_total_mb must be 1..4096 and max_leaves 1..5,000,000")
+        own: set[str] | None = None
+        try:
+            if app.proj.root is not None:
+                await asyncio.to_thread(app.proj.ensure_fresh)
+                own = {u.name.lower() for u in app.proj.units.values() if u.kind in ("PROGRAM", "GVL")} or None
+        except Exception:  # noqa: BLE001 — ordering is a nicety; without the project the heuristic applies
+            own = None
+
+        def on_timeout() -> str:
+            p = dict(getattr(app.ads, "dump_progress", {}) or {})
+            el = time.time() - p.get("started", time.time())
+            return (f"ads_dump did not finish within 900 s ({el:.0f} s): it was {p.get('phase', '?')}"
+                    + (f" root {p.get('index')} of {p.get('of')} ({p.get('root')}), {p.get('leaves', 0)} leaves, "
+                       f"{p.get('written_mb', 0)} MB written" if p.get("root") else "")
+                    + " — the time went into the dump itself, not into ADS (other ADS calls keep answering). It is being "
+                      "stopped and its partial files are removed; nothing is kept. Narrow it with pattern= or lower "
+                      "max_leaves / max_total_mb.")
         return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * 1024 * 1024, max_leaves,
-                                  cancel=app.ads_bulk_worker.cancel_event, timeout=900, bulk=True)
+                                  cancel=app.ads_bulk_worker.cancel_event, own_roots=own, timeout=900, bulk=True,
+                                  timeout_msg=on_timeout)
 
     @mcp.tool(annotations=READ)
     async def ads_leaves(name: str, max_leaves: int = 5000, with_values: bool = False) -> dict[str, Any]:

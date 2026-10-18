@@ -86,10 +86,42 @@ _XHELP = re.compile(r"ms-xhelp:///?\?Id=([^)\s\"'&#]+)", re.I)
 
 
 def _clean_md(md: str) -> str:
-    """R32: image placeholders ('![1107452]', also in headings) and empty links are noise in a text answer."""
+    """R32: image placeholders ('![1107452]', also in headings) and empty links are noise in a text answer; type names
+    wrapped in narrow table columns are joined again (_mend_md_tables). Done when a page is read, so a stored index
+    is never rebuilt for it."""
+    md = md.translate(_INVISIBLE)                       # zero-width spaces / soft hyphens: line-break hints
     md = _IMG.sub("", md)
     md = _EMPTY_LINK.sub("", md)
-    return re.sub(r"^(#+)\s{2,}", r"\1 ", md, flags=re.M)
+    md = re.sub(r"^(#+)\s{2,}", r"\1 ", md, flags=re.M)
+    return _mend_md_tables(md)
+
+
+def _mend_md_tables(md: str) -> str:
+    """R32 (0.8.8 retest): 'T_Ams NetId' — a type name broken across lines in a narrow table column (<br>, two <p>)
+    is stored with a space. Two or three fragments of a cell are joined when the page's own code declares the joined
+    name, or — in a Type column — when they meet at a camel-case boundary and none is an IEC keyword; inside longer
+    cells only on that evidence. Everything else keeps its space."""
+    if "|" not in md:
+        return md
+    idents = {w.lower() for code in re.findall(r"```[^\n]*\n(.*?)```", md, re.S) for w in re.findall(r"[A-Za-z_]\w*", code)}
+    lines = md.split("\n")
+    types: set[int] = set()
+    header = False
+    for i, ln in enumerate(lines):
+        if not ln.startswith("|"):
+            header = False
+            continue
+        cells = [c.strip() for c in re.split(r"(?<!\\)\|", ln.strip())[1:-1]]
+        if not header:                                  # first row of a table
+            types = {j for j, h in enumerate(cells) if _TYPE_HEADER.match(h.strip("*` ").strip())}
+            header = True
+            continue
+        if all(re.fullmatch(r"-+", c) for c in cells):
+            continue
+        mended = [_mend_cell(c, idents, j in types) for j, c in enumerate(cells)]
+        if mended != cells:
+            lines[i] = "| " + " | ".join(mended) + " |"
+    return "\n".join(lines)
 
 
 def _bump_gen(con: Any) -> None:
@@ -410,6 +442,34 @@ def _nobr(text: str) -> str:
     return " ".join(text.replace("\ue000", " ").split())
 
 
+_INVISIBLE = {0x200B: None, 0x200C: None, 0x200D: None, 0x2060: None, 0xFEFF: None, 0x00AD: None}
+_TYPE_HEADER = re.compile(r"(?i)^(?:data\s*)?type$|^typ$|^datentyp$")
+_IEC_WORDS = {"array", "of", "pointer", "reference", "to", "string", "wstring", "at", "constant", "retain", "persistent"}
+_IDENT = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def _mend_cell(cell: str, idents: set[str], type_column: bool) -> str:
+    toks = cell.replace("\ue000", " ").split()
+    camel = lambda a, b: bool(re.search(r"[a-z0-9]$", a)) and b[:1].isupper()  # noqa: E731
+    if 2 <= len(toks) <= 3 and all(_IDENT.match(t) for t in toks) \
+            and all(camel(a, b) for a, b in zip(toks, toks[1:])):
+        joined = "".join(toks)
+        if joined.lower() in idents and toks[0].lower() not in idents:
+            return joined
+        if type_column and not any(t.lower() in _IEC_WORDS for t in toks):
+            return joined
+    out: list[str] = []                     # inside longer cells: 'T_Ams NetId' when the page's code declares it
+    for t in toks:
+        a = out[-1] if out else ""
+        core, punct = re.match(r"^(.*?)([.,;:)]*)$", t).groups()
+        if a and "_" in a and _IDENT.match(a) and _IDENT.match(core) and camel(a, core) \
+                and (a + core).lower() in idents and a.lower() not in idents:
+            out[-1] = a + core + punct
+        else:
+            out.append(t)
+    return " ".join(out)
+
+
 def _guess_lang(code: str) -> str:
     up = code.upper()
     if re.search(r"\b(VAR_INPUT|VAR_OUTPUT|END_VAR|FUNCTION_BLOCK|END_STRUCT|END_TYPE|END_IF|END_FOR|:=)", up) \
@@ -595,6 +655,26 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
     return decl
 
 
+def _return_in_header(text: str, short: str, rtype: str, kw: str) -> str:
+    """R24: Infosys documents a FUNCTION's return value as a VAR_OUTPUT line named like the function. Drop that line
+    from every VAR_OUTPUT block (and the block once nothing but blanks is left), and give the header its ': type' —
+    also when the header is already there (reconstructed '(* header reconstructed *)' or without the type)."""
+    ret_line = re.compile(r"(?im)^[ \t]*" + re.escape(short) + r"[ \t]*:[^;\n]*;?[ \t]*(?:\(\*.*?\*\)|//[^\n]*)?[ \t]*\n?")
+
+    def block(m: re.Match) -> str:
+        body = ret_line.sub("", m.group(2))
+        return "" if not body.strip() else m.group(1) + body + m.group(3)
+    text = re.sub(r"(?is)(^[ \t]*VAR_OUTPUT\b[^\n]*\n)(.*?)(^[ \t]*END_VAR\b[^\n]*\n?)", block, text, flags=re.M)
+    head = re.search(r"(?im)^([ \t]*)(FUNCTION|METHOD)([ \t]+(?:\w+[ \t]+)*?)" + re.escape(short) + r"\b([^\n]*)", text)
+    if head:
+        rest = head.group(4)
+        if not re.match(r"\s*:", rest):                  # header without the return type
+            note = rest.strip()
+            text = (text[:head.start(4)] + f" : {rtype}" + (f"  {note}" if note else "") + text[head.end(4):])
+        return re.sub(r"\n{3,}", "\n\n", text).strip("\n")
+    return f"{kw} {short} : {rtype}\n" + re.sub(r"\n{3,}", "\n\n", text).strip("\n")
+
+
 def _tidy_declaration(decl: dict[str, Any]) -> None:
     """Output-time corrections of a stored declaration (no page is parsed again):
     R24 a FUNCTION's return value is not a VAR_OUTPUT; R25 implicit enum values are numbered and the declaration's
@@ -609,10 +689,9 @@ def _tidy_declaration(decl: dict[str, Any]) -> None:
             if ret.get("description") and not decl.get("return_description"):
                 decl["return_description"] = ret["description"]
         text = decl.get("declaration") or ""
-        if decl.get("return_type") and text and not re.match(r"\s*(FUNCTION|METHOD)\b", text, re.I):
-            kw = "FUNCTION" if decl.get("kind") == "Function" else "METHOD"
-            text = re.sub(r"(?im)^\s*VAR_OUTPUT\s*\n\s*" + re.escape(name.split(".")[-1]) + r"\s*:\s*[^;\n]+;?\s*\n\s*END_VAR\s*\n?", "", text)
-            decl["declaration"] = f"{kw} {name.split('.')[-1]} : {decl['return_type']}\n" + text.lstrip()
+        if decl.get("return_type") and text:
+            decl["declaration"] = _return_in_header(text, name.split(".")[-1], decl["return_type"],
+                                                    "FUNCTION" if decl.get("kind") == "Function" else "METHOD")
     if decl.get("kind") == "Enum" and decl.get("enum_values"):
         comments: dict[str, str] = {}
         body = decl.get("declaration") or ""
@@ -652,7 +731,6 @@ def _tidy_declaration(decl: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# book helpers# ---------------------------------------------------------------------------
 # book helpers
 # ---------------------------------------------------------------------------
 def book_of(url: str) -> tuple[str, str] | None:
@@ -1329,14 +1407,22 @@ class InfosysIndex:
             with self._db() as con:
                 row = con.execute("SELECT url, title, kind, library, decl FROM pages WHERE url = ?", (exact[0]["url"],)).fetchone()
             rows = [row]
+        libs = sorted({r["library"] for r in rows if r["library"]})
+        if len(libs) > 1 and not library:
+            # R23 (0.8.8 retest): MC_MoveAbsolute exists in Tc2_MC2 and Tc3_DriveMotionControl with different
+            # parameters — returning the first one let code be written against the wrong FB. Nothing is chosen.
+            cands = [f"{r['library']} ({r['url']})" for r in rows if r["library"]]
+            raise InfosysError(f"ambiguous: {s} is documented in {len(libs)} libraries: {cands} — nothing was chosen. "
+                               "Pass library= with the one the project uses (proj_libraries lists them) and say which "
+                               "one you used.")
         decl = json.loads(row["decl"]) if row["decl"] else {"name": row["title"], "kind": row["kind"], "declaration": None}
         decl.update({"url": row["url"], "library": row["library"]})
-        others = sorted({r["library"] for r in rows[1:] if r["library"] and r["library"] != row["library"]})
-        if others and not library:
-            # R23: MC_MoveAbsolute exists in Tc2_MC2 and Tc3_DriveMotionControl with different parameters
-            decl["also_in"] = others
-            decl["ambiguous"] = (f"{s} is documented in {len(others) + 1} libraries — this is {row['library']}'s; "
-                                 f"pass library= for {others}")
+        with self._db() as con:
+            same = con.execute("SELECT DISTINCT library FROM pages WHERE title = ? COLLATE NOCASE AND kind != 'Page' "
+                               "AND library IS NOT NULL AND library != ?", (s, row["library"] or "")).fetchall()
+        others = sorted(r["library"] for r in same if r["library"])
+        if others:
+            decl["also_in"] = others              # the other libraries with a symbol of this name
         _tidy_declaration(decl)
         if self.local is not None:
             with self._db() as con:
@@ -1602,7 +1688,7 @@ def _glob_to_re(pattern: str) -> str:
 def _summary(markdown: str | None, n: int = 220) -> str:
     if not markdown:
         return ""
-    for block in markdown.split("\n\n"):
+    for block in markdown.translate(_INVISIBLE).split("\n\n"):
         b = block.strip()
         if not b or b.startswith("#") or b.startswith("```") or b.startswith("|") or b.startswith("!["):
             continue

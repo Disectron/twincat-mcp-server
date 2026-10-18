@@ -252,3 +252,106 @@ def test_manuals_update_lock_state_and_doc_filter(tmp_path):
     assert "CX9021.pdf | p4" in p.stdout and "CX9020.pdf" not in p.stdout
     p = run("manuals_db.py", "search", "watchdog", "--doc", "nope", "--kb", str(kb))
     assert p.returncode == 1 and "no indexed manual matches 'nope'" in p.stderr
+
+
+def _manuals_module():
+    spec = importlib.util.spec_from_file_location("manuals_db_mod", B / "manuals_db.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_n37_running_headers_and_wrapped_headings(tmp_path):
+    """N37: running headers / footers in the page text, glued to a heading ('Calibration and compensation4.4
+    Calibration'); a heading wrapped over two lines became a level-1 chapter ('capacity')."""
+    m = _manuals_module()
+    body = lambda i: "\n".join(f"line {k} of page {i}: value {k * i + 7}" for k in range(8))  # noqa: E731
+    pages = [f"Calibration and compensation\n{body(i)}\nEL3356-0010 Version: 2.4 {i + 40}" for i in range(8)]
+    pages[3] = f"Calibration and compensation4.4 Calibration\n{body(3)}\nEL3356-0010 Version: 2.4 43"
+    pages[4] = f"NOTICE\n{body(4)}\nEL3356-0010 Version: 2.4 44"
+    pages[5] = f"NOTICE\n{body(5)}\nEL3356-0010 Version: 2.4 45"
+    pages[6] = f"NOTICE\nTable 3 of 9\n{body(6)}\nEL3356-0010 Version: 2.4 46"
+    pages[7] = f"Table 5 of 9\n{body(7)}\nEL3356-0010 Version: 2.4 47"
+    pages.append(f"Table 8 of 9\n{body(8)}\nEL3356-0010 Version: 2.4 48")
+    out, heads = m._strip_running(pages, set())
+    assert heads == ["calibration and compensation", "el#-# version: #.# #"], heads
+    assert out[0].split("\n")[0] == "" and out[0].split("\n")[-1] == "" and "line 0 of page 0" in out[0]
+    assert out[3].split("\n")[0] == "4.4 Calibration"                 # the glued header cut off, the heading kept
+    assert out[4].startswith("NOTICE") and out[6].startswith("NOTICE")  # signal words are never a running header
+    assert "Table 5 of 9" in out[7]                                     # numbers that are no page number: kept
+    # a page-number-only footer and a chapter title on two pages
+    out, heads = m._strip_running(["Commissioning\nx\n1", "Commissioning\ny\n2", "Intro\nz\n3"], {"commissioning"})
+    assert out == ["\nx\n", "\ny\n", "Intro\nz\n"] and heads == ["#", "commissioning"]
+    toc = [(1, "4 Commissioning", 40), (2, "4.10 Notes on the measurement of the bridge", 60), (1, "capacity", 60),
+           (2, "4.11 Filter (only", 61), (1, "only)", 61), (2, "4.12 Hinweise zur Brücken-", 62), (1, "kapazität", 62),
+           (1, "Appendix", 90), (2, "4.13 Settings and", 63), (1, "Parameterization", 63)]
+    assert m._mend_toc(toc) == [(1, "4 Commissioning", 40), (2, "4.10 Notes on the measurement of the bridge capacity", 60),
+                                (2, "4.11 Filter (only only)", 61), (2, "4.12 Hinweise zur Brückenkapazität", 62),
+                                (1, "Appendix", 90), (2, "4.13 Settings and Parameterization", 63)]
+    unnumbered = [(1, "Intro", 1), (1, "details", 1)]
+    assert m._mend_toc(unnumbered) == unnumbered                       # only manuals that number their chapters
+
+
+def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
+    pytest.importorskip("reportlab")
+    pytest.importorskip("pypdf")
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    kb = tmp_path / "kb"
+    (kb / "manuals").mkdir(parents=True)
+    pdf = kb / "manuals" / "EL3356.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    for i in range(8):
+        c.bookmarkPage(f"p{i}")
+        c.addOutlineEntry(f"4.{i + 1} Topic {i}", f"p{i}", level=0)
+        c.setFont("Helvetica", 9)
+        c.drawString(400, 810, "Calibration and compensation")
+        c.drawString(72, 30, f"EL3356-0010 Version: 2.4 {i + 1}")
+        c.setFont("Helvetica", 10)
+        for k in range(8):
+            c.drawString(72, 720 - 14 * k, f"strain gauge bridge {i} measurement step {k * 3 + i * 7}")
+        c.showPage()
+    c.save()
+    assert run("manuals_db.py", "update", "--kb", str(kb)).returncode == 0
+    db = kb / "manualsdb" / "manuals.db"
+    con = sqlite3.connect(db)
+    texts = [r[0] for r in con.execute("SELECT text FROM page ORDER BY page")]
+    assert texts and all("Calibration and compensation" not in t and "Version" not in t for t in texts), texts
+    assert all("strain gauge bridge" in t for t in texts)
+    assert con.execute("SELECT value FROM meta WHERE key='text_format'").fetchone()[0] == "2"
+    # an index written by the old builder (no text_format) is outdated, and update reads every manual again
+    con.execute("DELETE FROM meta WHERE key='text_format'")
+    con.commit()
+    con.close()
+    st = json.loads(run("manuals_db.py", "stats", "--json", "--kb", str(kb)).stdout)
+    assert st["state"] == "outdated" and "page text format 1" in st["message"]
+    assert kbdocs(kb, "status")["manuals_state"]["state"] == "outdated"
+    p = run("manuals_db.py", "update", "--kb", str(kb))
+    assert "every manual is read again" in p.stdout and "1 updated" in p.stdout, p.stdout
+    st = json.loads(run("manuals_db.py", "stats", "--json", "--kb", str(kb)).stdout)
+    assert st["state"] == "up_to_date"
+
+
+def test_n37_font_headings_wrapped_over_two_lines_are_one_entry(tmp_path):
+    """PDFs without bookmarks (PyMuPDF font headings): the second line of a wrapped heading was a level-1 chapter."""
+    pytest.importorskip("reportlab")
+    pytest.importorskip("pymupdf")
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    pdf = tmp_path / "fonts.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    for i, (title, tail) in enumerate((("Notes on the measurement of the bridge", "capacity"), ("Settings", None))):
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(72, 760, f"4.{i + 10}")
+        c.drawString(110, 760, title)
+        if tail:
+            c.drawString(110, 740, tail)
+        c.setFont("Helvetica", 10)
+        for k in range(10):
+            c.drawString(72, 700 - 14 * k, f"body text {i} {k * 5 + i * 3} words")
+        c.showPage()
+    c.save()
+    m = _manuals_module()
+    backend, _n, toc, _texts, _t = m._open_pdf(pdf)
+    assert backend == "pymupdf+font-headings"
+    assert toc == [(2, "4.10 Notes on the measurement of the bridge capacity", 1), (2, "4.11 Settings", 2)], toc

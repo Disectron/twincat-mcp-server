@@ -4,6 +4,8 @@
 //   "sim": {"start_ft": <FILETIME>, "speed": <x real time, 0 = flat out>, "stop_after_cycles": n,
 //           "drop": [[block, first_cycle, last_cycle], ...], "late": [[block, cycles], ...], "fail_block": k,
 //           "max_cycles": n,
+//           "skew": [[block, cycles], ...]        (that block's notifications run `cycles` ahead and arrive first in
+//                                                  each cycle: its sample of cycle c+n comes before the others' of c),
 //           "freeze": [first_cycle, last_cycle]   (PLC STOP: samples keep coming, every value frozen),
 //           "outage": [first_cycle, last_cycle]}  (TwinCAT in CONFIG: no samples; resubscribe() succeeds only after
 //                                                  last_cycle, as the runtime answers again)
@@ -41,6 +43,9 @@ public:
         if (const JVal* l = sim.get("late"))
             for (auto& r : l->a)
                 if (r.a.size() == 2) late_.push_back({r.a[0].i, r.a[1].i, 0});
+        if (const JVal* k = sim.get("skew"))
+            for (auto& r : k->a)
+                if (r.a.size() == 2) skew_.push_back({r.a[0].i, r.a[1].i, 0});
         if (const JVal* f = sim.get("freeze"))
             if (f->a.size() == 2) { freeze_from_ = f->a[0].i; freeze_to_ = f->a[1].i; }
         if (const JVal* o = sim.get("outage"))
@@ -115,9 +120,9 @@ private:
             cycle_now_.store(c);
             if (outage_from_ >= 0 && c == outage_from_) dead_.store(true);   // the runtime went away: handles dead
             // frozen PLC: the notification keeps coming, the values stay at the last cycle before the freeze
-            const int64_t cv = (freeze_from_ >= 0 && c >= freeze_from_ && c <= freeze_to_) ? freeze_from_ - 1 : c;
-            for (size_t k = 0; k < blocks_.size(); ++k) {
-                if (dropped(static_cast<int64_t>(k), c) || dead_.load()) continue;
+            auto emit = [&](size_t k, int64_t cyc) {
+                if (dropped(static_cast<int64_t>(k), cyc) || dead_.load()) return;
+                const int64_t cv = (freeze_from_ >= 0 && cyc >= freeze_from_ && cyc <= freeze_to_) ? freeze_from_ - 1 : cyc;
                 auto& b = buf[k];
                 size_t words = b.size() / 4;
                 for (size_t i = 0; i < words; ++i) {
@@ -125,8 +130,19 @@ private:
                     std::memcpy(&b[i * 4], &v, 4);
                 }
                 for (size_t i = words * 4; i < b.size(); ++i) b[i] = static_cast<uint8_t>(cv);
-                sink_->on_sample(static_cast<uint32_t>(k), ft, b.data(), static_cast<uint32_t>(b.size()));
+                sink_->on_sample(static_cast<uint32_t>(k), start_ft_ + cyc * cycle_, b.data(), static_cast<uint32_t>(b.size()));
+            };
+            // skewed blocks first, ahead by their skew (on the first cycle they also deliver the cycles they skip)
+            for (auto& sk : skew_) {
+                if (sk.block < 0 || sk.block >= static_cast<int64_t>(blocks_.size())) continue;
+                for (int64_t cyc = (c == 0 ? 0 : c + sk.first); cyc <= c + sk.first; ++cyc) emit(static_cast<size_t>(sk.block), cyc);
             }
+            for (size_t k = 0; k < blocks_.size(); ++k) {
+                bool skewed = false;
+                for (auto& sk : skew_) skewed = skewed || sk.block == static_cast<int64_t>(k);
+                if (!skewed) emit(k, c);
+            }
+            (void)ft;
             ++c;
             // pace every cycle when a cycle lasts ≥ 1 ms of wall time (a 10 ms PLC must not arrive in bursts of 64),
             // in groups of 64 otherwise
@@ -150,7 +166,7 @@ private:
     std::atomic<bool> dead_{false};
     uint64_t resubs_ = 0;
     double speed_ = 1.0;
-    std::vector<Range> drops_, late_;
+    std::vector<Range> drops_, late_, skew_;   // skew_: {block, cycles ahead, unused}
     std::vector<BlockSpec> blocks_;
     Sink* sink_ = nullptr;
     std::atomic<bool> run_{false};

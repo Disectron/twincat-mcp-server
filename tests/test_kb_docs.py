@@ -229,3 +229,23 @@ def test_review_help_slash_titles_code_headings_and_check_order(kbdir, tmp_path)
     # pages are checked before the manual is looked up
     rc, r = run(kbdir, "manual_page", "doc=nope", "pages=5-40")
     assert rc == 1 and r["error"] == "bad_param"
+
+
+def test_n36_questions_in_words_fall_back_and_n35_near_is_quick(kbdir):
+    """N36: `LED diagnostics` / `microSD boot card` gave 0 although each word finds the page — words were only ANDed.
+    N35: not_found took 9.6 s on the real package (a LIKE scan of every page body for `near`)."""
+    rc, r = run(kbdir, "manual_search", "query=watchdog diagnostics nonexistentword")
+    assert rc == 0 and r["query_mode"].startswith("some words") and r["items"][0]["page"] == 4
+    rc, r = run(kbdir, "manual_search", "query=Diagnos LED")
+    assert rc == 0 and r["query_mode"] == "all words (as prefixes)" and r["items"][0]["page"] in (3, 4)
+    rc, r = run(kbdir, "docs_search", "query=reads ADS device")
+    assert rc == 0 and r["query_mode"] == "all words" and r["items"][0]["ref"] == "tcplclib_tc2_system/30866571"
+    # FTS syntax and code are not rewritten
+    rc, r = run(kbdir, "docs_search", "query=ADSREAD NOT ADSWRITE")
+    assert rc == 0 and r["query_mode"] == "fts5"
+    rc, r = run(kbdir, "docs_search", "query=fbRead( READ := FALSE )")
+    assert r["query_mode"].startswith("phrase")
+    rc, r = run(kbdir, "docs_search", "query=zzqx yyqw")
+    assert rc == 0 and r["count"] == 0 and "hint" in r
+    rc, r = run(kbdir, "docs_declaration", "symbol=MC_MoveAbs")
+    assert rc == 1 and len(r["near"]) == 2 and r["elapsed_ms"] < 2000

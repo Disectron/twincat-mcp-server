@@ -358,10 +358,13 @@ class Block:
             return 0
         return int((self.first_t - start_t + 1e-6) / self.min_step)
 
-    def tail_missing(self, end_t: float | None) -> int:
+    def tail_missing(self, end_t: float | None, slack: float = 1) -> int:
+        """Samples missing after this block's last one up to the window end. slack: periods that are not a loss —
+        one by default; for a stop on request of the native engine the blocks are unsubscribed one after another
+        (R7), so 3 + the notification delay in periods, the rule the engine applies itself."""
         if end_t is None or not self.min_step or self.last_t is None or end_t <= self.last_t:
             return 0
-        return max(0, int((end_t - self.last_t) / self.min_step) - 1)
+        return max(0, int((end_t - self.last_t) / self.min_step - slack))
 
 
 # ------------------------------------------------------------------ selection patterns (A5)
@@ -749,7 +752,10 @@ class Recording:
     def _handle_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
         if self.armed:
             self.pre.append((t, b, data))
-            while self.pre and t - self.pre[0][0] > self.pre_trigger_ms:
+            # R41: blocks arrive with a skew (block 1's sample of cycle t+1 before block 0's trigger sample of cycle t);
+            # purging against the newest stamp of any block lost block 1's trigger-cycle sample. Keep a margin and
+            # commit only what lies inside the window.
+            while self.pre and t - self.pre[0][0] > self.pre_trigger_ms + 50.0:
                 self.pre.popleft()
             sw = self.start_when
             if sw is not None and sw.symbol in self.slot_of and self.slot_of[sw.symbol][0] is b:
@@ -758,8 +764,11 @@ class Recording:
                     self.triggered_at = t
                     pre, self.pre = list(self.pre), deque()
                     for pt, pb, pd in pre:
-                        self._commit_block(pt, pb, pd, light)
+                        if pt >= t - self.pre_trigger_ms:
+                            self._commit_block(pt, pb, pd, light)
             return
+        if self.triggered_at is not None and t < self.triggered_at - self.pre_trigger_ms:
+            return                      # a block's sample from before the window, delivered after the trigger
         self._commit_block(t, b, data, light)
 
     def _commit_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
@@ -1230,6 +1239,28 @@ def _manifest_sig(key: bytes, m: dict[str, Any]) -> str:
     return _hmac.new(key, body.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _earlier_export(out: Path, src: Path, params: dict[str, Any]) -> tuple[bool, str]:
+    """(same, description) of the file already at an export path: same = this tool wrote it from the same source
+    bytes with the same parameters and nobody changed it since (its provenance says so) — replacing it changes
+    nothing."""
+    try:
+        pv = json.loads(provenance_path(out).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, "it has no provenance file of this tool (not an export of this recording, or edited)"
+    old = pv.get("params") or {}
+    norm = lambda p: (p.get("fmt"), sorted(x.lower() for x in p["symbols"]) if p.get("symbols") else None,  # noqa: E731
+                      bool(p.get("fill")))
+    try:
+        edited = file_sha256(out)[0] != pv.get("export_sha256")
+        same_src = file_sha256(src)[0] == pv.get("source_sha256")
+    except OSError:
+        edited, same_src = True, False
+    desc = (f"an earlier export ({old.get('fmt')}, symbols {old.get('symbols') or 'all'}, fill {bool(old.get('fill'))}, "
+            f"{pv.get('created', '?')})" + ("; changed since it was written" if edited else "")
+            + ("" if same_src else "; the recording has changed since"))
+    return (not edited and same_src and norm(old) == norm(params)), desc
+
+
 def file_sha256(path: Path) -> tuple[str, int]:
     h, n = hashlib.sha256(), 0
     with open(path, "rb") as fh:
@@ -1647,9 +1678,23 @@ class Recorder:
             st["cycle_counter"] = counter.name
         st["notifications_per_s"] = round(rate, 1) if mode == "cycle" else f"≤{round(rate, 1)}"
         st["values_per_s"] = round(vals * 1000.0 / cycle_ms, 1) if mode == "cycle" else None
+        warns = []
         if mode == "cycle" and rate > 20_000 and st.get("engine") != "native":
-            st["warning"] = (f"{notifs} notifications every {cycle_ms} ms: above what this PC was measured to ingest. "
-                             "Watch missing_samples / backlog in rec_status, or select fewer, contiguous variables.")
+            warns.append(f"{notifs} notifications every {cycle_ms} ms: above what this PC was measured to ingest. "
+                         "Watch missing_samples / backlog in rec_status, or select fewer, contiguous variables.")
+        # N31: cycle_ms 0.1 on a PLC whose fastest task runs every 1 ms was accepted silently ("20000 notifications/s")
+        man = (getattr(rec, "meta", None) or {}).get("manifest") or {}
+        cycles = [float(t["cycle_time_ms"]) for t in (man.get("tasks") if isinstance(man.get("tasks"), list) else [])
+                  if isinstance(t, dict) and isinstance(t.get("cycle_time_ms"), (int, float)) and t["cycle_time_ms"] > 0]
+        if cycles and cycle_ms < min(cycles) - 1e-9:
+            fastest = min(cycles)
+            st["fastest_task_ms"] = fastest
+            warns.append(f"cycle_ms {cycle_ms:g} is below the fastest task of this runtime ({fastest:g} ms): no "
+                         f"variable changes faster than its task, so {'samples repeat the same PLC cycle' if mode != 'change' else 'the extra checks find nothing new'} "
+                         f"and the rate above ({st['notifications_per_s']} notifications/s) is load, not resolution — "
+                         f"use cycle_ms={fastest:g} or a multiple of it")
+        if warns:
+            st["warning"] = " | ".join(warns)
         return st
 
     def _start_notifications(self, rec: Recording, port: int | None, allow_partial: bool, max_delay_ms: float) -> None:
@@ -1976,7 +2021,7 @@ class Recorder:
         return out
 
     def export(self, rid: str, fmt: str, out_path: str | None, symbols: list[str] | None,
-               fill: bool = False) -> dict[str, Any]:
+               fill: bool = False, overwrite: bool = False) -> dict[str, Any]:
         """csv_wide: one row per PLC sample time, one column per variable and per array element (name[i]); a cell is
         empty when that variable has no sample at that time (fill=true repeats the last known value instead —
         convenient for charts, but then a cell no longer means "sampled at this time"). csv_long: one row per value.
@@ -1987,6 +2032,15 @@ class Recorder:
         if fmt == "jsonl":
             return {"id": rid, "file": str(path), "format": "jsonl", "note": "already on disk in this format"}
         out = Path(out_path) if out_path else path.with_suffix(f".{'wide' if fmt == 'csv_wide' else 'long'}.csv")
+        params = {"fmt": fmt, "symbols": symbols, "fill": fill}
+        replaced = None
+        if out.exists():
+            # N32: a re-export to the default path replaced the tool's own earlier CSV (other symbols, fill) silently
+            same, earlier = _earlier_export(out, path, params)
+            if not same and not overwrite:
+                raise RecorderError(f"{out} exists — {earlier}; pass overwrite=true to replace it, or out_path for a "
+                                    "second file (nothing was written)")
+            replaced = "identical (same source bytes and parameters)" if same else earlier
         want = {s.lower() for s in symbols} if symbols else None
         header = _read_header(path)
         syms = [x for x in header.get("symbols", []) if not want or x["name"].lower() in want]
@@ -2060,9 +2114,11 @@ class Recorder:
             out_d["complete"] = False
             out_d["note"] += "; no footer: the recording is still running or the process died before it ended"
         # R10: the export is a derived file — record exactly what it was derived from and how
-        prov = self._provenance(path, out, footer, {"fmt": fmt, "symbols": symbols, "fill": fill},
+        prov = self._provenance(path, out, footer, params,
                                 {"rows": rows_written, "values": n, "columns": len(cols) if fmt == "csv_wide" else 4})
         out_d["provenance"] = {k: prov[k] for k in ("file", "source_sha256", "source_label", "export_sha256")}
+        if replaced:
+            out_d["replaced"] = replaced
         if fill:
             out_d["note"] += "; fill=true: cells were forward-filled (recorded in the provenance file)"
         return out_d
@@ -2258,13 +2314,20 @@ class Recorder:
             lasts = [b.last_t for b in blocks.values() if b.last_t is not None]
             end = (footer or {}).get("window_end_ms") or (max(lasts) if lasts else None)
             start = (footer or {}).get("window_start_ms")
+            manual = bool((footer or {}).get("manual_stop"))
+            delay = float((footer or {}).get("max_delay_ms") or 0)
+            if manual:
+                out["tail_rule"] = ("stop on request: each block may end up to 3 periods + the notification delay "
+                                    f"({delay:g} ms) before the latest one — the unsubscribe order, not a loss (R7)")
             for b in blocks.values():
-                m = b.missing(end, start)
+                slack = (3 + delay / b.min_step) if manual and b.min_step else 1
+                tail = b.tail_missing(end, slack)
+                m = b.missing(end, start) - b.tail_missing(end) + tail
                 tot_s += b.samples
                 tot_m += m
                 rep.append({"block": b.bid, "first": b.slots[0].name if b.slots else None, "symbols": len(b.slots),
                             "samples": b.samples, "missing": m, "missing_head": b.head_missing(start),
-                            "missing_tail": b.tail_missing(end),
+                            "missing_tail": tail,
                             "period_ms": None if b.min_step is None else round(b.min_step, 4),
                             "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
             out["timeline"] = {"samples": tot_s, "missing": tot_m,

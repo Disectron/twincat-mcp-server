@@ -768,8 +768,13 @@ class Knowledge:
             res["indexed_now"] = idx
         if not rows:
             res["note"] = "not in the installed ESI files — update the ESI (XAE: TwinCAT → EtherCAT Devices → Update Device Descriptions)"
-        # the PDF manuals of the knowledge folder (read-only, built by manuals_db.py) for the same product codes
-        codes = types[:3] or ([q.upper()] if _PRODUCT.match(q) else [])
+        # the PDF manuals of the knowledge folder (read-only, built by manuals_db.py) for the same product codes.
+        # N34: ESI type names carry text ('CX9020 EtherCAT slave') — take the order codes out of the query and the types
+        codes: list[str] = []
+        for t in [q] + types[:5]:
+            for c in _PRODUCT_IN.findall(t.upper()):
+                if c not in codes:
+                    codes.append(c)
         res.update(manuals_for(self.location()[0], codes))
         return res
 
@@ -981,6 +986,7 @@ def _docs_parts(loc: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, An
 
 
 _PRODUCT = re.compile(r"^[A-Za-z]{1,4}\d{3,5}(?:-\d{4})?$")
+_PRODUCT_IN = re.compile(r"\b([A-Z]{1,4}\d{3,5}(?:-\d{4})?)\b")
 
 
 def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:

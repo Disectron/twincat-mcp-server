@@ -144,3 +144,17 @@ def test_r11_com_methods_are_invoked_not_read_as_properties():
     assert X._com_call(LateBound(), "StartRecord") == 0 and calls == [(7, 1, ())]
     X._com_call(LateBound(), "SaveSVD", "C:/x.svdx")
     assert calls[-1] == (9, 1, ("C:/x.svdx",))
+
+
+def test_r11_retest_start_record_returning_1_is_not_a_warning(monkeypatch, fake_xae, tmp_path):
+    """R11 (0.8.8 retest): StartRecord returns 1 (CONFIG and RUN) while recording normally — no warning; a negative
+    value (HRESULT) still is one."""
+    from twincat_mcp.config import XaeConfig
+    xb = X.XaeBackend(XaeConfig())
+    monkeypatch.setattr(fake_xae, "StartRecord", lambda: 1)
+    out = xb.scope_action("start")
+    assert out["result_code"] == 1 and "warning" not in out and "not an error" in out["result_note"]
+    monkeypatch.setattr(fake_xae, "StopRecord", lambda: -2147467259)
+    out = xb.scope_action("stop")
+    assert "an error code" in out["warning"] and "0x80004005" in out["warning"]
+    assert "result_note" not in xb.scope_action("save_svd", path=str(tmp_path / "r11.svdx"))
