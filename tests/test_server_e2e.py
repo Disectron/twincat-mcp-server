@@ -811,7 +811,8 @@ async def test_n4_restart_is_verified_only_after_the_target_left_run(monkeypatch
 
     script("RUN")                                                    # nothing happened
     v = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True, leave_timeout_s=5)
-    assert not v["verified"] and v["transition_seen"] is False and "stayed in RUN" in v["hint"]
+    assert not v["verified"] and v["transition_seen"] is False and "a restart could not be proven" in v["hint"]
+    assert "not in RUN" not in v["hint"]
     assert v["verify_s"] >= 5 and v["polls"] >= 10                   # 0.5 s polls in the first phase
 
     script("RUN", "down", "CONFIG", "RUN")                           # a real restart
@@ -820,6 +821,88 @@ async def test_n4_restart_is_verified_only_after_the_target_left_run(monkeypatch
 
     script("RUN")                                                    # activation keeps the old contract
     assert (await app.verify_target_after("xae_activate_configuration", expect_run=False))["verified"]
+
+
+@pytest.mark.anyio
+async def test_r40_restart_proven_by_a_witness_taken_before_the_commands(monkeypatch, project_dir):
+    """R40: polling started after activate + restart had returned and demanded to SEE RUN being left; a start in
+    CONFIG (the activation brings TwinCAT to RUN) or a fast restart was never seen → 'not in RUN afterwards (mode
+    RUN)' while the target ran the new configuration. B1–B5 of the fix spec."""
+    import time as _time
+    from twincat_mcp import dialogs as _dlg
+    from twincat_mcp.server import App, ToolError, restart_proven, _restart_failure
+    app = App(mk_cfg(project_dir))
+    clock = [1000.0]
+    mono = [500.0]
+    monkeypatch.setattr(_time, "time", lambda: clock[0])
+    monkeypatch.setattr(_time, "monotonic", lambda: mono[0])
+
+    async def fake_sleep(d):
+        clock[0] += d
+        mono[0] += d
+    monkeypatch.setattr("twincat_mcp.server.asyncio.sleep", fake_sleep)
+    dialogs: list = []
+    monkeypatch.setattr(_dlg, "list_dialogs", lambda pid: list(dialogs))
+    W = ("TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount", "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleTime",
+         "TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp")
+
+    def script(modes, counts, ts=1792300000):
+        seq, cnt = list(modes), list(counts)
+
+        async def ads_call(fn, *a, **kw):
+            if getattr(fn, "__name__", "") == "read_many":
+                c = cnt.pop(0) if len(cnt) > 1 else cnt[0]
+                return {W[0]: c, W[1]: 10000, W[2]: ts}                     # 1 ms task
+            m = seq.pop(0) if len(seq) > 1 else seq[0]
+            if m == "down":
+                raise ToolError("ADS error: target port not found")
+            return {"twincat_mode": m}
+        monkeypatch.setattr(app, "ads_call", ads_call)
+
+    # B1: CONFIG before, RUN at every poll → proven by the mode change
+    script(["CONFIG", "RUN"], [0])
+    before = await app.restart_witness()
+    v = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before)
+    assert v["verified"] and v["transition_by"] == "mode_change" and v["mode_before"] == "CONFIG"
+    # B2: RUN before and at every poll, CycleCount 900,000 → 1,200 → proven by the witness
+    script(["RUN"], [900_000, 1_200])
+    before = await app.restart_witness()
+    mono[0] += 30
+    v = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before)
+    assert v["verified"] and v["transition_by"] == "witness" and "started again (900000 → 1200)" in v["witness"]
+    assert v["witness_before"]["cycle_count"] == 900_000 and v["witness_after"]["cycle_count"] == 1_200
+    # B3: RUN before/after, CycleCount 900,000 → 920,000 after 20 s at 1 ms → no restart; never "not in RUN"
+    script(["RUN"], [900_000, 920_000])
+    before = await app.restart_witness()
+    mono[0] += 20
+    v = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before,
+                                      leave_timeout_s=5)
+    assert not v["verified"] and v["transition_seen"] is False and "went on from 900000 to 920000" in v["hint"]
+    assert "did not restart the runtime" in v["hint"] and "not in RUN" not in v["hint"]
+    msg = _restart_failure(v)
+    assert msg.startswith("the target is in RUN while a restart") and "not in RUN" not in msg
+    # B4: RUN → unreachable → RUN (the poll sees it; behaviour kept)
+    script(["RUN", "RUN", "down", "RUN"], [900_000])
+    before = await app.restart_witness()
+    v = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before)
+    assert v["verified"] and v["transition_by"] == "poll"
+    # B5: ends in CONFIG with a license dialog → not verified, the dialog named
+    script(["RUN", "CONFIG"], [900_000])
+    before = await app.restart_witness()
+    dialogs.append({"title": "TwinCAT System", "text": "License expired", "buttons": ["OK"]})
+    monkeypatch.setattr(_dlg, "list_dialogs", lambda pid: [type("D", (), {"to_dict": lambda self: d})() for d in dialogs])
+    v = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before, timeout_s=10)
+    assert not v["verified"] and v["dialogs"] and "License expired" in _restart_failure(v)
+    # the decision itself: a counter that restarted and climbed above its old value (uptime 8 s < 60 s since the
+    # command); one that went on (uptime 64 s); a frozen counter is no proof of a restart; wrap; unknown cycle time
+    b = {"t": 0, "cycle_count": 5_000, "cycle_time_100ns": 10000}
+    assert restart_proven(b, {"t": 60, "cycle_count": 8_000, "cycle_time_100ns": 10000})[0] is True
+    assert restart_proven(b, {"t": 60, "cycle_count": 64_000, "cycle_time_100ns": 10000})[0] is False
+    assert restart_proven({"t": 0, "cycle_count": 900_000, "cycle_time_100ns": 10000},
+                          {"t": 5, "cycle_count": 900_000, "cycle_time_100ns": 10000})[0] is False
+    assert restart_proven({"t": 0, "cycle_count": 0xFFFFFFF0, "cycle_time_100ns": 10000},
+                          {"t": 1, "cycle_count": 500, "cycle_time_100ns": 10000})[0] is None              # wrapped
+    assert restart_proven({"t": 0, "cycle_count": 10}, {"t": 5, "cycle_count": 20})[0] is None
 
 
 @pytest.mark.anyio
@@ -926,6 +1009,50 @@ async def test_d42_tree_delete_token_names_the_item(monkeypatch, project_dir):
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_tree_delete",
                                                                     "target": "TIPC^Plc^Plc Project^POUs^FB_Old"}))
         assert tok["target"] == "TIPC^Plc^Plc Project^POUs^FB_Old" and "xae_target" not in tok
+
+
+@pytest.mark.anyio
+async def test_n40_n42_token_targets_are_computed_by_the_server(monkeypatch, project_dir):
+    """N42: xae_plc's token named only the action — a 'download' token approved for project A downloaded B, or to a
+    remote XAE target. N40: every tool wanted a different target format and each wrong guess cost a retry. The
+    target is now computed by one rule, by the tool and by tc_request_confirmation."""
+    from twincat_mcp import xae_backend as X
+    install(monkeypatch)
+    projects = ["TIPC^PlcA^PlcA Project", "TIPC^PlcB^PlcB Project"]
+    done = []
+    monkeypatch.setattr(X.XaeBackend, "target_get", lambda self: {"target_net_id": "5.1.2.3.1.1", "twincat_started": True})
+    monkeypatch.setattr(X.XaeBackend, "_nested_projects", lambda self, p=None: [X._plc_split(p)[1]] if p else list(projects))
+    monkeypatch.setattr(X.XaeBackend, "plc_action", lambda self, a, p=None: done.append((a, p)) or {"action": a, "ok": True})
+    async with client_for(build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))) as s:
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "args": {
+            "action": "download", "plc_project_path": "TIPC^PlcB"}}))
+        assert tok["target"] == "download:TIPC^PlcB^PlcB Project@5.1.2.3.1.1" and tok["xae_target"] == "5.1.2.3.1.1"
+        # the token for B does not download A
+        r = await s.call_tool("xae_plc", {"action": "download", "plc_project_path": "TIPC^PlcA^PlcA Project",
+                                          "confirm_token": tok["confirm_token"]})
+        assert r.is_error and done == []
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "args": {
+            "action": "download", "plc_project_path": "TIPC^PlcB"}}))
+        payload(await s.call_tool("xae_plc", {"action": "download", "plc_project_path": "TIPC^PlcB",
+                                              "confirm_token": tok["confirm_token"]}))
+        assert done == [("download", "TIPC^PlcB")]
+        # two projects and only the action given: the error says what is missing, before any token exists
+        r = await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "target": "login"})
+        assert r.is_error and "2 PLC projects" in text(r) and "plc_project_path" in text(r)
+        # a partial hand-written target is completed (one project): no retry needed
+        projects[:] = ["TIPC^PlcA^PlcA Project"]
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "target": "login"}))
+        assert tok["target"] == "login:TIPC^PlcA^PlcA Project@5.1.2.3.1.1"
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_command", "target": "PLC.Login"}))
+        assert tok["target"] == "PLC.Login@5.1.2.3.1.1"
+        # a complete but wrong target is refused with the right one
+        r = await s.call_tool("tc_request_confirmation", {"action": "xae_deploy", "target": "TIPC^Untitled1"})
+        assert r.is_error and "checks the target '5.1.2.3.1.1', not 'TIPC^Untitled1'" in text(r)
+        r = await s.call_tool("tc_request_confirmation", {"action": "xae_command", "target": "PLC.Login@9.9.9.9.1.1"})
+        assert r.is_error and "PLC.Login@5.1.2.3.1.1" in text(r)
+        # the table is in the tool description
+        desc = next(t.description for t in (await s.list_tools()).tools if t.name == "tc_request_confirmation")
+        assert "xae_plc: '<action>:<PLC project path>@<XAE target NetId>'" in desc and "ipc_reboot" in desc
 
 
 @pytest.mark.anyio

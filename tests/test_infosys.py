@@ -283,30 +283,35 @@ def test_r17_to_r22_code_search(idx):
 
 
 
-def test_r24_r25_r32_declaration_tidy():
+def test_r24_return_value_is_the_header_from_real_help_viewer_markup():
+    """R24 (0.8.9 retest, unchanged): F_GetTaskTime still showed 'VAR_OUTPUT F_GetTaskTime : ULINT'. Root: Help
+    Viewer code is indented with non-breaking spaces, kept in the stored code; the 0.8.9 output-time fix matched
+    ASCII blanks only. Now the code is stored with plain spaces and the parser puts the return value into the header."""
+    from twincat_mcp.infosys import html_to_doc, parse_declaration, _tidy_declaration
+    nb = "\u00a0"
+    h = ("<html><body><h1>F_GetTaskTime</h1><p>Returns the task time.</p>"
+         f"<pre>VAR_OUTPUT\n{nb * 4}F_GetTaskTime{nb}:{nb}ULINT;{nb}(*{nb}time{nb}*)\nEND_VAR</pre>"
+         f"<pre>VAR_INPUT\n{nb * 4}nTask{nb}:{nb}UDINT;\nEND_VAR</pre>"
+         "<table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
+         "<tr><td>nTask</td><td>UDINT</td><td>task index</td></tr></table></body></html>")
+    doc = html_to_doc(h)
+    assert all(nb not in code for _l, code in doc.code_blocks)                  # stored without non-breaking spaces
+    d = parse_declaration("F_GetTaskTime", doc)
+    assert d["kind"] == "Function" and d["return_type"] == "ULINT" and d["outputs"] == []
+    assert d["declaration"] == "FUNCTION F_GetTaskTime : ULINT  (* header reconstructed *)\nVAR_INPUT\n    nTask : UDINT;\nEND_VAR"
+    assert d["inputs"][0]["name"] == "nTask" and d["inputs"][0]["description"] == "task index"
+    # a page that has the header already: the return VAR_OUTPUT goes, other outputs stay
+    h2 = ("<html><body><h1>M_Get</h1><pre>METHOD PUBLIC M_Get\nVAR_OUTPUT\n  M_Get : BOOL;\n  nErr : UDINT;\nEND_VAR</pre>"
+          "</body></html>")
+    d2 = parse_declaration("FB_X.M_Get", html_to_doc(h2))
+    assert d2["declaration"] == "METHOD PUBLIC M_Get : BOOL\nVAR_OUTPUT\n  nErr : UDINT;\nEND_VAR"
+    assert [o["name"] for o in d2["outputs"]] == ["nErr"] and d2["return_type"] == "BOOL"
+    _tidy_declaration(d)
+    assert "description" not in d                                              # every entry carried by an item
+
+
+def test_r25_r32_declaration_tidy():
     from twincat_mcp.infosys import _tidy_declaration
-    f = {"name": "F_GetSystemTime", "kind": "Function", "return_type": None,
-         "declaration": "VAR_OUTPUT\n  F_GetSystemTime : ULINT;\nEND_VAR\nVAR_INPUT\n  bX : BOOL;\nEND_VAR",
-         "outputs": [{"name": "F_GetSystemTime", "type": "ULINT", "description": "system time"}],
-         "inputs": [{"name": "bX", "type": "BOOL", "description": "x"}], "description": {"bX": "x", "F_GetSystemTime": "system time"}}
-    _tidy_declaration(f)
-    assert f["return_type"] == "ULINT" and f["outputs"] == [] and f["declaration"].startswith("FUNCTION F_GetSystemTime : ULINT")
-    assert "description" not in f                                    # every entry was carried by an item
-    assert "VAR_OUTPUT" not in f["declaration"] and "bX : BOOL" in f["declaration"]
-    # R24 (0.8.8 retest): the header was already there (reconstructed from VAR blocks) → the VAR_OUTPUT stayed
-    g = {"name": "F_GetSystemTime", "kind": "Function", "return_type": None,
-         "declaration": "FUNCTION F_GetSystemTime  (* header reconstructed *)\nVAR_OUTPUT\n  F_GetSystemTime : ULINT; (* time *)\n"
-                        "END_VAR",
-         "outputs": [{"name": "F_GetSystemTime", "type": "ULINT"}], "inputs": []}
-    _tidy_declaration(g)
-    assert g["declaration"] == "FUNCTION F_GetSystemTime : ULINT  (* header reconstructed *)", g["declaration"]
-    # other outputs stay; only the return line goes; a typed header is not touched
-    h = {"name": "FB.M_Get", "kind": "Method", "return_type": "BOOL",
-         "declaration": "METHOD PUBLIC M_Get : BOOL\nVAR_OUTPUT\n  M_Get : BOOL;\n  nErr : UDINT;\nEND_VAR",
-         "outputs": [{"name": "M_Get", "type": "BOOL"}, {"name": "nErr", "type": "UDINT"}]}
-    _tidy_declaration(h)
-    assert h["declaration"] == "METHOD PUBLIC M_Get : BOOL\nVAR_OUTPUT\n  nErr : UDINT;\nEND_VAR", h["declaration"]
-    assert [o["name"] for o in h["outputs"]] == ["nErr"]
     e = {"name": "E_OpenPath", "kind": "Enum",
          "declaration": "TYPE E_OpenPath :\n(\n  PATH_GENERIC := 1, (* search/open/create files in selected/generic folder *)\n"
                         "  PATH_BOOTPRJ, (* boot project folder *)\n  PATH_BOOTDATA,\n  PATH_MAX := 16#10\n);\nEND_TYPE",

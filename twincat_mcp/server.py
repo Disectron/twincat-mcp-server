@@ -179,6 +179,90 @@ def _license_hint(text: str) -> str | None:
             "On a CX with pre-installed licenses this means the activated configuration asks for a function level or a TFxxxx the box does not have — check Project → System → License → Manage Licenses.")
 
 
+_RESTART_WITNESS = ("TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount",
+                    "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleTime",
+                    "TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp")
+
+
+def restart_proven(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool | None, str]:
+    """R40: did the runtime restart between two witnesses (restart_witness)? True = restarted, False = provably not,
+    None = cannot tell. Task 1's CycleCount × cycle time is how long the task has been running: shorter than the time
+    since the first witness → it started within that time; at least that long → it did not. A counter below its
+    earlier value has started again (unless it could have wrapped)."""
+    a_ts, b_ts = after.get("app_timestamp"), before.get("app_timestamp")
+    if a_ts is not None and b_ts is not None and a_ts != b_ts:
+        return True, f"the application timestamp changed ({b_ts} → {a_ts})"
+    b, a = before.get("cycle_count"), after.get("cycle_count")
+    if not isinstance(b, int) or not isinstance(a, int):
+        return None, "task 1's cycle counter was not readable before and after"
+    elapsed = max(0.0, float(after.get("t", 0)) - float(before.get("t", 0)))
+    ct = after.get("cycle_time_100ns") or before.get("cycle_time_100ns")
+    if not isinstance(ct, (int, float)) or ct <= 0:
+        if a < b:
+            return True, f"task 1's CycleCount started again ({b} → {a})"
+        return None, f"CycleCount {b} → {a}, but the task cycle time is unknown"
+    cycle_s = ct / 1e7
+    window = elapsed / cycle_s                                  # cycles since the first witness
+    if a < b:
+        if b > 0xFFFFFFFF - 2 * window:
+            return None, f"CycleCount {b} → {a}: the counter may have wrapped"
+        return True, f"task 1's CycleCount started again ({b} → {a})"
+    uptime = a * cycle_s
+    if uptime < elapsed - 0.5:
+        return True, (f"task 1 has run for {uptime:.1f} s (CycleCount {a}), less than the {elapsed:.1f} s since the "
+                      "command — it started within that time")
+    return False, (f"task 1's CycleCount went on from {b} to {a}: the task has run for {uptime:.0f} s, longer than the "
+                   f"{elapsed:.0f} s since the command — no restart")
+
+
+_TRANSITION_KEYS = ("transition_seen", "transition_by", "mode_before", "witness_before", "witness_after", "witness")
+
+
+def _restart_outcome(ver: dict[str, Any]) -> str:
+    """Audit outcome of a restart that was not verified — what was actually wrong."""
+    if ver.get("dialogs"):
+        return "dialog-after-restart"
+    return "restart-not-proven" if ver.get("target_mode") == "RUN" else "not-running-after-restart"
+
+
+def _restart_failure(ver: dict[str, Any]) -> str:
+    """The error text: 'not in RUN' only when the mode is not RUN (R40: '… not in RUN afterwards (mode RUN)')."""
+    if ver.get("dialogs"):
+        d = ver["dialogs"][0]
+        msg = f"the shell shows a dialog ({d.get('title')}: {str(d.get('text', ''))[:300]}); target mode {ver['target_mode']}"
+    elif ver.get("target_mode") == "RUN":
+        msg = "the target is in RUN while a restart into the new configuration was not proven"
+    else:
+        msg = f"the target is not in RUN afterwards (mode {ver['target_mode']})"
+    return msg + (f". {ver['hint']}" if ver.get("hint") else "")
+
+
+# N40: what each confirmable action's token names. The entries with an argument name take that argument as it is;
+# the others are computed in App.token_target. tc_request_confirmation's docstring is generated from this table.
+TOKEN_TARGET_DOC = {
+    "xae_deploy / xae_restart_twincat / xae_activate_configuration / tcunit_run": "the XAE target NetId",
+    "xae_plc": "'<action>:<PLC project path>@<XAE target NetId>'",
+    "xae_command": "'<command name>@<XAE target NetId>'",
+    "xae_boot_project": "the plc_project_path (with '@<XAE target NetId>' when activate_after_generate)",
+    "xae_tree_delete": "'<parent_path>^<name>'",
+    "xae_target": "the new NetId", "xae_dialog_resolve": "'<dialog title>:<button>'",
+    "ads_plc_state / ads_system_mode": "the action (run, stop, reset / run, config)",
+    "ads_connect": "the NetId, or 'local'", "ads_add_route_to_plc": "the PLC's IP address",
+    "ipc_write_file / ipc_delete_file / ipc_start_process": "the remote path", "ipc_eventlog": "the log name",
+    "ipc_reboot": "the literal 'target'", "rec_delete": "the recording id", "tc_set_mode": "the mode",
+    "tc_allow_write": "the pattern ('-pattern' to remove)", "exp_run": "the experiment name",
+}
+TOKEN_TARGET_ARGS = {"xae_target": "net_id", "ads_plc_state": "action", "ads_system_mode": "action",
+                     "ads_connect": "ams_net_id", "ads_add_route_to_plc": "plc_ip", "ipc_write_file": "path",
+                     "ipc_delete_file": "path", "ipc_start_process": "path", "ipc_eventlog": "log",
+                     "ipc_reboot": "", "rec_delete": "id", "tc_set_mode": "mode", "exp_run": "name"}
+
+
+def _plc_iec_path(path: str) -> str:
+    from .xae_backend import _plc_split
+    return _plc_split(path)[1]
+
+
 class App:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -558,18 +642,46 @@ class App:
         for r in live:
             r.join(join_s)
 
+    async def restart_witness(self, mode: str | None = None) -> dict[str, Any]:
+        """R40: taken BEFORE a restart command (and again at each RUN poll after it, with the mode already known).
+        The System Service mode, and — when TwinCAT runs — what a runtime restart changes: task 1's cycle counter
+        (starts again from 0; × cycle time = how long the task has been running) and the application timestamp.
+        Unreadable values stay None."""
+        w: dict[str, Any] = {"t": time.monotonic(), "mode": mode, "cycle_count": None, "cycle_time_100ns": None,
+                             "app_timestamp": None}
+        if mode is None:
+            try:
+                st = await self.ads_call(self.ads.system_state, timeout=10)
+                w["mode"] = str(st.get("twincat_mode") or st.get("ads_state_name") or "unknown")
+            except ToolError:
+                w["mode"] = "unreachable"
+        if w["mode"] == "RUN":
+            try:
+                vals = await self.ads_call(self.ads.read_many, list(_RESTART_WITNESS), timeout=10)
+            except ToolError:
+                vals = {}
+            if isinstance(vals, dict):
+                for key, sym in zip(("cycle_count", "cycle_time_100ns", "app_timestamp"), _RESTART_WITNESS):
+                    v = vals.get(sym)
+                    if isinstance(v, (int, float, str)) and not isinstance(v, bool):
+                        w[key] = v
+        return w
+
     async def verify_target_after(self, action: str, expect_run: bool, timeout_s: float = 90.0,
                                   require_transition: bool = False, leave_timeout_s: float = 20.0,
-                                  poll_s: float = 2.0) -> dict[str, Any]:
+                                  poll_s: float = 2.0, before: dict[str, Any] | None = None) -> dict[str, Any]:
         """After ActivateConfiguration / StartRestartTwinCAT the Automation Interface reports success as soon as
         the command was accepted; whether the target actually came up is a separate question (a missing
         license drops it back to CONFIG with a dialog in the shell). Poll the target's System Service and
         the shell's dialogs and report what really happened.
 
-        ``require_transition`` (#4): a restart is only proven once the System Service was seen leaving RUN
-        (any other state, or unreachable) and coming back. Without it the first poll can read the old runtime's
-        RUN before the restart has even begun — that was the ``duration_s: 0`` success on a target that then
-        fell back to CONFIG. The first phase polls every 0.5 s for ``leave_timeout_s``."""
+        ``require_transition`` (#4): a restart must be proven, not assumed from the first RUN poll (the old runtime's
+        RUN before the restart had begun). R40: polling starts after the commands returned, so a restart that was
+        already over, or a start in CONFIG (the activation itself brings TwinCAT to RUN), was never *seen* leaving
+        RUN — a false failure. Proven by any of: ``poll`` (a poll saw another state or no answer), ``mode_change``
+        (``before`` — the witness taken before the commands — was not RUN, now it is), ``witness`` (task 1's cycle
+        counter restarted, or the application timestamp changed, compared with ``before``). The first phase polls
+        every 0.5 s for ``leave_timeout_s``."""
         from . import dialogs as _dlg
         t0 = time.time()
         deadline = t0 + timeout_s
@@ -579,6 +691,9 @@ class App:
         polls = 0
         left_run = not require_transition
         left_at: float | None = None
+        transition_by: str | None = None
+        witness_after: dict[str, Any] | None = None
+        witness_verdict: tuple[bool | None, str] | None = None
         modes_seen: list[str] = []
         while True:
             polls += 1
@@ -591,7 +706,15 @@ class App:
             if not modes_seen or modes_seen[-1] != short:
                 modes_seen.append(short)
             if mode != "RUN" and not left_run:
-                left_run, left_at = True, time.time()
+                left_run, left_at, transition_by = True, time.time(), "poll"
+            elif mode == "RUN" and not left_run and before is not None:
+                if before.get("mode") != "RUN":
+                    left_run, left_at, transition_by = True, time.time(), "mode_change"
+                else:
+                    witness_after = await self.restart_witness(mode)
+                    witness_verdict = restart_proven(before, witness_after)
+                    if witness_verdict[0]:
+                        left_run, left_at, transition_by = True, time.time(), "witness"
             try:
                 dl = await asyncio.to_thread(lambda: [d.to_dict() for d in _dlg.list_dialogs(self.xae.pid)])
             except Exception:  # noqa: BLE001
@@ -610,13 +733,27 @@ class App:
                                "modes_seen": modes_seen, "verify_s": round(time.time() - t0, 1)}
         if require_transition:
             out["transition_seen"] = left_run
+            out["transition_by"] = transition_by
             if left_at is not None:
                 out["left_run_after_s"] = round(left_at - t0, 1)
+            if before is not None:
+                out["mode_before"] = before.get("mode")
+                out["witness_before"] = {k: v for k, v in before.items() if k != "t"}
+                if witness_after is not None:
+                    out["witness_after"] = {k: v for k, v in witness_after.items() if k != "t"}
+                if witness_verdict is not None:
+                    out["witness"] = witness_verdict[1]
         hints = [h for h in (_license_hint(json.dumps(err_dialogs)),) if h]
-        if require_transition and not left_run and not err_dialogs:
-            hints.append(f"the System Service stayed in RUN for {leave_timeout_s:.0f} s after the command — no restart was "
-                         "observed (it did not happen, or it finished between two 0.5 s polls). Check the XAE Output / "
-                         "Error List and ads_status before relying on the new configuration.")
+        if require_transition and not left_run and not err_dialogs and mode == "RUN":
+            # in RUN, but no restart proven — never phrased as "not in RUN" (R40)
+            if witness_verdict is not None and witness_verdict[0] is False:
+                hints.append(f"TwinCAT was in RUN before and after the command; {witness_verdict[1]} — the activation "
+                             "did not restart the runtime. Check the XAE Output / Error List.")
+            else:
+                why = (witness_verdict[1] if witness_verdict is not None else "no witness was taken before the command")
+                hints.append(f"TwinCAT is in RUN, but a restart could not be proven: no other state was seen in "
+                             f"{leave_timeout_s:.0f} s and {why}. Check the XAE Output / Error List and ads_status before "
+                             "relying on the new configuration.")
         elif expect_run and mode != "RUN" and not err_dialogs:
             hints.append(f"target did not reach RUN within {timeout_s:.0f} s — xae_dialogs for a prompt in the shell; "
                          "ads_status for the runtime; the XAE Error List for 'Target system reports a fatal error'.")
@@ -771,6 +908,19 @@ class App:
             raise ToolError(f"{action}: TwinCAT on {self.scope()} is in {mode} — switch to CONFIG first "
                             "(safety.edit_requires_config_mode = true). ads_system_mode('config') or the XAE toolbar.")
 
+    async def guarded_target(self, action: str, args: dict[str, Any], op: OpClass, confirm_token: str | None) -> str:
+        """token_target for an XAE-bound action; when the shell cannot be reached the guard still gets the first word
+        (as xae_target_for)."""
+        try:
+            return await self.token_target(action, args)
+        except ToolError as xae_exc:
+            try:
+                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope())
+            except SafetyError as exc:
+                self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
+                raise ToolError(f"{exc} (target not known: {str(xae_exc)[:200]})") from exc
+            raise
+
     async def xae_target_for(self, action: str, op: OpClass, confirm_token: str | None) -> str:
         """The shell's target NetId for a target-bound XAE action. If no shell can be reached, the guard still
         gets the first word: in readonly/guarded-without-token the refusal is the guard's (the human never
@@ -784,6 +934,46 @@ class App:
                 self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
                 raise ToolError(f"{exc} (and no XAE shell is attached: {str(xae_exc)[:160]})") from exc
             raise
+
+    async def _xae_netid(self) -> str:
+        return str((await self.xae_call(self.xae.target_get, timeout=60)).get("target_net_id", ""))
+
+    async def token_target(self, action: str, args: dict[str, Any]) -> str:
+        """N40 / N42: the confirmation target of an action, computed from the tool's arguments and the server state —
+        by the tool when it checks a token AND by tc_request_confirmation when it issues one, so they cannot differ
+        and nobody has to guess the format. Machine-affecting XAE actions name the machine (the XAE target NetId),
+        because the token's scope only binds the ADS target; xae_plc names the action, the PLC project and the NetId."""
+        a = args or {}
+        if action in ("xae_activate_configuration", "xae_restart_twincat", "xae_deploy", "tcunit_run"):
+            return await self._xae_netid()
+        if action == "xae_plc":
+            act = str(a.get("action") or "")
+            if not act:
+                raise ToolError("xae_plc's token names the action: pass args={'action': 'login', 'plc_project_path': …}")
+            path = a.get("plc_project_path")
+            if path:
+                proj = _plc_iec_path(str(path))
+            else:
+                projs = await self.xae_call(self.xae._nested_projects, None, timeout=120)
+                if len(projs) != 1:
+                    raise ToolError(f"{len(projs)} PLC projects — xae_plc needs plc_project_path, and its token names it: "
+                                    f"{projs}")
+                proj = projs[0]
+            return f"{act}:{proj}@{await self._xae_netid()}"
+        if action == "xae_command":
+            return f"{a.get('name', '')}@{await self._xae_netid()}"
+        if action == "xae_boot_project":
+            path = str(a.get("plc_project_path") or "")
+            return f"{path}@{await self._xae_netid()}" if a.get("activate_after_generate") else path
+        if action == "xae_tree_delete":
+            return f"{a.get('parent_path', '')}^{a.get('name', '')}"
+        if action == "tc_allow_write":
+            t = str(a.get("pattern") if "pattern" in a else a.get("target", "")).strip()
+            return t[1:] if t.startswith("+") else t
+        key = TOKEN_TARGET_ARGS.get(action)
+        if key is not None:
+            return str(a.get(key, "") if key else "target")
+        return str(a.get("target", ""))
 
     async def check_targets(self, xae_target: str, allow_mismatch: bool) -> None:
         """Refuse deploy/tcunit when XAE targets one machine and ADS another."""
@@ -1307,14 +1497,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         product, with pages — the twincat-docs skill reads them."""
         return await app.kb_call(app.kb.hw_lookup, query, limit, revision, timeout=900)
 
-    @mcp.tool(annotations=READ)
-    async def tc_request_confirmation(action: str, target: str = "") -> dict[str, Any]:
-        """Issue a single-use confirm_token for a control/destructive tool. Use the exact
-        action name of the tool (e.g. 'xae_activate_configuration') and its target. For the XAE
-        actions that act on the shell's target (activate, restart, deploy, tree_delete) the target
-        must be the NetId XAE currently targets — a token for any other NetId is refused here, not
-        merely rejected later, so the agent cannot talk itself into a stale target. tcunit_run also takes the
-        NetId (D43). xae_tree_delete is a project edit: its target is the item path '<parent_path>^<name>' (D42)."""
+    async def tc_request_confirmation(action: str, target: str = "", args: dict[str, Any] | None = None) -> dict[str, Any]:
         act = (action or "").strip()
         # R2: a token for an action no tool performs ('format_c_drive') is noise at best, a decoy at worst
         known = {t.name for t in await mcp.list_tools()} | {"tcunit_scaffold_external"}
@@ -1323,27 +1506,51 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             near = difflib.get_close_matches(act, sorted(known), n=5, cutoff=0.5)
             raise ToolError(f"no tool performs {act!r}; a token is only issued for the name of the tool that will use it"
                             + (f" — did you mean {near}?" if near else ""))
-        if act in ("xae_activate_configuration", "xae_restart_twincat", "xae_deploy", "tcunit_run"):
+        netid_actions = ("xae_activate_configuration", "xae_restart_twincat", "xae_deploy", "tcunit_run")
+        a = dict(args) if args is not None else None
+        if a is None and target and act in ("xae_plc", "xae_command"):
+            # N40: a hand-written 'login' / 'login:<project>' / 'PLC.Login' is completed by the server, not refused
+            body = target.strip().split("@", 1)[0]
+            if act == "xae_plc":
+                verb, _, proj = body.partition(":")
+                a = {"action": verb, **({"plc_project_path": proj} if proj else {})}
+            else:
+                a = {"name": body}
+        computed: str | None = None
+        if a is not None or act in netid_actions or act == "tc_allow_write":
             try:
-                real = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
+                computed = await app.token_target(act, a if a is not None else {"target": target})
             except ToolError as exc:
-                raise ToolError(f"cannot issue a token for {act}: the XAE target is unknown ({exc}). Attach first (xae_attach).") from exc
-            if not target:
-                target = real
-            elif target.strip() != real:
-                raise ToolError(f"{act} acts on the shell's current target {real!r}, not {target!r}. "
-                                f"Request the token for {real!r} — or change the target first with xae_target.")
-            tok = app.guard.request_token(act, real, app.scope())
+                raise ToolError(f"cannot issue a token for {act}: {exc}") from exc
+            hand = target.strip()
+            if act == "tc_allow_write":
+                hand = hand[1:] if hand.startswith("+") else hand
+            # a complete hand-written target must match; a partial one ('login') was completed above
+            if hand and hand != computed and (act in netid_actions or "@" in hand or a is None or args is not None):
+                raise ToolError(f"{act} checks the target {computed!r}, not {target!r} — request the token for "
+                                f"{computed!r} (or pass the tool's arguments as args and the server computes it). "
+                                + ("Change the XAE target first with xae_target if that is what you meant."
+                                   if act in netid_actions else ""))
+            target = computed
+        xae_bound = act in netid_actions + ("xae_plc", "xae_command") or (
+            act == "xae_boot_project" and bool((a or {}).get("activate_after_generate")))
+        tok = app.guard.request_token(act, target, app.scope())
+        if xae_bound:
+            real = await app._xae_netid()
             tok["xae_target"] = real
             if app.ads.net_id and app.ads.net_id != real:
-                tok["warning"] = (f"ADS side targets {app.ads.net_id} while XAE targets {real}: the deploy/restart will hit the XAE "
-                                  f"target and the ADS tools will keep reading the other machine. ads_connect(ams_net_id={real!r}) to align.")
-            return tok
-        if act == "tc_allow_write":
-            # N1: the token is for the pattern as typed (adding); '-pattern' removes. A leading '+' is tolerated.
-            target = (target or "").strip()
-            target = target[1:] if target.startswith("+") else target
-        return app.guard.request_token(act, target, app.scope())
+                tok["warning"] = (f"ADS side targets {app.ads.net_id} while XAE targets {real}: the action hits the XAE "
+                                  f"target and the ADS tools keep reading the other machine. ads_connect(ams_net_id={real!r}) to align.")
+        return tok
+
+    # the docstring carries the per-tool target table (TOKEN_TARGET_DOC), so it is set before the tool is registered
+    tc_request_confirmation.__doc__ = (
+        "Issue a single-use confirm_token for a control/destructive tool: action = the tool's exact name. Easiest: "
+        "pass the tool's own arguments as args (e.g. action='xae_plc', args={'action': 'login', 'plc_project_path': "
+        "'TIPC^Plc^Plc Project'}) — the server computes the target the tool will check, the same way the tool does. "
+        "A target given by hand must equal it (a partial one — 'login', 'PLC.Login' — is completed); the error names "
+        "the right one. Targets: " + "; ".join(f"{k}: {v}" for k, v in TOKEN_TARGET_DOC.items()) + ".")
+    mcp.tool(annotations=READ)(tc_request_confirmation)
 
     @mcp.tool(annotations=READ)
     async def tc_audit_tail(n: int = 50) -> list[dict[str, Any]]:
@@ -3302,7 +3509,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Execute an arbitrary DTE command (e.g. 'PLC.Login'). Control-class; commands whose name
         contains download/reset/activate/restart/delete/remove/shutdown are destructive-class."""
         op = OpClass.DESTRUCTIVE if re.search(r"download|reset|activate|restart|delete|remove|shutdown|clean", name, re.I) else OpClass.CONTROL
-        await app.permit(ctx, op, "xae_command", name, confirm_token)
+        tgt = await app.guarded_target("xae_command", {"name": name}, op, confirm_token)
+        await app.permit(ctx, op, "xae_command", tgt, confirm_token)
         res = await app.confirmed("xae_command", {"name": name, "args": args}, op, app.xae_call(app.xae.command, name, args, timeout=120))
         return res
 
@@ -3314,8 +3522,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         plc_project_path when there are several PLC projects), then the shell's DTE commands (names vary by build).
         download/reset_cold/reset_origin are destructive-class, the rest control-class."""
         op = OpClass.DESTRUCTIVE if action in ("download", "reset_origin", "reset_cold") else OpClass.CONTROL
-        await app.permit(ctx, op, "xae_plc", action, confirm_token)
-        res = await app.confirmed("xae_plc", {"action": action}, op, app.xae_call(app.xae.plc_action, action, plc_project_path, timeout=300))
+        tgt = await app.guarded_target("xae_plc", {"action": action, "plc_project_path": plc_project_path}, op, confirm_token)
+        await app.permit(ctx, op, "xae_plc", tgt, confirm_token)
+        res = await app.confirmed("xae_plc", {"action": action, "target": tgt}, op, app.xae_call(app.xae.plc_action, action, plc_project_path, timeout=300))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -3355,21 +3564,21 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         tgt = await app.xae_target_for("xae_restart_twincat", OpClass.DESTRUCTIVE, confirm_token)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_restart_twincat", tgt, confirm_token)
         t0 = time.monotonic()
+        before = await app.restart_witness()                  # R40: what a restart must change, read before it
         res = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
-        ver = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True)
+        ver = await app.verify_target_after("xae_restart_twincat", expect_run=True, require_transition=True, before=before)
         # N5: the shell returns as soon as the command is accepted; the restart is over when the target reports RUN
         res.update({"restarted": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
                     "verification_polls": ver["polls"], "modes_seen": ver["modes_seen"],
-                    "transition_seen": ver.get("transition_seen"), "command_s": res.pop("duration_s", None),
-                    "duration_s": round(time.monotonic() - t0, 1)})
+                    "command_s": res.pop("duration_s", None), "duration_s": round(time.monotonic() - t0, 1)})
+        res.update({k: ver[k] for k in _TRANSITION_KEYS if k in ver})
         if ver.get("hint"):
             res["hint"] = ver["hint"]
-        app.audit("xae_restart_twincat", {"target": tgt}, OpClass.DESTRUCTIVE, "ok" if ver["verified"] else "target-not-in-run", res)
+        app.audit("xae_restart_twincat", {"target": tgt}, OpClass.DESTRUCTIVE,
+                  "ok" if ver["verified"] else _restart_outcome(ver), res)
         if not ver["verified"]:
-            raise ToolError(f"StartRestartTwinCAT was accepted but the target is in {ver['target_mode']}"
-                            + (f"; dialog: {ver['dialogs'][0].get('title')}: {ver['dialogs'][0].get('text', '')[:300]}" if ver["dialogs"] else "")
-                            + (f". {ver['hint']}" if ver.get("hint") else ""))
+            raise ToolError("StartRestartTwinCAT was accepted, but " + _restart_failure(ver))
         return res
 
     @mcp.tool(annotations=DESTR)
@@ -3378,7 +3587,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                          ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Save → build → (boot project autostart on) → activate → restart, in one call.
         Stops at the first build error. Destructive-class (one confirmation covers all steps).
-        Refuses when the XAE target and the ADS target of this server differ."""
+        Refuses when the XAE target and the ADS target of this server differ.
+        Done = the target runs the new configuration: in RUN and a restart proven (steps.verify.transition_by):
+        'poll' (another state seen after the commands), 'mode_change' (it was not in RUN before the activation),
+        'witness' (task 1 has been running for less time than since the activation, or the application timestamp
+        changed). In RUN without such proof is reported as that, not as 'not in RUN'."""
         tgt = await app.xae_target_for("xae_deploy", OpClass.DESTRUCTIVE, confirm_token)
         await app.check_targets(tgt, allow_target_mismatch)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_deploy", tgt, confirm_token)
@@ -3393,20 +3606,21 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 return {"deployed": False, "steps": steps}
         if plc_project_path:
             steps["boot_project"] = await app.xae_call(app.xae.boot_project, plc_project_path, True, True, False, timeout=300)
+        before = await app.restart_witness()                  # R40: before the activation — what a restart must change
         steps["activate"] = await app.xae_call(app.xae.activate_configuration, timeout=600)
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
         # P17: a deploy is done when the target runs it, not when the shell accepted the commands
-        ver = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True)
+        ver = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before)
         steps["verify"] = {"running": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
-                           "polls": ver["polls"], "modes_seen": ver["modes_seen"], "transition_seen": ver.get("transition_seen")}
+                           "polls": ver["polls"], "modes_seen": ver["modes_seen"]}
+        steps["verify"].update({k: ver[k] for k in _TRANSITION_KEYS if k in ver})
         if ver.get("hint"):
             steps["verify"]["hint"] = ver["hint"]
         ok = bool(ver["verified"])
-        app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "ok" if ok else "not-running-after-restart", steps)
+        app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "ok" if ok else _restart_outcome(ver), steps)
         if not ok:
-            raise ToolError("xae_deploy: activated and restarted, but the target is not in RUN afterwards "
-                            f"(mode {ver['target_mode']}). Dialogs: {ver['dialogs'][:2]}" + (f". {ver['hint']}" if ver.get("hint") else ""))
+            raise ToolError("xae_deploy: activated and restarted, but " + _restart_failure(ver))
         return {"deployed": True, "target": tgt, "steps": steps}
 
     # ---- tree ------------------------------------------------------------
@@ -3506,7 +3720,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def xae_plcopen_import(plc_project_path: str, xml_file: str, option: str = "none") -> dict[str, Any]:
         """Import a PLCopen XML file into a PLC project (path from xae_plc_projects).
-        option: none | rename | replace | skip (conflict handling)."""
+        option: none | rename | replace | skip (conflict handling).
+        replace: TwinCAT replaces an object only at the same place; an object that lives in a folder is put at the
+        project root as a renamed copy (PRG_X_1, header renamed too). The tool finishes the replace: the copy's header
+        is named back, the texts are checked against the XML, written into the existing object, read back, and the
+        declared name must equal the object's name. Only then is the copy — created by this import, it was not in the
+        tree before — deleted (nothing that existed before the import is ever deleted). Anything not proven → nothing
+        written, the copy kept and named in the error. Result: replaced, header_renamed, copies_removed,
+        build_required + objects_to_build (build next)."""
         app.guard_safety_path(plc_project_path, "xae_plcopen_import")
         await app.permit(None, OpClass.EDIT, "xae_plcopen_import", xml_file)
         res = await app.confirmed("xae_plcopen_import", {"project": plc_project_path, "file": xml_file, "option": option}, OpClass.EDIT, app.xae_call(app.xae.plcopen_import, plc_project_path, xml_file, option, timeout=300))
@@ -3526,7 +3747,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         unless activate_after_generate=true, which is then destructive-class)."""
         op = OpClass.DESTRUCTIVE if activate_after_generate else OpClass.EDIT
         app.guard_safety_path(plc_project_path, "xae_boot_project")
-        await app.permit(ctx, op, "xae_boot_project", plc_project_path, confirm_token)
+        tgt = (await app.guarded_target("xae_boot_project", {"plc_project_path": plc_project_path,
+                                                             "activate_after_generate": True}, op, confirm_token)
+               if activate_after_generate else plc_project_path)
+        await app.permit(ctx, op, "xae_boot_project", tgt, confirm_token)
         res = await app.confirmed("xae_boot_project", {"project": plc_project_path, "autostart": autostart, "generate": generate}, op, app.xae_call(app.xae.boot_project, plc_project_path, autostart, generate, activate_after_generate, timeout=300))
         return res
 

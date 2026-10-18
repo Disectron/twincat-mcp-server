@@ -497,73 +497,159 @@ def test_r15_plcopen_replace_that_duplicates_is_an_error(xae, tmp_path):
         proj._children.append(it)
         sm.items[it.PathName] = it
     proj.on_import = dup
-    # no original to replace: the copy is removed again and the import reported as not done
-    with pytest.raises(X.XaeError, match=r"could not replace .*0 existing objects named PRG_TcUnitRunner.*copies removed again"):
+    # no original to replace: nothing written, the copy (the import) is kept and named
+    with pytest.raises(X.XaeError, match=r"not replaced: .*0 existing objects named PRG_TcUnitRunner.*copies kept"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
-    assert proj.deleted == ["PRG_TcUnitRunner_1"]
+    assert proj.deleted == []
     proj.on_import = None
     r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
     assert r["objects_in_file"] == ["PRG_TcUnitRunner"] and "duplicates_created" not in r
 
 
-def test_r15_retest_replace_is_finished_by_copying_the_text(xae, tmp_path):
-    """R15 (0.8.8 retest): the duplicate was reported but left in the project. Now the replace is completed: the
-    copy's text (and its methods' text) goes into the existing object in its folder, the copy is deleted."""
-    be, dte, sm = xae
+def _r15_setup(sm, tmp_path, file_names=("PRG_TcUnitRunner",), xml_body=None):
     proj = sm.items["TIPC^Plc^Plc Project"]
     meth = FakeItem("Run", "TIPC^Plc^Plc Project^95_UnitTests^PRG_TcUnitRunner^Run")
     orig = FakeItem("PRG_TcUnitRunner", "TIPC^Plc^Plc Project^95_UnitTests^PRG_TcUnitRunner", [meth])
+    orig.DeclarationText = "PROGRAM PRG_TcUnitRunner\nVAR\nEND_VAR"
     folder = FakeItem("95_UnitTests", "TIPC^Plc^Plc Project^95_UnitTests", [orig])
     proj._children.append(folder)
     for it in (folder, orig, meth):
         sm.items[it.PathName] = it
     f = tmp_path / "r.xml"
-    f.write_text('<project><types><pous><pou name="PRG_TcUnitRunner" pouType="program"/></pous></types></project>')
+    f.write_text(xml_body or ("<project><types><pous>" + "".join(f'<pou name="{n}" pouType="program"/>' for n in file_names)
+                              + "</pous></types></project>"))
 
-    def dup(methods=("Run",)):
-        kids = [FakeItem(m, f"TIPC^Plc^Plc Project^PRG_TcUnitRunner_1^{m}") for m in methods]
-        for k in kids:
-            k.ImplementationText = f"// new {k.Name}"
-        it = FakeItem("PRG_TcUnitRunner_1", "TIPC^Plc^Plc Project^PRG_TcUnitRunner_1", kids)
-        it.DeclarationText, it.ImplementationText = "PROGRAM PRG_TcUnitRunner // new", "// new body"
+    def dup(name="PRG_TcUnitRunner_1", decl=None, methods=("Run",)):
+        """What the real shell does: the copy at the root, its header renamed to the copy's name (N38)."""
+        kids = []
+        for m in methods:
+            k = FakeItem(m, f"TIPC^Plc^Plc Project^{name}^{m}")
+            k.ImplementationText = f"// new {m}"
+            kids.append(k)
+        it = FakeItem(name, f"TIPC^Plc^Plc Project^{name}", kids)
+        it.DeclarationText = decl if decl is not None else (
+            "{attribute 'qualified_only'}\n// runner (* of the tests *)\nPROGRAM " + name + "\r\nVAR\r\n  n : INT;\r\nEND_VAR\r\n")
+        it.ImplementationText = "// new body"
         proj._children.append(it)
         sm.items[it.PathName] = it
         for k in kids:
             sm.items[k.PathName] = k
-    proj.on_import = dup
-    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
-    assert r["replaced"] == [{"object": orig.PathName, "from_copy": "TIPC^Plc^Plc Project^PRG_TcUnitRunner_1"}]
-    assert orig.DeclarationText == "PROGRAM PRG_TcUnitRunner // new" and orig.ImplementationText == "// new body"
-    assert meth.ImplementationText == "// new Run" and proj.deleted[-1] == "PRG_TcUnitRunner_1"
-    # a copy with other methods cannot be mapped: removed again, nothing else changed
-    proj._children = [c for c in proj._children if c.Name != "PRG_TcUnitRunner_1"]
-    proj.on_import = lambda: dup(("Run", "Extra"))
-    with pytest.raises(X.XaeError, match=r"other methods/properties.*extra.*nothing written.*copies removed again"):
-        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
-    assert proj.deleted[-1] == "PRG_TcUnitRunner_1" and orig.ImplementationText == "// new body"
-
-
-def _r15_setup(sm, tmp_path, file_names=("PRG_TcUnitRunner",)):
-    proj = sm.items["TIPC^Plc^Plc Project"]
-    meth = FakeItem("Run", "TIPC^Plc^Plc Project^95_UnitTests^PRG_TcUnitRunner^Run")
-    orig = FakeItem("PRG_TcUnitRunner", "TIPC^Plc^Plc Project^95_UnitTests^PRG_TcUnitRunner", [meth])
-    folder = FakeItem("95_UnitTests", "TIPC^Plc^Plc Project^95_UnitTests", [orig])
-    proj._children.append(folder)
-    for it in (folder, orig, meth):
-        sm.items[it.PathName] = it
-    f = tmp_path / "r.xml"
-    f.write_text("<project><types><pous>" + "".join(f'<pou name="{n}" pouType="program"/>' for n in file_names)
-                 + "</pous></types></project>")
-
-    def dup(name="PRG_TcUnitRunner_1"):
-        k = FakeItem("Run", f"TIPC^Plc^Plc Project^{name}^Run")
-        k.ImplementationText = "// new Run"
-        it = FakeItem(name, f"TIPC^Plc^Plc Project^{name}", [k])
-        it.DeclarationText, it.ImplementationText = "PROGRAM PRG_TcUnitRunner // new", "// new body"
-        proj._children.append(it)
-        sm.items[it.PathName], sm.items[k.PathName] = it, k
         return it
     return proj, orig, meth, f, dup
+
+
+def test_r15_n38_replace_renames_the_header_back_and_checks_the_declared_name(xae, tmp_path):
+    """N38 (0.8.9 retest): the copy's header reads PROGRAM PRG_TcUnitRunner_1 (TwinCAT renames it); 0.8.9 wrote it
+    into the original unchanged, compared the read-back with the same text, deleted the copy → the original declared
+    PROGRAM PRG_TcUnitRunner_1 and the build failed. A1: header renamed back, every other byte kept."""
+    be, dte, sm = xae
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path)
+    proj.on_import = dup
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert orig.DeclarationText == ("{attribute 'qualified_only'}\n// runner (* of the tests *)\nPROGRAM PRG_TcUnitRunner"
+                                    "\r\nVAR\r\n  n : INT;\r\nEND_VAR\r\n")
+    assert orig.ImplementationText == "// new body" and meth.ImplementationText == "// new Run"
+    assert r["header_renamed"] == [{"object": orig.PathName, "from": "PRG_TcUnitRunner_1", "to": "PRG_TcUnitRunner"}]
+    assert r["replaced"] == [{"object": orig.PathName, "from_copy": "TIPC^Plc^Plc Project^PRG_TcUnitRunner_1",
+                              "checked_against": "name"}]
+    assert r["build_required"] is True and r["objects_to_build"] == [orig.PathName]
+    assert proj.deleted == ["PRG_TcUnitRunner_1"]
+
+
+def test_r15_n38_header_shapes():
+    """A2–A4: FUNCTION_BLOCK with modifiers / EXTENDS / IMPLEMENTS, FUNCTION with a return type, DUT, interface."""
+    rh = X._rename_header
+    assert rh("FUNCTION_BLOCK PUBLIC FB_Axis_1 EXTENDS FB_Base IMPLEMENTS I_Axis\nVAR END_VAR", "FB_Axis_1", "FB_Axis") == \
+        "FUNCTION_BLOCK PUBLIC FB_Axis EXTENDS FB_Base IMPLEMENTS I_Axis\nVAR END_VAR"
+    assert rh("FUNCTION F_Calc_2 : LREAL", "F_Calc_2", "F_Calc") == "FUNCTION F_Calc : LREAL"
+    assert rh("TYPE ST_Data_1 :\nSTRUCT\n  x : INT;\nEND_STRUCT\nEND_TYPE", "ST_Data_1", "ST_Data").startswith("TYPE ST_Data :\n")
+    assert rh("INTERFACE I_Axis_1 EXTENDS I_Base", "I_Axis_1", "I_Axis") == "INTERFACE I_Axis EXTENDS I_Base"
+    assert rh("(* c *) {attribute 'x'}\r\nprogram prg_x_3\r\n", "PRG_X_3", "PRG_X") == "(* c *) {attribute 'x'}\r\nprogram PRG_X\r\n"
+    assert rh("PROGRAM PRG_Other", "PRG_X_1", "PRG_X") is None                 # does not name the copy
+    assert X._header_name("VAR_GLOBAL\n x : INT;\nEND_VAR") is None               # a GVL has no header name
+
+
+def test_r15_n38_unrecognised_header_or_stray_copy_name_writes_nothing(xae, tmp_path):
+    """A5: a header that does not name the copy → nothing written, copy kept, error names the object. A copy name
+    elsewhere (e.g. a method naming the type) that the XML does not hold → nothing written either."""
+    be, dte, sm = xae
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path)
+    before = (orig.DeclarationText, orig.ImplementationText, meth.ImplementationText)
+    proj.on_import = lambda: dup(decl="PROGRAM PRG_TcUnitRunner // header not renamed — an unknown shape")
+    with pytest.raises(X.XaeError, match=r"PRG_TcUnitRunner_1: the copy's declaration header names 'PRG_TcUnitRunner'.*"
+                                         r"header not recognised, nothing written.*copies kept"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert (orig.DeclarationText, orig.ImplementationText, meth.ImplementationText) == before and proj.deleted == []
+    proj._children = [c for c in proj._children if c.Name != "PRG_TcUnitRunner_1"]
+
+    def dup_ref():
+        it = dup()
+        it.ImplementationText = "PRG_TcUnitRunner_1.n := 1;"
+    proj.on_import = dup_ref
+    with pytest.raises(X.XaeError, match=r"also occurs in the object \(implementation\).*nothing written"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert (orig.DeclarationText, orig.ImplementationText, meth.ImplementationText) == before and proj.deleted == []
+
+
+class _StuckDecl(FakeItem):
+    """An original whose DeclarationText does not take a write (the shell keeps the old text)."""
+    def __setattr__(self, k, v):
+        if k == "DeclarationText" and getattr(self, "_ready", False):
+            return
+        object.__setattr__(self, k, v)
+
+
+def test_r15_n38_name_check_after_writing_restores_and_keeps_the_copy(xae, tmp_path):
+    """A6: the declared name after writing is not the object's tree name → restored, copy kept, error."""
+    be, dte, sm = xae
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path)
+    stuck = _StuckDecl("PRG_TcUnitRunner", orig.PathName, [meth])
+    stuck.DeclarationText = "PROGRAM PRG_TcUnitRunner_9\nVAR\nEND_VAR"            # what the shell keeps returning
+    object.__setattr__(stuck, "_ready", True)
+    folder = sm.items["TIPC^Plc^Plc Project^95_UnitTests"]
+    folder._children = [stuck]
+    sm.items[stuck.PathName] = stuck
+    proj.on_import = dup
+    with pytest.raises(X.XaeError, match=r"read back differs at .*declaration.*restored to its earlier text.*copies kept"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert stuck.ImplementationText == "// impl of PRG_TcUnitRunner" and proj.deleted == []
+
+
+def test_r15_n38_the_imported_xml_is_the_oracle(xae, tmp_path):
+    """TwinCAT's export carries every declaration as plain text and the bodies: the intended text is checked against
+    the user's XML, not against the copy TwinCAT made of it."""
+    be, dte, sm = xae
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+<project xmlns="http://www.plcopen.org/xml/tc6_0200"><types><pous>
+<pou name="PRG_TcUnitRunner" pouType="program"><interface><addData>
+<data name="http://www.3s-software.com/plcopenxml/interfaceasplaintext" handleUnknown="implementation">
+<InterfaceAsPlainText><xhtml xmlns="http://www.w3.org/1999/xhtml">{attribute 'qualified_only'}
+// runner (* of the tests *)
+PROGRAM PRG_TcUnitRunner
+VAR
+  n : INT;
+END_VAR
+</xhtml></InterfaceAsPlainText></data></addData></interface>
+<body><ST><xhtml xmlns="http://www.w3.org/1999/xhtml">// new body</xhtml></ST></body>
+<addData><data name="http://www.3s-software.com/plcopenxml/method" handleUnknown="implementation">
+<Method name="Run"><body><ST><xhtml xmlns="http://www.w3.org/1999/xhtml">// new Run</xhtml></ST></body></Method>
+</data></addData></pou></pous></types></project>"""
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path, xml_body=xml)
+    proj.on_import = dup
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert r["replaced"][0]["checked_against"] == "xml" and proj.deleted == ["PRG_TcUnitRunner_1"]
+    # the copy differs from the XML somewhere else than the header (an unknown transformation): nothing written
+    proj._children = [c for c in proj._children if c.Name != "PRG_TcUnitRunner_1"]
+    orig.ImplementationText = "// old body"
+
+    def dup_changed():
+        it = dup()
+        it._children[0].ImplementationText = "// Run as TwinCAT changed it"
+    proj.on_import = dup_changed
+    with pytest.raises(X.XaeError, match=r"differs from the imported XML at .*\^Run \(implementation\) line 1: "
+                                         r"'// Run as TwinCAT changed it' vs XML '// new Run'.*nothing written.*copies kept"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert orig.ImplementationText == "// old body" and proj.deleted == ["PRG_TcUnitRunner_1"]
 
 
 class _FailingText(FakeItem):
@@ -593,22 +679,22 @@ def test_r15_review_a_failed_write_restores_the_original_and_a_failed_restore_ke
     orig._children = [bad]
     sm.items[bad.PathName] = bad
     proj.on_import = dup
-    with pytest.raises(X.XaeError, match=r"writing failed .*was restored to its earlier text.*copies removed again"):
+    with pytest.raises(X.XaeError, match=r"writing failed .*was restored to its earlier text.*copies kept"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
-    assert orig.DeclarationText == "// decl of PRG_TcUnitRunner" and orig.ImplementationText == "// impl of PRG_TcUnitRunner"
-    assert bad.ImplementationText == "// impl of Run" and proj.deleted == ["PRG_TcUnitRunner_1"]
+    assert orig.DeclarationText == "PROGRAM PRG_TcUnitRunner\nVAR\nEND_VAR" and orig.ImplementationText == "// impl of PRG_TcUnitRunner"
+    assert bad.ImplementationText == "// impl of Run" and proj.deleted == []
     # the write and the restore both fail: the copy is kept and the original is named as possibly half-written
     proj._children = [c for c in proj._children if c.Name != "PRG_TcUnitRunner_1"]
     object.__setattr__(bad, "_fails", 5)
-    with pytest.raises(X.XaeError, match=r"restoring .*PRG_TcUnitRunner failed too.*may be half-written.*copies kept"):
+    with pytest.raises(X.XaeError, match=r"restoring .*PRG_TcUnitRunner failed too.*half-written.*copies kept"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
-    assert proj.deleted == ["PRG_TcUnitRunner_1"]                  # not deleted a second time
+    assert proj.deleted == []
 
 
 def test_r15_review_names_in_the_file_and_an_unreadable_tree(xae, tmp_path):
     be, dte, sm = xae
     proj, orig, meth, f, dup = _r15_setup(sm, tmp_path, ("PRG_TcUnitRunner", "PRG_TcUnitRunner_2"))
-    # PRG_TcUnitRunner_2 is in the file: imported on purpose, never treated as a copy of PRG_TcUnitRunner
+    # A8: PRG_TcUnitRunner_2 is in the file: imported on purpose, never treated as a copy of PRG_TcUnitRunner
     proj.on_import = lambda: dup("PRG_TcUnitRunner_2")
     r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
     assert "duplicates_created" not in r and proj.deleted == [] and orig.ImplementationText == "// impl of PRG_TcUnitRunner"
@@ -621,6 +707,26 @@ def test_r15_review_names_in_the_file_and_an_unreadable_tree(xae, tmp_path):
     assert len(proj.imported) == n
     r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "none")               # other options: imported, warned
     assert "not known" in r["warning"] and "added" not in r
+
+
+def test_r15_n44_listing_fails_after_a_replace_import(xae, tmp_path):
+    """N44: the listing after the import failed → 0.8.9 returned a normal result with a warning (copies stay,
+    nothing replaced, reads as success). Now an error that says the import ran and what to look for."""
+    be, dte, sm = xae
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path)
+    real = be.tree_children
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        res = real(*a, **k)
+        return res if calls["n"] == 1 else {**res, "unreadable_children": [{"parent": "x", "index": 2}]}
+    be.tree_children = flaky
+    proj.on_import = dup
+    with pytest.raises(X.XaeError, match=r"PlcOpenImport\(replace\) ran, but .*could not be listed afterwards.*"
+                                         r"nothing was replaced or deleted.*PRG_TcUnitRunner_1"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert proj.deleted == [] and orig.ImplementationText == "// impl of PRG_TcUnitRunner"
 
 
 def test_n10_n45_online_commands_and_check_all_objects_via_the_automation_interface(xae):
@@ -642,6 +748,49 @@ def test_n10_n45_online_commands_and_check_all_objects_via_the_automation_interf
     proj.ConsumeXml = refuse
     r = be.plc_action("login")                                  # falls back to the shell command, says why
     assert r["command"] == "PLC.Login" and "online command refused" in r["automation_interface"]
+
+
+def test_n41_xae_plc_acts_on_the_named_project_on_every_route(xae, monkeypatch):
+    """N41: when ConsumeXml failed (or for download, which has no ConsumeXml command), the DTE fallback acted on the
+    shell's ACTIVE project, ignoring plc_project_path; with two projects and none named it used whichever was active.
+    Now the project is resolved once and every route acts on exactly that one."""
+    be, dte, sm = xae
+    a, b = "TIPC^PlcA^PlcA Project", "TIPC^PlcB^PlcB Project"
+    monkeypatch.setattr(be, "_nested_projects", lambda p=None: [X._plc_split(p)[1]] if p else [a, b])
+    shell = {"active": "PlcA", "selected": []}
+
+    def cmds(prefix, limit=500):
+        return {"commands": [f"PLC.Loginto{shell['active']}", f"PLC.Logoutfrom{shell['active']}", "PLC.Download"]}
+    monkeypatch.setattr(be, "list_commands", cmds)
+
+    def select(name=None):
+        shell["selected"].append(name)
+        if shell.get("selectable", True):
+            shell["active"] = name
+            return f"Solution\\{name} Project"
+        return None
+    monkeypatch.setattr(be, "_select_plc_project_node", select)
+    issued = []
+    monkeypatch.setattr(be, "command", lambda c, *a, **k: issued.append(c) or {"command": c})
+    monkeypatch.setattr(be, "_item", lambda path: (_ for _ in ()).throw(X.XaeError(f"ConsumeXml not here: {path}")))
+    # two projects, none named: nothing is guessed, nothing issued
+    with pytest.raises(X.XaeError, match=r"2 PLC projects in the solution — name one.*nothing was done"):
+        be.plc_action("login")
+    assert issued == []
+    # B named while A is active: B's node is selected first, then B's command — never A's
+    r = be.plc_action("login", b)
+    assert issued == ["PLC.LogintoPlcB"] and shell["selected"] == ["PlcB"] and r["project"] == b
+    # B named, B cannot be made active: refused, A's command is not used
+    shell.update(active="PlcA", selectable=False)
+    issued.clear()
+    with pytest.raises(X.XaeError, match=r"act on the active project \['plca'\], not 'PlcB'.*Nothing was done"):
+        be.plc_action("logout", b)
+    assert issued == []
+    # download (no ConsumeXml command) on a shell whose generic PLC.Download does not name the project: refused
+    # with two projects in the solution
+    with pytest.raises(X.XaeError, match=r"do not name the project they act on and the solution has 2 PLC projects"):
+        be.plc_action("download", b)
+    assert issued == []
 
 
 def test_n10_retest_outer_and_nested_node_are_one_plc_project(xae):

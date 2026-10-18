@@ -51,7 +51,7 @@ from typing import Any, Callable
 # _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
 # re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
 # changes without a bump.
-INDEXER_VERSION = 2
+INDEXER_VERSION = 3          # 3: code without non-breaking spaces; the return value parsed into the header (R24)
 
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
@@ -333,7 +333,9 @@ class _MdWalker(HTMLParser):
             return
         if self.pre:
             if tag == "pre":
-                code = html.unescape("".join(self.pre_buf)).strip("\n")
+                # R24 root: Help Viewer code uses non-breaking spaces for indentation; every consumer (the
+                # declaration parser, code search, what an agent pastes into TwinCAT) needs plain spaces
+                code = html.unescape("".join(self.pre_buf)).translate(_CODE_SPACES).strip("\n")
                 self.pre = 0
                 if code.strip():
                     lang = _guess_lang(code)
@@ -436,6 +438,11 @@ def _doc_version(raw: str | None) -> str | None:
     if len(v) > 80 or not _VERSIONISH.search(v) or v.lower().startswith("type:"):
         return None
     return v
+
+
+# blanks other than the space that Help Viewer pages put into code (indentation), and zero-width marks
+_CODE_SPACES = str.maketrans({**{c: " " for c in "\u00a0\u2007\u202f\u2002\u2003\u2009\u200a"},
+                              **{c: None for c in "\u200b\u2060\ufeff"}})
 
 
 def _nobr(text: str) -> str:
@@ -652,6 +659,18 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
         decl["declaration"] = ((f"{head} {decl['name']}  (* header reconstructed *)\n" if head else "")
                                + "\n".join(fragments))
     decl["description"] = desc
+    short = decl["name"].split(".")[-1]
+    if kind in ("Function", "Method"):
+        # R24: Infosys documents the return value as a VAR_OUTPUT named like the function — it is the return type
+        ret = next((o for o in decl["outputs"] if str(o.get("name", "")).lower() == short.lower()), None)
+        if ret is not None:
+            decl["outputs"] = [o for o in decl["outputs"] if o is not ret]
+            decl["return_type"] = decl["return_type"] or ret.get("type")
+            if ret.get("description"):
+                decl["return_description"] = ret["description"]
+        if decl["return_type"] and decl["declaration"]:
+            decl["declaration"] = _return_in_header(decl["declaration"], short, decl["return_type"],
+                                                    "FUNCTION" if kind == "Function" else "METHOD")
     return decl
 
 
@@ -659,13 +678,13 @@ def _return_in_header(text: str, short: str, rtype: str, kw: str) -> str:
     """R24: Infosys documents a FUNCTION's return value as a VAR_OUTPUT line named like the function. Drop that line
     from every VAR_OUTPUT block (and the block once nothing but blanks is left), and give the header its ': type' —
     also when the header is already there (reconstructed '(* header reconstructed *)' or without the type)."""
-    ret_line = re.compile(r"(?im)^[ \t]*" + re.escape(short) + r"[ \t]*:[^;\n]*;?[ \t]*(?:\(\*.*?\*\)|//[^\n]*)?[ \t]*\n?")
+    ret_line = re.compile(r"(?im)^[^\S\n]*" + re.escape(short) + r"[^\S\n]*:[^;\n]*;?[^\S\n]*(?:\(\*.*?\*\)|//[^\n]*)?[^\S\n]*\n?")
 
     def block(m: re.Match) -> str:
         body = ret_line.sub("", m.group(2))
         return "" if not body.strip() else m.group(1) + body + m.group(3)
-    text = re.sub(r"(?is)(^[ \t]*VAR_OUTPUT\b[^\n]*\n)(.*?)(^[ \t]*END_VAR\b[^\n]*\n?)", block, text, flags=re.M)
-    head = re.search(r"(?im)^([ \t]*)(FUNCTION|METHOD)([ \t]+(?:\w+[ \t]+)*?)" + re.escape(short) + r"\b([^\n]*)", text)
+    text = re.sub(r"(?is)(^[^\S\n]*VAR_OUTPUT\b[^\n]*\n)(.*?)(^[^\S\n]*END_VAR\b[^\n]*\n?)", block, text, flags=re.M)
+    head = re.search(r"(?im)^([^\S\n]*)(FUNCTION|METHOD)([^\S\n]+(?:\w+[^\S\n]+)*?)" + re.escape(short) + r"\b([^\n]*)", text)
     if head:
         rest = head.group(4)
         if not re.match(r"\s*:", rest):                  # header without the return type
@@ -676,22 +695,10 @@ def _return_in_header(text: str, short: str, rtype: str, kw: str) -> str:
 
 
 def _tidy_declaration(decl: dict[str, Any]) -> None:
-    """Output-time corrections of a stored declaration (no page is parsed again):
-    R24 a FUNCTION's return value is not a VAR_OUTPUT; R25 implicit enum values are numbered and the declaration's
-    (* … *) comments become descriptions; R32 the per-name 'description' dict repeats what the items carry."""
+    """Output-time additions to a stored declaration (no page is parsed again): R25 implicit enum values are
+    numbered and the declaration's (* … *) comments become descriptions; R32 the per-name 'description' dict repeats
+    what the items carry. (R24, the return value, is the parser's job: parse_declaration.)"""
     name = decl.get("name") or ""
-    if decl.get("kind") in ("Function", "Method"):
-        outs = decl.get("outputs") or []
-        ret = next((o for o in outs if str(o.get("name", "")).lower() == name.split(".")[-1].lower()), None)
-        if ret is not None:
-            decl["outputs"] = [o for o in outs if o is not ret]
-            decl["return_type"] = decl.get("return_type") or ret.get("type")
-            if ret.get("description") and not decl.get("return_description"):
-                decl["return_description"] = ret["description"]
-        text = decl.get("declaration") or ""
-        if decl.get("return_type") and text:
-            decl["declaration"] = _return_in_header(text, name.split(".")[-1], decl["return_type"],
-                                                    "FUNCTION" if decl.get("kind") == "Function" else "METHOD")
     if decl.get("kind") == "Enum" and decl.get("enum_values"):
         comments: dict[str, str] = {}
         body = decl.get("declaration") or ""

@@ -704,17 +704,20 @@ class XaeBackend:
         # the real project first, the 'none' placeholder last
         return sorted(out, key=lambda n: (n.lower().endswith("none"), n))
 
-    def _select_plc_project_node(self) -> str | None:
-        """Make a PLC project the active one by selecting its node in Solution Explorer (what a click does).
+    def _select_plc_project_node(self, project_name: str | None = None) -> str | None:
+        """Make the named PLC project the active one by selecting its node in Solution Explorer (what a click does).
         Solution Explorer nests it as Solution → <TwinCAT project> → PLC → <PLC> → '<PLC> Project'; the node is
-        found by walking the UI hierarchy (fixed paths missed the TwinCAT project level — retest #10)."""
+        found by walking the UI hierarchy (fixed paths missed the TwinCAT project level — retest #10). N41: the
+        project is the one the call is for, never simply the first one listed."""
         try:
             dte = self._need()
-            projs = self.plc_projects().get("projects") or []
-            if not projs:
-                return None
-            pname = str(projs[0].get("name") or "").removesuffix(" Project")
-            want = {f"{pname} Project".lower(), pname.lower()}
+            if project_name:
+                pname = project_name.removesuffix(" Project")
+            else:
+                projs = self.plc_projects().get("projects") or []
+                if len(projs) != 1:
+                    return None
+                pname = str(projs[0].get("name") or "").removesuffix(" Project")
             # #10: the cached 7.0 gen_py DTE wrapper has no ToolWindows (D20) — late-bound first, then the window object
             se = None
             for get in (lambda: self._dte2_late().ToolWindows.SolutionExplorer,
@@ -772,44 +775,63 @@ class XaeBackend:
                        "reset_cold": "ResetColdCmd", "reset_origin": "ResetOriginCmd"}
 
     def plc_action(self, action: str, plc_project_path: str | None = None) -> dict[str, Any]:
-        """login/logout/start/stop/reset_cold/reset_origin/download. #10: first the documented Automation Interface
-        route — ConsumeXml(<IECProjectDef><OnlineSettings><Commands><LoginCmd>true…) on '<Name> Project' — which needs
-        no active PLC project; then the DTE commands as before (4024: PLC.Login; 4026: PLC.Loginto<ActiveProject>),
-        selecting the project node when the shell only offers '…none'."""
+        """login/logout/start/stop/reset_cold/reset_origin/download. N41: the PLC project is resolved ONCE — the
+        named one, or the only one — and every route acts on exactly that project; with several and none named
+        nothing is guessed. #10: first the documented Automation Interface route (ConsumeXml(<IECProjectDef>
+        <OnlineSettings><Commands><LoginCmd>true…) on '<Name> Project', no active project needed); then the DTE
+        commands, which act on the shell's ACTIVE project: a command that names the project (4026
+        'PLC.Loginto<Name>') must name the target, a generic one ('PLC.Login') is used only when the solution has a
+        single PLC project; the target's node is selected first when the shell names another project or none."""
         cands = list(PLC_LOGIN_COMMANDS.get(action) or [])
         if not cands:
             raise XaeError(f"unknown PLC action {action!r}; valid: {list(PLC_LOGIN_COMMANDS)}")
+        try:
+            all_projects = self._nested_projects(None)
+            list_err = ""
+        except Exception as exc:  # noqa: BLE001
+            all_projects, list_err = [], str(exc)[:160]
+        if plc_project_path:
+            target = _plc_split(plc_project_path)[1]
+        elif len(all_projects) == 1:
+            target = all_projects[0]
+        elif len(all_projects) > 1:
+            raise XaeError(f"{len(all_projects)} PLC projects in the solution — name one with plc_project_path: {all_projects} "
+                           "(nothing was done)")
+        else:
+            raise XaeError("the PLC projects of the solution could not be listed"
+                           + (f" ({list_err})" if list_err else "") + " — pass plc_project_path (xae_plc_projects); nothing was done")
+        target_name = target.split("^")[-1].removesuffix(" Project")
+        single = len(all_projects) <= 1 and (not all_projects or all_projects[0].lower() == target.lower())
         ai_note = ""
         tag = self._PLC_ONLINE_XML.get(action)
         if tag:
+            xml = (f"<TreeItem><IECProjectDef><OnlineSettings><Commands><{tag}>true</{tag}></Commands>"
+                   "</OnlineSettings></IECProjectDef></TreeItem>")
             try:
-                nested = self._nested_projects(plc_project_path)
-            except Exception as exc:  # noqa: BLE001
-                nested, ai_note = [], f"PLC projects not listed: {str(exc)[:120]}"
-            if len(nested) == 1:
-                xml = (f"<TreeItem><IECProjectDef><OnlineSettings><Commands><{tag}>true</{tag}></Commands>"
-                       "</OnlineSettings></IECProjectDef></TreeItem>")
-                try:
-                    it = self._item(nested[0])
-                    self._retry(lambda: it.ConsumeXml(xml), f"ConsumeXml {tag}")
-                    return {"action": action, "method": f"ConsumeXml {tag}", "project": nested[0], "ok": True}
-                except XaeError as exc:
-                    ai_note = f"ConsumeXml {tag} on {nested[0]}: {str(exc)[:200]}"
-            elif len(nested) > 1:
-                ai_note = f"{len(nested)} PLC projects — name one with plc_project_path: {nested}"
+                it = self._item(target)
+                self._retry(lambda: it.ConsumeXml(xml), f"ConsumeXml {tag}")
+                return {"action": action, "method": f"ConsumeXml {tag}", "project": target, "ok": True}
+            except XaeError as exc:
+                ai_note = f"ConsumeXml {tag} on {target}: {str(exc)[:200]}"
+        key = _cmd_key(target_name)
         tried: list[dict[str, str]] = []
         selected = None
+        others: list[str] = []
         for attempt in range(2):
-            dyn = [c for c in self._dynamic_plc_commands(action) if c not in cands]
-            real = [c for c in dyn if not c.lower().endswith("none")]
-            if not real and dyn and attempt == 0:
-                selected = self._select_plc_project_node()     # only '…none' offered: no active project
+            dyn = self._dynamic_plc_commands(action)
+            named = [(c, self._cmd_project(c, action)) for c in dyn]
+            mine = [c for c, k in named if k and k not in ("", "none") and k == key]
+            others = sorted({k for c, k in named if k and k not in ("", "none") and k != key})
+            generic = [c for c in dict.fromkeys(cands + [c for c, k in named if k == ""])] if single else []
+            if not mine and attempt == 0 and (others or not single or any(k == "none" for _c, k in named)):
+                selected = self._select_plc_project_node(target_name)   # make the TARGET the active project
                 if selected:
                     continue
-            for c in cands + real:
+            for c in mine + [g for g in generic if g not in mine]:
                 try:
                     self.command(c)
-                    out = {"action": action, "command": c, "ok": True, "tried": tried, "selected_node": selected}
+                    out = {"action": action, "command": c, "ok": True, "project": target, "tried": tried,
+                           "selected_node": selected}
                     if ai_note:
                         out["automation_interface"] = ai_note
                     return out
@@ -817,13 +839,37 @@ class XaeBackend:
                     tried.append({"command": c, "error": str(exc)[:200]})
             break
         offered = self._dynamic_plc_commands(action)
-        raise XaeError(
-            (f"Automation Interface route failed ({ai_note}); " if ai_note else "")
-            + f"no working DTE command for {action!r}: tried {[t['command'] for t in tried]}; this shell offers {offered or 'nothing matching'}. "
-            + ("A '…none' command means no PLC project is active: click the PLC project node once in Solution Explorer, then retry. "
-               if any(o.lower().endswith("none") for o in offered) else "")
-            + "ads_plc_state covers run/stop/reset via ADS without the shell."
-        )
+        why = []
+        if ai_note:
+            why.append(f"Automation Interface route failed ({ai_note})")
+        if others and not tried:
+            why.append(f"the shell's PLC commands act on the active project {others}, not {target_name!r} — select "
+                       f"'{target_name} Project' in Solution Explorer ('Set as Active PLC Project') and retry")
+        elif not single and not tried:
+            why.append(f"this shell's PLC commands do not name the project they act on and the solution has "
+                       f"{len(all_projects)} PLC projects, so {target_name!r} cannot be confirmed as the active one")
+        else:
+            why.append(f"no working DTE command for {action!r}: tried {[t['command'] for t in tried]}; this shell offers "
+                       f"{offered or 'nothing matching'}")
+        if any(o.lower().endswith("none") for o in offered):
+            why.append("a '…none' command means no PLC project is active: click the PLC project node once in Solution "
+                       "Explorer, then retry")
+        raise XaeError("; ".join(why) + ". Nothing was done. ads_plc_state covers run/stop/reset via ADS without the shell.")
+
+    def _cmd_project(self, cmd: str, action: str) -> str | None:
+        """Which project a PLC shell command acts on: '' = the active one (generic 'PLC.Login', context menu),
+        'none' = no active project, else the project key from 4026 names like 'PLC.LogintoUntitled1'; None = not a
+        command for this action."""
+        verb = self._PLC_VERB.get(action, "").lower()
+        low = cmd.lower()
+        if low.startswith("othercontextmenus.plcproject."):
+            return ""
+        for stem in (("plc.loginto", "plc.login") if verb == "login" else
+                     ("plc.logoutfrom", "plc.logout") if verb == "logout" else ("plc." + verb,)):
+            if low.startswith(stem):
+                rest = low[len(stem):]
+                return "none" if rest == "none" else _cmd_key(rest)
+        return None
 
     # ------------------------------------------------------------ target / activate
     def target_get(self) -> dict[str, Any]:
@@ -1137,6 +1183,12 @@ class XaeBackend:
             self._retry(lambda: it.PlcOpenImport(xml_file, opts[option]), "PlcOpenImport")
         after = snapshot()
         res: dict[str, Any] = {"imported": xml_file, "into": plc_project_path, "option": option, "objects_in_file": names}
+        if after is None and option == "replace":
+            # N44: a normal result here read as success while renamed copies (PRG_X_1) may sit at the project root
+            raise XaeError(f"PlcOpenImport(replace) ran, but the objects of {plc_project_path} could not be listed "
+                           "afterwards, so it is not known whether TwinCAT put renamed copies (<name>_1) at the project "
+                           "root instead of replacing — nothing was replaced or deleted. Check the tree (xae_tree) for "
+                           f"{[n + '_1' for n in names][:5]} …")
         if before is None or after is None:
             res["warning"] = ("the project's objects could not be listed completely "
                               f"{'before' if before is None else 'after'} the import: the objects added (and any "
@@ -1153,62 +1205,46 @@ class XaeBackend:
         if dup:
             res["duplicates_created"] = dup
             if option == "replace":
-                return self._replace_from_copies(res, dup, added, before)
+                return self._replace_from_copies(res, dup, added, before, _plcopen_oracle(xml_file))
         return res
 
     def _replace_from_copies(self, res: dict[str, Any], dup: list[str], added: dict[str, str],
-                             before: dict[str, str]) -> dict[str, Any]:
-        """R15: PlcOpenImport(replace) put objects that live in a folder at the project root as renamed copies
-        (PRG_X_1). Finish the replace ourselves, one object at a time:
-          1. read both trees (declaration / implementation of the object and of its methods, properties, actions —
-             every level) through the retrying COM path; different child names at any level → that object is not
-             touched;
-          2. keep the original's texts, write the copy's texts, read them back and compare;
-          3. on any failure write the kept texts back (and check them) — the original is as before;
-          4. delete a copy only when its original is verified: replaced, or restored, or never touched. A copy whose
-             original could not be restored is kept (it holds the new text) and named.
-        The XML file stays the source of the new text either way."""
-        done: list[dict[str, str]] = []
-        failed: list[str] = []            # original untouched or restored
-        partial: list[str] = []           # original half-written, restore failed: its copy is kept
+                             before: dict[str, str], oracle: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        """R15 / N38: PlcOpenImport(replace) put objects that live in a folder at the project root as renamed copies
+        (PRG_X_1) — and renamed their declaration header too (PROGRAM PRG_X_1). The copy is TwinCAT's transformed
+        version of the import, not the text the user imported, so it is never written as it is. Per object:
+          1. the intended text = the copy's texts with the header name changed back to the original's name
+             (PROGRAM/FUNCTION_BLOCK/FUNCTION/INTERFACE/TYPE, after pragmas and comments; nothing else changed);
+          2. the intended text is checked against the XML file (TwinCAT's export carries every declaration as plain
+             text, and the bodies): the user's input is the oracle, not the copy. A difference, a header that cannot
+             be renamed back, or the copy's name anywhere else that the XML does not hold → nothing written;
+          3. the original's texts are kept, the intended texts written, read back and compared, and the declared name
+             must equal the original's name in the tree — an independent check, not a comparison with what was just
+             written from the same source;
+          4. any failure → the kept texts are written back (and checked);
+          5. a copy (created by this import, it was not in the tree before) is deleted only when its original passed
+             step 3. Every other copy is kept and named."""
+        done: list[dict[str, Any]] = []
+        failed: list[str] = []
+        kept: list[str] = []
         for p in dup:
-            base = re.sub(r"_\d+$", "", added[p])
+            copy_name = added[p]
+            base = re.sub(r"_\d+$", "", copy_name)
             origs = [bp for bp, bn in before.items() if bn.lower() == base.lower()]
             if len(origs) != 1:
-                failed.append(f"{added[p]}: {len(origs)} existing objects named {base}")
+                failed.append(f"{copy_name}: {len(origs)} existing objects named {base} — nothing written")
+                kept.append(p)
                 continue
+            orig_path, orig_name = origs[0], before[origs[0]]
             try:
-                src = self._text_tree(self._item(p), added[p])
-                dst = self._text_tree(self._item(origs[0]), origs[0])
-                diff = _tree_diff(src, dst, origs[0])
-            except XaeError as exc:
-                failed.append(f"{added[p]}: could not read the texts ({exc}) — nothing written")
-                continue
-            if diff:
-                failed.append(f"{added[p]}: {diff} — nothing written")
-                continue
-            try:
-                self._write_tree(src, dst)
-                bad = _tree_mismatch(src, self._text_tree(dst["_it"], origs[0]), origs[0])
-                if bad:
-                    raise XaeError(f"read back differs at {bad}")
-                done.append({"object": origs[0], "from_copy": p})
-                continue
-            except XaeError as exc:
-                err = str(exc)
-            try:                                                   # step 3: back to the original texts
-                self._write_tree(dst, dst)
-                bad = _tree_mismatch(dst, self._text_tree(dst["_it"], origs[0]), origs[0])
-                if bad:
-                    raise XaeError(f"read back differs at {bad}")
-                failed.append(f"{added[p]}: writing failed ({err}); {origs[0]} was restored to its earlier text")
-            except XaeError as exc:
-                partial.append(p)
-                failed.append(f"{added[p]}: writing failed ({err}) and restoring {origs[0]} failed too ({exc}) — "
-                              f"{origs[0]} may be half-written; the copy {p} was kept, it has the new text")
+                rec = self._replace_one(p, copy_name, orig_path, orig_name, (oracle or {}).get(base.lower()))
+                done.append(rec)
+            except _ReplaceError as exc:
+                failed.append(f"{copy_name}: {exc}")
+                kept.append(p)
         removed, left = [], []
         for p in dup:
-            if p in partial:
+            if p in kept:
                 continue
             parent, name = p.rsplit("^", 1)
             try:
@@ -1217,21 +1253,87 @@ class XaeBackend:
             except XaeError as exc:
                 left.append(f"{p} ({exc})")
         res["copies_removed"] = removed
+        if done:
+            res["replaced"] = [{k: v for k, v in d.items() if k != "header_renamed"} for d in done]
+            res["header_renamed"] = [d["header_renamed"] for d in done if d.get("header_renamed")]
+            res["build_required"] = True
+            res["objects_to_build"] = [d["object"] for d in done]
         if failed or left:
-            raise XaeError(f"PlcOpenImport(replace) could not replace {failed} — TwinCAT imported the object(s) as "
-                           f"copies at the project root; "
-                           + (f"copies removed again: {removed}; " if removed else "")
-                           + (f"copies kept: {partial}; " if partial else "")
-                           + (f"copies that could NOT be removed: {left} (xae_tree_delete them); " if left else "")
-                           + (f"replaced and verified: {[d['object'] for d in done]}; " if done else "")
-                           + "every other original is unchanged. Update the object with xae_pou_set, or delete it and "
-                             "import again.")
-        res["replaced"] = done
+            raise XaeError("PlcOpenImport(replace) put the object(s) at the project root as renamed copies; "
+                           f"not replaced: {failed}; "
+                           + (f"copies kept (they hold the import, delete them with xae_tree_delete when done): {kept}; "
+                              if kept else "")
+                           + (f"copies that could NOT be removed: {left}; " if left else "")
+                           + (f"replaced and verified: {[d['object'] for d in done]} (build required); " if done else "")
+                           + "every original not listed as replaced is unchanged.")
         res.pop("duplicates_created", None)
         res["note"] = ("PlcOpenImport put the object(s) at the project root as renamed copies (they live in a folder); "
-                       "their text was copied into the existing object(s), read back and compared, and the copies were "
-                       "deleted — save + build")
+                       "the header names were changed back, the texts checked against the XML, written into the "
+                       "existing object(s), read back with the declared name checked, and the copies deleted — "
+                       "save + build (build_required)")
         return res
+
+    def _replace_one(self, copy_path: str, copy_name: str, orig_path: str, orig_name: str,
+                     xml: dict[str, Any] | None) -> dict[str, Any]:
+        """One object of _replace_from_copies (steps 1–4). Raises _ReplaceError; the original is as before then,
+        unless the message says it may be half-written."""
+        try:
+            src = self._text_tree(self._item(copy_path), copy_name)
+            dst = self._text_tree(self._item(orig_path), orig_path)
+        except XaeError as exc:
+            raise _ReplaceError(f"could not read the texts ({exc}) — nothing written") from exc
+        diff = _tree_diff(src, dst, orig_path)
+        if diff:
+            raise _ReplaceError(f"{diff} — nothing written")
+        # 1. intended text: the header renamed back
+        want = _tree_copy(src)
+        renamed = None
+        if want["decl"] is not None and _header_name(want["decl"]) is not None:
+            new_decl = _rename_header(want["decl"], copy_name, orig_name)
+            if new_decl is None:
+                kw_name = _header_name(want["decl"])
+                raise _ReplaceError(f"the copy's declaration header names {kw_name[1] if kw_name else '?'!r}, not "
+                                    f"{copy_name!r} — header not recognised, nothing written")
+            want["decl"] = new_decl
+            renamed = {"object": orig_path, "from": copy_name, "to": orig_name}
+        elif _HAS_HEADER.match(_strip_trivia_head(want["decl"] or "")):
+            raise _ReplaceError("the copy's declaration header could not be parsed — nothing written")
+        # 2. the XML is the oracle
+        checked = "name"
+        if xml is not None:
+            bad = _oracle_mismatch(want, xml, orig_path)
+            if bad:
+                raise _ReplaceError(f"the copy differs from the imported XML at {bad} — nothing written")
+            checked = "xml"
+        stray = _name_occurrences(want, copy_name, xml)
+        if stray:
+            raise _ReplaceError(f"the copy's name {copy_name!r} also occurs in {', '.join(stray)}, which the XML does not hold — "
+                                "TwinCAT may have renamed it there; nothing written")
+        # 3. write, read back, independent name check
+        try:
+            self._write_tree(want, dst)
+            got = self._text_tree(dst["_it"], orig_path)
+            bad = _tree_mismatch(want, got, orig_path)
+            if bad:
+                raise XaeError(f"read back differs at {bad}")
+            if got["decl"] is not None and _header_name(want["decl"] or "") is not None:
+                h = _header_name(got["decl"])
+                if h is None or h[1].lower() != orig_name.lower():
+                    raise XaeError(f"after writing, the declaration names {h[1] if h else 'nothing'!r}, the object in "
+                                   f"the tree is {orig_name!r}")
+            return {"object": orig_path, "from_copy": copy_path, "checked_against": checked, "header_renamed": renamed}
+        except XaeError as exc:
+            err = str(exc)
+        # 4. back to the kept texts
+        try:
+            self._write_tree(dst, dst)
+            bad = _tree_mismatch(dst, self._text_tree(dst["_it"], orig_path), orig_path)
+            if bad:
+                raise XaeError(f"read back differs at {bad}")
+        except XaeError as exc:
+            raise _ReplaceError(f"writing failed ({err}) and restoring {orig_path} failed too ({exc}) — it may be "
+                                "half-written; its copy is kept") from exc
+        raise _ReplaceError(f"writing failed ({err}); {orig_path} was restored to its earlier text")
 
     def _text_tree(self, it: Any, where: str, depth: int = 0) -> dict[str, Any]:
         """{'decl', 'impl', 'kids': {name: tree}, '_it'} of an object, every level (up to 6). Read through _retry: a
@@ -1595,12 +1697,12 @@ def _plc_split(path: str) -> tuple[str, str]:
 
 
 def _plcopen_names(xml_file: str) -> list[str]:
-    """Names of the POUs / DUTs / GVLs a PLCopen XML file holds."""
+    """Names of the POUs / DUTs / GVLs / interfaces a PLCopen XML file holds."""
     try:
         txt = Path(xml_file).read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return []
-    found = re.findall(r"<(?:pou|dataType|globalVars)\b[^>]*\bname=\"([^\"]+)\"", txt)
+    found = re.findall(r"<(?:pou|dataType|globalVars|Interface)\b[^>]*\bname=\"([^\"]+)\"", txt)
     return list(dict.fromkeys(found))
 
 
@@ -1650,6 +1752,181 @@ def _tree_mismatch(want: dict[str, Any], got: dict[str, Any], where: str) -> str
         if m:
             return m
     return None
+
+
+def _cmd_key(name: str) -> str:
+    """A project name as it appears in a VS command name (letters and digits, lower case)."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+class _ReplaceError(Exception):
+    pass
+
+
+def _tree_copy(t: dict[str, Any]) -> dict[str, Any]:
+    return {"_it": t.get("_it"), "decl": t.get("decl"), "impl": t.get("impl"),
+            "kids": {k: _tree_copy(v) for k, v in (t.get("kids") or {}).items()}}
+
+
+_HEAD_KW = {"PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "INTERFACE", "TYPE"}
+_HEAD_MODS = {"PUBLIC", "PRIVATE", "PROTECTED", "INTERNAL", "FINAL", "ABSTRACT"}
+_IDENT_AT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_HAS_HEADER = re.compile(r"(?i)(PROGRAM|FUNCTION_BLOCK|FUNCTION|INTERFACE|TYPE)\b")
+
+
+def _skip_trivia(s: str, i: int) -> int:
+    """Index after whitespace, // and /* */ comments, nested (* *) comments and {pragma} blocks."""
+    n = len(s)
+    while i < n:
+        if s[i].isspace():
+            i += 1
+        elif s.startswith("//", i):
+            j = s.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif s.startswith("(*", i):
+            depth = 0
+            while i < n:
+                if s.startswith("(*", i):
+                    depth, i = depth + 1, i + 2
+                elif s.startswith("*)", i):
+                    depth, i = depth - 1, i + 2
+                    if depth == 0:
+                        break
+                else:
+                    i += 1
+        elif s.startswith("/*", i):
+            j = s.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        elif s[i] == "{":
+            j = s.find("}", i)
+            i = n if j < 0 else j + 1
+        else:
+            break
+    return i
+
+
+def _strip_trivia_head(s: str) -> str:
+    return s[_skip_trivia(s, 0):]
+
+
+def _header_name(decl: str | None) -> tuple[str, str, int, int] | None:
+    """(keyword, name, start, end) of the object's own name in its declaration header — PROGRAM / FUNCTION_BLOCK
+    (with PUBLIC, FINAL, ABSTRACT …) / FUNCTION / INTERFACE / TYPE, after pragmas and comments — else None (a GVL
+    has no header name)."""
+    if not decl:
+        return None
+    i = _skip_trivia(decl, 0)
+    m = _IDENT_AT.match(decl, i)
+    if not m or m.group(0).upper() not in _HEAD_KW:
+        return None
+    kw = m.group(0).upper()
+    i = m.end()
+    while True:
+        i = _skip_trivia(decl, i)
+        m = _IDENT_AT.match(decl, i)
+        if not m:
+            return None
+        if kw != "PROGRAM" and kw != "TYPE" and m.group(0).upper() in _HEAD_MODS:
+            i = m.end()
+            continue
+        return kw, m.group(0), m.start(), m.end()
+
+
+def _rename_header(decl: str, old: str, new: str) -> str | None:
+    """The declaration with exactly the header's object name old → new (case-insensitive match, every other byte
+    kept: EXTENDS, IMPLEMENTS, ': <return type>', comments, line endings); None when the header does not name old."""
+    h = _header_name(decl)
+    if h is None or h[1].lower() != old.lower():
+        return None
+    return decl[:h[2]] + new + decl[h[3]:]
+
+
+def _name_occurrences(tree: dict[str, Any], name: str, xml: dict[str, Any] | None, where: str = "") -> list[str]:
+    """Where `name` occurs as a whole word in the tree's texts and the XML (where it has that text) does not."""
+    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", re.I)
+    out: list[str] = []
+    for key in ("decl", "impl"):
+        t = tree.get(key)
+        if t and pat.search(t):
+            x = (xml or {}).get(key)
+            if not (x and pat.search(x)):
+                out.append(f"{where or 'the object'} ({'declaration' if key == 'decl' else 'implementation'})")
+    for k, sub in (tree.get("kids") or {}).items():
+        out += _name_occurrences(sub, name, ((xml or {}).get("kids") or {}).get(k.lower()), f"{where}^{k}" if where else k)
+    return out
+
+
+def _oracle_mismatch(want: dict[str, Any], xml: dict[str, Any], where: str) -> str | None:
+    """First place where the intended text differs from the XML's text (where the XML has one; line endings and
+    trailing blanks ignored), with the first differing line."""
+    for key in ("decl", "impl"):
+        a, b = want.get(key), xml.get(key)
+        if a is None or b is None:
+            continue
+        na, nb = _norm_text(a), _norm_text(b)
+        if na != nb:
+            la, lb = (na or "").split("\n"), (nb or "").split("\n")
+            i = next((k for k in range(max(len(la), len(lb))) if (la[k] if k < len(la) else None) != (lb[k] if k < len(lb) else None)), 0)
+            return (f"{where} ({'declaration' if key == 'decl' else 'implementation'}) line {i + 1}: "
+                    f"{(la[i] if i < len(la) else '')!r} vs XML {(lb[i] if i < len(lb) else '')!r}")
+    xk = xml.get("kids") or {}
+    for k, sub in (want.get("kids") or {}).items():
+        if k.lower() in xk:
+            m = _oracle_mismatch(sub, xk[k.lower()], f"{where}^{k}")
+            if m:
+                return m
+    return None
+
+
+def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
+    """What the PLCopen XML says each object's texts are: {name.lower(): {'decl', 'impl', 'kids': {…}}} from
+    TwinCAT's 'interfaceasplaintext' blocks and the ST bodies; methods, actions, properties (Get / Set) as kids.
+    Objects without plain text (a foreign XML) are left out — the name check alone applies to them."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(xml_file).getroot()
+    except (ET.ParseError, OSError):
+        return {}
+    for el in root.iter():                                  # namespaces off: tags and attributes by local name
+        if isinstance(el.tag, str) and "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+
+    def plain(el: Any) -> str | None:
+        for d in el.findall("./interface/addData/data") + el.findall("./addData/data"):
+            if str(d.get("name", "")).endswith("interfaceasplaintext"):
+                x = d.find("./InterfaceAsPlainText/xhtml")
+                if x is not None:
+                    return x.text or ""
+        return None
+
+    def body(el: Any) -> str | None:
+        x = el.find("./body/ST/xhtml")
+        return (x.text or "") if x is not None else None
+
+    def node(el: Any) -> dict[str, Any]:
+        kids: dict[str, Any] = {}
+        for d in el.findall("./addData/data"):
+            nm = str(d.get("name", ""))
+            for tag in ("Method", "Action", "Property", "Transition"):
+                if nm.endswith("/" + tag.lower()):
+                    for c in d.findall("./" + tag):
+                        sub = node(c)
+                        if tag == "Property":
+                            for dd in c.findall("./addData/data"):
+                                for acc, kid in (("GetAccessor", "Get"), ("SetAccessor", "Set")):
+                                    a = dd.find("./" + acc)
+                                    if a is not None:
+                                        sub["kids"][kid.lower()] = node(a)
+                        kids[str(c.get("name", "")).lower()] = sub
+        return {"decl": plain(el), "impl": body(el), "kids": kids}
+
+    out: dict[str, dict[str, Any]] = {}
+    for el in root.iter():
+        if el.tag in ("pou", "dataType", "globalVars", "Interface") and el.get("name"):
+            n = node(el)
+            if n["decl"] is not None or n["impl"] is not None:
+                out.setdefault(str(el.get("name")).lower(), n)
+    return out
 
 
 def _try(fn: Callable[[], Any]) -> Any:
