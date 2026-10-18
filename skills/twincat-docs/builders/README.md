@@ -21,7 +21,8 @@ PDF text needs PyMuPDF or pypdf (see section 5).
   3. the folder chosen with the plugin's `kb_set_location` (pointer file `~\.twincat_mcp\knowledge_location.json`,
      or `%TCMCP_HOME%\knowledge_location.json` when `TCMCP_HOME` is set),
   4. the folder above the script, when that folder is a knowledge folder (it contains `helpviewer\` or `knowledge.db`
-     for `infosys_local.py`; `manualsdb\` or `knowledge.db` for `manuals_db.py`). This is why a copy in `<kb>\tools\` works,
+     for `infosys_local.py`; `manualsdb\` or `knowledge.db` for `manuals_db.py`). This is why a builder in `<kb>\tools\`
+     works, and the stub there (section 6: it sets `TCMCP_STUB_DIR`, so "the script" means the stub),
   5. `D:\TwinCAT-MCP\knowledge` (the default, `FALLBACK_KB` in each script).
 - `--kb` and `--db` may be given before or after the command: `--kb D:\kb index` and `index --kb D:\kb` are the same.
 - In a new folder, neither `helpviewer\` nor `knowledge.db` exists yet, so the folder-above lookup does not apply.
@@ -293,19 +294,33 @@ Pending and outdated items are fixed by `update`.
 - Text quality differs: PyMuPDF with `sort=True` keeps reading order on two-column pages and finds headings from
   fonts; pypdf does not. The backend used per manual is stored in `doc.backend`.
 
-## 6. Copies in `<kb>\tools\`
+## 6. Stubs in `<kb>\tools\` (nothing to update after a plugin update)
 
-The plugin ships both scripts in `skills\twincat-docs\builders\`. The copies in `<kb>\tools\` are optional: they make
-the commands short. Replace any older copy with the current files (`infosys_local.py` 2, `manuals_db.py` 3). Copy **both** files:
+`<kb>\tools\infosys_local.py` and `<kb>\tools\manuals_db.py` are **stubs** (`stub.py` in this folder, saved under the
+builder's name). A stub holds no builder code: it finds the builders of the installed plugin and runs the one with its
+own file name, with the same arguments and the same Python, so `tools\manuals_db.py update` always runs the current
+`manuals_db.py`. A stub never changes; a plugin update needs no copying.
 
-```
-copy "<plugin>\skills\twincat-docs\builders\infosys_local.py" "<kb>\tools\"
-copy "<plugin>\skills\twincat-docs\builders\manuals_db.py"   "<kb>\tools\"
-```
+Where a stub finds the builders, first match wins:
 
-They find `<kb>` as the folder above `tools\` (section 1, step 4), so no path needs to be edited. The server's
-`kb_status` → `docs.builders` reports `shipped_version` and `copy_in_tools` / `copy_version`, and notes when the copy in
-`<kb>\tools` is older than the one shipped with the plugin.
+1. `TCMCP_BUILDERS` — a folder holding `infosys_local.py` / `manuals_db.py`;
+2. `<TCMCP_HOME or ~\.twincat_mcp>\plugin_location.json` — written by the twincat MCP server at every start
+   (`builders`: this folder of the running plugin, `version`);
+3. the newest `twincat-mcp` version in the Claude Code plugin cache (`~\.claude\plugins\cache\*\twincat-mcp\<version>`).
+
+None found: one line saying what was tried, exit code 1. `TCMCP_STUB_VERBOSE=1` prints which builder runs. The stub
+sets `TCMCP_STUB_DIR` to its own folder, so the builder's "folder above the script" (section 1, step 4) is the folder
+above the stub — `<kb>`.
+
+**Installed by the server, once.** At every start (and on `kb_set_location`) the server replaces a file in
+`<kb>\tools\` with the stub when it is a copy of the builder (any version, recognised by its first line) or an older
+stub. The replaced file is kept beside it as `<name>.v<version>.bak`. A file that is neither (your own script under
+that name) is left alone and reported; a missing file is not created. `kb_status` → `docs.builders` shows
+`copy_kind` (`stub`, `copy` or `other`), `docs.builder_upkeep` what the last start did, and the commands it suggests
+use the stub path in `<kb>\tools\`.
+
+Without the plugin (a PC that only has the knowledge folder): put the builders themselves into `tools\` instead of the
+stubs; they work there as before.
 
 Stored PDF paths are absolute. Moving the knowledge folder makes the next `update` index every manual again
 (accepted limitation).

@@ -93,6 +93,11 @@ def bundle_members() -> list[tuple[Path, str]]:
         if "__pycache__" in py.parts:
             continue
         members.append((py, "server/src/" + py.relative_to(ROOT).as_posix()))
+    # the twincat-docs skill: kb_docs.py (the server reads the index state through it) and the knowledge-folder
+    # builders + stub (the stubs in <kb>\tools run these through plugin_location.json)
+    for f in sorted((ROOT / "skills" / "twincat-docs").rglob("*")):
+        if f.is_file() and "__pycache__" not in f.parts and f.suffix in (".py", ".md"):
+            members.append((f, "server/src/" + f.relative_to(ROOT).as_posix()))
     # native capture service (tcmcp-capture.exe, built by CI from native/capture) when present
     for exe in sorted((ROOT / PKG / "bin").glob("tcmcp-capture*")):
         members.append((exe, "server/src/" + exe.relative_to(ROOT).as_posix()))

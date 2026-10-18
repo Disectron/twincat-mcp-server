@@ -3,7 +3,7 @@
 Reads the two databases of the local TwinCAT knowledge base (`<kb>`, see `status`):
   <kb>\\helpviewer\\infosys_en.db   Beckhoff Infosys from the Help Viewer package, built by builders\\infosys_local.py index
   <kb>\\manualsdb\\manuals.db       PDF hardware manuals, built by builders\\manuals_db.py update
-(the builders ship next to this script and need Python 3.12+; copies in <kb>\\tools\\ work the same)
+(the builders ship next to this script and need Python 3.12+; <kb>\\tools\\ holds stubs that run them)
 Nothing is written: both are opened with SQLite's read-only mode. Standard library only. Needs Python 3.12 or newer
 (checked at start, like the builders and the server), SQLite with FTS5 — the python.org builds have it.
 

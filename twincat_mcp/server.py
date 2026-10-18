@@ -198,6 +198,8 @@ class App:
         self.ads.interface_hint = self.is_source_interface
         from .config import _home
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
+        # the builder stubs in <kb>\tools run this plugin's builders: record where they are, turn old copies into stubs
+        threading.Thread(target=self._builder_upkeep, name="tcmcp-builders", daemon=True).start()
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
         self.scope_runs: dict[str, dict[str, Any]] = {}     # recording id → Scope recording started with it
         self.rec.rcfg = cfg.recorder
@@ -250,6 +252,14 @@ class App:
             self.docs_warm = {"state": "warm", **r}
         except Exception as exc:  # noqa: BLE001
             self.docs_warm = {"state": "failed", "error": str(exc)[:160]}
+
+    def _builder_upkeep(self) -> None:
+        res = self.kb.builder_upkeep(__version__)
+        for n, v in (res.get("tools") or {}).items():
+            if isinstance(v, dict) and v.get("state") == "replaced":
+                log.info("knowledge folder: tools\\%s (%s) replaced by the builder stub; the old file is %s", n, v["was"], v["backup"])
+        if res.get("error"):
+            log.warning("builder stub upkeep: %s", res["error"])
 
     def _seal_sweep(self) -> None:
         """N27: recordings that finished while no server was there to seal them get their manifest now."""

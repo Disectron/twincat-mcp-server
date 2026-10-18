@@ -278,7 +278,8 @@ def _kb_with_docs(tmp: Path) -> Path:
     (loc / "sop" / "scope").mkdir(parents=True)
     (loc / "sop" / "scope" / "SOP-scope-display.md").write_text("# Scope", encoding="utf-8")
     (loc / "tools").mkdir()
-    (loc / "tools" / "manuals_db.py").write_text("# placeholder", encoding="utf-8")
+    (loc / "tools" / "manuals_db.py").write_text('"""Hardware manual bank: index the PDF manuals (version 1 copy)."""\n',
+                                                 encoding="utf-8")
     return loc
 
 
@@ -295,10 +296,12 @@ def test_status_reports_the_offline_documentation_layout(kb):
     m = d["manuals"]
     assert m["manuals"] == 1 and m["pdfs_in_folder"] == 1 and m["not_indexed"] == ["EL3102.pdf"]
     assert m["indexed_but_gone"] == ["CX9020.pdf"]                   # the fixture's PDF path is not in this folder
-    assert m["state"] == "pending" and 'manuals_db.py" update --kb' in m["command"] and "builders" in m["command"]
+    # the old copy in tools\ became the stub when the folder was chosen: the command runs it from the knowledge folder
+    assert m["state"] == "pending" and m["command"].startswith(f'<Python 3.12+> "{loc / "tools" / "manuals_db.py"}" update --kb')
     b = d["builders"]
     assert b["infosys_local.py"]["shipped_version"] == "2" and b["infosys_local.py"]["copy_in_tools"] is None
-    assert b["manuals_db.py"]["copy_version"] == "1" and "version 1" in b["manuals_db.py"]["note"]   # an old copy in tools\
+    assert b["manuals_db.py"]["copy_kind"] == "stub" and "nothing to update" in b["manuals_db.py"]["note"]
+    assert (loc / "tools" / "manuals_db.py.v1.bak").is_file()
     assert d["sop"] == [str(Path("sop") / "scope" / "SOP-scope-display.md")]
     # read-only: nothing next to the databases was created
     assert sorted(p.name for p in (loc / "helpviewer").iterdir()) == ["infosys_en.db"]
@@ -398,3 +401,34 @@ def test_n34_hw_lookup_takes_the_order_code_out_of_the_esi_type(kb, monkeypatch)
     r = k.hw_lookup("CX9020")
     assert r["types"] == ["CX9020 EtherCAT slave"]
     assert r["manuals"]["CX9020"][0]["doc"] == "CX9020.pdf" and "manuals_note" not in r
+
+
+def test_builder_copies_become_stubs_once_and_are_reported(kb, tmp_path):
+    """The knowledge folder's tools\\ copies had to be replaced by hand after every plugin update. The server now
+    turns copies of the builders (any version) into the stub that runs the plugin's builders; the copy is kept as a
+    .bak; anything else in tools\\ is left alone."""
+    k, tmp = kb
+    loc = tmp / "kbfolder"
+    (loc / "tools").mkdir(parents=True)
+    v1 = ('"""Search the locally installed Beckhoff Infosys (Microsoft Help Viewer package) with compact, low-token '
+          'output.\n"""\nprint("version 1")\n')
+    (loc / "tools" / "infosys_local.py").write_text(v1, encoding="utf-8")
+    (loc / "tools" / "manuals_db.py").write_text("# my own script\n", encoding="utf-8")
+    r = k.set_location(str(loc))
+    st = r["builder_stubs"]
+    assert st["infosys_local.py"]["state"] == "replaced" and st["infosys_local.py"]["was"] == "copy version 1"
+    assert Path(st["infosys_local.py"]["backup"]).read_text(encoding="utf-8") == v1
+    assert st["manuals_db.py"]["state"] == "left alone"
+    assert (loc / "tools" / "manuals_db.py").read_text(encoding="utf-8") == "# my own script\n"
+    assert K.builder_kind(loc / "tools" / "infosys_local.py", "infosys_local.py") == ("stub", "1")
+    # every later start: nothing to do; the pointer for the stubs is written once per plugin location/version
+    up = k.builder_upkeep("9.9.9")
+    assert up["tools"]["infosys_local.py"] == {"state": "stub", "stub_version": "1"} and up["pointer_written"] is True
+    assert k.builder_upkeep("9.9.9")["pointer_written"] is False
+    ptr = json.loads((k.home / "plugin_location.json").read_text(encoding="utf-8"))
+    assert Path(ptr["builders"]) == K.builders_dir() and ptr["version"] == "9.9.9"
+    d = k.docs_layout(loc)
+    b = d["builders"]["infosys_local.py"]
+    assert b["copy_kind"] == "stub" and "nothing to update" in b["note"]
+    assert d["builders"]["manuals_db.py"]["copy_kind"] == "other"
+    assert d["infosys"]["command"].startswith(f'<Python 3.12+> "{loc / "tools" / "infosys_local.py"}" index')   # stable path

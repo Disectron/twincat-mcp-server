@@ -327,3 +327,9 @@ def test_python_minimum_is_312_everywhere():
     assert tpl["compatibility"]["runtimes"]["python"] == ">=3.12"
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert 'python: ["3.12"]' in ci and '"3.9"' not in ci and '"3.10"' not in ci
+
+
+def test_mcpb_ships_the_docs_skill_builders_and_stub():
+    names = {a for _src, a in mcpb_build.bundle_members()}
+    for f in ("kb_docs.py", "builders/infosys_local.py", "builders/manuals_db.py", "builders/stub.py"):
+        assert f"server/src/skills/twincat-docs/{f}" in names

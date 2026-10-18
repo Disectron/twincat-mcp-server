@@ -28,6 +28,7 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| next | builder stubs: the server turns the `tools\` copies into stubs at start; the stubs find the plugin's builders (pointer, else the plugin cache) | `kb_status` → `docs.builders.*.copy_kind: stub`, `tools\*.v1.bak` beside them; `tools\manuals_db.py stats` works; after the next plugin update it runs the new builder without any copy |
 | 0.8.9 | Python 3.12 only: the existing plugin venv (built by 0.8.8) on the engineering PC | after `/plugin` update, the first start rebuilds the venv if it was not 3.12 (background install, reconnect); `tc_doctor` → `python` 3.12.10 |
 | 0.8.9 | R42 `ads_dump` on the TcUnit project (`GVL_TcUnit.TestSuiteAddresses`, 1,000 × POINTER TO FB_TestSuite) | `ads_dump()` defaults → `TestSuiteAddresses` 1,000 rows of `0x…` addresses, `MAIN.*` / `GVL_Test.*` present, JSON < 64 MB, no `.partial` left; a forced timeout → no final files, message names the phase |
 | 0.8.9 | R15 `plcopen_import(option='replace')` of a POU living in a folder | `added` names the copy, `replaced` names the original, `copies_removed` the copy; the original has the new text after save + build |
@@ -43,7 +44,7 @@ tool wishlist (2026-10-18).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
 - D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
 - Retest of 0.8.9 (the 0.8.8 retest items R42, #10, R7, R41, R15, R23, R11, R24, R32, N31, N32, N34–N37; builders).
-- Copy `skills\twincat-docs\builders\*.py` over `D:\TwinCAT-MCP\knowledge\tools\` (infosys_local.py 2, manuals_db.py 3), README.md of the knowledge folder replaced by the updated one.
+- Knowledge folder: after the plugin update the server turns `tools\infosys_local.py` / `manuals_db.py` into stubs (old copies kept as `.bak`); the slim README.md (no builder internals) replaces the old one once.
 - D19 (ESI PDOs read empty): the PDOs are template references (`Ref="TxEL3xxNComplex10-10V"`, `Chn`); the template
   definition's format is unknown here — the ESI file that holds it (e.g. `C:\TwinCAT\3.1\Config\Io\EtherCAT\Beckhoff EL31xx.xml`).
 

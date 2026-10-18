@@ -230,7 +230,8 @@ def kb_root(arg: str | None) -> tuple[Path, str]:
             return Path(d["path"]), "kb_set_location"
     except (OSError, ValueError):
         pass
-    up = Path(__file__).resolve().parent.parent           # <kb>\tools\infosys_local.py
+    # the folder above <kb>\\tools\\<this script> — or above the builder stub in <kb>\\tools\\ that runs this script
+    up = Path(os.environ.get("TCMCP_STUB_DIR") or Path(__file__).resolve().parent).resolve().parent
     if (up / "knowledge.db").is_file() or (up / "helpviewer").is_dir():
         return up, "folder above the script"
     return FALLBACK_KB, "default"

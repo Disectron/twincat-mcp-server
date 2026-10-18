@@ -43,7 +43,8 @@ FALLBACK_LOCATION = r"D:\TwinCAT-MCP\knowledge"
 MIN_FREE_BYTES = 1 << 30
 DB_NAME = "knowledge.db"
 POINTER_NAME = "knowledge_location.json"
-# the offline documentation next to knowledge.db (built by the knowledge folder's own tools, read by twincat-docs)
+# the offline documentation next to knowledge.db (built by the plugin's builders — <kb>\\tools holds stubs that run them —
+# read by twincat-docs)
 INFOSYS_DB = ("helpviewer", "infosys_en.db")
 MANUALS_DB = ("manualsdb", "manuals.db")
 _SKILL_REL = Path("skills") / "twincat-docs" / "kb_docs.py"
@@ -289,6 +290,7 @@ class Knowledge:
         self.esi_dirs = esi_dirs or []
         self.library_dirs = library_dirs or []
         self._fts: bool | None = None
+        self.last_upkeep: dict[str, Any] | None = None
 
     # -- location -------------------------------------------------------------------------
     def _pointer(self) -> Path:
@@ -370,8 +372,25 @@ class Knowledge:
         with self._db():
             pass
         out["changed"] = old is None or norm_path(old) != norm_path(p)
+        stubs = install_builder_stubs(p)
+        if any(v.get("state") == "replaced" for v in stubs.values() if isinstance(v, dict)):
+            out["builder_stubs"] = stubs
         out["docs"] = self.docs_layout(p, brief=True)
         return out
+
+    def builder_upkeep(self, version: str) -> dict[str, Any]:
+        """At every server start: record where this plugin's builders are (for the stubs) and turn builder copies in
+        <kb>\\tools into stubs. File-system only; never raises."""
+        res: dict[str, Any] = {}
+        try:
+            res["pointer_written"] = record_plugin_location(self.home, version)
+            loc, _src = self.location()
+            if loc is not None and (loc / "tools").is_dir():
+                res["tools"] = install_builder_stubs(loc)
+        except Exception as exc:  # noqa: BLE001 — a convenience; the tools work without it
+            res["error"] = f"{type(exc).__name__}: {exc}"
+        self.last_upkeep = res
+        return res
 
     # -- database -------------------------------------------------------------------------
     def _db(self) -> "_Conn":
@@ -427,8 +446,8 @@ class Knowledge:
 
     # -- the offline documentation next to knowledge.db (read-only) ------------------------
     def docs_layout(self, loc: Path | None = None, brief: bool = False) -> dict[str, Any]:
-        """What the twincat-docs skill finds in the knowledge folder: the two databases built by the folder's own
-        tools (tools\\infosys_local.py, tools\\manuals_db.py), the manuals not indexed yet, the SOPs."""
+        """What the twincat-docs skill finds in the knowledge folder: the two databases built by the builders (the
+        plugin's, run directly or through the stubs in tools\\), the manuals not indexed yet, the SOPs."""
         loc = loc or self.location()[0]
         if loc is None:
             return {"note": "no knowledge folder chosen yet"}
@@ -440,6 +459,8 @@ class Knowledge:
                                "infosys": inf, "manuals": man}
         if not brief:
             out["builders"] = builders
+            if getattr(self, "last_upkeep", None):
+                out["builder_upkeep"] = self.last_upkeep        # this server start: pointer written, copies replaced
             sop = loc / "sop"
             out["sop"] = sorted(str(f.relative_to(loc)) for f in sop.rglob("*.md"))[:50] if sop.is_dir() else []
         return out
@@ -934,27 +955,125 @@ def _builder_version(f: Path) -> str | None:
     return m.group(1) if m else "1"
 
 
-def _builders(loc: Path) -> dict[str, Any]:
+BUILDER_NAMES = ("infosys_local.py", "manuals_db.py")
+PLUGIN_POINTER = "plugin_location.json"
+_STUB_MARK = "twincat-mcp builder stub"
+# the first line of each builder, every version so far: what makes a file in <kb>\\tools a builder copy
+_BUILDER_HEADS = {"infosys_local.py": '"""Search the locally installed Beckhoff Infosys',
+                  "manuals_db.py": '"""Hardware manual bank:'}
+
+
+def builders_dir() -> Path | None:
+    """The builders the plugin ships (skills/twincat-docs/builders), or None."""
     shipped = docs_skill_path()
-    bdir = shipped.parent / "builders" if shipped else None
+    b = shipped.parent / "builders" if shipped else None
+    return b if b is not None and b.is_dir() else None
+
+
+def builder_kind(f: Path, name: str) -> tuple[str, str | None]:
+    """('stub', stub version) | ('copy', builder version) | ('other', None) for a file in <kb>\\tools."""
+    try:
+        text = f.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "other", None
+    if _STUB_MARK in text[:400]:
+        m = re.search(r'^STUB_VERSION = "(\d+)"', text, re.M)
+        return "stub", m.group(1) if m else None
+    if text.lstrip("\ufeff").startswith(_BUILDER_HEADS.get(name, "\0")):
+        return "copy", _builder_version(f)
+    return "other", None
+
+
+def record_plugin_location(home: Path, version: str) -> bool:
+    """Write <home>/plugin_location.json (the shipped builders' folder and the plugin version) when it changed. The
+    builder stubs in <kb>\\tools find the current builders through it after every plugin update. -> written?"""
+    b = builders_dir()
+    if b is None:
+        return False
+    p = home / PLUGIN_POINTER
+    data = {"builders": str(b), "version": version}
+    try:
+        cur = json.loads(p.read_text(encoding="utf-8"))
+        if {k: cur.get(k) for k in data} == data:
+            return False
+    except (OSError, ValueError):
+        pass
+    home.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps({**data, "written": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                               "note": "read by the builder stubs in <kb>\\tools — written by the twincat MCP server"},
+                              indent=1), encoding="utf-8")
+    os.replace(tmp, p)
+    return True
+
+
+def install_builder_stubs(loc: Path) -> dict[str, Any]:
+    """<kb>\\tools\\infosys_local.py / manuals_db.py that are copies of a builder (any version) or an older stub are
+    replaced by the stub (skills/twincat-docs/builders/stub.py), which runs the plugin's current builder — so the
+    knowledge folder never needs a copy updated after a plugin update. The replaced file is kept beside it as
+    <name>.v<version>.bak; a file that is neither a builder copy nor a stub is left alone and reported; a missing one
+    is not created."""
+    b = builders_dir()
     out: dict[str, Any] = {}
-    for n in ("infosys_local.py", "manuals_db.py"):
+    if b is None or not (b / "stub.py").is_file():
+        return {"skipped": "the plugin's builders (skills/twincat-docs/builders/stub.py) were not found"}
+    stub_text = (b / "stub.py").read_text(encoding="utf-8")
+    m = re.search(r'^STUB_VERSION = "(\d+)"', stub_text, re.M)
+    stub_ver = m.group(1) if m else None
+    for n in BUILDER_NAMES:
+        f = loc / "tools" / n
+        if not f.is_file():
+            continue
+        kind, ver = builder_kind(f, n)
+        if kind == "stub" and ver == stub_ver:
+            out[n] = {"state": "stub", "stub_version": ver}
+            continue
+        if kind == "other":
+            out[n] = {"state": "left alone", "reason": "not a copy of the builder nor a stub — not replaced"}
+            continue
+        backup = f.with_name(f"{n}.{'stub' if kind == 'stub' else 'v'}{ver or '?'}.bak")
+        if backup.exists():
+            backup = f.with_name(f"{n}.{'stub' if kind == 'stub' else 'v'}{ver or '?'}.{time.strftime('%Y%m%d-%H%M%S')}.bak")
+        try:
+            shutil.copy2(f, backup)
+            tmp = f.with_name(f.name + ".tmp")
+            tmp.write_text(stub_text, encoding="utf-8")
+            os.replace(tmp, f)
+        except OSError as exc:
+            out[n] = {"state": "error", "error": str(exc)}
+            continue
+        out[n] = {"state": "replaced", "was": f"{kind} version {ver}", "backup": str(backup), "stub_version": stub_ver}
+    return out
+
+
+def _builders(loc: Path) -> dict[str, Any]:
+    bdir = builders_dir()
+    out: dict[str, Any] = {}
+    for n in BUILDER_NAMES:
         plug = bdir / n if bdir and (bdir / n).is_file() else None
         copy = loc / "tools" / n
         e: dict[str, Any] = {"shipped": str(plug) if plug else None,
                              "shipped_version": _builder_version(plug) if plug else None,
                              "copy_in_tools": str(copy) if copy.is_file() else None}
         if copy.is_file():
-            e["copy_version"] = _builder_version(copy)
-            if plug and e["copy_version"] != e["shipped_version"]:
-                e["note"] = (f"tools\\{n} is version {e['copy_version']}, the plugin ships version {e['shipped_version']} — "
-                             f"run the shipped one, or copy it into tools\\")
+            kind, ver = builder_kind(copy, n)
+            e["copy_kind"] = kind
+            if kind == "stub":
+                e["note"] = (f"tools\\{n} is the builder stub: it runs the plugin's {n} (version {e['shipped_version']}) — "
+                             "nothing to update")
+            else:
+                e["copy_version"] = ver
+                if plug and kind == "copy" and ver != e["shipped_version"]:
+                    e["note"] = (f"tools\\{n} is a copy of version {ver}, the plugin ships version {e['shipped_version']} — "
+                                 "the server replaces such copies with the builder stub at its next start")
         out[n] = e
     return out
 
 
 def _cmd(builders: dict[str, Any], name: str, loc: Path, sub: str) -> str:
     b = builders.get(name) or {}
+    if b.get("copy_kind") == "stub":                      # the stable path in the knowledge folder
+        return f'<Python 3.12+> "{b["copy_in_tools"]}" {sub} --kb "{loc}"'
     script = b.get("shipped") or b.get("copy_in_tools") or name
     return f'<Python 3.12+> "{script}" {sub} --kb "{loc}"'
 

@@ -388,3 +388,52 @@ def test_n37_font_headings_wrapped_over_two_lines_are_one_entry(tmp_path):
     backend, _n, toc, _texts, _t = m._open_pdf(pdf)
     assert backend == "pymupdf+font-headings"
     assert toc == [(2, "4.10 Notes on the measurement of the bridge capacity", 1), (2, "4.11 Settings", 2)], toc
+
+
+# ---------------------------------------------------------------------------------------------- builder stubs
+def _stub_env(tmp_path: Path, **extra: str) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in ("TCMCP_KNOWLEDGE_DIR", "TCMCP_HOME", "TCMCP_BUILDERS")}
+    home = tmp_path / "userhome"
+    home.mkdir(exist_ok=True)
+    env.update(HOME=str(home), USERPROFILE=str(home), TCMCP_HOME=str(tmp_path / "tchome"), PYTHONIOENCODING="utf-8")
+    env.update(extra)
+    return env
+
+
+def test_stub_runs_the_plugins_builder_for_the_folder_above_it(tmp_path):
+    """The knowledge folder keeps tools\\manuals_db.py / infosys_local.py as stubs that never change: they run the
+    builder of the installed plugin (pointer written by the server, else the newest version in the plugin cache)."""
+    import shutil as _sh
+    kb = tmp_path / "kb"
+    (kb / "tools").mkdir(parents=True)
+    (kb / "manualsdb").mkdir()
+    (kb / "manuals").mkdir()
+    for n in ("infosys_local.py", "manuals_db.py"):
+        _sh.copy(B / "stub.py", kb / "tools" / n)
+    # 1. no pointer, no cache: a message, no traceback
+    env = _stub_env(tmp_path)
+    p = subprocess.run([sys.executable, str(kb / "tools" / "manuals_db.py"), "stats", "--json"], capture_output=True,
+                       encoding="utf-8", env=env, timeout=60)
+    assert p.returncode == 1 and "was not found" in p.stderr and "Traceback" not in p.stderr
+    # 2. the plugin cache of Claude Code: the newest version wins
+    cache = Path(env["HOME"]) / ".claude" / "plugins" / "cache" / "twincat-mcp" / "twincat-mcp"
+    for ver in ("0.8.9", "0.8.10"):
+        d = cache / ver / "skills" / "twincat-docs" / "builders"
+        d.mkdir(parents=True)
+        for n in ("infosys_local.py", "manuals_db.py"):
+            _sh.copy(B / n, d / n)
+    p = subprocess.run([sys.executable, str(kb / "tools" / "manuals_db.py"), "stats", "--json"], capture_output=True,
+                       encoding="utf-8", env={**env, "TCMCP_STUB_VERBOSE": "1"}, timeout=60)
+    assert p.returncode == 0, p.stderr
+    assert "0.8.10" in p.stderr and "plugin cache" in p.stderr
+    st = json.loads(p.stdout)
+    assert Path(st["database"]) == kb / "manualsdb" / "manuals.db" and Path(st["folder"]) == kb / "manuals"
+    # 3. the pointer the server writes wins over the cache
+    from twincat_mcp import knowledge as K
+    tch = Path(env["TCMCP_HOME"])
+    tch.mkdir()
+    (tch / "plugin_location.json").write_text(json.dumps({"builders": str(B), "version": "repo"}), encoding="utf-8")
+    p = subprocess.run([sys.executable, str(kb / "tools" / "infosys_local.py"), "stats", "--json"], capture_output=True,
+                       encoding="utf-8", env={**env, "TCMCP_STUB_VERBOSE": "1"}, timeout=60)
+    assert "plugin_location.json (twincat plugin repo)" in p.stderr and str(B / "infosys_local.py") in p.stderr
+    assert K.builder_kind(kb / "tools" / "infosys_local.py", "infosys_local.py") == ("stub", "1")
