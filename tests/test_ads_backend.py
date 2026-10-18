@@ -1,6 +1,7 @@
 import time
 
 import pytest
+from pathlib import Path
 
 from twincat_mcp.config import AdsConfig
 from twincat_mcp.ads_backend import AdsBackend, AdsError
@@ -241,16 +242,26 @@ def test_r42_dump_budget_order_streaming_and_no_rename_after_the_call_ended(ads,
     assert cut["truncated"] and cut["leaves"] == 5 and cut["skipped_total"] >= 1 and "max_leaves 5" in cut["truncated_reason"]
     j = json.loads(open(cut["json"], encoding="utf-8").read())
     assert j["truncated"] is True and sum(1 for _ in open(cut["csv"], encoding="utf-8")) == 6
-    # max_total_mb bounds what is written
-    tiny = ads.dump(None, False, str(out), max_total_bytes=200)
-    assert tiny["truncated"] and "size limit" in tiny["truncated_reason"] and tiny["csv_bytes"] + tiny["json_bytes"] < 2000
+    # max_total_mb bounds what is written; below the files' own frame (header, head, footer) nothing can fit: refused
+    with pytest.raises(AdsError, match="smaller than the files' own frame"):
+        ads.dump(None, False, str(out), max_total_bytes=200)
+    tiny = ads.dump(None, False, str(out), max_total_bytes=3000)
+    assert tiny["truncated"] and "size limit" in tiny["truncated_reason"] and tiny["csv_bytes"] + tiny["json_bytes"] <= 3000
     # review: one big root — its JSON (written after its CSV rows) counts against the limit as well
     _big_root(monkeypatch)
     ads._symcache.clear()
     ads._dtcache.clear()
     lim = 60_000
     one = ads.dump("GVL_Big.*", False, str(out), max_total_bytes=lim)
-    assert one["truncated"] and one["csv_bytes"] + one["json_bytes"] < lim * 1.2, one
+    # N76: exact — never past the limit, and not stopped early by an estimate (the JSON was counted as large as the
+    # CSV: 45 of 64 MiB). What is left is the room kept for the endings the dump may still have to write: the root cut
+    # (wrapper + footer) or a read error (its text at most _ERR_JSON_MAX, in the JSON, the CSV and the footer)
+    from twincat_mcp.ads_backend import _ERR_JSON_MAX
+    total = one["csv_bytes"] + one["json_bytes"]
+    assert one["truncated"] and lim - 5 * _ERR_JSON_MAX - 400 <= total <= lim, one
+    assert one["written_mib"] == round(total / (1024 * 1024), 3) and "on disk" in one["limit_counts"]
+    files = sum(Path(one[k]).stat().st_size for k in ("csv", "json"))
+    assert files == total                                       # counted = on disk
     doc = json.loads(open(one["json"], encoding="utf-8").read())
     assert doc["values"]["GVL_Big.aValues"]["_truncated"] is True
     # the client's timeout set the cancel event while the dump was finishing: nothing is renamed into place
@@ -266,6 +277,33 @@ def test_r42_dump_budget_order_streaming_and_no_rename_after_the_call_ended(ads,
     with pytest.raises(AdsError, match="call had already ended"):
         ads.dump(None, False, str(out), cancel=ev)
     assert sorted(p.name for p in out.iterdir()) == before
+
+
+def test_n76_the_limit_is_the_bytes_on_disk_for_any_limit(ads, tmp_path, monkeypatch):
+    """N76: for every limit the files on disk stay within it, are valid, and hold exactly what the result says."""
+    import csv as _csv
+    import json
+    from twincat_mcp.ads_backend import _ERR_JSON_MAX
+    _big_root(monkeypatch)
+    ads._symcache.clear()
+    ads._dtcache.clear()
+    full = ads.dump(None, False, str(tmp_path / "full"))
+    need = full["csv_bytes"] + full["json_bytes"]
+    # a dump stops when the next row and the ending it would still have to write (the footer naming the roots left
+    # out) no longer fit: at exactly its own size it may leave a few small roots out, a little above it is complete
+    for k, lim in enumerate([*range(3000, need, max(1, need // 9)), need, need + 1024]):
+        r = ads.dump(None, False, str(tmp_path / f"d{k}"), max_total_bytes=lim)
+        total = sum(Path(r[x]).stat().st_size for x in ("csv", "json"))
+        assert total == r["csv_bytes"] + r["json_bytes"] <= lim, (lim, r)
+        doc = json.loads(open(r["json"], encoding="utf-8").read())
+        rows = list(_csv.reader(open(r["csv"], encoding="utf-8", newline="")))
+        assert len(rows) - 1 == r["leaves"] == doc["leaves"]
+        if lim >= need + 1024:
+            assert r["complete"] and not r["truncated"]
+        elif lim >= need:
+            assert lim - total <= 600, (lim, total)
+        else:
+            assert r["truncated"] and lim - total <= 5 * _ERR_JSON_MAX + 600 + max(len(",".join(x)) for x in rows), (lim, total)
 
 
 @pytest.mark.anyio
@@ -335,6 +373,37 @@ def test_n39_n49_big_root_is_read_in_pieces_and_an_unreadable_root_is_named(ads,
     assert vals["GVL_Bad.nX"][3].startswith("NOT READ") and vals["GVL_Bad.nX"][2] == ""
 
 
+def test_n76_a_read_error_inside_a_big_root_still_ends_within_the_limit(ads, tmp_path, monkeypatch):
+    """N76: while bytes of a root are still to be read, the dump keeps room for the INCOMPLETE ending (its text
+    bounded by _ERR_JSON_MAX); a root read completely by its first request needs none."""
+    import pyads as _pyads
+    from tests.fake_ads import _dt
+    from twincat_mcp.ads_backend import _ERR_JSON_MAX
+    blk = _dt("ST_Blk", "", 80, subs=[_dt("sName", "STRING(79)", 80, 0, 30)])
+    arr = _dt("ARRAY [1..4000] OF ST_Blk", "ST_Blk", 320_000, dims=[(1, 4000)])
+    s79 = _dt("STRING(79)", "", 80, dtype=30)
+    image = b"".join(f"blk{i}".encode().ljust(80, b"\x00") for i in range(1, 4001))
+
+    def second_piece_fails(off, n):
+        if off + n > 256 * 1024:                     # the second piece
+            raise _pyads.ADSError(1861)
+        return image[off:off + n]
+    _add_symbols(monkeypatch, [("GVL_Big.aBlk", arr.name, 320_000, second_piece_fails)], [blk, arr, s79])
+    free = ads.dump("GVL_Big.*", False, str(tmp_path / "a"))
+    assert free["failed_roots"][0]["leaves_written"] == 3276 and "1861" in free["errors"][0]["error"]
+    rows, doc = _files(free)
+    assert rows[-1][3].startswith("INCOMPLETE: read stopped after 3276 of 4000 leaves")
+    assert doc["values"]["GVL_Big.aBlk"]["_incomplete"] and len(doc["values"]["GVL_Big.aBlk"]["_partial"]) == 3276
+    need = free["csv_bytes"] + free["json_bytes"]
+    for k, lim in enumerate((need - 1, need - 3000, need // 2)):
+        r = ads.dump("GVL_Big.*", False, str(tmp_path / f"b{k}"), max_total_bytes=lim)
+        rows, doc = _files(r)
+        assert r["csv_bytes"] + r["json_bytes"] <= lim and len(rows) - 1 >= 1, (lim, r)
+        node = doc["values"].get("GVL_Big.aBlk")
+        assert node is not None and ("_incomplete" in node or "_truncated" in node), node
+    assert len('"' + "x" * 10 + '"') <= _ERR_JSON_MAX
+
+
 def test_n39_ads_leaves_and_read_full_read_big_symbols_in_pieces(ads, monkeypatch):
     """N39 had the same root in ads_leaves (leaf_values) and the full read: one ADS request for the whole symbol."""
     from tests.fake_ads import FakeConnection, _dt
@@ -369,7 +438,7 @@ def test_n47_budget_holds_per_row_and_a_huge_leaf_is_never_read_whole(ads, tmp_p
     assert sum(n for name, _o, n in FakeConnection.read_log if name == "GVL_Ring.aBuf") <= 64
     small = ads.dump("GVL_Str.*", False, str(tmp_path / "s"), max_total_bytes=16 * 1024)
     assert small["truncated"] and small["complete"] is False
-    assert small["csv_bytes"] + small["json_bytes"] < 16 * 1024 + 2 * 300        # at most one row past the limit
+    assert small["csv_bytes"] + small["json_bytes"] <= 16 * 1024                 # N76: never past the limit
 
 
 def test_n48_a_value_that_is_not_expanded_is_the_same_in_csv_and_json(ads, tmp_path, monkeypatch):

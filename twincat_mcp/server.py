@@ -2745,7 +2745,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         POINTER TO / REFERENCE TO / INTERFACE values are addresses (NULL = 0x0000…0000) — the target is never
         expanded. An array beyond 4096 elements or a value beyond 64 KiB is not expanded: both files show the same
         {not_expanded, bytes, elements, head_hex}. Big symbols are read in 256 KiB pieces. max_leaves bounds CSV and
-        JSON together; max_total_mb (MiB) bounds the bytes written, checked after every row. complete=false names
+        JSON together; max_total_mb (MiB) bounds the CSV + JSON on disk (written_mib; the bytes read from the PLC are
+        not counted): a row is written only when it, the root's JSON with it and the ending still to be written (the
+        footer naming what is left out) fit — nothing is estimated. complete=false names
         every root that is missing or cut (skipped_roots) and every root that could not be read (failed_roots, also
         in the CSV note column and the JSON footer). Returns counts, largest_roots, file paths and a 50-leaf
         preview."""

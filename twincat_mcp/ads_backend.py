@@ -645,7 +645,7 @@ class AdsBackend:
         a leaf needs bytes (N39/N47: never one read of a huge symbol, never a huge root in RAM); the byte budget is
         checked after every row (N47) and the cancel event inside the leaf walk, the row loop and the chunk reads
         (N55). A root that cannot be read is named in the result, the JSON footer and a CSV row (N49)."""
-        import csv, json
+        import csv, io, json
         c = self.conn(port)
         table = self.typesystem(False, port)
         ts = table if table is not None else TypeSystem({})
@@ -670,11 +670,67 @@ class AdsBackend:
         def stop(where: str) -> AdsError:
             return AdsError(f"cancelled {where} — the call timed out or was stopped")
 
+        # N76: max_total_bytes bounds the CSV + JSON ON DISK, nothing else (the bytes read from the PLC are not
+        # counted). Nothing is estimated: before a row is written, the dump knows exactly what that row adds, what the
+        # root's JSON adds with it (_TreeStream), and the largest ending it may still have to write — the root cut
+        # here, or a read error on a later leaf (its text bounded by _ERR_JSON_MAX), and the footer with every later
+        # root listed as skipped. A row that would make that pass the limit is not written: the root is cut there.
+        size_reason = f"size limit: CSV + JSON on disk would pass max_total_mb ({max_total_bytes / MIB:g} MiB)"
+        leaf_reason = f"leaf limit: max_leaves {max_leaves}"
+        long_reason = max(size_reason, leaf_reason, key=len)
+        ph = "x" * _ERR_JSON_MAX            # stands for the longest error text the files can hold
+        rowbuf = io.StringIO()
+        rw = csv.writer(rowbuf)
+
+        def csv_line(row: list[Any]) -> str:
+            rowbuf.seek(0)
+            rowbuf.truncate()
+            rw.writerow(row)
+            return rowbuf.getvalue()
+
+        def blen(s: str) -> int:
+            return len(s.encode("utf-8"))
+
+        def footer(leaves_v: int, truncated_v: str | None, unread: list[dict[str, str]], fail: list[dict[str, Any]],
+                   skip: list[dict[str, str]]) -> str:
+            complete_v = not truncated_v and not fail and not unread
+            return "\n}, " + json.dumps({"roots": len(roots), "leaves": leaves_v, "complete": complete_v,
+                                         "truncated": bool(truncated_v), "truncated_reason": truncated_v,
+                                         "unreadable_leaves": unread[:200], "unreadable_total": len(unread),
+                                         "failed_roots": fail[:200], "failed_total": len(fail),
+                                         "skipped_roots": skip[:200], "skipped_total": len(skip)})[1:] + "\n"
+
+        w_cut = len('{"_truncated": true, "_reason": ') + len(json.dumps(long_reason)) + len(', "_partial": ') + 1
+        w_err = len('{"_incomplete": ') + _ERR_JSON_MAX + len(', "_partial": ') + 1
+
+        def later_skipped(i: int) -> list[dict[str, str]]:
+            return [{"root": x.name, "reason": long_reason} for x in roots[i + 1:]]
+
+        def endings(i: int, r: Any, n_lv: int, cut_leaves: bool, unread: list[dict[str, str]]) -> tuple[int, int, int]:
+            """(cut, read error, normal end): the most each ending of root i can add beyond its tree, with the footer
+            in which every later root is skipped — computed from the real state, nothing estimated."""
+            later = later_skipped(i)
+            f_cut = footer(n_leaves + n_lv, long_reason, unread, failed,
+                           skipped + [{"root": r.name, "reason": f"cut after {n_lv} leaves: {long_reason}"}] + later)
+            f_err = footer(n_leaves + n_lv, long_reason, unread,
+                           failed + [{"root": r.name, "error": ph, "leaves_written": n_lv}],
+                           skipped + [{"root": r.name, "reason": f"read stopped after {n_lv} of {n_lv} leaves: {ph}"}]
+                           + later)
+            row_err = blen(csv_line([r.name, r.type, "", f"INCOMPLETE: read stopped after {n_lv} of {n_lv} leaves: {ph}"]))
+            f_done = footer(n_leaves + n_lv, long_reason if later else (leaf_reason if cut_leaves else None), unread,
+                            failed, skipped + ([{"root": r.name, "reason": f"cut after {n_lv} leaves: {leaf_reason}"}]
+                                               if cut_leaves else []) + later)
+            return w_cut + len(f_cut), w_err + row_err + len(f_err), (w_cut if cut_leaves else 0) + len(f_done)
+
         with open(cpath, "wb") as fh, open(jpath, "wb") as jh:
             cw, jw = _Counting(fh), _Counting(jh)
-            w = csv.writer(cw)
-            w.writerow(["path", "type", "value", "note"])
+            cw.write(csv_line(["path", "type", "value", "note"]))
             jw.write('{"target": ' + json.dumps(self.target_label()) + ', "taken": ' + json.dumps(stamp) + ', "values": {')
+            frame = cw.n + jw.n + len(footer(0, long_reason, [], [], later_skipped(-1)))
+            if frame > max_total_bytes:
+                raise AdsError(f"max_total_mb ({max_total_bytes} bytes) is smaller than the files' own frame "
+                               f"({frame} bytes: CSV header, JSON head, the footer naming the {len(roots)} roots) — "
+                               "nothing would fit")
             first = True
             for i, r in enumerate(roots):
                 if cancelled():
@@ -682,9 +738,8 @@ class AdsBackend:
                 if truncated:
                     skipped.append({"root": r.name, "reason": truncated})
                     continue
-                if cw.n + jw.n >= max_total_bytes or n_leaves >= max_leaves:
-                    truncated = (f"size limit: max_total_mb ({max_total_bytes / MIB:g} MiB) written"
-                                 if cw.n + jw.n >= max_total_bytes else f"leaf limit: max_leaves {max_leaves}")
+                if n_leaves >= max_leaves:
+                    truncated = leaf_reason
                     skipped.append({"root": r.name, "reason": truncated})
                     continue
                 prog.update(phase="listing leaves", root=r.name, index=i + 1, of=len(roots), leaves=n_leaves,
@@ -696,14 +751,40 @@ class AdsBackend:
                     raise stop(f"while listing the leaves of {r.name}") from exc
                 cut = len(lv) > left
                 lv = lv[:left]
+                head = ("" if first else ",") + "\n" + json.dumps(r.name) + ": "
                 # bytes past the last one any leaf needs are never requested (a value that is not expanded needs
                 # only its head): an 8 MiB buffer costs one 64-byte read
                 reader = _RootReader(c, r, cancelled, need_end=max((x.offset + x.need for x in lv), default=0))
-                vals: dict[str, Any] = {}
+                tree = _TreeStream(r.name)
                 c0, j0 = cw.n, jw.n
                 read_error: str | None = None
+                read_error_full = ""
+                fits = True
+                # whether the root is readable is known before anything of it is written: its first bytes are read
+                # first (a root up to one chunk is then read completely — no later read, so no read error, can follow)
+                lead = next((x for x in lv if x.size and x.need), None)
+                if lead is not None:
+                    try:
+                        reader.get(lead.offset, lead.need)
+                    except _DumpCancelled as exc:
+                        raise stop(f"while reading {r.name}") from exc
+                    except _OutsideRoot:
+                        pass                                # that leaf's own note, below
+                    except _ReadFailed as exc:
+                        read_error, read_error_full = _err_text(exc), str(exc)
+                if read_error is not None:
+                    later = later_skipped(i)
+                    f = footer(n_leaves, long_reason if later else None, unreadable,
+                               failed + [{"root": r.name, "error": read_error, "leaves_written": 0}],
+                               skipped + [{"root": r.name, "reason": f"not read: {read_error}"}] + later)
+                    end_b = (blen(csv_line([r.name, r.type, "", f"NOT READ: {read_error}"])) + len(head)
+                             + len('{"_not_read": ' + json.dumps(read_error) + "}") + len(f))
+                    fits = cw.n + jw.n + end_b <= max_total_bytes
+                elif not lv:
+                    fits = cw.n + jw.n + len(head) + 2 + endings(i, r, 0, cut, unreadable)[2] <= max_total_bytes
+                res_cut, res_err, res_done = endings(i, r, len(lv), cut, unreadable)
                 prog["phase"] = "reading and writing"
-                for k, leaf in enumerate(lv):
+                for k, leaf in enumerate(lv if read_error is None and fits else []):
                     if k % 256 == 255 and cancelled():
                         raise stop(f"while writing {r.name} (leaf {k + 1} of {len(lv)})")
                     outside: str | None = None
@@ -713,53 +794,81 @@ class AdsBackend:
                         raise stop(f"while reading {r.name}") from exc
                     except _OutsideRoot as exc:
                         val, outside = None, str(exc)      # this leaf only: the others are inside and readable
-                        errors.append({"symbol": leaf.path, "error": outside})
-                        unreadable.append({"leaf": leaf.path, "error": outside})
                     except _ReadFailed as exc:
-                        read_error = str(exc)
+                        read_error, read_error_full = _err_text(exc), str(exc)
                         break
-                    w.writerow([leaf.path, leaf.type, _csv_val(val), outside or _leaf_note(leaf, val)])
+                    line = csv_line([leaf.path, leaf.type, _csv_val(val), outside or _leaf_note(leaf, val)])
                     # the JSON says why too: a bare null there stood for a value that was never read
-                    vals[leaf.path] = {"_not_read": outside} if outside else val
+                    vjson = _json_strict({"_not_read": outside} if outside else val)
+                    st = tree.steps(leaf.path)
+                    try:
+                        cost = tree.plan(st, vjson)
+                    except _TreeOrder as exc:
+                        read_error_full = (f"internal: leaf {leaf.path} does not continue the tree of {r.name} ({exc}) "
+                                           "— not written")
+                        read_error = _err_text(read_error_full)
+                        break
+                    entry = {"leaf": leaf.path, "error": outside} if outside else None
+                    if entry is not None:
+                        res_cut, res_err, res_done = endings(i, r, len(lv), cut, unreadable + [entry])
+                    # the endings still possible after this leaf: after the last one only the normal end; before it
+                    # a cut — and a read error only while bytes of the root are still to be read
+                    room = (res_done if k == len(lv) - 1 else
+                            res_cut if reader.all_read() else max(res_cut, res_err))
+                    if cw.n + jw.n + blen(line) + len(head) + tree.size_after(cost, st) + room > max_total_bytes:
+                        truncated = size_reason
+                        if k == 0:
+                            fits = False                    # not even its first row: the root is skipped, not cut
+                        else:
+                            cut = True
+                        if entry is not None:
+                            res_cut, res_err, res_done = endings(i, r, len(lv), cut, unreadable)
+                        break
+                    cw.write(line)
+                    tree.apply(st, vjson)
+                    if entry is not None:
+                        errors.append({"symbol": leaf.path, "error": outside})
+                        unreadable.append(entry)
                     if len(preview) < 50:
                         preview.append({"path": leaf.path, "type": leaf.type, "value": val})
-                    # N47: the budget is checked after every row; the root's JSON (not written yet) is counted as
-                    # large as its CSV rows
-                    if cw.n + jw.n + (cw.n - c0) >= max_total_bytes and k < len(lv) - 1:
-                        cut = True
-                        truncated = f"size limit: max_total_mb ({max_total_bytes / MIB:g} MiB) written"
-                        break
-                n_leaves += len(vals)
                 n_read += reader.bytes_read
-                tree = _nest(r.name, vals)
+                if not fits:
+                    truncated = size_reason
+                    skipped.append({"root": r.name, "reason": truncated})
+                    if read_error is not None:
+                        errors.append({"symbol": r.name, "error": read_error_full + " (not in the files: the size limit "
+                                       "left no room for it)"})
+                    continue
+                done = tree.leaves
+                n_leaves += done
+                body = tree.text()
                 if read_error is not None:
                     # N49: a root (or the rest of one) that could not be read is never silent
-                    errors.append({"symbol": r.name, "error": read_error})
-                    failed.append({"root": r.name, "error": read_error, "leaves_written": len(vals)})
-                    skipped.append({"root": r.name, "reason": f"not read: {read_error}" if not vals else
-                                    f"read stopped after {len(vals)} of {len(lv)} leaves: {read_error}"})
-                    w.writerow([r.name, r.type, "", f"NOT READ: {read_error}" if not vals else
-                                f"INCOMPLETE: read stopped after {len(vals)} of {len(lv)} leaves: {read_error}"])
-                    node: Any = {"_not_read": read_error} if not vals else {"_incomplete": read_error, "_partial": tree}
+                    errors.append({"symbol": r.name, "error": read_error_full or read_error})   # the result: whole
+                    failed.append({"root": r.name, "error": read_error, "leaves_written": done})
+                    skipped.append({"root": r.name, "reason": f"not read: {read_error}" if not done else
+                                    f"read stopped after {done} of {len(lv)} leaves: {read_error}"})
+                    cw.write(csv_line([r.name, r.type, "", f"NOT READ: {read_error}" if not done else
+                                       f"INCOMPLETE: read stopped after {done} of {len(lv)} leaves: {read_error}"]))
+                    node = ('{"_not_read": ' + json.dumps(read_error) + "}" if not done else
+                            '{"_incomplete": ' + json.dumps(read_error) + ', "_partial": ' + body + "}")
                 elif cut:
-                    truncated = truncated or (f"leaf limit: max_leaves {max_leaves}" if n_leaves >= max_leaves
-                                              else f"size limit: max_total_mb ({max_total_bytes / MIB:g} MiB) written")
-                    skipped.append({"root": r.name, "reason": f"cut after {len(vals)} leaves: {truncated}"})
-                    node = {"_truncated": True, "_reason": truncated, "_partial": tree}
+                    truncated = truncated or leaf_reason
+                    skipped.append({"root": r.name, "reason": f"cut after {done} leaves: {truncated}"})
+                    node = '{"_truncated": true, "_reason": ' + json.dumps(truncated) + ', "_partial": ' + body + "}"
                 else:
-                    node = tree
-                jw.write(("" if first else ",") + "\n" + json.dumps(r.name) + ": " + _json_strict(node))
+                    node = body
+                jw.write(head + node)
                 first = False
-                sizes.append({"root": r.name, "leaves": len(vals), "bytes_read": reader.bytes_read,
+                sizes.append({"root": r.name, "leaves": done, "bytes_read": reader.bytes_read,
                               "csv_bytes": cw.n - c0, "json_bytes": jw.n - j0})
             complete = not truncated and not failed and not unreadable
-            jw.write("\n}, " + json.dumps({"roots": len(roots), "leaves": n_leaves, "complete": complete,
-                                           "truncated": bool(truncated), "truncated_reason": truncated,
-                                           "unreadable_leaves": unreadable[:200], "unreadable_total": len(unreadable),
-                                           "failed_roots": failed[:200], "failed_total": len(failed),
-                                           "skipped_roots": skipped[:200], "skipped_total": len(skipped)})[1:] + "\n")
+            jw.write(footer(n_leaves, truncated, unreadable, failed, skipped))
         out = {"roots": len(roots), "leaves": n_leaves, "bytes_read": n_read, "csv_bytes": cw.n, "json_bytes": jw.n,
-               "limit_mib": round(max_total_bytes / MIB, 3), "duration_s": round(time.time() - t0, 2),
+               "written_mib": round((cw.n + jw.n) / MIB, 3),
+               "limit_mib": round(max_total_bytes / MIB, 3),
+               "limit_counts": "the CSV + JSON on disk (the bytes read from the PLC are not counted)",
+               "duration_s": round(time.time() - t0, 2),
                "datatype_table": table is not None, "complete": complete, "truncated": bool(truncated),
                "errors": errors[:50], "errors_total": len(errors),
                "largest_roots": sorted(sizes, key=lambda x: -(x["csv_bytes"] + x["json_bytes"]))[:10],
@@ -1438,6 +1547,10 @@ class _RootReader:
         self.bytes_read += len(data)
         return data[off - start:off - start + n]
 
+    def all_read(self) -> bool:
+        """Every byte any leaf still needs is in hand: no further request, so no read error, can follow (N76)."""
+        return self.end <= 0 or (self.w0 == 0 and len(self.buf) >= self.end)
+
 
 def _at_zero(leaf: Leaf) -> Leaf:
     """The same leaf with offset 0: _RootReader.get returns exactly the leaf's bytes."""
@@ -1502,6 +1615,157 @@ def _nest(root: str, vals: dict[str, Any]) -> Any:
                 return [fin(groups[g]) for g in sorted(groups)]
         return {(k if isinstance(k, str) else str(list(k))): fin(x) for k, x in n.items()}
     return fin(tree)
+
+
+class _TreeOrder(Exception):
+    """A leaf that does not continue the tree depth first (a type walk never yields one)."""
+
+
+class _TreeStream:
+    """N76: the JSON of one root, produced as its leaves arrive — the same text as _json_strict(_nest(root, vals))
+    ('.name' → object member, '[i]' / '[i,j]' → nested lists in index order) without building the tree, so the
+    exact number of bytes the root will add is known BEFORE a leaf is accepted. plan() prices a leaf without changing
+    anything, apply() writes it. A type walk yields the leaves depth first (every struct and array contiguous,
+    indices ascending); a leaf that does not continue the tree that way raises _TreeOrder and is never written in the
+    wrong place. JSON text is ASCII (json.dumps), so its length is its size in bytes."""
+
+    def __init__(self, root: str):
+        import json as _json
+        self._dumps = _json.dumps
+        self.root = root
+        self.parts: list[str] = []
+        self.n = 0                       # bytes in parts
+        # open containers, outermost first: [kind 'o' | 'a', the step that opened it, used keys | last index, members]
+        self.frames: list[list[Any]] = []
+        self.scalar: str | None = None   # the root's own value (a root that is one leaf)
+        self.leaves = 0
+
+    def steps(self, path: str) -> list[tuple[str, Any]]:
+        rest = path[len(self.root):] if path.startswith(self.root) else path
+        out: list[tuple[str, Any]] = []
+        for m in _SEG.finditer(rest):
+            if m.group(1) is not None:
+                out.append(("o", m.group(1)))
+                continue
+            try:
+                idx = tuple(int(x) for x in m.group(2).split(","))
+            except ValueError:
+                out.append(("o", m.group(2)))        # a non-numeric index is a member name in _nest too
+            else:
+                out.extend(("a", i) for i in idx)    # '[i,j]': a list of lists
+        return out
+
+    def _common(self, st: list[tuple[str, Any]]) -> int:
+        p = 0
+        while p + 1 < len(self.frames) and p < len(st) - 1 and self.frames[p + 1][1] == st[p]:
+            p += 1
+        return p
+
+    def _convert(self) -> None:
+        """The root's own value was not its only leaf: it becomes the member "" of the root object (as in _nest)."""
+        s, self.scalar = self.scalar or "", None
+        self.frames = [["o", None, {""}, 1]]
+        self.parts, self.n = ["{", '"": ', s], 5 + len(s)
+
+    def plan(self, st: list[tuple[str, Any]], vjson: str) -> int:
+        """Bytes this leaf adds to parts (closers of the containers it leaves, openers, separators, keys, value)."""
+        if not st:
+            if not self.leaves:
+                return len(vjson)                           # the root's own value (alone: the root is that value)
+            st = [("o", "")]
+        if self.scalar is not None:
+            if st[0][0] != "o":
+                raise _TreeOrder("list elements next to the root's own value")
+            tmp = _TreeStream(self.root)
+            tmp.scalar, tmp.leaves = self.scalar, self.leaves
+            tmp._convert()
+            return (tmp.n - self.n) + tmp.plan(st, vjson)
+        cost = 0
+        if not self.frames:
+            cost += 1                                       # the root's '{' / '['
+            p = 0
+        else:
+            if self.frames[0][0] != st[0][0]:
+                raise _TreeOrder(f"{st[0]} in a {'list' if self.frames[0][0] == 'a' else 'struct'}")
+            p = self._common(st)
+            cost += len(self.frames) - 1 - p                # closers of the containers left
+            f = self.frames[p]
+            kind, key = st[p]
+            if kind != f[0] or (key in f[2] if kind == "o" else (f[2] is not None and key <= f[2])):
+                raise _TreeOrder(f"{kind}:{key} repeats or goes back in its container")
+        for d in range(p, len(st)):
+            kind, key = st[d]
+            members = self.frames[p][3] if (d == p and self.frames) else 0
+            cost += (2 if members else 0) + (len(self._dumps(key)) + 2 if kind == "o" else 0)
+            cost += 1 if d < len(st) - 1 else len(vjson)
+        return cost
+
+    def apply(self, st: list[tuple[str, Any]], vjson: str) -> None:
+        def w(s: str) -> None:
+            self.parts.append(s)
+            self.n += len(s)
+        if not st:
+            if not self.leaves:
+                self.scalar, self.leaves = vjson, 1
+                return
+            st = [("o", "")]
+        if self.scalar is not None:
+            self._convert()
+        self.leaves += 1
+        if not self.frames:
+            self.frames.append([st[0][0], None, set() if st[0][0] == "o" else None, 0])
+            w("{" if st[0][0] == "o" else "[")
+            p = 0
+        else:
+            p = self._common(st)
+            while len(self.frames) > p + 1:
+                w("}" if self.frames.pop()[0] == "o" else "]")
+        for d in range(p, len(st)):
+            kind, key = st[d]
+            f = self.frames[d]
+            if f[3]:
+                w(", ")
+            if kind == "o":
+                w(self._dumps(key) + ": ")
+                f[2].add(key)
+            else:
+                f[2] = key
+            f[3] += 1
+            if d < len(st) - 1:
+                nk = st[d + 1][0]
+                self.frames.append([nk, st[d], set() if nk == "o" else None, 0])
+                w("{" if nk == "o" else "[")
+            else:
+                w(vjson)
+
+    def size_after(self, cost: int, st: list[tuple[str, Any]]) -> int:
+        """Bytes of the finished tree if this (priced) leaf were the last one."""
+        if not st:
+            return self.n + cost + (1 if self.leaves else 0)
+        return self.n + cost + len(st)          # one closer per container still open after it
+
+    def text(self) -> str:
+        if self.scalar is not None:
+            return self.scalar
+        if not self.frames:
+            return "{}"
+        return "".join(self.parts) + "".join("}" if f[0] == "o" else "]" for f in reversed(self.frames))
+
+
+# N76: an error text written into the dump files is at most this long JSON-escaped (ASCII, no control characters —
+# and so at most this long in the CSV too): the procedure's own bound, which gives a read error's ending a known size
+_ERR_JSON_MAX = 300
+
+
+def _err_text(msg: Any) -> str:
+    import json
+    s = "".join(ch for ch in " ".join(str(msg).split()) if ch >= " ")
+    s = s.encode("ascii", "backslashreplace").decode("ascii")
+    if len(json.dumps(s)) <= _ERR_JSON_MAX:
+        return s
+    while s and len(json.dumps(s + "...")) > _ERR_JSON_MAX:
+        s = s[:-1]
+    return s + "..."
 
 
 def _move_new(src: Any, dst: Any) -> None:

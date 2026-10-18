@@ -152,6 +152,81 @@ def test_nest_builds_the_decode_tree_shape_from_leaf_values():
     assert _nest("G.n", {"G.n": 5}) == 5
 
 
+def _walk_like(root, rnd, depth=0):
+    """Leaves in the order a type walk yields them: depth first, structs and arrays contiguous, indices ascending."""
+    kind = rnd.choice(["struct", "array", "array2", "enumidx"] if depth < 3 else ["struct"])
+    out = []
+    if kind == "struct":
+        for i in range(rnd.randint(1, 4)):
+            p = f"{root}.m{i}{rnd.choice(['', 'Ü', '_x'])}"
+            out += _walk_like(p, rnd, depth + 1) if depth < 3 and rnd.random() < 0.4 else [p]
+    elif kind == "array":
+        lo = rnd.randint(-3, 2)
+        for i in range(lo, lo + rnd.randint(1, 4)):
+            p = f"{root}[{i}]"
+            out += _walk_like(p, rnd, depth + 1) if rnd.random() < 0.3 else [p]
+    elif kind == "array2":
+        for i in range(rnd.randint(1, 3)):
+            for j in range(rnd.randint(1, 3)):
+                out.append(f"{root}[{i},{j}]")
+    else:
+        for e in ("eRed", "eGreen"):
+            out.append(f"{root}[{e}]")
+    return out
+
+
+def test_n76_tree_stream_writes_exactly_the_nested_json_and_knows_its_size_before_each_leaf():
+    """N76: the dump knows the bytes of a root's JSON before it accepts a leaf — the stream writes the same text as
+    _json_strict(_nest(...)) and size_after() is exactly the length of the text if that leaf were the last."""
+    import random
+    from twincat_mcp.ads_backend import _TreeStream, _json_strict, _nest
+    rnd = random.Random(76)
+    values = [1, -2.5, float("nan"), float("inf"), "s\"q", "Ünï", None, True, {"value": 20, "name": "Idle"},
+              "0x0000000000000000", {"_not_read": "outside"}]
+    for case in range(400):
+        root = rnd.choice(["G", "MAIN.fb", "GVL_X.a"])
+        paths = _walk_like(root, rnd)
+        vals = {}
+        ts = _TreeStream(root)
+        for path in paths:
+            v = rnd.choice(values)
+            vj = _json_strict(v)
+            st = ts.steps(path)
+            cost = ts.plan(st, vj)
+            predicted = ts.size_after(cost, st)
+            ts.apply(st, vj)
+            vals[path] = v
+            assert len(ts.text()) == predicted, (case, path)
+            assert ts.text() == _json_strict(_nest(root, vals)), (case, paths)
+    # a scalar root, an empty root, the root's own value with members (as _nest: the member "")
+    one = _TreeStream("G.n")
+    one.apply(one.steps("G.n"), "5")
+    assert one.text() == "5" and _TreeStream("G").text() == "{}"
+    mix = _TreeStream("R")
+    for path, vj in (("R", '"head"'), ("R.x", "1")):
+        st = mix.steps(path)
+        c = mix.plan(st, vj)
+        n = mix.size_after(c, st)
+        mix.apply(st, vj)
+        assert len(mix.text()) == n
+    assert mix.text() == _json_strict(_nest("R", {"R": "head", "R.x": 1}))
+
+
+def test_n76_tree_stream_refuses_a_leaf_that_does_not_continue_the_tree():
+    import pytest as _p
+    from twincat_mcp.ads_backend import _TreeOrder, _TreeStream
+    ts = _TreeStream("G")
+    for path in ("G.a.x", "G.b"):
+        ts.apply(ts.steps(path), "1")
+    for bad in ("G.a.y", "G.b", "G[0]"):          # a closed struct again, a repeated member, an index in a struct
+        with _p.raises(_TreeOrder):
+            ts.plan(ts.steps(bad), "1")
+    arr = _TreeStream("A")
+    arr.apply(arr.steps("A[2]"), "1")
+    with _p.raises(_TreeOrder):
+        arr.plan(arr.steps("A[1]"), "1")           # indices go back
+
+
 def test_write_guard_follows_the_alias_chain_like_the_dump():
     """Review B: unwritable_reason checked only the entry's own flags, so TYPE PT_X : POINTER TO FB_X (an address the
     dump already shows as one) was writable as a number; an alias of an interface too."""
