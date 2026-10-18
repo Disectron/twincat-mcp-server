@@ -406,3 +406,51 @@ def test_n46_a_health_check_timeout_is_not_a_broken_venv(tmp_path, monkeypatch):
     assert launch.main(["--src", str(src), "--venv", str(venv), "--python", sys.executable]) == 0
     assert executed and executed[-1][0] == vp and not any(c[1:3] == ["-m", "venv"] for c in calls)
     assert vp.read_text() == "ok"
+
+
+def test_n46_an_older_pending_build_never_replaces_a_newer_install(tmp_path, monkeypatch):
+    """Review A: after an install swapped in, tidy() put a build left pending by an EARLIER install back over it —
+    the fresh venv was retired and deleted, the old code ran; with that build busy (another window), `venv` was left
+    missing and every start rebuilt. Builds are ordered by their stamp's install time; a superseded pending build is
+    unmarked (never run) and retired when it can be."""
+    import os as _os
+    src, venv, calls, executed = _launch_env(tmp_path, monkeypatch, lambda v, timeout_s=60: "ok")
+    # build2: finished earlier, left pending, another window runs from it
+    b2 = tmp_path / "venv.build-20261001-100000-1"
+    launch.venv_python(b2).parent.mkdir(parents=True)
+    launch.venv_python(b2).write_text("build2")
+    launch.write_stamp(b2, {"version": "0.0.1", "digest": "x", "built": 1000.0})
+    (b2 / launch.PENDING).write_text("venv in use\n", encoding="utf-8")
+    # the venv in place came from a later install of newer sources
+    launch.venv_python(venv).parent.mkdir(parents=True)
+    launch.venv_python(venv).write_text("build3")
+    launch.write_stamp(venv, {**launch.make_stamp(src, sys.executable), "built": 2000.0})
+    real_rename = _os.rename
+
+    def busy(a, b):
+        if Path(a) == b2:
+            raise PermissionError(32, "being used by another process")
+        return real_rename(a, b)
+    monkeypatch.setattr(launch.os, "rename", busy)
+    assert launch.active_venv(venv) == venv                   # the stale build is not what runs …
+    assert launch.main(["--src", str(src), "--venv", str(venv), "--python", sys.executable]) == 0
+    assert launch.venv_python(venv).read_text() == "build3" and executed[-1][0] == launch.venv_python(venv)
+    assert b2.exists() and not (b2 / launch.PENDING).exists()     # … busy: stays, but no longer pending
+    assert not any(c[1:3] == ["-m", "venv"] for c in calls)
+    # a newer pending build still goes in place, and a failed second rename puts the old venv back
+    b4 = tmp_path / "venv.build-20261002-100000-1"
+    launch.venv_python(b4).parent.mkdir(parents=True)
+    launch.venv_python(b4).write_text("build4")
+    launch.write_stamp(b4, {"version": "0.0.1", "digest": "x", "built": 3000.0})
+    (b4 / launch.PENDING).write_text("venv in use\n", encoding="utf-8")
+
+    def b4_stuck(a, b):
+        if Path(a) == b4:
+            raise PermissionError(5, "access denied")
+        return real_rename(a, b)
+    monkeypatch.setattr(launch.os, "rename", b4_stuck)
+    assert launch.swap_in(venv, b4) is False
+    assert launch.venv_python(venv).read_text() == "build3"       # never left missing
+    monkeypatch.setattr(launch.os, "rename", real_rename)
+    launch.tidy(venv, lock_free=True)
+    assert launch.venv_python(venv).read_text() == "build4" and not b2.exists()

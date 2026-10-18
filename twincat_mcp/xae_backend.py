@@ -801,7 +801,10 @@ class XaeBackend:
             raise XaeError("the PLC projects of the solution could not be listed"
                            + (f" ({list_err})" if list_err else "") + " — pass plc_project_path (xae_plc_projects); nothing was done")
         target_name = target.split("^")[-1].removesuffix(" Project")
-        single = len(all_projects) <= 1 and (not all_projects or all_projects[0].lower() == target.lower())
+        # generic commands act on the ACTIVE project: only when the listing proves the target is the only one. An
+        # empty or failed listing proves nothing (XAE busy) — 'single' was True then, and PLC.Download ran on PlcA
+        # for a call (and a token) about PlcB
+        single = len(all_projects) == 1 and all_projects[0].lower() == target.lower()
         ai_note = ""
         tag = self._PLC_ONLINE_XML.get(action)
         if tag:
@@ -846,8 +849,10 @@ class XaeBackend:
             why.append(f"the shell's PLC commands act on the active project {others}, not {target_name!r} — select "
                        f"'{target_name} Project' in Solution Explorer ('Set as Active PLC Project') and retry")
         elif not single and not tried:
-            why.append(f"this shell's PLC commands do not name the project they act on and the solution has "
-                       f"{len(all_projects)} PLC projects, so {target_name!r} cannot be confirmed as the active one")
+            known = (f"the solution has {len(all_projects)} PLC projects" if all_projects else
+                     "the solution's PLC projects could not be listed" + (f" ({list_err})" if list_err else ""))
+            why.append(f"this shell's PLC commands do not name the project they act on and {known}, so "
+                       f"{target_name!r} cannot be confirmed as the active one")
         else:
             why.append(f"no working DTE command for {action!r}: tried {[t['command'] for t in tried]}; this shell offers "
                        f"{offered or 'nothing matching'}")
@@ -1301,6 +1306,10 @@ class XaeBackend:
         # 2. the XML is the oracle
         checked = "name"
         if xml is not None:
+            graphic = _non_text_body(xml, orig_path)
+            if graphic:
+                raise _ReplaceError(f"{graphic}: a body that is not ST text cannot be moved from the copy as text, nor "
+                                    "checked — nothing written; the copy holds the imported version")
             bad = _oracle_mismatch(want, xml, orig_path)
             if bad:
                 raise _ReplaceError(f"the copy differs from the imported XML at {bad} — nothing written")
@@ -1903,6 +1912,22 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
         x = el.find("./body/ST/xhtml")
         return (x.text or "") if x is not None else None
 
+    def body_kind(el: Any) -> str | None:
+        """'ST', the graphical / other language of the body (FBD, LD, SFC, IL, CFC …), or None (no body: a DUT, a
+        GVL, an interface method). TwinCAT writes CFC as body/addData/data name='…/cfc'."""
+        b = el.find("./body")
+        if b is None:
+            return None
+        if b.find("./ST") is not None:
+            return "ST"
+        for c in b:
+            if c.tag == "addData":
+                for d in c.findall("./data"):
+                    return str(d.get("name", "")).rsplit("/", 1)[-1].upper() or "addData"
+                continue
+            return str(c.tag)
+        return "empty"
+
     def node(el: Any) -> dict[str, Any]:
         kids: dict[str, Any] = {}
         for d in el.findall("./addData/data"):
@@ -1912,21 +1937,38 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
                     for c in d.findall("./" + tag):
                         sub = node(c)
                         if tag == "Property":
-                            for dd in c.findall("./addData/data"):
-                                for acc, kid in (("GetAccessor", "Get"), ("SetAccessor", "Set")):
-                                    a = dd.find("./" + acc)
-                                    if a is not None:
-                                        sub["kids"][kid.lower()] = node(a)
+                            # Get / Set: children of <Property> in TwinCAT / CODESYS exports; also looked for under
+                            # its addData (seen in other writers) — not found meant never compared
+                            for acc, kid in (("GetAccessor", "Get"), ("SetAccessor", "Set")):
+                                a = c.find("./" + acc)
+                                if a is None:
+                                    a = next((x for dd in c.findall("./addData/data") for x in dd.findall("./" + acc)),
+                                             None)
+                                if a is not None:
+                                    sub["kids"][kid.lower()] = node(a)
                         kids[str(c.get("name", "")).lower()] = sub
-        return {"decl": plain(el), "impl": body(el), "kids": kids}
+        return {"decl": plain(el), "impl": body(el), "body": body_kind(el), "kids": kids}
 
     out: dict[str, dict[str, Any]] = {}
     for el in root.iter():
         if el.tag in ("pou", "dataType", "globalVars", "Interface") and el.get("name"):
             n = node(el)
-            if n["decl"] is not None or n["impl"] is not None:
+            if n["decl"] is not None or n["impl"] is not None or _non_text_body(n, ""):
                 out.setdefault(str(el.get("name")).lower(), n)
     return out
+
+
+def _non_text_body(xml: dict[str, Any], where: str) -> str | None:
+    """The first part of an XML object whose body is not ST text (FBD, LD, SFC, CFC, IL …): '<where> (FBD)', or None.
+    Such a body is not in DeclarationText / ImplementationText — moving the copy's texts over would leave the imported
+    graphics behind in the copy that is then deleted."""
+    if xml.get("body") not in (None, "ST"):
+        return f"{where or 'the object'} ({xml['body']})"
+    for k, sub in (xml.get("kids") or {}).items():
+        m = _non_text_body(sub, f"{where}^{k}" if where else k)
+        if m:
+            return m
+    return None
 
 
 def _try(fn: Callable[[], Any]) -> Any:

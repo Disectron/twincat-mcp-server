@@ -521,3 +521,31 @@ def test_stub_runs_the_plugins_builder_for_the_folder_above_it(tmp_path):
                        encoding="utf-8", env={**env, "TCMCP_STUB_VERBOSE": "1"}, timeout=60)
     assert "plugin_location.json (twincat plugin repo)" in p.stderr and str(B / "infosys_local.py") in p.stderr
     assert K.builder_kind(kb / "tools" / "infosys_local.py", "infosys_local.py") == ("stub", "1")
+
+
+def test_pymupdf_space_in_its_own_font_run_is_kept(tmp_path):
+    """Review A: whitespace-only spans were dropped before the page text was built, so a space set in another font
+    than the words around it ('Note' bold, ' ' regular, 'that' bold) glued them: 'Notethat' on every such line."""
+    pytest.importorskip("reportlab")
+    pytest.importorskip("pymupdf", exc_type=ImportError)
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    pdf = tmp_path / "space.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    for i in range(4):
+        t = c.beginText(72, 700)
+        for font, txt in (("Helvetica-Bold", "Note"), ("Helvetica", " "), ("Helvetica-Bold", "that"),
+                          ("Helvetica", " the bridge is balanced")):
+            t.setFont(font, 10)
+            t.textOut(txt)
+        c.drawText(t)
+        c.setFont("Helvetica", 10)
+        for k in range(8):
+            c.drawString(72, 680 - 14 * k, f"body line {k} of page {i}")
+        c.showPage()
+    c.save()
+    m = _manuals_module()
+    spans, _h = m._spans_pymupdf(__import__("pymupdf").open(str(pdf))[0])
+    assert any(s.blank for s in spans), [s.text for s in spans]          # the space is its own span here
+    _used, _n, _toc, texts, _title, _running = m._open_pdf(pdf)
+    assert all("Note that the bridge is balanced" in t for t in texts), texts[0][:200]

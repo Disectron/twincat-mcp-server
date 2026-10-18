@@ -894,11 +894,18 @@ async def test_r40_restart_proven_by_a_witness_taken_before_the_commands(monkeyp
     monkeypatch.setattr(_dlg, "list_dialogs", lambda pid: [type("D", (), {"to_dict": lambda self: d})() for d in dialogs])
     v = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before, timeout_s=10)
     assert not v["verified"] and v["dialogs"] and "License expired" in _restart_failure(v)
-    # the decision itself: a counter that restarted and climbed above its old value (uptime 8 s < 60 s since the
-    # command); one that went on (uptime 64 s); a frozen counter is no proof of a restart; wrap; unknown cycle time
+    # the decision itself (spec: proof = the counter went back or AppTimestamp differs). A counter above its old value
+    # with fewer cycles than the time allows (8 s of cycles, 60 s elapsed) is a restart OR a task that stood still for
+    # part of the time — cannot tell (review A: a frozen counter, 30 s of cycles at 35 s, was reported as a restart);
+    # one that went on (64 s of cycles) is no restart; wrap; unknown cycle time
     b = {"t": 0, "cycle_count": 5_000, "cycle_time_100ns": 10000}
-    assert restart_proven(b, {"t": 60, "cycle_count": 8_000, "cycle_time_100ns": 10000})[0] is True
+    assert restart_proven(b, {"t": 60, "cycle_count": 8_000, "cycle_time_100ns": 10000})[0] is None
     assert restart_proven(b, {"t": 60, "cycle_count": 64_000, "cycle_time_100ns": 10000})[0] is False
+    frozen = restart_proven({"t": 0, "cycle_count": 3_000, "cycle_time_100ns": 100000},
+                            {"t": 35, "cycle_count": 3_000, "cycle_time_100ns": 100000})
+    assert frozen[0] is None and "did not advance" in frozen[1], frozen
+    assert restart_proven({"t": 0, "cycle_count": 3_000, "app_timestamp": 1}, {"t": 35, "cycle_count": 3_000,
+                                                                              "app_timestamp": 2})[0] is True
     assert restart_proven({"t": 0, "cycle_count": 900_000, "cycle_time_100ns": 10000},
                           {"t": 5, "cycle_count": 900_000, "cycle_time_100ns": 10000})[0] is False
     assert restart_proven({"t": 0, "cycle_count": 0xFFFFFFF0, "cycle_time_100ns": 10000},

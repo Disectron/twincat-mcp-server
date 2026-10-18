@@ -238,59 +238,99 @@ def _builds(venv: Path) -> list[Path]:
 
 
 def _pending(venv: Path) -> list[Path]:
-    """Finished builds that could not be put in place yet (newest last)."""
+    """Finished builds marked pending (newest last) — whether they are newer than `venv` is _supersedes'."""
     return [b for b in _builds(venv) if (b / PENDING).is_file() and (b / STAMP_NAME).is_file() and venv_python(b).is_file()]
 
 
+def _built(v: Path) -> float:
+    """When the venv's install finished (stamp 'built'); 0 for a venv without it (written by an older launcher)."""
+    try:
+        return float((read_stamp(v) or {}).get("built") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _supersedes(venv: Path, build: Path) -> bool:
+    """A pending build replaces (and runs instead of) `venv` only when it is newer than what is in place, or nothing
+    usable is there. Without this, a build left pending by an earlier install was put back over a newer install —
+    the fresh venv retired and deleted, the old code running (review A)."""
+    if not venv_python(venv).is_file() or read_stamp(venv) is None:
+        return True
+    return _built(build) > _built(venv)
+
+
+def _live_pending(venv: Path) -> list[Path]:
+    return [b for b in _pending(venv) if _supersedes(venv, b)]
+
+
+def _unmark(build: Path) -> None:
+    """No longer pending: never run, never swapped in (removable while another window runs from it — the build itself
+    may not be renamable then, the marker is)."""
+    try:
+        (build / PENDING).unlink()
+    except OSError:
+        pass
+
+
 def active_venv(venv: Path) -> Path:
-    """The venv to run: normally `venv`; the newest finished build while its swap is pending (another window still
-    runs the old server from `venv`, so `venv` could not be renamed)."""
-    pend = _pending(venv)
+    """The venv to run: normally `venv`; the newest finished build that is newer than `venv` while its swap is
+    pending (another window still runs the old server from `venv`, so `venv` could not be renamed)."""
+    pend = _live_pending(venv)
     return pend[-1] if pend else venv
 
 
-def _retire(path: Path) -> bool:
-    """Rename out of the way as `<venv>.old-…` (removed later); False when it is in use."""
+def _retire(path: Path) -> Path | None:
+    """Rename out of the way as `<venv>.old-…` (removed later) -> the new path; None when it is in use."""
     import time
     old = path.with_name(f"{path.name.split('.build-')[0]}.old-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-"
                          f"{abs(hash(path.name)) % 10000}")
     try:
         os.rename(path, old)
-        return True
+        return old
     except OSError:
-        return False
+        return None
 
 
 def swap_in(venv: Path, build: Path) -> bool:
     """Put a finished build in place of `venv`: `venv` → `venv.old-…`, build → `venv`. N46: a live venv is never
     deleted or changed in place (rmtree of a venv another Claude window ran broke that server and the rebuild failed
     at every start). When `venv` cannot be renamed (files in use on Windows) the build stays beside it, marked
-    pending, and is the one that runs until a later start can swap. -> swapped?"""
-    if venv.exists() and not _retire(venv):
-        (build / PENDING).write_text("venv in use\n", encoding="utf-8")
-        log(f"{venv} is in use (another window runs the server from it); the new build {build.name} is used until a "
-            "later start can put it in place")
-        return False
+    pending, and is the one that runs until a later start can swap. When the build cannot be moved after `venv` was
+    retired, `venv` is moved back — it is never left missing. -> swapped?"""
+    retired = None
+    if venv.exists():
+        retired = _retire(venv)
+        if retired is None:
+            (build / PENDING).write_text("venv in use\n", encoding="utf-8")
+            log(f"{venv} is in use (another window runs the server from it); the new build {build.name} is used until "
+                "a later start can put it in place")
+            return False
     try:
         os.rename(build, venv)
     except OSError as exc:
+        if retired is not None:
+            try:
+                os.rename(retired, venv)
+            except OSError as back:
+                log(f"could not move {retired} back to {venv}: {back}")
         (build / PENDING).write_text(f"{exc}\n", encoding="utf-8")
         log(f"could not move {build} to {venv}: {exc}; {build.name} is used for now")
         return False
-    try:
-        (venv / PENDING).unlink()
-    except OSError:
-        pass
+    _unmark(venv)
     return True
 
 
 def tidy(venv: Path, lock_free: bool) -> None:
-    """At every start: the newest pending build goes in place when it can; superseded pending builds, unfinished
-    builds (only when no install holds the lock) and replaced venvs (`.old-*`) are retired or removed — best effort,
-    anything in use stays for a later start."""
+    """At every start: the newest pending build that is newer than `venv` goes in place when it can; every other
+    pending build is superseded — unmarked and retired; unfinished builds (only when no install holds the lock) and
+    replaced venvs (`.old-*`) are retired or removed — best effort, anything in use stays for a later start."""
     import shutil
     pend = _pending(venv)
-    keep = pend[-1] if pend and not swap_in(venv, pend[-1]) else None
+    live = _live_pending(venv)
+    keep = live[-1] if live and not swap_in(venv, live[-1]) else None
+    for b in pend:
+        if b != keep:
+            _unmark(b)
     for b in _builds(venv):
         if b == keep:
             continue
@@ -323,7 +363,9 @@ def install(vpython: Path, src: Path, stamp: dict, venv: Path) -> None:
         log("pip install failed. Offline PC? Pre-download wheels on a connected machine: "
             f"`pip download -d wheels -r {src / 'requirements.txt'}` then set PIP_FIND_LINKS=<wheels> PIP_NO_INDEX=1 and retry.")
         raise SystemExit(4)
-    write_stamp(venv, stamp)
+    import time
+    data = stamp.full() if hasattr(stamp, "full") else dict(stamp)
+    write_stamp(venv, {**data, "built": time.time()})   # orders builds: an older pending build never replaces this
 
 
 # ---------------------------------------------------------------------------

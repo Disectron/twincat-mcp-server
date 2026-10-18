@@ -300,3 +300,10 @@ def test_n65_fallback_drops_stop_words_absent_and_common_words_and_ranks_the_tit
     assert info["words_ignored"] == {"zzz": "on no page"} and total == 2 and rows[0]["title"] == "ADSREAD"
     rows, total, mode, _expr, info = m.search_tiers(con, sql, cnt, "every common", [], 5, title_key="title")
     assert rows and "words_too_common" not in info          # both words common: the AND tiers still answer
+
+
+def test_stop_words_are_compared_folded():
+    """Review A: the query word is folded ('für' → 'fur') but the stop-word set held 'für' — never matched."""
+    m = _kbd_module()
+    assert m._fold("Für") in m.STOP_WORDS and "für" not in m.STOP_WORDS
+    assert all(w == m._fold(w) for w in m.STOP_WORDS)

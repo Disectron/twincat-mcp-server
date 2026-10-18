@@ -652,6 +652,49 @@ END_VAR
     assert orig.ImplementationText == "// old body" and proj.deleted == ["PRG_TcUnitRunner_1"]
 
 
+def test_r15_n38_graphical_bodies_and_property_accessors_in_the_oracle(xae, tmp_path):
+    """Review A: (1) a CFC / FBD / LD / SFC body is not in ImplementationText — only the declaration was moved over,
+    the copy holding the imported graphics was deleted and the object reported 'checked against xml'. Refused now,
+    the copy kept. (2) Get / Set are children of <Property> in TwinCAT's export; the oracle looked only under the
+    property's addData, so accessor bodies were never compared."""
+    be, dte, sm = xae
+    ns = 'xmlns="http://www.w3.org/1999/xhtml"'
+    plain = ('<interface><addData><data name="http://www.3s-software.com/plcopenxml/interfaceasplaintext" '
+             'handleUnknown="implementation"><InterfaceAsPlainText><xhtml ' + ns + '>{decl}</xhtml></InterfaceAsPlainText>'
+             '</data></addData></interface>')
+    prop = ('<addData><data name="http://www.3s-software.com/plcopenxml/property" handleUnknown="implementation">'
+            '<Property name="P">' + plain.format(decl="PROPERTY P : INT") +
+            '<GetAccessor><body><ST><xhtml ' + ns + '>P := 7;</xhtml></ST></body></GetAccessor>'
+            '<SetAccessor><body><ST><xhtml ' + ns + '>;</xhtml></ST></body></SetAccessor></Property></data></addData>')
+    xml = ('<?xml version="1.0" encoding="utf-8"?><project xmlns="http://www.plcopen.org/xml/tc6_0200"><types><pous>'
+           '<pou name="FB_A" pouType="functionBlock">' + plain.format(decl="FUNCTION_BLOCK FB_A") +
+           '<body><ST><xhtml ' + ns + '>;</xhtml></ST></body>' + prop + '</pou>'
+           '<pou name="PRG_Cfc" pouType="program">' + plain.format(decl="PROGRAM PRG_Cfc") +
+           '<body><addData><data name="http://www.3s-software.com/plcopenxml/cfc" handleUnknown="implementation">'
+           '<CFC /></data></addData></body></pou>'
+           '<pou name="PRG_Fbd" pouType="program"><body><FBD /></body></pou>'
+           '</pous></types></project>')
+    f = tmp_path / "o.xml"
+    f.write_text(xml, encoding="utf-8")
+    o = X._plcopen_oracle(str(f))
+    assert o["fb_a"]["kids"]["p"]["kids"]["get"]["impl"] == "P := 7;" and "set" in o["fb_a"]["kids"]["p"]["kids"]
+    assert o["prg_cfc"]["body"] == "CFC" and o["prg_fbd"]["body"] == "FBD" and o["fb_a"]["body"] == "ST"
+    assert X._non_text_body(o["prg_cfc"], "X") == "X (CFC)" and X._non_text_body(o["fb_a"], "X") is None
+    # an accessor that differs from the XML is caught
+    want = {"decl": "FUNCTION_BLOCK FB_A", "impl": ";", "kids": {"P": {"decl": "PROPERTY P : INT", "impl": None,
+            "kids": {"Get": {"decl": None, "impl": "P := 8;", "kids": {}}}}}}
+    assert "P^Get (implementation)" in (X._oracle_mismatch(want, o["fb_a"], "FB_A") or "")
+    # a replace of a graphical POU: refused, the original untouched, the copy kept
+    proj, orig, meth, _f, dup = _r15_setup(sm, tmp_path, xml_body=xml.replace("PRG_Cfc", "PRG_TcUnitRunner"))
+    orig.ImplementationText = "// old"
+    proj.on_import = lambda: dup(methods=())
+    orig._children = []
+    with pytest.raises(X.XaeError, match=r"\(CFC\): a body that is not ST text cannot be moved.*copies kept"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(_f), "replace")
+    assert orig.ImplementationText == "// old" and orig.DeclarationText == "PROGRAM PRG_TcUnitRunner\nVAR\nEND_VAR"
+    assert proj.deleted == []
+
+
 class _FailingText(FakeItem):
     """A method item whose ImplementationText cannot be written (fails n times, then works)."""
     def __init__(self, base, fails):
@@ -789,6 +832,18 @@ def test_n41_xae_plc_acts_on_the_named_project_on_every_route(xae, monkeypatch):
     # download (no ConsumeXml command) on a shell whose generic PLC.Download does not name the project: refused
     # with two projects in the solution
     with pytest.raises(X.XaeError, match=r"do not name the project they act on and the solution has 2 PLC projects"):
+        be.plc_action("download", b)
+    assert issued == []
+    # review A: the listing fails (XAE busy) — an unknown list is not 'one project': the generic PLC.Download (which
+    # acts on the active PlcA) is never issued for B
+    def busy(p=None):
+        raise X.XaeError("XAE busy")
+    monkeypatch.setattr(be, "_nested_projects", busy)
+    with pytest.raises(X.XaeError, match=r"PLC projects could not be listed \(XAE busy\).*Nothing was done"):
+        be.plc_action("download", b)
+    assert issued == []
+    monkeypatch.setattr(be, "_nested_projects", lambda p=None: [])
+    with pytest.raises(X.XaeError, match=r"Nothing was done"):
         be.plc_action("download", b)
     assert issued == []
 

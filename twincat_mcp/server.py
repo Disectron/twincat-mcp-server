@@ -186,12 +186,16 @@ _RESTART_WITNESS = ("TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount",
 
 def restart_proven(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool | None, str]:
     """R40: did the runtime restart between two witnesses (restart_witness)? True = restarted, False = provably not,
-    None = cannot tell. Task 1's CycleCount × cycle time is how long the task has been running: shorter than the time
-    since the first witness → it started within that time; at least that long → it did not. A counter below its
-    earlier value has started again (unless it could have wrapped)."""
+    None = cannot tell. A counter below its earlier value has started again (unless it could have wrapped). Task 1's
+    CycleCount × cycle time is how long the task has run: at least the time since the first witness → no restart in
+    that time. Shorter is NOT proof of a restart when the counter did not go back: a task that stood still (breakpoint,
+    PLC stopped while TwinCAT stays in RUN) also counts fewer cycles than the time allows — a frozen counter (30 s of
+    cycles, 35 s elapsed) was reported as 'started within that time'. That case is 'cannot tell'."""
     a_ts, b_ts = after.get("app_timestamp"), before.get("app_timestamp")
     if a_ts is not None and b_ts is not None and a_ts != b_ts:
-        return True, f"the application timestamp changed ({b_ts} → {a_ts})"
+        # AppTimestamp is the time the PLC application was compiled (InfoSys PlcAppSystemInfo): a different value means a
+        # different application is running — it was loaded, which takes a start of the runtime's PLC
+        return True, f"the PLC application's compile timestamp changed ({b_ts} → {a_ts}): a newly built application runs"
     b, a = before.get("cycle_count"), after.get("cycle_count")
     if not isinstance(b, int) or not isinstance(a, int):
         return None, "task 1's cycle counter was not readable before and after"
@@ -208,11 +212,15 @@ def restart_proven(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool 
             return None, f"CycleCount {b} → {a}: the counter may have wrapped"
         return True, f"task 1's CycleCount started again ({b} → {a})"
     uptime = a * cycle_s
-    if uptime < elapsed - 0.5:
-        return True, (f"task 1 has run for {uptime:.1f} s (CycleCount {a}), less than the {elapsed:.1f} s since the "
-                      "command — it started within that time")
-    return False, (f"task 1's CycleCount went on from {b} to {a}: the task has run for {uptime:.0f} s, longer than the "
-                   f"{elapsed:.0f} s since the command — no restart")
+    if uptime >= elapsed - 0.5:
+        return False, (f"task 1's CycleCount went on from {b} to {a}: the task has run for {uptime:.0f} s, longer than "
+                       f"the {elapsed:.0f} s since the command — no restart")
+    if a == b:
+        return None, (f"task 1's CycleCount did not advance ({a}) in {elapsed:.1f} s: the task stands still (breakpoint, "
+                      "PLC stopped) — a restart can be neither shown nor excluded by it")
+    return None, (f"task 1's CycleCount went on from {b} to {a} ({uptime:.1f} s of cycles, {elapsed:.1f} s elapsed): a "
+                  "restart within that time, or a task that stood still for part of it — the counter cannot tell "
+                  "which (it did not go back)")
 
 
 _TRANSITION_KEYS = ("transition_seen", "transition_by", "mode_before", "witness_before", "witness_after", "witness")
@@ -650,8 +658,8 @@ class App:
     async def restart_witness(self, mode: str | None = None) -> dict[str, Any]:
         """R40: taken BEFORE a restart command (and again at each RUN poll after it, with the mode already known).
         The System Service mode, and — when TwinCAT runs — what a runtime restart changes: task 1's cycle counter
-        (starts again from 0; × cycle time = how long the task has been running) and the application timestamp.
-        Unreadable values stay None."""
+        (starts again from 0 — below its earlier value proves a restart; × cycle time ≥ the time since this witness
+        proves none) and the application's compile timestamp. Unreadable values stay None."""
         w: dict[str, Any] = {"t": time.monotonic(), "mode": mode, "cycle_count": None, "cycle_time_100ns": None,
                              "app_timestamp": None}
         if mode is None:
@@ -3615,8 +3623,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         Refuses when the XAE target and the ADS target of this server differ.
         Done = the target runs the new configuration: in RUN and a restart proven (steps.verify.transition_by):
         'poll' (another state seen after the commands), 'mode_change' (it was not in RUN before the activation),
-        'witness' (task 1 has been running for less time than since the activation, or the application timestamp
-        changed). In RUN without such proof is reported as that, not as 'not in RUN'."""
+        'witness' (task 1's cycle counter went back, or the PLC application's compile timestamp changed). In RUN
+        without such proof is reported as that, not as 'not in RUN'."""
         tgt = await app.xae_target_for("xae_deploy", OpClass.DESTRUCTIVE, confirm_token)
         await app.check_targets(tgt, allow_target_mismatch)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_deploy", tgt, confirm_token)

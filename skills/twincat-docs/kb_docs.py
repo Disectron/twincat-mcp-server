@@ -472,18 +472,19 @@ def natural(q: str) -> bool:
 
 
 # words that say nothing about a page: never searched alone, never a prefix (N65)
-STOP_WORDS = frozenset("""
+def _fold(w: str) -> str:
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", w.lower()) if not unicodedata.combining(c))
+
+
+# compared with _fold(word), so stored folded: 'für' was never matched (the query word folds to 'fur')
+STOP_WORDS = frozenset(_fold(w) for w in """
 a an and are as at be but by can do does for from has have how i if in into is it its no not of on or so such that
 the their then there these this to was were what when where which while who why will with without you your
 der die das den dem des ein eine einer eines einem und oder ist sind wie was wann wo warum mit von zu zum zur im in
 am an auf aus bei für nicht kein keine ich es er sie wir ihr
 """.split())
 COMMON_SHARE = 0.2          # a word on more than this share of the pages does not pick a page in the some-words tier
-
-
-def _fold(w: str) -> str:
-    import unicodedata
-    return "".join(c for c in unicodedata.normalize("NFKD", w.lower()) if not unicodedata.combining(c))
 
 
 def _term_df(con: sqlite3.Connection, word: str, prefix: bool) -> int | None:

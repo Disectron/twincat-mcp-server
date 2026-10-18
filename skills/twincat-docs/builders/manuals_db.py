@@ -116,10 +116,11 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 class Span:
     """One piece of text with its place on the page: baseline y from the TOP of the page (pt), x, font size, bold,
     and the PDF backend's line it belongs to (PyMuPDF block/line; pypdf: one text operation)."""
-    __slots__ = ("y", "x", "size", "bold", "text", "line")
+    __slots__ = ("y", "x", "size", "bold", "text", "line", "blank")
 
     def __init__(self, y: float, x: float, size: float, bold: bool, text: str, line: tuple):
         self.y, self.x, self.size, self.bold, self.text, self.line = y, x, size, bold, text, line
+        self.blank = not text.strip()     # a space in its own font run: part of the text, not of the layout
 
 
 def _spans_pymupdf(page) -> tuple[list[Span], float]:
@@ -127,8 +128,11 @@ def _spans_pymupdf(page) -> tuple[list[Span], float]:
     for bi, b in enumerate(page.get_text("dict").get("blocks", [])):
         for li, ln in enumerate(b.get("lines", [])):
             for s in ln.get("spans", []):
-                if not s["text"].strip():
+                if not s["text"]:
                     continue
+                # a whitespace-only span is kept: a space set in another font than the words around it ('bold
+                # regular-space bold') is the only space between them — dropping it glued 'Note that' into 'Notethat'.
+                # It takes no part in the layout statistics (Span.blank)
                 ox, oy = s.get("origin") or (s["bbox"][0], s["bbox"][3])
                 out.append(Span(round(oy, 1), round(ox, 1), round(s["size"], 1), bool(s["flags"] & 16), s["text"],
                                 (bi, li)))
@@ -175,7 +179,7 @@ def _running(pages: list[tuple[list[Span], float]]) -> list[set[int]]:
         return drops
     pitches = []
     for sp, _h in pages:
-        ys = sorted({round(s.y) for s in sp})
+        ys = sorted({round(s.y) for s in sp if not s.blank})
         pitches += [b - a for a, b in zip(ys, ys[1:]) if 2 <= b - a <= 40]
     pitch = statistics.median(pitches) if pitches else 12.0
     apart = max(1.6 * pitch, 6.0)
@@ -183,6 +187,8 @@ def _running(pages: list[tuple[list[Span], float]]) -> list[set[int]]:
     cand: dict[tuple, list[tuple[float, int, int]]] = {}
     for pi, (sp, h) in enumerate(pages):
         for si, s in enumerate(sp):
+            if s.blank:
+                continue
             side = "top" if s.y < 0.15 * h else "bottom" if s.y > 0.85 * h else None
             if side:
                 cand.setdefault((side, round(s.size * 2) / 2), []).append((s.y, pi, si))
@@ -211,7 +217,7 @@ def _running(pages: list[tuple[list[Span], float]]) -> list[set[int]]:
             ys = [y for y, p_, _si in group if p_ == pi]
             yc = sum(ys) / len(ys)
             others = [s.y for si, s in enumerate(sp)
-                      if (pi, si) not in passed and (pi, si) not in mine and abs(s.y - yc) > 2.0]
+                      if not s.blank and (pi, si) not in passed and (pi, si) not in mine and abs(s.y - yc) > 2.0]
             towards = [y - yc for y in others if y > yc] if side == "top" else [yc - y for y in others if y < yc]
             if not towards or min(towards) >= apart:
                 ok += 1
@@ -232,6 +238,8 @@ def _page_text(spans: list[Span], drop: set[int], by_line: bool) -> str:
     lines: dict[tuple, list[Span]] = {}
     for s in keep:
         lines.setdefault(s.line, []).append(s)
+    # a line is kept for its words: the spaces left over from a running header's line are not a line
+    lines = {k: ln for k, ln in lines.items() if any(not x.blank for x in ln)}
     items = sorted(((min(x.y for x in ln), min(x.x for x in ln), "".join(x.text for x in sorted(ln, key=lambda z: z.x)))
                     for ln in lines.values()), key=lambda t: (t[0], t[1]))
     rows: list[list[tuple[float, float, str]]] = []
@@ -319,8 +327,9 @@ def _toc_from_fonts(pages: list[tuple[list[Span], float]], drops: list[set[int]]
             txt = "".join(s.text for s in spans).strip()
             if not txt:
                 continue
-            size = max(s.size for s in spans)
-            bold = any(s.bold for s in spans)
+            words = [s for s in spans if not s.blank]
+            size = max(s.size for s in words)
+            bold = any(s.bold for s in words)
             sizes[size] += len(txt)
             lines.append((size, bold, txt))
         lines_per_page.append(lines)
