@@ -60,7 +60,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import pyads
 from pyads import constants as C
@@ -349,35 +349,94 @@ class Block:
 
     # N60: the counts below are integer arithmetic on 100 ns ticks — the native engine's units and formulas — so the
     # same file gives the same numbers in both (float ms made 3.0 periods read as 2.9999 → one sample less).
-    def missing(self, end_t: float | None = None, start_t: float | None = None) -> int:
+    #
+    # A block with fewer than two samples has no period of its own. It is not complete for that: the other blocks'
+    # smallest period (or the task cycle) stands in — the engine's step_of — and a block that never delivered misses the
+    # whole window, from `origin` (the window start, or the moment every delivering block had delivered) to the end.
+    # Returning 0 for such a block let a recording in which one block delivered once, or never, read as COMPLETE.
+    def period(self, fallback: float | None = None) -> float | None:
+        return self.min_step or fallback
+
+    def missing(self, end_t: float | None = None, start_t: float | None = None, *,
+                fallback: float | None = None, origin: float | None = None) -> int:
         """Holes between the first and last sample, plus the samples this block should have delivered before its first
         one (window start known: trigger − pre_trigger_ms) and after its last one (window end known: the stop's PLC
         time, duration / post-trigger cut, or the other blocks' last sample) — field report N11: a recording that went
         quiet halfway must not look complete. One period of allowance at the tail, none at the head."""
+        return (self.inner_missing() + self.tail_missing(end_t, fallback, origin)
+                + self.head_missing(start_t, fallback))
+
+    def inner_missing(self) -> int:
+        """Holes between the first and last sample (needs the block's own period: two samples or more)."""
         if self.samples < 2 or not self.min_step or self.first_t is None or self.last_t is None:
             return 0
         step = _ticks(self.min_step)
         if step <= 0:
             return 0
         expected = int(math.floor((_ticks(self.last_t) - _ticks(self.first_t)) / step + 0.5)) + 1   # llround
-        inner = max(0, expected - self.samples)
-        return inner + self.tail_missing(end_t) + self.head_missing(start_t)
+        return max(0, expected - self.samples)
 
-    def head_missing(self, start_t: float | None) -> int:
+    def head_missing(self, start_t: float | None, fallback: float | None = None) -> int:
         """Samples the window needed before this block's first one: floor((first − start) / period), as the engine."""
-        if start_t is None or not self.min_step or self.first_t is None or self.first_t <= start_t:
+        p = self.period(fallback)
+        if start_t is None or not p or self.first_t is None or self.first_t <= start_t:
             return 0
-        step = _ticks(self.min_step)
+        step = _ticks(p)
         return (_ticks(self.first_t) - _ticks(start_t)) // step if step > 0 else 0
 
-    def tail_missing(self, end_t: float | None) -> int:
+    def tail_missing(self, end_t: float | None, fallback: float | None = None, origin: float | None = None) -> int:
         """Samples missing after this block's last one up to the window end, one period of allowance:
         floor((end − last) / period) − 1, as the engine. No other allowance: a stop on request ends at a PLC time
-        both engines wait for (N56), so a block that ends early has lost samples."""
-        if end_t is None or not self.min_step or self.last_t is None or end_t <= self.last_t:
+        both engines wait for (N56), so a block that ends early has lost samples. A block that never delivered misses
+        the whole window: floor((end − origin) / period) + 1, as the engine."""
+        p = self.period(fallback)
+        step = _ticks(p) if p else 0
+        if end_t is None or step <= 0:
             return 0
-        step = _ticks(self.min_step)
-        return max(0, (_ticks(end_t) - _ticks(self.last_t)) // step - 1) if step > 0 else 0
+        if self.last_t is None:
+            if origin is None or end_t < origin:
+                return 0
+            return (_ticks(end_t) - _ticks(origin)) // step + 1
+        if end_t <= self.last_t:
+            return 0
+        return max(0, (_ticks(end_t) - _ticks(self.last_t)) // step - 1)
+
+
+def end_not_waited_for(footer: dict[str, Any]) -> bool:
+    """True when the file's window end is not a PLC time every block was waited for, so each block ended where its
+    notification happened to be and only the earliest block end is a time every block is known to have delivered:
+    - ≤ 0.8.9 native stop on request: manual_stop, with the LATEST block end written as window_end_ms (so a missing end
+      cannot be the test — that read every such file as a normal one and passed a short tail);
+    - Python without a window end: ≤ 0.8.9 stop on request, stop_when or max_events cut the queue at once; today only a
+      plain stop (start failure, fallback) or a file without a footer.
+    The present engines end a stop on request at a PLC time and say so (stop_on_request); native stop_when / max_events
+    end at the firing sample's time, which every block has reached (it writes in PLC order); Python waits for it."""
+    if footer.get("stop_on_request") or footer.get("stop_at"):
+        return False
+    if footer.get("manual_stop"):
+        return True
+    return footer.get("window_end_ms") is None
+
+
+def fallback_period(blocks: Iterable[Block], cycle_ms: float | None = None) -> float | None:
+    """The period that stands in for a block with fewer than two samples: the smallest period of the other blocks, else
+    the task cycle (the native engine's step_of)."""
+    steps = [b.min_step for b in blocks if b.min_step]
+    return min(steps) if steps else (cycle_ms or None)
+
+
+def window_origin(blocks: Iterable[Block], start: float | None) -> float | None:
+    """Where the window starts for a block that never delivered: the window start of a triggered recording, else the
+    moment every delivering block had its first sample (the native engine's origin)."""
+    if start is not None:
+        return start
+    firsts = [b.first_t for b in blocks if b.first_t is not None]
+    return max(firsts) if firsts else None
+
+
+def unprovable_blocks(blocks: Iterable[Block], fallback: float | None) -> list[int]:
+    """Blocks whose completeness cannot be shown at all: never delivered, or one sample with no period to judge it by."""
+    return [b.bid for b in blocks if b.samples == 0 or (b.samples < 2 and not b.period(fallback))]
 
 
 # ------------------------------------------------------------------ selection patterns (A5)
@@ -566,6 +625,7 @@ class Recording:
         # notifications stay until every block has delivered up to it (bounded), like the duration end (N13)
         self._recv_max_ts: int | None = None
         self.stop_at_cut = False
+        self.cut_by: str | None = None        # what set the end the blocks are waited for: request / stop_when / max_events
         self._stop_cut_mono: float | None = None
         self.stop_wait_ms: float | None = None
         self._tail_wait: float | None = None  # monotonic time the duration was reached (N13 tail wait)
@@ -847,13 +907,27 @@ class Recording:
             with self._lock:
                 for s in changed:
                     self._ingest_value(t, s.name, s.decode(data))
-        if ew is not None and ew.symbol in self.slot_of and self.slot_of[ew.symbol][0] is b:
+        ending = self._stop.is_set() or self.cut_by in ("stop_when", "max_events")
+        if not ending and ew is not None and ew.symbol in self.slot_of and self.slot_of[ew.symbol][0] is b:
             if ew.fires(self.slot_of[ew.symbol][1].decode(data)):
-                self.stop_reason = f"stop_when {ew.symbol} {ew.op} {ew.value}"
-                self._cut_now = True
-                self._stop.set()
-        if self.max_events and self.events >= self.max_events and not self._stop.is_set():
-            self.stop_reason = f"max_events {self.max_events}"
+                self._end_at_sample(t, f"stop_when {ew.symbol} {ew.op} {ew.value}", "stop_when")
+                ending = True
+        if not ending and self.max_events and self.events >= self.max_events:
+            self._end_at_sample(t, f"max_events {self.max_events}", "max_events")
+
+    def _end_at_sample(self, t: float, reason: str, by: str) -> None:
+        """stop_when / max_events fired on a block's sample at PLC time t. Cycle mode with several blocks: the recording
+        ends at t and every block is waited for up to it, as for a stop on request (N56). Samples arrive in ADS order,
+        not PLC order — another block's samples up to t can come up to max_delay_ms later — so cutting the queue at once
+        lost them and their blocks' tails read as missing. The native engine writes in PLC order, so its end is reached
+        by every block already. Otherwise stop now: what is queued lies after the end."""
+        self.stop_reason = self.stop_reason or reason      # the first reason stands, as in the native engine
+        if self.mode == "cycle" and len(self.blocks) > 1:
+            self._cut_t = t if self._cut_t is None else min(self._cut_t, t)
+            self._stop_cut_mono = time.monotonic()
+            self.stop_at_cut = True
+            self.cut_by = by
+        else:
             self._cut_now = True
             self._stop.set()
 
@@ -912,8 +986,8 @@ class Recording:
         if self._stop.is_set():
             return
         if self.stop_at_cut:
-            # N56: stop on request — every block delivers up to the stop's PLC time, or the wait (max_delay + 1 s)
-            # ends and what is missing is missing (tail, allowance 1)
+            # N56: stop on request / stop_when / max_events — every block delivers up to the end's PLC time, or the
+            # wait (max_delay + 1 s) ends and what is missing is missing (tail, allowance 1)
             waited = time.monotonic() - (self._stop_cut_mono or time.monotonic())
             if self._tail_reached(self._cut_t) or waited >= TAIL_WAIT_S + self.max_delay_ms / 1000.0:
                 self.stop_wait_ms = round(waited * 1000.0, 1)
@@ -942,10 +1016,13 @@ class Recording:
             self._stop.set()
 
     def _tail_reached(self, cut: float) -> bool:
-        """Every block that delivered at all has a sample within one period of the cut."""
+        """Every block has a sample within one period of the cut. A block that has not delivered (or delivered once,
+        period from the other blocks) is waited for like any other — until the caller's timeout; skipping it ended the
+        wait while its samples were still on their way, or hid that it never delivered."""
         if self.mode != "cycle" or not self.blocks:
             return True
-        return all(b.last_t is None or not b.min_step or b.tail_missing(cut) == 0 for b in self.blocks)
+        fb = self.fallback_period()
+        return all(b.last_t is not None and b.tail_missing(cut, fb) == 0 for b in self.blocks)
 
     def request_stop(self, reason: str = "requested", at_plc_time: bool = False) -> None:
         """at_plc_time (rec_stop): N56 — the recording ends at the newest PLC time received now; the notifications stay
@@ -964,6 +1041,7 @@ class Recording:
             self._cut_t = self._rel_ms(self._recv_max_ts)
             self._stop_cut_mono = time.monotonic()
             self.stop_at_cut = True
+            self.cut_by = "request"
             return
         self._stop.set()
 
@@ -991,13 +1069,14 @@ class Recording:
                     self._close_stall(max(we_ if we_ is not None else self.last_t, self._stall_adv_t or 0.0))
                 if self.mode == "cycle" and self.t0_wall is not None:
                     ws, we = self.window_start(), self.window_end()
+                    fb, org = self.fallback_period(), self.window_origin()
                     for b in self.blocks:
-                        h = b.head_missing(ws)
+                        h = b.head_missing(ws, fb)
                         if h > 0 and ws is not None and b.first_t is not None:
                             self._write_gap(b, "head", ws, b.first_t, h)
-                        tm = b.tail_missing(we)
+                        tm = b.tail_missing(we, fb, org)
                         if tm > 0 and we is not None:
-                            self._write_gap(b, "tail", b.last_t, we, tm)
+                            self._write_gap(b, "tail", b.last_t if b.last_t is not None else org, we, tm)
                 digest = self._sha.hexdigest()
                 footer = {"_footer": True, "events": self.events, "samples": self.samples,
                           "missing_samples": miss, "label": self.label(miss), "gap_markers": self.gap_markers,
@@ -1032,16 +1111,21 @@ class Recording:
             return "NOT_PROVABLE"
         miss = self.missing_samples() if miss is None else miss
         ok = (self.samples > 0 and not miss and not self.dropped and not self.dropped_on_stop and not self.unsubscribed
-              and (self.start_when is None or self.triggered_at is not None) and not self.stalled_now())
+              and (self.start_when is None or self.triggered_at is not None) and not self.stalled_now()
+              and not unprovable_blocks(self.blocks, self.fallback_period()))
         return "COMPLETE" if ok else "INCOMPLETE"
 
     def stop_and_trigger_notes(self) -> dict[str, Any]:
         """N56 / N61: what the end of a stop on request and the start_when warm-up did — in the footer and rec_status."""
         out: dict[str, Any] = {}
-        if self.stop_at_cut:
+        if self.stop_at_cut and self.cut_by == "request":
             out["stop_on_request"] = {"at_ms": self._cut_t, "waited_ms": self.stop_wait_ms,
                                       "rule": "ends at the newest PLC time received when the stop was asked for; every "
                                               "block must deliver up to it (allowance 1 period)"}
+        elif self.stop_at_cut:
+            out["stop_at"] = {"at_ms": self._cut_t, "waited_ms": self.stop_wait_ms, "by": self.cut_by,
+                              "rule": f"ends at the PLC time of the sample on which {self.cut_by} fired; every block "
+                                      "must deliver up to it (allowance 1 period)"}
         if self.trigger_delayed_ms is not None:
             out["trigger_delayed_ms"] = self.trigger_delayed_ms
             out["trigger_note"] = (f"start_when was already true at {self.warmup_true_at:.4f} ms, before every block had "
@@ -1075,11 +1159,18 @@ class Recording:
         lasts = [b.last_t for b in self.blocks if b.last_t is not None]
         return max(lasts) if lasts else None
 
+    def fallback_period(self) -> float | None:
+        return fallback_period(self.blocks, self.cycle_ms)
+
+    def window_origin(self) -> float | None:
+        return window_origin(self.blocks, self.window_start())
+
     def missing_samples(self) -> int | None:
         if self.mode != "cycle":
             return None
         end, start = self.window_end(), self.window_start()
-        return sum(b.missing(end, start) for b in self.blocks)
+        fb, org = self.fallback_period(), self.window_origin()
+        return sum(b.missing(end, start, fallback=fb, origin=org) for b in self.blocks)
 
     def completeness(self, live_estimate: float = 0.0) -> float | None:
         """Share of the window that is in the file as samples of a running PLC: stalled samples don't count, and
@@ -1098,10 +1189,14 @@ class Recording:
             d: dict[str, Any] = {"id": b.bid, "bytes": b.size, "symbols": len(b.slots), "first": b.slots[0].name if b.slots else None,
                                  "samples": b.samples}
             if self.mode == "cycle":
-                d.update({"missing_samples": b.missing(self.window_end(), self.window_start()),
-                          "missing_head": b.head_missing(self.window_start()), "missing_tail": b.tail_missing(self.window_end()),
+                ws, we, fb, org = self.window_start(), self.window_end(), self.fallback_period(), self.window_origin()
+                d.update({"missing_samples": b.missing(we, ws, fallback=fb, origin=org),
+                          "missing_head": b.head_missing(ws, fb), "missing_tail": b.tail_missing(we, fb, org),
                           "period_ms": None if b.min_step is None else round(b.min_step, 4),
                           "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
+                if b.samples < 2:
+                    d["period_note"] = ("never delivered: the whole window counts as missing" if b.samples == 0 else
+                                        "one sample: counted with the other blocks' period")
                 if self.active and b.last_wall is not None and b.min_step and (time.monotonic() - b.last_wall) * 1000 > max(500.0, 50 * b.min_step):
                     d["silent"] = True
                     d["silent_s"] = round(time.monotonic() - b.last_wall, 1)
@@ -1161,6 +1256,9 @@ class Recording:
             warn.append(f"{self.dropped + self.dropped_on_stop} samples LOST on this PC (backlog full / stop timeout)")
         if st["missing_samples"]:
             warn.append(f"{st['missing_samples']} samples missing in the PLC timeline (gaps between timestamps)")
+        quiet = [b.bid for b in self.blocks if b.samples == 0] if self.mode == "cycle" and self.samples else []
+        if quiet:
+            warn.append(f"block(s) {quiet} have not delivered a sample: their whole window counts as missing")
         if self.active and backlog > self.q.maxsize // 2:
             warn.append(f"ingest cannot keep up: backlog {backlog}/{self.q.maxsize} — fewer symbols, a larger cycle_ms or mode='change'")
         if self.unsubscribed:
@@ -2530,12 +2628,11 @@ class Recorder:
             ft_ = footer or {}
             end = ft_.get("window_end_ms")
             start = ft_.get("window_start_ms")
-            legacy_stop = bool(ft_.get("manual_stop")) and end is None
-            if end is None and ends:
-                # a stop without a PLC end time. Written by an engine before the stop at a PLC time (≤ 0.8.9 native,
-                # manual_stop): each block ended where its unsubscription happened to be, so the window ends at the
-                # earliest block end — the last time every block is known to have delivered. Otherwise the latest end.
-                end = min(ends.values()) if legacy_stop else max(ends.values())
+            legacy_stop = end_not_waited_for(ft_)
+            if legacy_stop and ends:
+                end = min(ends.values())
+            elif end is None and ends:
+                end = max(ends.values())
             if ends:
                 first_end = min(ends, key=lambda k: ends[k])
                 spread = max(ends.values()) - min(ends.values())
@@ -2544,26 +2641,36 @@ class Recorder:
                                      "ends_ms": {str(k): round(v, 4) for k, v in sorted(ends.items())}}
                 if legacy_stop:
                     out["tail_rule"] = (
-                        "stop on request by an engine that unsubscribed at once (no PLC end time in the footer): the "
+                        "the footer has no window end every block was waited for (a stop that cut the notifications at "
+                        "once — ≤ 0.8.9 stop on request, ≤ 0.8.9 Python stop_when / max_events, or no footer): the "
                         f"window is checked up to the earliest block end ({end:.4f} ms, block {first_end}); the "
                         f"{spread:g} ms after it differ per block and cannot be told from a loss")
                     if periods and spread > max(periods) + 1e-6:
                         out["inconclusive"] = (f"the blocks ended {spread:g} ms apart (more than one period): the last "
                                                f"{spread:g} ms of block(s) other than {first_end} are not verified")
+            fb = fallback_period(blocks.values(), header.get("cycle_ms"))
+            org = window_origin(blocks.values(), start)
             for b in blocks.values():
-                m = b.missing(end, start)
+                m = b.missing(end, start, fallback=fb, origin=org)
                 tot_s += b.samples
                 tot_m += m
-                rep.append({"block": b.bid, "first": b.slots[0].name if b.slots else None, "symbols": len(b.slots),
-                            "samples": b.samples, "missing": m, "missing_head": b.head_missing(start),
-                            "missing_tail": b.tail_missing(end),
-                            "end_ms": None if b.last_t is None else round(b.last_t, 4),
-                            "period_ms": None if b.min_step is None else round(b.min_step, 4),
-                            "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
+                row = {"block": b.bid, "first": b.slots[0].name if b.slots else None, "symbols": len(b.slots),
+                       "samples": b.samples, "missing": m, "missing_head": b.head_missing(start, fb),
+                       "missing_tail": b.tail_missing(end, fb, org),
+                       "end_ms": None if b.last_t is None else round(b.last_t, 4),
+                       "period_ms": None if b.min_step is None else round(b.min_step, 4),
+                       "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]}
+                if b.samples < 2:
+                    row["period_note"] = ("never delivered: the whole window counts as missing" if b.samples == 0 else
+                                          "one sample: counted with the other blocks' period")
+                rep.append(row)
+            unprovable = unprovable_blocks(blocks.values(), fb)
             out["timeline"] = {"samples": tot_s, "missing": tot_m, "window_start_ms": start, "window_end_ms": end,
                                "allowance": "1 period at the end of each block, none inside or at the start",
                                "completeness": round(tot_s / (tot_s + tot_m), 6) if tot_s + tot_m else None,
                                "blocks": rep[:50]}
+            if unprovable:
+                out["timeline"]["unprovable_blocks"] = unprovable[:50]
         elif header.get("mode") != "cycle":
             out["timeline"] = {"note": (
                 "change mode: the PLC sends a sample only when a value changes, so a quiet period cannot be told from a "
@@ -2628,6 +2735,9 @@ class Recorder:
         passed = (ok and not tl.get("missing") and cn.get("lossless", True) and not ft.get("dropped")
                   and not ft.get("dropped_on_stop") and not ft.get("overflow_samples") and not ft.get("stalls")
                   and ft.get("verdict_hint", "PASS") == "PASS"          # the engine's findings can only add a FAIL
+                  # Python writes only a label; a legacy stop's label counted the per-block stop skew as a loss
+                  and (ft.get("label") != "INCOMPLETE" or "tail_rule" in out)
+                  and not tl.get("unprovable_blocks")                   # a block that never delivered proves nothing
                   and not (tl.get("samples") == 0 and "blocks" in tl))  # nothing recorded is not a pass
         out["verdict"] = "FAIL" if not passed else ("INCONCLUSIVE" if out.get("inconclusive") else "PASS")
         return out

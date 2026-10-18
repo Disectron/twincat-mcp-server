@@ -725,6 +725,74 @@ def test_n60_tail_and_head_counts_are_integer_ticks_like_the_engine():
     assert b.missing(0.6, None) == 2
 
 
+def test_block_with_fewer_than_two_samples_is_counted_with_a_borrowed_period():
+    """Review B: a block with one sample or none has no period of its own — it was counted as 0 missing. The other
+    blocks' smallest period stands in (engine step_of); a block that never delivered misses the whole window."""
+    one = R.Block(1, 0x4040, 0, 4, [])
+    one.note_stamp(0.0)
+    assert one.missing(300.0, None) == 0                  # no period at all: nothing can be counted …
+    assert R.unprovable_blocks([one], None) == [1]        # … so nothing can be proven either
+    assert one.missing(300.0, None, fallback=10.0) == 29  # (300 − 0) // 10 − 1, the engine's tail rule
+    assert R.unprovable_blocks([one], 10.0) == []
+    none = R.Block(2, 0x4040, 64, 4, [])
+    assert none.missing(300.0, None, fallback=10.0, origin=0.0) == 31   # (300 − 0) // 10 + 1, the engine's rule
+    assert none.missing(300.0, None, fallback=10.0, origin=None) == 0
+    assert R.unprovable_blocks([none], 10.0) == [2]
+    b = R.Block(3, 0x4040, 128, 4, [])
+    for t in (0.0, 10.0, 20.0):
+        b.note_stamp(t)
+    assert R.fallback_period([one, none, b], 50.0) == 10.0 and R.fallback_period([one, none], 50.0) == 50.0
+    assert R.window_origin([one, none, b], None) == 0.0 and R.window_origin([b], -5.0) == -5.0
+
+
+@pytest.mark.parametrize("cc_samples", [0, 1])
+def test_python_recording_with_a_block_that_delivered_once_or_never_is_incomplete(rec, cc_samples):
+    """Review B: the Python recorder and rec_verify read a two-block recording as COMPLETE / PASS when one block
+    delivered a single sample or none; the native engine counts the window. Both must be INCOMPLETE / FAIL."""
+    st = _two_blocks(rec)
+    c = _conn()
+    for ms in range(0, 310, 10):
+        c.fire("MAIN.nCycle", ms // 10, ft(ms))
+        if cc_samples and ms == 0:
+            c.fire(CC, 0, ft(0))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 31 + cc_samples)
+    live = rec.status(st["id"])
+    assert live["label"].startswith("INCOMPLETE"), live
+    if not cc_samples:
+        assert any("have not delivered" in w for w in live["warnings"]), live["warnings"]
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    want = 31 if cc_samples == 0 else 29                  # whole window (end − origin) // 10 + 1, or the tail rule
+    assert footer["label"] == "INCOMPLETE" and footer["missing_samples"] == want, footer
+    v = rec.verify(st["id"])
+    blk = {b["first"]: b for b in v["timeline"]["blocks"]}
+    assert blk[CC]["missing_tail"] == want and "period_note" in blk[CC], blk
+    assert v["verdict"] == "FAIL", v
+    if not cc_samples:
+        assert v["timeline"]["unprovable_blocks"] == [blk[CC]["block"]]
+
+
+def test_python_stop_when_ends_at_the_firing_sample_and_waits_for_the_other_blocks(rec):
+    """Python stop_when cut the queue at once, but samples arrive in ADS order: the other block's samples up to the
+    firing PLC time were still on their way and its tail read as missing. The end is the firing sample's PLC time and
+    every block is waited for up to it (the native engine writes in PLC order, so it reaches that time already)."""
+    st = _two_blocks(rec, stop_when="MAIN.nCycle >= 20")
+    c = _conn()
+    for ms in range(0, 210, 10):
+        c.fire("MAIN.nCycle", ms // 10, ft(ms))          # stop_when fires at 200 ms …
+    assert wait_until(lambda: rec.recs[st["id"]].stop_at_cut)
+    for ms in range(0, 310, 10):
+        c.fire(CC, ms // 10, ft(ms))                      # … the counter block's batch arrives afterwards
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
+    out = rec.stop(st["id"])
+    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer["window_end_ms"] == 200.0 and footer["stop_at"]["by"] == "stop_when", footer
+    assert footer["label"] == "COMPLETE" and footer["missing_samples"] == 0 and footer["after_limit"] == 10, footer
+    assert footer["stop_reason"].startswith("stop_when")
+    v = rec.verify(st["id"])
+    assert v["verdict"] == "PASS" and "tail_rule" not in v, v
+
+
 def test_n56_python_stop_on_request_ends_at_a_plc_time_and_a_block_that_stopped_early_fails(rec):
     """N56 (Python engine): rec_stop ends at the newest PLC time received; every block must reach it. A block that
     stopped delivering 100 ms before the stop has lost those samples — FAIL, in the footer and in rec_verify."""
@@ -758,10 +826,18 @@ def test_n56_python_lossless_stop_on_request_passes_with_allowance_one(rec):
     assert v["verdict"] == "PASS" and v["timeline"]["window_end_ms"] == 300.0 and v["block_ends"]["spread_ms"] == 0
 
 
-def test_n56_verify_of_a_legacy_stop_without_plc_end_is_inconclusive_not_pass(rec, monkeypatch):
-    """A file written by an engine that unsubscribed at once (≤ 0.8.9 native: manual_stop, no window end): the blocks
-    end where their unsubscription happened to be. rec_verify checks up to the earliest end and says the rest is
-    not verified — it does not lend the engine's max_delay allowance (900 lost samples passed)."""
+@pytest.mark.parametrize("legacy_footer", [
+    # ≤ 0.8.9 native: manual_stop, and the LATEST block end as window_end_ms (review B: the old test set the end to
+    # None, which no real file has, so the legacy rule was never reached for a real 0.8.9 file)
+    {"engine": "native", "manual_stop": True, "window_end_ms": 300.0, "max_delay_ms": 1000.0, "verdict_hint": "PASS",
+     "label": "COMPLETE"},
+    # ≤ 0.8.9 Python: no window end, no stop_on_request
+    {"engine": "python", "window_end_ms": None, "stop_on_request": None},
+])
+def test_n56_verify_of_a_legacy_stop_without_plc_end_is_inconclusive_not_pass(rec, monkeypatch, legacy_footer):
+    """A file written by an engine that unsubscribed at once (≤ 0.8.9): the blocks end where their unsubscription
+    happened to be. rec_verify checks up to the earliest end and says the rest is not verified — it does not lend
+    the engine's max_delay allowance (900 lost samples passed)."""
     st = _two_blocks(rec)
     c = _conn()
     for ms in range(0, 310, 10):
@@ -775,14 +851,22 @@ def test_n56_verify_of_a_legacy_stop_without_plc_end_is_inconclusive_not_pass(re
 
     def legacy(path):
         out = real(path)
-        out["_footer_raw"] = {**(out["_footer_raw"] or {}), "manual_stop": True, "window_end_ms": None,
-                              "max_delay_ms": 1000.0, "verdict_hint": "PASS"}
+        out["_footer_raw"] = {**(out["_footer_raw"] or {}), **legacy_footer}
         return out
     monkeypatch.setattr(rec, "_integrity", legacy)
     v = rec.verify(st["id"])
     assert v["timeline"]["window_end_ms"] == 200.0 and v["timeline"]["missing"] == 0
     assert v["verdict"] == "INCONCLUSIVE" and "100 ms" in v["inconclusive"], v
     assert v["block_ends"]["spread_ms"] == 100.0
+
+
+def test_n56_present_engines_footers_are_not_legacy():
+    assert not R.end_not_waited_for({"engine": "native", "manual_stop": False, "window_end_ms": 300.0})
+    assert not R.end_not_waited_for({"manual_stop": True, "stop_on_request": {"at_ms": 3.0}, "window_end_ms": 3.0})
+    assert not R.end_not_waited_for({"engine": "python", "window_end_ms": 3.0, "stop_at": {"by": "stop_when"}})
+    assert not R.end_not_waited_for({"engine": "python", "window_end_ms": 1000.0})           # duration cut
+    assert R.end_not_waited_for({"engine": "native", "manual_stop": True, "window_end_ms": 300.0})
+    assert R.end_not_waited_for({})                                                           # no footer
 
 
 def test_n57_n63_python_trigger_keeps_the_trigger_cycle_when_the_trigger_block_is_batched(rec):
