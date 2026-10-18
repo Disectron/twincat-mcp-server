@@ -150,3 +150,26 @@ def test_nest_builds_the_decode_tree_shape_from_leaf_values():
     vals = {"G.a[1,1].x": 1, "G.a[1,2].x": 2, "G.a[2,1].x": 3, "G.a[2,2].x": 4, "G.s.t[-1]": "m", "G.s.t[0]": "z"}
     assert _nest("G", vals) == {"a": [[{"x": 1}, {"x": 2}], [{"x": 3}, {"x": 4}]], "s": {"t": ["m", "z"]}}
     assert _nest("G.n", {"G.n": 5}) == 5
+
+
+def test_write_guard_follows_the_alias_chain_like_the_dump():
+    """Review B: unwritable_reason checked only the entry's own flags, so TYPE PT_X : POINTER TO FB_X (an address the
+    dump already shows as one) was writable as a number; an alias of an interface too."""
+    from twincat_mcp.ads_backend import AdsBackend
+    from twincat_mcp.ads_types import F_METHODINFOS, DtEntry, TypeSystem
+    from twincat_mcp.config import AdsConfig
+    fb = DtEntry("FB_X", "", 400, 0, 65, 0, "", [], [DtEntry("n", "UDINT", 4, 0, 19, 0, "")])
+    alias = DtEntry("PT_X", "POINTER TO FB_X", 8, 0, 21, 0, "")
+    alias2 = DtEntry("PT_Y", "PT_X", 8, 0, 21, 0, "")
+    itf = DtEntry("I_Run", "", 8, 0, 65, F_METHODINFOS, "")
+    itf_alias = DtEntry("T_Run", "I_Run", 8, 0, 65, 0, "")
+    ts = TypeSystem({e.name.lower(): e for e in (fb, alias, alias2, itf, itf_alias,
+                                                 DtEntry("UDINT", "", 4, 0, 19, 0, ""))})
+    ads = AdsBackend(AdsConfig(ams_net_id="5.1.2.3.1.1"))
+    ads.typesystem = lambda *a, **k: ts                     # type: ignore[method-assign]
+    assert ts.indirect_kind(alias2) == "pointer" and ts.indirect_kind(itf_alias) == "interface"
+    r = ads.unwritable_reason("PT_Y", 8)
+    assert r and "POINTER" in r and "alias of PT_X" in r, r
+    assert "INTERFACE" in (ads.unwritable_reason("T_Run", 8) or "")
+    assert "POINTER" in (ads.unwritable_reason("ARRAY [1..4] OF PT_X", 32) or "")
+    assert ads.unwritable_reason("UDINT", 4) is None and ads.unwritable_reason("FB_X", 400) is None

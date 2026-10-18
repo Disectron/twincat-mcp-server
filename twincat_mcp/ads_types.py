@@ -250,24 +250,39 @@ class TypeSystem:
         FB_TestSuite entry carries the pointee as its base type and was expanded as the whole FB at the pointer's
         8 bytes — fabricated members, 4.7 GB of JSON for 1,000 pointers). N50: the alias chain is followed, so
         TYPE PT_X : POINTER TO FB_X (and an alias of that) is an indirection too."""
-        if type_name and _RE_INDIRECT.match(type_name):
-            return True
+        return self.indirect_kind(e, type_name) is not None
+
+    def indirect_kind(self, e: DtEntry | None, type_name: str | None = None) -> str | None:
+        """'pointer' / 'reference' / 'interface' / 'tccom interface' when the value is an address (see is_indirect,
+        the alias chain followed), else None. One rule for the dump, the decoder and the write guard."""
+        def by_text(t: str | None) -> str | None:
+            m = _RE_INDIRECT.match(t or "")
+            return m.group(1).lower() if m else None
+        k = by_text(type_name)
+        if k:
+            return k
         cur, hops = e, 0
         while cur is not None and hops <= 16:
-            if cur.flags & F_REFERENCETO or is_interface(cur):
-                return True
-            if cur.name and _RE_INDIRECT.match(cur.name):
-                return True
+            if cur.flags & F_TCCOMIFACEPTR:
+                return "tccom interface"
+            if cur.flags & F_REFERENCETO:
+                return "reference"
+            if is_interface(cur):
+                return "interface"
+            k = by_text(cur.name)
+            if k:
+                return k
             # a struct, an array (its type is the ELEMENT type), an enum or a base type: not an alias
             if cur.subitems or cur.dims or cur.enum or not cur.type or cur.type.lower() == cur.name.lower():
-                return False
-            if _RE_INDIRECT.match(cur.type):
-                return True                                    # TYPE PT_X : POINTER TO FB_X
+                return None
+            k = by_text(cur.type)
+            if k:
+                return k                                       # TYPE PT_X : POINTER TO FB_X
             nxt = self.get(cur.type)
             if cur.size in (4, 8) and nxt is not None and (nxt.size or 0) > cur.size and (nxt.subitems or nxt.dims):
-                return True          # a pointer-sized "alias" of a bigger structured type is an indirection
+                return "pointer"     # a pointer-sized "alias" of a bigger structured type is an indirection
             cur, hops = nxt, hops + 1                          # follow the alias: TYPE A : B
-        return False
+        return None
 
     # ---------------------------------------------------------------- expand
     def leaves(self, root_path: str, type_name: str, max_leaves: int = 200_000,

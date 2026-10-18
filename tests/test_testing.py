@@ -45,6 +45,17 @@ def test_expect_now_and_within(bench):
         bench.expect([])
 
 
+def test_expect_on_a_null_pointer_matches_null_and_zero(bench):
+    """Review B: a NULL pointer now reads as the address 0x0000000000000000 (N51), so expect(value=None) on it failed;
+    an address is compared as an address: None / 'NULL' / 0 / '0x0' / '16#0' all name the address 0."""
+    assert bench.ads.read("PRG_Test.pData")["value"] == "0x0000000000000000"
+    for want in (None, "NULL", 0, "0x0", "16#0"):
+        r = bench.expect([{"symbol": "PRG_Test.pData", "op": "==", "value": want}])
+        assert r["pass"], (want, r)
+    r = bench.expect([{"symbol": "PRG_Test.pData", "op": "!=", "value": None}])
+    assert not r["pass"], r
+
+
 def test_stable(bench):
     r = bench.assert_stable("MAIN.stRecipe.rTargetKg", duration_ms=60, tolerance=0.01, interval_ms=5)
     assert r["stable"] and r["spread"] == 0

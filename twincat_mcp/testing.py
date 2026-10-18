@@ -45,6 +45,31 @@ class TestError(RuntimeError):
     pass
 
 
+def _address(v: Any, expected: bool = True) -> Any:
+    """A pointer / reference / interface value as an integer address: '0x00C0FFEE', '16#C0FFEE', 12648430 → the int.
+    An expected None / 'NULL' is the address 0: a NULL pointer reads as 0x0…0 (N51), and an expectation written as
+    null must still match it — comparing the string '0x0000000000000000' with None failed every such check. An actual
+    None (no value read) stays None."""
+    if v is None:
+        return 0 if expected else None
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        t = v.strip().replace("_", "")
+        try:
+            if t.upper() in ("NULL", ""):
+                return 0
+            if t[:2].lower() == "0x":
+                return int(t, 16)
+            if t.startswith("16#"):
+                return int(t[3:], 16)
+            if t.isdigit():
+                return int(t)
+        except ValueError:
+            return v
+    return v
+
+
 def _raw(v: Any) -> Any:
     """Decoded value → comparable raw (TIME dict → ms, etc.)."""
     if isinstance(v, dict):
@@ -79,7 +104,20 @@ class TestBench:
         self.snapshot_dir = snapshot_dir
 
     # ------------------------------------------------------------ expectations
+    def _is_address(self, symbol: str) -> bool:
+        """POINTER TO / REFERENCE TO / INTERFACE (the alias chain followed): the value is an address."""
+        s = self.ads.symbol_info(symbol)
+        if T.parse_type(s.type, s.size).kind == "pointer":
+            return True
+        try:
+            ts = self.ads.typesystem(False)
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(ts is not None and ts.is_indirect(ts.get(s.type), s.type))
+
     def _encode_expected(self, symbol: str, value: Any) -> Any:
+        if self._is_address(symbol):
+            return [_address(v) for v in value] if isinstance(value, (list, tuple)) else _address(value)
         s = self.ads.symbol_info(symbol)
         tt = T.parse_type(s.type, s.size)
 
@@ -109,7 +147,8 @@ class TestBench:
         for ch in checks:
             if "symbol" not in ch or "op" not in ch or "value" not in ch:
                 raise TestError(f"check needs symbol/op/value: {ch}")
-            prepared.append({**ch, "_exp": self._encode_expected(ch["symbol"], ch["value"])})
+            prepared.append({**ch, "_exp": self._encode_expected(ch["symbol"], ch["value"]),
+                             "_addr": self._is_address(ch["symbol"])})
         names = [c["symbol"] for c in prepared]
         t0 = time.perf_counter()
         deadline = t0 + within_ms / 1000.0
@@ -122,7 +161,8 @@ class TestBench:
             for i, c in enumerate(prepared):
                 v = vals.get(c["symbol"])
                 last[c["symbol"]] = v
-                ok = not (isinstance(v, dict) and "error" in v) and _cmp(c["op"], v, c["_exp"], c.get("tolerance"))
+                ok = not (isinstance(v, dict) and "error" in v) and _cmp(c["op"], _address(v, False) if c["_addr"] else v,
+                                                                         c["_exp"], c.get("tolerance"))
                 if ok and i not in met_at:
                     met_at[i] = now
                 if not ok:

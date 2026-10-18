@@ -685,15 +685,29 @@ class ProjectIndex:
         return {"file": u.file, "changed": changed, "backup": str(bak), "eol": "CRLF" if eol == "\r\n" else "LF", "bom": bom}
 
     # -- tasks (N62) ------------------------------------------------------------------------------------------
+    def _plc_of(self, path: str | Path) -> str | None:
+        """The PLC project (its .plcproj file) a file belongs to: the nearest folder above it holding a .plcproj."""
+        dirs = {Path(pp["file"]).parent.resolve(): pp["file"] for pp in self.plcproj if pp.get("file")}
+        try:
+            here = Path(path).resolve()
+        except OSError:
+            return None
+        for d in here.parents:
+            if d in dirs:
+                return dirs[d]
+        return None
+
     def task_config(self) -> dict[str, dict[str, Any]]:
-        """The PLC tasks of the project from its *.TcTTO files: {task: {"cycle_ms": float | None, "programs": [...],
-        "file": path}}. CycleTime in a .TcTTO is in microseconds; the programs are the task's PouCall entries."""
+        """The PLC tasks of the project from its *.TcTTO files: {file: {"name", "cycle_ms": float | None,
+        "programs": [...], "plc_project": .plcproj | None, "file"}}. Keyed by file: two PLC projects can each have a
+        task of the same name (PlcTask), and keying by name dropped one of them. CycleTime in a .TcTTO is in
+        microseconds; the programs are the task's PouCall entries."""
         self._ensure()
         out: dict[str, dict[str, Any]] = {}
         if self.root is None:
             return out
         for f in sorted(self.root.rglob("*.TcTTO")) + sorted(self.root.rglob("*.tctto")):
-            if "_Boot" in f.parts or any(v.get("file") == str(f) for v in out.values()):
+            if "_Boot" in f.parts or str(f) in out:
                 continue
             try:
                 task = ET.fromstring(f.read_text(encoding="utf-8-sig", errors="replace")).find("Task")
@@ -703,29 +717,37 @@ class ProjectIndex:
                 continue
             ct = (task.findtext("CycleTime") or "").strip()
             progs = [(c.findtext("Name") or "").strip() for c in task.findall("PouCall")]
-            out[task.get("Name") or f.stem] = {"cycle_ms": int(ct) / 1000.0 if ct.isdigit() else None,
-                                               "programs": [p for p in progs if p], "file": str(f)}
+            out[str(f)] = {"name": task.get("Name") or f.stem, "cycle_ms": int(ct) / 1000.0 if ct.isdigit() else None,
+                           "programs": [p for p in progs if p], "plc_project": self._plc_of(f), "file": str(f)}
         return out
 
-    def tasks_of(self, unit_name: str) -> list[str] | None:
+    def tasks_of(self, unit_name: str) -> list[dict[str, Any]] | None:
         """The tasks that run a PROGRAM: it is in a task's PouCall, or a program of that task calls it (transitively,
-        from its body, actions and methods). [] when the name is no program (a GVL, an FB type: no owner of its own);
-        None when the project has no task configuration to tell."""
+        from its body, actions and methods) — only tasks and programs of the program's own PLC project. Each task:
+        {"name", "cycle_ms", "plc_project"}. [] when the name is no program (a GVL, an FB type: no owner of its own);
+        None when the project cannot tell: no task configuration, or the name exists in several files (MAIN in two
+        PLC projects — which one the recording reads is not known here)."""
         tasks = self.task_config()
         if not tasks:
             return None
-        u = self.units.get(unit_name.lower())
+        key = unit_name.lower()
+        if key in self.duplicates:
+            return None
+        u = self.units.get(key)
         if u is None or u.kind != "PROGRAM":
             return []
-        progs = {k: v for k, v in self.units.items() if v.kind == "PROGRAM"}
+        plc = self._plc_of(u.file)
+        progs = {k: v for k, v in self.units.items() if v.kind == "PROGRAM" and self._plc_of(v.file) == plc}
         calls: dict[str, set[str]] = {}       # program → programs it calls
-        for key in progs:
+        for k in progs:
             body = " ".join(x.implementation for x in self.units.values()
-                            if x.name.lower() == key or (x.parent or "").lower() == key)
+                            if x.name.lower() == k or (x.parent or "").lower() == k)
             code = "\n".join(_strip_comments_line(ln) for ln in body.splitlines())
-            calls[key] = {o for o in progs if o != key and re.search(r"\b" + re.escape(progs[o].name) + r"\s*[(.]", code, re.I)}
+            calls[k] = {o for o in progs if o != k and re.search(r"\b" + re.escape(progs[o].name) + r"\s*[(.]", code, re.I)}
         owners = []
-        for tname, t in tasks.items():
+        for t in tasks.values():
+            if t["plc_project"] != plc:
+                continue
             seen: set[str] = set()
             todo = [p.lower() for p in t["programs"]]
             while todo:
@@ -734,8 +756,8 @@ class ProjectIndex:
                     continue
                 seen.add(p)
                 todo.extend(calls.get(p, ()))
-            if unit_name.lower() in seen:
-                owners.append(tname)
+            if key in seen:
+                owners.append({"name": t["name"], "cycle_ms": t["cycle_ms"], "plc_project": t["plc_project"]})
         return owners
 
     def read_file(self, rel_or_abs: str, max_chars: int = 200_000) -> dict[str, Any]:

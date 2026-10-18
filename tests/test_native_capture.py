@@ -722,3 +722,21 @@ def test_n61_native_level_trigger_true_only_during_the_warmup_is_reported(captur
     finally:
         s.close()
     assert f["triggered_at_ms"] == 4.0 and f["trigger_delayed_ms"] == 4.0 and "already true" in f["trigger_note"], f
+
+
+def test_native_warmup_truth_that_lapsed_is_not_reported_as_a_delayed_trigger(capture_exe, tmp_path):
+    """Review B: true during the warm-up, false once every block delivered, true again much later — the fire is a new
+    truth. It was reported as 'already true … fired on the first cycle all blocks delivered' with the whole quiet
+    time as trigger_delayed_ms. The byte at offset 4 of a 5-byte sim block is the cycle as u8: ≤ 2 at 0–2, again at 256."""
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "warm", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 5, "leaves": 1},
+                                                 {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4, "leaves": 1}],
+                              start_when={"block": 0, "off": 4, "type": "u8", "op": "<=", "value": 2},
+                              post_trigger_s=0.01, sim={"speed": 50, "late": [[1, 5]]}))
+        assert r["ok"], r
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    assert f["triggered_at_ms"] == 256.0 and "trigger_delayed_ms" not in f, f
+    assert f["start_when_warmup_true_ms"] == 0.0 and "when it was true again" in f["trigger_note"], f

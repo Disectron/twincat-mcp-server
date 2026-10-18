@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from twincat_mcp.config import AdsConfig
@@ -343,8 +345,9 @@ def test_n39_ads_leaves_and_read_full_read_big_symbols_in_pieces(ads, monkeypatc
     _add_symbols(monkeypatch, [("GVL_Big.aBlk", arr.name, 320_000, image)], [blk, arr, s79])
     FakeConnection.max_read_bytes = 300_000
     s, lv = ads.leaves("GVL_Big.aBlk", 10_000)
-    vals = ads.leaf_values(s, lv)
+    vals, notes = ads.leaf_values(s, lv)
     assert vals["GVL_Big.aBlk[3277].sName"] == "blk3277" and vals["GVL_Big.aBlk[4000].sName"] == "blk4000"
+    assert not notes
     full = ads.read_full("GVL_Big.aBlk", max_bytes=1_000_000)
     assert full["size"] == 320_000
     assert max(n for name, _o, n in FakeConnection.read_log if name == "GVL_Big.aBlk") <= 256 * 1024
@@ -472,3 +475,82 @@ def test_n55_a_cancel_stops_inside_a_root(ads, tmp_path, monkeypatch):
     with pytest.raises(AdsError, match="cancelled"):
         ads.dump("GVL_C.*", False, str(tmp_path), cancel=ev)
     assert len(seen) < 300, len(seen)                 # stopped within the root, not after it
+
+
+def test_dump_names_are_unique_and_a_finished_file_is_never_overwritten(ads, tmp_path, monkeypatch):
+    """Review B: dump-<second>.json/.csv — two dumps in the same second wrote the same .partial files and the second
+    replaced the first's finished files. Names are reserved exclusively; a target that appears meanwhile is not
+    overwritten; a rollback that fails is reported as a partial commit, not as 'nothing kept'."""
+    import os
+    from twincat_mcp.server import dump_timeout_message
+    monkeypatch.setattr(time, "strftime", lambda fmt, *a: "20261018-101500")
+    out = tmp_path / "d"
+    a = ads.dump("MAIN.*", False, str(out))
+    b = ads.dump("MAIN.*", False, str(out))
+    assert a["json"] != b["json"] and a["csv"] != b["csv"] and b["json"].endswith("dump-20261018-101500-2.json"), b
+    assert os.path.isfile(a["json"]) and os.path.isfile(b["json"])
+    # a file with the reserved name appears while the dump runs (another program): it is not replaced
+    real = ads._dump
+
+    def squat(*args, **kw):
+        r = real(*args, **kw)
+        (out / "dump-20261018-101500-3.csv").write_text("theirs", encoding="utf-8")
+        return r
+    monkeypatch.setattr(ads, "_dump", squat)
+    with pytest.raises(AdsError, match="not overwritten"):
+        ads.dump("MAIN.*", False, str(out))
+    assert (out / "dump-20261018-101500-3.csv").read_text(encoding="utf-8") == "theirs"
+    assert not list(out.glob("*.partial"))
+    monkeypatch.setattr(ads, "_dump", real)
+    # the JSON rename fails and so does moving the CSV back: say what is where, remove nothing
+    rep = os.replace
+    calls = []
+
+    def json_and_back_fail(src, dst):
+        calls.append((src, dst))
+        if len(calls) >= 2:
+            raise OSError("locked")
+        return rep(src, dst)
+    monkeypatch.setattr(os, "replace", json_and_back_fail)
+    with pytest.raises(AdsError, match="PARTIAL commit") as ei:
+        ads.dump("MAIN.*", False, str(tmp_path / "p"))
+    monkeypatch.setattr(os, "replace", rep)
+    left = sorted(p.name for p in (tmp_path / "p").iterdir())
+    assert left == ["dump-20261018-101500.csv", "dump-20261018-101500.json.partial"], left
+    st = ads.dump_outcome()
+    assert st["phase"] == "partial" and "PARTIAL" in dump_timeout_message(st, 900), st
+    assert "json.partial" in str(ei.value)
+
+
+def test_leaf_values_reads_the_head_of_a_value_that_is_not_expanded_and_never_past_the_symbol(ads, monkeypatch,
+                                                                                              tmp_path):
+    """Review B: leaf_values read lf.size for a leaf that is not expanded (a whole 8 MiB buffer for a 64-byte preview)
+    and skipped a leaf the datatype table places past the symbol's end without a word; the dump read such a leaf from
+    the next variable's bytes."""
+    import dataclasses
+    from tests.fake_ads import FakeConnection, _dt
+    ring = _dt("ARRAY [0..8388607] OF BYTE", "BYTE", 8 * 1024 * 1024, dtype=17, dims=[(0, 8 * 1024 * 1024)])
+    _add_symbols(monkeypatch, [("GVL_R.aRing", ring.name, 8 * 1024 * 1024, bytes(range(256)) * 32768)], [ring])
+    s, lv = ads.leaves("GVL_R.aRing", 100)
+    assert len(lv) == 1 and lv[0].not_expanded
+    FakeConnection.read_log.clear()
+    vals, notes = ads.leaf_values(s, lv)
+    assert sum(n for name, _o, n in FakeConnection.read_log if name == "GVL_R.aRing") <= 1024, FakeConnection.read_log
+    assert "not expanded" in notes["GVL_R.aRing"]
+    # a leaf past the end of the symbol: no value, a note — never the neighbour's bytes
+    past = dataclasses.replace(lv[0], path="GVL_R.aRing.x", offset=8 * 1024 * 1024 - 2, size=4, elements=None)
+    vals, notes = ads.leaf_values(s, [past])
+    assert vals["GVL_R.aRing.x"] is None and "outside GVL_R.aRing" in notes["GVL_R.aRing.x"], notes
+    # the dump: that leaf gets a note row, the root's other leaves are still read
+    import csv as _csv
+    from twincat_mcp.ads_types import TypeSystem
+    real = TypeSystem.leaves
+
+    def plus_past(self, name, *a, **kw):
+        got = real(self, name, *a, **kw)
+        return got + [past] if name == "GVL_R.aRing" else got
+    monkeypatch.setattr(TypeSystem, "leaves", plus_past)
+    res = ads.dump("GVL_R.*", False, str(tmp_path / "d"))
+    rows = {r[0]: r for r in _csv.reader(open(res["csv"], encoding="utf-8"))}
+    assert "outside GVL_R.aRing" in rows["GVL_R.aRing.x"][3] and rows["GVL_R.aRing.x"][2] == "", rows
+    assert "not expanded" in rows["GVL_R.aRing"][3] and not res.get("failed_roots"), res

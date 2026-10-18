@@ -565,12 +565,18 @@ void Engine::process(size_t b, int64_t ft, const uint8_t* d, uint32_t n) {
         }
         const bool all_live = armed_seen_n_ >= blocks_.size() || ft - armed_t0_ > 2000000;
         bool fire = false;
-        if (start_when_.block == b && start_when_.fires(d, n)) {
-            if (start_when_.edge || all_live) {
-                fire = true;
-            } else if (!have_warm_true_) {
-                have_warm_true_ = true;        // N61: true before every block delivered — remembered, reported
-                warm_true_ft_ = ft;
+        if (start_when_.block == b) {
+            if (start_when_.fires(d, n)) {
+                if (start_when_.edge || all_live) {
+                    fire = true;
+                } else if (!have_warm_true_) {
+                    have_warm_true_ = true;        // N61: true before every block delivered — remembered, reported
+                    warm_true_ft_ = ft;
+                }
+            } else if (all_live && have_warm_true_) {
+                // false once every block delivered: the warm-up truth is over. A later fire is a new truth, not the
+                // warm-up's delayed (reporting it as "delayed by" the whole quiet time was false)
+                warm_lapsed_ = true;
             }
         }
         if (fire) {
@@ -920,13 +926,17 @@ void Engine::finish() {
     f.raw("window_start_ms", have_ws_ && have_t0_ ? ms(ws_) : "null");
     f.raw("window_end_ms", have_end && have_t0_ ? ms(end) : "null");
     if (triggered_) f.raw("triggered_at_ms", ms(trig_ft_));
-    if (triggered_ && have_warm_true_) {
+    if (triggered_ && have_warm_true_ && !warm_lapsed_) {
         f.raw("trigger_delayed_ms", jnum(double(trig_ft_ - warm_true_ft_) / 1e4, 6));
         f.str("trigger_note", "start_when was already true at " + ms(warm_true_ft_) + " ms, before every block had "
               "delivered; it fired on the first cycle all blocks delivered (the window cannot start before a block's "
               "first sample)");
+    } else if (triggered_ && have_warm_true_ && have_t0_) {
+        f.str("trigger_note", "start_when was true at " + ms(warm_true_ft_) + " ms during the warm-up (before every "
+              "block had delivered) and false afterwards; it fired at " + ms(trig_ft_) + " ms, when it was true again");
     }
-    if (start_when_.set && !triggered_ && have_warm_true_ && have_t0_) f.raw("start_when_warmup_true_ms", ms(warm_true_ft_));
+    if (start_when_.set && have_warm_true_ && have_t0_ && (!triggered_ || warm_lapsed_))
+        f.raw("start_when_warmup_true_ms", ms(warm_true_ft_));
     if (stop_on_request_ && have_t0_) {
         JObj so;
         so.raw("at_ms", ms(cut_)).d("waited_ms", stop_wait_ms_, 3)
@@ -995,7 +1005,7 @@ std::string Engine::status() {
     if (!resub_error_.empty()) o.str("resubscribe_error", resub_error_);
     if (have_warm_true_ && have_t0_) {
         o.raw("start_when_warmup_true_ms", ms(warm_true_ft_));
-        if (triggered_) o.raw("trigger_delayed_ms", jnum(double(trig_ft_ - warm_true_ft_) / 1e4, 6));
+        if (triggered_ && !warm_lapsed_) o.raw("trigger_delayed_ms", jnum(double(trig_ft_ - warm_true_ft_) / 1e4, 6));
     }
     if (stop_cut_pending_.load() && have_t0_) o.raw("stopping_at_ms", ms(cut_));
     if (stop_reason_.empty()) o.null("stop_reason");

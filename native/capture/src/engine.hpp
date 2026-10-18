@@ -171,6 +171,7 @@ private:
     // that never fires says it was true then (and false afterwards) instead of nothing
     bool have_warm_true_ = false;
     int64_t warm_true_ft_ = 0;
+    bool warm_lapsed_ = false;   // … and false on a cycle every block delivered: a later fire is not that warm-up truth
     uint64_t samples_ = 0, events_ = 0, after_limit_ = 0;
     int64_t last_emitted_ = 0;
     bool any_emitted_ = false;

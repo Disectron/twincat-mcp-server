@@ -499,24 +499,37 @@ class AdsBackend:
                 break
         return out
 
-    def leaf_values(self, root: SymbolEntry, leaves: list[Leaf], port: int | None = None) -> dict[str, Any]:
-        """Decode every leaf of the root symbol → {path: value}. Read through _RootReader like ads_dump (N39): bounded
-        chunks, only up to the last byte a leaf needs — a big root is never one ADS request (1802 out of memory)."""
+    def leaf_values(self, root: SymbolEntry, leaves: list[Leaf],
+                    port: int | None = None) -> tuple[dict[str, Any], dict[str, str]]:
+        """Decode every leaf of the root symbol → ({path: value}, {path: note}). Read through _RootReader like ads_dump
+        (N39): bounded chunks, only the bytes a leaf needs — the head of a value that is not expanded (reading its full
+        size read a whole 8 MiB buffer for a 64-byte preview) — so a big root is never one ADS request. A leaf whose
+        value is not given says why in the notes (it was dropped without a word)."""
         c = self.conn(port)
         ts = self.typesystem(False, port)
-        need = max((lf.offset + lf.size for lf in leaves if lf.size > 0), default=0)
+        need = max((lf.offset + lf.need for lf in leaves if lf.size > 0), default=0)
         reader = _RootReader(c, root, lambda: False, need_end=need or None)
         out: dict[str, Any] = {}
+        notes: dict[str, str] = {}
         for lf in leaves:
-            if lf.size <= 0 or lf.offset + lf.size > max(root.size, 1):
+            if lf.size <= 0:
+                out[lf.path] = None
+                notes[lf.path] = _leaf_note(lf, None)
                 continue
             try:
-                raw = reader.get(lf.offset, lf.size)
+                raw = reader.get(lf.offset, lf.need)
+            except _OutsideRoot as exc:
+                out[lf.path] = None
+                notes[lf.path] = str(exc)
+                continue
             except _ReadFailed as exc:
                 raise AdsError(f"read {root.name!r}: {exc}") from exc
             z = _at_zero(lf)
-            out[lf.path] = ts.decode_leaf(raw, z) if ts is not None else TypeSystem._decode_scalar(raw, 0, lf.type, None, None)
-        return out
+            val = ts.decode_leaf(raw, z) if ts is not None else TypeSystem._decode_scalar(raw, 0, lf.type, None, None)
+            out[lf.path] = val
+            if lf.not_expanded or val is None:
+                notes[lf.path] = _leaf_note(lf, val)
+        return out, notes
 
     def read_full(self, name: str, max_bytes: int | None = None, port: int | None = None) -> dict[str, Any]:
         """One ADS read of the whole variable, decoded into a nested tree via the datatype table."""
@@ -558,13 +571,9 @@ class AdsBackend:
         check, both renames or neither (rolled back on a file error); dump_outcome() gives the timeout its verdict
         under the same lock."""
         import os
-        from pathlib import Path
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        jpath = Path(out_dir) / f"dump-{stamp}.json"
-        cpath = Path(out_dir) / f"dump-{stamp}.csv"
-        jpart, cpart = jpath.with_name(jpath.name + ".partial"), cpath.with_name(cpath.name + ".partial")
         os.makedirs(out_dir, exist_ok=True)
         with self._dump_lock:
+            jpath, cpath, jpart, cpart = _reserve_dump_names(out_dir)
             self.dump_progress = {"phase": "listing the symbols", "started": time.time()}
 
         def drop() -> list[str]:
@@ -592,14 +601,27 @@ class AdsBackend:
         with self._dump_lock:
             if cancel is not None and cancel.is_set():
                 raise fail("ads_dump cancelled: the call had already ended (timeout) — the files are not kept")
+            taken = [p.name for p in (cpath, jpath) if p.exists()]
+            if taken:                                  # the names were free when reserved; never overwrite a file
+                raise fail(f"ads_dump: {taken} appeared in {out_dir} while the dump ran (another program?) — not "
+                           "overwritten, nothing kept")
             try:
                 os.replace(cpart, cpath)
-                try:
-                    os.replace(jpart, jpath)
-                except OSError:
-                    os.replace(cpath, cpart)          # both or neither: the CSV goes back to .partial
-                    raise
             except OSError as exc:
+                raise fail(f"ads_dump: the finished files could not be moved into place (a file error, not an ADS "
+                           f"error): {exc}") from exc
+            try:
+                os.replace(jpart, jpath)
+            except OSError as exc:
+                try:
+                    os.replace(cpath, cpart)           # both or neither: the CSV goes back to .partial
+                except OSError as back:
+                    # neither both nor neither: say exactly what is where. Both files are complete; nothing is removed
+                    msg = (f"ads_dump: PARTIAL commit — the CSV is in place ({cpath}), the JSON could not be renamed "
+                           f"({exc}) and the CSV could not be moved back ({back}). Both files are complete; the JSON is "
+                           f"at {jpart} (rename it to {jpath.name}).")
+                    self.dump_progress.update(phase="partial", files=[str(cpath)], left=[str(jpart)], error=msg)
+                    raise AdsError(msg) from exc
                 raise fail(f"ads_dump: the finished files could not be moved into place (a file error, not an ADS "
                            f"error): {exc}") from exc
             self.dump_progress.update(phase="done", files=[str(cpath), str(jpath)])
@@ -679,14 +701,18 @@ class AdsBackend:
                 for k, leaf in enumerate(lv):
                     if k % 256 == 255 and cancelled():
                         raise stop(f"while writing {r.name} (leaf {k + 1} of {len(lv)})")
+                    outside: str | None = None
                     try:
                         val = ts.decode_leaf(reader.get(leaf.offset, leaf.need), _at_zero(leaf)) if leaf.size else None
                     except _DumpCancelled as exc:
                         raise stop(f"while reading {r.name}") from exc
+                    except _OutsideRoot as exc:
+                        val, outside = None, str(exc)      # this leaf only: the others are inside and readable
+                        errors.append({"symbol": leaf.path, "error": outside})
                     except _ReadFailed as exc:
                         read_error = str(exc)
                         break
-                    w.writerow([leaf.path, leaf.type, _csv_val(val), _leaf_note(leaf, val)])
+                    w.writerow([leaf.path, leaf.type, _csv_val(val), outside or _leaf_note(leaf, val)])
                     vals[leaf.path] = val
                     if len(preview) < 50:
                         preview.append({"path": leaf.path, "type": leaf.type, "value": val})
@@ -884,14 +910,20 @@ class AdsBackend:
                 hits = [k for k in ts.table if k.lower() == want or k.lower().rsplit(".", 1)[-1] == want]
                 e = ts.table[hits[0]] if len(hits) == 1 else None
             if e is not None:
-                from .ads_types import F_TCCOMIFACEPTR, F_REFERENCETO, is_interface
-                if e.flags & F_TCCOMIFACEPTR:
-                    return f"{base} is a TcCOM interface pointer — not writable through ADS"
-                if e.flags & F_REFERENCETO:
-                    return f"{base} is a REFERENCE — writing the reference itself is refused; write the referenced variable"
-                if is_interface(e):
-                    return (f"{base} is an INTERFACE type (pointer to an FB's method table) — writing it would make the PLC call a "
-                            "wild pointer; assign interfaces in PLC code, not over ADS")
+                # the dump's rule (is_indirect: the alias chain followed) — TYPE PT_X : POINTER TO FB_X, or an alias of
+                # an interface, is as much an address as the type it names; only the entry itself was checked
+                kind = ts.indirect_kind(e, base)
+                alias = bool(e.type) and e.type.strip().lower() != base.strip().lower() and not (e.subitems or e.dims)
+                via = f" (an alias of {e.type})" if alias else ""
+                if kind == "tccom interface":
+                    return f"{base}{via} is a TcCOM interface pointer — not writable through ADS"
+                if kind == "reference":
+                    return f"{base}{via} is a REFERENCE — writing the reference itself is refused; write the referenced variable"
+                if kind == "interface":
+                    return (f"{base}{via} is an INTERFACE type (pointer to an FB's method table) — writing it would make the PLC "
+                            "call a wild pointer; assign interfaces in PLC code, not over ADS")
+                if kind == "pointer":
+                    return (f"{base}{via} is a POINTER — writing an address is refused; write the variable it points to")
         return None
 
     def enum_literal(self, type_name: str, value: Any, port: int | None = None) -> Any:
@@ -1353,6 +1385,11 @@ class _DumpCancelled(Exception):
     pass
 
 
+class _OutsideRoot(_ReadFailed):
+    """A leaf the datatype table places past the end of the symbol (the two tables disagree — an online change in
+    progress, a library mismatch). Reading it would decode the next variable's bytes as this leaf's value."""
+
+
 class _RootReader:
     """The bytes of one root symbol, read in bounded chunks only where a leaf needs them (N39/N47/N55): a root up to
     one chunk is read in one request as before; a bigger one is never read whole, never held whole in RAM, and the
@@ -1367,6 +1404,9 @@ class _RootReader:
         self.bytes_read = 0
 
     def get(self, off: int, n: int) -> bytes:
+        if off < 0 or off + n > self.size:
+            raise _OutsideRoot(f"bytes {off}..{off + n} lie outside {self.s.name} ({self.s.size} bytes): the datatype "
+                               "table and the symbol table disagree (online change in progress?) — not read")
         if self.w0 <= off and off + n <= self.w0 + len(self.buf):
             return self.buf[off - self.w0:off - self.w0 + n]
         if self.end <= self.chunk:
@@ -1449,6 +1489,35 @@ def _nest(root: str, vals: dict[str, Any]) -> Any:
                 return [fin(groups[g]) for g in sorted(groups)]
         return {(k if isinstance(k, str) else str(list(k))): fin(x) for k, x in n.items()}
     return fin(tree)
+
+
+def _reserve_dump_names(out_dir: str) -> tuple[Any, Any, Any, Any]:
+    """dump-<stamp>[-n].json/.csv names no file in out_dir has, reserved by creating both .partial files exclusively —
+    two dumps in the same second (or from two servers) got the same names, and the second replaced the first's files.
+    Caller holds _dump_lock (within this process; O_EXCL covers other processes)."""
+    from pathlib import Path
+    out = Path(out_dir)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(1, 1000):
+        base = f"dump-{stamp}" + ("" if n == 1 else f"-{n}")
+        jpath, cpath = out / f"{base}.json", out / f"{base}.csv"
+        jpart, cpart = out / f"{base}.json.partial", out / f"{base}.csv.partial"
+        if jpath.exists() or cpath.exists():
+            continue
+        made = []
+        try:
+            for p in (cpart, jpart):
+                with open(p, "x"):
+                    made.append(p)
+        except FileExistsError:
+            for p in made:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            continue
+        return jpath, cpath, jpart, cpart
+    raise AdsError(f"ads_dump: no free file name dump-{stamp}[-n] in {out_dir}")
 
 
 def _dump_order(roots: list[SymbolEntry], own: set[str] | None) -> list[SymbolEntry]:

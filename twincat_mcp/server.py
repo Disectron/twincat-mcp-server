@@ -289,9 +289,8 @@ class App:
         self.rec.rcfg = cfg.recorder
 
         # N62: the recorder compares cycle_ms with the task that runs each recorded program (project task config)
-        def _task_of(name: str) -> list[str] | None:
+        def _task_of(name: str) -> list[dict[str, Any]] | None:
             return self.proj.tasks_of(name)
-        _task_of.config = self.proj.task_config      # type: ignore[attr-defined]
         self.rec.task_of = _task_of
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
@@ -1223,6 +1222,8 @@ def dump_timeout_message(p: dict[str, Any], limit_s: float) -> str:
     if p.get("phase") == "done":
         return (f"ads_dump finished just as the {limit_s:.0f} s limit ran out ({el:.0f} s), so its result did not reach "
                 f"this call — the files WERE kept: {p.get('files')}")
+    if p.get("phase") == "partial":
+        return f"ads_dump finished just as the {limit_s:.0f} s limit ran out ({el:.0f} s), then: {p.get('error')}"
     where = (f" root {p.get('index')} of {p.get('of')} ({p.get('root')}), {p.get('leaves', 0)} leaves, "
              f"{p.get('written_mib', 0)} MiB written" if p.get("root") else "")
     return (f"ads_dump did not finish within {limit_s:.0f} s ({el:.0f} s): it was {p.get('phase', '?')}{where} — the "
@@ -2749,16 +2750,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def ads_leaves(name: str, max_leaves: int = 5000, with_values: bool = False) -> dict[str, Any]:
         """Enumerate every scalar leaf under a symbol with byte offsets (datatype table):
         'MAIN' → all program variables, 'MAIN.arrSteps' → arrSteps[1].nId … With values=true
-        each leaf is decoded from one read of the whole symbol."""
+        each leaf is decoded from the symbol's bytes, read in bounded pieces (a value that is not
+        expanded: its head only); value_note says why a value is missing or partial."""
         groups = await app.ads_call(app.ads.leaves_under, name, max_leaves, timeout=120)
         out: list[dict[str, Any]] = []
         for root, leaves in groups:
             vals: dict[str, Any] = {}
+            notes: dict[str, str] = {}
+            err: str | None = None
             if with_values:
                 try:
-                    vals = await app.ads_call(app.ads.leaf_values, root, leaves, timeout=120)
+                    vals, notes = await app.ads_call(app.ads.leaf_values, root, leaves, timeout=120)
                 except ToolError as exc:
-                    vals = {"__error__": str(exc)}
+                    err = str(exc)
             for lf in leaves:
                 d = {"path": lf.path, "type": lf.type, "offset": lf.offset, "size": lf.size, "root": root.name}
                 if lf.enum:
@@ -2766,7 +2770,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 if lf.note:
                     d["note"] = lf.note
                 if with_values:
-                    d["value"] = vals.get(lf.path, vals.get("__error__"))
+                    d["value"] = vals.get(lf.path)
+                    if err is not None or lf.path in notes:
+                        d["value_note"] = err if err is not None else notes[lf.path]
                 out.append(d)
         return {"name": name, "roots": [g[0].name for g in groups], "count": len(out), "leaves": out[:max_leaves],
                 "truncated": len(out) > max_leaves}

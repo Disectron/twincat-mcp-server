@@ -866,11 +866,11 @@ class Recording:
                         self.warmup_true_at = t                  # N61: remembered, reported if it never fires
                     return
                 if not fires and all_live and self.warmup_true_at is not None:
-                    self.warmup_lapsed = True
+                    self.warmup_lapsed = True        # the warm-up truth is over: a later fire is a new one
                 if fires:
                     self.armed = False
                     self.triggered_at = t
-                    if self.warmup_true_at is not None:
+                    if self.warmup_true_at is not None and not self.warmup_lapsed:
                         self.trigger_delayed_ms = round(t - self.warmup_true_at, 4)
                     pre, self.pre = list(self.pre), deque()
                     for pt, pb, pd in pre:
@@ -1131,10 +1131,11 @@ class Recording:
             out["trigger_note"] = (f"start_when was already true at {self.warmup_true_at:.4f} ms, before every block had "
                                    f"delivered; it fired {self.trigger_delayed_ms:g} ms later, on the first cycle all "
                                    "blocks delivered (the window cannot start before a block's first sample)")
-        elif self.start_when is not None and self.triggered_at is None and self.warmup_lapsed:
+        elif self.start_when is not None and self.warmup_lapsed and self.warmup_true_at is not None:
             out["trigger_note"] = (f"start_when was true at {self.warmup_true_at:.4f} ms during the warm-up (before every "
-                                   f"block had delivered, at most {self.WARMUP_MS:g} ms) and false afterwards — it did "
-                                   "not fire")
+                                   f"block had delivered, at most {self.WARMUP_MS:g} ms) and false afterwards — " +
+                                   ("it did not fire" if self.triggered_at is None else
+                                    f"it fired at {self.triggered_at:.4f} ms, when it was true again"))
             out["start_when_warmup_true_ms"] = self.warmup_true_at
         return out
 
@@ -1921,7 +1922,7 @@ class Recorder:
 
     # set by the server from the project index: name of a program → the tasks that run it ([] = no program, e.g. a
     # GVL; None = the project has no task configuration). N62.
-    task_of: Callable[[str], list[str] | None] | None = None
+    task_of: Callable[[str], list[dict[str, Any]] | None] | None = None
 
     def _task_check(self, rec: Any, syms: list[SymbolEntry], cycle_ms: float) -> dict[str, Any]:
         man = (getattr(rec, "meta", None) or {}).get("manifest") or {}
@@ -1932,7 +1933,6 @@ class Recorder:
         checked: dict[str, Any] = {}
         below: list[dict[str, Any]] = []
         roots = sorted({x.name.split(".", 1)[0] for x in syms if not _is_system_root(x.name)})
-        cfg: dict[str, dict[str, Any]] = {}
         for r in roots:
             owners = None
             if self.task_of is not None:
@@ -1941,13 +1941,12 @@ class Recorder:
                 except Exception:  # noqa: BLE001 — no project: the fastest task is the comparison
                     owners = None
             if owners:
-                if not cfg and self.task_of is not None:
-                    cfg = getattr(self.task_of, "config", lambda: {})() or {}
                 cyc = []
-                for o in owners:
+                for t in owners:             # {"name", "cycle_ms", "plc_project"} of the program's own PLC project
+                    o = str(t.get("name") or "")
                     c = rt.get(o.lower())
                     if c is None:
-                        c = (cfg.get(o) or {}).get("cycle_ms")
+                        c = t.get("cycle_ms")
                     if c:
                         cyc.append((c, o))
                 if cyc:

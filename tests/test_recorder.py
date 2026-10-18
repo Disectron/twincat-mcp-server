@@ -938,6 +938,18 @@ def test_n61_python_level_trigger_true_only_during_the_warmup_is_reported(rec):
     s = rec.status(st["id"])
     assert s["triggered_at_ms"] == 40.0 and s["trigger_delayed_ms"] == 40.0 and "fired 40 ms later" in s["trigger_note"], s
     rec.stop(st["id"])
+    # review B: true during the warm-up, false once every block delivered, true again later — a new truth, no delay
+    st = _two_blocks(rec, start_when="MAIN.nCycle == 0")
+    c = _conn()
+    for k in range(0, 40):
+        c.fire("MAIN.nCycle", 0 if k < 5 or k >= 30 else 1, ft(10 * k))
+        if k >= 5:
+            c.fire(CC, k, ft(10 * k))
+    assert wait_until(lambda: rec.status(st["id"]).get("triggered_at_ms") is not None)
+    s = rec.status(st["id"])
+    assert s["triggered_at_ms"] == 300.0 and "trigger_delayed_ms" not in s, s
+    assert s["start_when_warmup_true_ms"] == 0.0 and "when it was true again" in s["trigger_note"], s
+    rec.stop(st["id"])
 
 
 def test_n58_export_never_writes_over_the_recording_or_a_sidecar(rec, tmp_path):
@@ -988,7 +1000,7 @@ def test_n62_cycle_compared_with_the_task_that_runs_the_program(rec, monkeypatch
     man = {**man, "tasks": [{"index": 1, "name": "PlcTask", "cycle_time_ms": 10.0},
                             {"index": 2, "name": "FastTask", "cycle_time_ms": 1.0}]}
     monkeypatch.setattr(rec, "_manifest", lambda port=None: man)
-    owners = {"MAIN": ["PlcTask"]}
+    owners = {"MAIN": [{"name": "PlcTask", "cycle_ms": 10.0, "plc_project": None}]}
     rec.task_of = lambda name: owners.get(name, [])
     st = rec.start(symbols=["MAIN.nCycle", "GVL_Machine.nDrumsFilled"], prefix=None, pattern=None, mode="cycle",
                    cycle_ms=1, duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0,
@@ -1021,8 +1033,44 @@ def test_n62_project_task_config_maps_programs_to_tasks(tmp_path):
         (plc / f"{name}.TcTTO").write_text(
             f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><Task Name="{name}"><CycleTime>{cyc}</CycleTime>'
             f'<Priority>20</Priority><PouCall><Name>{prog}</Name></PouCall></Task></TcPlcObject>', encoding="utf-8")
-    cfg = idx.task_config()
+    cfg = {t["name"]: t for t in idx.task_config().values()}
     assert cfg["PlcTask"]["cycle_ms"] == 10.0 and cfg["FastTask"]["programs"] == ["PRG_Fast"]
-    assert idx.tasks_of("MAIN") == ["PlcTask"] and idx.tasks_of("PRG_Machine") == ["PlcTask"]   # called from MAIN
-    assert idx.tasks_of("PRG_Fast") == ["FastTask"]          # the commented call in MAIN does not count
-    assert idx.tasks_of("GVL_Machine") == []
+
+    def names(u):
+        got = idx.tasks_of(u)
+        return got if got is None else [t["name"] for t in got]
+    assert names("MAIN") == ["PlcTask"] and names("PRG_Machine") == ["PlcTask"]   # called from MAIN
+    assert names("PRG_Fast") == ["FastTask"]                 # the commented call in MAIN does not count
+    assert names("GVL_Machine") == []
+
+
+def test_n62_tasks_of_two_plc_projects_with_the_same_task_name_are_both_kept(tmp_path):
+    """Review B: task_config keyed tasks by name, so PlcTask of a second PLC project replaced the first one's; and a
+    program was matched against every project's tasks. Tasks are per file, owners per PLC project; a program name
+    that exists in two projects cannot be told apart here (None: the fastest task is the comparison)."""
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex
+
+    def plc(name, prog, cyc):
+        d = tmp_path / name
+        (d / "POUs").mkdir(parents=True)
+        (d / f"{name}.plcproj").write_text('<?xml version="1.0" encoding="utf-8"?><Project><PropertyGroup><Name>'
+                                           f'{name}</Name></PropertyGroup><ItemGroup /></Project>', encoding="utf-8")
+        for p in (prog, "MAIN"):
+            (d / "POUs" / f"{p}.TcPOU").write_text(
+                f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="{p}"><Declaration><![CDATA[PROGRAM {p}\n'
+                'END_VAR]]></Declaration><Implementation><ST><![CDATA[;]]></ST></Implementation></POU></TcPlcObject>',
+                encoding="utf-8")
+        (d / "PlcTask.TcTTO").write_text(
+            f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><Task Name="PlcTask"><CycleTime>{cyc}</CycleTime>'
+            f'<PouCall><Name>{prog}</Name></PouCall><PouCall><Name>MAIN</Name></PouCall></Task></TcPlcObject>',
+            encoding="utf-8")
+    plc("PlcA", "PRG_A", 10000)
+    plc("PlcB", "PRG_B", 2000)
+    idx = ProjectIndex(ProjectConfig(root=str(tmp_path)))
+    cfg = idx.task_config()
+    assert sorted(t["cycle_ms"] for t in cfg.values()) == [2.0, 10.0], cfg
+    a, b = idx.tasks_of("PRG_A"), idx.tasks_of("PRG_B")
+    assert [(t["name"], t["cycle_ms"]) for t in a] == [("PlcTask", 10.0)] and a[0]["plc_project"].endswith("PlcA.plcproj")
+    assert [(t["name"], t["cycle_ms"]) for t in b] == [("PlcTask", 2.0)], b
+    assert idx.tasks_of("MAIN") is None                      # in both projects: not known which one is recorded
