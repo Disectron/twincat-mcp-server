@@ -39,6 +39,10 @@ def mk_cfg(project_dir, **safety):
 
 
 def payload(res: types.CallToolResult):
+    """The tool's result. A tool error fails here with its own text — json.loads of an error message said only
+    'Expecting value' (Windows CI of 88a221c: the reason infosys_get_page failed was not in the log)."""
+    if res.is_error:
+        raise AssertionError(f"the tool returned an error: {text(res)}")
     if res.structured_content is not None:
         sc = res.structured_content
         return sc.get("result", sc) if isinstance(sc, dict) else sc

@@ -7,6 +7,7 @@ Everything runs on Python 3.12 (the only version the project targets); the refus
 running each script with sys.version_info set to 3.11."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -228,9 +229,15 @@ def test_an_interrupted_build_next_to_a_complete_index_is_neither_stuck_nor_nagg
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
     assert build(kb, pkg).returncode == 0
     db = live(kb)
-    building = _as_building(db, state="building", target_stamp=sqlite3.connect(db).execute(
-        "SELECT value FROM meta WHERE key = 'source_stamp'").fetchone()[0])
-    sqlite3.connect(building).execute("DELETE FROM meta WHERE key = 'source_stamp'").connection.commit()
+    # every connection closed: on Windows an open one keeps the file, and the build could not swap it in (Windows CI
+    # of 88a221c: "… infosys-1033.db is open in another program" — this test's own connection; Python ≥ 3.11
+    # connections sit in a reference cycle, so dropping the last name does not close them)
+    with contextlib.closing(sqlite3.connect(db)) as c:
+        stamp = c.execute("SELECT value FROM meta WHERE key = 'source_stamp'").fetchone()[0]
+    building = _as_building(db, state="building", target_stamp=stamp)
+    with contextlib.closing(sqlite3.connect(building)) as c:
+        c.execute("DELETE FROM meta WHERE key = 'source_stamp'")
+        c.commit()
     st = state(kb)
     assert st["state"] == "complete" and st["rebuild"]["state"] == "stale", st
     assert "complete and current" in st["message"] and "kb_rebuild" not in st["message"]
