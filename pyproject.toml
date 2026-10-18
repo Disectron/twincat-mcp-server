@@ -24,7 +24,7 @@ Repository = "https://github.com/Disectron/twincat-mcp-server"
 Issues = "https://github.com/Disectron/twincat-mcp-server/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "pypdf>=4", "reportlab>=4"]   # pypdf + reportlab: the manuals builder tests
+dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "pypdf>=4", "reportlab>=4"]   # pypdf + reportlab: the manuals builder tests
 
 [project.scripts]
 twincat-mcp = "twincat_mcp.__main__:main"
