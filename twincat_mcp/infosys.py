@@ -1289,12 +1289,20 @@ class InfosysIndex:
         """D3: what every answer carries — the date of the documentation it came from (a local package can be months
         old) and how much is indexed; the full book list and source block live in tc_doctor / infosys_books."""
         if self.local is not None:
-            out = {"doc_date": self.local.describe()["modified"], "indexed_books_count": len(self.indexed_books())}
+            out = {"doc_date": self.local.describe()["modified"], "indexed_books_count": self._indexed_count()}
             note = self.index_note()
             if note:
                 out["index_note"] = note          # rule 6: an answer from an index that is not the current one says so
             return out
-        return {"indexed_books_count": len(self.indexed_books())}
+        return {"indexed_books_count": self._indexed_count()}
+
+    def _indexed_count(self) -> int:
+        """Books in the index; 0 while a read-only index does not exist yet. A page converted from the package during
+        the first build failed here with 'no Infosys index yet' after it had been converted (Windows CI of 88a221c,
+        where the build had not finished when the first call came; on Linux it had)."""
+        if self.read_only and self._file_sig() is None:
+            return 0
+        return len(self.indexed_books())
 
     def source(self) -> dict[str, Any]:
         """Where the documentation comes from — every answer carries it (a local package can be months old)."""

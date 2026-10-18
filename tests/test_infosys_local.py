@@ -155,6 +155,18 @@ def test_not_a_package(tmp_path):
         HV.HelpViewerSource(bad).pages()
 
 
+def test_a_page_is_answered_from_the_package_before_the_first_index_exists(tmp_path, pkg):
+    """Windows CI of 88a221c: the first infosys_get_page while the first build ran converted the page, then failed in
+    the answer's metadata ('no Infosys index yet'). On Linux the build had finished before the call; here no index
+    exists at all."""
+    ro = InfosysIndex(db_file=tmp_path / "index" / "infosys-1033.db", fetcher=NoNetwork(),
+                      local=HV.HelpViewerSource(pkg), read_only=True)
+    d = ro.get_page(F.ADSREAD, max_chars=200)
+    assert d["title"] == "ADSREAD" and d["indexed"] is False and d["indexed_books_count"] == 0, d
+    assert "no index yet" in d["index_note"], d
+    assert not (tmp_path / "index").exists()                      # read-only: nothing created
+
+
 @pytest.mark.anyio
 async def test_server_uses_local_package(monkeypatch, tmp_path, pkg):
     from tests.test_server_e2e import client_for, payload
