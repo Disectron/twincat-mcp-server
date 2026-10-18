@@ -90,6 +90,7 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
 | launcher POSIX | on Linux / macOS a directory rename succeeds while a server runs from it, so a replaced venv (`.old-*`) can be removed under another window's server; on Windows the rename fails and the venv stays (N46). Windows is the target platform |
+| Python recorder order | the Python recorder writes rows in ADS order, the native engine in PLC order: a block that runs ahead can have rows past an end set later (stop_when on a batched block). They are counted (`rows_after_window`) and every reader skips them; writing in PLC order (a reorder buffer of max_delay_ms, as the native engine) would leave none in the file |
 | R40 back-to-back | a restart soon after another (task 1 had run for less than the time the command took) is "cannot tell" by the counter when the counter did not go back; the mode poll and the compile timestamp still prove most cases |
 
 ### From the 0.8.3 deep test

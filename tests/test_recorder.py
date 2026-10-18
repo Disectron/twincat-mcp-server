@@ -242,11 +242,12 @@ def test_limit_ends_recording_promptly_even_while_notifications_keep_coming(rec)
     assert rec.status(rid)["events"] == 5
 
 
-def test_cycle_mode_duration_independent_of_plc_clock(rec):
+def test_cycle_mode_duration_independent_of_plc_clock(rec, monkeypatch):
     """Round 2, #1 re-check: rec_start(mode='cycle', duration_s=3) was still active at 17.8 s on the engineering PC —
     the cyclic notification stamps come from the task clock, which can be far from Windows time. Duration is now
     this PC's monotonic time from the first sample (or the PLC-relative span), never PLC FILETIME vs time.time()."""
     ahead = int(90 * 1e7)                       # PLC clock 90 s ahead of Windows
+    monkeypatch.setattr(R, "TAIL_WAIT_S", 0.2)            # one sample, never seen past the end: the wait runs out
     st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=100, duration_s=0.5,
                    max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10)
     c = _conn()
@@ -455,7 +456,7 @@ def test_lossless_run_passes_verification(rec):
     assert live["symbols"]["MAIN.nCycle"]["max"] == exact["symbols"]["MAIN.nCycle"]["max"] == 1999
 
 
-def test_partial_subscription_fails_unless_allowed(rec):
+def test_partial_subscription_fails_unless_allowed(rec, monkeypatch):
     """A3: a notification that cannot be registered fails the start instead of leaving a silent hole.
     MAIN.nCycle (offset 0) and MAIN.fbFill.bDone (offset 320) are too far apart to share a block."""
     FakeConnection.fail_offsets = {5 * 64}
@@ -469,6 +470,7 @@ def test_partial_subscription_fails_unless_allowed(rec):
     finally:
         FakeConnection.fail_offsets = None
     assert st["unsubscribed_symbols"] == ["MAIN.fbFill.bDone"] and any("could not be subscribed" in w for w in st["warnings"])
+    monkeypatch.setattr(R, "TAIL_WAIT_S", 5.0)            # waiting for the unregistered block would take 5 s
     c = _conn()
     for i in range(0, 50):
         c.fire("MAIN.nCycle", i, ft(i))
@@ -477,7 +479,7 @@ def test_partial_subscription_fails_unless_allowed(rec):
     out = rec.stop(st["id"])
     # review: the block that was never registered is not part of the timeline — it was counted as a block that never
     # delivered (the whole window missing) and every stop waited out its timeout for it
-    assert time.monotonic() - t0 < 0.9 and out["missing_samples"] == 0, out
+    assert time.monotonic() - t0 < 2.0 and out["missing_samples"] == 0, out      # well under the 5 s wait
     footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
     assert footer["unregistered_blocks"] and footer["label"] == "INCOMPLETE" and footer["missing_samples"] == 0, footer
     v = rec.verify(st["id"])
@@ -785,10 +787,11 @@ def test_python_recording_with_a_block_that_delivered_once_or_never_is_incomplet
         assert v["timeline"]["unprovable_blocks"] == [blk[CC]["block"]]
 
 
-def test_python_stop_when_ends_at_the_firing_sample_and_waits_for_the_other_blocks(rec):
+def test_python_stop_when_ends_at_the_firing_sample_and_waits_for_the_other_blocks(rec, monkeypatch):
     """Python stop_when cut the queue at once, but samples arrive in ADS order: the other block's samples up to the
     firing PLC time were still on their way and its tail read as missing. The end is the firing sample's PLC time and
     every block is waited for up to it (the native engine writes in PLC order, so it reaches that time already)."""
+    monkeypatch.setattr(R, "TAIL_WAIT_S", 10.0)          # the wait ends by the blocks, never by the clock here
     st = _two_blocks(rec, stop_when="MAIN.nCycle >= 20")
     c = _conn()
     for ms in range(0, 210, 10):
@@ -815,9 +818,10 @@ def test_python_stop_when_ends_at_the_firing_sample_and_waits_for_the_other_bloc
     assert v["verdict"] == "PASS" and "tail_rule" not in v, v
 
 
-def test_python_post_trigger_end_waits_for_a_block_still_in_transit(rec):
+def test_python_post_trigger_end_waits_for_a_block_still_in_transit(rec, monkeypatch):
     """Review: post_trigger_s cut the queue at once (stop → unsubscribe) while another block's samples up to the end
     were still on their way — their tail was lost. Every end at a PLC time waits for every block (footer stop_at)."""
+    monkeypatch.setattr(R, "TAIL_WAIT_S", 10.0)          # the wait ends by the blocks, never by the clock here
     st = _two_blocks(rec, start_when="MAIN.nCycle >= 30", post_trigger_s=0.15)
     c = _conn()
     for k in range(0, 51):
@@ -837,6 +841,30 @@ def test_python_post_trigger_end_waits_for_a_block_still_in_transit(rec):
     assert rec.verify(st["id"])["verdict"] == "PASS"
 
 
+def test_python_rows_written_past_a_later_end_are_counted_and_skipped_by_every_reader(rec):
+    """Review 3: the Python recorder writes in ADS order — a block that ran ahead (unbatched) has rows past an end
+    that a batched block's stop_when sets later. They cannot be taken out of the sealed file: the footer counts them
+    and every reader (rec_read, rec_stats, export, rec_verify) skips rows past window_end_ms."""
+    st = _two_blocks(rec, stop_when=f"{CC} >= 50")
+    c = _conn()
+    for k in range(0, 61):
+        c.fire("MAIN.nCycle", k, ft(10 * k))              # ahead: written up to 600 ms …
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 61)
+    for k in range(0, 61):
+        c.fire(CC, k, ft(10 * k))                         # … before the counter block's stop_when fires at 500 ms
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
+    out = rec.stop(st["id"])
+    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer["window_end_ms"] == 500.0 and footer["rows_after_window"] == 10, footer
+    assert "rows_after_window_at_least" not in footer and footer["label"] == "COMPLETE", footer
+    r = rec.read(st["id"], None, None, ["MAIN.nCycle", CC], 10_000, False)
+    assert max(row["t_ms"] for row in r["rows"]) == 500.0 and len(r["rows"]) == 102, len(r["rows"])
+    stx = rec.stats(st["id"], ["MAIN.nCycle"], False, 0, exact=True)
+    assert stx["symbols"]["MAIN.nCycle"]["count"] == 51 and stx["symbols"]["MAIN.nCycle"]["max"] == 50, stx
+    v = rec.verify(st["id"])
+    assert v["verdict"] == "PASS" and v["timeline"]["rows_after_window"] == 10 and v["timeline"]["samples"] == 102, v
+
+
 def test_verify_of_a_change_recording_without_a_counter_is_inconclusive(rec):
     """Review: a change / poll recording has no PLC timeline: rec_verify said PASS on integrity alone."""
     st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="change", cycle_ms=10, duration_s=None,
@@ -850,6 +878,8 @@ def test_verify_of_a_change_recording_without_a_counter_is_inconclusive(rec):
     assert v["verdict"] == "INCONCLUSIVE" and "no PLC timeline" in v["inconclusive"], v
     v = rec.verify(st["id"], counter="MAIN.nCycle")
     assert v["verdict"] == "PASS" and v["counter"]["lossless"], v
+    v = rec.verify(st["id"], counter="MAIN.nope")            # review 3: a check that could not run is no PASS
+    assert v["verdict"] == "INCONCLUSIVE" and "could not run" in v["inconclusive"], v
 
 
 def test_n56_python_stop_on_request_ends_at_a_plc_time_and_a_block_that_stopped_early_fails(rec):

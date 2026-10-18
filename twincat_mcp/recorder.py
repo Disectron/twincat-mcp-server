@@ -57,6 +57,7 @@ import stat
 import struct
 import threading
 import time
+from array import array
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +75,9 @@ MAX_BLOCK_BYTES = 16384        # one notification never carries more than this
 QUEUE_BYTES = 256 << 20        # in-memory backlog cap per recording
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
 TAIL_WAIT_S = 1.0             # after the duration: wait at most this long for in-flight samples up to the cut
+
+
+RECENT_ROWS = 4096            # per block: rows remembered to count those written past a later end (≥ max_delay)
 
 
 def _ticks(ms: float) -> int:
@@ -323,6 +327,24 @@ class Block:
     error: str | None = None
     last_wall: float | None = None          # monotonic time the last sample arrived (D14: silence estimate)
     seen_t: float | None = None             # newest PLC time received, kept or not (an end is reached at or past it)
+    recent: Any = None                      # ring of the last RECENT_ROWS written stamps (rows past a later end)
+    recent_i: int = 0
+
+    def remember(self, t: float) -> None:
+        """The stamp of a row written to the file (the recorder only): rows of a block that ran ahead in ADS order can
+        lie past an end that is set later; rows_after counts them."""
+        if self.recent is None:
+            self.recent = array("d", [math.nan]) * RECENT_ROWS
+        self.recent[self.recent_i] = t
+        self.recent_i = (self.recent_i + 1) % RECENT_ROWS
+
+    def rows_after(self, end: float) -> tuple[int, bool]:
+        """(rows written with a stamp past `end`, exact?) — not exact when every remembered row is past it."""
+        if self.recent is None or self.last_t is None or _ticks(self.last_t) <= _ticks(end):
+            return 0, True
+        e = _ticks(end)
+        n = sum(1 for x in self.recent if x == x and _ticks(x) > e)
+        return n, n < RECENT_ROWS
 
     def header(self) -> dict[str, Any]:
         return {"id": self.bid, "igrp": self.igrp, "ioffs": self.ioffs, "size": self.size,
@@ -827,7 +849,7 @@ class Recording:
             blk = self.blocks[key]
             if blk.seen_t is None or t > blk.seen_t:
                 blk.seen_t = t
-        if self._cut_t is not None and t > self._cut_t:
+        if self._cut_t is not None and _ticks(t) > _ticks(self._cut_t):    # in ticks: 1.005 s × 1000 is 1004.99…
             self.after_limit += 1
             return
         if self.t0_mono is None:
@@ -860,7 +882,7 @@ class Recording:
                 # R41: in cycle mode every block delivers every cycle; a level condition true at the very start would
                 # open the window before the other blocks' first samples. Fire on the first cycle all blocks deliver
                 # (at most WARMUP_MS after arming). Change mode delivers on change only: no such wait there.
-                all_live = (self.mode != "cycle" or sw.edge or len(self._armed_seen) >= len(self.blocks)
+                all_live = (self.mode != "cycle" or sw.edge or len(self._armed_seen) >= len(self.timeline_blocks())
                             or t - self._armed_t0 > self.WARMUP_MS)
                 if fires and not all_live:
                     if self.warmup_true_at is None:
@@ -885,6 +907,7 @@ class Recording:
 
     def _commit_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
         # timeline of what is IN the file (pre-trigger samples that were discarded are not part of it)
+        b.remember(t)
         if self.mode == "cycle":
             prev = b.last_t
             gap = b.note_stamp(t)
@@ -1002,7 +1025,7 @@ class Recording:
         and lost it. A block that has not delivered is waited for like any other — until the caller's timeout."""
         if self.mode != "cycle" or not self.blocks:
             return True
-        return all(b.seen_t is not None and b.seen_t >= cut - 1e-9 for b in self.timeline_blocks())
+        return all(b.seen_t is not None and _ticks(b.seen_t) >= _ticks(cut) for b in self.timeline_blocks())
 
     def _end_at(self, t: float, reason: str, by: str) -> None:
         """The recording ends at PLC time t — duration, post_trigger, stop_when, max_events or a stop on request (N56).
@@ -1093,6 +1116,16 @@ class Recording:
                           "sha256": digest}
                 if self.label_reason():
                     footer["label_reason"] = self.label_reason()
+                if self._cut_t is not None:
+                    # rows of a block that was ahead in ADS order, written before the end was known: in the file, not in
+                    # the recording — every reader skips rows past window_end_ms (the native engine writes in PLC order
+                    # and has none)
+                    after = [b.rows_after(self._cut_t) for b in self.blocks]
+                    n_after = sum(n for n, _ in after)
+                    if n_after:
+                        footer["rows_after_window"] = n_after
+                        if not all(ok for _, ok in after):
+                            footer["rows_after_window_at_least"] = True
                 footer.update(self.stop_and_trigger_notes())
                 if self.stall_cfg:
                     footer["stall_counter_block"] = self.stall_cfg.get("block")
@@ -1347,6 +1380,10 @@ def iter_events(path: Path, want: set[str] | None = None) -> Iterator[tuple[floa
     mode = "change"
     prev: dict[tuple[int, int], bytes] = {}
     sel: dict[int, list[Slot]] = {}
+    # the recording is the window the footer names: rows past its end (the Python recorder writes in ADS order, so a
+    # block that ran ahead can have rows past an end set later) are in the file but not in the recording
+    ft = read_footer(path)
+    wend = _ticks(ft["window_end_ms"]) if ft and isinstance(ft.get("window_end_ms"), (int, float)) else None
     with open(path, encoding="utf-8") as fh:
         for ln in fh:
             if not ln.strip():
@@ -1367,6 +1404,8 @@ def iter_events(path: Path, want: set[str] | None = None) -> Iterator[tuple[floa
             except json.JSONDecodeError:
                 continue
             t, k, v = ev[0], ev[1], ev[2]
+            if wend is not None and isinstance(t, (int, float)) and _ticks(t) > wend:
+                continue
             if isinstance(k, str) and k.startswith("#") and blocks:
                 bid = int(k[1:])
                 slots = sel.get(bid)
@@ -2626,8 +2665,14 @@ class Recorder:
             unreg = sorted(set((footer or {}).get("unregistered_blocks") or []) & set(blocks))
             for k in unreg:
                 blocks.pop(k, None)
+            wend = (footer or {}).get("window_end_ms")
+            wend_t = _ticks(wend) if isinstance(wend, (int, float)) else None
+            rows_after = 0
             for ev in _iter_raw_rows(path):
                 t, k = ev[0], ev[1]
+                if wend_t is not None and isinstance(t, (int, float)) and _ticks(t) > wend_t:
+                    rows_after += 1            # in the file, past the window: not part of the recording (readers skip)
+                    continue
                 if isinstance(k, str) and k.startswith("#"):
                     b = blocks.get(int(k[1:]))
                     if b is not None:
@@ -2685,6 +2730,11 @@ class Recorder:
                 out["timeline"]["unprovable_blocks"] = unprovable[:50]
             if unreg:
                 out["timeline"]["unregistered_blocks"] = unreg[:50]
+            if rows_after:
+                out["timeline"]["rows_after_window"] = rows_after
+                out["timeline"]["rows_after_window_note"] = (
+                    "rows past window_end_ms, written before the end was known (a block ahead in ADS order — Python "
+                    "recorder): not part of the recording; rec_read / rec_stats / rec_export skip them")
         elif header.get("mode") != "cycle":
             out["timeline"] = {"note": (
                 "change mode: the PLC sends a sample only when a value changes, so a quiet period cannot be told from a "
@@ -2754,7 +2804,10 @@ class Recorder:
                   and not tl.get("unprovable_blocks")                   # a block that never delivered proves nothing
                   and not ft.get("unsubscribed")                        # requested symbols that were never recorded
                   and not (tl.get("samples") == 0 and "blocks" in tl))  # nothing recorded is not a pass
-        if passed and header.get("mode") != "cycle" and not cn and not out.get("inconclusive"):
+        if passed and cn.get("error") and not out.get("inconclusive"):
+            # a check that was asked for and could not run is not a check that held (a counter name not in the file)
+            out["inconclusive"] = f"the counter check could not run: {cn['error']} ({cn.get('symbol')})"
+        if passed and header.get("mode") != "cycle" and not (cn and "error" not in cn) and not out.get("inconclusive"):
             # change / poll: the file is intact, but nothing showed that it is complete (no PLC timeline, no counter) —
             # PASS here meant only "not tampered with"
             out["inconclusive"] = ("the file is intact, but a change / poll recording has no PLC timeline to show it "

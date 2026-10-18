@@ -1521,7 +1521,14 @@ def _move_new(src: Any, dst: Any) -> None:
             raise FileExistsError(errno.EEXIST, "file exists", str(dst)) from None
         os.rename(src, dst)
         return
-    os.unlink(src)
+    try:
+        os.unlink(src)
+    except OSError:
+        try:
+            os.unlink(dst)                      # undo: never two names for one file, never a half-done move
+        except OSError as exc2:
+            raise OSError(f"{dst} was linked but {src} could not be removed, nor the link undone ({exc2})") from None
+        raise
 
 
 def _reserve_dump_names(out_dir: str) -> tuple[Any, Any, Any, Any]:
