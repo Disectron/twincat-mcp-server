@@ -335,12 +335,14 @@ def test_plcopen_and_boot(xae, tmp_path):
     be, dte, sm = xae
     f = tmp_path / "x.xml"; f.write_text("<project/>")
     r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
-    # TE1000 PLCIMPORTOPTIONS: REPLACE 1 (2 is RENAME — what produced the renamed copies of R15 / N38); a test double
-    # has no type library, so the enum page decides and the result says so
-    assert sm.items["TIPC^Plc^Plc Project"].imported == [(str(f), 1)]
-    assert r["option_value"]["value"] == 1 and "enum page" in r["option_value"]["from"]
+    # TE1000 PLCIMPORTOPTIONS: REPLACE 1, RENAME 2; a test double has no type library, so the enum page decides and the
+    # result says so. N97: 'replace' (in place) imports as RENAME — TwinCAT's own REPLACE moves objects to the root
+    assert sm.items["TIPC^Plc^Plc Project"].imported == [(str(f), 2)]
+    assert r["option_value"]["value"] == 2 and "enum page" in r["option_value"]["from"]
     be.plcopen_import("TIPC^Plc^Plc Project", str(f), "rename")
     assert sm.items["TIPC^Plc^Plc Project"].imported[-1] == (str(f), 2)
+    be.plcopen_import("TIPC^Plc^Plc Project", str(f), "skip")
+    assert sm.items["TIPC^Plc^Plc Project"].imported[-1] == (str(f), 3)
     with pytest.raises(X.XaeError, match="not found"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(tmp_path / "missing.xml"))
     be.plcopen_export("TIPC^Plc^Plc Project", ["POUs.MAIN", "POUs.FB_Fill"], str(tmp_path / "out.xml"))
@@ -1041,3 +1043,34 @@ def test_review_plcimportoptions_are_read_from_the_type_library_as_pywin32_gives
     be = X.XaeBackend.__new__(X.XaeBackend)
     m, src = be._import_options(obj)
     assert m == {"none": 0, "replace": 1, "rename": 2, "skip": 3} and src.startswith("type library"), (m, src)
+
+
+def test_n97_replace_is_done_in_place_and_a_removed_object_is_never_silent(xae, tmp_path):
+    """N97 (0.8.11 retest): with PLCIMPORTOPTIONS_REPLACE (1, from the type library) TwinCAT deleted the foldered
+    originals and re-created them at the project root with new GUIDs; the result said only 'added'. 'replace' now
+    imports as RENAME (copies beside the originals) and moves the checked text into each original in its folder; an
+    object that leaves its place is named, and stops a replace."""
+    be, dte, sm = xae
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path)
+    folder = sm.items["TIPC^Plc^Plc Project^95_UnitTests"]
+
+    def by_value():
+        v = proj.imported[-1][1]
+        if v == X._DOC_IMPORT_OPTIONS["rename"]:
+            dup()                                    # TwinCAT's rename: a copy PRG_TcUnitRunner_1 at the root
+        elif v == X._DOC_IMPORT_OPTIONS["replace"]:  # TwinCAT's replace: the original leaves its folder
+            folder._children.remove(orig)
+            sm.items.pop(orig.PathName)
+            sm.items.pop(meth.PathName)
+            dup("PRG_TcUnitRunner")
+    proj.on_import = by_value
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert proj.imported[-1][1] == X._DOC_IMPORT_OPTIONS["rename"] and "rename" in r["option_value"]["imported_as"]
+    assert orig in folder._children and orig.DeclarationText.startswith("{attribute 'qualified_only'}")
+    assert "PROGRAM PRG_TcUnitRunner\r\n" in orig.DeclarationText and r["replaced"][0]["object"] == orig.PathName
+    assert proj.deleted == ["PRG_TcUnitRunner_1"] and "removed" not in r
+    # if the shell still moves an object (whatever the option), a replace stops and says where it went
+    proj.on_import = lambda: (folder._children.remove(orig), sm.items.pop(orig.PathName), sm.items.pop(meth.PathName),
+                              dup("PRG_TcUnitRunner"))
+    with pytest.raises(X.XaeError, match=r"removed 2 existing object\(s\) from their place.*re-created elsewhere"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")

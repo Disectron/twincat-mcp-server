@@ -34,6 +34,7 @@ SRC_EXT = {".tcpou": "POU", ".tcdut": "DUT", ".tcgvl": "GVL", ".tcio": "Itf"}
 # N92: the variables of a PROGRAM / GVL that become symbols of the runtime (VAR_TEMP never does; CONSTANT is replaced)
 _SYMBOL_SECTIONS = {"PROGRAM": {"VAR", "VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_STAT", "VAR_INST"},
                     "GVL": {"VAR_GLOBAL"}}
+_RE_ALIAS = re.compile(r"\bTYPE\s+(?P<name>[A-Za-z_]\w*)\s*:\s*(?P<base>.+?)\s*(?::=.*?)?;?\s*END_TYPE", re.I | re.S)
 _RE_LINKALWAYS = re.compile(r"\{\s*attribute\s+'linkalways'\s*\}", re.I)
 # ST comments and string literals in ONE pass, strings first: a // or (* inside a literal ('//srv/share/') is text,
 # a quote inside a comment is comment. Separate passes cut code at the // of a literal (review of N92)
@@ -696,6 +697,21 @@ class ProjectIndex:
         return {"name": name, "instances": instances,
                 "mentions": [h for h in decl_hits if not h["in_comment"]],
                 "mentions_in_comments": [h for h in decl_hits if h["in_comment"]][:50], "truncated": res["truncated"]}
+
+    def type_alias(self, name: str) -> str | None:
+        """N50: the base an ALIAS DUT of the source declares — 'PT_X' -> 'POINTER TO FB_X' for TYPE PT_X : POINTER TO
+        FB_X; END_TYPE (qualified or not; comments and pragmas are not part of it), else None."""
+        self._ensure()
+        u = self.units.get((name or "").strip().split(".")[-1].lower())
+        if u is None or u.kind not in ("ALIAS", "DUT"):     # 'TYPE X : POINTER TO Y;' is not a header line: DUT
+            return None
+        m = _RE_ALIAS.search(st_strip(u.declaration, comment=" "))
+        if m is None or m.group("name").lower() != u.name.lower():
+            return None
+        base = " ".join(m.group("base").split())
+        if re.match(r"(STRUCT|UNION)\b|\(", base, re.I):
+            return None                                     # a structure or an enumeration, not an alias
+        return base
 
     def _base_type_name(self, type_str: str) -> str:
         """The bare type name behind ARRAY OF / POINTER TO / STRING(n) / library qualification."""

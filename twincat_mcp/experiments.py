@@ -774,8 +774,14 @@ class Runner:
                 raise ExperimentError("spec invalid: " + "; ".join(v["problems"]))
             self._resolve_types()
             self._archived_note = None
+            earlier = self.store.runs(self.name)
             if resume:
-                done = self.store.runs(self.name)
+                done = earlier
+            elif dry_run:
+                # N108: a dry run moves nothing — it says what a real start with resume=false would archive
+                done = []
+                self._archived_note = (f"{len(earlier)} earlier run(s) would be moved to runs_archive_*.jsonl"
+                                       if earlier else None)
             else:
                 archived = self.store.archive_runs(self.name)
                 done = []
@@ -783,8 +789,14 @@ class Runner:
             plan = self._plan(done)
             if max_runs is not None:
                 plan = plan[:max_runs]
+            why = self._why_planned(plan, done, resume, max_runs)
             if dry_run:
-                return self._dry_run(plan)
+                out = self._dry_run(plan)
+                if why:
+                    out["planned_note"] = why
+                if self._archived_note:
+                    out["archived"] = self._archived_note
+                return out
             prev = self.store.status(self.name)
             sessions = list(prev.get("sessions") or [])
             sessions.append({"started": time.time(), "finished": None, "planned": len(plan)})
@@ -798,9 +810,31 @@ class Runner:
             self._thread.start()
         out = {"experiment": self.name, "state": "running", "planned_runs": len(plan), "already_done": len(done),
                "estimated_duration_min": v["estimated_duration_min"], "scope": self._scope0}
+        if why:
+            out["planned_note"] = why
         if getattr(self, "_archived_note", None):
             out["archived"] = self._archived_note
         return out
+
+    def _why_planned(self, plan: list, done: list[dict[str, Any]], resume: bool, max_runs: int | None) -> str | None:
+        """N108: a plan smaller than the spec's full series says why — runs already done (resume), the spec's
+        max_runs, or the call's max_runs."""
+        full = len(levels_of(self.spec)) * int(self.spec.get("runs_per_level") or 1)
+        if len(plan) >= full:
+            return None
+        ok = len([r for r in done if r.get("status") == "ok"])
+        parts = []
+        if resume and ok:
+            parts.append(f"{ok} of the {full} runs of the series are already done (resume=true continues the series; "
+                         "resume=false starts it over — the earlier runs are moved to an archive, never deleted)")
+        spec_max = self.spec.get("max_runs")
+        if spec_max is not None and ok + len(plan) >= int(spec_max) and len(plan) < full - (ok if resume else 0):
+            parts.append(f"the spec's max_runs is {spec_max}")
+        if max_runs is not None and len(plan) == max_runs:
+            parts.append(f"max_runs={max_runs} in this call")
+        if not plan and not parts:
+            parts.append("every run of the series is done")
+        return f"{len(plan)} of {full} runs planned: " + "; ".join(parts) if parts else None
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread:

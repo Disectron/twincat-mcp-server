@@ -463,7 +463,11 @@ async def test_ipc_eventlog_token_provider_cleanup(monkeypatch, project_dir):
     fs: dict[str, str] = {}
     deleted: list[str] = []
     started: list[str] = []
-    monkeypatch.setattr(F.SystemServiceFiles, "resolve_prefix_dir", lambda self, p: r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot")
+    # N110: the real resolve_prefix_dir runs (a stand-in that ignored its argument hid 'boot:' being unknown to it);
+    # only the target's file system is faked
+    boot = r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot"
+    monkeypatch.setattr(F.SystemServiceFiles, "_ffind_raw", lambda self, pattern, mx: [{"name": "CurrentConfig.xml",
+                        "size": 1, "is_dir": False}] if pattern == boot + "\\*" else [])
 
     def start(self, path, directory="", command_line=""):
         started.append(command_line)
@@ -1337,3 +1341,25 @@ async def test_n92_a_gvl_of_the_source_without_symbols_on_the_target_is_named(mo
         "GVL_Machine.nDrumsFilled := GVL_Machine.nDrumsFilled + 1;\n\tnSpare := 1;"), encoding="utf-8")
     app.proj.refresh()
     assert app.proj.unreferenced_gvls()["not_linked"] == []                   # an unqualified use is a use
+
+
+@pytest.mark.anyio
+async def test_n98_an_export_into_a_folder_that_does_not_exist_yet(monkeypatch, project_dir, tmp_path):
+    """N98 (0.8.11 retest): rec_export(out_path=<new folder>\\x.csv) raised FileNotFoundError of its temp file. A
+    folder inside the folders this server writes to is created; outside them nothing is created."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir)
+    async with client_for(build_server(cfg)) as s:
+        rid = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change"}))["id"]
+        await s.call_tool("rec_stop", {"id": rid})
+        target = project_dir / "exports" / "new" / "deeper" / "x.csv"
+        ok = payload(await s.call_tool("rec_export", {"id": rid, "out_path": str(target)}))
+        assert Path(ok["file"]).resolve() == target.resolve() and target.is_file()
+        out = project_dir / "types" / "fresh" / "types.ts"                 # another writer through the same check
+        payload(await s.call_tool("ads_export", {"types": ["ST_Recipe"], "fmt": "typescript", "out_path": str(out)}))
+        assert out.is_file()
+        bad = await s.call_tool("rec_export", {"id": rid, "out_path": str(tmp_path / "elsewhere" / "new" / "x.csv")})
+        assert bad.is_error and not (tmp_path / "elsewhere").exists()
+        (project_dir / "exports" / "afile").write_text("x")
+        bad = await s.call_tool("rec_export", {"id": rid, "out_path": str(project_dir / "exports" / "afile" / "x.csv")})
+        assert bad.is_error and "is a file, not a folder" in text(bad)

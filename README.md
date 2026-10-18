@@ -154,7 +154,7 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **Experiments** `exp_template` · `exp_validate` · `exp_save` · `exp_list` · `exp_get` · `exp_runs` · `exp_run[dry_run]` · `exp_status` · `exp_abort` · `exp_evaluate` · `exp_report` · `exp_compare`
 
-**Knowledge base** `kb_set_location` · `kb_status` · `kb_rebuild` · `kb_add_project` · `kb_remove_project` · `kb_reindex` · `kb_search` · `hw_lookup` · `proj_libraries` — the database lives in a folder you name; only project folders you add are indexed
+**Knowledge base** `kb_set_location` · `kb_status` · `kb_rebuild` · `kb_add_project` · `kb_remove_project` · `kb_reindex` · `kb_search` · `hw_lookup` · `hw_search` · `hw_object` · `hw_diag` · `hw_module` · `proj_libraries` — the database lives in a folder you name; only project folders you add are indexed; the `hw_*` tools read the ESI index (every ESI file in the knowledge folder's `manuals\` and TwinCAT's ESI folders)
 
 **Offline documentation — skill `twincat-docs`** (no MCP tools; a read-only script the skill runs). The knowledge
 folder has one fixed layout (0.8.11; the rules are `docs/KNOWLEDGE_BASE.md`):
@@ -163,13 +163,14 @@ folder has one fixed layout (0.8.11; the rules are `docs/KNOWLEDGE_BASE.md`):
 |---|---|---|
 | `index\infosys-1033.db` | the TwinCAT 3 books of the Help Viewer package — the one Infosys index, read by the `infosys_*` tools and the skill | the plugin, the first time by itself; later `tools\infosys_local.py index` or `kb_rebuild(index='infosys')` |
 | `index\manuals.db` | the PDF manuals in `manuals\` — page text, chapters, product codes | the plugin, the first time by itself; later `tools\manuals_db.py update` or `kb_rebuild(index='manuals')` (Python 3.12+ with pypdf or PyMuPDF) |
-| `index\knowledge.db` | projects for `kb_search`, ESI devices for `hw_lookup` | the `kb_*` tools; the ESI part the first `hw_lookup`, later `kb_rebuild(index='esi')` |
+| `index\esi.db` | every EtherCAT device description on the PC: the ESI files you put in `manuals\` (e.g. Beckhoff's whole ESI folder) and TwinCAT's `Config\Io\EtherCAT` — devices, PDOs, PDO assignments, CoE dictionaries with defaults, diagnosis messages, modules | the plugin, the first time by itself; later `kb_rebuild(index='esi')` (the builder `esi_db.py`, minutes) |
+| `index\knowledge.db` | projects for `kb_search` | the `kb_*` tools |
 | `manuals\`, `sop\` | your PDFs and SOPs (Markdown) | you — the plugin never writes there |
 | `tools\` | builder stubs that run the plugin's builders | the plugin (only files it shipped are replaced) |
 
 `skills/twincat-docs/kb_docs.py` answers `docs_search`, `docs_declaration`, `docs_page`, `docs_books`,
-`manual_search`, `manual_product`, `manual_toc`, `manual_page`, `manual_docs`, `status` as one JSON object each
-(standard library, opens both indexes read-only). A name that exists in several libraries (`MC_MoveAbsolute` in
+`manual_search`, `manual_product`, `manual_toc`, `manual_page`, `manual_docs`, `hw_lookup`, `hw_search`, `hw_object`,
+`hw_diag`, `hw_module`, `status` as one JSON object each (standard library, opens the indexes read-only). A name that exists in several libraries (`MC_MoveAbsolute` in
 Tc2_MC2 and Tc3_DriveMotionControl) is never resolved silently: the answer is `ambiguous` with the candidates.
 `kb_status` → `docs` shows both indexes, the PDFs not indexed yet and the exact command for this folder; `hw_lookup`
 lists the manuals that mention a product code. Every index is `complete`, `rebuild_needed` (another format) or

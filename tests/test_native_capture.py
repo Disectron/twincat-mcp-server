@@ -883,3 +883,22 @@ def test_n84_rows_before_the_window_are_counted_apart_and_skipped_by_readers(cap
     assert sum(1 for t, _k, _b in _rows(path) if t < 2.0) == 2          # in the file as delivered
     ts = [t for t, _n, _v in R.iter_events(path, None)]
     assert ts and min(ts) == 2.0                                        # not part of the recording
+
+
+def test_n107_compare_of_two_native_recordings(rec):
+    """N107 (S2, 0.8.11 retest): rec_compare crashed on native recordings — 'NativeRecording' has no 'stats'. It now
+    takes the statistics rec_stats gives (from the file for the native engine) for either engine."""
+    ids = []
+    for i in range(2):
+        st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=1 + i,
+                       max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=f"c{i}", max_symbols=50,
+                       cycle_counter=None)
+        _wait_done(rec, st["id"])
+        rec.stop(st["id"])
+        ids.append(st["id"])
+    c = rec.compare(ids[0], ids[1])
+    row = c["rows"][0]
+    assert c["source"] == {"a": "file", "b": "file"} and c["common_symbols"] == 1 and row["symbol"] == "MAIN.nCycle"
+    sa, sb = (rec.stats(i, ["MAIN.nCycle"], False, 0)["symbols"]["MAIN.nCycle"] for i in ids)
+    assert row["a"]["count"] == sa["count"] and row["b"]["count"] == sb["count"]
+    assert row["delta"]["count"] == sb["count"] - sa["count"] > 0 and "note" not in c

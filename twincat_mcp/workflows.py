@@ -22,8 +22,13 @@ def _classify_write(line: str, leaf: str, segs: list[str]) -> str | None:
     variable with the same leaf name, e.g. other.x := … when the symbol is MAIN.fb.x)."""
     import re as _re
     code = _re.sub(r"//.*$|\(\*.*?\*\)", "", line)
-    if _re.search(rf"=>\s*([\w.\[\]^]*\.)?{_re.escape(leaf)}\b", code, _re.I):
-        return "output_binding"
+    for m in _re.finditer(rf"=>\s*((?:[\w\[\]^]+\.)*){_re.escape(leaf)}\b", code, _re.I):
+        # N111: `Q => x` binds this symbol only when unqualified in its scope, or qualified by a suffix of its path
+        quals = [x.split("[")[0].rstrip("^").lower() for x in m.group(1).split(".") if x]
+        if not quals:
+            return "output_binding_unqualified"
+        if _qualifier_matches(quals + [leaf.lower()], segs):
+            return "output_binding"
     for m in _re.finditer(rf"([\w\[\]^]+\.)*\b{_re.escape(leaf)}\b(\[[^\]]*\])?\s*:=", code, _re.I):
         start = m.start()
         qual = code[start:m.start() + len(m.group(0))].split(":=")[0].strip()
@@ -33,13 +38,37 @@ def _classify_write(line: str, leaf: str, segs: list[str]) -> str | None:
             return "named_input_parameter"
         if len(parts) > 1:
             # qualified: the qualifier must be a suffix of the symbol's own path (fbFill.bDone for MAIN.fbFill.bDone)
-            want = [x.lower() for x in segs]
-            got = [x.lower() for x in parts]
-            if got != want[-len(got):] and got[0] not in ("this", "super"):
+            if not _qualifier_matches([x.lower() for x in parts], segs):
                 continue
-            return "assignment"
+            return "assignment_unqualified" if parts[0].lower() in ("this", "super") else "assignment"
         return "assignment_unqualified"
     return None
+
+
+def _qualifier_matches(got: list[str], segs: list[str]) -> bool:
+    """A qualified name (fbFill.bDone) names this symbol when it is a suffix of the symbol's own path
+    (MAIN.fbFill.bDone); THIS^ / SUPER^ name the unit's own member (decided by scope, as an unqualified name)."""
+    want = [x.lower() for x in segs]
+    return got[0] in ("this", "super") or got == want[-len(got):]
+
+
+def mention_kind(line: str, leaf: str, segs: list[str]) -> str | None:
+    """N111: does this line name the symbol? 'qualified' (a suffix of its path: MAIN.nCount, fbFill.bDone),
+    'unqualified' (a bare nCount — the symbol only in a unit of its scope), or None (only other variables of the same
+    name: fbCounter.nCount when the symbol is MAIN.nCount). Comments and strings are not code."""
+    import re as _re
+    code = _re.sub(r"//.*$|\(\*.*?\*\)|'[^']*'|\"[^\"]*\"", "", line)
+    found = None
+    for m in _re.finditer(rf"((?:[\w\[\]^]+\.)*)\b{_re.escape(leaf)}\b", code, _re.I):
+        quals = [x.split("[")[0].rstrip("^").lower() for x in m.group(1).split(".") if x]
+        if not quals:
+            found = found or "unqualified"
+        elif _qualifier_matches(quals + [leaf.lower()], segs):
+            if quals[0] in ("this", "super"):
+                found = found or "unqualified"
+            else:
+                return "qualified"
+    return found
 
 
 def _in_scope(app, unit_name: str, declared_in: str | None) -> bool:
@@ -77,12 +106,12 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
             kind = _classify_write(h.get("text", ""), leaf, segs)
             if kind is None:
                 continue
-            if kind == "assignment_unqualified":
-                # N3: a bare `x :=` writes the x in scope of that unit — only a writer if that unit (or one derived
-                # from it) declares this symbol's x; FB_Counter.OnReset's nCount is not MAIN.nCount
+            if kind in ("assignment_unqualified", "output_binding_unqualified"):
+                # N3: a bare `x :=` (or `Q => x`) writes the x in scope of that unit — only a writer if that unit (or
+                # one derived from it) declares this symbol's x; FB_Counter.OnReset's nCount is not MAIN.nCount
                 if not _in_scope(app, h.get("unit", ""), declared_in):
                     continue
-                kind = "assignment"
+                kind = kind.replace("_unqualified", "")
             h["kind"] = kind
             (input_bindings if kind == "named_input_parameter" else kept).append(h)
         writers["hits"] = kept
@@ -100,7 +129,13 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
         except Exception:  # noqa: BLE001 — no HMI/visu in this project
             pass
         mentions = await app.proj_call(app.proj.search, rf"\b{leaf}\b", ["PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "ACTION", "GET", "SET"], 200, True)
-        impl_mentions = [h for h in mentions["hits"] if h["part"] == "implementation"]
+
+        def names_it(unit: str, text: str) -> bool:
+            # N111: FB_CounterModule's own nCount is not MAIN.nCount — a bare name counts only in the symbol's scope
+            k = mention_kind(text, leaf, segs)
+            return k == "qualified" or (k == "unqualified" and _in_scope(app, unit, declared_in))
+        impl_mentions = [h for h in mentions["hits"] if h["part"] == "implementation"
+                         and names_it(h.get("unit", ""), h.get("text", ""))]
         rep["writers"] = writers["hits"][:30]
         rep["mentions"] = impl_mentions[:30]
         excerpts: list[dict[str, Any]] = []
@@ -115,7 +150,7 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
                 continue
             lines = (code.get("implementation") or "").splitlines()
             u = app.proj.get_unit(h["unit"])
-            idxs = [i for i, ln in enumerate(lines) if leaf.lower() in ln.lower()][:3]
+            idxs = [i for i, ln in enumerate(lines) if names_it(h["unit"], ln)][:3]
             for i in idxs:
                 lo, hi = max(0, i - context_lines // 2), min(len(lines), i + context_lines // 2 + 1)
                 excerpts.append({"unit": h["unit"], "file": h["file"], "from_line": u.impl_line0 + lo,

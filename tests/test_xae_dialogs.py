@@ -117,3 +117,38 @@ async def test_review_a_deploy_stops_before_the_next_step_when_a_dialog_waits(mo
 
 async def _value(v):
     return v
+
+
+@pytest.mark.anyio
+async def test_n93_a_run_to_run_restart_compares_the_application_it_read(monkeypatch, project_dir):
+    """N93 (0.8.11 retest): xae_restart_twincat RUN -> RUN read the compile time before the restart, but compared with
+    the witness of an earlier activation made in CONFIG (no compile time): 'nothing to compare'."""
+    from twincat_mcp.server import build_server
+    from tests.fake_ads import install
+    from tests.test_server_e2e import client_for, payload
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    app = srv._tcmcp_app
+    monkeypatch.setattr(app, "dialogs_now", lambda: [])
+
+    async def ok(*a, **kw):
+        return "PLC@192.168.0.10.1.1"
+
+    async def nothing(*a, **kw):
+        return None
+
+    async def xae_call(fn, *a, **kw):
+        return {}
+    witnesses = iter([{"mode": "RUN", "app_timestamp": 1792380152}])
+    monkeypatch.setattr(app, "xae_target_for", ok)
+    monkeypatch.setattr(app, "permit", nothing)
+    monkeypatch.setattr(app, "xae_call", xae_call)
+    monkeypatch.setattr(app, "restart_witness", lambda *a, **kw: _value(next(witnesses)))
+    monkeypatch.setattr(app, "verify_target_after", lambda *a, **kw: _value(
+        {"verified": True, "target_mode": "RUN", "dialogs": [], "polls": 2, "modes_seen": ["RUN", "CONFIG", "RUN"],
+         "witness_after": {"mode": "RUN", "app_timestamp": 1792380999}}))
+    app.last_activation = {"mono": time.monotonic(), "witness": {"mode": "CONFIG", "app_timestamp": None}}
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("xae_restart_twincat", {"confirm_token": "x"}))
+    pa = r["plc_application"]
+    assert pa["changed"] is True and pa["compiled_before"] is not None and pa["compared_with"] == "before this restart", pa

@@ -2652,12 +2652,7 @@ class Recorder:
               exact: bool | None = None) -> dict[str, Any]:
         """Live statistics while they are complete; from the file when the ingest had to skip them under load
         (stats_coverage < 1), when the recording is from an earlier session, or with exact=true."""
-        rec = self.recs.get(rid)
-        if rec is None:
-            try:
-                rec = self._get(rid)
-            except RecorderError:
-                rec = None
+        rec = self._rec_or_none(rid)
         if rec is not None and getattr(rec, "engine", "python") == "native":
             rec = None if not rec.active else rec
             if rec is not None:
@@ -2673,13 +2668,37 @@ class Recorder:
                     out["stats_coverage"] = round(coverage, 4)
                     out["note"] = "live statistics skipped samples under load; call again after rec_stop (or exact=true) for exact values"
                 return out
-        path = self._path_for(rid)
         want = {s.lower() for s in symbols} if symbols else None
-        st: dict[str, SymStats] = {}
-        for t, n, v in iter_events(path, want):
-            st.setdefault(n, SymStats()).ingest(t, v, _numeric_dec(v), self.max_runs)
+        st = self._file_stats(rid, want)
         return {"id": rid, "active": bool(rec and rec.active), "source": "file",
                 "events": sum(s.count for s in st.values()), "symbols": _stats_out(st, symbols, include_runs, max_runs_out)}
+
+    def _rec_or_none(self, rid: str) -> Any:
+        rec = self.recs.get(rid)
+        if rec is None:
+            try:
+                rec = self._get(rid)
+            except RecorderError:
+                rec = None
+        return rec
+
+    def _file_stats(self, rid: str, want: set[str] | None = None) -> dict[str, SymStats]:
+        """Exact statistics from the recording's file — what rec_stats gives after the recording, for either engine."""
+        st: dict[str, SymStats] = {}
+        for t, n, v in iter_events(self._path_for(rid), want):
+            st.setdefault(n, SymStats()).ingest(t, v, _numeric_dec(v), self.max_runs)
+        return st
+
+    def _final_stats(self, rid: str) -> tuple[dict[str, SymStats], str]:
+        """The statistics of a recording as rec_stats gives them once it has stopped: the live ones of a Python-engine
+        recording only when they are complete (nothing skipped under load), else — native engine (no live
+        statistics, N107), a recording from an earlier session, live ones with gaps — exact, from the file.
+        -> (stats, 'live' | 'file')."""
+        rec = self._rec_or_none(rid)
+        if (rec is not None and getattr(rec, "engine", "python") == "python" and not rec.active
+                and (not rec.samples or rec.stats_samples >= rec.samples)):
+            return rec.stats, "live"
+        return self._file_stats(rid), "file"
 
     @staticmethod
     def _elapsed_ms(rec: Recording) -> float | None:
@@ -3417,21 +3436,11 @@ class Recorder:
     def compare(self, rid_a: str, rid_b: str, symbols: list[str] | None = None) -> dict[str, Any]:
         """Before/after comparison of two recordings over their common symbols: stats deltas
         (count, min, max, mean, changes) and, for BOOL symbols, pulse width/period deltas."""
-        def stats_from_file(rid: str) -> tuple[dict[str, SymStats], dict[str, str]]:
-            st: dict[str, SymStats] = {}
-            types: dict[str, str] = {}
-            for t, n, v in iter_events(self._path_for(rid), None):
-                v = _raw_val(v)
-                st.setdefault(n, SymStats()).ingest(t, v, _numeric_dec(v), 100_000)
-            return st, types
-        if rid_a in self.recs and not self.recs[rid_a].active:
-            sa = self.recs[rid_a].stats
-        else:
-            sa, _ = stats_from_file(rid_a)
-        if rid_b in self.recs and not self.recs[rid_b].active:
-            sb = self.recs[rid_b].stats
-        else:
-            sb, _ = stats_from_file(rid_b)
+        # N107: the statistics rec_stats gives — the same for both engines (a native recording has no live ones; the
+        # compare read `.stats` of whatever object it was and crashed on it)
+        running = [r for r in (rid_a, rid_b) if getattr(self._rec_or_none(r), "active", False)]
+        sa, src_a = self._final_stats(rid_a)
+        sb, src_b = self._final_stats(rid_b)
         common = sorted(set(sa) & set(sb), key=str.lower)
         if symbols:
             want = {s.lower() for s in symbols}
@@ -3451,8 +3460,13 @@ class Recorder:
                 except RecorderError:
                     pass
             out.append(row)
-        return {"a": rid_a, "b": rid_b, "common_symbols": len(common), "only_in_a": sorted(set(sa) - set(sb))[:50],
-                "only_in_b": sorted(set(sb) - set(sa))[:50], "rows": out}
+        res: dict[str, Any] = {"a": rid_a, "b": rid_b, "source": {"a": src_a, "b": src_b},
+                               "common_symbols": len(common), "only_in_a": sorted(set(sa) - set(sb))[:50],
+                               "only_in_b": sorted(set(sb) - set(sa))[:50], "rows": out}
+        if running:
+            res["note"] = (f"{', '.join(running)} still recording: compared as recorded so far (the file up to now) — "
+                           "compare again after rec_stop for the whole recording")
+        return res
 
     def _path_for(self, rid: str) -> Path:
         rec = self.recs.get(rid)

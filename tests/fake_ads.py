@@ -49,6 +49,7 @@ SYMBOLS: list[tuple[str, str, int, Any, int]] = [
     ("PRG_Test.ipThing", "I_Thing", 8, -114343974404328, 0),          # interface NOT recognisable in the datatype table
     ("PRG_Test.aThings", "ARRAY [1..2] OF I_Thing", 16, [0, -114343974404328], 0),
     ("PRG_Test.pAlias", "PT_Int", 8, -114343571583168, 0),           # N50: TYPE PT_Int : POINTER TO INT (0xFFFF980150088F40)
+    ("PRG_Test.pAlias4026", "PT_RetestAlarm", 8, -114343571591392, 0),  # N50 (0.8.11 retest): the 4026 table gives it no base
 ]
 
 
@@ -73,6 +74,7 @@ DATATYPES = [
     _dt("I_Module", "", 8, dtype=65, flags=0x800),                 # METHODINFOS, no members, pointer-sized → interface
     _dt("POINTER TO INT", "INT", 8, dtype=21),
     _dt("PT_Int", "POINTER TO INT", 8, dtype=21),
+    _dt("PT_RetestAlarm", "", 8, dtype=65),           # as 4026 lists TYPE PT_RetestAlarm : POINTER TO FB_AlarmList
     _dt("ARRAY [0..7] OF BOOL", "BOOL", 8, dtype=33, dims=[(0, 8)]),
 ]
 DATATYPE_BLOB = b"".join(encode_entry(e) for e in DATATYPES)

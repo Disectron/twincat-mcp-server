@@ -44,6 +44,8 @@ Version 5 (0.8.11): page text format 4 — invisible text (font size 0, fully tr
   puts a size-0 copy of the running header under every heading, which doubled headings and toc titles (N37). The
   index lives in <kb>\\index\\manuals.db (moved there once from manualsdb\\); an update builds <db>.building from a copy
   of the index and swaps it in when complete. `stats` is the twincat-docs skill's state (one implementation).
+Version 6 (0.8.12): page text format 5 — text drawn below 1 pt is not page text: the hidden copy of the running
+  header under each heading is drawn at 0.003 pt, not at 0, so format 4 still doubled headings and toc titles (N37).
 Stored paths stay absolute (moving the knowledge folder re-indexes every manual on the next update).
 """
 from __future__ import annotations
@@ -79,8 +81,9 @@ except ImportError:                 # a copy of this file outside the plugin fol
              "<plugin>\\skills\\twincat-docs\\builders\\manuals_db.py — not a copy of it")
 
 BUILDER = "manuals_db.py"
-BUILDER_VERSION = "5"
-TEXT_FORMAT = "4"                # page text / toc rules; 4: text set at font size 0 is not page text (N37).
+BUILDER_VERSION = "6"
+TEXT_FORMAT = "5"                # page text / toc rules; 5: text drawn below 1 pt is not page text (N37: Beckhoff's
+                                 # hidden header copy is drawn at 0.003 pt, not 0 — format 4 kept it).
                                  # An index of another format stays in use, reported 'rebuild_needed', until `update`
                                  # (or kb_rebuild('manuals')) reads every manual again. tests/test_formats.py fingerprints
                                  # the code that makes the text and fails when it changes without a new format
@@ -142,13 +145,17 @@ class Span:
         self.blank = not text.strip()     # a space in its own font run: part of the text, not of the layout
 
 
+MIN_TEXT_PT = 1.0       # below 1 pt (0.35 mm) no printed text can be read
+
+
 def _visible(size) -> bool:
-    """N37 (format 4): Beckhoff PDFs carry under every heading a copy of the running header at font size 0
-    ('4.2.2 Signal flow diagram' + '| Signal flow diagram' at 0.0 pt), which doubled headings and TOC titles. Text set
-    at size 0 is not page text. Invisible text of a real size stays: it is how a scanned PDF carries its OCR text
-    layer (render mode 3 — PyMuPDF reports it with alpha 0), the only text such a manual has."""
+    """N37: Beckhoff PDFs carry under every heading a copy of the running header drawn at a vanishing size ('4.4
+    Calibration and compensation' + '| Calibration and compensation' at 0.0028 pt in EL3356-0010.pdf), which doubled
+    headings and TOC titles. Format 4 dropped size 0 only — the real copy is 0.003 pt, so it stayed. Text drawn below
+    MIN_TEXT_PT is not page text (format 5). Invisible text of a real size stays: it is how a scanned PDF carries its
+    OCR text layer (render mode 3 — PyMuPDF reports it with alpha 0), the only text such a manual has."""
     try:
-        return size is None or float(size) > 0
+        return size is None or float(size) >= MIN_TEXT_PT
     except (TypeError, ValueError):
         return True
 

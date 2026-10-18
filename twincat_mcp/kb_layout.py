@@ -8,7 +8,8 @@
       index\\               the plugin's: one index per source, rebuildable from it
         infosys-<lcid>.db  the Beckhoff Information System of the local Help Viewer package
         manuals.db         the PDFs in manuals\\
-        knowledge.db       added project folders (kb_search) and ESI devices (hw_lookup)
+        esi.db             the EtherCAT device descriptions: ESI files in manuals\\ and TwinCAT's ESI folders (hw_*)
+        knowledge.db       added project folders (kb_search)
         README.md          what each index is, its format, how it is rebuilt
 
 Standard library only: the server, the docs skill script (kb_docs.py) and the builders all import it, so the three
@@ -21,9 +22,9 @@ from pathlib import Path
 from typing import Any
 
 INDEX_DIR = "index"
-FILES = {"infosys": "infosys-{lcid}.db", "manuals": "manuals.db", "knowledge": "knowledge.db"}
+FILES = {"infosys": "infosys-{lcid}.db", "manuals": "manuals.db", "esi": "esi.db", "knowledge": "knowledge.db"}
 # where an index lived before the layout was fixed (0.8.11): moved into index\ once, never copied
-LEGACY = {"infosys": ["infosys/helpviewer-{lcid}/index.sqlite"], "manuals": ["manualsdb/manuals.db"],
+LEGACY = {"infosys": ["infosys/helpviewer-{lcid}/index.sqlite"], "manuals": ["manualsdb/manuals.db"], "esi": [],
           "knowledge": ["knowledge.db"]}
 # files the plugin no longer reads — reported (with their size) for the user to delete; never deleted here
 OBSOLETE = ["helpviewer/infosys_en.db", "helpviewer/infosys_en.db.building", "helpviewer/infosys_en.db.lock"]
@@ -142,12 +143,14 @@ edit; outside index\\ the plugin writes only the builder stubs in tools\\ (a cop
 |---|---|---|
 | infosys-<lcid>.db | the Beckhoff Information System package of the local Help Viewer (BKINFOSYS3_*.mshc) | tools\\infosys_local.py index, or kb_rebuild('infosys') |
 | manuals.db | the PDF manuals in ..\\manuals\\ | tools\\manuals_db.py update, or kb_rebuild('manuals') |
-| knowledge.db | project folders you added (kb_add_project) and TwinCAT's ESI files | kb_reindex / kb_rebuild('esi') |
+| esi.db | the EtherCAT device descriptions (ESI .xml) in ..\\manuals\\ and TwinCAT's Config\\Io\\EtherCAT | the plugin's esi_db.py update, or kb_rebuild('esi'); its first build starts by itself |
+| knowledge.db | project folders you added (kb_add_project) | kb_add_project / kb_reindex |
 
 Each index records its format version and the stamp of its source. When a plugin update changes a format, or the
 source changes (a new Help Viewer package, new PDFs, new ESI files), the index is reported as needing a rebuild and
 stays in use as it is until you approve the rebuild. A rebuild writes a new file beside the old one (.building) and
-swaps it in only when it is complete; knowledge.db changes in one transaction. Apart from an index replaced by its
+swaps it in only when it is complete; knowledge.db changes in one transaction. (knowledge.db of 0.8.11 and before also
+holds an ESI table: no longer read — esi.db replaced it.) Apart from an index replaced by its
 complete rebuild, the plugin never deletes a file here or anywhere in the knowledge folder; files it no longer reads
 are listed by kb_status for you to delete.
 """

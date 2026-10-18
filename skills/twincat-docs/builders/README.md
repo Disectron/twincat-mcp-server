@@ -1,7 +1,7 @@
-# Builders: infosys_local.py and manuals_db.py
+# Builders: infosys_local.py, manuals_db.py and esi_db.py
 
-Two scripts that build the knowledge folder's documentation indexes, read by the `twincat-docs` skill (`kb_docs.py`)
-and by the twincat MCP server. `infosys_local.py` version 3, `manuals_db.py` version 5 (plugin 0.8.11). The layout,
+Three scripts that build the knowledge folder's indexes, read by the `twincat-docs` skill (`kb_docs.py`) and by the
+twincat MCP server. `infosys_local.py` version 3, `manuals_db.py` version 6, `esi_db.py` version 1 (plugin 0.8.12). The layout,
 the states and when an index is rebuilt follow the ground rules in the plugin's `docs/KNOWLEDGE_BASE.md`; the paths
 come from `twincat_mcp/kb_layout.py`, which the server, `kb_docs.py` and both builders import.
 
@@ -9,6 +9,7 @@ come from `twincat_mcp/kb_layout.py`, which the server, `kb_docs.py` and both bu
 |---|---|---|
 | `infosys_local.py` | Beckhoff Infosys package `BKINFOSYS3*.mshc` (Microsoft Help Viewer) | `<kb>\index\infosys-1033.db` (`--lang de`: `infosys-1031.db`) |
 | `manuals_db.py` | PDF files under `<kb>\manuals\` (sub-folders allowed) | `<kb>\index\manuals.db` |
+| `esi_db.py` | ESI files (`.xml`) under `<kb>\manuals\` and in TwinCAT's `Config\Io\EtherCAT` (+ `--esi-dir`) | `<kb>\index\esi.db` |
 
 `infosys_local.py` runs the plugin's own extractor (`twincat_mcp.infosys_build`, from the plugin folder the builder
 ships in): the one Infosys index, the same file the `infosys_*` tools read. Version 2 built a second, different index
@@ -248,9 +249,83 @@ A version-1 database has no `meta` table; the next `update` creates it.
 | `docs [--filter GLOB]` | overview | id, file, pages, text pages, title |
 | `stats [--json]` | state from `manuals_state` (section 4) | counts, DB size, the state message; `--json` gives the full object |
 
+## 3b. esi_db.py
+
+### Commands
+
+```
+python esi_db.py [--kb PATH | --db PATH] update [--force] [--esi-dir DIR ... | --no-esi-dirs] [--no-twincat]
+python esi_db.py stats   [--json]
+python esi_db.py lookup  QUERY [--revision REV] [--detail newest|summary|full] [--limit 5]
+python esi_db.py search  QUERY [--kinds device,object,diag,module] [--limit 20]
+python esi_db.py object  DEVICE INDEX [--revision REV]
+python esi_db.py diag    CODE [--device DEVICE]
+python esi_db.py module  IDENT [--device DEVICE]
+```
+
+The server runs `update` itself (the first build at its start, later `kb_rebuild(index='esi')` once approved) with its
+`knowledge.esi_dirs` as `--esi-dir` (or `--no-esi-dirs`); without either, `update` uses the folders the index in use
+was built with. Standard library only; the queries print the JSON of the server's `hw_*` tools.
+
+### What is read (`twincat_mcp/esi_index.py`, format 1)
+
+Every `*.xml` below the sources whose root element is an ESI document — files of other roots are listed (`not_esi`)
+and skipped:
+
+| root | what is stored |
+|---|---|
+| `EtherCATInfo` | each `Device`: type, product code, revision, names (English, German), group, vendor, `FileVersion`, physics, E-bus current, URLs, the picture `RES\<type>_standard.*` beside the file, mailbox protocols, sync managers, FMMUs, DC operation modes, `HideType`, every PDO with every entry (a gap — index 0 — is kept with `gap`, it occupies bits), excludes, `Virtual`, slot-dependent indices, the predefined PDO assignments (`AlternativeSmMapping`: PDOs per SM, DC mode, init commands), slots, the CoE dictionary, inline diagnosis messages, `DictionaryFile` / `DiagFile`; each `Descriptions\Modules\Module` |
+| `EtherCATModule` | each module: ModuleIdent, type, name, PDOs, dictionary, diagnosis messages |
+| `EtherCATDict` | a dictionary named by a device's `DictionaryFile` (AX5000) |
+| `EtherCATDiag` | a diagnosis catalogue named by a device's `DiagFile`: text id, message, description, causes and remedies, class, reaction / reset / type as their texts |
+
+- **PDO templates** (`<TxPdo Ref="…" Chn="n"/>` and `Descriptions\Pdos\Pdo[@RefName]`, Beckhoff's compact files):
+  resolved per channel — `ChnFac` adds `n × ChnFac` to an index or sub-index, a name's `#1` becomes `1 + n × ChnFac`.
+  A template the file does not hold is kept as `unresolved` with the reason. Such a file is read twice (templates
+  first); every other file once, element by element, each device dropped once read (memory stays bounded — the
+  88 MB `ELM310x.xml` included).
+- **Dictionary**: objects with type, bit size, access, PDO mapping, backup / setting flags, comment; sub-indices from
+  the object's data type (bit offset, type, access); an array type's elements one by one (`SubIndex 001` …, base
+  type, own bit offset); `Info\SubItem` defaults matched by name; `DefaultData` decoded little-endian for elementary
+  types (kept as `default_raw`), an enumeration's value with its text; min / max; the unit code as written.
+  Indices in hex (`#x8000`) or decimal (`0410` in AX5000 Dict files).
+- **Stored once by content**: an object, a dictionary, a diagnosis message, a catalogue — most revisions share them.
+- **Duplicates**: a file whose content another source already gave is read once (its devices list it in `also_in`).
+  A revision (type, product code, revision) in several files: the one with the higher vendor `FileVersion`, then the
+  newer file, is kept; the others are named in `also_in` (identical) or `differs_in` (different).
+- **Modules are per file**: the same ModuleIdent is a different module in each AX8000 module file. A device's slot
+  module is resolved when read, by rule: the device's own file; else the module file paired with it by name
+  (`<prefix> Modules….xml`, `<prefix>` beginning the device file's name, the longest first); else the only module
+  with that ident. Several different modules at the first rule that applies: all are named, none chosen.
+- A `DictionaryFile` / `DiagFile` is looked up beside the device file as written, else as the one source file of that
+  name; not found: the device says so (`dictionary_note`), `stats` counts it (`missing_refs`).
+
+### Build
+
+One build at a time (`<db>.lock`); the build writes `<db>.building` and replaces the index when complete (60 s retry
+while a reader has it open; otherwise it waits as `waiting_to_replace` and is swapped in by the next `update`); an
+interrupted build replaces nothing and the next one starts over. Without `--force`, an index of this format built from
+exactly these files (paths, sizes, times — `sources_stamp`) is left as it is (`up to date`). Full-text search
+(`search`) needs SQLite with FTS5; without it everything else works.
+
+### Schema (format 1)
+
+```sql
+files(id, path, source, kind, size, mtime, hash, same_as, items, error)
+obj(id, hash UNIQUE, idx, name, type, access, pdo_mapping, data)          -- data: zlib JSON of the object
+dicts(id, hash UNIQUE, objects, origin)            dict_obj(dict_id, idx, obj_id)
+msg(id, hash UNIQUE, text_id, message, data)       diag_sets(id, hash UNIQUE, messages, origin)
+diag_msg(set_id, text_id, msg_id)
+devices(id, type, name, product_code, revision, vendor, group_type, file_version, file_id, dict_id, diag_set,
+        pdo_count, pdo_entries, objects, also_in, differs_in, data)       -- data: zlib JSON of the device
+modules(id, ident, type, name, vendor, file_id, dict_id, diag_set, data)
+search USING fts5(kind, ref, title, body)          -- devices, objects, diagnosis messages, modules
+meta(k, v)  -- format, state, sources, extra_dirs, sources_stamp, counts, errors, missing_refs, not_esi, built, built_by
+```
+
 ## 4. Index state
 
-Both scripts report the real state with `stats` (and `--json`). The same code gives it to `kb_docs.py status` (and
+The scripts report the real state with `stats` (and `--json`). The same code gives it to `kb_docs.py status` (and
 `source.state` in every answer), to the server at every connection (instructions line `Offline documentation, state
 at this connection (<kb>): …`), to `tc_doctor` (`offline_docs`) and to `kb_status` → `docs`.
 

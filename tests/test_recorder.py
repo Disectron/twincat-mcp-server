@@ -213,7 +213,7 @@ def test_compare_recordings(rec):
     b = record([(0, "MAIN.fbFill.bDone", False), (0, "MAIN.nCycle", 1), (100, "MAIN.fbFill.bDone", True), (180, "MAIN.fbFill.bDone", False), (300, "MAIN.nCycle", 9)])
     c = rec.compare(a, b)
     rows = {r["symbol"]: r for r in c["rows"]}
-    assert c["common_symbols"] == 2
+    assert c["common_symbols"] == 2 and c["source"] == {"a": "live", "b": "live"}
     assert rows["MAIN.nCycle"]["delta"]["max"] == 4
     assert rows["MAIN.fbFill.bDone"]["pulses"]["a"]["high_ms"]["mean"] == 50 and rows["MAIN.fbFill.bDone"]["pulses"]["b"]["high_ms"]["mean"] == 80
 

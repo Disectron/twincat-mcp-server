@@ -794,3 +794,34 @@ def test_n50_an_alias_pointer_reads_as_an_address_everywhere(ads):
     r = ads.read("PRG_Test.pAlias")
     assert r["value"] == "0xFFFF980150088F40" and r["note"] == POINTER_NOTE, r
     assert ads.read_many(["PRG_Test.pAlias"])["PRG_Test.pAlias"] == "0xFFFF980150088F40"
+
+
+def test_n50_retest_an_alias_the_table_gives_no_base_is_raw_bytes_or_what_the_source_declares(ads):
+    """N50 (0.8.11 retest): on 4026 TYPE PT_RetestAlarm : POINTER TO FB_AlarmList is in the datatype table as 8 bytes
+    of BIGTYPE with NO base type — the 0.8.11 rule (follow the base) had nothing to follow, and the size guess read it
+    as the signed integer -114343571591392. BIGTYPE is never a number: without the project source the value is raw
+    bytes with a note; with it (TYPE … : POINTER TO …) it is an address with the pointer note."""
+    from twincat_mcp.ads_types import POINTER_NOTE
+    ads.alias_hint = None
+    r = ads.read("PRG_Test.pAlias4026")
+    assert r["value"] == {"raw_hex": (-114343571591392 & (2**64 - 1)).to_bytes(8, "little").hex()}, r
+    assert "no base type" in r["type_note"] and "note" not in r
+    ads.alias_hint = lambda name: "POINTER TO FB_AlarmList" if name.lower() == "pt_retestalarm" else None
+    r = ads.read("PRG_Test.pAlias4026")
+    assert r["value"] == "0xFFFF980150086F20" and r["note"] == POINTER_NOTE, r
+    assert "project source: TYPE PT_RetestAlarm : POINTER TO FB_AlarmList" in r["type_source"]
+    assert ads.read_many(["PRG_Test.pAlias4026"])["PRG_Test.pAlias4026"] == "0xFFFF980150086F20"
+    ads.alias_hint = None
+
+
+def test_n50_retest_the_project_source_names_an_alias(tmp_path, project_dir):
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex
+    (project_dir / "Plc" / "DUTs" / "PT_RetestAlarm.TcDUT").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n<TcPlcObject Version="1.1.0.1">\n  <DUT Name="PT_RetestAlarm" '
+        'Id="{aaaaaaaa-0000-0000-0000-000000000077}"><Declaration><![CDATA[(* alarm list *)\n'
+        "TYPE PT_RetestAlarm : POINTER TO FB_AlarmList; // the list\nEND_TYPE\n]]></Declaration></DUT>\n</TcPlcObject>\n",
+        encoding="utf-8")
+    idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
+    assert idx.type_alias("PT_RetestAlarm") == "POINTER TO FB_AlarmList"
+    assert idx.type_alias("ST_Recipe") is None and idx.type_alias("Nope") is None

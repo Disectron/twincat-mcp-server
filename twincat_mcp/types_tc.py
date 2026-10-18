@@ -95,6 +95,17 @@ def plc_string(raw: bytes) -> str:
         return "".join(chr(x) if x in _CP1252_HOLES else bytes([x]).decode("cp1252") for x in b)
 
 
+def plc_text(raw: bytes) -> str:
+    """Free text the runtime keeps from the project source — symbol and datatype comments, attribute values. N95: the
+    source is UTF-8 (a DUT comment with '—' came out 'â€”' read as Latin-1); bytes that are not valid UTF-8 are read
+    as Windows-1252 (a STRING's character set). Names and type names stay byte-for-byte (they go back to the runtime)."""
+    b = bytes(raw)
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return "".join(chr(x) if x in _CP1252_HOLES else bytes([x]).decode("cp1252") for x in b)
+
+
 def plc_string_bytes(text: str, size: int) -> bytes:
     """The bytes of a STRING variable of `size` bytes (capacity size - 1, NUL-terminated): Windows-1252; a character
     1252 cannot hold is refused, never replaced by '?'."""
@@ -108,6 +119,7 @@ def plc_string_bytes(text: str, size: int) -> bytes:
     return b.ljust(size, b"\x00")
 
 
+ADST_BIGTYPE = 65                 # a type the datatype table describes (struct, FB, alias, pointer alias …)
 # ADS data type ids (ADST_*) → the ctype of a value of that id: what the runtime itself says a scalar is
 ADST_CTYPE = {2: (C.PLCTYPE_INT, "int"), 3: (C.PLCTYPE_DINT, "int"), 16: (C.PLCTYPE_SINT, "int"),
               17: (C.PLCTYPE_USINT, "int"), 18: (C.PLCTYPE_UINT, "int"), 19: (C.PLCTYPE_UDINT, "int"),
@@ -161,6 +173,10 @@ def parse_type(type_str: str, size: int | None = None, data_type: int | None = N
     # enum or struct/alias: the runtime's data type id when given, else by size (a guess, flagged)
     if data_type in ADST_CTYPE and size in (1, 2, 4, 8) and ctypes.sizeof(ADST_CTYPE[data_type][0]) == size:
         return TcType(t, ADST_CTYPE[data_type][0], "enum", size)
+    if data_type == ADST_BIGTYPE:
+        # N50: BIGTYPE says the datatype table describes the value — never a number by its size (4026 gives an alias
+        # TYPE PT_X : POINTER TO FB_X as 8 bytes of BIGTYPE with no base type: it read as a signed integer)
+        return TcType(t, None, "struct", size, opaque=True)
     if size in (1, 2, 4, 8) and not up.startswith("ST_") and not up.startswith("FB_"):
         # Most likely an enum (TwinCAT reports the enum type name). Base type
         # is INT unless declared otherwise; we read by size, signed.

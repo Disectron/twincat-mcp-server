@@ -1358,14 +1358,24 @@ class XaeBackend:
         if before is None and option == "replace":
             raise XaeError(f"the objects of {plc_project_path} could not be listed completely, so the result of a 'replace' "
                            "import could not be checked for duplicate copies — nothing was imported. Retry when XAE is idle.")
+        # N97: 'replace' here means the existing object gets the imported text IN PLACE (its folder, its GUID).
+        # TwinCAT's PLCIMPORTOPTIONS_REPLACE deletes the existing object and creates the import at the import target —
+        # foldered objects left their folders for the project root with new GUIDs (0.8.11 retest, value 1 from the type
+        # library). So 'replace' imports as RENAME (copies <name>_1 beside the originals) and moves the checked text
+        # of each copy into its original (_replace_from_copies), then deletes the copy
+        value = opts["rename"] if option == "replace" else opts[option]
         # all four arguments: the folder structure from the XML is kept (bFolderStructure, default TRUE in the docs)
         try:
-            self._retry(lambda: it.PlcOpenImport(xml_file, opts[option], "", True), "PlcOpenImport")
+            self._retry(lambda: it.PlcOpenImport(xml_file, value, "", True), "PlcOpenImport")
         except XaeError:
-            self._retry(lambda: it.PlcOpenImport(xml_file, opts[option]), "PlcOpenImport")
+            self._retry(lambda: it.PlcOpenImport(xml_file, value), "PlcOpenImport")
         after = snapshot()
+        ov: dict[str, Any] = {"value": value, "from": opt_src}
+        if option == "replace":
+            ov["imported_as"] = ("rename — then each copy's text, checked against the XML, is written into the existing "
+                                 "object and the copy deleted (TwinCAT's own replace moves objects to the project root)")
         res: dict[str, Any] = {"imported": xml_file, "into": plc_project_path, "option": option, "objects_in_file": names,
-                               "option_value": {"value": opts[option], "from": opt_src}}
+                               "option_value": ov}
         if after is None and option == "replace":
             # N44: a normal result here read as success while renamed copies (PRG_X_1) may sit at the project root
             raise XaeError(f"PlcOpenImport(replace) ran, but the objects of {plc_project_path} could not be listed "
@@ -1379,6 +1389,20 @@ class XaeBackend:
             return res
         added = {p: n for p, n in after.items() if p not in before}
         res["added"] = sorted(added)[:200]
+        gone = sorted(p for p in before if p not in after)
+        if gone:
+            # N97: objects that were in the project before the import and are not now — never silent
+            res["removed"] = gone[:200]
+            moved = [{"from": p, "to": q} for p in gone for q, n in added.items() if n.lower() == before[p].lower()]
+            if moved:
+                res["moved"] = moved[:200]
+            if option == "replace":
+                raise XaeError(f"PlcOpenImport removed {len(gone)} existing object(s) from their place: {gone[:10]}"
+                               + (f" — re-created elsewhere: {moved[:10]}" if moved else "")
+                               + ". The in-place replace was not done; put them back (xae_tree) before importing again")
+            res["warning"] = (f"{len(gone)} object(s) that were in the project before the import are not at their place "
+                              f"any more: {gone[:10]}" + (f"; re-created at {[m['to'] for m in moved[:10]]}" if moved
+                                                          else ""))
         # R15: 'replace' replaces an object at the SAME place; when the XML carries no folder for it, TwinCAT puts it at
         # the project root and renames it (PRG_X_1) because the name exists elsewhere — a silent duplicate. A name the
         # file itself holds (FB_Axis_2 imported on purpose) is never a copy.
@@ -1389,6 +1413,11 @@ class XaeBackend:
             res["duplicates_created"] = dup
             if option == "replace":
                 return self._replace_from_copies(res, dup, added, before, _plcopen_oracle(xml_file))
+        if option == "replace":
+            existing = sorted({n for n in before.values() if n.lower() in in_file})
+            if existing:
+                res["warning"] = (f"{existing[:10]} exist in the project, but the import made no copy of them, so "
+                                  "nothing was written into them — they are unchanged")
         return res
 
     def _replace_from_copies(self, res: dict[str, Any], dup: list[str], added: dict[str, str],

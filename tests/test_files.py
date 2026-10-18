@@ -215,3 +215,16 @@ def test_boot_prefix_prefers_live_folder_on_4026(files, monkeypatch):
     monkeypatch.setattr(svc, "read_file", nofile)
     monkeypatch.setattr(type(svc), "_PREFIX_DIRS", {"boot": [live, legacy]})
     assert svc.resolve_prefix_dir("boot") == live
+
+
+def test_n110_a_prefix_with_or_without_its_colon_is_the_same_folder(files, monkeypatch):
+    """N110 (S2, 0.8.11 retest): ipc_eventlog asked for 'boot:' and got 'no folder is known for the prefix' while
+    ipc_list_dir('boot:*') resolved 'boot' in the same session."""
+    svc, _ = files
+    live = r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot"
+    monkeypatch.setattr(svc, "_ffind_raw", lambda pattern, mx: [{"name": "x", "size": 1, "is_dir": False}]
+                        if pattern == live + "\\*" else [])
+    assert svc.resolve_prefix_dir("boot:") == svc.resolve_prefix_dir("boot") == svc.resolve_prefix_dir("BOOT") == live
+    assert svc.list_dir("boot:*")["resolved_pattern"] == live + "\\*"
+    with pytest.raises(F.AdsError, match="no folder is known for the prefix 'user1'"):
+        svc.resolve_prefix_dir("user1:")

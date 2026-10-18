@@ -62,7 +62,7 @@ class Check:
 # tools this run never calls, with the manual step that exercises each (docs/HARDWARE_DAY.md)
 MANUAL: dict[str, str] = {
     "kb_set_location": "only with a folder you name (kb_status says what to ask); then kb_status shows the database",
-    "kb_status": "after kb_set_location: location, projects, ESI devices",
+    "kb_status": "after kb_set_location: location, projects, the ESI index (esi)",
     "kb_rebuild": "only when kb_status shows an index rebuild_needed / outdated: kb_rebuild(index='infosys'|'manuals'|"
                   "'esi') asks for approval (or takes a confirm_token); kb_status then shows the build running, "
                   "then complete",
@@ -74,7 +74,12 @@ MANUAL: dict[str, str] = {
                     "<recordings>/scope; then rec_start(..., also_scope=true) + rec_stop → <id>.svdx/.scope.csv/.scope.json",
     "scope_export": "save a Scope View recording as .svdx, then scope_export svd=<file> → CSV in <recordings>/scope "
                     "plus <csv>.provenance.json; open the CSV next to the Scope View chart",
-    "hw_lookup": "'EL2008' (or a terminal you use) → PDOs and CoE objects from the installed ESI files",
+    "hw_lookup": "'EL2008' (or a terminal you use) → PDOs and CoE objects from the ESI index (index\\esi.db)",
+    "hw_object": "hw_object(device='EL3356-0010', index='#x8000') → sub-indices with defaults and enum texts; compare "
+                 "with the CoE tab of that terminal in XAE",
+    "hw_search": "hw_search('Underrange') → devices with that PDO entry; hw_search('overtemperature', kinds=['diag'])",
+    "hw_diag": "a text id from a terminal's diagnosis history (0x10F3) → hw_diag(code=…, device=<its type>)",
+    "hw_module": "an AX8000 / EL3314-0090 slot module from hw_lookup's slots → hw_module(ident=…, device=…)",
     "ads_connect": "re-target to a second PLC port: ads_connect ams_port=852 on a box that has one",
     "ads_write_raw": "raw write by index group/offset — only with a known address on the test box",
     "ads_plc_state": "HARDWARE_DAY §7+: ads_plc_state stop/start on the test box with a confirm token",

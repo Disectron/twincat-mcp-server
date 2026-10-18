@@ -191,13 +191,16 @@ class SystemServiceFiles:
         path ids, so the folder is found by probing known locations. When several boot folders exist (4026 keeps the
         legacy one), the one whose CurrentConfig.xml has the size the target itself returns for 'boot:CurrentConfig.xml'
         (FOPEN honours path ids) wins; without that evidence the first in probe order (the 4026 location) wins."""
-        key = (prefix.lower(), self.ads.target_label())
+        # N110: 'boot' and 'boot:' name the same folder (the prefix as written in a path); ipc_eventlog passed 'boot:'
+        # and got 'no folder is known' while ipc_list_dir('boot:*') resolved it
+        prefix = prefix.strip().rstrip(":").lower()
+        key = (prefix, self.ads.target_label())
         cache = getattr(self, "_prefix_cache", None)
         if cache is None:
             cache = self._prefix_cache = {}
         if key in cache:
             return cache[key]
-        cands = self._PREFIX_DIRS.get(prefix.lower())
+        cands = self._PREFIX_DIRS.get(prefix)
         if not cands:
             raise AdsError(f"no folder is known for the prefix {prefix!r}: ipc_list_dir needs an absolute path here "
                            f"(ipc_read_file accepts the prefix; the target resolves it for FOPEN)")
@@ -213,7 +216,7 @@ class SystemServiceFiles:
         if not found:
             raise AdsError(f"none of the known folders for {prefix!r} exist on the target: {cands}. Pass the absolute path.")
         pick = found[0]
-        if len(found) > 1 and prefix.lower() in ("boot", "bootprj", "bootdata"):
+        if len(found) > 1 and prefix in ("boot", "bootprj", "bootdata"):
             try:
                 live = self.read_file(f"{prefix}:CurrentConfig.xml", 64 << 20, False)["bytes"]
             except Exception:  # noqa: BLE001 — no activated configuration: keep probe order

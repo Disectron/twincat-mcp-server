@@ -166,7 +166,7 @@ def test_manual_commands(kbdir):
 def test_commands_status_help_and_location(kbdir, tmp_path):
     rc, r = run(kbdir, "ads_read")
     assert rc == 1 and r["error"] == "unknown_command" and "never return documentation" in r["message"]
-    assert len(r["commands"]) == 10
+    assert len(r["commands"]) == 15
     rc, r = run(kbdir, "help")
     assert rc == 0 and set(r["commands"]) >= {"docs_search", "manual_page", "status"} and r["rules"]
     rc, r = run(kbdir, "status")
@@ -325,3 +325,34 @@ def test_stop_words_are_compared_folded():
     m = _kbd_module()
     assert m._fold("Für") in m.STOP_WORDS and "für" not in m.STOP_WORDS
     assert all(w == m._fold(w) for w in m.STOP_WORDS)
+
+
+def test_hw_commands_read_the_esi_index_with_its_state(kbdir, tmp_path):
+    """0.8.12: the skill's hw_* commands read index\\esi.db through the plugin's esi_index — the same answers as the
+    server's hw_* tools — and say the index's state; nothing is written."""
+    from tests.test_esi_index import EL33, VENDOR
+    from twincat_mcp import esi_index as E
+    rc, r = run(kbdir, "hw_lookup", "query=EL3356-0010")
+    assert rc == 1 and r["error"] == "no_index" and "esi_db.py" in r["hint"]
+    m = kbdir / "manuals" / "Beckhoff_EtherCAT_XML"
+    m.mkdir(parents=True)
+    (m / "Beckhoff EL33xx.xml").write_text(EL33.format(vendor=VENDOR.format(fv=10)), encoding="utf-8")
+    E.build(kbdir / "index" / "esi.db", kbdir, [], twincat=False, log=lambda s: None)
+    before = _digest(kbdir)
+    rc, r = run(kbdir, "hw_lookup", "query=EL3356-0010", "limit=1")
+    assert rc == 0 and r["devices"][0]["revision"] == "#x0019000A" and r["source"]["state"] == "complete"
+    rc, r = run(kbdir, "hw_object", "device=EL3356-0010", "index=8000")
+    assert rc == 0 and r["index"] == "#x8000" and r["subitems"][0]["default"] == 20
+    rc, r = run(kbdir, "hw_search", "query=Underrange", "kinds=device")
+    assert rc == 0 and r["items"][0]["device"] == "EL3356-0010"
+    rc, r = run(kbdir, "hw_object", "device=EL3356-0010", "index=#x8010")
+    assert rc == 1 and r["error"] == "not_found" and "the nearest" in r["message"]
+    rc, r = run(kbdir, "hw_lookup", "query=EL3356-0010", "detail=all")
+    assert rc == 1 and r["error"] == "bad_param"
+    rc, r = run(kbdir, "status")
+    assert rc == 0 and r["esi_state"]["state"] == "complete" and "ESI index: 2 device revisions" in r["summary"]
+    (m / "Beckhoff EL34xx.xml").write_text(EL33.format(vendor=VENDOR.format(fv=1)).replace("EL3356", "EL3456"),
+                                           encoding="utf-8")
+    rc, r = run(kbdir, "hw_lookup", "query=EL3356-0010", "limit=1")
+    assert rc == 0 and r["source"]["state"] == "outdated" and "OUTDATED" in r["source"]["state_note"]
+    assert {k: v for k, v in _digest(kbdir).items() if "EL34xx" not in k} == before

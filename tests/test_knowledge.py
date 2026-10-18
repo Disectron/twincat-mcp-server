@@ -102,17 +102,24 @@ def test_pattern_search_only_over_added_projects(kb, project_dir):
 
 
 def test_hw_lookup_from_esi(kb):
+    """0.8.12: hw_lookup reads index\\esi.db (esi_index); the first build starts by itself in the server — here, a
+    lookup before it says so and builds nothing."""
     k, tmp = kb
     k.set_location(str(tmp / "kbdata"))
     r = k.hw_lookup("EL2008")
+    assert r["esi_index"]["state"] == "missing" and "first build" in r["note"]
+    assert k.esi_build()["devices"] == 2
+    r = k.hw_lookup("EL2008")
     d = r["devices"][0]
-    assert r["indexed_now"]["devices_added"] == 2 and d["product_code"] == "#x07D83052" and d["group"] == "DigOut"
+    assert d["product_code"] == "#x07D83052" and d["group"] == "DigOut" and "esi_index_note" not in r
     rx = [p for p in d["pdo"] if p["index"] == "#x1601"][0]
-    assert [e["index"] for e in rx["entries"]] == ["#x7010"]          # padding entries dropped
+    assert [(e["index"], e.get("gap", False), e["bits"]) for e in rx["entries"]] == [("#x0000", True, 7),
+                                                                                  ("#x7010", False, 1)]
     assert d["coe_objects"][0] == {"index": "#x1018", "name": "Identity", "type": "DT1018"}
     assert k.hw_lookup("#x0bf03052")["devices"][0]["type"] == "EL3062"
     assert k.hw_lookup("Ana. Input")["types"] == ["EL3062"]
-    assert "indexed_now" not in k.hw_lookup("EL2008")                   # second call: from the database
+    with pytest.raises(K.KnowledgeError, match="empty query"):
+        k.hw_lookup(" ")
 
 
 def test_library_versions(kb, project_dir):
@@ -154,14 +161,17 @@ def test_n17_ads_error_6_explained_from_port_and_mode():
 
 def test_d19_esi_namespaced_pdos_entries_and_coe():
     """D19: an ESI with a default namespace (and German names first) still yields PDOs, entries and CoE objects."""
-    rows = list(K._parse_esi(Path(__file__).parent / "fixtures" / "esi_namespaced.xml"))
-    assert len(rows) == 1
-    typ, name, pc, rev, vendor, group, _f, pdos, coe = rows[0]
-    pdos, coe = json.loads(pdos), json.loads(coe)
-    assert typ == "EL3102" and name.startswith("EL3102 2Ch.") and vendor.startswith("Beckhoff") and group == "AnaIn"
-    assert pdos[0]["index"] == "#x1A00" and pdos[0]["name"] == "AI Standard Channel 1"
-    assert [(e["index"], e["sub"], e["bits"]) for e in pdos[0]["entries"]] == [("#x6000", 1, 1), ("#x6000", 17, 16)]
-    assert coe == [{"index": "#x8000", "name": "AI Settings Ch.1", "type": "DT8000"}]
+    from twincat_mcp import esi_index as E
+    rows = list(E.iter_info(Path(__file__).parent / "fixtures" / "esi_namespaced.xml"))
+    assert [w for w, _r in rows] == ["device"]
+    d = rows[0][1]
+    assert d["type"] == "EL3102" and d["name"].startswith("EL3102 2Ch.") and d["vendor"].startswith("Beckhoff")
+    assert d["group_type"] == "AnaIn" and d["name_de"] == "EL3102 2K. Ana. Eingang"
+    p = d["pdos"][0]
+    assert p["index"] == "#x1A00" and p["name"] == "AI Standard Channel 1" and p["bits"] == 22
+    assert [(e["index"], e["sub"], e["bits"], e.get("gap", False)) for e in p["entries"]] == [
+        ("#x6000", 1, 1, False), ("#x0000", 0, 5, True), ("#x6000", 17, 16, False)]
+    assert [(o["index"], o["name"], o["type"]) for o in d["dictionary"]] == [(0x8000, "AI Settings Ch.1", "DT8000")]
 
 
 def test_r16_rpc_size_error_points_at_the_argument_list():
@@ -331,10 +341,12 @@ def test_set_location_names_the_docs_it_finds(kb, kb_fixture):
 def test_hw_lookup_adds_the_manuals_that_mention_the_product(kb, kb_fixture):
     k, tmp = kb
     k.set_location(str(tmp / "kbdata"))
+    k.esi_build()
     r = k.hw_lookup("EL2008")
     assert "manuals" not in r and "no manuals database" in r["manuals_note"]
     assert str(tmp / "kbdata" / "index" / "manuals.db") in r["manuals_note"]
     k.set_location(str(_kb_with_docs(tmp, kb_fixture)))
+    k.esi_build()
     r = k.hw_lookup("EL3102")                                  # not in this ESI, but a product code in the manual
     assert r["matches"] == 0 and r["manuals"]["EL3102"][0]["doc"] == "CX9020.pdf"
     assert r["manuals"]["EL3102"][0]["pages"] == [2, 4]
@@ -411,6 +423,7 @@ def test_n34_hw_lookup_takes_the_order_code_out_of_the_esi_type(kb, kb_fixture, 
         '<Device><Type ProductCode="#x23446052" RevisionNo="#x1">CX9020 EtherCAT slave</Type>'
         '<Name LcId="1033">CX9020 EtherCAT slave</Name></Device></Devices></Descriptions></EtherCATInfo>', encoding="utf-8")
     k.set_location(str(_kb_with_docs(tmp, kb_fixture)))
+    k.esi_build()
     r = k.hw_lookup("CX9020")
     assert r["types"] == ["CX9020 EtherCAT slave"]
     assert r["manuals"]["CX9020"][0]["doc"] == "CX9020.pdf" and "manuals_note" not in r
@@ -446,14 +459,14 @@ def test_builder_copies_become_stubs_once_and_are_reported(kb, tmp_path, monkeyp
     assert "stub.py" in st["infosys_local.py"]["to_use_the_plugin_builders"]
     assert st["manuals_db.py"]["state"] == "replaced" and st["manuals_db.py"]["was"] == "shipped version 2"
     assert Path(st["manuals_db.py"]["backup"]).read_bytes() == old_shipped
-    assert K.builder_kind(loc / "tools" / "manuals_db.py", "manuals_db.py") == ("stub", "1")
+    assert K.builder_kind(loc / "tools" / "manuals_db.py", "manuals_db.py") == ("stub", "2")
     # an edited copy of the shipped builder is the user's file now: left alone
     edited = (K.builders_dir() / "infosys_local.py").read_text(encoding="utf-8") + "\n# my change\n"
     (loc / "tools" / "infosys_local.py").write_text(edited, encoding="utf-8")
     assert K.builder_kind(loc / "tools" / "infosys_local.py", "infosys_local.py") == ("other", None)
     # every later start: nothing to do; the pointer for the stubs is written once per plugin location/version
     up = k.builder_upkeep("9.9.9")
-    assert up["tools"]["manuals_db.py"] == {"state": "stub", "stub_version": "1"} and up["pointer"] == "written"
+    assert up["tools"]["manuals_db.py"] == {"state": "stub", "stub_version": "2"} and up["pointer"] == "written"
     assert up["tools"]["infosys_local.py"]["state"] == "left alone"
     assert k.builder_upkeep("9.9.9")["pointer"] == "unchanged"
     ptr = json.loads((k.home / "plugin_location.json").read_text(encoding="utf-8"))
@@ -517,17 +530,20 @@ def test_n71_n72_kb_search_stop_words_error_text_and_copy_names(kb, project_dir)
     assert r["known_error"] is None and "1861" in r["known_errors_covered"], r
 
 
+def _older_revisions(tmp):
+    """Two older revisions of EL2008 (as Beckhoff's files hold them: every revision a Device of its own)."""
+    old = ESI.replace('RevisionNo="#x00100000">EL2008', 'RevisionNo="#x000F0000">EL2008')
+    (tmp / "esi" / "Beckhoff EL2xxx old.xml").write_text(old, encoding="utf-8")
+    older = ESI.replace('RevisionNo="#x00100000">EL2008', 'RevisionNo="#x000E0000">EL2008')
+    (tmp / "esi" / "Beckhoff EL2xxx older.xml").write_text(older, encoding="utf-8")
+
+
 def test_n73_hw_lookup_output_size_is_controllable(kb):
     """N73: every revision came with all its PDOs and CoE objects — EL3356-0010 / EL2407 were walls of repeats."""
     k, tmp = kb
     k.set_location(str(tmp / "kbdata"))
-    k.hw_lookup("EL2008")
-    with k._db() as con:                                   # two older revisions of the same terminal
-        row = dict(con.execute("SELECT * FROM esi WHERE type='EL2008'").fetchone())
-        for rev in (row["revision"] - 1, row["revision"] - 2):
-            con.execute("INSERT INTO esi (type, name, product_code, revision, vendor, grp, file, pdo, coe) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)", (row["type"], row["name"], row["product_code"], rev, row["vendor"],
-                                                      row["grp"], row["file"], row["pdo"], row["coe"]))
+    _older_revisions(tmp)
+    k.esi_build()
     r = k.hw_lookup("EL2008", limit=5)
     assert r["detail"] == "newest" and len(r["devices"]) == 3
     assert "pdo" in r["devices"][0] and all("pdo" not in d and "coe_objects" not in d for d in r["devices"][1:])
@@ -581,62 +597,63 @@ def test_review_known_errors_and_kb_search_edge_cases(kb, project_dir, tmp_path)
 def test_review_hw_lookup_revision_text_and_newest_of_every_type_first(kb):
     k, tmp = kb
     k.set_location(str(tmp / "kbdata"))
-    k.hw_lookup("EL2008")
-    with k._db() as con:
-        row = dict(con.execute("SELECT * FROM esi WHERE type='EL2008'").fetchone())
-        for rev in (row["revision"] - 1, row["revision"] - 2):
-            con.execute("INSERT INTO esi (type, name, product_code, revision, vendor, grp, file, pdo, coe) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)", (row["type"], row["name"], row["product_code"], rev, row["vendor"],
-                                                      row["grp"], row["file"], row["pdo"], row["coe"]))
+    _older_revisions(tmp)
+    k.esi_build()
     r = k.hw_lookup("EL", limit=2)                       # name fragment: EL2008 ×3 revisions and EL3062
     assert [d["type"] for d in r["devices"]] == ["EL2008", "EL3062"] and all("pdo" in d for d in r["devices"]), r
-    old = f"#x{row['revision'] - 2:08X}"
+    old = "#x000E0000"
     o = k.hw_lookup("EL2008", revision=old)              # the text form the output shows
     assert [d["revision"] for d in o["devices"]] == [old] and "pdo" in o["devices"][0]
     with pytest.raises(K.KnowledgeError, match="revision must be"):
         k.hw_lookup("EL2008", revision="banana")
 
 
-def test_esi_index_is_built_once_by_itself_and_rebuilt_only_when_asked(kb, monkeypatch):
-    """docs/KNOWLEDGE_BASE.md rule 6 for knowledge.db's ESI part: the first hw_lookup builds the index; an index that
-    exists is used as it is — new ESI files or another parser are reported (esi_state, the answer's esi_index_note)
-    until kb_rebuild(index='esi') runs esi_index — in one transaction: an error part-way changes nothing."""
+def test_esi_index_is_built_once_by_itself_and_rebuilt_only_when_asked(kb):
+    """docs/KNOWLEDGE_BASE.md rule 6 for index\\esi.db: its first build starts by itself (the server); an index that
+    exists is used as it is — new ESI files or another format are reported (esi_state, the answer's esi_index_note)
+    until kb_rebuild(index='esi') runs the builder. Nothing of the old knowledge.db ESI table is read."""
     k, tmp = kb
     k.set_location(str(tmp / "kbdata"))
     assert k.esi_state()["state"] == "missing"
-    assert k.hw_lookup("EL2008")["indexed_now"]["devices_added"] == 2
+    assert k.esi_build()["devices"] == 2
     st = k.esi_state()
-    assert st["state"] == "complete" and st["devices"] == 2 and st["files_indexed"] == 1
-    # a new ESI file: reported, not read by a lookup
+    assert st["state"] == "complete" and st["devices"] == 2 and st["files"] == 1
+    assert st["sources"] == [{"folder": str(tmp / "esi"), "source": "twincat"}]
     (tmp / "esi" / "Beckhoff EL1xxx.xml").write_text(ESI.replace("EL2008", "EL1008").replace("EL3062", "EL1018")
                                                      .replace("#x07d83052", "#x03f03052").replace("#x0bf03052", "#x03fa3052"),
                                                      encoding="utf-8")
     st = k.esi_state()
-    assert st["state"] == "outdated" and st["new_files"] == 1 and "kb_rebuild(index='esi')" in st["message"]
+    assert st["state"] == "outdated" and "kb_rebuild(index='esi')" in st["message"]
     r = k.hw_lookup("EL1008")
-    assert r["matches"] == 0 and "indexed_now" not in r and "OUTDATED" in r["esi_index_note"]
-    # another parser's rows: a rebuild is due, every file is read again — but only when asked
-    with k._db() as con:
-        con.execute("UPDATE meta SET v = '1' WHERE k = 'esi_parser'")
-    assert k.esi_state()["state"] == "rebuild_needed" and "ESI parser 1" in k.esi_state()["message"]
-    # one transaction: a failure on the second file leaves the index exactly as it was
-    real = K._parse_esi
-    calls = []
+    assert r["matches"] == 0 and "OUTDATED" in r["esi_index_note"]
+    assert k.esi_build()["result"] == "built" and k.hw_lookup("EL1008")["matches"] == 1
+    assert k.esi_state()["state"] == "complete" and k.esi_build()["result"] == "up_to_date"
+    # the ESI files in the knowledge folder's manuals\\ are read too
+    m = tmp / "kbdata" / "manuals" / "Beckhoff_EtherCAT_XML"
+    m.mkdir(parents=True)
+    (m / "Beckhoff EL9xxx.xml").write_text(ESI.replace("EL2008", "EL9008").replace("EL3062", "EL9062")
+                                           .replace("#x07d83052", "#x23303052").replace("#x0bf03052", "#x2336052"),
+                                           encoding="utf-8")
+    assert k.esi_state()["state"] == "outdated"
+    k.esi_build()
+    assert k.hw_lookup("EL9008")["devices"][0]["file"] == str(m / "Beckhoff EL9xxx.xml")
+    assert k.status()["esi"]["state"] == "complete"
 
-    def flaky(f):
-        calls.append(f)
-        if len(calls) == 2:
-            raise OSError("disk read error")
-        return real(f)
-    monkeypatch.setattr(K, "_parse_esi", flaky)
-    with pytest.raises(OSError):
-        k.esi_index()
-    assert k.esi_state()["state"] == "rebuild_needed" and k.esi_state()["devices"] == 2
-    monkeypatch.setattr(K, "_parse_esi", real)
-    r = k.esi_index()
-    assert r["indexed"] == 2 and r["devices_added"] == 4
-    assert k.esi_state()["state"] == "complete" and k.hw_lookup("EL1008")["matches"] == 1
-    # a removed file: its rows go with the next rebuild
-    (tmp / "esi" / "Beckhoff EL1xxx.xml").unlink()
-    assert k.esi_state()["removed_files"] == 1
-    assert k.esi_index()["removed"] == 1 and k.esi_state()["state"] == "complete" and k.esi_state()["devices"] == 2
+
+def test_a_stub_of_0811_becomes_the_current_one(kb, monkeypatch):
+    """0.8.12 stub 2 also runs esi_db.py: the stub 1 every knowledge folder has (sha in SHIPPED_STUBS) is replaced,
+    kept as .bak."""
+    k, tmp = kb
+    loc = tmp / "kbfolder"
+    (loc / "tools").mkdir(parents=True)
+    import subprocess
+    old = subprocess.run(["git", "show", "1200fee:skills/twincat-docs/builders/stub.py"], capture_output=True,
+                         cwd=Path(__file__).resolve().parents[1])
+    if old.returncode != 0:
+        pytest.skip("git history not available")
+    (loc / "tools" / "manuals_db.py").write_bytes(old.stdout)
+    assert K.builder_kind(loc / "tools" / "manuals_db.py", "manuals_db.py") == ("copy", "stub 1")
+    st = k.set_location(str(loc))["builder_stubs"]
+    assert st["manuals_db.py"]["state"] == "replaced"
+    assert K.builder_kind(loc / "tools" / "manuals_db.py", "manuals_db.py") == ("stub", "2")
+    assert "esi_db.py" in (loc / "tools" / "manuals_db.py").read_text(encoding="utf-8")

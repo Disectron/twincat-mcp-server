@@ -175,3 +175,41 @@ async def test_r30_infosys_tools_describe_the_configured_source(monkeypatch, pro
         assert "local Help Viewer" in desc["infosys_search"] and "changes nothing" in desc["infosys_index"]
     else:
         assert "DuckDuckGo" in desc["infosys_search"] and "fetched live" in desc["infosys_get_page"]
+
+
+@pytest.mark.anyio
+async def test_n94_a_confirmation_without_the_tick_says_so(monkeypatch, project_dir):
+    """N94 (0.8.11 retest): a prompt submitted with the confirm box not ticked came back 'declined by the user
+    (accept)' — a correct refusal that read as a contradiction."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    cb = Answers(types.ElicitResult(action="accept", content={"confirm": False}))
+    async with Client(srv, elicitation_callback=cb) as c:
+        res = await c.call_tool("ads_plc_state", {"action": "stop"})
+        tail = payload(await c.call_tool("tc_audit_tail", {"n": 5}))
+    t = text(res)
+    assert res.is_error and "confirm box not ticked" in t and "declined by the user (accept)" not in t, t
+    outcomes = [e.get("outcome") for e in (tail if isinstance(tail, list) else tail.get("entries", []))]
+    assert "declined-elicitation:accept-unticked" in outcomes, outcomes
+
+
+@pytest.mark.anyio
+async def test_n96_kb_rebuild_checks_before_it_asks(monkeypatch, project_dir, tmp_path):
+    """N96 (0.8.11 retest): kb_rebuild(index='manuals') asked for the confirmation, then failed: this server's Python
+    has no PDF library. Everything that can stop the rebuild is checked first; nothing is asked when it cannot run."""
+    import importlib.util as iu
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded")
+    kb = tmp_path / "kb"
+    (kb / "manuals").mkdir(parents=True)
+    (kb / "index").mkdir()
+    cfg.knowledge.location = str(kb)
+    srv = build_server(cfg)
+    real = iu.find_spec
+    monkeypatch.setattr(iu, "find_spec", lambda name, *a, **k: None if name in ("pymupdf", "fitz", "pypdf")
+                        else real(name, *a, **k))
+    cb = Answers(ACCEPT)
+    async with Client(srv, elicitation_callback=cb) as c:
+        res = await c.call_tool("kb_rebuild", {"index": "manuals"})
+    r = payload(res)
+    assert r["started"] is False and "no PDF library" in r["error"] and cb.asked == [], (r, cb.asked)

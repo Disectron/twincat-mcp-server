@@ -328,3 +328,16 @@ def test_n50_unknown_names_are_not_guessed_when_the_table_knows_them():
     raw = (0xFFFF980150088F40).to_bytes(8, "little") + bytes(8)
     assert ts.decode_tree(raw, "PT_X", size=8) == "0xFFFF980150088F40"
     assert ts.decode_tree(raw, "ARRAY [0..1] OF PT_X", size=16) == ["0xFFFF980150088F40", "0x0000000000000000"]
+
+
+def test_n95_comments_and_attribute_values_are_the_sources_utf8_text():
+    """N95 (0.8.11 retest): a DUT comment with '—' came out 'â€”' — the runtime keeps the source's UTF-8 bytes, read as
+    Latin-1. Comments and attribute values: UTF-8, else Windows-1252; names stay byte-for-byte."""
+    from twincat_mcp.ads_types import F_ATTRIBUTES
+    from twincat_mcp import types_tc as T
+    e = DtEntry("ST_Level", "", 4, 0, 65, F_ATTRIBUTES, "Füllstand — in kg", [], [DtEntry("n", "DINT", 4, 0, 3, 0, "")], {},
+                {"Unit": "°C"})
+    blob = encode_entry(e)
+    parsed, _ = parse_entry(blob, 0)
+    assert parsed.comment == "Füllstand — in kg" and parsed.attributes == {"Unit": "°C"}, (parsed.comment, parsed.attributes)
+    assert T.plc_text("Gr\xfc\xdfe".encode("cp1252")) == "Grüße"            # not UTF-8: Windows-1252

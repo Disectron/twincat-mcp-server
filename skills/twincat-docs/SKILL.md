@@ -1,6 +1,6 @@
 ---
 name: twincat-docs
-description: Use for ANY Beckhoff documentation question — what a library FB/function/struct/enum does, its inputs/outputs/types (ADSREAD, MC_MoveAbsolute, FB_FileOpen …), error codes, TwinCAT concepts, code examples, or hardware details from manuals (LEDs, wiring, diagnostics of an IPC/terminal). Looks it up OFFLINE in the local Infosys (Help Viewer package) and PDF-manual knowledge base. Never use ads_* tools for documentation.
+description: Use for ANY Beckhoff documentation question — what a library FB/function/struct/enum does, its inputs/outputs/types (ADSREAD, MC_MoveAbsolute, FB_FileOpen …), error codes, TwinCAT concepts, code examples, hardware details from manuals (LEDs, wiring, diagnostics of an IPC/terminal), or EtherCAT device data from the ESI files (PDOs, CoE objects with defaults, diagnosis text ids). Looks it up OFFLINE in the local Infosys (Help Viewer package), PDF-manual and ESI knowledge base. Never use ads_* tools for documentation.
 ---
 
 # twincat-docs — offline Beckhoff documentation
@@ -37,6 +37,11 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 | Hardware: LEDs, wiring, diagnostics, error codes | `manual_search query=… [doc=CX9020]` → `manual_page doc=… pages=N-M` (≤ 21 pages) |
 | Chapters of a manual | `manual_toc doc=CX9020 [depth=1-6]` |
 | Which manuals are indexed | `manual_docs [filter=…]` |
+| EtherCAT device from its ESI: PDOs and entries, PDO assignments, DC modes, slots, CoE object list | `hw_lookup query=EL3356-0010 [revision=#x…] [detail=newest\|summary\|full] [limit=1-30]` (a product code `#x0d1c3052` or part of a name works too) |
+| One CoE object: sub-indices, types, bit offsets, defaults (decoded), limits, enum texts | `hw_object device=EL3356-0010 index=#x8000 [revision=]` |
+| A diagnosis message (diagnosis history text id, object 0x10F3) | `hw_diag code=#x4101 [device=EL7211-0010]` |
+| Which device / object / message mentions a word | `hw_search query=… [kinds=device,object,diag,module] [limit=1-100]` |
+| A module of a modular device (AX8000 slots, TSC) | `hw_module ident=#x006b0064 [device=AX8206-0210-0107]` |
 
 ## Rules
 1. Documentation → this skill. Live PLC values and types → the ads_* tools.
@@ -73,6 +78,7 @@ indexed yet.
 |---|---|---|
 | `<kb>\index\infosys-1033.db` | the TwinCAT 3 books of the Help Viewer package — the same index the twincat server's `infosys_*` tools read | the plugin itself the first time; later `<kb>\tools\infosys_local.py index` or `kb_rebuild(index='infosys')` (minutes) |
 | `<kb>\index\manuals.db` | PDF manuals from `<kb>\manuals\`, one row per page, chapters, product codes | `<kb>\tools\manuals_db.py update` or `kb_rebuild(index='manuals')` (Python 3.12+ with PyMuPDF or pypdf) |
+| `<kb>\index\esi.db` | the ESI files (`.xml`) in `<kb>\manuals\` and TwinCAT's ESI folders: devices, PDOs, CoE dictionaries, diagnosis messages, modules — the same index the twincat server's `hw_*` tools read | the plugin itself the first time; later `kb_rebuild(index='esi')` or the plugin's `builders\esi_db.py update` (minutes) |
 
 `status`, and `source.state` in every answer, give the state of the index: `complete`; `rebuild_needed` (built by
 another format) or `outdated` (the package or the PDFs changed) — both are used as they are; or `missing`. A build

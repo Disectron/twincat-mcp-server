@@ -247,10 +247,11 @@ async def test_kb_rebuild_only_with_approval_and_a_server_start_never_rebuilds(m
         st = await until_complete(s)                         # the first build: by itself
         assert Path(st["database"]) == live and st["format"] == inf.INDEXER_VERSION
         assert not (tmp_path / "docs" / "helpviewer-1033").exists()        # one index, in the knowledge folder
-        r = await s.call_tool("kb_rebuild", {"index": "infosys"})           # no approval: nothing happens
+        # N96: complete and current — said before anyone is asked, nothing happens
+        r = payload(await s.call_tool("kb_rebuild", {"index": "infosys"}))
+        assert r["started"] is False and r["up_to_date"]
+        r = await s.call_tool("kb_rebuild", {"index": "infosys", "force": True})   # a rebuild: never without approval
         assert r.is_error and "tc_request_confirmation" in text(r)
-        r = payload(await s.call_tool("kb_rebuild", {"index": "infosys", "confirm_token": await token(s)}))
-        assert r["started"] is False and r["up_to_date"]                    # complete and current: left as it is
         r = await s.call_tool("kb_rebuild", {"index": "everything"})
         assert r.is_error and "'infosys', 'manuals' or 'esi'" in text(r)
     c = sqlite3.connect(live)

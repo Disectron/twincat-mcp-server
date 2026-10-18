@@ -349,6 +349,7 @@ class App:
         self.pending_edits: dict[str, dict[str, Any]] = {}
         self.ads.write_guard = self.constant_reason       # every write path: CONSTANT / no-source checks
         self.ads.interface_hint = self.is_source_interface
+        self.ads.alias_hint = self.source_alias
         from .config import _home
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
         # the permanent layout of the knowledge folder (docs/KNOWLEDGE_BASE.md) before anything opens an index
@@ -468,10 +469,11 @@ class App:
             out["first_build"] = self.spawn_infosys_build(first=True)
         return out
 
-    def spawn_infosys_build(self, force: bool = False, first: bool = False) -> dict[str, Any]:
+    def spawn_infosys_build(self, force: bool = False, first: bool = False, dry_run: bool = False) -> dict[str, Any]:
         """The build of the local package's index, in its own process (the parse is CPU-bound for minutes: in the
         server it would take the time of the ADS and recorder threads) — the builder the knowledge folder's stub runs,
-        with this server's Python. It survives a restart of the server; its state is infosys_build.state."""
+        with this server's Python. It survives a restart of the server; its state is infosys_build.state. dry_run:
+        every check, nothing started -> {'would_start': True} or why not (N96: asked before it could run)."""
         import subprocess
         from . import infosys_build as IB
         if self.docs is None or self.docs.local is None or self.docs_build_target is None:
@@ -485,6 +487,8 @@ class App:
             return {"started": False, "already_running": st["rebuild"], "message": st["message"]}
         if st["state"] == "complete" and not force and not st.get("rebuild"):
             return {"started": False, "up_to_date": True, "message": st["message"]}
+        if dry_run:
+            return {"would_start": True}
         # a build left behind (interrupted, finished but not swapped in, stale) is the builder's to finish or discard
         logs = Path(self.cfg.safety.audit_log).parent / "logs"
         logs.mkdir(parents=True, exist_ok=True)
@@ -513,9 +517,10 @@ class App:
                 "note": "the current index (if any) stays in use until the new one is complete; kb_status / tc_doctor "
                         "show the progress"}
 
-    def spawn_manuals_update(self, force: bool = False) -> dict[str, Any]:
+    def spawn_manuals_update(self, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
         """manuals_db.py update for the knowledge folder in its own process, with this server's Python — when that
-        Python can read PDFs (pypdf or PyMuPDF); otherwise the command for the user's Python."""
+        Python can read PDFs (pypdf or PyMuPDF); otherwise the command for the user's Python. dry_run: every check,
+        nothing started -> {'would_start': True} or why not (N96)."""
         import importlib.util
         import subprocess
         loc = self.kb.location()[0]
@@ -536,6 +541,8 @@ class App:
             return {"started": False, "error": f"this server's Python ({sys.executable}) has no PDF library (pypdf or "
                     "PyMuPDF) — run the update with your own Python 3.12 that has one",
                     "command": f'<Python 3.12+ with pypdf or PyMuPDF> "{loc / "tools" / "manuals_db.py"}" update --kb "{loc}"'}
+        if dry_run:
+            return {"would_start": True}
         logs = Path(self.cfg.safety.audit_log).parent / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         log_file = logs / "manuals-update.log"
@@ -548,6 +555,59 @@ class App:
         self.manuals_update_proc = p
         return {"started": True, "pid": p.pid, "log": str(log_file),
                 "note": "the current manuals index stays in use until the update is complete; kb_status shows it"}
+
+    def spawn_esi_build(self, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        """esi_db.py update for the knowledge folder in its own process, with this server's Python (standard library
+        only), from the knowledge folder's manuals\\ and TwinCAT's ESI folders plus knowledge.esi_dirs. dry_run:
+        every check, nothing started -> {'would_start': True} or why not (N96)."""
+        import subprocess
+        from . import esi_index as E
+        from . import kb_layout as L
+        loc = self.kb.location()[0]
+        b = K.builders_dir()
+        if loc is None or b is None or not (b / "esi_db.py").is_file():
+            return {"started": False, "error": "no knowledge folder chosen yet" if loc is None else
+                    "the plugin's builder esi_db.py (skills/twincat-docs/builders) was not found"}
+        st = self.kb.esi_state()
+        if (st.get("rebuild") or {}).get("state") == "running":
+            return {"started": False, "already_running": st["rebuild"], "message": st["message"]}
+        if st["state"] == "complete" and not force:
+            return {"started": False, "up_to_date": True, "message": st["message"]}
+        folders = E.source_folders(loc, self.kb.esi_dirs)
+        if not E.xml_files(folders):
+            return {"started": False, "error": "no ESI files: no .xml in " + (", ".join(str(f) for f, _s in folders)
+                    or "the knowledge folder's manuals\\, and no TwinCAT ESI folder (Config\\Io\\EtherCAT) on this PC")
+                    + " — copy the ESI files into manuals\\ or set knowledge.esi_dirs"}
+        if dry_run:
+            return {"would_start": True}
+        dirs = [a for d in self.kb.esi_dirs for a in ("--esi-dir", str(d))] or ["--no-esi-dirs"]
+        cmd = [sys.executable, str(b / "esi_db.py"), "update", "--kb", str(loc), *dirs] + (["--force"] if force else [])
+        logs = Path(self.cfg.safety.audit_log).parent / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log_file = logs / "esi-build.log"
+        kw: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000} if os.name == "nt" \
+            else {"start_new_session": True}
+        with open(log_file, "ab") as fh:
+            fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(cmd)}\n".encode())
+            fh.flush()
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, cwd=str(loc), **kw)
+        self.esi_build_proc = p
+        return {"started": True, "pid": p.pid, "log": str(log_file), "index": str(L.index_file(loc, "esi")),
+                "note": ("the first build of the ESI index" if st["state"] == "missing" else
+                         "the current ESI index stays in use until the new one is complete") + "; kb_status shows it"}
+
+    def esi_first_build(self) -> dict[str, Any] | None:
+        """Rule 6: the first build of an ESI index that does not exist yet starts by itself (when an ESI source
+        exists). An index that exists is left to the user's approval. None when there is nothing to do."""
+        from . import esi_index as E
+        from . import kb_layout as L
+        loc = self.kb.location()[0]
+        if loc is None or L.index_file(loc, "esi").exists() or not E.xml_files(E.source_folders(loc, self.kb.esi_dirs)):
+            return None
+        st = self.kb.esi_state()
+        if st["state"] != "missing" or (st.get("rebuild") or {}).get("state") == "running":
+            return None
+        return self.spawn_esi_build()
 
     def manuals_first_build(self) -> dict[str, Any] | None:
         """Rule 6: the first build of a manuals index that does not exist yet starts by itself — when the knowledge
@@ -568,6 +628,12 @@ class App:
                 log.info("manuals index: first build %s", "started" if first.get("started") else first)
         except Exception as exc:  # noqa: BLE001 — a convenience; kb_status shows the state either way
             log.warning("manuals first build: %s", exc)
+        try:
+            first = self.esi_first_build()
+            if first:
+                log.info("ESI index: first build %s", "started" if first.get("started") else first)
+        except Exception as exc:  # noqa: BLE001 — a convenience; kb_status shows the state either way
+            log.warning("ESI first build: %s", exc)
         res = self.kb.builder_upkeep(__version__)
         for n, v in (res.get("tools") or {}).items():
             if isinstance(v, dict) and v.get("state") == "replaced":
@@ -1085,7 +1151,9 @@ class App:
 
     def out_path(self, path: str, overwrite: bool = False, what: str = "file", is_dir: bool = False) -> Path:
         """R4: a caller-chosen output path must lie in a folder this server writes to (plugin data, recordings,
-        project, solution, [server] output_dirs) and must not silently replace an existing file."""
+        project, solution, [server] output_dirs) and must not silently replace an existing file. N98: a folder that
+        does not exist yet (inside those) is created — the folder itself for is_dir, else the file's folder — so
+        every writer can write there (rec_export into a new folder raised FileNotFoundError of its temp file)."""
         p = Path(path).expanduser()
         try:
             rp = p.resolve()
@@ -1097,6 +1165,13 @@ class App:
                             f"{[str(r) for r in roots]}. Write there, or add the folder to [server] output_dirs.")
         if not is_dir and rp.exists() and not overwrite:
             raise ToolError(f"{str(rp)!r} exists — pass overwrite=true to replace it (nothing was written)")
+        folder = rp if is_dir else rp.parent
+        if folder.exists() and not folder.is_dir():
+            raise ToolError(f"{what} path {str(rp)!r}: {str(folder)!r} is a file, not a folder (nothing was written)")
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ToolError(f"{what} path {str(rp)!r}: its folder could not be created ({exc}) — nothing was written") from exc
         return rp
 
     def note_edit(self, path: str, declaration: str | None, implementation: str | None) -> None:
@@ -1158,6 +1233,15 @@ class App:
         out["edits_on_disk"] = sorted(self.pending_edits)
         self.pending_edits.clear()
         return out
+
+    def source_alias(self, type_name: str) -> str | None:
+        """N50: the base the project source declares for an alias type (TYPE PT_X : POINTER TO FB_X), or None."""
+        if self.proj.root is None:
+            return None
+        try:
+            return self.proj.type_alias(type_name)
+        except Exception:  # noqa: BLE001
+            return None
 
     def is_source_interface(self, type_name: str) -> bool:
         """The project declares `type_name` (qualified or not) as an INTERFACE."""
@@ -1359,7 +1443,14 @@ class App:
         if res.action == "accept" and res.data is not None and res.data.confirm:
             self.guard.audit(action, {"target": target, "scope": scope}, op, "human-confirmed-elicitation", timing)
             return
-        self.guard.audit(action, {"target": target, "scope": scope}, op, f"declined-elicitation:{res.action}", timing)
+        unticked = res.action == "accept"          # submitted, but the confirm box was not ticked
+        self.guard.audit(action, {"target": target, "scope": scope}, op,
+                         "declined-elicitation:" + ("accept-unticked" if unticked else res.action), timing)
+        if unticked:
+            # N94: 'declined by the user (accept)' read as a contradiction — the form came back without the tick
+            raise ToolError(f"{action} on {target!r}: the confirmation was submitted with the confirm box not ticked, "
+                            "so it counts as not confirmed. Nothing was done. Run the tool again and tick the box to "
+                            "allow it.")
         if res.action == "cancel":
             # 'cancel' is also what the client sends when the prompt was dismissed or timed out unseen
             raise ToolError(f"{action} on {target!r}: the confirmation prompt came back cancelled — it was dismissed, timed out, "
@@ -1795,6 +1886,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 infos.append("offline docs: Infosys index " + ds["infosys"])
             if ds.get("manuals_state") in ("outdated", "rebuild_needed"):
                 infos.append("offline docs: manuals index " + ds["manuals"])
+            if ds.get("esi_state") in ("outdated", "rebuild_needed") or ds.get("esi_rebuild") in (
+                    "running", "interrupted", "waiting_to_replace"):
+                infos.append("ESI index: " + ds["esi"])
         except Exception as exc:  # noqa: BLE001
             rep["offline_docs"] = {"error": f"{type(exc).__name__}: {exc}"}
         if infos_el:
@@ -1933,22 +2027,30 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (docs/KNOWLEDGE_BASE.md rule 6: the user is asked, or pass the confirm_token of
         tc_request_confirmation(action='kb_rebuild', args={'index': …})). index: 'infosys' (the Help Viewer package,
         the plugin's extractor, in its own process — minutes; the current index stays in use until the new one is
-        complete and then replaces it), 'manuals' (the PDFs in manuals\\, in its own process), 'esi' (TwinCAT's ESI
-        files, now, in one transaction). Without force an index that is complete and current is left as it is.
+        complete and then replaces it), 'manuals' (the PDFs in manuals\\, in its own process), 'esi' (the ESI files in
+        manuals\\ and TwinCAT's ESI folders → index\\esi.db, in its own process — minutes; the current index stays in
+        use until the new one is complete). Without force an index that is complete and current is left as it is.
         Nothing is deleted. kb_status / tc_doctor show the progress."""
         idx = (index or "").strip().lower()
         if idx not in ("infosys", "manuals", "esi"):
             raise ToolError(f"index must be 'infosys', 'manuals' or 'esi' (got {index!r})")
+        if idx == "infosys" and (app.docs is None or app.docs.local is None):
+            raise ToolError("no index of a local Help Viewer package here (docs.source = 'local' and a package are "
+                            "needed) — " + (app.docs_error or "docs.source = 'web' keeps a web cache, not an index"))
+        # N96: everything that can stop the rebuild is checked BEFORE the user is asked — the prompt came first and
+        # then 'this server's Python has no PDF library'
+        pre = await asyncio.to_thread({"infosys": app.spawn_infosys_build, "manuals": app.spawn_manuals_update,
+                                       "esi": app.spawn_esi_build}[idx], force, dry_run=True)
+        if not pre.get("would_start"):
+            app.audit("kb_rebuild", {"index": idx, "force": force}, OpClass.CONTROL, "not-started", pre)
+            return pre
         await app.permit(ctx, OpClass.CONTROL, "kb_rebuild", idx, confirm_token, mode_gate=False)
         if idx == "infosys":
-            if app.docs is None or app.docs.local is None:
-                raise ToolError("no index of a local Help Viewer package here (docs.source = 'local' and a package are "
-                                "needed) — " + (app.docs_error or "docs.source = 'web' keeps a web cache, not an index"))
             res = await asyncio.to_thread(app.spawn_infosys_build, force)
         elif idx == "manuals":
             res = await asyncio.to_thread(app.spawn_manuals_update, force)
         else:
-            res = await app.kb_call(app.kb.esi_index, force, timeout=1800)
+            res = await asyncio.to_thread(app.spawn_esi_build, force)
         app.audit("kb_rebuild", {"index": idx, "force": force}, OpClass.CONTROL,
                   "ok" if res.get("started", True) or res.get("up_to_date") else "not-started", res)
         return res
@@ -2006,14 +2108,57 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def hw_lookup(query: str, limit: int = 3, revision: int | str | None = None,
                         detail: str = "newest") -> dict[str, Any]:
-        """EtherCAT terminal/box data from the installed ESI files (K4): name, product code, revisions, PDOs with
-        their entries (index, subindex, bit length, type), CoE objects. query = type ('EL2008'), part of a name, or a
-        product code ('#x07D83052'). detail: 'newest' (default) = PDOs and CoE objects of the newest revision of each
-        type (or of `revision`), other revisions as one line each; 'summary' = counts only; 'full' = everything for
-        every revision. The first call indexes TwinCAT's ESI folder into the knowledge database (can take a minute).
-        `manuals` names the indexed PDF manuals (knowledge folder, manuals_db.py) that mention the product, with
-        pages — the twincat-docs skill reads them."""
-        return await app.kb_call(app.kb.hw_lookup, query, limit, revision, detail, timeout=900)
+        """EtherCAT device data from the ESI index (index\\esi.db: the ESI files in the knowledge folder's manuals\\
+        and TwinCAT's ESI folders): name, product code, revisions, E-bus current, mailbox, DC modes, sync managers,
+        PDOs with every entry (index, subindex, bit length, type; gaps marked), the predefined PDO assignments, slots
+        of modular devices with their modules, the CoE object list, the diagnosis catalogue size, the ESI file(s).
+        query = type / order code ('EL3356-0010'), part of a name, or a product code ('#x07D83052'). detail: 'newest'
+        (default) = all of that for the newest revision of each type (or of `revision`), other revisions as one line
+        each; 'summary' = counts only; 'full' = everything for every revision. One CoE object with sub-indices,
+        defaults and enum texts: hw_object; full-text: hw_search; a diagnosis text id: hw_diag. The index's first build
+        starts by itself (minutes); until it is there the answer says so. `manuals` names the indexed PDF manuals that
+        mention the product, with pages (the twincat-docs skill reads them)."""
+        first = await asyncio.to_thread(app.esi_first_build)
+        res = await app.kb_call(app.kb.hw_lookup, query, limit, revision, detail, timeout=120)
+        if first:
+            res["esi_first_build"] = first
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def hw_search(query: str, kinds: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
+        """Full-text search of the ESI index: devices (names, PDOs and their entries, PDO assignments), CoE objects
+        (names, descriptions, sub-index names), diagnosis messages (text, description, causes, remedies) and modules.
+        kinds: any of 'device', 'object', 'diag', 'module' (default all). FTS5 syntax (words ANDed, "phrase",
+        prefix*); other text is searched as one phrase. Hits with the same title (revisions of one type, one text in
+        several catalogues) are one item with `variants`; objects and messages name the device types that have them."""
+        first = await asyncio.to_thread(app.esi_first_build)
+        res = await app.kb_call(app.kb.hw_search, query, kinds, limit, timeout=120)
+        if first:
+            res["esi_first_build"] = first
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def hw_object(device: str, index: str, revision: int | str | None = None) -> dict[str, Any]:
+        """One CoE object of a device from its ESI (newest revision unless `revision`): every sub-index with type, bit
+        size and offset, access, PDO mapping, backup/setting flags, the default (decoded from DefaultData, enum text
+        when there is one), min/max, unit code, enumeration texts; array elements one by one. index: '#x8000' or
+        '0x8000' (4 hex digits alone are read as hex). device: the exact type ('EL3356-0010')."""
+        return await app.kb_call(app.kb.hw_object, device, index, revision, timeout=60)
+
+    @mcp.tool(annotations=READ)
+    async def hw_diag(code: str, device: str | None = None, revision: int | str | None = None) -> dict[str, Any]:
+        """A diagnosis message by its text id as the diagnosis history shows it (object 0x10F3; '#x4101', '0x4101'):
+        message text, description, causes and remedies, class, reaction, reset — from the device's own catalogue when
+        `device` is given, else every distinct message with that id and the device types / modules that use it."""
+        return await app.kb_call(app.kb.hw_diag, code, device, revision, timeout=60)
+
+    @mcp.tool(annotations=READ)
+    async def hw_module(ident: str, device: str | None = None, revision: int | str | None = None) -> dict[str, Any]:
+        """A module of a modular device (AX8000, EP/EL with slots, TSC …) by its ModuleIdent as hw_lookup's slots give
+        it: PDOs, CoE objects, diagnosis messages. With `device`, the module that device's slot means (hw_lookup's
+        rule: the device's own file, then the module file paired with it by name, then the only one), else every
+        module with that ident."""
+        return await app.kb_call(app.kb.hw_module, ident, device, revision, timeout=60)
 
     async def tc_request_confirmation(action: str, target: str = "", args: dict[str, Any] | None = None) -> dict[str, Any]:
         act = (action or "").strip()
@@ -3844,7 +3989,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 raise ToolError(f"{label} {v!r}: only letters, digits, space, '.', '-', '/' allowed (it goes into a command line on the IPC)")
         await app.permit(ctx, OpClass.DESTRUCTIVE, "ipc_eventlog", log, confirm_token)
         try:
-            folder = await app.ads_call(app.files.resolve_prefix_dir, "boot:", timeout=60)
+            folder = await app.ads_call(app.files.resolve_prefix_dir, "boot", timeout=60)
         except ToolError as exc:
             # #56: no guessed folder — the old fallback C:\TwinCAT\3.1\Boot is a stale legacy copy on 3.1.4026
             raise ToolError(f"cannot resolve the target's boot folder for the temp file ({exc}); nothing was started "
@@ -4168,11 +4313,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if ver.get("hint"):
             res["hint"] = ver["hint"]
         if ver["verified"]:
-            # the application before the activation that preceded this restart (within 30 min), else before the restart
+            # the application that ran before: from before the activation that preceded this restart (within 30 min)
+            # when that witness read one, else from before this restart. N93: an activation made in CONFIG has no
+            # compile time; it hid the one read right before a RUN -> RUN restart ('nothing to compare')
             act = app.last_activation if app.last_activation and time.monotonic() - app.last_activation["mono"] < 1800 else None
             app.last_activation = None
             after = ver.get("witness_after") or await app.restart_witness("RUN")
-            res["plc_application"] = plc_application(act["witness"] if act else before, after)
+            base, base_is = before, "before this restart"
+            if act and (act["witness"] or {}).get("app_timestamp") is not None:
+                base, base_is = act["witness"], "before the activation that preceded this restart"
+            res["plc_application"] = {**plc_application(base, after), "compared_with": base_is}
         app.audit("xae_restart_twincat", {"target": tgt}, OpClass.DESTRUCTIVE,
                   "ok" if ver["verified"] else _restart_outcome(ver), res)
         if not ver["verified"]:
@@ -4351,13 +4501,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_plcopen_import(plc_project_path: str, xml_file: str, option: str = "none") -> dict[str, Any]:
         """Import a PLCopen XML file into a PLC project (path from xae_plc_projects).
         option: none | rename | replace | skip (conflict handling).
-        replace: TwinCAT replaces an object only at the same place; an object that lives in a folder is put at the
-        project root as a renamed copy (PRG_X_1, header renamed too). The tool finishes the replace: the copy's header
-        is named back, the texts are checked against the XML, written into the existing object, read back, and the
-        declared name must equal the object's name. Only then is the copy — created by this import, it was not in the
-        tree before — deleted (nothing that existed before the import is ever deleted). Anything not proven → nothing
-        written, the copy kept and named in the error. Result: replaced, header_renamed, copies_removed,
-        build_required + objects_to_build (build next)."""
+        replace: the existing object keeps its place (folder) and identity and gets the imported text. TwinCAT's own
+        replace deletes it and re-creates the import at the project root, so the file is imported as renamed copies
+        (PRG_X_1, header renamed too) and the tool finishes the replace: the copy's header is named back, the texts are
+        checked against the XML, written into the existing object, read back, and the declared name must equal the
+        object's name. Only then is the copy — created by this import, it was not in the tree before — deleted
+        (nothing that existed before the import is ever deleted). Anything not proven → nothing written, the copy kept
+        and named in the error. An object that is not at its place after an import is named (removed / moved).
+        Result: replaced, header_renamed, copies_removed, build_required + objects_to_build (build next)."""
         app.guard_safety_path(plc_project_path, "xae_plcopen_import")
         await app.permit(None, OpClass.EDIT, "xae_plcopen_import", xml_file)
         res = await app.confirmed("xae_plcopen_import", {"project": plc_project_path, "file": xml_file, "option": option}, OpClass.EDIT, app.xae_call(app.xae.plcopen_import, plc_project_path, xml_file, option, timeout=300))
@@ -4541,7 +4692,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if not waited.get("exists"):
             app.audit("tcunit_run", {"target": tgt}, OpClass.DESTRUCTIVE, "timeout", steps)
             try:
-                where = await app.ads_call(app.files.resolve_prefix_dir, "boot:", timeout=30) if rp.lower().startswith("boot:") else None
+                where = await app.ads_call(app.files.resolve_prefix_dir, "boot", timeout=30) if rp.lower().startswith("boot:") else None
             except ToolError:
                 where = None
             return {"ran": True, "result": None, "steps": steps,

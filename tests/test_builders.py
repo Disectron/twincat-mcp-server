@@ -84,7 +84,7 @@ def _as_python_311(path: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", timeout=60)
 
 
-@pytest.mark.parametrize("script", ["infosys_local.py", "manuals_db.py"])
+@pytest.mark.parametrize("script", ["infosys_local.py", "manuals_db.py", "esi_db.py"])
 def test_minimum_python_is_enforced_with_a_message(script):
     assert "needs Python 3.12" not in run(script, "stats").stderr                 # this Python (3.12+) runs it
     p = _as_python_311(B / script, "stats")
@@ -107,7 +107,7 @@ def test_builders_compile_on_this_python():
     """The version check only helps if an older Python can compile the file to reach it (no 3.12-only syntax above
     the check: checked with the 3.8 grammar)."""
     import ast
-    for f in (B / "infosys_local.py", B / "manuals_db.py", KBD, ROOT / "scripts" / "launch.py",
+    for f in (B / "infosys_local.py", B / "manuals_db.py", B / "esi_db.py", KBD, ROOT / "scripts" / "launch.py",
               ROOT / "twincat_mcp" / "__main__.py"):
         ast.parse(f.read_text(encoding="utf-8"), str(f), feature_version=(3, 8))
 
@@ -301,7 +301,7 @@ def test_a_builder_copy_outside_the_plugin_says_so(tmp_path):
     """Version 3 / 5 run the plugin's own code (twincat_mcp, kb_docs.py beside them): a copy on its own — no plugin
     folder around it, nothing installed (-I -S) — stops with one line saying how to run it, not a traceback."""
     import shutil
-    for n in ("infosys_local.py", "manuals_db.py"):
+    for n in ("infosys_local.py", "manuals_db.py", "esi_db.py"):
         d = tmp_path / n.split(".")[0] / "tools"
         d.mkdir(parents=True)
         shutil.copy(B / n, d / n)
@@ -459,9 +459,10 @@ def test_n37_running_headers_and_wrapped_headings(tmp_path):
 
 @pytest.mark.parametrize("backend", ["pypdf", "pymupdf"])
 def test_n37_text_at_size_zero_is_dropped_and_an_ocr_text_layer_is_kept(tmp_path, backend):
-    """N37 (format 4): under each heading Beckhoff PDFs carry the running header again at font size 0 — not page text.
-    Invisible text of a real size is: a scanned manual's OCR layer (render mode 3; PyMuPDF reports alpha 0) is the only
-    text it has (review: an alpha-0 rule emptied such manuals with PyMuPDF and not with pypdf)."""
+    """N37: under each heading Beckhoff PDFs carry the running header again at a vanishing size — not page text. Format 4
+    dropped size 0 only; the real copy (EL3356-0010.pdf, the EtherCAT system manual) is drawn at 0.0028 pt and stayed
+    (0.8.11 retest). Format 5: below 1 pt. Invisible text of a real size is page text: a scanned manual's OCR layer
+    (render mode 3; PyMuPDF reports alpha 0) is the only text it has."""
     lib = pytest.importorskip(backend)
     pytest.importorskip("reportlab")
     from reportlab.pdfgen import canvas
@@ -472,6 +473,14 @@ def test_n37_text_at_size_zero_is_dropped_and_an_ocr_text_layer_is_kept(tmp_path
     t = c.beginText(72, 760)
     t.setFont("Helvetica", 0)
     t.textLine("| Signal flow diagram")
+    c.drawText(t)
+    t = c.beginText(300, 760)
+    t.setFont("Helvetica", 0.0028)                 # as Beckhoff draws it
+    t.textLine("| Signal flow diagram")
+    c.drawText(t)
+    t = c.beginText(72, 730)
+    t.setFont("Helvetica", 4.5)                    # the smallest real text of the four manuals
+    t.textLine("footnote")
     c.drawText(t)
     t = c.beginText(72, 700)
     t.setFont("Helvetica", 11)
@@ -484,7 +493,7 @@ def test_n37_text_at_size_zero_is_dropped_and_an_ocr_text_layer_is_kept(tmp_path
     page = lib.PdfReader(str(pdf)).pages[0] if backend == "pypdf" else lib.open(str(pdf))[0]
     spans, _h = (m._spans_pypdf if backend == "pypdf" else m._spans_pymupdf)(page)
     texts = [sp.text.strip() for sp in spans]
-    assert texts == ["4.2.2 Signal flow diagram", "EL3356 OCR layer text"], texts
+    assert texts == ["4.2.2 Signal flow diagram", "footnote", "EL3356 OCR layer text"], texts
 
 
 def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
@@ -697,7 +706,7 @@ def test_stub_runs_the_plugins_builder_for_the_folder_above_it(tmp_path):
     p = subprocess.run([sys.executable, str(kb / "tools" / "infosys_local.py"), "stats", "--json"], capture_output=True,
                        encoding="utf-8", env={**env, "TCMCP_STUB_VERBOSE": "1"}, timeout=60)
     assert "plugin_location.json (twincat plugin repo)" in p.stderr and str(B / "infosys_local.py") in p.stderr
-    assert K.builder_kind(kb / "tools" / "infosys_local.py", "infosys_local.py") == ("stub", "1")
+    assert K.builder_kind(kb / "tools" / "infosys_local.py", "infosys_local.py") == ("stub", "2")
 
 
 def test_pymupdf_space_in_its_own_font_run_is_kept(tmp_path):
@@ -746,3 +755,31 @@ def test_finished_rebuild_is_running_while_its_builder_swaps_it_in(kb, tmp_path)
     st = state(kb)                                         # the builder is gone: the finished file waits
     assert st["rebuild"]["state"] == "waiting_to_replace" and "swapped in at the next server start" in st["message"], st
     assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "waiting_to_replace"
+
+
+def test_esi_builder_update_stats_and_queries(tmp_path):
+    """esi_db.py: update builds index\\esi.db (the plugin's esi_index), a second update leaves it, stats tells the
+    state, the queries answer as the server's hw_* tools; --esi-dir is remembered for the next update."""
+    from tests.test_esi_index import EL33, TERMINALS, VENDOR
+    kb = tmp_path / "kb"
+    (kb / "manuals" / "Beckhoff_EtherCAT_XML").mkdir(parents=True)
+    (kb / "manuals" / "Beckhoff_EtherCAT_XML" / "Beckhoff EL33xx.xml").write_text(EL33.format(vendor=VENDOR.format(fv=10)),
+                                                                                encoding="utf-8")
+    extra = tmp_path / "tc"
+    extra.mkdir()
+    (extra / "Beckhoff EtherCAT Terminals.xml").write_text(TERMINALS.format(vendor=VENDOR.format(fv=3)), encoding="utf-8")
+    p = run("esi_db.py", "update", "--kb", str(kb), "--esi-dir", str(extra), "--no-twincat")
+    assert p.returncode == 0 and "indexed 3 device revisions" in p.stdout, p.stdout + p.stderr
+    p = run("esi_db.py", "update", "--kb", str(kb), "--no-twincat")          # the extra folder is remembered
+    assert p.returncode == 0 and "up to date" in p.stdout, p.stdout
+    p = run("esi_db.py", "stats", "--kb", str(kb), "--json")
+    st = json.loads(p.stdout)
+    assert st["state"] in ("complete", "outdated") and st["devices"] == 3
+    p = run("esi_db.py", "lookup", "EL1002", "--kb", str(kb))
+    assert json.loads(p.stdout)["devices"][0]["pdo"][1]["name"] == "Channel 2"
+    p = run("esi_db.py", "object", "EL3356-0010", "#x8000", "--kb", str(kb))
+    assert json.loads(p.stdout)["name"] == "RMB Settings"
+    p = run("esi_db.py", "object", "EL3356-0010", "#x8010", "--kb", str(kb))
+    assert p.returncode == 1 and "the nearest" in json.loads(p.stdout)["error"]
+    p = run("esi_db.py", "update", "--kb", str(kb), "--no-esi-dirs", "--no-twincat")
+    assert p.returncode == 0 and "indexed 2 device revisions" in p.stdout, p.stdout

@@ -331,9 +331,20 @@ async def test_experiment_e2e(monkeypatch, project_dir, tmp_path):
             html = Path(rep["html"]).read_text(encoding="utf-8")
             assert "<svg" in html and "All four fills" in html and "ads_write" in html or "exp_run" in html
 
+            # N108: a dry run of a finished series says why nothing is planned; resume=false in a dry run archives
+            # nothing (it says what a start would archive)
+            from pathlib import Path as _P
+            d = payload(await s.call_tool("exp_run", {"name": "fake-fill", "dry_run": True}))
+            assert d["planned_runs"] == 0 and "already done (resume=true" in d["planned_note"], d
+            runs_file = tmp_path / "experiments" / "fake-fill" / "runs.jsonl"
+            before = runs_file.read_bytes()
+            d = payload(await s.call_tool("exp_run", {"name": "fake-fill", "dry_run": True, "resume": False}))
+            assert d["planned_runs"] > 0 and d["archived"].endswith("would be moved to runs_archive_*.jsonl"), d
+            assert runs_file.read_bytes() == before and not list(runs_file.parent.glob("runs_archive_*")) \
+                and d["nothing_written"]
             # resume: nothing left to do
             r2 = payload(await s.call_tool("exp_run", {"name": "fake-fill"}))
-            assert r2["planned_runs"] == 0
+            assert r2["planned_runs"] == 0 and "already done" in r2["planned_note"]
 
             # the audit trail holds the experiment's writes
             tail = payload(await s.call_tool("tc_audit_tail", {"n": 400}))

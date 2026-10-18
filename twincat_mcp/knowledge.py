@@ -43,6 +43,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from . import esi_index as E
 from . import kb_layout as L
 
 FALLBACK_LOCATION = r"D:\TwinCAT-MCP\knowledge"
@@ -372,16 +373,6 @@ def _posix_fstype(p: Path) -> str | None:
         return None
 
 
-def _hexint(v: str | None) -> int | None:
-    if not v:
-        return None
-    v = v.strip()
-    try:
-        return int(v[2:], 16) if v[:2] in ("#x", "#X") else int(v, 0)
-    except ValueError:
-        return None
-
-
 def _vkey(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", v)) or (0,)
 
@@ -526,10 +517,6 @@ class Knowledge:
         con.execute("CREATE TABLE IF NOT EXISTS units (project TEXT, name TEXT, kind TEXT, file TEXT, line INTEGER, "
                     "declaration TEXT, implementation TEXT, comments TEXT)")
         con.execute("CREATE INDEX IF NOT EXISTS units_project ON units(project)")
-        con.execute("CREATE TABLE IF NOT EXISTS esi (type TEXT, name TEXT, product_code INTEGER, revision INTEGER, vendor TEXT, "
-                    "grp TEXT, file TEXT, pdo TEXT, coe TEXT)")
-        con.execute("CREATE INDEX IF NOT EXISTS esi_type ON esi(type)")
-        con.execute("CREATE TABLE IF NOT EXISTS esi_files (file TEXT PRIMARY KEY, mtime REAL, devices INTEGER)")
         if self._fts is None:
             try:
                 con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS units_fts USING fts5(project UNINDEXED, name, kind UNINDEXED, "
@@ -554,9 +541,8 @@ class Knowledge:
         with self._db() as con:
             out["database"] = str(L.locate(loc, "knowledge"))
             out["projects"] = [dict(r) for r in con.execute("SELECT path, label, added, indexed, units FROM projects ORDER BY path")]
-            out["esi_devices"] = con.execute("SELECT COUNT(*) FROM esi").fetchone()[0]
-            out["esi_files"] = con.execute("SELECT COUNT(*) FROM esi_files").fetchone()[0]
             out["fts5"] = bool(self._fts)
+            old_esi = con.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('esi', 'esi_files')").fetchall()
         dup: dict[str, list[str]] = {}
         for pr in out["projects"]:
             dup.setdefault(norm_path(pr["path"]), []).append(pr["path"])
@@ -574,6 +560,10 @@ class Knowledge:
             lay["moved_into_index"] = [m for m in moves if m.get("state") == "moved"]
         if [m for m in moves if m.get("state") == "in use"]:
             lay["not_moved_yet"] = [m for m in moves if m.get("state") == "in use"]
+        if old_esi:
+            lay["obsolete_tables"] = {"file": out["database"], "tables": sorted(r[0] for r in old_esi),
+                                      "why": "the ESI devices of 0.8.11 and before — index\\esi.db replaced them (0.8.12); "
+                                             "no longer read, never deleted by the plugin"}
         obsolete = L.obsolete_files(loc)
         if obsolete:
             lay["obsolete_files"] = obsolete
@@ -612,10 +602,14 @@ class Knowledge:
         inf, man, _b = _docs_parts(loc, getattr(self, "docs_local", None))
         from . import infosys_build as IB
         ok = not IB.problem(inf)
+        esi = self.esi_state()
         out: dict[str, Any] = {"knowledge_folder": str(loc), "infosys": inf.get("message"), "manuals": man.get("message"),
-                               "infosys_state": inf.get("state"), "manuals_state": man.get("state"), "ok": ok,
+                               "esi": esi.get("message"), "infosys_state": inf.get("state"),
+                               "manuals_state": man.get("state"), "esi_state": esi.get("state"), "ok": ok,
                                "infosys_rebuild": (inf.get("rebuild") or {}).get("state"),
-                               "summary": f"Infosys index: {inf.get('message')}. Manuals: {man.get('message')}."}
+                               "esi_rebuild": (esi.get("rebuild") or {}).get("state"),
+                               "summary": f"Infosys index: {inf.get('message')}. Manuals: {man.get('message')}. "
+                                          f"ESI index: {esi.get('message')}."}
         if inf.get("command"):
             out["infosys_command"] = inf["command"]
         if man.get("command"):
@@ -941,196 +935,88 @@ class Knowledge:
         return con.execute(f"SELECT 1 FROM units WHERE rowid = ? AND {self._LIKE_ONE}",
                            [rid] + [self._like(term)] * 4).fetchone() is not None
 
-    # -- K4 hardware ---------------------------------------------------------------------
+    # -- K4 hardware: the ESI index (index\\esi.db, twincat_mcp/esi_index.py) ---------------------------
     def esi_folders(self) -> list[Path]:
-        cands = [Path(d) for d in self.esi_dirs] + [
-            Path(r"C:\TwinCAT\3.1\Config\Io\EtherCAT"),
-            Path(r"C:\Program Files (x86)\Beckhoff\TwinCAT\3.1\Config\Io\EtherCAT"),
-            Path(r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Config\Io\EtherCAT"),
-        ]
-        seen, out = set(), []
-        for c in cands:
-            k = str(c).lower()
-            if k not in seen and c.is_dir():
-                seen.add(k)
-                out.append(c)
-        return out
+        """TwinCAT's ESI folders on this PC and knowledge.esi_dirs (the knowledge folder's manuals\\ is read too)."""
+        return E.twincat_esi_folders(self.esi_dirs)
 
-    def esi_index(self, force: bool = False) -> dict[str, Any]:
-        """Read the ESI files into the index: the files new or changed since the last run (all with force), in ONE
-        transaction — a reader sees the old rows or the new ones, never half (rule 6; knowledge.db also holds the
-        project folders, so it is not swapped as a file). Run by the first hw_lookup on an empty index, and by
-        kb_rebuild(index='esi') — never by itself for an index that exists (a new parser or new files: esi_state says
-        so until the user approves)."""
-        folders = self.esi_folders()
-        if not folders:
-            raise KnowledgeError("no ESI folder found (looked in TwinCAT's Config\\Io\\EtherCAT folders); set knowledge.esi_dirs")
-        files = sorted({f for d in folders for f in d.glob("*.xml")})
-        indexed = devices = skipped = 0
-        errors: list[str] = []
-        # ONE transaction: the rows of each file are written as it is parsed (memory: one file at a time — the
-        # Beckhoff ESI folder holds hundreds of MB) and committed together at the end; knowledge.db is WAL, so a
-        # reader keeps seeing the rows of before until the commit. Any error before it: nothing changes.
-        with self._db() as con:
-            if self._esi_parser_stale(con):
-                force = True                         # another parser's rows: every file is read again
-            known = {r["file"]: r["mtime"] for r in con.execute("SELECT file, mtime FROM esi_files")}
-            gone = sorted(set(known) - {str(f) for f in files})
-            for f in files:
-                mt = f.stat().st_mtime
-                if not force and known.get(str(f)) == mt:
-                    skipped += 1
-                    continue
-                try:
-                    rows = list(_parse_esi(f))
-                except ET.ParseError as exc:
-                    errors.append(f"{f.name}: {exc}")    # its earlier rows stay; esi_state reports it as changed
-                    continue
-                con.execute("DELETE FROM esi WHERE file=?", (str(f),))
-                con.executemany("INSERT INTO esi VALUES (?,?,?,?,?,?,?,?,?)", rows)
-                con.execute("INSERT OR REPLACE INTO esi_files VALUES (?,?,?)", (str(f), mt, len(rows)))
-                indexed += 1
-                devices += len(rows)
-            for g in gone:
-                con.execute("DELETE FROM esi WHERE file=?", (g,))
-                con.execute("DELETE FROM esi_files WHERE file=?", (g,))
-            con.execute("INSERT OR REPLACE INTO meta VALUES ('esi_parser', ?)", (str(ESI_PARSER_VERSION),))
-        return {"folders": [str(d) for d in folders], "files": len(files), "indexed": indexed, "unchanged": skipped,
-                "removed": len(gone), "devices_added": devices, "errors": errors[:20]}
+    def esi_db(self) -> Path:
+        return L.index_file(self.require(), "esi")
 
     def esi_state(self) -> dict[str, Any]:
-        """missing | complete | rebuild_needed (built by another ESI parser) | outdated (ESI files added, changed or
-        removed since) — an index that exists stays in use as it is until kb_rebuild(index='esi') is approved."""
+        """The ESI index's state (esi_index.state): missing | complete | rebuild_needed | outdated, with a build that
+        runs, was interrupted or waits to replace it. An index that exists is used as it is until the user approves
+        kb_rebuild(index='esi'); its first build starts by itself (the server)."""
         try:
-            folders = self.esi_folders()
-            files = {str(f): f.stat().st_mtime for d in folders for f in d.glob("*.xml")}
-            with self._db() as con:
-                n = con.execute("SELECT COUNT(*) FROM esi").fetchone()[0]
-                stale = self._esi_parser_stale(con)
-                parser = con.execute("SELECT v FROM meta WHERE k = 'esi_parser'").fetchone()
-                known = {r["file"]: r["mtime"] for r in con.execute("SELECT file, mtime FROM esi_files")}
+            loc = self.require()
         except KnowledgeError as exc:
             return {"state": "unknown", "message": str(exc)}
-        new = [f for f in files if f not in known]
-        changed = [f for f in files if f in known and known[f] != files[f]]
-        gone = [f for f in known if f not in files]
-        out: dict[str, Any] = {"devices": n, "files_indexed": len(known), "files_in_folders": len(files),
-                               "folders": [str(d) for d in folders]}
-        if n == 0 and not known:
-            out["state"] = "missing"
-            out["message"] = "no ESI index yet — the first hw_lookup builds it"
-            return out
-        msgs = []
-        if stale:
-            out["state"] = "rebuild_needed"
-            msgs.append(f"in use as it is, a REBUILD is due — built by ESI parser {parser[0] if parser else 'unknown'}, "
-                        f"this plugin's is {ESI_PARSER_VERSION}")
-        if new or changed or gone:
-            out.setdefault("state", "outdated")
-            out["new_files"], out["changed_files"], out["removed_files"] = len(new), len(changed), len(gone)
-            msgs.append(f"in use as it is, OUTDATED — {len(new)} new, {len(changed)} changed, {len(gone)} removed ESI "
-                        "file(s) not in it")
-        out.setdefault("state", "complete")
-        out["message"] = (f"{n} devices from {len(known)} files" + ("; " + "; ".join(msgs) if msgs else "")
-                          + (" — the rebuild runs once approved: kb_rebuild(index='esi')" if msgs else ""))
-        return out
+        st = E.state(L.index_file(loc, "esi"), loc, self.esi_dirs)
+        st["sources"] = [{"folder": str(f), "source": s} for f, s in E.source_folders(loc, self.esi_dirs)]
+        return st
 
-    @staticmethod
-    def _esi_parser_stale(con: sqlite3.Connection) -> bool:
-        r = con.execute("SELECT v FROM meta WHERE k = 'esi_parser'").fetchone()
-        return r is None or r[0] != str(ESI_PARSER_VERSION)
+    def esi_build(self, force: bool = False, log: Any = None) -> dict[str, Any]:
+        """Build the ESI index in this process (the builder esi_db.py does the same in its own; the server runs that
+        one). Raises KnowledgeError when no source exists or another build runs."""
+        loc = self.require()
+        try:
+            return E.build(L.index_file(loc, "esi"), loc, self.esi_dirs, force=force, log=log or (lambda m: None),
+                           built_by="twincat-mcp server")
+        except E.EsiError as exc:
+            raise KnowledgeError(str(exc)) from None
 
-    HW_DETAILS = ("newest", "summary", "full")
+    HW_DETAILS = E.DETAILS
+
+    def _hw(self, fn: str, *a: Any) -> dict[str, Any]:
+        """One read of the ESI index, with its state: no index yet → what is happening (the first build), an index
+        that is not current → esi_index_note (rule 6: an answer from an index that is not current says so)."""
+        st = self.esi_state()
+        if st["state"] == "missing":
+            rb = st.get("rebuild") or {}
+            return {"esi_index": st, "note": (
+                f"the ESI index is being built (its first build: {rb.get('phase') or 'starting'}) — ask again in a "
+                "minute; kb_status shows the progress" if rb.get("state") == "running" else
+                "no ESI index yet: its first build starts by itself (server start, or this call through the server); "
+                "or approve kb_rebuild(index='esi')")}
+        try:
+            res = getattr(E.EsiIndex(L.index_file(self.require(), "esi")), fn)(*a)
+        except E.EsiError as exc:
+            raise KnowledgeError(str(exc)) from None
+        if st["state"] != "complete" or st.get("rebuild"):
+            res["esi_index_note"] = st["message"]
+        return res
 
     def hw_lookup(self, query: str, limit: int = 5, revision: int | str | None = None,
                   detail: str = "newest") -> dict[str, Any]:
-        """N73: detail bounds the output — 'newest' (default): PDOs and CoE objects of the newest revision of each type
-        (or of `revision`), the other revisions as a line each; 'summary': no PDO entries or CoE objects at all, only
-        their counts; 'full': everything for every revision (an EL3356 with its revisions was a wall of repeats)."""
+        """EtherCAT devices from the ESI index (esi_index.EsiIndex.lookup: detail newest / summary / full, N73), with
+        the PDF manuals of the knowledge folder that mention the product (manuals.db, read-only)."""
         q = (query or "").strip()
         if not q:
-            raise KnowledgeError("empty query (e.g. 'EL2008', 'EL3062', '#x0bf03052')")
+            raise KnowledgeError("empty query (e.g. 'EL2008', 'EL3356-0010', '#x0bf03052')")
         if detail not in self.HW_DETAILS:
             raise KnowledgeError(f"detail must be one of {list(self.HW_DETAILS)} (got {detail!r})")
-        # the first build of the ESI index starts by itself; an index that exists is never rebuilt unasked (a new
-        # parser or new files: esi_state in the answer says so — kb_rebuild(index='esi') once approved)
-        idx = self.esi_index() if self._esi_count() == 0 else None
-        if isinstance(revision, str):
-            rs = revision.strip()
-            try:
-                revision = _hexint(rs) if rs[:2].lower() in ("#x", "0x") else int(rs)
-            except (TypeError, ValueError):
-                raise KnowledgeError(f"revision must be a number or '#x…' as hw_lookup shows it (got {revision!r})") from None
-        pc = _hexint(q) if q.startswith(("#x", "0x", "#X")) else None
-        rev_sql, rev_p = (" AND revision = ?", [revision]) if revision is not None else ("", [])
-        with self._db() as con:
-            if pc is not None:
-                rows = con.execute(f"SELECT * FROM esi WHERE product_code=?{rev_sql} ORDER BY revision DESC LIMIT 50",
-                                   [pc, *rev_p]).fetchall()
-            else:
-                rows = con.execute(f"SELECT * FROM esi WHERE type = ? COLLATE NOCASE{rev_sql} ORDER BY revision DESC "
-                                   "LIMIT 50", [q, *rev_p]).fetchall()
-                if not rows:
-                    rows = con.execute(f"SELECT * FROM esi WHERE (type LIKE ? OR name LIKE ?){rev_sql} ORDER BY type, "
-                                       "revision DESC LIMIT 50", [f"%{q}%", f"%{q}%", *rev_p]).fetchall()
-        # the newest revision of every type first, then the older ones: older revisions of the first type used up
-        # the limit and the other types never showed
-        firsts, rest, seen_t = [], [], set()
-        for r in rows:
-            (rest if r["type"] in seen_t else firsts).append(r)
-            seen_t.add(r["type"])
-        rows = firsts + rest
-        types = sorted({r["type"] for r in rows})
-        out_rows = []
-        newest_seen: set[str] = set()
-        trimmed = 0
-        for r in rows[: max(1, min(limit, 20))]:
-            pdo = json.loads(r["pdo"] or "[]")
-            coe = json.loads(r["coe"] or "[]")
-            d = {"type": r["type"], "name": r["name"], "vendor": r["vendor"], "group": r["grp"],
-                 "product_code": f"#x{r['product_code']:08X}" if r["product_code"] is not None else None,
-                 "revision": f"#x{r['revision']:08X}" if r["revision"] is not None else None,
-                 "pdo_count": len(pdo), "pdo_entries": sum(len(p.get("entries") or []) for p in pdo),
-                 "coe_count": len(coe), "file": r["file"]}
-            # the rows come newest revision first per type: the first one of a type is its newest
-            first_of_type = r["type"] not in newest_seen
-            newest_seen.add(r["type"])
-            if detail == "full" or (detail == "newest" and (first_of_type or revision is not None)):
-                d["pdo"] = pdo
-                d["coe_objects"] = coe
-            else:
-                trimmed += 1
-            out_rows.append(d)
-        res: dict[str, Any] = {"query": q, "matches": len(rows), "types": types[:30], "detail": detail,
-                               "devices": out_rows}
-        if trimmed:
-            res["detail_note"] = (f"{trimmed} device row(s) without their PDO entries and CoE objects (detail="
-                                  f"{detail!r}): detail='full', or revision='#x…' (as shown), gives them")
-        bad = sum(1 for d in out_rows for p in d.get("pdo", []) if p.get("unparsed"))
-        if bad:
-            res["parse_note"] = (f"{bad} PDO(s) could not be read from the ESI file (index or entries missing) — their raw "
-                                 "layout is under 'unparsed'; send it (or the ESI file) to get the parser fixed")
-        if idx:
-            res["indexed_now"] = idx
-        else:
-            st = self.esi_state()
-            if st.get("state") not in ("complete", "missing"):
-                res["esi_index_note"] = st["message"]          # rule 6: an answer from an index that is not current
-        if not rows:
-            res["note"] = "not in the installed ESI files — update the ESI (XAE: TwinCAT → EtherCAT Devices → Update Device Descriptions)"
-        # the PDF manuals of the knowledge folder (read-only, built by manuals_db.py) for the same product codes.
-        # N34: ESI type names carry text ('CX9020 EtherCAT slave') — take the order codes out of the query and the types
+        res = self._hw("lookup", q, limit, revision, detail)
+        # the PDF manuals of the knowledge folder for the same product codes (N34: ESI type names carry text — 'CX9020
+        # EtherCAT slave' — so the order codes are taken out of the query and the types)
         codes: list[str] = []
-        for t in [q] + types[:5]:
+        for t in [q] + list(res.get("types") or [])[:5]:
             for c in _PRODUCT_IN.findall(t.upper()):
                 if c not in codes:
                     codes.append(c)
         res.update(manuals_for(self.location()[0], codes))
         return res
 
-    def _esi_count(self) -> int:
-        with self._db() as con:
-            return con.execute("SELECT COUNT(*) FROM esi").fetchone()[0]
+    def hw_search(self, query: str, kinds: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
+        return self._hw("search", query, kinds, limit)
+
+    def hw_object(self, device: str, index: str | int, revision: int | str | None = None) -> dict[str, Any]:
+        return self._hw("object", device, index, revision)
+
+    def hw_diag(self, code: str | int, device: str | None = None, revision: int | str | None = None) -> dict[str, Any]:
+        return self._hw("diag", code, device, revision)
+
+    def hw_module(self, ident: str | int, device: str | None = None, revision: int | str | None = None) -> dict[str, Any]:
+        return self._hw("module", ident, device, revision)
 
     # -- K3 libraries --------------------------------------------------------------------
     def library_folders(self) -> list[Path]:
@@ -1285,7 +1171,7 @@ def _builder_version(f: Path) -> str | None:
     return m.group(1) if m else "1"
 
 
-BUILDER_NAMES = ("infosys_local.py", "manuals_db.py")
+BUILDER_NAMES = ("infosys_local.py", "manuals_db.py", "esi_db.py")
 PLUGIN_POINTER = "plugin_location.json"
 _STUB_MARK = "twincat-mcp builder stub"
 # N64: a file in <kb>\tools is replaced by the stub only when it IS a file this plugin shipped — identified by its
@@ -1308,9 +1194,10 @@ SHIPPED_BUILDERS: dict[str, dict[str, str]] = {
         "7f65bb454e0e57975ca5227fafce3b8db444dbcc334c990ab1da8359272fa341": "4",   # release 0.8.10
         "cb18f84dd247bd5451cabb10055879c5210702a739cb1719d90fe42e85de66f8": "5",   # release 0.8.11
     },
+    "esi_db.py": {},                                                                # new in 0.8.12
 }
 SHIPPED_STUBS: dict[str, str] = {
-    "6eb88af57099b2610da38becf909609829ed9c69d015cb98800e0740a86c9adf": "1",       # 1200fee
+    "6eb88af57099b2610da38becf909609829ed9c69d015cb98800e0740a86c9adf": "1",       # 1200fee … release 0.8.11
 }
 
 
@@ -1542,90 +1429,6 @@ def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
         return {"manuals_note": f"no indexed manual mentions {', '.join(codes[:3])} — copy its PDF into "
                                 f"{loc / 'manuals'} and run manuals_db.py update"}
     return {"manuals": found, "manuals_more": "twincat-docs skill: manual_search query=… doc=… / manual_page"}
-
-
-ESI_PARSER_VERSION = 3       # bump when _parse_esi's output changes: every ESI file is read again once
-
-
-def _ln(tag: Any) -> str:
-    """Local name of an element tag ('{ns}TxPdo' → 'TxPdo')."""
-    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
-
-
-def _kids(el: Any, name: str) -> list[Any]:
-    return [c for c in el if _ln(c.tag) == name]
-
-
-def _text(el: Any, name: str, prefer_lcid: str = "1033") -> str:
-    """Text of the child `name` — namespace-agnostic, English (LcId 1033) first when there are several."""
-    cs = _kids(el, name)
-    if not cs:
-        return ""
-    # (an Element without children is falsy: compare with None, never `or`)
-    best = next((c for c in cs if c.get("LcId") == prefer_lcid), None)
-    if best is None:
-        best = next((c for c in cs if c.get("LcId") is None), cs[0])
-    return " ".join("".join(best.itertext()).split())
-
-
-def _deep_text(el: Any, name: str, skip: str = "") -> str:
-    """First descendant `name` whose path does not run through a `skip` element (a PDO's own Index, not an Entry's)."""
-    stack = [c for c in el]
-    while stack:
-        c = stack.pop(0)
-        ln = _ln(c.tag)
-        if skip and ln == skip:
-            continue
-        if ln == name:
-            return " ".join("".join(c.itertext()).split())
-        stack.extend(list(c))
-    return ""
-
-
-def _parse_esi(path: Path):
-    """Rows for the esi table from one ESI XML (EtherCATInfo): one per Device/revision. D19: namespace-agnostic,
-    PDO / entry indices from their element text (#x1A00), English names first, CoE objects from the dictionary."""
-    tree = ET.parse(path)
-    root = tree.getroot()
-    vendor = next((_text(v, "Name") for v in root.iter() if _ln(v.tag) == "Vendor"), "")
-    for dev in (d for d in root.iter() if _ln(d.tag) == "Device"):
-        t = next(iter(_kids(dev, "Type")), None)
-        if t is None or not (t.text or "").strip():
-            continue
-        name = _text(dev, "Name")
-        pdos = []
-        for kind in ("RxPdo", "TxPdo"):
-            for pdo in _kids(dev, kind):
-                entries = []
-                for e in _kids(pdo, "Entry"):
-                    idx = _hexint(_text(e, "Index"))
-                    if not idx:
-                        continue                      # padding entry
-                    entries.append({"index": f"#x{idx:04X}", "sub": _hexint(_text(e, "SubIndex")) or 0,
-                                    "bits": _hexint(_text(e, "BitLen")), "name": _text(e, "Name"),
-                                    "type": _text(e, "DataType")})
-                pi = _hexint(_text(pdo, "Index") or _deep_text(pdo, "Index", skip="Entry"))
-                row = {"dir": "out (RxPdo)" if kind == "RxPdo" else "in (TxPdo)", "index": f"#x{pi:04X}" if pi else None,
-                       "name": _text(pdo, "Name") or _deep_text(pdo, "Name", skip="Entry"),
-                       "fixed": pdo.get("Fixed") in ("1", "true"),
-                       "mandatory": pdo.get("Mandatory") in ("1", "true"), "sm": pdo.get("Sm"), "entries": entries[:64]}
-                if pi is None or not entries:
-                    # D19 (still empty on the real files): keep what the element holds so the layout can be fixed
-                    row["unparsed"] = {"attrs": dict(pdo.attrib), "children": sorted({_ln(c.tag) for c in pdo})[:20],
-                                       "text": " ".join("".join(pdo.itertext()).split())[:160]}
-                pdos.append(row)
-        coe = []
-        objs = [o for prof in _kids(dev, "Profile") for dic in _kids(prof, "Dictionary")
-                for ob in _kids(dic, "Objects") for o in _kids(ob, "Object")]
-        for obj in objs:
-            oi = _hexint(_text(obj, "Index"))
-            if oi is None:
-                continue
-            coe.append({"index": f"#x{oi:04X}", "name": _text(obj, "Name"), "type": _text(obj, "Type")})
-            if len(coe) >= 400:
-                break
-        yield ((t.text or "").strip(), name, _hexint(t.get("ProductCode")), _hexint(t.get("RevisionNo")), vendor,
-               _text(dev, "GroupType"), str(path), json.dumps(pdos), json.dumps(coe))
 
 
 class _Conn:

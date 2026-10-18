@@ -36,7 +36,7 @@ from pyads.structs import AmsAddr
 
 from .config import AdsConfig
 from . import types_tc as T
-from .ads_types import POINTER_NOTE, TypeSystem, Leaf, WalkCancelled, parse_table
+from .ads_types import ADST_NAME, POINTER_NOTE, TypeSystem, Leaf, WalkCancelled, parse_table
 
 SYSTEM_SERVICE_PORT = 10000
 ROUTER_PORT = 1
@@ -301,7 +301,7 @@ class AdsBackend:
             p = ptr + 30
             name = raw[p:p + nlen].decode("latin-1", "replace"); p += nlen + 1
             typ = raw[p:p + tlen].decode("latin-1", "replace"); p += tlen + 1
-            com = raw[p:p + clen].decode("latin-1", "replace")
+            com = T.plc_text(raw[p:p + clen])                  # N95: the comment is the source's UTF-8 text
             out.append(SymbolEntry(name, typ, size, igrp, ioffs, flags, com, dtype))
             ptr += entry_len
         return out, {s.name.lower(): s for s in out}
@@ -423,6 +423,8 @@ class AdsBackend:
         ver = self._table_identity(c)
         dtver = self.__dict__.setdefault("_dtver", {})
         if hit and not refresh:
+            if hit[1] is not None:
+                hit[1].declared = self.alias_hint     # the project's aliases (N50) — set again: the project may change
             if ver is not None and dtver.get(key) == ver:
                 return hit[1]
             if ver is None and time.time() - hit[0] < self.cfg.symbol_cache_ttl_s:
@@ -434,6 +436,8 @@ class AdsBackend:
         except Exception as exc:  # noqa: BLE001
             ts, err = None, _fmt_exc(exc)
         self._dtcache[key] = (time.time(), ts, err)
+        if ts is not None:
+            ts.declared = self.alias_hint
         return ts
 
     def type_info(self, type_name: str, port: int | None = None) -> dict[str, Any]:
@@ -590,8 +594,19 @@ class AdsBackend:
         if ts is not None and (ts.get(s.type) is not None or (tt.kind == "array" and not T.is_elementary(tt))):
             out["value"] = ts.decode_tree(raw, s.type, size=s.size)
             out["decoder"] = "datatype-table"
-            if ts.is_indirect(ts.get(s.type), s.type):
+            e = ts.get(s.type)
+            if ts.is_indirect(e, s.type):
                 out["note"] = POINTER_NOTE
+            src = ts.source_base(e)
+            if src:
+                out["type_source"] = (f"project source: TYPE {s.type} : {src} — the runtime's datatype table gives "
+                                      f"{s.type} no base type (N50)")
+            elif e is not None and not (e.type or e.subitems or e.dims or e.enum) and isinstance(out["value"], dict) \
+                    and "raw_hex" in out["value"]:
+                out["type_note"] = (f"the runtime's datatype table describes {s.type} only as {e.size} bytes "
+                                    f"({ADST_NAME.get(e.data_type, e.data_type)}, no base type, no members): shown as raw "
+                                    "bytes. An alias declared in the project source (TYPE … : POINTER TO …) is decoded "
+                                    "as what it is once the project is configured (project.root)")
         else:
             tt = T.parse_type(s.type, s.size)
             if tt.ctype is not None and not tt.opaque:
@@ -1251,6 +1266,9 @@ class AdsBackend:
     # set by the server: True when the project source declares this name as an INTERFACE — the runtime's datatype
     # table does not always mark interface types recognisably (field retest #52/#64)
     interface_hint: Callable[[str], bool] | None = None
+    # set by the server: the base the project source declares for an alias type ('PT_X' -> 'POINTER TO FB_X') — the
+    # 4026 datatype table gives an alias of a pointer no base type (N50)
+    alias_hint: Callable[[str], str | None] | None = None
 
     def is_interface_type(self, type_name: str, port: int | None = None) -> bool:
         try:

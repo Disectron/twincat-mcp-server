@@ -147,6 +147,11 @@ def _cstr(buf: bytes, pos: int, n: int) -> tuple[str, int]:
     return buf[pos:pos + n].decode("latin-1", "replace"), pos + n + 1
 
 
+def _ctxt(buf: bytes, pos: int, n: int) -> tuple[str, int]:
+    """A comment / attribute value: the source's text (UTF-8, else Windows-1252 — N95)."""
+    return T.plc_text(buf[pos:pos + n]), pos + n + 1
+
+
 def parse_entry(buf: bytes, pos: int) -> tuple[DtEntry, int]:
     """Parse one AdsDatatypeEntry at ``pos``; returns (entry, pos_after_entry)."""
     if pos + HDR.size > len(buf):
@@ -157,7 +162,7 @@ def parse_entry(buf: bytes, pos: int) -> tuple[DtEntry, int]:
     p = pos + HDR.size
     name, p = _cstr(buf, p, nlen)
     typ, p = _cstr(buf, p, tlen)
-    com, p = _cstr(buf, p, clen)
+    com, p = _ctxt(buf, p, clen)
     dims = []
     for _ in range(adim):
         lb, el = struct.unpack_from("<iI", buf, p)
@@ -189,7 +194,7 @@ def parse_entry(buf: bytes, pos: int) -> tuple[DtEntry, int]:
             for _ in range(n):
                 al, vl = buf[p], buf[p + 1]; p += 2
                 an, p = _cstr(buf, p, al)
-                av, p = _cstr(buf, p, vl)
+                av, p = _ctxt(buf, p, vl)
                 e.attributes[an] = av
         if flags & F_ENUMINFOS and p + 2 <= end:
             n = struct.unpack_from("<H", buf, p)[0]; p += 2
@@ -253,6 +258,26 @@ class TypeSystem:
         TYPE PT_X : POINTER TO FB_X (and an alias of that) is an indirection too."""
         return self.indirect_kind(e, type_name) is not None
 
+    # set by the server (AdsBackend.alias_hint): the base the PROJECT SOURCE declares for an alias type name
+    # ('PT_X' -> 'POINTER TO FB_X'), or None
+    declared: Callable[[str], str | None] | None = None
+
+    def source_base(self, e: DtEntry | None) -> str | None:
+        """N50: the project source's base of an entry the table gives no base for — only for a pointer-sized entry with
+        no members, dimensions or enum values (what the 4026 table gives for an alias of a pointer), else None."""
+        if e is None or self.declared is None or e.type or e.subitems or e.dims or e.enum or e.size not in (4, 8):
+            return None
+        try:
+            base, hops = self.declared(e.name), 0
+            while base and not _RE_INDIRECT.match(base) and hops < 8:      # TYPE PT_A : PT_B; TYPE PT_B : POINTER TO …
+                nxt = self.declared(base.strip())
+                if not nxt:
+                    break
+                base, hops = nxt, hops + 1
+            return base
+        except Exception:  # noqa: BLE001
+            return None
+
     def indirect_kind(self, e: DtEntry | None, type_name: str | None = None) -> str | None:
         """'pointer' / 'reference' / 'interface' / 'tccom interface' when the value is an address (see is_indirect,
         the alias chain followed), else None. One rule for the dump, the decoder and the write guard."""
@@ -275,7 +300,9 @@ class TypeSystem:
                 return k
             # a struct, an array (its type is the ELEMENT type), an enum or a base type: not an alias
             if cur.subitems or cur.dims or cur.enum or not cur.type or cur.type.lower() == cur.name.lower():
-                return None
+                # N50 (4026): TYPE PT_X : POINTER TO FB_X arrives with NO base type — 8 bytes, BIGTYPE, nothing else.
+                # What it is can only come from the project source; without it the value stays raw bytes
+                return by_text(self.source_base(cur))
             k = by_text(cur.type)
             if k:
                 return k                                       # TYPE PT_X : POINTER TO FB_X
@@ -554,12 +581,14 @@ def encode_entry(e: DtEntry) -> bytes:
         flags |= F_ATTRIBUTES
         tail += struct.pack("<H", len(e.attributes))
         for k, v in e.attributes.items():
-            tail += bytes([len(k), len(v)]) + k.encode() + b"\x00" + v.encode() + b"\x00"
+            kb_, vb_ = k.encode(), v.encode()               # lengths in BYTES (UTF-8 text is longer than its chars)
+            tail += bytes([len(kb_), len(vb_)]) + kb_ + b"\x00" + vb_ + b"\x00"
     if e.enum:
         flags |= F_ENUMINFOS
         tail += struct.pack("<H", len(e.enum))
         for val, nm in e.enum.items():
-            tail += bytes([len(nm)]) + nm.encode() + b"\x00" + int(val).to_bytes(e.size, "little", signed=True)
+            nb_ = nm.encode()
+            tail += bytes([len(nb_)]) + nb_ + b"\x00" + int(val).to_bytes(e.size, "little", signed=True)
     total = HDR.size + len(body) + len(tail)
     return HDR.pack(total, 1, 0, 0, e.size, e.offs, e.data_type, flags, len(name), len(typ), len(com),
                     len(e.dims), len(e.subitems)) + body + tail

@@ -25,13 +25,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
 INFOSYS_FINGERPRINT = (4, "8769f95d966b84f4")
-MANUALS_FINGERPRINT = ("4", "5039656cc9a5f9a2")
-ESI_FINGERPRINT = (3, "010bd7d7a6b1ea08")      # parser unchanged since 0.8.10 (version 3)
+MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
+ESI_FINGERPRINT = ("1", "95a4f556032d311a")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
 
 EXCLUDE = frozenset({
     "_db", "_Conn", "_file_sig", "_probe", "_writable", "missing_text", "ro_uri", "source", "has_fts", "_bump_gen",
     "InfosysError", "HelpViewerError", "_sitemap_locs", "_sitemap_urlset",
     "connect", "_meta",
+    "_RES_CACHE",                 # esi_index: the RES\\ folder listings of this process (runtime state, not a rule)
 })
 
 
@@ -124,11 +125,26 @@ def test_manuals_text_format_tracks_the_text_code():
         f"manuals page text code changed: bump manuals_db.TEXT_FORMAT and set MANUALS_FINGERPRINT = {got!r}")
 
 
-def test_esi_parser_version_tracks_the_parser():
-    from twincat_mcp import knowledge as K
-    got = (K.ESI_PARSER_VERSION, _digest(_closure([K._parse_esi], [K])))
+def esi_code() -> dict[str, str]:
+    """What the ESI files become in index\\esi.db: the readers of the four document kinds, the dictionary, PDO,
+    template, slot and diagnosis rules, the content store and the schema (esi_index._build_into reaches them all)."""
+    from twincat_mcp import esi_index as E
+    return _closure([E._build_into], [E])
+
+
+def test_esi_format_tracks_the_index_code():
+    from twincat_mcp import esi_index as E
+    got = (E.FORMAT, _digest(esi_code()))
     assert got == ESI_FINGERPRINT, (
-        f"ESI parser changed: bump knowledge.ESI_PARSER_VERSION and set ESI_FINGERPRINT = {got!r}")
+        f"ESI index code changed: bump esi_index.FORMAT and set ESI_FINGERPRINT = {got!r}")
+
+
+def test_the_esi_closure_reaches_the_parsers():
+    found = esi_code()
+    for name in ("parse_device", "parse_dictionary", "parse_diag_messages", "parse_module", "iter_info",
+                 "iter_modules", "_templates", "_pdo", "_chn", "_slots", "_mappings", "decode_data", "_INT_TYPES",
+                 "_Build", "_Writer", "SCHEMA", "FTS", "_resolve_ref", "_title", "_hash", "_pack"):
+        assert name in found, name
 
 
 def test_the_closure_reaches_what_decides_stored_content():

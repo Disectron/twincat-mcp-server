@@ -1,10 +1,12 @@
 """twincat-docs: offline Beckhoff documentation lookup, read-only, one JSON object per call.
 
-Reads two indexes of the local TwinCAT knowledge base (`<kb>`, see `status`; the layout and rules:
+Reads three indexes of the local TwinCAT knowledge base (`<kb>`, see `status`; the layout and rules:
 docs/KNOWLEDGE_BASE.md of the twincat plugin):
   <kb>\\index\\infosys-<lcid>.db   Beckhoff Infosys from the Help Viewer package — the same index the plugin's infosys_*
                                  tools read, built by the plugin's extractor (builders\\infosys_local.py index)
   <kb>\\index\\manuals.db         PDF hardware manuals, built by builders\\manuals_db.py update
+  <kb>\\index\\esi.db             EtherCAT device descriptions (ESI files in manuals\\ and TwinCAT's ESI folders), built by
+                                 builders\\esi_db.py update — the same index the plugin's hw_* tools read
 (the builders ship next to this script and need Python 3.12+; <kb>\\tools\\ holds stubs that run them)
 Nothing is written: both are opened with SQLite's read-only mode, and what they hold is shown as stored (it is
 normalised when indexed, never repaired here). Standard library only (and the plugin's own twincat_mcp package beside
@@ -44,8 +46,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "4"           # 2: index state in every answer, links as refs, builders shipped beside it; 3: Python 3.12+
+VERSION = "5"           # 2: index state in every answer, links as refs, builders shipped beside it; 3: Python 3.12+
                         # 4: the plugin's one Infosys index (index\\infosys-<lcid>.db), the permanent layout (0.8.11)
+                        # 5: hw_* commands on the ESI index (index\\esi.db), its state in status (0.8.12)
 FALLBACK_KB = r"D:\TwinCAT-MCP\knowledge"
 WEB = "https://infosys.beckhoff.com/content/{lcid}/{book}/{pid}.html"
 BUILDERS = Path(__file__).resolve().parent / "builders"
@@ -53,6 +56,7 @@ _PLUGIN = Path(__file__).resolve().parents[2]          # <plugin>/skills/twincat
 # the plugin's own package beside this skill (this version's rules) — unless this runs inside the server, which has it
 if "twincat_mcp" not in sys.modules and (_PLUGIN / "twincat_mcp" / "kb_layout.py").is_file() and str(_PLUGIN) not in sys.path:
     sys.path.insert(0, str(_PLUGIN))
+from twincat_mcp import esi_index as ESI  # noqa: E402 — the ESI index: one implementation (the server's hw_* tools)
 from twincat_mcp import infosys_build as IB  # noqa: E402 — the index's state: one implementation for every reader
 from twincat_mcp import kb_layout as L  # noqa: E402 — where everything is: one place
 from twincat_mcp import kb_lock as KL  # noqa: E402 — whether a build runs: the OS lock, never a guess
@@ -334,8 +338,9 @@ def overview(kb: Path) -> dict[str, Any]:
         m = manuals_state(L.locate(kb, "manuals"), kb / "manuals")
     except sqlite3.Error as exc:
         m = {"state": "error", "message": f"manuals database not readable: {exc}"}
-    return {"knowledge_base": str(kb), "infosys": i, "manuals": m,
-            "summary": f"Infosys index: {i['message']}. Manuals: {m['message']}."}
+    e = ESI.state(L.index_file(kb, "esi"), kb)
+    return {"knowledge_base": str(kb), "infosys": i, "manuals": m, "esi": e,
+            "summary": f"Infosys index: {i['message']}. Manuals: {m['message']}. ESI index: {e['message']}."}
 
 
 class Ctx:
@@ -1005,8 +1010,53 @@ def cmd_status(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
             out[which] = src
         except Err as exc:
             out[which] = {"missing": exc.message, **exc.extra}
+    out["esi_state"] = ov["esi"]
     out["rules"] = [kbtext(r) for r in RULES]
     return out
+
+
+# ---------------------------------------------------------------------------------------------- hw_* (the ESI index)
+def _esi(ctx: Ctx, fn: str, *a: Any) -> dict[str, Any]:
+    """One read of index\\esi.db through the plugin's esi_index (the server's hw_* tools read it the same way), with
+    the index it came from — and its state when it is not current (rule 6)."""
+    db = L.index_file(ctx.kb, "esi")
+    st = ESI.state(db, ctx.kb)
+    if st["state"] == "missing":
+        raise Err("no_index", f"no ESI index at {db} — {st['message']}",
+                  hint=f'build it: <Python 3.12+> "{BUILDERS / "esi_db.py"}" update --kb "<kb>" (or approve '
+                       "kb_rebuild(index='esi') in the twincat server; its first build starts by itself there)")
+    try:
+        out = getattr(ESI.EsiIndex(db), fn)(*a)
+    except ESI.EsiError as exc:
+        raise Err(exc.code, str(exc)) from None
+    src: dict[str, Any] = {"database": str(db), "state": st["state"], "built": st.get("built")}
+    if st["state"] != "complete" or st.get("rebuild"):
+        src["state_note"] = st["message"]
+    out["source"] = src
+    return out
+
+
+def cmd_hw_lookup(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
+    if a["detail"] not in ESI.DETAILS:
+        raise Err("bad_param", f"detail must be one of {list(ESI.DETAILS)} (got {a['detail']!r})")
+    return _esi(ctx, "lookup", a["query"], a["limit"], a["revision"], a["detail"])
+
+
+def cmd_hw_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
+    kinds = [k.strip() for k in a["kinds"].split(",") if k.strip()] if a["kinds"] else None
+    return _esi(ctx, "search", a["query"], kinds, a["limit"])
+
+
+def cmd_hw_object(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
+    return _esi(ctx, "object", a["device"], a["index"], a["revision"])
+
+
+def cmd_hw_diag(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
+    return _esi(ctx, "diag", a["code"], a["device"], a["revision"])
+
+
+def cmd_hw_module(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
+    return _esi(ctx, "module", a["ident"], a["device"], a["revision"])
 
 
 COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[str, P], str]] = {
@@ -1033,6 +1083,23 @@ COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[
                                       "max_chars": P("int", default=4000, lo=200, hi=20000)},
                     "page text of a manual with the section of each page"),
     "manual_docs": (cmd_manual_docs, {"filter": P(doc="file name / title glob or word")}, "the indexed manuals"),
+    "hw_lookup": (cmd_hw_lookup, {"query": P(required=True, doc="type / order code, part of a name, or product code #x…"),
+                                  "limit": P("int", default=3, lo=1, hi=30), "revision": P(doc="#x… as shown, or a number"),
+                                  "detail": P(default="newest", doc="newest | summary | full")},
+                  "EtherCAT device from the ESI index: identity, PDOs and entries, PDO assignments, DC, slots, CoE list"),
+    "hw_search": (cmd_hw_search, {"query": P(required=True, doc="FTS5 query"),
+                                  "kinds": P(doc="comma list of device, object, diag, module"),
+                                  "limit": P("int", default=20, lo=1, hi=100)},
+                  "ESI full text: devices, CoE objects, diagnosis messages, modules"),
+    "hw_object": (cmd_hw_object, {"device": P(required=True, doc="exact type, e.g. EL3356-0010"),
+                                  "index": P(required=True, doc="#x8000 / 0x8000 / 8000"), "revision": P(doc="#x…")},
+                  "one CoE object: sub-indices, types, bit offsets, defaults, limits, enum texts"),
+    "hw_diag": (cmd_hw_diag, {"code": P(required=True, doc="text id, e.g. #x4101"), "device": P(doc="exact type"),
+                              "revision": P(doc="#x…")},
+                "a diagnosis message (diagnosis history text id): text, causes, remedies, reaction"),
+    "hw_module": (cmd_hw_module, {"ident": P(required=True, doc="ModuleIdent #x…"), "device": P(doc="exact type"),
+                                  "revision": P(doc="#x…")},
+                  "a module of a modular device by its ModuleIdent"),
     "status": (cmd_status, {}, "where the knowledge base is, what is indexed, the rules"),
 }
 
@@ -1061,7 +1128,7 @@ def main(argv: list[str] | None = None) -> int:
             if cmd.startswith("ads_"):
                 why = (" (ads_* are tools of the twincat MCP server: they read the running PLC and never return "
                        "documentation)")
-            elif cmd.startswith(("infosys_", "kb_", "hw_")):
+            elif cmd.startswith(("infosys_", "kb_")):
                 why = " (that is a tool of the twincat MCP server, not a command of this script)"
             raise Err("unknown_command", f"{cmd!r} is not a command of this script{why}", commands=list(COMMANDS),
                       near=near)

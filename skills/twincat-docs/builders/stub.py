@@ -1,11 +1,11 @@
 """twincat-mcp builder stub: runs the knowledge-folder builder that the installed twincat plugin ships.
 
-This file sits in <kb>\\tools\\ under the builder's own name (infosys_local.py or manuals_db.py) and never needs
-updating: it finds the plugin's current builders and runs the one with its own file name, with the same arguments and
-the same Python. Commands and output are those of the builder (python infosys_local.py stats, ... update, ...).
+This file sits in <kb>\\tools\\ under the builder's own name (infosys_local.py, manuals_db.py or esi_db.py) and never
+needs updating: it finds the plugin's current builders and runs the one with its own file name, with the same
+arguments and the same Python. Commands and output are those of the builder (python infosys_local.py stats, ...).
 
 Where the builders are found, first match wins:
-  1. TCMCP_BUILDERS (a folder holding infosys_local.py / manuals_db.py)
+  1. TCMCP_BUILDERS (a folder holding infosys_local.py / manuals_db.py / esi_db.py)
   2. the location the twincat MCP server records at every start: <TCMCP_HOME or ~/.twincat_mcp>/plugin_location.json
   3. the newest twincat-mcp version in the Claude Code plugin cache (~/.claude/plugins/cache/*/twincat-mcp/<version>)
 The knowledge folder is the builder's usual one (--kb, TCMCP_KNOWLEDGE_DIR, kb_set_location, ...) with "the folder above
@@ -19,8 +19,8 @@ import sys
 from pathlib import Path
 
 STUB = "twincat-mcp builder stub"
-STUB_VERSION = "1"
-NAMES = ("infosys_local.py", "manuals_db.py")
+STUB_VERSION = "2"
+NAMES = ("infosys_local.py", "manuals_db.py", "esi_db.py")
 
 
 def _version_key(p):
@@ -59,7 +59,8 @@ def main():
     me = Path(__file__).resolve()
     name = me.name if me.name in NAMES else None
     if name is None:
-        sys.exit("twincat-mcp builder stub: name this file infosys_local.py or manuals_db.py (it is " + me.name + ")")
+        sys.exit("twincat-mcp builder stub: name this file infosys_local.py, manuals_db.py or esi_db.py (it is "
+                 + me.name + ")")
     folder, how = find_builders(name)
     if folder is None:
         sys.exit("twincat-mcp builder stub: the twincat plugin's " + name + " was not found (tried: " + how + "). "
