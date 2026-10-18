@@ -113,6 +113,7 @@ class FakeConnection:
     handles: dict[int, tuple[str, int]] = {}
     next_handle: int = 1000
     handles_survive: bool = False
+    fail_version_reads: bool = False
 
     def __init__(self, ams_net_id: str = None, ams_net_port: int = None, ip_address: str = None):
         self.ams_net_id, self.ams_net_port, self.ip_address = ams_net_id, ams_net_port, ip_address
@@ -186,6 +187,8 @@ class FakeConnection:
 
     def read(self, index_group, index_offset, plc_datatype, return_ctypes=False, check_length=True):
         if index_group == 0xF008:                        # ADSIGRP_SYM_VERSION
+            if FakeConnection.fail_version_reads:
+                raise pyads.ADSError(1861)              # timeout: the runtime does not answer
             if plc_datatype is ctypes.c_ubyte:
                 return FakeConnection.symbol_version
             n = ctypes.sizeof(plc_datatype)
@@ -549,6 +552,7 @@ def install(monkeypatch):
     FakeConnection.read_log = []                       # (symbol, offset inside it, bytes) of every raw 0x4040 read
     FakeConnection.initial_notification = False      # tests that model real ADS registration behaviour turn it on
     FakeConnection.symbol_version = 1
+    FakeConnection.fail_version_reads = False
     FakeConnection.handles = {}
     FakeConnection.next_handle = 1000
     FakeConnection.handles_survive = False

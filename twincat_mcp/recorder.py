@@ -67,13 +67,14 @@ import pyads
 from pyads import constants as C
 
 from . import types_tc as T
-from .ads_backend import AdsBackend, AdsError, SymbolEntry, _fmt_exc
+from .ads_backend import ADSIGRP_SYM_VERSION, AdsBackend, AdsError, ProgramChanged, SymbolEntry, _fmt_exc
 
 FILETIME_EPOCH_OFFSET_100NS = 116444736000000000  # 1601 → 1970
 MERGE_GAP_BYTES = 256          # leaves closer than this share one notification
 MAX_BLOCK_BYTES = 16384        # one notification never carries more than this
 QUEUE_BYTES = 256 << 20        # in-memory backlog cap per recording
 HOLD_MARGIN_MS = 50.0            # transport margin on top of max_delay_ms for a block's late delivery
+VERSION_CHECK_MS = 20.0          # R43: how often the symbol version is read while block samples wait for it
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
 TAIL_WAIT_S = 1.0             # after the duration: wait at most this long for in-flight samples up to the cut
 
@@ -639,6 +640,31 @@ class Recording:
         self._stop_cut_mono: float | None = None
         self.stop_wait_ms: float | None = None
         self._cut_lock = threading.Lock()     # the end (_cut_t, stop_at_cut, cut_by): ingest thread vs rec_stop
+        # R43: block notifications sample memory addresses; a download / online change can put other variables there.
+        # A block sample is released only once a symbol version read taken after its delivery returned the version
+        # the recording started with (it was sampled before the read was answered): _verified_t. Poll mode reads the
+        # version in each poll's own sum request instead. Same rule as the native engine.
+        self.read_program: Callable[[], int] | None = None      # the symbol version, read now (raises if not)
+        self.read_identity: Callable[[], str | None] | None = None
+        self.check_ms = VERSION_CHECK_MS
+        self._watch = False
+        self._watch_error: str | None = None
+        self._ver: int | None = None
+        self._identity: str | None = None
+        self._verified_t: float | None = None
+        self._last_check = 0.0
+        self._check_failing = False
+        self._check_fail_since = 0.0
+        self._check_fail_newest: float | None = None
+        self._check_error: str | None = None
+        self.version_reads = 0
+        self.version_read_failures = 0
+        self._final_check_done = False
+        self.program_changed: dict[str, Any] | None = None
+        self.program_watch_lost = False
+        self.program_notes: list[str] = []
+        self.unverified_rows = 0
+        self.unverified_polls = 0
         # PLC-order release (_ingest_loop): per block, the samples that wait for the other blocks
         self._pending: dict[int, deque] = {}
         self._heads: list[tuple[float, int]] = []
@@ -848,9 +874,11 @@ class Recording:
                 self.dropped_on_stop += self.q.qsize() + self._pending_n
                 break
             final = stopping and self.q.empty()
+            self._maybe_check(final)
             done = self._release_ordered(final)
             released_last = bool(done)
-            if final and not self._pending_n:
+            if final and (not self._pending_n or self._only_unverified_left()):
+                self._count_leftover()
                 break
             if not stopping and not done:
                 self._check_limits()
@@ -887,6 +915,159 @@ class Recording:
         q.append((t, payload))
         self._pending_n += 1
 
+    # ------------------------------------------------------------ R43: the program the addresses belong to
+    def _gated(self) -> bool:
+        return self._watch and self.read_program is not None and self.mode != "poll"
+
+    def _check_period(self) -> float:
+        return (max(self.check_ms, 500.0) if self._check_failing else self.check_ms) / 1000.0
+
+    def _newest_t(self) -> float | None:
+        """The newest PLC time delivered by any block (ms since t0): what a version read taken now can verify."""
+        ts = self._recv_max_ts
+        if ts is None or self.t0_ft is None:
+            return None
+        return (int(ts) - self.t0_ft) / 1e4
+
+    def _flowing(self, now: float) -> bool:
+        return any(now - (b.last_wall if b.last_wall is not None else self._ingest_mono) <= self._silent_s
+                   for b in self.timeline_blocks())
+
+    def _maybe_check(self, final: bool) -> None:
+        if not self._gated():
+            return
+        newest = self._newest_t()
+        if newest is not None and (self._verified_t is None or newest > self._verified_t):
+            now = time.monotonic()
+            if (final and not self._final_check_done) or now - self._last_check >= self._check_period():
+                self._check_program(newest, now)
+        if final:
+            self._final_check_done = True
+
+    def _check_program(self, newest: float, now: float) -> None:
+        """Ingest thread. One read of the symbol version; after failed reads, and whenever it moved, the program's
+        identity too (another build can come back after a restart with the same version byte)."""
+        ok, v, err = True, None, None
+        try:
+            v = int(self.read_program())  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001
+            ok, err = False, _fmt_exc(exc)
+        use_id = ok and self._identity is not None and (v != self._ver or self._check_failing)
+        id_now = None
+        if use_id:
+            try:
+                id_now = self.read_identity() if self.read_identity is not None else None
+            except Exception:  # noqa: BLE001
+                id_now = None
+            if id_now is None:
+                ok, err = False, "the program identity (compile time, online changes, table sizes) could not be read"
+        self._last_check = now
+        self.version_reads += 1
+        if not ok:
+            self.version_read_failures += 1
+            self._check_error = err
+            if not self._check_failing:
+                self._check_failing, self._check_fail_since, self._check_fail_newest = True, now, newest
+            # samples keep coming while the version cannot be read: they cannot be verified — end at the last verified
+            # one (an outage delivers nothing: waited for)
+            if (not self.program_watch_lost and self._flowing(now)
+                    and now - self._check_fail_since > 1.0 + self.max_delay_ms / 1000.0
+                    and self._check_fail_newest is not None and newest > self._check_fail_newest):
+                self.program_watch_lost = True
+                self._end_program(f"the PLC program version could not be read for {now - self._check_fail_since:.1f} s "
+                                  f"while samples kept coming ({err}): a download / online change could not be ruled "
+                                  "out — the recording ends at the last verified sample")
+            return
+        self._check_failing = False
+        same = (id_now == self._identity) if use_id else (v == self._ver)
+        if same:
+            if v != self._ver:
+                self.program_notes.append(f"symbol version {self._ver} -> {v} with the same program ({id_now}): the "
+                                          "recording continued")
+                self._ver = v
+            if self._verified_t is None or newest > self._verified_t:
+                self._verified_t = newest
+            return
+        if self.program_changed is not None:
+            return
+        what = f"symbol version {self._ver} -> {v}" + (f", program {self._identity} -> {id_now}" if use_id else "")
+        self.program_changed = {
+            "after_ms": None if self._verified_t is None else round(self._verified_t, 4),
+            "read_by_ms": round(newest, 4), "symbol_version": [self._ver, v],
+            "rule": "the change happened after the last verified sample (after_ms) and before the version read taken "
+                    "once the sample at read_by_ms had been delivered; samples between are not written"}
+        self._end_program(f"the PLC program changed ({what}: download / online change / another build) - the "
+                          "notifications sample memory addresses that may now hold other variables; the recording ends "
+                          "at the last sample verified before the change")
+
+    def _end_program(self, reason: str) -> None:
+        if self._verified_t is None or self.armed:
+            with self._cut_lock:
+                if not self._stop.is_set():
+                    self.stop_reason = reason
+                    self._stop.set()        # no window to keep
+            return
+        self._end_at(self._verified_t, reason, "program_change")
+
+    def _only_unverified_left(self) -> bool:
+        if not self._gated() or not self._heads:
+            return False
+        v = self._verified_t
+        return v is None or self._heads[0][0] > v
+
+    def _count_leftover(self) -> None:
+        """At the end: block samples still waiting — past the end (after_limit), or inside it but never verified
+        against a program change (unverified_rows: delivered, not written, counted as missing where they fall)."""
+        cut = self._cut_t
+        for q in self._pending.values():
+            for t, _p in q:
+                if cut is not None and _ticks(t) > _ticks(cut):
+                    self.after_limit += 1
+                elif self._gated():
+                    self.unverified_rows += 1
+                else:
+                    self.after_limit += 1
+            q.clear()
+        self._heads.clear()
+        self._pending_n = 0
+
+    def program_footer(self) -> dict[str, Any]:
+        """R43: program_watch (and what a change did) — the native engine's footer fields."""
+        out: dict[str, Any] = {}
+        if self.mode == "poll":
+            pw: dict[str, Any] = {"checked": self._ver is not None,
+                                  "per_read": "each poll reads the symbol version in its own sum request: values of "
+                                              "another program are never recorded"}
+            if self._ver is None:
+                pw["error"] = self._watch_error or "not readable"
+            if self.unverified_polls:
+                pw["unverified_polls"] = self.unverified_polls
+        elif self._watch:
+            pw = {"checked": True, "check_ms": self.check_ms, "reads": self.version_reads,
+                  "failed_reads": self.version_read_failures}
+            if self._check_error:
+                pw["last_error"] = self._check_error
+            pw["verified_to_ms"] = None if self._verified_t is None else round(self._verified_t, 4)
+        else:
+            pw = {"checked": False, "error": self._watch_error or "not readable"}
+        if self.program_notes:
+            pw["notes"] = list(self.program_notes)
+        out["program_watch"] = pw
+        if not pw["checked"]:
+            out["program_watch_error"] = (f"the symbol version could not be read at the start ({pw['error']}): a "
+                                          "download / online change during the recording would not be noticed")
+        if self.program_changed is not None:
+            out["program_changed"] = self.program_changed
+        if self.program_watch_lost:
+            out["program_watch_lost"] = True
+        if self.unverified_rows:
+            v = "none verified" if self._verified_t is None else f"{self._verified_t:.4f} ms"
+            out["unverified_rows"] = self.unverified_rows
+            out["unverified_note"] = (f"samples delivered after the last verified one ({v}) but not written: the symbol "
+                                      f"version could not be read again ({self._check_error}), so a download / online "
+                                      "change could not be ruled out — counted as missing where they fall")
+        return out
+
     def backlog(self) -> int:
         """Samples received but not in the file yet: queued, or waiting for the other blocks (PLC-order release)."""
         return self.q.qsize() + self._pending_n
@@ -921,6 +1102,10 @@ class Recording:
             # is the newest time received plus the wall time since it came, so nothing waits longer than the bound.
             plc_now = self._max_seen_t + (now - self._max_seen_mono) * 1000.0
             w = min(w, plc_now - (self.max_delay_ms + HOLD_MARGIN_MS))
+        if self._gated():
+            if self._verified_t is None:
+                return None
+            w = min(w, self._verified_t)
         return w
 
     def _next_quiet_s(self) -> float:
@@ -938,6 +1123,8 @@ class Recording:
             left = (self._heads[0][0] + hold - self._max_seen_t) / 1000.0 - (now - self._max_seen_mono)
             if left > 0:
                 nxt = min(nxt, left)
+        if self._heads and self._gated():
+            nxt = min(nxt, self._last_check + self._check_period() - now)      # the next version read
         return max(0.001, nxt)
 
     def _release_ordered(self, final: bool) -> int:
@@ -945,7 +1132,12 @@ class Recording:
         limits are checked after each one, so a sample past an end set by an earlier one is never written."""
         if not self._pending_n:
             return 0
-        w = math.inf if final else self._horizon()
+        if final:
+            w = math.inf
+            if self._gated():          # R43: what no version read verified is never written, not even at the end
+                w = self._verified_t if self._verified_t is not None else -math.inf
+        else:
+            w = self._horizon()
         if w is None:
             return 0
         n = 0
@@ -1255,6 +1447,7 @@ class Recording:
                 if self.poll_refused:
                     footer["poll_refused"] = self.poll_refused
                 footer.update(self.stop_and_trigger_notes())
+                footer.update(self.program_footer())
                 if self.stall_cfg:
                     footer["stall_counter_block"] = self.stall_cfg.get("block")
                 if self.key:
@@ -1287,7 +1480,8 @@ class Recording:
                                       "rule": "ends at the newest PLC time received when the stop was asked for; every "
                                               "block must deliver up to it (allowance 1 period)"}
         elif self.stop_at_cut:
-            what = {"duration": "the end of duration_s", "post_trigger": "the end of post_trigger_s"}.get(
+            what = {"duration": "the end of duration_s", "post_trigger": "the end of post_trigger_s",
+                    "program_change": "the last sample verified before the PLC program changed (R43)"}.get(
                 self.cut_by or "", f"the sample on which {self.cut_by} fired")
             out["stop_at"] = {"at_ms": self._cut_t, "waited_ms": self.stop_wait_ms, "by": self.cut_by,
                               "rule": f"ends at the PLC time of {what}; every block must deliver up to it (allowance "
@@ -1434,6 +1628,10 @@ class Recording:
             warn.append(f"ingest cannot keep up: backlog {backlog}/{self.q.maxsize} — fewer symbols, a larger cycle_ms or mode='change'")
         if self.unsubscribed:
             warn.append(f"{len(self.unsubscribed)} symbols could not be subscribed")
+        pf = self.program_footer()
+        st.update(pf)
+        from .native_capture import program_warnings
+        warn.extend(program_warnings(pf))
         if warn:
             st["warnings"] = warn
         return st
@@ -1911,7 +2109,21 @@ class Recorder:
                 out[s.name] = d
         return out
 
-    def start(self, *, symbols: list[str] | None, prefix: str | None, pattern: str | None, mode: str,
+    def start(self, **kw: Any) -> dict[str, Any]:
+        """Start a recording (arguments: _start). R43: when the PLC program changed between looking the variables up
+        and registering them (their addresses may belong to other variables), the symbol table is loaded again and
+        the start repeated once — nothing is subscribed or written before that check."""
+        try:
+            return self._start(**kw)
+        except _ProgramMoved:
+            self.ads.refresh_symbols(kw.get("port"))
+        try:
+            return self._start(**kw)
+        except _ProgramMoved as exc:
+            raise AdsError(f"{exc} — twice in a row: nothing was recorded. Start again once the download / online "
+                           "change is done.") from exc
+
+    def _start(self, *, symbols: list[str] | None, prefix: str | None, pattern: str | None, mode: str,
               cycle_ms: float, duration_s: float | None, max_events: int | None, start_when: str | None,
               stop_when: str | None, pre_trigger_ms: float, name: str | None, max_symbols: int,
               port: int | None = None, post_trigger_s: float | None = None, allow_partial: bool = False,
@@ -1986,6 +2198,7 @@ class Recorder:
                 if want == "native":
                     raise RecorderError(f"engine 'native' requested but not usable: {exc}") from exc
                 engine_note = f"native engine not used: {exc}"
+        self._program_baseline(rec, port)
         rec.start_ingest()
         try:
             if mode == "poll":
@@ -2003,6 +2216,22 @@ class Recorder:
         if engine_note:
             st["engine_note"] = engine_note
         return self._start_summary(st, rec, syms, counter, mode, cycle_ms)
+
+    def _program_baseline(self, rec: Recording, port: int | None) -> None:
+        """R43: the symbol version the recording runs with, read before anything is registered; the addresses must be
+        from the same program (the symbol table's version)."""
+        c = self.ads.conn(port)
+        want = self.ads._table_version(c)
+        try:
+            v = int(c.read(ADSIGRP_SYM_VERSION, 0, ctypes.c_ubyte))
+        except Exception as exc:  # noqa: BLE001
+            rec._watch_error = _fmt_exc(exc)
+            return
+        if want is not None and v != want:
+            raise _ProgramMoved(f"the PLC program changed after the variables were looked up (symbol version {want}, "
+                                f"now {v}): their addresses may belong to other variables")
+        rec._watch, rec._ver, rec.version_reads = True, v, 1
+        rec._identity = _program_identity(c)
 
     def _choose_engine(self, want: str, mode: str, allow_partial: bool) -> tuple[str, str | None]:
         if want == "python":
@@ -2038,6 +2267,10 @@ class Recorder:
         rc = self.rcfg
         if rec.stall_cfg:
             extra["stall"] = rec.stall_cfg
+        if "symbol_version" not in extra:
+            tv = self.ads._table_version(self.ads.conn(port))
+            if tv is not None:
+                extra["symbol_version"] = tv          # R43: the service refuses addresses of another program version
         try:
             nrec = NC.start_native(
                 rec, header, self.native_exe(), net_id=net_id or "", port=port or self.ads.port, ip=self.ads.ip,
@@ -2048,6 +2281,8 @@ class Recorder:
                 timeout_ms=int(getattr(self.ads.cfg, "timeout_ms", 5000)), backend=backend, extra=extra)
         except NC.NativeUnavailable as exc:
             raise _NativeFallback(str(exc)) from exc
+        except NC.ProgramMoved as exc:
+            raise _ProgramMoved(str(exc)) from exc
         except NC.NativeStartError as exc:
             raise AdsError(f"{exc}. Nothing is recorded rather than a recording with holes.") from exc
         self.recs[rec.id] = nrec
@@ -2152,6 +2387,8 @@ class Recorder:
             raise AdsError(f"recorder connection failed: {_fmt_exc(exc)}") from exc
         rec.conn = conn
         rec.on_finish = lambda: self._stop_notifications(rec)
+        rec.read_program = lambda: int(conn.read(ADSIGRP_SYM_VERSION, 0, ctypes.c_ubyte))     # R43, ingest thread
+        rec.read_identity = lambda: _program_identity(conn)
         trans = C.ADSTRANS_SERVERCYCLE if rec.mode == "cycle" else C.ADSTRANS_SERVERONCHA
         _fast_switch(+1)          # the ADS callback thread gets the GIL within ~0.5 ms instead of up to 5 ms
         rec._fast_switch = True
@@ -2224,11 +2461,29 @@ class Recorder:
         interval = rec.cycle_ms / 1000.0
 
         def loop() -> None:
+            last_ok: float | None = None
             while not rec._stop.is_set():
                 t_cycle = time.perf_counter()
                 ts = time.time()
                 try:
-                    got = self.ads.read_values(conn, items, decode=False)
+                    # R43: the symbol version is read in the same sum request; values of another program never come back
+                    got = self.ads.read_values(conn, items, decode=False, expect_version=rec._ver)
+                except ProgramChanged as exc:
+                    if exc.now is None:            # not verified: not recorded (counted)
+                        rec.unverified_polls += 1
+                        if len(rec.errors) < 20:
+                            rec.errors.append(f"poll: {exc}")
+                        time.sleep(min(1.0, interval * 5))
+                        continue
+                    t_last = (None if last_ok is None or rec.t0_wall is None
+                              else round((last_ok - rec.t0_wall) * 1000.0, 4))
+                    rec.program_changed = {"after_ms": t_last, "symbol_version": [exc.expected, exc.now],
+                                           "rule": "poll mode: every poll reads the symbol version with the values; "
+                                                   "the first poll of the new program is not recorded"}
+                    rec.request_stop(f"the PLC program changed (symbol version {exc.expected} -> {exc.now}: download / "
+                                     "online change) - the recording ends at the last poll of the program it started "
+                                     "with")
+                    break
                 except Exception as exc:  # noqa: BLE001
                     if len(rec.errors) < 20:
                         rec.errors.append(f"poll: {_fmt_exc(exc)}")
@@ -2243,6 +2498,7 @@ class Recorder:
                 good = {n: v for n, v in got.items() if n not in bad}
                 if good:
                     rec.enqueue(ts, None, good)
+                    last_ok = ts
                 elif len(rec.errors) < 20:
                     rec.errors.append("poll: " + "; ".join(f"{n}: {e}" for n, e in list(bad.items())[:5]))
                 time.sleep(max(0.0, interval - (time.perf_counter() - t_cycle)))
@@ -3243,6 +3499,24 @@ def _fast_switch(delta: int) -> None:
         if _SWITCH_USERS[0] == 0 and _SWITCH_USERS[1] is not None:
             sys.setswitchinterval(_SWITCH_USERS[1])
             _SWITCH_USERS[1] = None
+
+
+class _ProgramMoved(Exception):
+    """R43: the PLC program changed after the variables were looked up (Recorder.start loads the table again once)."""
+
+
+def _program_identity(conn: Any) -> str | None:
+    """R43: "t<compile time>:c<online changes>:u<symbols>,<symbol bytes>,<datatypes>,<datatype bytes>" of the PLC
+    application (the native engine's identity); None when any part is not readable."""
+    try:
+        ts = int(conn.read_by_name("TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp", pyads.PLCTYPE_UDINT))
+        oc = int(conn.read_by_name("TwinCAT_SystemInfoVarList._AppInfo.OnlineChangeCnt", pyads.PLCTYPE_UDINT))
+        info = bytes(conn.read(C.ADSIGRP_SYM_UPLOADINFO2, 0, ctypes.c_ubyte * 64, return_ctypes=True,
+                               check_length=False))
+        u = struct.unpack_from("<IIII", info, 0)
+    except Exception:  # noqa: BLE001
+        return None
+    return f"t{ts}:c{oc}:u{u[0]},{u[1]},{u[2]},{u[3]}"
 
 
 class _NativeFallback(Exception):

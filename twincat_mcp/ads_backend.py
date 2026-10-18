@@ -85,6 +85,18 @@ class AdsError(RuntimeError):
     pass
 
 
+class ProgramChanged(AdsError):
+    """R43: the symbol version read with the values is not the one the caller works with (download / online change):
+    the values are not returned."""
+
+    def __init__(self, expected: int, now: int | None) -> None:
+        super().__init__(f"the PLC program changed (symbol version {expected} -> {now}: download / online change)"
+                         if now is not None else "the symbol version could not be read with the values: they are not "
+                         "verified against a program change")
+        self.expected = expected
+        self.now = now
+
+
 @dataclass
 class SymbolEntry:
     name: str
@@ -347,6 +359,13 @@ class AdsBackend:
         lst, idx = self._load_symbols(c)
         self._symcache[key] = (time.time(), lst, idx, ver)
         return lst, idx
+
+    def refresh_symbols(self, port: int | None = None) -> None:
+        """Load the symbol table again now — not from the identity read of the last 2 s (R43: the program changed)."""
+        c = self.conn(port)
+        self.__dict__.setdefault("_symver", {}).pop((c.ams_net_id, c.ams_net_port), None)
+        self._drop_handles(c)
+        self.symbols_cached(True, port)
 
     def list_symbols(self, pattern: str | None, limit: int, offset: int, refresh: bool,
                      type_filter: str | None = None, port: int | None = None) -> dict[str, Any]:
@@ -1114,11 +1133,13 @@ class AdsBackend:
             out[n] = (s, T.parse_type(s.type, s.size)) if s is not None else "no longer in the PLC program"
         return out
 
-    def _raw_many(self, c: Any, items: list[tuple["SymbolEntry", T.TcType]]
+    def _raw_many(self, c: Any, items: list[tuple["SymbolEntry", T.TcType]], expect_version: int | None = None
                   ) -> tuple[dict[str, tuple["SymbolEntry", T.TcType] | str], dict[str, tuple[int, bytes]]]:
         """The bytes of each variable by its handle, the symbol version read in the same sum request. Values of
         another version than the handles / the symbol table are never returned: renewed and read again (at most
-        twice more). -> ({name: (entry, type) it decodes with, or why not}, {name: (ADS error, bytes)})."""
+        twice more). expect_version (a recording of one program, R43): values read with another version raise
+        ProgramChanged instead of being renewed. -> ({name: (entry, type) it decodes with, or why not},
+        {name: (ADS error, bytes)})."""
         names = [s.name for s, _t in items]
         entries: dict[str, tuple[SymbolEntry, T.TcType] | str] = {s.name: (s, t) for s, t in items}
         for attempt in range(3):
@@ -1128,6 +1149,8 @@ class AdsBackend:
                             + [(0xF005, hs[n], max(entries[n][0].size, 1)) for n in live if n in hs])  # type: ignore[index]
             verr, vb = got[0]
             now = vb[0] if not verr and vb else None
+            if expect_version is not None and now != expect_version:
+                raise ProgramChanged(expect_version, now)
             codes = dict(zip([n for n in live if n in hs], got[1:]))
             tv = self._table_version(c)
             changed = ((ver is not None and now != ver) or (tv is not None and now is not None and tv != now)
@@ -1144,21 +1167,42 @@ class AdsBackend:
         raise AdsError("the PLC program changed while reading (download / online change in progress) — read again")
 
     def read_values(self, c: pyads.Connection, items: list[tuple["SymbolEntry", T.TcType]],
-                    decode: bool = True) -> dict[str, Any]:
+                    decode: bool = True, expect_version: int | None = None) -> dict[str, Any]:
         """Values of simple symbols in ONE sum read by their handles, the symbol version read in the same request
         (_raw_many: a value of another program version is never decoded). A runtime without sum commands: a fresh
         handle per symbol (pyads read by name). An item the runtime refuses is {"error": …}, never decoded.
         decode=False: the raw value (as pyads gives it) for callers that decode themselves (the recorder).
+        expect_version (R43): every value is of that program version, or ProgramChanged is raised — without sum
+        commands the version is read before and after the reads (it only ever rises).
         -> {symbol name: value}."""
         out: dict[str, Any] = {}
         if not items:
             return out
         try:
-            entries, got = self._raw_many(c, items)
+            entries, got = self._raw_many(c, items, expect_version)
         except AdsError:
             raise
         except Exception:  # noqa: BLE001 — no sum commands on this runtime (ADS 1793 / 1794)
             entries, got = {s.name: (s, t) for s, t in items}, None
+        if got is None and expect_version is not None:
+            self._expect_version(c, expect_version)
+        try:
+            return self._values_out(c, items, entries, got, decode, out)
+        finally:
+            if got is None and expect_version is not None:
+                self._expect_version(c, expect_version)
+
+    @staticmethod
+    def _expect_version(c: Any, want: int) -> None:
+        try:
+            now = int(c.read(ADSIGRP_SYM_VERSION, 0, ctypes.c_ubyte))
+        except Exception:  # noqa: BLE001
+            now = None
+        if now != want:
+            raise ProgramChanged(want, now)
+
+    def _values_out(self, c: Any, items: list[tuple["SymbolEntry", T.TcType]], entries: dict[str, Any],
+                    got: dict[str, tuple[int, bytes]] | None, decode: bool, out: dict[str, Any]) -> dict[str, Any]:
         for s0, _t0 in items:
             e = entries.get(s0.name)
             if isinstance(e, str):

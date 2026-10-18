@@ -100,6 +100,34 @@ private:
     std::string ms(int64_t ft) const;          // ft relative to t0 as exact decimal ms (4 places)
 
     std::string version_;
+    // R43: the blocks sample memory addresses; a download / online change can put other variables there. The symbol
+    // version is read every check_ms_ while new samples wait: a read that returns the version the recording started
+    // with proves every sample stamped at or before the newest one delivered before the read was taken by that
+    // program (it was sampled before the read was answered). Only such samples are written (verified_ft_).
+    void check_program(int64_t newest, bool flowing, std::chrono::steady_clock::time_point now);
+    void end_at(int64_t ft, bool have_ft, const std::string& reason);   // engine mutex held
+    std::string identity_;
+    bool watch_ = false;                 // the version was readable at the start: the gate is on
+    std::string watch_error_;            // … why not
+    uint32_t ver_ = 0;
+    bool have_verified_ = false;
+    int64_t verified_ft_ = 0;
+    int64_t check_ms_ = 20;
+    std::chrono::steady_clock::time_point last_check_{};
+    bool check_failing_ = false;
+    std::chrono::steady_clock::time_point check_fail_since_{};
+    int64_t check_fail_newest_ = 0;      // the newest delivered stamp when the reads began to fail
+    std::string check_error_;
+    uint64_t checks_ = 0, check_failures_ = 0;
+    bool final_check_done_ = false;
+    bool resub_since_check_ = false;     // registered again since the last good read: the identity is compared too
+    bool program_changed_ = false;
+    uint32_t changed_from_ = 0, changed_to_ = 0;
+    int64_t changed_seen_ft_ = 0;        // the newest delivered stamp when the change was read
+    bool watch_lost_ = false;            // reads failed while samples kept coming: ended at the last verified sample
+    std::string rebuild_note_;
+    std::vector<std::string> program_notes_;
+    uint64_t unverified_rows_ = 0;
     std::unique_ptr<Source> source_;
     std::string source_desc_;
     std::vector<std::unique_ptr<BState>> blocks_;

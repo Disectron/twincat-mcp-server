@@ -288,6 +288,8 @@ std::string Engine::start(const JVal& cmd) {
     if (cmd.has("silent_ms")) silent_ns_ = std::max<int64_t>(1, cmd.integer("silent_ms", 500)) * 1000000LL;
     resub_after_ns_ = std::max<int64_t>(silent_ns_, cmd.integer("resubscribe_after_ms", 3000) * 1000000LL);
     resub_retry_ms_ = std::max<int64_t>(50, cmd.integer("resubscribe_retry_ms", 2000));
+    check_ms_ = std::max<int64_t>(1, cmd.integer("version_check_ms", 20));
+    const int64_t want_ver = cmd.integer("symbol_version", -1);   // the version the addresses were resolved with
     if (const JVal* st = cmd.get("stall")) {
         int64_t bid = st->integer("block", -1);
         for (size_t k = 0; k < specs.size(); ++k)
@@ -343,6 +345,30 @@ std::string Engine::start(const JVal& cmd) {
     else return fail_reply("backend must be ads | sim");
     if (!source_) return fail_reply(err.empty() ? "source failed" : err);
     source_desc_ = source_->describe();
+    // R43: the version the recording runs with, read before anything is subscribed (a change after this read is seen
+    // by the first check); the addresses must come from the same program
+    {
+        uint32_t v = 0;
+        std::string verr;
+        if (source_->read_version(v, verr)) {
+            if (want_ver >= 0 && static_cast<int64_t>(v) != want_ver) {
+                source_.reset();
+                JObj o;
+                o.str("reply", "start").b("ok", false)
+                    .str("error", "the PLC program changed after the variables were looked up (symbol version " +
+                                  std::to_string(want_ver) + ", now " + std::to_string(v) + "): their addresses may "
+                                  "belong to other variables — nothing subscribed, nothing written")
+                    .i("symbol_version_now", v);
+                return o.done();
+            }
+            watch_ = true;
+            ver_ = v;
+            ++checks_;
+        } else {
+            watch_error_ = verr;
+        }
+    }
+    identity_ = source_->identity();
     auto now = std::chrono::steady_clock::now();
     t_start_ = now;
     for (auto& b : blocks_) b->progress = now;
@@ -493,6 +519,101 @@ void Engine::write_chain() {
     ++chains_;
 }
 
+// R43, engine mutex held: end the recording at ft — every block is waited for up to it (as N56); without a window to
+// keep (still armed, nothing verified) at once.
+void Engine::end_at(int64_t ft, bool have_ft, const std::string& r) {
+    if (finish_req_.load()) return;
+    if (armed_ || !have_ft) {
+        finish_now(r, 0, false);
+        return;
+    }
+    if (!have_cut_ || ft < cut_) {
+        cut_ = ft;
+        have_cut_ = true;
+        cut_reason_ = r;
+        stop_reason_ = r;
+    }
+    if (!stop_cut_pending_.load()) {
+        stop_cut_wall_ = std::chrono::steady_clock::now();
+        stop_cut_pending_.store(true);
+    }
+}
+
+// R43, writer thread, engine mutex NOT held (the read is a request to the runtime).
+void Engine::check_program(int64_t newest, bool flowing, std::chrono::steady_clock::time_point now) {
+    uint32_t v = 0;
+    std::string err;
+    last_check_ = now;
+    bool ok = source_->read_version(v, err);
+    // the version byte alone proves nothing across a restart (another build can come back with the same byte): after
+    // failed reads or a re-registration, and whenever it moved, the program's identity decides
+    const bool after_gap = check_failing_ || resub_since_check_;
+    const bool use_id = ok && !identity_.empty() && (v != ver_ || after_gap);
+    std::string id_now;
+    if (use_id) {
+        id_now = source_->identity();
+        if (id_now.empty()) {
+            ok = false;
+            err = "the program identity (compile time, online changes, table sizes) could not be read";
+        }
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    ++checks_;
+    if (!ok) {
+        ++check_failures_;
+        check_error_ = err;
+        if (!check_failing_) {
+            check_failing_ = true;
+            check_fail_since_ = now;
+            check_fail_newest_ = newest;
+        }
+        // samples keep coming while the version cannot be read: they cannot be verified — end at the last verified one
+        // (an outage delivers nothing: waited for; the identity decides when the runtime is back)
+        const auto bound = std::chrono::seconds(1) + std::chrono::nanoseconds(max_delay_ * 100);
+        if (!watch_lost_ && flowing && now - check_fail_since_ > bound && newest > check_fail_newest_ &&
+            !finish_req_.load()) {
+            watch_lost_ = true;
+            char r[320];
+            std::snprintf(r, sizeof r, "the PLC program version could not be read for %.1f s while samples kept coming "
+                          "(%s): a download / online change could not be ruled out — the recording ends at the last "
+                          "verified sample",
+                          std::chrono::duration<double>(now - check_fail_since_).count(), err.c_str());
+            end_at(verified_ft_, have_verified_, r);
+        }
+        return;
+    }
+    check_failing_ = false;
+    const bool same_program = use_id ? id_now == identity_ : v == ver_;
+    if (same_program) {
+        if (v != ver_) {
+            // the version byte moved, the program did not (a TwinCAT restart, the same build downloaded again)
+            program_notes_.push_back("symbol version " + std::to_string(ver_) + " -> " + std::to_string(v) +
+                                     " with the same program (" + id_now + "): the recording continued");
+            ver_ = v;
+        }
+        resub_since_check_ = false;
+        if (!have_verified_ || newest > verified_ft_) verified_ft_ = newest;
+        have_verified_ = true;
+        return;
+    }
+    if (program_changed_) return;
+    program_changed_ = true;
+    changed_from_ = ver_;
+    changed_to_ = v;
+    changed_seen_ft_ = newest;
+    std::string what = "symbol version " + std::to_string(ver_) + " -> " + std::to_string(v);
+    if (use_id) what += ", program " + identity_ + " -> " + id_now;
+    end_at(verified_ft_, have_verified_,
+           "the PLC program changed (" + what + ": download / online change / another build) - the notifications "
+           "sample memory addresses that may now hold other variables; the recording ends at the last sample verified "
+           "before the change");
+}
+
+static bool identity_differs(const std::string& a, const std::string& b) {
+    // "t<compile time>": unknown on either side ("") means: cannot tell — not different
+    return !a.empty() && !b.empty() && a != b;
+}
+
 void Engine::finish_now(const std::string& reason, int64_t end_ft, bool have_end) {
     if (finish_req_.load()) return;
     if (stop_reason_.empty()) stop_reason_ = reason;
@@ -630,6 +751,8 @@ void Engine::writer_loop() {
         bool all_silent = true, wait_for_block = false;
         size_t backlog = 0;
         int64_t W = i64max;
+        int64_t newest = 0;                // the newest stamp delivered by any block (R43: what a check can verify)
+        bool have_newest = false;
         for (auto& bp : blocks_) {
             BState& s = *bp;
             const uint64_t h = s.ring.head();
@@ -644,6 +767,11 @@ void Engine::writer_loop() {
             if (!s.silent) all_silent = false;
             const size_t sz = static_cast<size_t>(h - s.ring.tail());
             backlog += sz;
+            if (sz > 0 || s.consumed_any) {
+                const int64_t f = sz > 0 ? s.ring.ft_at(h - 1) : s.consumed_ft;
+                if (!have_newest || f > newest) newest = f;
+                have_newest = true;
+            }
             if (!s.silent) {
                 if (sz > 0) W = std::min(W, s.ring.ft_at(h - 1));
                 else if (s.consumed_any) W = std::min(W, s.consumed_ft);
@@ -659,7 +787,18 @@ void Engine::writer_loop() {
             W = cut_;                      // N56: the wait is over: write what is up to the cut, block by block
             wait_for_block = false;
         }
+        // R43: only samples a version read has verified are written
+        if (watch_ && source_ && !finish_req_.load() && have_newest && (!have_verified_ || newest > verified_ft_)) {
+            const int64_t period = check_failing_ ? std::max<int64_t>(check_ms_, 500) : check_ms_;
+            const bool final_check = stopping && !final_check_done_;
+            if (final_check || now - last_check_ >= std::chrono::milliseconds(period))
+                check_program(newest, !all_silent, now);
+        }
+        if (stopping) final_check_done_ = true;
+        const int64_t Wv = !watch_ ? i64max : have_verified_ ? verified_ft_ : std::numeric_limits<int64_t>::min();
+        W = std::min(W, Wv);
         size_t done = 0;
+        bool drained = false;              // nothing left that could still be written (R43: unverified rows aside)
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (backlog > max_backlog_) max_backlog_ = backlog;
@@ -690,8 +829,8 @@ void Engine::writer_loop() {
                             ws_ = o;
                             have_ws_ = true;
                         }
-                        if (duration_s_ > 0) {
-                            cut_ = o + std::llround(duration_s_ * 1e7);
+                        if (duration_s_ > 0 && (!have_cut_ || o + std::llround(duration_s_ * 1e7) < cut_)) {
+                            cut_ = o + std::llround(duration_s_ * 1e7);   // (an earlier end set before stands: R43)
                             have_cut_ = true;
                             char r[64];
                             std::snprintf(r, sizeof r, "duration %gs", duration_s_);
@@ -709,6 +848,20 @@ void Engine::writer_loop() {
                     ++done;
                 }
             }
+            {
+                size_t left_rows = 0;
+                bool only_unverified = watch_;
+                for (auto& bp : blocks_) {
+                    SampleRing& r = bp->ring;
+                    const size_t n = static_cast<size_t>(r.head() - r.tail());
+                    if (n == 0) continue;
+                    left_rows += n;
+                    if (r.ft_at(r.tail()) <= Wv) only_unverified = false;
+                }
+                // rows only a version read could release, and the reads fail (the runtime is away / gone): they are
+                // not waited for — counted at the end (unverified_rows)
+                drained = left_rows == 0 || (only_unverified && (check_failing_ || final_check_done_));
+            }
             // D13: every block silent for resub_after → the runtime restarted (CONFIG→RUN) or the route dropped; the
             // handles we hold are dead. Ask the source for new ones, at most every 2 s, until it succeeds.
             if (!finish_req_.load() && !stopping && all_silent && have_first_wall_ && source_) {
@@ -719,7 +872,19 @@ void Engine::writer_loop() {
                     resub_tried_ = true;
                     last_resub_try_ = now;
                     std::string err;
-                    if (source_->resubscribe(err)) {
+                    const std::string id_now = source_->identity();
+                    if (identity_differs(identity_, id_now)) {
+                        // R43: another build / an online change came back — its variables need not be where the old
+                        // ones were
+                        rebuild_note_ = "the PLC program changed while TwinCAT was away (program " + identity_ +
+                                        " -> " + id_now + ": compile time, online changes, table sizes): the "
+                                        "notifications were not registered again "
+                                        "at the old program's addresses; the recording ends at the last " +
+                                        std::string(watch_ ? "verified sample" : "sample") + " before the outage";
+                        if (watch_) end_at(verified_ft_, have_verified_, rebuild_note_);
+                        else end_at(last_emitted_, any_emitted_, rebuild_note_);
+                    } else if (source_->resubscribe(err)) {
+                        resub_since_check_ = true;   // the next read compares the program identity too
                         char n[200];
                         std::snprintf(n, sizeof n, "notifications registered again after %.1f s without samples (TwinCAT restart / route loss?) at %s ms",
                                       std::chrono::duration<double>(now - blocks_[0]->progress).count(),
@@ -737,26 +902,40 @@ void Engine::writer_loop() {
             if (!finish_req_.load() && !stopping && duration_s_ > 0) {
                 const auto grace = std::chrono::seconds(1) + std::chrono::nanoseconds(max_delay_ * 100);
                 const auto dur = std::chrono::nanoseconds(static_cast<int64_t>(duration_s_ * 1e9));
-                if (!have_first_wall_ && backlog == 0 && now - t_start_ > dur + std::chrono::seconds(5)) {
-                    finish_now("duration elapsed with no data (PLC not running? symbols never updated?)", 0, false);
-                } else if (have_first_wall_ && all_silent && backlog == 0 && now - t_first_ > dur + grace && have_cut_) {
+                if (!have_first_wall_ && drained && now - t_start_ > dur + std::chrono::seconds(5)) {
+                    finish_now(backlog == 0 ? "duration elapsed with no data (PLC not running? symbols never updated?)"
+                                            : "duration elapsed: no sample could be verified against a program change "
+                                              "(the symbol version could not be read again)", 0, false);
+                } else if (have_first_wall_ && all_silent && drained && now - t_first_ > dur + grace && have_cut_) {
                     char r[160];
                     std::snprintf(r, sizeof r, "duration %gs: the PLC stopped delivering at %s ms (rest of the window counted as missing_tail)",
                                   duration_s_, have_t0_ ? ms(last_emitted_).c_str() : "?");
                     finish_now(r, cut_, true);
                 }
             }
-            // N56: a stop on request — every block delivers up to the stop's PLC time (process() ends the recording at
-            // the first sample after it), or the wait (max_delay + 1 s) ends: then what is up to the cut is written and
-            // the rest of a block that did not get there is its tail (missing, allowance 1)
-            if (!finish_req_.load() && stop_cut_pending_.load() &&
-                now - stop_cut_wall_ > std::chrono::seconds(1) + std::chrono::nanoseconds(max_delay_ * 100)) {
-                bool left = false;
+            // N56: an end at a PLC time (stop on request, R43 program change) — every block delivers up to it
+            // (process() ends the recording at the first sample after it; a block that delivered past it while its
+            // rows wait for nothing more ends it too), or the wait (max_delay + 1 s) ends: then what is up to the cut is
+            // written and the rest of a block that did not get there is its tail (missing, allowance 1)
+            if (!finish_req_.load() && stop_cut_pending_.load()) {
+                const bool waited =
+                    now - stop_cut_wall_ > std::chrono::seconds(1) + std::chrono::nanoseconds(max_delay_ * 100);
+                bool left = false, behind = false;
                 for (auto& bp : blocks_) {
                     SampleRing& r = bp->ring;
-                    if (r.head() != r.tail() && r.ft_at(r.tail()) <= cut_) left = true;
+                    const uint64_t h = r.head();
+                    if (h != r.tail()) {
+                        const int64_t t = r.ft_at(r.tail());
+                        // a row up to the cut is left while it can still be written: verified, or verifiable (reads ok)
+                        if (t <= cut_ && (t <= Wv || !check_failing_)) left = true;
+                    }
+                    if (!bp->silent) {
+                        const bool hn = h != r.tail() || bp->consumed_any;
+                        const int64_t nw = h != r.tail() ? r.ft_at(h - 1) : bp->consumed_ft;
+                        if (!hn || nw <= cut_) behind = true;
+                    }
                 }
-                if (!left) finish_now(cut_reason_, cut_, true);
+                if (!left && (waited || !behind)) finish_now(cut_reason_, cut_, true);
             }
             if (fh_ && now - last_flush_ > std::chrono::seconds(1)) {
                 if (have_t0_) write_chain();
@@ -765,13 +944,12 @@ void Engine::writer_loop() {
             }
         }
         if (finish_req_.load()) break;
-        if (stopping && backlog == 0 && done == 0) break;
+        if (stopping && drained && done == 0) break;
         if (done == 0) std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     unsubscribe_once();
     {
         std::lock_guard<std::mutex> lk(mu_);
-        for (auto& bp : blocks_) after_limit_ += bp->ring.size();
         finish();
     }
     finished_.store(true);
@@ -845,6 +1023,16 @@ std::string Engine::block_json(const BState& s, int64_t end, bool have_end) cons
 void Engine::finish() {
     bool have_end = false;
     int64_t end = window_end(have_end);
+    // what the rings still hold: past the end (after_limit), or inside it but never verified against a program change
+    // (R43: delivered, not written — counted as missing where they fall)
+    for (auto& bp : blocks_) {
+        SampleRing& r = bp->ring;
+        for (uint64_t i = r.tail(); i != r.head(); ++i) {
+            const int64_t ft = r.ft_at(i);
+            if (watch_ && (!have_verified_ || ft > verified_ft_) && (!have_end || ft <= end)) ++unverified_rows_;
+            else ++after_limit_;
+        }
+    }
     int64_t head = 0, gaps = 0, tail = 0;
     uint64_t ovf = 0, mismatch = 0;
     std::vector<std::string> bl, ivs;
@@ -937,6 +1125,46 @@ void Engine::finish() {
     }
     if (start_when_.set && have_warm_true_ && have_t0_ && (!triggered_ || warm_lapsed_))
         f.raw("start_when_warmup_true_ms", ms(warm_true_ft_));
+    {
+        JObj pw;
+        pw.b("checked", watch_);
+        if (!watch_) {
+            pw.str("error", watch_error_.empty() ? std::string("not readable") : watch_error_);
+        } else {
+            pw.i("check_ms", check_ms_).u("reads", checks_).u("failed_reads", check_failures_);
+            if (!check_error_.empty()) pw.str("last_error", check_error_);
+            pw.raw("verified_to_ms", have_verified_ && have_t0_ ? ms(verified_ft_) : "null");
+        }
+        if (!program_notes_.empty()) {
+            std::vector<std::string> pn;
+            for (auto& n : program_notes_) pn.push_back(jq(n));
+            pw.raw("notes", jarr(pn));
+        }
+        f.raw("program_watch", pw.done());
+    }
+    if (!watch_)
+        f.str("program_watch_error", "the symbol version could not be read at the start (" +
+                                     (watch_error_.empty() ? std::string("not readable") : watch_error_) +
+                                     "): a download / online change during the recording would not be noticed");
+    if (program_changed_) {
+        JObj pc;
+        pc.raw("after_ms", have_verified_ && have_t0_ ? ms(verified_ft_) : "null")
+            .raw("read_by_ms", have_t0_ ? ms(changed_seen_ft_) : "null")
+            .raw("symbol_version", "[" + std::to_string(changed_from_) + "," + std::to_string(changed_to_) + "]")
+            .str("rule", "the change happened after the last verified sample (after_ms) and before the version read "
+                         "taken once the sample at read_by_ms had been delivered; samples between are not written");
+        f.raw("program_changed", pc.done());
+    }
+    if (!rebuild_note_.empty()) f.str("program_rebuilt_in_outage", rebuild_note_);
+    if (watch_lost_) f.b("program_watch_lost", true);
+    if (unverified_rows_) {
+        f.u("unverified_rows", unverified_rows_);
+        f.str("unverified_note", "samples delivered after the last verified one (" +
+                                 (have_verified_ && have_t0_ ? ms(verified_ft_) + " ms" : std::string("none verified")) +
+                                 ") but not written: the symbol version could not be read again (" + check_error_ +
+                                 "), so a download / online change could not be ruled out — counted as missing where "
+                                 "they fall");
+    }
     if (stop_on_request_ && have_t0_) {
         JObj so;
         so.raw("at_ms", ms(cut_)).d("waited_ms", stop_wait_ms_, 3)
@@ -1008,6 +1236,10 @@ std::string Engine::status() {
         if (triggered_ && !warm_lapsed_) o.raw("trigger_delayed_ms", jnum(double(trig_ft_ - warm_true_ft_) / 1e4, 6));
     }
     if (stop_cut_pending_.load() && have_t0_) o.raw("stopping_at_ms", ms(cut_));
+    if (!watch_) o.str("program_watch_error", watch_error_.empty() ? std::string("not readable") : watch_error_);
+    else if (have_verified_ && have_t0_) o.raw("verified_to_ms", ms(verified_ft_));
+    if (check_failing_) o.str("version_read_error", check_error_);
+    if (program_changed_) o.b("program_changed", true);
     if (stop_reason_.empty()) o.null("stop_reason");
     else o.str("stop_reason", stop_reason_);
     std::vector<std::string> errs;

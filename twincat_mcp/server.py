@@ -2152,7 +2152,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         runtime batch samples (fewer ADS frames; each sample keeps its own timestamp). cycle mode also records a
         per-cycle counter as ground truth (cycle_counter='auto' = the matching task's _TaskInfo[n].CycleCount, or your
         own e.g. 'MAIN.nCycleCount', or null for none) and the header carries a manifest of what was recorded from
-        (AppTimestamp, OnlineChangeCnt, tasks, TwinCAT build, symbol version). Conditions are levels: a start_when that
+        (AppTimestamp, OnlineChangeCnt, tasks, TwinCAT build, symbol version). A recording is of one program: a download
+        / online change while it runs ends it at the last sample verified against the symbol version (program_changed);
+        nothing sampled from the new program is written. Conditions are levels: a start_when that
         already holds fires at once — edge_triggers=true fires only when it BECOMES true. A condition may name one
         element of an array recorded as a whole (GVL_Test.aCounter[1] when GVL_Test.aCounter is recorded).
         engine (cycle mode): 'native' = the C++ capture service (Beckhoff AdsLib on TcAdsDll: ADS callback → ring →

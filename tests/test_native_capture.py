@@ -740,3 +740,132 @@ def test_native_warmup_truth_that_lapsed_is_not_reported_as_a_delayed_trigger(ca
         s.close()
     assert f["triggered_at_ms"] == 256.0 and "trigger_delayed_ms" not in f, f
     assert f["start_when_warmup_true_ms"] == 0.0 and "when it was true again" in f["trigger_note"], f
+
+
+# ------------------------------------------------------------------ R43: a program change during a recording
+def _run(capture_exe, tmp_path, name, blocks, timeout=30, **kw):
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, name, blocks, **kw))
+        if not r["ok"]:
+            return r, None
+        f = s.wait_event(timeout)["footer"]
+    finally:
+        s.close()
+    return r, f
+
+
+TWO = [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}, {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4}]
+
+
+def test_r43_an_online_change_ends_the_recording_at_the_last_verified_sample(capture_exe, tmp_path):
+    """The blocks sample memory addresses: after a download / online change they can hold other variables. A sample is
+    written only once a symbol version read taken after its delivery returned the version the recording started
+    with; the first read with another version ends the recording there — nothing of the new program is in the file."""
+    r, f = _run(capture_exe, tmp_path, "oc", TWO, duration_s=5, version_check_ms=5,
+                sim={"speed": 1, "program_change_at": 300})
+    assert r["ok"], r
+    end = f["window_end_ms"]
+    assert "PLC program changed" in f["stop_reason"] and f["program_changed"]["symbol_version"] == [1, 2], f
+    assert 250.0 <= end < 300.0, end                                  # verified ≤ cycle 299, checked every 5 ms
+    assert f["program_changed"]["after_ms"] == end and f["program_changed"]["read_by_ms"] >= 300.0
+    rows = _rows(tmp_path / "oc.jsonl")
+    assert rows and max(t for t, _k, _b in rows) <= end                # not one row of the new program
+    assert f["missing_samples"] == 0 and f["label"] == "COMPLETE"      # the window up to the change is whole
+    assert f["samples"] == 2 * (int(end) + 1) and f["program_watch"]["checked"] is True
+
+
+def test_r43_another_build_after_an_outage_is_not_registered_again(capture_exe, tmp_path):
+    """D13 registers the notifications again when TwinCAT comes back — at the old addresses. Another build (compile
+    time / online-change count differ) is not: the recording ends at the last verified sample before the outage."""
+    for ver_after in (2, 1):            # the version byte moved — or, after the restart, stands where it stood
+        name = f"rb{ver_after}"
+        r, f = _run(capture_exe, tmp_path, name, [TWO[0]], duration_s=4, cycle_100ns=100_000, silent_ms=300,
+                    resubscribe_after_ms=600, resubscribe_retry_ms=200,
+                    sim={"speed": 1, "outage": [50, 199], "rebuild_in_outage": True, "version_after_outage": ver_after})
+        assert r["ok"], r
+        # read by the version check (program_changed) or by D13 before registering again (program_rebuilt_in_outage),
+        # whichever comes first once the runtime answers
+        assert f["resubscriptions"] == 0 and "PLC program changed" in f["stop_reason"], f
+        assert "program t1:c0:u9,900,4,400 -> t2:c0:u9,900,4,400" in f["stop_reason"]
+        assert ("program_changed" in f) != ("program_rebuilt_in_outage" in f), f
+        assert f.get("program_changed", {"symbol_version": [1, ver_after]})["symbol_version"] == [1, ver_after]
+        rows = _rows(tmp_path / f"{name}.jsonl")
+        assert f["window_end_ms"] <= 490.0 and max(t for t, _k, _b in rows) <= f["window_end_ms"]
+
+
+def test_r43_the_same_build_back_with_another_version_byte_continues(capture_exe, tmp_path):
+    """A restart can move the version byte without another program: same compile time, online-change count and table
+    sizes → the recording continues (said in program_watch.notes). The version is readable again before the
+    notifications are registered again — the identity decides, not the order."""
+    r, f = _run(capture_exe, tmp_path, "same", [TWO[0]], duration_s=4, cycle_100ns=100_000, silent_ms=300,
+                resubscribe_after_ms=600, resubscribe_retry_ms=200,
+                sim={"speed": 1, "outage": [50, 199], "version_after_outage": 5})
+    assert r["ok"], r
+    assert f["resubscriptions"] == 1 and f["stop_reason"] == "duration 4s", f
+    assert any("1 -> 5 with the same program (t1:c0:u9,900,4,400)" in n for n in f["program_watch"]["notes"]), f
+    assert "program_changed" not in f
+
+
+def test_r43_a_runtime_that_refuses_the_version_read_is_recorded_and_said(capture_exe, tmp_path):
+    r, f = _run(capture_exe, tmp_path, "nov", [TWO[0]], duration_s=0.3, sim={"speed": 1, "version_read_fails": True})
+    assert r["ok"], r
+    assert f["program_watch"] == {"checked": False, "error": "ADS error 0x701 (1793): service is not supported by the "
+                                                             "server (simulated)"}
+    assert "would not be noticed" in f["program_watch_error"] and f["missing_samples"] == 0 and f["samples"] >= 299
+
+
+def test_r43_reads_that_fail_while_samples_keep_coming_end_the_recording(capture_exe, tmp_path):
+    """Samples that cannot be verified are never written; when the reads keep failing while samples keep coming
+    (max_delay + 1 s), the recording ends at the last verified sample instead of holding them forever."""
+    r, f = _run(capture_exe, tmp_path, "lost", [TWO[0]], duration_s=10, cycle_100ns=100_000,
+                sim={"speed": 1, "version_fail_from": 30})
+    assert r["ok"], r
+    assert f["program_watch_lost"] is True and "could not be read for" in f["stop_reason"], f
+    end = f["window_end_ms"]
+    assert end < 300.0 and f["program_watch"]["failed_reads"] >= 1 and "timeout" in f["program_watch"]["last_error"]
+    assert max(t for t, _k, _b in _rows(tmp_path / "lost.jsonl")) <= end
+
+
+def test_r43_unverified_samples_before_an_outage_are_counted_not_written(capture_exe, tmp_path):
+    """The reads fail from cycle 40, the runtime goes away at 50 and the duration ends during the outage: cycles after
+    the last verified one were delivered but are not written — counted exactly (unverified_rows) and as missing."""
+    r, f = _run(capture_exe, tmp_path, "unv", [TWO[0]], duration_s=1, cycle_100ns=100_000, silent_ms=300,
+                resubscribe_after_ms=60_000, sim={"speed": 1, "outage": [50, 100_000], "version_fail_from": 40})
+    assert r["ok"], r
+    v = f["program_watch"]["verified_to_ms"]
+    assert v is not None and 300.0 <= v < 400.0, f["program_watch"]
+    assert f["unverified_rows"] == round((490.0 - v) / 10.0), (v, f["unverified_rows"])
+    assert "not written" in f["unverified_note"] and f["window_end_ms"] == 1000.0
+    rows = _rows(tmp_path / "unv.jsonl")
+    assert max(t for t, _k, _b in rows) == v and len(rows) == int(v / 10) + 1
+    assert f["missing_samples"] >= f["unverified_rows"]
+
+
+def test_r43_addresses_from_another_program_version_are_refused_at_the_start(capture_exe, tmp_path):
+    r, _f = _run(capture_exe, tmp_path, "sv", [TWO[0]], duration_s=1, symbol_version=7, sim={"speed": 1})
+    assert not r["ok"] and r["symbol_version_now"] == 1 and "changed after the variables were looked up" in r["error"]
+    assert not (tmp_path / "sv.jsonl").exists()
+
+
+def test_r43_recorder_passes_the_table_version_and_reports_a_change(rec):
+    """The recorder hands the service the symbol version its addresses come from; a program change shows in rec_stop
+    (footer fields and a warning)."""
+    rec.native_extra = {**rec.native_extra, "sim": {"speed": 1, "start_ft": START_FT, "program_change_at": 150},
+                        "version_check_ms": 5}
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=5,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10,
+                   cycle_counter=None)
+    _wait_done(rec, st["id"])
+    fin = rec.stop(st["id"])
+    assert fin["program_changed"]["symbol_version"] == [1, 2] and fin["window_end_ms"] < 150.0, fin
+    assert any("PLC program changed" in w for w in fin["warnings"]), fin["warnings"]
+    head = json.loads(Path(fin["file"]).read_text(encoding="utf-8").splitlines()[0])
+    assert head["_header"]
+    # the version the addresses were looked up with went to the service: another one is refused (and looked up
+    # again once — the fake's table still says 1, the service 2: refused twice)
+    rec.native_extra = {**rec.native_extra, "sim": {"speed": 1, "start_ft": START_FT, "version_at_start": 2}}
+    with pytest.raises(AdsError, match="twice in a row"):
+        rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=1,
+                  max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10,
+                  cycle_counter=None)

@@ -26,6 +26,18 @@ PLC (TwinCAT RT) ──ADS notifications──▶ tcmcp-capture (C++)           
   `verdict_hint` in the footer.
 * **All or nothing:** if any block cannot be subscribed, everything is unsubscribed, no file is created and the
   error names the block (igrp/ioffs/size, ADS code).
+* **One program per recording (R43):** the blocks sample memory addresses, which a download / online change can give
+  to other variables. The symbol version (`0xF008`) is read before anything is subscribed — refused when it is not
+  the `symbol_version` the server resolved the addresses with — and again every `version_check_ms` (20) while
+  samples wait. A sample is written only once a read taken after its delivery returned the starting version (it was
+  sampled before that read was answered); the first read of another program ends the recording at the last
+  verified sample (`program_changed`: `after_ms`, `read_by_ms`, `symbol_version`). After failed reads, and whenever
+  the byte moved, the program identity decides (application compile time, online-change count, symbol / datatype
+  table sizes): the same program continues (`program_watch.notes`), another one ends it; D13 does not register the
+  blocks again onto another program (`program_rebuilt_in_outage`). Samples never verified are not written
+  (`unverified_rows`, counted as missing); reads that fail while samples keep coming end the recording after
+  max_delay + 1 s (`program_watch_lost`); a runtime that refuses the read at the start is recorded unchecked and
+  said so (`program_watch_error`). `program_watch` in every footer: reads, failed reads, `verified_to_ms`.
 * **One process per recording.** Closing stdin ends the recording cleanly (signed footer) and exits.
 
 ## Build
@@ -46,11 +58,12 @@ copy lives in `twincat_mcp/bin/`.
 
 | → | ← |
 |---|---|
-| `{"cmd":"start","backend":"ads","ams_net_id","port","file","header","blocks":[{id,igrp,ioffs,size,leaves}],"cycle_100ns","max_delay_100ns","duration_s","post_trigger_s","pre_trigger_ms","max_events","start_when","stop_when","hmac_key_path","ring_s","ring_mb"}` | `{"reply":"start","ok":true,"subscribed":N,"source":{…},"ring":{…}}` or `{"ok":false,"error","block","code"}` |
+| `{"cmd":"start","backend":"ads","ams_net_id","port","file","header","blocks":[{id,igrp,ioffs,size,leaves}],"cycle_100ns","max_delay_100ns","duration_s","post_trigger_s","pre_trigger_ms","max_events","start_when","stop_when","hmac_key_path","ring_s","ring_mb","symbol_version","version_check_ms"}` | `{"reply":"start","ok":true,"subscribed":N,"source":{…},"ring":{…}}` or `{"ok":false,"error","block","code"}` (`"symbol_version_now"`: the program changed after the addresses were resolved) |
 | `{"cmd":"status"}` | samples, events, missing_*, overflow_samples, backlog, max_backlog, plc_span_s, per-block counters |
 | `{"cmd":"stop"}` | `{"reply":"stop","ok":true,"footer":{…}}` |
 | — | `{"event":"finished","footer":{…}}` when duration / post-trigger / stop_when / max_events ended it |
 
 Conditions arrive resolved to raw bytes: `{"block","off","type":"u32|i16|f64|bool|…","op","value","edge"}`.
 `"backend":"sim"` replaces ADS with a simulated PLC (UDINT counters, exact timestamps, injectable drops / late
-blocks / PLC stop / subscription failure) — used by `tests/test_native_capture.py` and CI.
+blocks / PLC stop / subscription failure / outage / program change / failing version reads) — used by
+`tests/test_native_capture.py` and CI.

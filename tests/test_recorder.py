@@ -1289,3 +1289,118 @@ def test_n62_tasks_of_two_plc_projects_with_the_same_task_name_are_both_kept(tmp
         main.write_text(main.read_text(encoding="utf-8").replace("<![CDATA[;]]>", "<![CDATA[PRG_C();]]>"), encoding="utf-8")
     idx = ProjectIndex(ProjectConfig(root=str(tmp_path)))
     assert idx.tasks_of("PRG_C") is None, idx.tasks_of("PRG_C")
+
+
+# ------------------------------------------------------------------ R43: a program change during a recording
+OC_CNT = "TwinCAT_SystemInfoVarList._AppInfo.OnlineChangeCnt"
+
+
+def _footer(out) -> dict:
+    return json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+
+
+def _rows_t(out) -> list[float]:
+    return [json.loads(ln)[0] for ln in Path(out["file"]).read_text(encoding="utf-8").splitlines() if ln.startswith("[")]
+
+
+def test_r43_python_an_online_change_ends_at_the_last_verified_sample(rec):
+    """The block notifications sample memory addresses: after a download / online change they can hold other
+    variables. A sample is written only once a version read taken after its delivery returned the version the
+    recording started with; the first read of another program ends the recording there (the native engine's rule)."""
+    st = _cycle_rec(rec)
+    c = _conn()
+    for i in range(100):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == 100)
+    FakeConnection.symbol_version = 2                      # online change: version and online-change count move
+    FakeConnection.shared_values[OC_CNT] = 4
+    for i in range(100, 200):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
+    out = rec.stop(st["id"])
+    f = _footer(out)
+    assert "PLC program changed" in f["stop_reason"] and f["program_changed"]["symbol_version"] == [1, 2], f
+    assert ":c3:" in f["stop_reason"] and ":c4:" in f["stop_reason"]          # the identity said which program
+    assert f["window_end_ms"] == 99.0 and f["program_changed"]["after_ms"] == 99.0 and max(_rows_t(out)) == 99.0
+    assert f["after_limit"] == 100 and f["missing_samples"] == 0 and "unverified_rows" not in f
+    assert f["program_watch"]["checked"] and f["program_watch"]["verified_to_ms"] == 99.0
+    assert any("PLC program changed" in w for w in out.get("warnings", [])), out.get("warnings")
+
+
+def test_r43_python_a_moved_version_byte_with_the_same_program_continues(rec):
+    st = _cycle_rec(rec)
+    c = _conn()
+    for i in range(50):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == 50)
+    FakeConnection.symbol_version = 7                      # same compile time, online changes and table sizes
+    for i in range(50, 100):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == 100)
+    out = rec.stop(st["id"])
+    f = _footer(out)
+    assert "program_changed" not in f and len(_rows_t(out)) == 100
+    assert any("1 -> 7 with the same program" in n for n in f["program_watch"]["notes"]), f["program_watch"]
+
+
+def test_r43_python_unverified_samples_are_counted_not_written(rec):
+    """The version reads fail and no more samples come (TwinCAT went away): what was delivered after the last verified
+    sample is not written — counted exactly at the end."""
+    st = _cycle_rec(rec)
+    c = _conn()
+    for i in range(50):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == 50)
+    FakeConnection.fail_version_reads = True
+    for i in range(50, 60):
+        c.fire("MAIN.nCycle", i, ft(i))
+    time.sleep(0.2)
+    out = rec.stop(st["id"])
+    f = _footer(out)
+    assert f["unverified_rows"] == 10 and "not written" in f["unverified_note"] and max(_rows_t(out)) == 49.0, f
+    assert f["program_watch"]["verified_to_ms"] == 49.0 and "1861" in f["program_watch"]["last_error"]
+
+
+def test_r43_python_reads_that_fail_while_samples_keep_coming_end_the_recording(rec):
+    st = _cycle_rec(rec)
+    c = _conn()
+    for i in range(50):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == 50)
+    FakeConnection.fail_version_reads = True
+    t0 = time.time()
+    i = 50
+    while rec.status(st["id"])["active"] and time.time() - t0 < 5:
+        c.fire("MAIN.nCycle", i, ft(i))
+        i += 1
+        time.sleep(0.002)
+    out = rec.stop(st["id"])
+    f = _footer(out)
+    assert f["program_watch_lost"] is True and "could not be read for" in f["stop_reason"], f
+    assert f["window_end_ms"] == 49.0 and max(_rows_t(out)) == 49.0 and 1.0 <= time.time() - t0 < 5
+
+
+def test_r43_python_addresses_of_another_program_version_are_looked_up_again(rec, monkeypatch):
+    """The symbol table (and its identity) is cached up to 2 s: a change in that time gave the recording addresses of
+    the old program. The version read before registering refuses them; the table is loaded again and the start
+    repeated once."""
+    rec.expand_symbols(["MAIN.nCycle"], None, None, 10)          # table cached with version 1
+    FakeConnection.symbol_version = 2
+    loads = []
+    real = rec.ads._load_symbols
+    monkeypatch.setattr(rec.ads, "_load_symbols", lambda c: (loads.append(1), real(c))[1])
+    st = _cycle_rec(rec, symbols=["MAIN.nCycle"])
+    assert loads and st["active"] and st["program_watch"]["checked"]
+    rec.stop(st["id"])
+
+
+def test_r43_python_poll_reads_the_version_with_each_poll(rec):
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="poll", cycle_ms=5, duration_s=None,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10)
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 5)
+    FakeConnection.symbol_version = 2
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
+    out = rec.stop(st["id"])
+    f = _footer(out)
+    assert f["program_changed"]["symbol_version"] == [1, 2] and "PLC program changed" in f["stop_reason"], f
+    assert f["program_watch"]["checked"] and "per_read" in f["program_watch"]

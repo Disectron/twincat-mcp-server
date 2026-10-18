@@ -9,8 +9,15 @@
 //           "skew": [[block, cycles], ...]        (that block's notifications run `cycles` ahead and arrive first in
 //                                                  each cycle: its sample of cycle c+n comes before the others' of c),
 //           "freeze": [first_cycle, last_cycle]   (PLC STOP: samples keep coming, every value frozen),
-//           "outage": [first_cycle, last_cycle]}  (TwinCAT in CONFIG: no samples; resubscribe() succeeds only after
+//           "outage": [first_cycle, last_cycle],  (TwinCAT in CONFIG: no samples; resubscribe() succeeds only after
 //                                                  last_cycle, as the runtime answers again)
+//           "program_change_at": cycle,           (an online change: once a sample of that cycle is delivered, the
+//                                                  symbol version reads 2 and the online-change count 1)
+//           "rebuild_in_outage": true,            (the runtime comes back from the outage with another build)
+//           "version_after_outage": n,            (the runtime comes back with symbol version n)
+//           "version_at_start": n,                (the symbol version before anything changes, default 1)
+//           "version_read_fails": true,           (the runtime refuses every symbol version read)
+//           "version_fail_from": cycle}           (symbol version reads fail once that cycle is delivered)
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -55,6 +62,43 @@ public:
             if (f->a.size() == 2) { freeze_from_ = f->a[0].i; freeze_to_ = f->a[1].i; }
         if (const JVal* o = sim.get("outage"))
             if (o->a.size() == 2) { outage_from_ = o->a[0].i; outage_to_ = o->a[1].i; }
+        program_change_at_ = sim.integer("program_change_at", -1);
+        if (const JVal* r = sim.get("rebuild_in_outage")) rebuild_in_outage_ = r->t == JVal::Bool && r->b;
+        version_after_outage_ = sim.integer("version_after_outage", -1);
+        version_at_start_ = sim.integer("version_at_start", 1);
+        if (const JVal* r = sim.get("version_read_fails")) version_read_fails_ = r->t == JVal::Bool && r->b;
+        version_fail_from_ = sim.integer("version_fail_from", -1);
+    }
+
+    bool read_version(uint32_t& v, std::string& err) override {
+        const int64_t m = max_emitted_.load();
+        if (version_read_fails_) {
+            err = "ADS error 0x701 (1793): service is not supported by the server (simulated)";
+            return false;
+        }
+        if (version_fail_from_ >= 0 && m >= version_fail_from_) {
+            err = "ADS error 0x745 (1861): timeout elapsed (simulated)";
+            return false;
+        }
+        if (away()) {
+            err = "ADS error 0x6 (6): target port not found (simulated outage)";
+            return false;
+        }
+        int64_t ver = version_at_start_;
+        if (program_change_at_ >= 0 && m >= program_change_at_) ver = version_at_start_ + 1;
+        if (back_from_outage()) {
+            if (version_after_outage_ >= 0) ver = version_after_outage_;
+            else if (rebuild_in_outage_) ver = version_at_start_ + 1;
+        }
+        v = static_cast<uint32_t>(ver);
+        return true;
+    }
+
+    std::string identity() override {
+        if (away() || version_read_fails_) return "";
+        if (back_from_outage() && rebuild_in_outage_) return "t2:c0:u9,900,4,400";
+        const bool changed = program_change_at_ >= 0 && max_emitted_.load() >= program_change_at_;
+        return changed ? "t1:c1:u9,900,4,400" : "t1:c0:u9,900,4,400";
     }
     ~SimSource() override { unsubscribe(); }
 
@@ -103,6 +147,12 @@ public:
     }
 
 private:
+    bool away() const {          // the runtime does not answer during the outage
+        const int64_t c = cycle_now_.load();
+        return outage_from_ >= 0 && c >= outage_from_ && c <= outage_to_;
+    }
+    bool back_from_outage() const { return outage_to_ >= 0 && cycle_now_.load() > outage_to_; }
+
     bool dropped(int64_t b, int64_t c) const {
         for (auto& r : drops_)
             if (r.block == b && c >= r.first && c <= r.last) return true;
@@ -127,6 +177,7 @@ private:
             // frozen PLC: the notification keeps coming, the values stay at the last cycle before the freeze
             auto emit = [&](size_t k, int64_t cyc) {
                 if (dropped(static_cast<int64_t>(k), cyc) || dead_.load()) return;
+                if (cyc > max_emitted_.load()) max_emitted_.store(cyc);    // before delivery: a read after it sees it
                 const int64_t cv = (freeze_from_ >= 0 && cyc >= freeze_from_ && cyc <= freeze_to_) ? freeze_from_ - 1 : cyc;
                 auto& b = buf[k];
                 size_t words = b.size() / 4;
@@ -173,7 +224,10 @@ private:
     }
 
     int64_t start_ft_ = 0, cycle_ = 10000, stop_after_ = -1, max_cycles_ = -1, fail_block_ = -1;
-    int64_t freeze_from_ = -1, freeze_to_ = -1, outage_from_ = -1, outage_to_ = -1;
+    int64_t freeze_from_ = -1, freeze_to_ = -1, outage_from_ = -1, outage_to_ = -1, program_change_at_ = -1;
+    bool rebuild_in_outage_ = false, version_read_fails_ = false;
+    int64_t version_after_outage_ = -1, version_at_start_ = 1, version_fail_from_ = -1;
+    std::atomic<int64_t> max_emitted_{-1};
     std::atomic<int64_t> cycle_now_{0};
     std::atomic<bool> dead_{false};
     uint64_t resubs_ = 0;

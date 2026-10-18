@@ -377,9 +377,13 @@ class NativeRecording:
             "blocks": (src.get("blocks") or [])[:20],
         }
         for k in ("stalls", "stalled_samples", "stalled", "stalled_since_ms", "missing_silent_est", "completeness_estimated",
-                  "resubscriptions", "resubscribe_error", "label_reason", "stall_s"):
+                  "resubscriptions", "resubscribe_error", "label_reason", "stall_s",
+                  # R43: the program the addresses belong to
+                  "program_watch", "program_watch_error", "program_changed", "program_rebuilt_in_outage",
+                  "program_watch_lost", "unverified_rows", "unverified_note", "verified_to_ms", "version_read_error"):
             if k in src:
                 st[k] = src[k]
+        st.setdefault("warnings", []).extend(program_warnings(src))
         if src.get("stalled") and src.get("stalled_since_ms") is not None:
             st.setdefault("warnings", []).append(
                 f"PLC STOPPED? the cycle counter has not advanced since {src['stalled_since_ms']} ms — samples since then are frozen values, not measurements")
@@ -450,6 +454,35 @@ class NativeRecording:
         return {}
 
 
+class ProgramMoved(Exception):
+    """The PLC program changed after the variables were looked up: their addresses may belong to other variables."""
+
+    def __init__(self, msg: str, now: Any) -> None:
+        super().__init__(msg)
+        self.now = now
+
+
+def program_warnings(src: dict[str, Any]) -> list[str]:
+    """R43, both engines: what a program change (or a version that could not be checked) did to the recording."""
+    out: list[str] = []
+    pc = src.get("program_changed")
+    if isinstance(pc, dict) or pc is True:
+        at = pc.get("after_ms") if isinstance(pc, dict) else src.get("verified_to_ms")
+        out.append("the PLC program changed during the recording (download / online change): it ends at the last "
+                   f"sample verified before the change ({at} ms); nothing of the new program is in the file")
+    elif src.get("program_rebuilt_in_outage"):
+        out.append(str(src["program_rebuilt_in_outage"]))
+    if src.get("program_watch_lost"):
+        out.append("the symbol version could not be read while samples kept coming: the recording ends at the last "
+                   "verified sample")
+    if src.get("program_watch_error"):
+        out.append(str(src["program_watch_error"]))
+    if src.get("unverified_rows"):
+        out.append(f"{src['unverified_rows']} samples delivered but not written: " + str(src.get("unverified_note") or
+                   "they could not be verified against a program change"))
+    return out
+
+
 def start_native(rec: Any, header: dict[str, Any], exe: Path, *, net_id: str, port: int, ip: str | None,
                  local_net_id: str | None, cycle_ms: float, max_delay_ms: float, duration_s: float | None,
                  post_trigger_s: float | None, pre_trigger_ms: float, max_events: int | None, key_path: Path,
@@ -483,6 +516,8 @@ def start_native(rec: Any, header: dict[str, Any], exe: Path, *, net_id: str, po
     if not r.get("ok"):
         proc.close(timeout=5)
         err = str(r.get("error") or "start failed")
+        if "symbol_version_now" in r:
+            raise ProgramMoved(err, r["symbol_version_now"])
         if "block" in r:
             raise NativeStartError(err)
         if any(s in err for s in ("TcAdsDll.dll not found", "has no export", "could not open an ADS port", "standalone AdsLib")):

@@ -44,6 +44,10 @@ inline const uint8_t* sample_bytes(const AdsNotificationHeader* h) {
     return reinterpret_cast<const uint8_t*>(h) + 16;
 }
 
+constexpr uint32_t kSymVersion = 0xF008;         // ADSIGRP_SYM_VERSION
+constexpr uint32_t kSymValByName = 0xF004;       // ADSIGRP_SYM_VALBYNAME
+constexpr uint32_t kSymUploadInfo2 = 0xF00F;     // ADSIGRP_SYM_UPLOADINFO2
+
 // One call per sample (TcAdsDll and AdsLib both split batched frames into single samples).
 void on_notification(const AmsAddr*, const AdsNotificationHeader* h, uint32_t hUser) {
     Sink* s = g_sink.load(std::memory_order_acquire);
@@ -154,6 +158,44 @@ public:
         // AdsNotification's destructor deletes the device notification (synchronous ADS request).
         notes_.clear();
         g_sink.store(nullptr, std::memory_order_release);
+    }
+
+    bool read_version(uint32_t& version, std::string& err) override {
+        if (!dev_) {
+            err = "not connected";
+            return false;
+        }
+        uint8_t v = 0;
+        uint32_t got = 0;
+        const long e = dev_->ReadReqEx2(kSymVersion, 0, 1, &v, &got);
+        if (e != 0) {
+            err = ads_error(e);
+            return false;
+        }
+        if (got != 1) {
+            err = "the symbol version read returned " + std::to_string(got) + " bytes";
+            return false;
+        }
+        version = v;
+        return true;
+    }
+
+    // "t<compile time>:c<online changes>:u<symbols>,<symbol bytes>,<datatypes>,<datatype bytes>" of the PLC
+    // application; "" when any part is not readable.
+    std::string identity() override {
+        if (!dev_) return "";
+        static const char kTs[] = "TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp";
+        static const char kOc[] = "TwinCAT_SystemInfoVarList._AppInfo.OnlineChangeCnt";
+        uint32_t ts = 0, oc = 0, got1 = 0, got2 = 0, got3 = 0;
+        uint8_t up[64] = {};
+        const long e1 = dev_->ReadWriteReqEx2(kSymValByName, 0, sizeof ts, &ts, sizeof kTs, kTs, &got1);
+        const long e2 = dev_->ReadWriteReqEx2(kSymValByName, 0, sizeof oc, &oc, sizeof kOc, kOc, &got2);
+        const long e3 = dev_->ReadReqEx2(kSymUploadInfo2, 0, sizeof up, up, &got3);
+        if (e1 != 0 || e2 != 0 || e3 != 0 || got1 != sizeof ts || got2 != sizeof oc || got3 < 16) return "";
+        uint32_t u[4];
+        std::memcpy(u, up, sizeof u);
+        return "t" + std::to_string(ts) + ":c" + std::to_string(oc) + ":u" + std::to_string(u[0]) + "," +
+               std::to_string(u[1]) + "," + std::to_string(u[2]) + "," + std::to_string(u[3]);
     }
 
     // D13: after RUN→CONFIG→RUN the runtime's notification table is gone; the handles we hold are dead. Drop them

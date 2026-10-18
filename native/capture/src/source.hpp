@@ -43,6 +43,18 @@ public:
     // are subscribed again; false (with err) when the target is still away — the engine retries later.
     virtual bool resubscribe(std::string& err) { err = "not supported by this source"; return false; }
     virtual uint64_t resubscriptions() const { return 0; }
+    // R43: the blocks sample memory addresses; a download / online change can put other variables there. The
+    // runtime's symbol version (ADSIGRP_SYM_VERSION 0xF008, one byte, raised by every download / online change),
+    // read now. Called from the engine's writer thread only (never concurrently with resubscribe()).
+    virtual bool read_version(uint32_t& version, std::string& err) {
+        (void)version;
+        err = "not supported by this source";
+        return false;
+    }
+    // The program's identity — the application's compile time, its online-change count and the sizes of the symbol
+    // and datatype tables — to tell a restart of the same program from another build or an online change (the
+    // version byte alone can move with a restart). "" when not readable.
+    virtual std::string identity() { return ""; }
     // Describes the target once connected ({"device": ..., "router": ...}); JSON object text.
     virtual std::string describe() const = 0;
 };
