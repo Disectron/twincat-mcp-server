@@ -16,6 +16,9 @@ tool wishlist (2026-10-18).
 | 0.8.4 | restart verification (`modes_seen`, `transition_seen`) | `xae_restart_twincat` → `modes_seen` contains a non-RUN state, `duration_s` > 0; without license → error naming CONFIG |
 | 0.8.4 | Infosys index time on the real package (one transaction per book) | `tc_doctor` → infosys `complete: true`; time for 282 books |
 | 0.8.5 | D44 dirty-document walk (`Document.Saved`, `Project.Saved`, nested `SubProject`) in the real shell | `xae_pou_set` → `xae_build` → `save.dirty_before` names the POU, `edits_on_disk` lists it, the .TcPOU has the text |
+| 0.8.6 | D20 Error List: late-bound `ToolWindows.ErrorList`, else the view copy (focus + clipboard, restored) | `xae_diagnostics` with Scope warnings in the Error List → they are in `items`, `source` names the route |
+| 0.8.6 | #10 Solution Explorer via the late-bound DTE / window object; 'Set as Active PLC Project' command | `xae_plc('logout')` while logged in → `command: PLC.Logoutfrom<name>`, `selected_node` set |
+| 0.8.6 | D41 4026 compiler line format | a build error in a method → `file`, `object`, `line`, `code` filled |
 | 0.8.5 | D37 abort timing: `abort_received.during` vs. the run that actually stopped | `exp_run` 10 runs, `exp_abort` during run 6 → state `aborted`, run 6 `aborted`, its `after` ran, no run 7 |
 | 0.8.3 | local Infosys against the real `BKINFOSYS3_VS_100_EN-US.2.mshc` (built from the layout in the knowledge README, tested with a synthetic package) | `infosys_declaration ADSREAD` lists NETID…TMOUT; `infosys_get_page FB_CXProfiler` has `version` + `breadcrumb`, markdown without breadcrumb text; `tc_doctor` → infosys `source.kind = helpviewer` |
 
@@ -49,23 +52,12 @@ tool wishlist (2026-10-18).
 |---|---|
 | R12 / A6 | `rec_verify` over many counters (pattern/list) and the 300 × 1 ms acceptance run per recording method; capacity documented |
 | #45 | Check all objects does not run |
-| #10 | login needs the PLC project node selected |
-
-### Next patch (0.8.6), from the 0.8.3 deep test
-
-| ID | Sev | What |
-|---|---|---|
-| D40 | S2 | `tcunit_run`: `xUnitEnablePublish` not checked; note names the legacy Boot folder |
-| D41 | S2 | 4026 compiler lines `File.TcPOU@Method(9) : error:` not parsed (file/line empty) |
-| D42 | S2 | `xae_tree_delete` token target contradiction |
-| D38 | S3 | `proj_libraries`: 4026 `PlcEngineering\Managed Libraries` not scanned |
-| D39 | S3 | `tcunit_scaffold`: `E_Command.0` literal; stubs |
-| D43 | S3 | `tcunit_run` composite token target undocumented |
-| D20 | S3 | `xae_diagnostics` does not read the XAE Error List |
-| D26–D29, D32 | S4 | `rec_pulses` duty, `rec_profile_stop` after end, `updated` format, profile groups start apart, `rec_snapshot` events |
-| N19b, xae_status | S4 | `effective` library version; "no solution open" without the raw error |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
+
+### From the 0.8.3 deep test
+
+All items fixed up to 0.8.6 except D5 (waiting on Ryan, above).
 
 ## On hold
 

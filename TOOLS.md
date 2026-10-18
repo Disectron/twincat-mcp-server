@@ -1,4 +1,4 @@
-# twincat-mcp 0.8.5 — tool reference
+# twincat-mcp 0.8.6 — tool reference
 
 155 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
@@ -108,7 +108,7 @@
 - `xae_status` [R] — Shell version, open solution, projects, TwinCAT project name, target NetId, started flag. Attaches to the shell first if not attached yet (as every xae_* tool does).
 - `xae_open_solution` [E] — Open a .sln in the attached shell.
 - `xae_build` [E] — Build the solution. save_first (default) runs File.SaveAll, saves whatever the shell still reports unsaved, and checks that every xae_pou_set / xae_pou_create edit of this session is in the source files — it refuses to build otherwise (an external reload would discard the edits). Returns success, error/warning items…
-- `xae_diagnostics` [R] — Current error list (errors/warnings/messages with file:line) plus the tail of the Build output pane, without rebuilding.
+- `xae_diagnostics` [R] — Current XAE Error List (errors/warnings/messages with file:line — TwinCAT's own entries too, read from the list view when the automation interface reports none; this focuses the Error List window) merged with the Build output pane, plus the pane's tail, without rebuilding. `source` names where each part came from.
 - `xae_list_commands` [R] — List DTE command names containing a substring (to discover what this shell exposes).
 - `xae_command` [C/D] — Execute an arbitrary DTE command (e.g. 'PLC.Login'). Control-class; commands whose name contains download/reset/activate/restart/delete/remove/shutdown are destructive-class.
 - `xae_plc` [C/D] — PLC online actions through the shell: login | logout | start | stop | reset_cold | reset_origin | download. Command names vary by shell version; all candidates are tried. download/reset_cold/reset_origin are destructive-class, the rest control-class.
@@ -120,7 +120,7 @@
 - `xae_tree_consume_xml` [E] — ConsumeXml on a tree item — the generic write path for any configuration (add I/O boxes, link variables, set task cycle time, add project routes on TIRR …).
 - `xae_tree_set_values` [E] — Set element texts in a tree item's XML by relative XPath, e.g. {'TaskDef/CycleTime': '10000'} (unit 100 ns).
 - `xae_tree_create_child` [E] — Generic CreateChild (tree item types/subtypes per Infosys). For PLC objects prefer xae_pou_create.
-- `xae_tree_delete` [D] — Delete a tree item (POU, box, task …). Destructive-class.
+- `xae_tree_delete` [D] — Delete a tree item (POU, box, task …). Destructive-class; the confirmation names the item: tc_request_confirmation(action='xae_tree_delete', target='<parent_path>^<name>').
 - `xae_plc_projects` [R] — PLC projects in the TwinCAT project with their tree paths (needed by PLCopen / boot tools).
 - `xae_pou_get` [R] — Declaration/implementation text of a POU/DUT/GVL/interface tree item and its methods/properties/actions.
 - `xae_pou_set` [E] — Replace declaration and/or implementation text of a POU item inside the live shell (no file round-trip, XAE keeps LineIds consistent). Build afterwards.
@@ -173,7 +173,7 @@
 
 - `tcunit_scaffold` [E] — Generate <FB>_Tests.TcPOU (TcUnit.FB_TestSuite) with Test_InitialState and one test method per public method, arranged from the FB interface, and register it in the .plcproj. Assertions are left as TODO stubs.
 - `tcunit_results` [R] — Parse a TcUnit xUnit result into a pass/fail summary. Source: the file on the target over ADS (default: configured remote path), a local file, or raw XML text.
-- `tcunit_run` [D] — Full TcUnit cycle: build → boot project autostart+generate → activate → restart → delete old result → wait for the xUnit file on the target → parse. Destructive-class (it activates a configuration on the target). plc_project_path from xae_plc_projects.
+- `tcunit_run` [D] — Full TcUnit cycle: save (checked) → build → boot project autostart+generate → activate → restart → delete old result → wait for the xUnit file on the target → parse. Destructive-class (it activates a configuration on the target): tc_request_confirmation(action='tcunit_run', target=<NetId XAE targets>).…
 
 ## Beckhoff Infosys reference (TwinCAT 3 docs) (7)
 
