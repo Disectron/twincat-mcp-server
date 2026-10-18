@@ -169,6 +169,9 @@ class FakeConnection:
             if getattr(FakeConnection, "no_datatypes", False):
                 raise pyads.ADSError(1793)
             return (ctypes.c_ubyte * len(DATATYPE_BLOB))(*DATATYPE_BLOB)
+        if index_group == 0x4040 and 0x9000 <= index_offset < 0x9000 + 64 * len(EXTRA_SYMBOLS):
+            want = ctypes.sizeof(plc_datatype)                   # TwinCAT_SystemInfoVarList (resolved by name)
+            return (ctypes.c_ubyte * want)(*memory_image(index_offset, want))
         if index_group == 0x4040:
             # raw read of a symbol by offset -> find by ioffs (a read inside a big symbol: the symbol containing it)
             i, rel = _symbol_at(index_offset)
@@ -249,6 +252,24 @@ class FakeConnection:
             inst._deliver(name, value, ts)
 
     def read_write(self, index_group, index_offset, plc_read_datatype, value, plc_write_datatype, return_ctypes=False, check_length=True):
+        if index_group == 0xF080:                     # ADSIGRP_SUMUP_READ: n × (igrp, ioffs, len) → n codes, then the data
+            if getattr(FakeConnection, "no_sum_commands", False):
+                raise pyads.ADSError(1793)
+            raw = bytes(value)
+            n = index_offset
+            hdr = [struct.unpack_from("<III", raw, 12 * k) for k in range(n)]
+            FakeConnection.sum_reads = getattr(FakeConnection, "sum_reads", 0) + 1
+            codes, data = [], b""
+            for igrp, ioffs, ln in hdr:
+                try:
+                    part = bytes(self.read(igrp, ioffs, ctypes.c_ubyte * ln, return_ctypes=True))
+                    codes.append(0)
+                except pyads.ADSError as exc:
+                    codes.append(exc.err_code)
+                    part = b""
+                data += part[:ln].ljust(ln, b"\x00")
+            out = struct.pack(f"<{n}I", *codes) + data
+            return (ctypes.c_ubyte * len(out))(*out)
         if index_group == 0xF081:                     # ADSIGRP_SUMUP_WRITE: n × (igrp, ioffs, len) then the data
             raw = bytes(value)
             n = index_offset
@@ -281,8 +302,24 @@ class FakeConnection:
             return (ctypes.c_ubyte * n)(*out[:n].ljust(n, b"\x00"))
         raise pyads.ADSError(1793)
 
-    def read_list_by_name(self, names, **kw):
-        return {n: self.values[n] for n in names}
+    def read_list_by_name(self, names, cache_symbol_info=True, **kw):
+        """Like pyads: each name's address (index group/offset, size, type) is looked up once per connection and kept
+        — a download that moves the variable is not noticed; the old offset is read."""
+        from twincat_mcp import types_tc as _T
+        cache = self.__dict__.setdefault("_symbol_info_cache", {})
+        out = {}
+        for n in names:
+            if n not in cache or not cache_symbol_info:
+                i = next((k for k, x in enumerate(SYMBOLS) if x[0] == n), None)
+                if i is None:
+                    raise pyads.ADSError(1808)
+                cache[n] = (0x4040, i * 64, SYMBOLS[i][2], SYMBOLS[i][1])
+            _g, off, size, typ = cache[n]
+            tt = _T.parse_type(typ, size)
+            raw = memory_image(off, size)
+            obj = tt.ctype.from_buffer_copy(raw[:ctypes.sizeof(tt.ctype)])
+            out[n] = list(obj) if tt.kind == "array" else obj.value
+        return out
 
     # notifications
     def add_device_notification(self, data, attr, callback, user_handle=None):
@@ -403,7 +440,8 @@ def _scalar_bytes(typ, size, v):
         tt = _T.parse_type(typ, size)
         if tt.kind == "array" and isinstance(v, list) and tt.ctype is not None:
             return bytes(tt.ctype(*v))
-        if tt.ctype is not None and tt.kind in ("int", "uint", "enum", "bool", "float", "pointer"):
+        if tt.ctype is not None and tt.kind in ("int", "uint", "enum", "bool", "float", "pointer", "dt", "date", "tod",
+                                                "time"):
             return bytes(tt.ctype(v))
     except Exception:  # noqa: BLE001
         pass
@@ -416,6 +454,7 @@ def install(monkeypatch):
     FakeConnection.shared_state = {}
     FakeConnection.reset_values()
     FakeConnection.no_datatypes = False
+    FakeConnection.no_sum_commands = False             # a runtime without ADS sum commands (ADS 1793)
     FakeConnection.fail_reads = set()                  # symbol names whose raw reads fail (ADS 1802)
     FakeConnection.max_read_bytes = None               # a read asking for more fails with ADS 1802, like the router
     FakeConnection.read_log = []                       # (symbol, offset inside it, bytes) of every raw 0x4040 read

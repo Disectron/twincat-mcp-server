@@ -883,10 +883,30 @@ async def test_r40_restart_proven_by_a_witness_taken_before_the_commands(monkeyp
     msg = _restart_failure(v)
     assert msg.startswith("the target is in RUN while a restart") and "not in RUN" not in msg
     # B4: RUN → unreachable → RUN (the poll sees it; behaviour kept)
-    script(["RUN", "RUN", "down", "RUN"], [900_000])
+    script(["RUN", "RUN", "down", "RUN"], [900_000, 900_000, 1_500])
     before = await app.restart_witness()
     v = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before)
     assert v["verified"] and v["transition_by"] == "poll"
+    # N75: the witness reported is the one of the runtime that came back — taken in RUN after the transition, not the
+    # attempt from the first poll (the old runtime going down: every value null, 'not readable before and after')
+    assert v["witness_after"]["cycle_count"] == 1_500 and "started again (900000 → 1500)" in v["witness"], v
+    # one poll without an answer, but task 1's counter ran on: no restart (the counter outweighs the poll)
+    script(["RUN", "RUN", "down", "RUN"], [900_000, 900_000, 990_000])
+    before = await app.restart_witness()
+    v = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before)
+    assert not v["verified"] and "went on from 900000 to 990000" in v["hint"] and "did not restart" in v["hint"]
+
+    # N75: a value that could not be read says why; the DT AppTimestamp is compared by its number
+    async def unreadable(fn, *a, **kw):
+        if getattr(fn, "__name__", "") == "read_many":
+            return {W[0]: {"error": "ADSError 1861 (0x745): timeout"}, W[1]: 10000,
+                    W[2]: {"raw": 1792300000, "text": "DT#2026-10-17-00:00:00"}}
+        return {"twincat_mode": "RUN"}
+    monkeypatch.setattr(app, "ads_call", unreadable)
+    w = await app.restart_witness()
+    assert w["app_timestamp"] == 1792300000 and "1861" in w["unreadable"]["cycle_count"]
+    verdict = restart_proven({"t": 0, "mode": "RUN", "cycle_count": 5}, w)
+    assert verdict[0] is None and "after it (ADSError 1861" in verdict[1], verdict
     # B5: ends in CONFIG with a license dialog → not verified, the dialog named
     script(["RUN", "CONFIG"], [900_000])
     before = await app.restart_witness()
@@ -1037,6 +1057,13 @@ async def test_n40_n42_token_targets_are_computed_by_the_server(monkeypatch, pro
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "args": {
             "action": "download", "plc_project_path": "TIPC^PlcB"}}))
         assert tok["target"] == "download:TIPC^PlcB^PlcB Project@5.1.2.3.1.1" and tok["xae_target"] == "5.1.2.3.1.1"
+        # N78: no token for a PLC project the solution does not have — and the tool refuses it the same way
+        r = await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "args": {
+            "action": "download", "plc_project_path": "TIPC^Other^Other Project"}})
+        assert r.is_error and "no PLC project 'TIPC^Other^Other Project'" in text(r) and "PlcB Project" in text(r)
+        r = await s.call_tool("xae_plc", {"action": "download", "plc_project_path": "TIPC^Other^Other Project",
+                                          "confirm_token": tok["confirm_token"]})
+        assert r.is_error and "no PLC project" in text(r) and done == []
         # the token for B does not download A
         r = await s.call_tool("xae_plc", {"action": "download", "plc_project_path": "TIPC^PlcA^PlcA Project",
                                           "confirm_token": tok["confirm_token"]})

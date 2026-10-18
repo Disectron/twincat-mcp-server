@@ -296,28 +296,43 @@ class AdsBackend:
             ptr += entry_len
         return out, {s.name.lower(): s for s in out}
 
-    def _symbol_version(self, c: pyads.Connection) -> int | None:
-        """ADSIGRP_SYM_VERSION (0xF008): one byte the runtime increments on every download / online change.
-        Checked at most every 2 s per target; None where the runtime does not offer it."""
+    def _table_identity(self, c: pyads.Connection) -> tuple[Any, ...] | None:
+        """What says the runtime still has the symbol table that was loaded: its symbol version (ADSIGRP_SYM_VERSION
+        0xF008, +1 on every download / online change), the sizes of its symbol and datatype tables
+        (ADSIGRP_SYM_UPLOADINFO2) and the PLC application's compile timestamp — after a TwinCAT restart with another
+        build the version byte can stand where the old one stood, the build's timestamp cannot. Read at most every
+        2 s per target; None where none of it is readable (then the TTL applies)."""
         key = (c.ams_net_id, c.ams_net_port)
         vc = self.__dict__.setdefault("_symver", {})
         hit = vc.get(key)
         if hit and time.time() - hit[0] < 2.0:
             return hit[1]
+        parts: list[Any] = []
         try:
-            v = int(c.read(0xF008, 0, ctypes.c_ubyte))
+            parts.append(int(c.read(0xF008, 0, ctypes.c_ubyte)))
         except Exception:  # noqa: BLE001
-            v = None
-        vc[key] = (time.time(), v)
-        return v
+            parts.append(None)
+        try:
+            info = bytes(c.read(C.ADSIGRP_SYM_UPLOADINFO2, 0, ctypes.c_ubyte * 64, return_ctypes=True, check_length=False))
+            parts.append(struct.unpack_from("<IIII", info, 0))
+        except Exception:  # noqa: BLE001
+            parts.append(None)
+        try:
+            parts.append(int(c.read_by_name("TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp", pyads.PLCTYPE_UDINT)))
+        except Exception:  # noqa: BLE001 — not a PLC runtime port
+            parts.append(None)
+        ident = tuple(parts) if any(x is not None for x in parts) else None
+        vc[key] = (time.time(), ident)
+        return ident
 
     def symbols_cached(self, refresh: bool = False, port: int | None = None) -> tuple[list[SymbolEntry], dict[str, SymbolEntry]]:
-        """Symbol table cache. Invalidated when the runtime's symbol version changes (download / online change /
-        activation) — not on a fixed timer; the TTL only applies where the version is not readable."""
+        """Symbol table cache. Invalidated when the runtime's table identity changes (download / online change /
+        activation / a restart with another build) — not on a fixed timer; the TTL only applies where the identity
+        is not readable. Every read by name goes through this table (read_values): one source for name → address."""
         c = self.conn(port)
         key = (c.ams_net_id, c.ams_net_port)
         hit = self._symcache.get(key)
-        ver = self._symbol_version(c)
+        ver = self._table_identity(c)
         if hit and not refresh:
             cached_ver = hit[3] if len(hit) > 3 else None
             if ver is not None and cached_ver is not None:
@@ -387,7 +402,7 @@ class AdsBackend:
         c = self.conn(port)
         key = (c.ams_net_id, c.ams_net_port)
         hit = self._dtcache.get(key)
-        ver = self._symbol_version(c)
+        ver = self._table_identity(c)
         dtver = self.__dict__.setdefault("_dtver", {})
         if hit and not refresh:
             if ver is not None and dtver.get(key) == ver:
@@ -963,6 +978,7 @@ class AdsBackend:
     def read_many(self, names: list[str], port: int | None = None) -> dict[str, Any]:
         c = self.conn(port)
         simple: dict[str, T.TcType] = {}
+        syms: dict[str, SymbolEntry] = {}
         results: dict[str, Any] = {}
         for n in names:
             try:
@@ -973,23 +989,53 @@ class AdsBackend:
             tt = T.parse_type(s.type, s.size)
             if tt.ctype is not None and not tt.opaque and tt.kind not in ("string", "wstring"):
                 simple[s.name] = tt
+                syms[s.name] = s
             else:
                 try:
                     results[n] = self.read(n, True, 50, port)["value"]
                 except AdsError as exc:
                     results[n] = {"error": str(exc)}
         if simple:
-            try:
-                got = c.read_list_by_name(list(simple.keys()))
-                for n, v in got.items():
-                    results[n] = T.decode(simple[n], v) if not isinstance(v, str) or not v.startswith("error") else {"error": v}
-            except Exception:  # noqa: BLE001  (sum-read unsupported → fallback)
-                for n, tt in simple.items():
-                    try:
-                        results[n] = T.decode(tt, c.read_by_name(n, tt.ctype))
-                    except Exception as exc:  # noqa: BLE001
-                        results[n] = {"error": _fmt_exc(exc)}
+            results.update(self.read_values(c, [(syms[n], tt) for n, tt in simple.items()]))
         return results
+
+    def read_values(self, c: pyads.Connection, items: list[tuple["SymbolEntry", T.TcType]],
+                    decode: bool = True) -> dict[str, Any]:
+        """Values of simple symbols in ONE sum read (ADSIGRP_SUMUP_READ) at the addresses of this server's symbol
+        table, which follows the runtime's table identity. pyads's read_list_by_name keeps each name's address for
+        the life of the connection: after a download, an online change or a restart with another build it read the
+        old offsets — another variable's bytes, or an ADS error. A runtime without sum commands: one read per symbol
+        at the same address. An item the runtime refuses is {"error": …}, never decoded. decode=False: the raw value
+        (as pyads gives it) for callers that decode themselves (the recorder). -> {symbol name: value}."""
+        out: dict[str, Any] = {}
+        if not items:
+            return out
+        try:
+            got: list[tuple[int, bytes]] | None = _sum_read(c, [(s.index_group, s.index_offset, s.size) for s, _t in items])
+        except Exception:  # noqa: BLE001 — no sum commands on this runtime (ADS 1793 / 1794)
+            got = None
+        for j, (s, tt) in enumerate(items):
+            if got is not None:
+                err, data = got[j]
+            else:
+                try:
+                    data = bytes(c.read(s.index_group, s.index_offset, ctypes.c_ubyte * max(s.size, 1),
+                                        return_ctypes=True, check_length=False))
+                    err = 0
+                except pyads.ADSError as exc:
+                    err, data = int(exc.err_code or 1), b""
+                except Exception as exc:  # noqa: BLE001
+                    out[s.name] = {"error": _fmt_exc(exc)}
+                    continue
+            if err:
+                out[s.name] = {"error": _fmt_exc(pyads.ADSError(err))}
+                continue
+            try:
+                raw = _ctype_value(tt, data)
+                out[s.name] = T.decode(tt, raw) if decode else raw
+            except Exception as exc:  # noqa: BLE001
+                out[s.name] = {"error": f"not decodable as {s.type}: {type(exc).__name__}: {exc}"}
+        return out
 
     # set by the server: True when the project source declares this name as an INTERFACE — the runtime's datatype
     # table does not always mark interface types recognisably (field retest #52/#64)
@@ -1244,30 +1290,24 @@ class AdsBackend:
         interval_ms = max(interval_ms, self.cfg.min_watch_interval_ms)
         c = self.conn(port)
         types: dict[str, T.TcType] = {}
+        items: list[tuple[SymbolEntry, T.TcType]] = []
         for n in names:
             s = self.symbol_info(n, port)
             tt = T.parse_type(s.type, s.size)
             if tt.ctype is None or tt.opaque:
                 raise AdsError(f"{n!r} is an opaque type; watch its members instead")
             types[s.name] = tt
+            items.append((s, tt))
         keys = list(types.keys())
         samples: list[dict[str, Any]] = []
         changes = 0
         last: dict[str, Any] | None = None
         t0 = time.perf_counter()
         deadline = t0 + duration_ms / 1000
-        use_sum = True
         while True:
             now = time.perf_counter()
-            try:
-                if use_sum:
-                    row = c.read_list_by_name(keys)
-                else:
-                    raise RuntimeError
-            except Exception:  # noqa: BLE001
-                use_sum = False
-                row = {k: c.read_by_name(k, types[k].ctype) for k in keys}
-            vals = {k: T.decode(types[k], v) for k, v in row.items()}
+            # one sum read at the addresses resolved above (read_values) — a refused item is {"error": …} in the sample
+            vals = self.read_values(c, items)
             if not change_only or last is None or vals != last:
                 samples.append({"t_ms": round((now - t0) * 1000, 2), **vals})
                 if last is not None and vals != last:
@@ -1766,6 +1806,41 @@ def _err_text(msg: Any) -> str:
     while s and len(json.dumps(s + "...")) > _ERR_JSON_MAX:
         s = s[:-1]
     return s + "..."
+
+
+_SUM_MAX = 500                    # sub-commands per ADS sum request (Beckhoff's recommendation, pyads' MAX_ADS_SUB_COMMANDS)
+
+
+def _sum_read(c: Any, items: list[tuple[int, int, int]]) -> list[tuple[int, bytes]]:
+    """ADSIGRP_SUMUP_READ (0xF080) over (index group, index offset, length), _SUM_MAX per request. The answer holds an
+    error code per item, then each item's bytes (its full length, also for an item that failed).
+    -> [(ADS error code, bytes)] in the order asked."""
+    out: list[tuple[int, bytes]] = []
+    for k in range(0, len(items), _SUM_MAX):
+        part = items[k:k + _SUM_MAX]
+        req = b"".join(struct.pack("<III", g, o, max(n, 1)) for g, o, n in part)
+        rlen = 4 * len(part) + sum(max(n, 1) for _g, _o, n in part)
+        raw = bytes(c.read_write(0xF080, len(part), ctypes.c_ubyte * rlen, (ctypes.c_ubyte * len(req))(*req),
+                                 ctypes.c_ubyte * len(req), return_ctypes=True))
+        pos = 4 * len(part)
+        for j, (_g, _o, n) in enumerate(part):
+            out.append((struct.unpack_from("<I", raw, 4 * j)[0], raw[pos:pos + max(n, 1)]))
+            pos += max(n, 1)
+    return out
+
+
+def _ctype_value(tt: T.TcType, data: bytes) -> Any:
+    """The raw value of these bytes, as pyads' read_by_name gives it (get_value_from_ctype_data); STRING is the PLC's
+    Windows-1252 text up to its NUL, WSTRING UTF-16 up to its double NUL."""
+    if tt.kind == "string":
+        return bytes(data).split(b"\x00", 1)[0].decode("cp1252", "replace")
+    if tt.kind == "wstring":
+        b = bytes(data)
+        end = next((i for i in range(0, len(b) - 1, 2) if b[i] == 0 and b[i + 1] == 0), len(b) - len(b) % 2)
+        return b[:end].decode("utf-16-le", "replace")
+    n = ctypes.sizeof(tt.ctype)
+    obj = tt.ctype.from_buffer_copy(bytes(data[:n]).ljust(n, b"\x00"))
+    return pyads.pyads_ex.get_value_from_ctype_data(obj, tt.ctype)
 
 
 def _move_new(src: Any, dst: Any) -> None:

@@ -198,7 +198,9 @@ def restart_proven(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool 
         return True, f"the PLC application's compile timestamp changed ({b_ts} → {a_ts}): a newly built application runs"
     b, a = before.get("cycle_count"), after.get("cycle_count")
     if not isinstance(b, int) or not isinstance(a, int):
-        return None, "task 1's cycle counter was not readable before and after"
+        miss = [f"{side} ({(w.get('unreadable') or {}).get('cycle_count') or (w.get('unreadable') or {}).get('all') or 'not read: TwinCAT was not in RUN'})"
+                for side, w, v in (("before the command", before, b), ("after it", after, a)) if not isinstance(v, int)]
+        return None, "task 1's cycle counter was not readable " + " and ".join(miss)
     elapsed = max(0.0, float(after.get("t", 0)) - float(before.get("t", 0)))
     ct = after.get("cycle_time_100ns") or before.get("cycle_time_100ns")
     if not isinstance(ct, (int, float)) or ct <= 0:
@@ -673,13 +675,18 @@ class App:
         if w["mode"] == "RUN":
             try:
                 vals = await self.ads_call(self.ads.read_many, list(_RESTART_WITNESS), timeout=10)
-            except ToolError:
+            except ToolError as exc:
                 vals = {}
+                w["unreadable"] = {"all": str(exc)[:200]}
             if isinstance(vals, dict):
                 for key, sym in zip(("cycle_count", "cycle_time_100ns", "app_timestamp"), _RESTART_WITNESS):
                     v = vals.get(sym)
+                    if isinstance(v, dict) and "raw" in v:
+                        v = v["raw"]                # DT (AppTimestamp): the decoded value carries the number it compares
                     if isinstance(v, (int, float, str)) and not isinstance(v, bool):
                         w[key] = v
+                    elif isinstance(v, dict) and "error" in v:
+                        w.setdefault("unreadable", {})[key] = str(v["error"])[:200]
         return w
 
     async def verify_target_after(self, action: str, expect_run: bool, timeout_s: float = 90.0,
@@ -743,6 +750,15 @@ class App:
             if now >= deadline or (not left_run and now >= leave_deadline):
                 break
             await asyncio.sleep(0.5 if not left_run else poll_s)
+        if (require_transition and transition_by == "poll" and mode == "RUN" and before is not None
+                and before.get("mode") == "RUN"):
+            # N75: the witness compared is the one of the runtime that came back — taken now, in RUN after the
+            # transition — never an attempt from a poll while the old runtime was going down. A counter that ran on
+            # (provably no restart) outweighs one poll without an answer
+            witness_after = await self.restart_witness(mode)
+            witness_verdict = restart_proven(before, witness_after)
+            if witness_verdict[0] is False:
+                left_run, left_at, transition_by = False, None, None
         ok = ((mode == "RUN") if expect_run else (mode in ("RUN", "CONFIG"))) and left_run and not err_dialogs
         out: dict[str, Any] = {"target_mode": mode, "verified": ok, "polls": polls, "dialogs": err_dialogs,
                                "modes_seen": modes_seen, "verify_s": round(time.time() - t0, 1)}
@@ -966,10 +982,17 @@ class App:
             if not act:
                 raise ToolError("xae_plc's token names the action: pass args={'action': 'login', 'plc_project_path': …}")
             path = a.get("plc_project_path")
+            # N78: the token names a PLC project of the open solution — one that does not exist gets no token (and
+            # the tool, which computes its target the same way, refuses it before anything is done)
+            projs = await self.xae_call(self.xae._nested_projects, None, timeout=120)
             if path:
-                proj = _plc_iec_path(str(path))
+                want = _plc_iec_path(str(path))
+                hit = [p for p in projs if p.lower() == want.lower()]
+                if not hit:
+                    raise ToolError(f"no PLC project {str(path)!r} in the open solution — its PLC projects: {projs} "
+                                    "(xae_plc_projects lists them)")
+                proj = hit[0]
             else:
-                projs = await self.xae_call(self.xae._nested_projects, None, timeout=120)
                 if len(projs) != 1:
                     raise ToolError(f"{len(projs)} PLC projects — xae_plc needs plc_project_path, and its token names it: "
                                     f"{projs}")
@@ -3620,7 +3643,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # N5: the shell returns as soon as the command is accepted; the restart is over when the target reports RUN
         res.update({"restarted": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
                     "verification_polls": ver["polls"], "modes_seen": ver["modes_seen"],
-                    "command_s": res.pop("duration_s", None), "duration_s": round(time.monotonic() - t0, 1)})
+                    "duration_s": round(time.monotonic() - t0, 1)})
         res.update({k: ver[k] for k in _TRANSITION_KEYS if k in ver})
         if ver.get("hint"):
             res["hint"] = ver["hint"]
@@ -3657,10 +3680,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             steps["boot_project"] = await app.xae_call(app.xae.boot_project, plc_project_path, True, True, False, timeout=300)
         before = await app.restart_witness()                  # R40: before the activation — what a restart must change
         steps["activate"] = await app.xae_call(app.xae.activate_configuration, timeout=600)
+        t_restart = time.monotonic()
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
         # P17: a deploy is done when the target runs it, not when the shell accepted the commands
         ver = await app.verify_target_after("xae_deploy", expect_run=True, require_transition=True, before=before)
+        # N5: the restart lasted from its command until the target was seen running again (command_s: the shell part)
+        steps["restart"]["duration_s"] = round(time.monotonic() - t_restart, 1)
         steps["verify"] = {"running": bool(ver["verified"]), "target_mode": ver["target_mode"], "dialogs": ver["dialogs"],
                            "polls": ver["polls"], "modes_seen": ver["modes_seen"]}
         steps["verify"].update({k: ver[k] for k in _TRANSITION_KEYS if k in ver})

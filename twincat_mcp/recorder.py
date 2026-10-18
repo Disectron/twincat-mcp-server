@@ -1784,7 +1784,8 @@ class Recorder:
         except Exception as exc:  # noqa: BLE001
             m["device"] = f"unavailable: {exc}"
         try:
-            m["symbol_version"] = self.ads._symbol_version(self.ads.conn(port))
+            ident = self.ads._table_identity(self.ads.conn(port))
+            m["symbol_version"] = ident[0] if ident else None
         except Exception:  # noqa: BLE001
             m["symbol_version"] = None
         return m
@@ -2150,31 +2151,30 @@ class Recorder:
         except Exception as exc:  # noqa: BLE001
             raise AdsError(f"recorder connection failed: {_fmt_exc(exc)}") from exc
         rec.conn = conn
-        names = [s.name for s in rec.symbols]
         types = rec.types
+        # the addresses the recording resolved at its start (the same ones notification mode subscribes to): one sum
+        # read per cycle, never pyads' per-connection name cache (stale after a download)
+        items = [(s, types[s.name]) for s in rec.symbols]
         interval = rec.cycle_ms / 1000.0
 
         def loop() -> None:
-            use_sum = True
             while not rec._stop.is_set():
                 t_cycle = time.perf_counter()
                 ts = time.time()
                 try:
-                    if use_sum:
-                        row = conn.read_list_by_name(names)
-                        if any(isinstance(v, str) and v.startswith("error") for v in row.values()) and len(names) == 1:
-                            raise RuntimeError("sum read error")
-                    else:
-                        row = {n: conn.read_by_name(n, types[n].ctype) for n in names}
+                    got = self.ads.read_values(conn, items, decode=False)
                 except Exception as exc:  # noqa: BLE001
-                    if use_sum:
-                        use_sum = False
-                        continue
                     if len(rec.errors) < 20:
                         rec.errors.append(f"poll: {_fmt_exc(exc)}")
                     time.sleep(min(1.0, interval * 5))
                     continue
-                rec.enqueue(ts, None, dict(row))
+                bad = {n: v["error"] for n, v in got.items() if isinstance(v, dict) and set(v) == {"error"}}
+                if bad:
+                    if len(rec.errors) < 20:
+                        rec.errors.append("poll: " + "; ".join(f"{n}: {e}" for n, e in list(bad.items())[:5]))
+                    time.sleep(min(1.0, interval * 5))
+                    continue
+                rec.enqueue(ts, None, got)
                 time.sleep(max(0.0, interval - (time.perf_counter() - t_cycle)))
             try:
                 conn.close()

@@ -128,12 +128,13 @@ def test_watch_and_wait(ads, monkeypatch):
     ads.conn()
     conn = FakeConnection.instances[-1]
     seq = itertools.chain([0, 0, 1, 1, 2], itertools.repeat(2))
-    orig = conn.read_list_by_name
+    orig = conn.read_write
 
-    def rl(names, **kw):
-        conn.values["MAIN.nCycle"] = next(seq)
-        return orig(names)
-    conn.read_list_by_name = rl
+    def rw(igrp, *a, **kw):                          # each sum read sees the next value
+        if igrp == 0xF080:
+            conn.values["MAIN.nCycle"] = next(seq)
+        return orig(igrp, *a, **kw)
+    conn.read_write = rw
     ads.cfg.min_watch_interval_ms = 1
     w = ads.watch(["MAIN.nCycle"], duration_ms=60, interval_ms=5, change_only=True)
     vals = [s["MAIN.nCycle"] for s in w["samples"]]
@@ -214,6 +215,40 @@ def test_symbol_cache_follows_symbol_version(ads, monkeypatch):
     ads.__dict__.get("_symver", {}).clear()
     ads.symbols_cached()
     assert loads["n"] == 2                     # online change: reloaded
+
+
+def test_reads_by_name_follow_a_download_that_moves_the_variables(ads, monkeypatch):
+    """pyads' read_list_by_name kept each name's address for the life of the connection: after a download (or a
+    restart with another build) ads_read_many, ads_watch and polled recordings read the OLD offsets — another
+    variable's bytes, or an ADS error. Every read by name now goes through the server's own symbol table, whose
+    identity (symbol version, table sizes, the application's compile timestamp) is checked: a new build → reloaded."""
+    from tests import fake_ads as F
+    from tests.fake_ads import FakeConnection
+    FakeConnection.shared_values["MAIN.nCycle"] = 4242
+    assert ads.read_many(["MAIN.nCycle"]) == {"MAIN.nCycle": 4242}
+    # the download: the same variables at other offsets (MAIN.nCycle swaps places with the 4-byte MAIN.fbFill.tSettle),
+    # same symbol count and sizes — only the build differs, as its compile timestamp says
+    syms = list(F.SYMBOLS)
+    i = next(k for k, x in enumerate(syms) if x[0] == "MAIN.nCycle")
+    j = next(k for k, x in enumerate(syms) if x[0] == "MAIN.fbFill.tSettle")
+    syms[i], syms[j] = syms[j], syms[i]
+    monkeypatch.setattr(F, "SYMBOLS", syms)
+    FakeConnection.shared_values["TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp"] += 3600
+    ads.__dict__.get("_symver", {}).clear()           # the identity is read at most every 2 s; the test does not wait
+    FakeConnection.read_log.clear()
+    assert ads.read_many(["MAIN.nCycle"]) == {"MAIN.nCycle": 4242}
+    w = ads.watch(["MAIN.nCycle"], duration_ms=1, interval_ms=1, change_only=False)
+    assert w["samples"][0]["MAIN.nCycle"] == 4242
+    # a runtime without sum commands: one read per symbol, at the same (current) address
+    FakeConnection.no_sum_commands = True
+    assert ads.read_many(["MAIN.nCycle", "MAIN.bStart"]) == {"MAIN.nCycle": 4242, "MAIN.bStart": True}
+
+
+def test_a_refused_item_of_a_sum_read_is_an_error_never_a_value(ads):
+    from tests.fake_ads import FakeConnection
+    FakeConnection.fail_reads = {"MAIN.nCycle"}
+    got = ads.read_many(["MAIN.nCycle", "MAIN.bStart"])
+    assert set(got["MAIN.nCycle"]) == {"error"} and "1802" in got["MAIN.nCycle"]["error"] and got["MAIN.bStart"] is True
 
 
 def _big_root(monkeypatch):

@@ -909,7 +909,9 @@ class XaeBackend:
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(1.0)
-        return {"restarted": True, "twincat_started": started, "duration_s": round(time.time() - t0, 1)}
+        # command_s: the command and the wait for IsTwinCATStarted — from RUN that is the OLD runtime, true at once
+        # (N5: 0 s); how long the restart took is known only to who sees the target come back (verify_target_after)
+        return {"restarted": True, "twincat_started": started, "command_s": round(time.time() - t0, 1)}
 
     # ------------------------------------------------------------ tree
     def _item(self, path: str) -> Any:
