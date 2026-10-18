@@ -12,15 +12,15 @@ tool wishlist (2026-10-18).
 | 0.8.1 | sealing on Windows: read-only recording + manifest, `rec_delete` of a read-only file | covered by Windows CI only |
 | 0.8.2 | Scope via the XAE Automation Interface (`IMeasurementScope`, late-bound) | `scope_list`; `scope_record` start → stop → save; `rec_start(also_scope=true)` + `rec_stop` → `<id>.svdx/.scope.csv/.scope.json` |
 | 0.8.2 | `scope_export` with the real `TC3ScopeExportTool.exe` | `scope_export svd=<saved .svdx>` |
+| 0.8.3 | local Infosys against the real `BKINFOSYS3_VS_100_EN-US.2.mshc` (built from the layout in the knowledge README, tested with a synthetic package) | `infosys_declaration ADSREAD` lists NETID…TMOUT; `infosys_get_page FB_CXProfiler` has `version` + `breadcrumb`, markdown without breadcrumb text; `tc_doctor` → infosys `source.kind = helpviewer` |
 | 0.8.4 | native re-subscription after RUN → CONFIG → RUN and the `_stall` line on PLC STOP (tested on the simulator backend) | `rec_capture … cycle_ms=1 seconds=40`, toggle RUN/CONFIG → `resubscriptions ≥ 1`; PLC stop → `label: INCOMPLETE`, `label_reason: PLC stopped …` |
 | 0.8.4 | restart verification (`modes_seen`, `transition_seen`) | `xae_restart_twincat` → `modes_seen` contains a non-RUN state, `duration_s` > 0; without license → error naming CONFIG |
 | 0.8.4 | Infosys index time on the real package (one transaction per book) | `tc_doctor` → infosys `complete: true`; time for 282 books |
 | 0.8.5 | D44 dirty-document walk (`Document.Saved`, `Project.Saved`, nested `SubProject`) in the real shell | `xae_pou_set` → `xae_build` → `save.dirty_before` names the POU, `edits_on_disk` lists it, the .TcPOU has the text |
+| 0.8.5 | D37 abort timing: `abort_received.during` vs. the run that actually stopped | `exp_run` 10 runs, `exp_abort` during run 6 → state `aborted`, run 6 `aborted`, its `after` ran, no run 7 |
 | 0.8.6 | D20 Error List: late-bound `ToolWindows.ErrorList`, else the view copy (focus + clipboard, restored) | `xae_diagnostics` with Scope warnings in the Error List → they are in `items`, `source` names the route |
 | 0.8.6 | #10 Solution Explorer via the late-bound DTE / window object; 'Set as Active PLC Project' command | `xae_plc('logout')` while logged in → `command: PLC.Logoutfrom<name>`, `selected_node` set |
 | 0.8.6 | D41 4026 compiler line format | a build error in a method → `file`, `object`, `line`, `code` filled |
-| 0.8.5 | D37 abort timing: `abort_received.during` vs. the run that actually stopped | `exp_run` 10 runs, `exp_abort` during run 6 → state `aborted`, run 6 `aborted`, its `after` ran, no run 7 |
-| 0.8.3 | local Infosys against the real `BKINFOSYS3_VS_100_EN-US.2.mshc` (built from the layout in the knowledge README, tested with a synthetic package) | `infosys_declaration ADSREAD` lists NETID…TMOUT; `infosys_get_page FB_CXProfiler` has `version` + `breadcrumb`, markdown without breadcrumb text; `tc_doctor` → infosys `source.kind = helpviewer` |
 
 ## Waiting on Ryan
 
@@ -28,9 +28,11 @@ tool wishlist (2026-10-18).
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
 - D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
-- Retest of 0.8.4.
+- Retest of 0.8.6.
 
 ## Decided (wishlist 2026-10-18)
+
+Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and `prof_task`.
 
 | Item | Decision |
 |---|---|
@@ -50,7 +52,7 @@ tool wishlist (2026-10-18).
 
 | ID | What |
 |---|---|
-| R12 / A6 | `rec_verify` over many counters (pattern/list) and the 300 × 1 ms acceptance run per recording method; capacity documented |
+| R12 / A6 | `rec_verify` over many counters (pattern/list) and the 300 × 1 ms acceptance run per recording method; capacity documented — not built (`rec_verify` takes one counter) |
 | #45 | Check all objects does not run |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
