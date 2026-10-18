@@ -330,6 +330,19 @@ def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
     assert "every manual is read again" in p.stdout and "1 updated" in p.stdout, p.stdout
     st = json.loads(run("manuals_db.py", "stats", "--json", "--kb", str(kb)).stdout)
     assert st["state"] == "up_to_date"
+    # review: a manual that fails during the re-read keeps its old rows — the format is not stamped, so the next
+    # update reads every manual again instead of calling the old rows current
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM meta WHERE key='text_format'")
+    con.commit()
+    con.close()
+    pdf.write_bytes(b"%PDF-1.4 broken")
+    p = run("manuals_db.py", "update", "--kb", str(kb))
+    assert "1 failed" in p.stdout, p.stdout
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT value FROM meta WHERE key='text_format'").fetchone() is None
+    assert con.execute("SELECT COUNT(*) FROM page").fetchone()[0] == 8              # the old rows are still there
+    con.close()
 
 
 def test_n37_font_headings_wrapped_over_two_lines_are_one_entry(tmp_path):

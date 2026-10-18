@@ -235,21 +235,24 @@ class TypeSystem:
 
     # ---------------------------------------------------------------- expand
     def leaves(self, root_path: str, type_name: str, max_leaves: int = 200_000,
-               base_offset: int = 0, max_array: int = MAX_ARRAY_ELEMENTS) -> list[Leaf]:
+               base_offset: int = 0, max_array: int = MAX_ARRAY_ELEMENTS, size: int | None = None) -> list[Leaf]:
+        """size: the root's own size (the symbol's) — used where the table has no entry for its type (a POINTER TO
+        is 4 bytes on a 32-bit runtime such as the CX9020, 8 on x64)."""
         out: list[Leaf] = []
-        self._expand(root_path, type_name, base_offset, out, max_leaves, max_array, None, 0)
+        self._expand(root_path, type_name, base_offset, out, max_leaves, max_array, None, 0, size)
         return out
 
     def _expand(self, path: str, type_name: str, off: int, out: list[Leaf], max_leaves: int, max_array: int,
-                entry: DtEntry | None, depth: int) -> None:
+                entry: DtEntry | None, depth: int, size_hint: int | None = None) -> None:
         if len(out) >= max_leaves or depth > 32:
             return
         e = entry or self.get(type_name)
         if e is None:
-            # unknown to the table: treat as scalar by name
-            tt = T.parse_type(type_name, None)
+            # unknown to the table: treat as scalar by name; the declared size (member / element / symbol) wins over
+            # the size the name implies (pointer width depends on the runtime)
+            tt = T.parse_type(type_name, size_hint)
             note = "pointer/reference: the address, not the target" if _RE_INDIRECT.match(type_name or "") else "type not in datatype table"
-            out.append(Leaf(path, type_name, off, tt.size or 0, 0, None, note))
+            out.append(Leaf(path, type_name, off, size_hint or tt.size or 0, 0, None, note))
             return
         if self.is_indirect(e, type_name):
             out.append(Leaf(path, type_name if entry is None else e.type, off, e.size, e.data_type, None,
@@ -286,7 +289,8 @@ class TypeSystem:
                     rem //= lens[d]
                 coords.reverse()
                 sub_path = f"{path}[{','.join(str(c) for c in coords)}]"
-                self._expand(sub_path, elem_type, off + linear * elem_size, out, max_leaves, max_array, None, depth + 1)
+                self._expand(sub_path, elem_type, off + linear * elem_size, out, max_leaves, max_array, None, depth + 1,
+                             elem_size or None)
                 if len(out) >= max_leaves:
                     return
             return
@@ -295,7 +299,8 @@ class TypeSystem:
                 if s.flags & F_PROPITEM or s.flags & F_STATIC:
                     continue
                 sub_entry = s if (s.subitems or s.dims) else None
-                self._expand(f"{path}.{s.name}", s.type, off + s.offs, out, max_leaves, max_array, sub_entry, depth + 1)
+                self._expand(f"{path}.{s.name}", s.type, off + s.offs, out, max_leaves, max_array, sub_entry, depth + 1,
+                             s.size or None)
                 if len(out) >= max_leaves:
                     return
             return
@@ -312,11 +317,12 @@ class TypeSystem:
 
     # ---------------------------------------------------------------- decode
     def decode_tree(self, buf: bytes, type_name: str, off: int = 0, entry: DtEntry | None = None,
-                    max_array: int = MAX_ARRAY_ELEMENTS, depth: int = 0) -> Any:
+                    max_array: int = MAX_ARRAY_ELEMENTS, depth: int = 0, size: int | None = None) -> Any:
+        """size: the declared size where the table has no entry (see leaves)."""
         e = entry or self.get(type_name)
         if e is None and _RE_INDIRECT.match(type_name or ""):
-            size = T.parse_type(type_name, None).size or 8
-            return T.fmt_pointer(int.from_bytes(buf[off:off + size], "little"), size) if size in (4, 8) else None
+            n = size or T.parse_type(type_name, None).size or 8
+            return T.fmt_pointer(int.from_bytes(buf[off:off + n], "little"), n) if n in (4, 8) and len(buf) >= off + n else None
         if e is None or depth > 32:
             return self._decode_scalar(buf, off, type_name, None, None)
         if self.is_indirect(e, type_name if entry is None else e.type):
@@ -336,7 +342,8 @@ class TypeSystem:
             if count > max_array:
                 return {"array_elements": count, "note": "not expanded", "raw_hex": buf[off:off + e.size].hex()[:512]}
             elem_size = e.size // count
-            flat = [self.decode_tree(buf, elem_type, off + i * elem_size, None, max_array, depth + 1) for i in range(count)]
+            flat = [self.decode_tree(buf, elem_type, off + i * elem_size, None, max_array, depth + 1, elem_size or None)
+                    for i in range(count)]
             if len(e.dims) > 1:
                 return T._reshape(flat, [(lb, lb + n - 1) for lb, n in e.dims])
             return flat
@@ -346,7 +353,7 @@ class TypeSystem:
                 if s.flags & F_PROPITEM or s.flags & F_STATIC:
                     continue
                 sub_entry = s if (s.subitems or s.dims) else None
-                d[s.name] = self.decode_tree(buf, s.type, off + s.offs, sub_entry, max_array, depth + 1)
+                d[s.name] = self.decode_tree(buf, s.type, off + s.offs, sub_entry, max_array, depth + 1, s.size or None)
             return d
         if e.type and e.type.lower() != e.name.lower() and self.get(e.type) is not None and not e.enum:
             return self.decode_tree(buf, e.type, off, None, max_array, depth + 1)

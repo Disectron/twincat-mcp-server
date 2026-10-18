@@ -52,6 +52,8 @@ RPC_E_DISCONNECTED = -2147417848        # 0x80010108
 RPC_S_SERVER_UNAVAILABLE = -2147023174  # 0x800706BA — the shell was closed/reopened; our DTE proxy points at a dead process
 DISP_E_EXCEPTION = -2147352567          # 0x80020009 — with scode E_POINTER after a solution reopen: stale System Manager
 E_POINTER = -2147467261                 # 0x80004003
+DISP_E_MEMBERNOTFOUND = -2147352573     # 0x80020003 — the item type has no such property (folder, property node)
+E_NOTIMPL = -2147467263                 # 0x80004001
 
 VS_WINDOW_ERRORLIST = "{D78612C7-9962-4B83-95D9-268046DAD23A}"
 VS_WINDOW_SOLUTION_EXPLORER = "{3AE79031-E1BC-11D0-8F78-00A0C9110057}"   # vsWindowKindSolutionExplorer
@@ -1114,25 +1116,40 @@ class XaeBackend:
         it = self._item(plc_project_path)
         names = _plcopen_names(xml_file)
 
-        def snapshot() -> dict[str, str]:
+        def snapshot() -> dict[str, str] | None:
+            """The project's objects by path — None when the listing cannot be trusted (it failed, or children were
+            unreadable): then nothing is compared and nothing is deleted on its basis."""
             try:
-                items = self.tree_children(plc_project_path, depth=8, max_items=20000)["items"]
+                tc = self.tree_children(plc_project_path, depth=8, max_items=20000)
             except Exception:  # noqa: BLE001
-                return {}
-            return {str(x.get("PathName")): str(x.get("Name")) for x in items if x.get("PathName")}
+                return None
+            if tc.get("unreadable_children") or tc.get("count", 0) >= 20000:
+                return None
+            return {str(x.get("PathName")): str(x.get("Name")) for x in tc["items"] if x.get("PathName")}
         before = snapshot()
+        if before is None and option == "replace":
+            raise XaeError(f"the objects of {plc_project_path} could not be listed completely, so the result of a 'replace' "
+                           "import could not be checked for duplicate copies — nothing was imported. Retry when XAE is idle.")
         # all four arguments: the folder structure from the XML is kept (bFolderStructure, default TRUE in the docs)
         try:
             self._retry(lambda: it.PlcOpenImport(xml_file, opts[option], "", True), "PlcOpenImport")
         except XaeError:
             self._retry(lambda: it.PlcOpenImport(xml_file, opts[option]), "PlcOpenImport")
         after = snapshot()
+        res: dict[str, Any] = {"imported": xml_file, "into": plc_project_path, "option": option, "objects_in_file": names}
+        if before is None or after is None:
+            res["warning"] = ("the project's objects could not be listed completely "
+                              f"{'before' if before is None else 'after'} the import: the objects added (and any "
+                              "renamed copies such as PRG_X_1) are not known — check the tree (xae_tree)")
+            return res
         added = {p: n for p, n in after.items() if p not in before}
-        res: dict[str, Any] = {"imported": xml_file, "into": plc_project_path, "option": option,
-                               "objects_in_file": names, "added": sorted(added)[:200]}
+        res["added"] = sorted(added)[:200]
         # R15: 'replace' replaces an object at the SAME place; when the XML carries no folder for it, TwinCAT puts it at
-        # the project root and renames it (PRG_X_1) because the name exists elsewhere — a silent duplicate
-        dup = [p for p, n in added.items() if any(re.fullmatch(re.escape(o) + r"_\d+", n, re.I) for o in names)]
+        # the project root and renames it (PRG_X_1) because the name exists elsewhere — a silent duplicate. A name the
+        # file itself holds (FB_Axis_2 imported on purpose) is never a copy.
+        in_file = {o.lower() for o in names}
+        dup = [p for p, n in added.items() if n.lower() not in in_file
+               and any(re.fullmatch(re.escape(o) + r"_\d+", n, re.I) for o in names)]
         if dup:
             res["duplicates_created"] = dup
             if option == "replace":
@@ -1142,12 +1159,18 @@ class XaeBackend:
     def _replace_from_copies(self, res: dict[str, Any], dup: list[str], added: dict[str, str],
                              before: dict[str, str]) -> dict[str, Any]:
         """R15: PlcOpenImport(replace) put objects that live in a folder at the project root as renamed copies
-        (PRG_X_1). Finish the replace ourselves: copy the copy's declaration / implementation — and those of its
-        methods, properties, actions, by name — into the existing object, then delete the copy. If an object cannot
-        be matched (no single original, or a different set of methods), every copy is still removed again and the
-        import is reported as not done, so the project is never left with duplicates."""
+        (PRG_X_1). Finish the replace ourselves, one object at a time:
+          1. read both trees (declaration / implementation of the object and of its methods, properties, actions —
+             every level) through the retrying COM path; different child names at any level → that object is not
+             touched;
+          2. keep the original's texts, write the copy's texts, read them back and compare;
+          3. on any failure write the kept texts back (and check them) — the original is as before;
+          4. delete a copy only when its original is verified: replaced, or restored, or never touched. A copy whose
+             original could not be restored is kept (it holds the new text) and named.
+        The XML file stays the source of the new text either way."""
         done: list[dict[str, str]] = []
-        failed: list[str] = []
+        failed: list[str] = []            # original untouched or restored
+        partial: list[str] = []           # original half-written, restore failed: its copy is kept
         for p in dup:
             base = re.sub(r"_\d+$", "", added[p])
             origs = [bp for bp, bn in before.items() if bn.lower() == base.lower()]
@@ -1155,12 +1178,38 @@ class XaeBackend:
                 failed.append(f"{added[p]}: {len(origs)} existing objects named {base}")
                 continue
             try:
-                self._sync_texts(self._item(p), self._item(origs[0]), origs[0])
-                done.append({"object": origs[0], "from_copy": p})
+                src = self._text_tree(self._item(p), added[p])
+                dst = self._text_tree(self._item(origs[0]), origs[0])
+                diff = _tree_diff(src, dst, origs[0])
             except XaeError as exc:
-                failed.append(f"{added[p]}: {exc}")
+                failed.append(f"{added[p]}: could not read the texts ({exc}) — nothing written")
+                continue
+            if diff:
+                failed.append(f"{added[p]}: {diff} — nothing written")
+                continue
+            try:
+                self._write_tree(src, dst)
+                bad = _tree_mismatch(src, self._text_tree(dst["_it"], origs[0]), origs[0])
+                if bad:
+                    raise XaeError(f"read back differs at {bad}")
+                done.append({"object": origs[0], "from_copy": p})
+                continue
+            except XaeError as exc:
+                err = str(exc)
+            try:                                                   # step 3: back to the original texts
+                self._write_tree(dst, dst)
+                bad = _tree_mismatch(dst, self._text_tree(dst["_it"], origs[0]), origs[0])
+                if bad:
+                    raise XaeError(f"read back differs at {bad}")
+                failed.append(f"{added[p]}: writing failed ({err}); {origs[0]} was restored to its earlier text")
+            except XaeError as exc:
+                partial.append(p)
+                failed.append(f"{added[p]}: writing failed ({err}) and restoring {origs[0]} failed too ({exc}) — "
+                              f"{origs[0]} may be half-written; the copy {p} was kept, it has the new text")
         removed, left = [], []
         for p in dup:
+            if p in partial:
+                continue
             parent, name = p.rsplit("^", 1)
             try:
                 self.tree_delete_child(parent, name)
@@ -1169,35 +1218,51 @@ class XaeBackend:
                 left.append(f"{p} ({exc})")
         res["copies_removed"] = removed
         if failed or left:
-            raise XaeError(f"PlcOpenImport(replace) could not replace {failed or ''} — TwinCAT imported the object(s) as "
+            raise XaeError(f"PlcOpenImport(replace) could not replace {failed} — TwinCAT imported the object(s) as "
                            f"copies at the project root; "
-                           + (f"the copies were removed again ({removed}), " if removed else "")
-                           + (f"these copies could NOT be removed: {left} (xae_tree_delete them), " if left else "")
-                           + ("objects replaced by text before the failure: " + str([d['object'] for d in done]) + ", " if done else "")
-                           + "nothing else changed. Update the object with xae_pou_set, or delete it and import again.")
+                           + (f"copies removed again: {removed}; " if removed else "")
+                           + (f"copies kept: {partial}; " if partial else "")
+                           + (f"copies that could NOT be removed: {left} (xae_tree_delete them); " if left else "")
+                           + (f"replaced and verified: {[d['object'] for d in done]}; " if done else "")
+                           + "every other original is unchanged. Update the object with xae_pou_set, or delete it and "
+                             "import again.")
         res["replaced"] = done
         res.pop("duplicates_created", None)
         res["note"] = ("PlcOpenImport put the object(s) at the project root as renamed copies (they live in a folder); "
-                       "their text was copied into the existing object(s) and the copies were deleted — save + build")
+                       "their text was copied into the existing object(s), read back and compared, and the copies were "
+                       "deleted — save + build")
         return res
 
-    def _sync_texts(self, src: Any, dst: Any, where: str, depth: int = 0) -> None:
-        def kids(it: Any) -> dict[str, Any]:
-            out: dict[str, Any] = {}
-            try:
-                for i in range(1, int(it.ChildCount) + 1):
-                    c = it.Child(i)
-                    out[str(c.Name)] = c
-            except Exception:  # noqa: BLE001
-                pass
-            return out
-        sk, dk = kids(src), kids(dst)
-        if set(sk) != set(dk):
-            raise XaeError(f"{where} has other methods/properties than the imported one (differ: {sorted(set(sk) ^ set(dk))})")
-        self._set_text(dst, _try(lambda: src.DeclarationText), _try(lambda: src.ImplementationText))
+    def _text_tree(self, it: Any, where: str, depth: int = 0) -> dict[str, Any]:
+        """{'decl', 'impl', 'kids': {name: tree}, '_it'} of an object, every level (up to 6). Read through _retry: a
+        busy or failing shell raises; a node type that has no such text property gives None."""
+        def prop(name: str) -> Callable[[], Any]:
+            def rd() -> Any:
+                try:
+                    v = getattr(it, name)
+                except AttributeError:
+                    return None
+                except Exception as exc:  # noqa: BLE001
+                    if getattr(exc, "hresult", None) in (DISP_E_MEMBERNOTFOUND, E_NOTIMPL):
+                        return None
+                    raise
+                return None if v is None else str(v)
+            return rd
+        out: dict[str, Any] = {"_it": it, "decl": self._retry(prop("DeclarationText"), f"{where} DeclarationText"),
+                               "impl": self._retry(prop("ImplementationText"), f"{where} ImplementationText"), "kids": {}}
+        n = int(self._retry(lambda: it.ChildCount, f"{where} ChildCount"))
         if depth < 6:
-            for n in sk:
-                self._sync_texts(sk[n], dk[n], f"{where}^{n}", depth + 1)
+            for i in range(1, n + 1):
+                c = self._retry(lambda i=i: it.Child(i), f"{where} Child({i})")
+                nm = str(self._retry(lambda c=c: c.Name, f"{where} Child({i}).Name"))
+                out["kids"][nm] = self._text_tree(c, f"{where}^{nm}", depth + 1)
+        return out
+
+    def _write_tree(self, src: dict[str, Any], dst: dict[str, Any]) -> None:
+        """Write src's texts into dst's items, every level (same child names, checked before)."""
+        self._set_text(dst["_it"], src["decl"], src["impl"])
+        for nm, sub in src["kids"].items():
+            self._write_tree(sub, dst["kids"][nm])
 
     def plcopen_export(self, plc_project_path: str, items: list[str], xml_file: str) -> dict[str, Any]:
         plc_project_path = _plc_split(plc_project_path)[1]          # R14: 'TIPC^X' raised AttributeError
@@ -1553,6 +1618,38 @@ def _com_call(obj: Any, name: str, *args: Any) -> Any:
         method_flag = 1                                   # DISPATCH_METHOD
     dispid = ole.GetIDsOfNames(name)
     return ole.Invoke(dispid, 0, method_flag, True, *args)
+
+
+def _tree_diff(a: dict[str, Any], b: dict[str, Any], where: str) -> str | None:
+    """Where two text trees have other children (names, case-insensitive like IEC), or None."""
+    ka, kb = {k.lower() for k in a["kids"]}, {k.lower() for k in b["kids"]}
+    if ka != kb:
+        return f"{where} has other methods/properties/actions than the imported one (differ: {sorted(ka ^ kb)})"
+    if set(a["kids"]) != set(b["kids"]):
+        return f"{where}: child names differ in case ({sorted(set(a['kids']) ^ set(b['kids']))})"
+    for k in a["kids"]:
+        d = _tree_diff(a["kids"][k], b["kids"][k], f"{where}^{k}")
+        if d:
+            return d
+    return None
+
+
+def _norm_text(t: str | None) -> str | None:
+    return None if t is None else "\n".join(ln.rstrip() for ln in t.replace("\r\n", "\n").split("\n")).strip("\n")
+
+
+def _tree_mismatch(want: dict[str, Any], got: dict[str, Any], where: str) -> str | None:
+    """First place where a read-back tree does not hold the wanted text (only where a text was wanted)."""
+    for key in ("decl", "impl"):
+        if want[key] is not None and _norm_text(want[key]) != _norm_text(got.get(key)):
+            return f"{where} ({'declaration' if key == 'decl' else 'implementation'})"
+    for k, sub in want["kids"].items():
+        if k not in got["kids"]:
+            return f"{where}^{k} (gone)"
+        m = _tree_mismatch(sub, got["kids"][k], f"{where}^{k}")
+        if m:
+            return m
+    return None
 
 
 def _try(fn: Callable[[], Any]) -> Any:

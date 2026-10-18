@@ -90,6 +90,18 @@ def test_r42_pointer_to_fb_is_an_address_not_the_fb():
     assert [(l.path, l.type) for l in hl] == [("MAIN.st.pCurrent", "POINTER TO FB_TestSuite"), ("MAIN.st.pRaw", "POINTER TO BYTE")]
     d = ts.decode_tree(bytes(16), "ST_Holder")
     assert d == {"pCurrent": None, "pRaw": None}
+    # review: a 32-bit runtime (CX9020) has 4-byte pointers — without a table entry the declared size is used
+    h32 = DtEntry("ST_H32", "", 8, 0, 65, 0, "", [], [DtEntry("pRaw", "POINTER TO BYTE", 4, 0, 65, 0, ""),
+                                                      DtEntry("nNext", "UDINT", 4, 4, 19, 0, "")])
+    ts.table["st_h32"] = h32
+    ts.table["udint"] = DtEntry("UDINT", "", 4, 0, 19, 0, "")
+    buf32 = (0x00C0FFEE).to_bytes(4, "little") + (7).to_bytes(4, "little")
+    l32 = ts.leaves("MAIN.h", "ST_H32")
+    assert [(l.path, l.size) for l in l32] == [("MAIN.h.pRaw", 4), ("MAIN.h.nNext", 4)]
+    assert ts.decode_leaf(buf32, l32[0]) == "0x00C0FFEE" and ts.decode_leaf(buf32, l32[1]) == 7
+    assert ts.decode_tree(buf32, "ST_H32") == {"pRaw": "0x00C0FFEE", "nNext": 7}
+    root = ts.leaves("GVL.pX", "POINTER TO WORD", size=4)                       # a root symbol of 4 bytes
+    assert root[0].size == 4 and ts.decode_tree(buf32[:4], "POINTER TO WORD", size=4) == "0x00C0FFEE"
     # an ordinary alias of a struct (same size) is still expanded
     alias = DtEntry("T_TestAlias", "ST_Test", 39, 0, 65, 0, "")
     ts.table["t_testalias"] = alias

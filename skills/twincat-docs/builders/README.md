@@ -173,7 +173,7 @@ python manuals_db.py stats --json
    (`N added, N updated, N removed, N unchanged, N failed`) and `meta.text_format` are written.
 5. **Page text format.** `TEXT_FORMAT` (currently `2`) names the page text and toc rules below. A database whose
    `meta.text_format` differs (a version 1 or 2 database has none: format `1`) is reported as `outdated`, and the next
-   `update` reads every manual again (`page text format 1 -> 2: every manual is read again`). An interrupted run leaves
+   `update` reads every manual again (`page text format 1 -> 2: every manual is read again`). An interrupted run, or a re-read in which a manual failed (that manual keeps its old rows), leaves
    the old format in `meta`, so the next run reads all manuals again.
 
 ### Index logic per PDF
@@ -190,8 +190,10 @@ python manuals_db.py stats --json
   page); otherwise the line is kept (`Table 3 of 9`). Never removed: signal words (`NOTE`, `NOTICE`, `CAUTION`,
   `WARNING`, `DANGER`, `ATTENTION`, `HINWEIS`, `VORSICHT`, `WARNUNG`, `GEFAHR`, `ACHTUNG`, `TIP`, `EXAMPLE`,
   `BEISPIEL`), a numbered toc heading or its first line, the second line of a wrapped toc heading. A removed header of
-  8 or more characters glued to the start of a line is cut off when the rest starts with a digit or a capital letter
-  (`Calibration and compensation4.4 Calibration` → `4.4 Calibration`); glued to the end of a line, it is cut off.
+  8 or more characters glued to the start of a line is cut off when no space separates it and the rest starts with a
+  digit or a capital letter (`Calibration and compensation4.4 Calibration` → `4.4 Calibration`), or when a section
+  number follows (`Commissioning 4.4 Calibration`); a sentence such as `Commissioning EtherCAT slaves is …` is left
+  alone. Glued to the end of a line without a space, after a digit or punctuation (`79Commissioning`), it is cut off.
   Limit: a table header row repeated at the top of 3+ pages (and 5 %) is removed from those pages too. The update prints
   the number of removed header/footer texts per manual.
 - Title: PDF metadata title; if empty, the largest text span on page 1.

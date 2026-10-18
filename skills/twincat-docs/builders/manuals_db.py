@@ -264,8 +264,10 @@ def _strip_running(pages: list[str], chapter_titles: set[str],
     """N37: running headers, footers and margin labels ('Commissioning', 'EL3356 Version: 2.4  79') were part of the
     page text and glued to headings ('Calibration and compensation4.4 Calibration'). A line among the first or last
     three of a page whose text (digits as '#') repeats there on 3 pages and 5 % of the pages — or on 2 when it is a
-    chapter title — is removed (signal words like NOTE / WARNING are never); such a header glued to the start or end of a line is cut off when what remains starts like a
-    heading. -> (pages, the header texts removed)"""
+    chapter title — is removed (signal words like NOTE / WARNING are never); such a header glued to the start of a line is cut off when
+    no space separates it and the rest starts with a digit or a capital, or when a section number follows; glued to
+    the end of a line without a space, after a digit or punctuation, it is cut off too. -> (pages, the header texts
+    removed)"""
     from collections import Counter
     split = [[ln for ln in t.split("\n")] for t in pages]
     edge = lambda ls: [i for i, ln in enumerate(ls) if ln.strip()][:_HEAD_LINES] + \
@@ -301,12 +303,16 @@ def _strip_running(pages: list[str], chapter_titles: set[str],
                 ls[i] = ""
                 continue
             for pat in pats:
-                m = pat.match(ls[i].lstrip())
-                if m and m.end() < len(ls[i].lstrip()) and re.match(r"\s*[\dA-ZÄÖÜ]", ls[i].lstrip()[m.end():]):
-                    ls[i] = ls[i].lstrip()[m.end():].lstrip()
+                line = ls[i].lstrip()
+                m = pat.match(line)
+                rest = line[m.end():] if m else ""
+                # glued without a space ('…compensation4.4 Calibration'), or followed by a section number: a header
+                # in front of a heading. 'Commissioning EtherCAT slaves is …' (a sentence) is left alone.
+                if m and rest and (re.match(r"[\dA-ZÄÖÜ]", rest) or re.match(r"\s+\d+(?:\.\d+)*\s+[A-ZÄÖÜ]", rest)):
+                    ls[i] = rest.lstrip()
                     break
-                m = re.search(r"(?<=\S)\s*(?:" + pat.pattern + r")\s*$", ls[i], re.I)
-                if m:
+                m = re.search(r"(?<=[^\s])(?:" + pat.pattern + r")\s*$", ls[i], re.I)   # glued to the end, no space
+                if m and re.match(r"[A-ZÄÖÜ]", ls[i][m.start():]) and not re.search(r"[A-Za-zÄÖÜäöü]$", ls[i][:m.start()]):
                     ls[i] = ls[i][:m.start()].rstrip()
                     break
         out.append("\n".join(ls))
@@ -494,7 +500,9 @@ def _update(args, folder: Path, db: Path, lock: "UpdateLock") -> None:
     con.commit()
     if added or changed or removed:
         con.execute("INSERT INTO fts(fts) VALUES('optimize')"); con.commit()
-    _meta(con, state="idle", files_done=len(found), heartbeat=f"{time.time():.0f}", text_format=TEXT_FORMAT,
+    if not (reread and failed):     # a manual that failed during a re-read keeps its old-format rows: read all again next time
+        _meta(con, text_format=TEXT_FORMAT)
+    _meta(con, state="idle", files_done=len(found), heartbeat=f"{time.time():.0f}",
           last_update=time.strftime("%Y-%m-%d %H:%M:%S"),
           last_result=f"{added} added, {changed} updated, {removed} removed, {unchanged} unchanged, {failed} failed")
     print(f"done: {added} added, {changed} updated, {removed} removed, {unchanged} unchanged, {failed} failed "

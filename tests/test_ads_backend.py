@@ -213,7 +213,19 @@ def test_symbol_cache_follows_symbol_version(ads, monkeypatch):
     assert loads["n"] == 2                     # online change: reloaded
 
 
-def test_r42_dump_budget_order_streaming_and_no_rename_after_the_call_ended(ads, tmp_path):
+def _big_root(monkeypatch):
+    """A 4,000-element UDINT array (≈ 4,000 CSV rows) on the fake runtime."""
+    import struct as _s
+    from tests import fake_ads as F
+    from tests.fake_ads import _dt, encode_entry
+    arr = _dt("ARRAY [1..4000] OF UDINT", "UDINT", 16000, dtype=19, dims=[(1, 4000)])
+    monkeypatch.setattr(F, "SYMBOLS", F.SYMBOLS + [("GVL_Big.aValues", arr.name, 16000, None, 0)])
+    monkeypatch.setattr(F, "DATATYPES", F.DATATYPES + [arr])
+    monkeypatch.setattr(F, "DATATYPE_BLOB", b"".join(encode_entry(e) for e in F.DATATYPES))
+    monkeypatch.setattr(F, "RAW_IMAGES", {**F.RAW_IMAGES, "GVL_Big.aValues": _s.pack("<4000I", *range(4000))})
+
+
+def test_r42_dump_budget_order_streaming_and_no_rename_after_the_call_ended(ads, tmp_path, monkeypatch):
     import json, threading
     out = tmp_path / "dumps"
     full = ads.dump(None, False, str(out), own_roots={"prg_test"})
@@ -230,6 +242,15 @@ def test_r42_dump_budget_order_streaming_and_no_rename_after_the_call_ended(ads,
     # max_total_mb bounds what is written
     tiny = ads.dump(None, False, str(out), max_total_bytes=200)
     assert tiny["truncated"] and "size limit" in tiny["truncated_reason"] and tiny["csv_bytes"] + tiny["json_bytes"] < 2000
+    # review: one big root — its JSON (written after its CSV rows) counts against the limit as well
+    _big_root(monkeypatch)
+    ads._symcache.clear()
+    ads._dtcache.clear()
+    lim = 60_000
+    one = ads.dump("GVL_Big.*", False, str(out), max_total_bytes=lim)
+    assert one["truncated"] and one["csv_bytes"] + one["json_bytes"] < lim * 1.2, one
+    doc = json.loads(open(one["json"], encoding="utf-8").read())
+    assert doc["values"]["GVL_Big.aValues"]["_truncated"] is True
     # the client's timeout set the cancel event while the dump was finishing: nothing is renamed into place
     before = sorted(p.name for p in out.iterdir())
     ev = threading.Event()
@@ -255,3 +276,12 @@ async def test_r42_timeout_names_the_phase_not_the_router(monkeypatch, project_d
     with pytest.raises(ToolError, match="phase: writing JSON") as ei:
         await app.ads_call(lambda: _t.sleep(1.5), timeout=0.2, bulk=True, timeout_msg=lambda: "phase: writing JSON")
     assert "router" not in str(ei.value)
+
+
+def test_r42_review_dump_json_is_strict_for_nan_and_infinity():
+    import json
+    from twincat_mcp.ads_backend import _json_strict
+    v = {"r": float("nan"), "a": [1.5, float("inf"), float("-inf")], "s": "x"}
+    txt = _json_strict(v)
+    assert "NaN" in txt and json.loads(txt, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c))) == \
+        {"r": "NaN", "a": [1.5, "Infinity", "-Infinity"], "s": "x"}

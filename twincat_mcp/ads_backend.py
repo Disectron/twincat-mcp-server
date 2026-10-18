@@ -35,7 +35,7 @@ from pyads.structs import AmsAddr
 
 from .config import AdsConfig
 from . import types_tc as T
-from .ads_types import TypeSystem, Leaf, parse_table
+from .ads_types import TypeSystem, Leaf, parse_table, _RE_INDIRECT
 
 SYSTEM_SERVICE_PORT = 10000
 ROUTER_PORT = 1
@@ -440,7 +440,7 @@ class AdsBackend:
             # fallback: published member symbols
             mem = self.members(s.name, port)
             return s, [Leaf(m.name, m.type, m.index_offset - s.index_offset, m.size, 0, None, "from symbol table") for m in mem]
-        return s, ts.leaves(s.name, s.type, max_leaves)
+        return s, ts.leaves(s.name, s.type, max_leaves, size=s.size)
 
     def roots(self, pattern: str | None = None, include_system: bool = False, port: int | None = None) -> list[SymbolEntry]:
         """Top-level symbols: those not nested under another symbol in the table."""
@@ -523,7 +523,7 @@ class AdsBackend:
         ts = self.typesystem(False, port)
         out: dict[str, Any] = {"name": s.name, "type": s.type, "size": s.size, "flags": s.flag_names()}
         if ts is not None and ts.get(s.type) is not None:
-            out["value"] = ts.decode_tree(raw, s.type)
+            out["value"] = ts.decode_tree(raw, s.type, size=s.size)
             out["decoder"] = "datatype-table"
         else:
             tt = T.parse_type(s.type, s.size)
@@ -631,7 +631,7 @@ class AdsBackend:
                 prog["phase"] = "decoding"
                 if ts is not None and ts.get(r.type) is not None:
                     left = max_leaves - n_leaves
-                    lv = ts.leaves(r.name, r.type, left + 1)
+                    lv = ts.leaves(r.name, r.type, left + 1, size=r.size)
                     cut = len(lv) > left
                     lv = lv[:left]
                     prog["phase"] = "writing CSV"
@@ -643,10 +643,12 @@ class AdsBackend:
                             vals[leaf.path] = val
                         if len(preview) < 50:
                             preview.append({"path": leaf.path, "type": leaf.type, "value": val})
-                        if k % 2000 == 1999:
-                            if cancelled():
+                        if k % 256 == 255:
+                            if k % 2048 == 2047 and cancelled():
                                 raise AdsError(f"cancelled while writing {r.name} — the call timed out or was stopped")
-                            if cw.n + jw.n >= max_total_bytes:
+                            # this root's JSON is not written yet: count it as large as its CSV rows (review: the
+                            # in-flight root could reach about twice max_total_mb)
+                            if cw.n + jw.n + (cw.n - c0) >= max_total_bytes:
                                 cut = True
                                 lv = lv[:k + 1]
                                 vals = {x.path: vals.get(x.path) for x in lv} if vals else {
@@ -660,15 +662,17 @@ class AdsBackend:
                         truncated = truncated or (f"leaf limit: max_leaves {max_leaves}" if n_leaves >= max_leaves
                                                   else "size limit: max_total_mb written")
                     else:
-                        node = ts.decode_tree(raw, r.type)
+                        node = ts.decode_tree(raw, r.type, size=r.size)
                 else:
-                    node = TypeSystem._decode_scalar(raw, 0, r.type, None, None)
+                    node = (T.fmt_pointer(int.from_bytes(raw, "little"), len(raw))
+                            if _RE_INDIRECT.match(r.type or "") and len(raw) in (4, 8)
+                            else TypeSystem._decode_scalar(raw, 0, r.type, None, None))
                     w.writerow([r.name, r.type, _csv_val(node)])
                     n_leaves += 1
                     lv = [None]
                     if len(preview) < 50:
                         preview.append({"path": r.name, "type": r.type, "value": node})
-                jw.write(("" if first else ",") + "\n" + json.dumps(r.name) + ": " + json.dumps(node, default=str))
+                jw.write(("" if first else ",") + "\n" + json.dumps(r.name) + ": " + _json_strict(node))
                 first = False
                 sizes.append({"root": r.name, "leaves": len(lv), "csv_bytes": cw.n - c0, "json_bytes": jw.n - j0})
             jw.write("\n}, " + json.dumps({"roots": len(roots), "leaves": n_leaves, "truncated": bool(truncated)})[1:] + "\n")
@@ -1251,6 +1255,24 @@ def _parse_discovery(data: bytes) -> dict[str, Any] | None:
     if raw_tags:
         out["raw_tags"] = raw_tags
     return out
+
+
+def _json_strict(v: Any) -> str:
+    """JSON that every parser reads: a REAL that is NaN / ±Infinity becomes the string "NaN" / "Infinity" /
+    "-Infinity" (json.dumps writes bare NaN, which strict parsers refuse)."""
+    import json
+    try:
+        return json.dumps(v, default=str, allow_nan=False)
+    except ValueError:
+        def fix(x: Any) -> Any:
+            if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
+                return "NaN" if x != x else ("Infinity" if x > 0 else "-Infinity")
+            if isinstance(x, dict):
+                return {k: fix(y) for k, y in x.items()}
+            if isinstance(x, (list, tuple)):
+                return [fix(y) for y in x]
+            return x
+        return json.dumps(fix(v), default=str, allow_nan=False)
 
 
 class _Counting:

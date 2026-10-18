@@ -498,7 +498,7 @@ def test_r15_plcopen_replace_that_duplicates_is_an_error(xae, tmp_path):
         sm.items[it.PathName] = it
     proj.on_import = dup
     # no original to replace: the copy is removed again and the import reported as not done
-    with pytest.raises(X.XaeError, match=r"could not replace .*0 existing objects named PRG_TcUnitRunner.*copies were removed again"):
+    with pytest.raises(X.XaeError, match=r"could not replace .*0 existing objects named PRG_TcUnitRunner.*copies removed again"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
     assert proj.deleted == ["PRG_TcUnitRunner_1"]
     proj.on_import = None
@@ -538,9 +538,89 @@ def test_r15_retest_replace_is_finished_by_copying_the_text(xae, tmp_path):
     # a copy with other methods cannot be mapped: removed again, nothing else changed
     proj._children = [c for c in proj._children if c.Name != "PRG_TcUnitRunner_1"]
     proj.on_import = lambda: dup(("Run", "Extra"))
-    with pytest.raises(X.XaeError, match=r"other methods/properties.*Extra.*copies were removed again"):
+    with pytest.raises(X.XaeError, match=r"other methods/properties.*extra.*nothing written.*copies removed again"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
     assert proj.deleted[-1] == "PRG_TcUnitRunner_1" and orig.ImplementationText == "// new body"
+
+
+def _r15_setup(sm, tmp_path, file_names=("PRG_TcUnitRunner",)):
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    meth = FakeItem("Run", "TIPC^Plc^Plc Project^95_UnitTests^PRG_TcUnitRunner^Run")
+    orig = FakeItem("PRG_TcUnitRunner", "TIPC^Plc^Plc Project^95_UnitTests^PRG_TcUnitRunner", [meth])
+    folder = FakeItem("95_UnitTests", "TIPC^Plc^Plc Project^95_UnitTests", [orig])
+    proj._children.append(folder)
+    for it in (folder, orig, meth):
+        sm.items[it.PathName] = it
+    f = tmp_path / "r.xml"
+    f.write_text("<project><types><pous>" + "".join(f'<pou name="{n}" pouType="program"/>' for n in file_names)
+                 + "</pous></types></project>")
+
+    def dup(name="PRG_TcUnitRunner_1"):
+        k = FakeItem("Run", f"TIPC^Plc^Plc Project^{name}^Run")
+        k.ImplementationText = "// new Run"
+        it = FakeItem(name, f"TIPC^Plc^Plc Project^{name}", [k])
+        it.DeclarationText, it.ImplementationText = "PROGRAM PRG_TcUnitRunner // new", "// new body"
+        proj._children.append(it)
+        sm.items[it.PathName], sm.items[k.PathName] = it, k
+        return it
+    return proj, orig, meth, f, dup
+
+
+class _FailingText(FakeItem):
+    """A method item whose ImplementationText cannot be written (fails n times, then works)."""
+    def __init__(self, base, fails):
+        super().__init__(base.Name, base.PathName)
+        object.__setattr__(self, "_impl", base.ImplementationText)
+        object.__setattr__(self, "_fails", fails)
+
+    def __setattr__(self, k, v):
+        if k == "ImplementationText" and getattr(self, "_fails", 0):
+            object.__setattr__(self, "_fails", self._fails - 1)
+            raise ComError(-2147467259, "write refused")
+        object.__setattr__(self, "_impl" if k == "ImplementationText" else k, v)
+
+    def __getattribute__(self, k):
+        if k == "ImplementationText":
+            return object.__getattribute__(self, "_impl")
+        return object.__getattribute__(self, k)
+
+
+def test_r15_review_a_failed_write_restores_the_original_and_a_failed_restore_keeps_the_copy(xae, tmp_path):
+    """Review of the 0.8.9 fix: a write that fails half-way left the original half-updated and deleted the copy."""
+    be, dte, sm = xae
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path)
+    bad = _FailingText(meth, fails=1)                     # the method write fails once: restore works
+    orig._children = [bad]
+    sm.items[bad.PathName] = bad
+    proj.on_import = dup
+    with pytest.raises(X.XaeError, match=r"writing failed .*was restored to its earlier text.*copies removed again"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert orig.DeclarationText == "// decl of PRG_TcUnitRunner" and orig.ImplementationText == "// impl of PRG_TcUnitRunner"
+    assert bad.ImplementationText == "// impl of Run" and proj.deleted == ["PRG_TcUnitRunner_1"]
+    # the write and the restore both fail: the copy is kept and the original is named as possibly half-written
+    proj._children = [c for c in proj._children if c.Name != "PRG_TcUnitRunner_1"]
+    object.__setattr__(bad, "_fails", 5)
+    with pytest.raises(X.XaeError, match=r"restoring .*PRG_TcUnitRunner failed too.*may be half-written.*copies kept"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert proj.deleted == ["PRG_TcUnitRunner_1"]                  # not deleted a second time
+
+
+def test_r15_review_names_in_the_file_and_an_unreadable_tree(xae, tmp_path):
+    be, dte, sm = xae
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path, ("PRG_TcUnitRunner", "PRG_TcUnitRunner_2"))
+    # PRG_TcUnitRunner_2 is in the file: imported on purpose, never treated as a copy of PRG_TcUnitRunner
+    proj.on_import = lambda: dup("PRG_TcUnitRunner_2")
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert "duplicates_created" not in r and proj.deleted == [] and orig.ImplementationText == "// impl of PRG_TcUnitRunner"
+    # the tree cannot be listed completely: a 'replace' import is refused before anything happens
+    real = be.tree_children
+    be.tree_children = lambda *a, **k: {**real(*a, **k), "unreadable_children": [{"parent": "x", "index": 1}]}
+    n = len(proj.imported)
+    with pytest.raises(X.XaeError, match="could not be listed completely.*nothing was imported"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert len(proj.imported) == n
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "none")               # other options: imported, warned
+    assert "not known" in r["warning"] and "added" not in r
 
 
 def test_n10_n45_online_commands_and_check_all_objects_via_the_automation_interface(xae):
