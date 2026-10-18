@@ -1526,7 +1526,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await app.kb_call(app.kb.search, query, kinds, project, limit)
 
     @mcp.tool(annotations=READ)
-    async def hw_lookup(query: str, limit: int = 3, revision: int | None = None,
+    async def hw_lookup(query: str, limit: int = 3, revision: int | str | None = None,
                         detail: str = "newest") -> dict[str, Any]:
         """EtherCAT terminal/box data from the installed ESI files (K4): name, product code, revisions, PDOs with
         their entries (index, subindex, bit length, type), CoE objects. query = type ('EL2008'), part of a name, or a

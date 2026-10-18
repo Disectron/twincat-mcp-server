@@ -148,7 +148,7 @@ def test_books_and_index_all_and_the_reindex_rule(idx, pkg, tmp_path):
 
 # Fingerprint of the code that turns a page into stored rows. When this test fails: the extraction logic changed —
 # bump infosys.INDEXER_VERSION (every index is rebuilt once) and update the fingerprint below together.
-INDEXER_FINGERPRINT = (3, "ba51ea3a1ce20ebb")     # 3 is not released yet (0.8.9 shipped 2): one rebuild
+INDEXER_FINGERPRINT = (3, "0486bae1a19633ae")     # 3 is not released yet (0.8.9 shipped 2): one rebuild
 
 
 def _indexer_source_hash() -> str:
@@ -157,7 +157,8 @@ def _indexer_source_hash() -> str:
     from twincat_mcp import helpviewer as hv
     from twincat_mcp import infosys as inf
     parts = [inspect.getsource(o) for o in (inf._MdWalker, inf.html_to_doc, inf.parse_declaration, inf.classify,
-                                            inf._parse_vars, inf._descriptions, inf._library_from_tables,
+                                            inf._parse_vars, inf._descriptions, inf._table_kind,
+                                            inf._member_tables, inf.HtmlDoc, inf._library_from_tables,
                                             inf.InfosysIndex._store, inf._doc_version, hv.body_html, hv.page_meta)]
     norm = ["\n".join(ln.rstrip() for ln in p.splitlines() if ln.strip() and not ln.strip().startswith("#")) for p in parts]
     return hashlib.sha256("\n\n".join(norm).encode()).hexdigest()[:16]

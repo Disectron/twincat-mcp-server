@@ -193,6 +193,7 @@ class HtmlDoc:
     code_blocks: list[tuple[str, str]] = field(default_factory=list)   # (language, code)
     tables: list[list[list[str]]] = field(default_factory=list)          # table -> rows -> cells
     headings: list[tuple[int, str]] = field(default_factory=list)
+    table_titles: list[str] = field(default_factory=list)               # per table: the heading above it ('Methods')
     meta: dict[str, str] = field(default_factory=dict)                   # <meta name=…> (Help Viewer pages)
     crumb: str = ""                                                      # breadcrumb (Help Viewer pages)
 
@@ -250,6 +251,7 @@ class _MdWalker(HTMLParser):
         width = max(len(r) for r in rows)
         rows = [r + [""] * (width - len(r)) for r in rows]
         self.doc.tables.append(rows)
+        self.doc.table_titles.append(self.doc.headings[-1][1] if self.doc.headings else "")
         esc = lambda c: c.replace("|", "\\|")  # noqa: E731
         lines = ["| " + " | ".join(esc(c) for c in rows[0]) + " |", "|" + "---|" * width]
         lines += ["| " + " | ".join(esc(c) for c in r) + " |" for r in rows[1:]]
@@ -561,30 +563,40 @@ def _parse_vars(body: str) -> list[dict[str, Any]]:
     return out
 
 
-def _table_kind(rows: list[list[str]]) -> str | None:
-    """What a 'Name | …' table of a symbol page lists: 'properties' (an Access column: Get, Set), 'methods' (a
-    Definition location column, or every name written as a call 'Reset()'), 'vars' (inputs, outputs, members, enum
-    values), None (not a Name table)."""
+def _table_kind(rows: list[list[str]], title: str = "") -> str | None:
+    """What a 'Name | …' table of a symbol page lists: 'methods' / 'properties' by the heading above it (an interface
+    page has 'Name | Description' under 'Methods' — the header alone says nothing), else by its columns: Access, or
+    Type with Definition location → properties; Definition location, or every name written as a call → methods;
+    otherwise 'vars' (inputs, outputs, members, enum values). None: not a Name table."""
     if not rows:
         return None
     hdr = [c.strip().lower() for c in rows[0]]
     if not hdr or "name" not in hdr[0]:
         return None
-    if any("access" in h for h in hdr):
+    t = (title or "").lower()
+    if "method" in t:
+        return "methods"
+    if "propert" in t:
+        return "properties"
+    if re.search(r"\b(?:inputs?|outputs?|in[ /_-]?outs?|parameters?|members?|values?|variables?)\b", t):
+        return "vars"
+    has = lambda key: any(key in h for h in hdr)  # noqa: E731
+    if has("access") or (has("type") and has("definition location")):
         return "properties"
     names = [r[0].strip() for r in rows[1:] if r and r[0].strip()]
-    if any("definition location" in h for h in hdr) or (names and all(n.endswith(")") for n in names)):
+    if has("definition location") or (names and all(n.endswith(")") for n in names)):
         return "methods"
     return "vars"
 
 
-def _member_tables(tables: list[list[list[str]]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """N74: the Methods and Properties tables of an FB page as their own lists — they were read as variable
-    descriptions, so 'description' carried the method list ('Configure()': …)."""
+def _member_tables(tables: list[list[list[str]]], titles: list[str] | None = None
+                   ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """N74: the Methods and Properties tables of an FB / interface page as their own lists — they were read as
+    variable descriptions, so 'description' carried the method list ('Configure()': …)."""
     methods: list[dict[str, Any]] = []
     props: list[dict[str, Any]] = []
-    for rows in tables:
-        kind = _table_kind(rows)
+    for k, rows in enumerate(tables):
+        kind = _table_kind(rows, (titles or [])[k] if titles and k < len(titles) else "")
         if kind not in ("methods", "properties"):
             continue
         hdr = [c.strip().lower() for c in rows[0]]
@@ -607,12 +619,12 @@ def _member_tables(tables: list[list[list[str]]]) -> tuple[list[dict[str, Any]],
     return methods, props
 
 
-def _descriptions(tables: list[list[list[str]]]) -> dict[str, str]:
+def _descriptions(tables: list[list[list[str]]], titles: list[str] | None = None) -> dict[str, str]:
     """Infosys description tables of variables: header has Name | Type | Description (sometimes without Type) —
     not the Methods / Properties tables (_member_tables)."""
     desc: dict[str, str] = {}
-    for rows in tables:
-        if _table_kind(rows) != "vars":
+    for k, rows in enumerate(tables):
+        if _table_kind(rows, (titles or [])[k] if titles and k < len(titles) else "") != "vars":
             continue
         hdr = [c.strip().lower() for c in rows[0]]
         di = next((i for i, h in enumerate(hdr) if "descr" in h or "meaning" in h or "comment" in h), len(hdr) - 1)
@@ -648,7 +660,7 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
     decl: dict[str, Any] = {"name": title.strip(), "kind": kind, "declaration": None, "extends": None, "implements": None,
                             "return_type": None, "inputs": [], "outputs": [], "in_out": [], "members": [],
                             "enum_values": [], "description": {}}
-    desc = _descriptions(doc.tables)
+    desc = _descriptions(doc.tables, doc.table_titles)
     fragments: list[str] = []   # header-less VAR_INPUT/VAR_OUTPUT blocks (how Infosys documents most FBs)
     for _lang, code in doc.code_blocks:
         m = _HEAD_RE.search(code)
@@ -707,7 +719,7 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
         decl["declaration"] = ((f"{head} {decl['name']}  (* header reconstructed *)\n" if head else "")
                                + "\n".join(fragments))
     decl["description"] = desc
-    methods, props = _member_tables(doc.tables)
+    methods, props = _member_tables(doc.tables, doc.table_titles)
     if methods:
         decl["methods"] = methods
     if props:
@@ -778,7 +790,9 @@ def _tidy_declaration(decl: dict[str, Any]) -> None:
             if not ev.get("description") and comments.get(ev.get("name", "")):
                 ev["description"] = comments[ev["name"]]
     desc = decl.get("description")
-    if isinstance(desc, dict) and desc:
+    if isinstance(desc, dict) and not desc:
+        decl.pop("description", None)                 # nothing to say: no empty field
+    elif isinstance(desc, dict):
         carried = {it.get("name") for key in ("inputs", "outputs", "in_out", "members", "enum_values")
                    for it in (decl.get(key) or []) if it.get("description")}
         if decl.get("return_description"):

@@ -528,3 +528,57 @@ def test_n73_hw_lookup_output_size_is_controllable(kb):
     assert len(o["devices"]) == 1 and "pdo" in o["devices"][0]
     with pytest.raises(K.KnowledgeError, match="detail must be one of"):
         k.hw_lookup("EL2008", detail="all")
+
+
+def test_review_known_errors_and_kb_search_edge_cases(kb, project_dir, tmp_path):
+    """Review of N70–N74: the first table match shadowed the compiler patterns ('bLicenseOk' read as a license
+    error); an offset '0x7' turned ADSError 1796 into 7; 'error code 7' of any program was an ADS error; annotate()
+    took a filled-in name for a tool name and dropped the annotation; a code query that only CONTAINED a known-error
+    text ('Valve license') was not searched; a one-word query of a keyword ('WHILE') was refused; INT → BOOL
+    suggested BOOL_TO_BOOL."""
+    assert "'bLicenseOk' is not declared" in K.known_error("C0046: Identifier 'bLicenseOk' not defined")["cause"]
+    assert K.known_error("FB_LicenseCheck") is None
+    assert K.known_error("ADSError 1796 at offset 0x7")["cause"].startswith("reading/writing this index group")
+    assert K.known_error("exited with error code 7") is None
+    assert "[known cause:" in K.annotate("C0046: Identifier 'my_var' not defined")
+    f = K.known_error("C0032: Cannot convert type 'INT' to type 'BOOL'")["fix"]
+    assert "(value <> 0)" in f and "BOOL_TO_BOOL" not in f, f
+    assert "not assignment-compatible" in K.known_error("C0032: Cannot convert type 'ST_Foo' to type 'INT'")["fix"]
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    k.add_project(str(project_dir), "sample")
+    r = k.search("Valve license")
+    assert r["known_error"] and r["hits"] and r["hits"][0]["unit"].startswith("FB_Valve"), r
+    assert isinstance(k.search("WHILE")["hits"], list)                   # searched as written, not refused
+    # every word common in a big project: the least common one still picks units (the tier was empty)
+    big = tmp_path / "big" / "POUs"
+    big.mkdir(parents=True)
+    for i in range(30):
+        words = "Valve" if i < 18 else "Pump"           # no unit has both; both are on more than 20 % of them
+        (big / f"PRG_{i}.TcPOU").write_text(
+            f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="PRG_{i}"><Declaration><![CDATA[PROGRAM '
+            f'PRG_{i}\nVAR\nEND_VAR]]></Declaration><Implementation><ST><![CDATA[// {words}\n;]]></ST></Implementation>'
+            '</POU></TcPlcObject>', encoding="utf-8")
+    k.add_project(str(tmp_path / "big"), "big")
+    r = k.search("Valve Pump", project="big", limit=50)
+    assert r["hits"] and r.get("words_used") == ["Pump"] and r.get("words_too_common") == ["Valve"], r
+    assert len(r["hits"]) == 12 and all(h["matched"] == ["Pump"] for h in r["hits"]), r
+
+
+def test_review_hw_lookup_revision_text_and_newest_of_every_type_first(kb):
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    k.hw_lookup("EL2008")
+    with k._db() as con:
+        row = dict(con.execute("SELECT * FROM esi WHERE type='EL2008'").fetchone())
+        for rev in (row["revision"] - 1, row["revision"] - 2):
+            con.execute("INSERT INTO esi (type, name, product_code, revision, vendor, grp, file, pdo, coe) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", (row["type"], row["name"], row["product_code"], rev, row["vendor"],
+                                                      row["grp"], row["file"], row["pdo"], row["coe"]))
+    r = k.hw_lookup("EL", limit=2)                       # name fragment: EL2008 ×3 revisions and EL3062
+    assert [d["type"] for d in r["devices"]] == ["EL2008", "EL3062"] and all("pdo" in d for d in r["devices"]), r
+    old = f"#x{row['revision'] - 2:08X}"
+    o = k.hw_lookup("EL2008", revision=old)              # the text form the output shows
+    assert [d["revision"] for d in o["devices"]] == [old] and "pdo" in o["devices"][0]
+    with pytest.raises(K.KnowledgeError, match="revision must be"):
+        k.hw_lookup("EL2008", revision="banana")

@@ -419,3 +419,23 @@ def test_n74_methods_and_properties_are_their_own_lists_not_descriptions():
     assert d["outputs"][0]["description"] == "TRUE, if an error occurs."
     _tidy_declaration(d)
     assert "description" not in d, d.get("description")          # no method or property list left in it
+
+
+def test_n74_interface_page_methods_by_their_heading():
+    """Review: an interface page (I_TcEventBase) lists its methods as 'Name | Description' with no parentheses and no
+    Definition location — the header alone looks like a variable table. The heading above it says 'Methods'."""
+    from twincat_mcp.infosys import html_to_doc, parse_declaration, _tidy_declaration
+    h = ("<html><body><h1>I_TcEventBase</h1><pre>INTERFACE I_TcEventBase</pre>"
+         "<h2>Methods</h2><table><tr><th>Name</th><th>Description</th></tr>"
+         "<tr><td>EqualsTo</td><td>Compares the instance with another.</td></tr>"
+         "<tr><td>GetText</td><td>Returns the text of the event.</td></tr></table>"
+         "<h2>Properties</h2><table><tr><th>Name</th><th>Type</th><th>Access</th><th>Description</th></tr>"
+         "<tr><td>eSeverity</td><td>TcEventSeverity</td><td>Get</td><td>Severity</td></tr></table>"
+         "</body></html>")
+    doc = html_to_doc(h)
+    assert doc.table_titles == ["Methods", "Properties"]
+    d = parse_declaration("I_TcEventBase", doc)
+    assert [m["name"] for m in d["methods"]] == ["EqualsTo", "GetText"], d
+    assert d["properties"][0]["name"] == "eSeverity" and d["properties"][0]["access"] == "Get"
+    _tidy_declaration(d)
+    assert "description" not in d, d.get("description")

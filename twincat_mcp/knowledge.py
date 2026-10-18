@@ -78,8 +78,37 @@ LOCATION_CONDITIONS = [
 
 # --------------------------------------------------------------------------------------------- K6 known errors
 # (pattern, cause, fix) — first match wins. Seeded from the field reports; extend here, never from tool output.
-KNOWN_ERRORS: list[tuple[re.Pattern[str], str, str]] = [(re.compile(p, re.I), c, f) for p, c, f in [
-    (r"0x98110724|2551252772|licen[cs]e",
+_ELEMENTARY = frozenset("BOOL BYTE WORD DWORD LWORD SINT USINT INT UINT DINT UDINT LINT ULINT REAL LREAL TIME LTIME "
+                        "DATE TOD TIME_OF_DAY DT DATE_AND_TIME STRING WSTRING".split())
+
+
+def _convert_fix(a: str, b: str) -> str:
+    """C0032: the conversion that exists — {A}_TO_{B} only between elementary types; INT → BOOL is a comparison."""
+    ua, ub = a.upper(), b.upper()
+    if ua in _ELEMENTARY and ub in _ELEMENTARY:
+        if ub == "BOOL":
+            return f"compare instead: (value <> 0) turns the {ua} into a BOOL (or {ua}_TO_BOOL(…) when that is meant)"
+        return (f"convert explicitly: {ua}_TO_{ub}(…)" + (" — TRUE → 1, FALSE → 0" if ua == "BOOL" else "")
+                + ", or declare both sides with the same type")
+    return (f"{a} and {b} are not assignment-compatible: assign member by member / element by element, use a variable "
+            f"of type {b}, or (pointer / reference) the referenced type")
+
+
+KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [(re.compile(p, re.I), c, f) for p, c, f in [
+    # N70: the TwinCAT compiler's messages, by their text (the C-numbers differ between builds; the text does not).
+    # First: their quoted names may contain anything the broader patterns below look for ('bLicenseOk')
+    (r"identifier '([^']+)' (?:is )?not defined",
+     "'{1}' is not declared where it is used: a typo, a variable declared in another POU or GVL without the "
+     "qualifier, a library that is not referenced, or a namespace / qualified_only GVL ('GVL.{1}')",
+     "proj_search {1} (this project) / kb_search {1} (added folders) show where it is declared; declare it, qualify "
+     "it, or add the library (proj_libraries)"),
+    (r"cannot convert type '([^']+)' to type '([^']+)'",
+     "IEC 61131-3 has no implicit conversion from {1} to {2} here",
+     _convert_fix),
+    (r"unknown type:? '([^']+)'",
+     "the type '{1}' is not known to the compiler: a typo, a DUT not in the project, or a library not referenced",
+     "kb_search {1} / infosys_declaration {1} shows where it comes from; add the DUT or the library"),
+    (r"0x98110724|2551252772|\blicen[cs]es?\b",
      "TwinCAT license missing or expired on the target (TwinCAT falls back to CONFIG)",
      "XAE → SYSTEM → License → '7 Days Trial License…', activate the configuration again, restart TwinCAT"),
     (r"0x80010001|-2147418111|0x8001010a|-2147417846|call was rejected|retry later|blocked by dialog",
@@ -121,19 +150,6 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, str]] = [(re.compile(p, re.I), c,
     (r"adserror 1796\b|0x704\b|not permitted",
      "reading/writing this index group/offset is not permitted (read-only area or protected symbol)",
      "write a writable symbol instead; check READONLY flags with ads_symbol_info"),
-    # N70: the TwinCAT compiler's messages, by their text (the C-numbers differ between builds; the text does not)
-    (r"identifier '([^']+)' (?:is )?not defined",
-     "'{1}' is not declared where it is used: a typo, a variable declared in another POU or GVL without the "
-     "qualifier, a library that is not referenced, or a namespace / qualified_only GVL ('GVL.{1}')",
-     "proj_search {1} (this project) / kb_search {1} (added folders) show where it is declared; declare it, qualify "
-     "it, or add the library (proj_libraries)"),
-    (r"cannot convert type '([^']+)' to type '([^']+)'",
-     "IEC 61131-3 has no implicit conversion from {1} to {2} here",
-     "convert explicitly: {1}_TO_{2}(…) (or declare both sides with the same type); for BOOL ↔ number use SEL / "
-     "an IF, or BOOL_TO_{2}"),
-    (r"unknown type:? '([^']+)'",
-     "the type '{1}' is not known to the compiler: a typo, a DUT not in the project, or a library not referenced",
-     "kb_search {1} / infosys_declaration {1} shows where it comes from; add the DUT or the library"),
 ]]
 KNOWN_ERRORS_COVERED = ("ADS errors 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation (ADSError 1861, "
                         "ADS error 1861, ADS-Error: 1861, 0x745, 0x00000745); license; XAE busy / modal dialog / "
@@ -163,6 +179,9 @@ def _fold(w: str) -> str:
 _ADS_CODE = re.compile(r"\bads[\s_-]*(?:error|fehler|err)\b[\s:#=-]*(?:code[\s:#=-]*)?(0x[0-9a-f]+|\d+)"
                        r"|\berror[\s_-]*code[\s:#=-]*(0x[0-9a-f]+|\d+)", re.I)
 _HEX = re.compile(r"\b0x([0-9a-f]{1,8})\b", re.I)
+_ADS_WORD = re.compile(r"\bads(?:\b|error|err\b|fehler)", re.I)      # 'ADS', 'ADSError' — not 'ads_write_raw'
+# an error message, not a search in words: quoted names, an ADS code, a hex number, a compiler number
+_ERROR_MARKER = re.compile(r"'[A-Za-z_][\w.]*'|\b0x[0-9a-f]+\b|\bC\d{4}\b|\bads[\s_-]*(?:error|err|fehler)\b", re.I)
 
 
 def ads6_context(port: int | None, mode: str | None) -> dict[str, str]:
@@ -182,44 +201,64 @@ def ads6_context(port: int | None, mode: str | None) -> dict[str, str]:
     return {"cause": f"nothing listens on AMS port {p} (TwinCAT is in {mode})", "fix": "check the port number"}
 
 
-def _canonical_error(msg: str) -> str:
-    """The message with every ADS error code it names appended as 'adserror <decimal>' — the table matches one
-    notation, the messages come in many: 'ADSError 1861' (pyads), 'ADS error 1861', 'ADS-Error: 1861', 'error code
-    1861', '0x745', '0x00000745' (N70: only the first and the hex form were known). A bare hex number counts when the
-    message mentions ADS or the number is an ADS device error (0x700–0x7FF) — not every HRESULT is an ADS code."""
+def _ads_codes(msg: str, bare_hex: bool) -> list[int]:
+    """ADS error codes a message names. Explicit notations: 'ADSError 1861' (pyads), 'ADS error 1861', 'ADS-Error:
+    0x745', and 'error code 1861' when the message is about ADS (N70: only the first and the hex form were known).
+    bare_hex: also bare hex numbers — when the message mentions ADS or the number is an ADS device error (0x700–0x7FF);
+    not every HRESULT, offset or address is an ADS code."""
+    ads = _ADS_WORD.search(msg) is not None
     codes: list[int] = []
     for m in _ADS_CODE.finditer(msg):
         v = m.group(1) or m.group(2)
-        codes.append(int(v, 16) if v.lower().startswith("0x") else int(v))
-    ads = re.search(r"\bads", msg, re.I) is not None
-    for m in _HEX.finditer(msg):
-        v = int(m.group(1), 16)
-        if ads or 0x700 <= v <= 0x7FF:
-            codes.append(v)
-    return msg + "".join(f" adserror {c}" for c in dict.fromkeys(codes))
+        n = int(v, 16) if v.lower().startswith("0x") else int(v)
+        if m.group(2) is not None and not ads and not 0x700 <= n <= 0x7FF:
+            continue                                  # 'exited with error code 7' is not an ADS error; 1861 is
+        codes.append(n)
+    if bare_hex:
+        for m in _HEX.finditer(msg):
+            v = int(m.group(1), 16)
+            if ads or 0x700 <= v <= 0x7FF:
+                codes.append(v)
+    return list(dict.fromkeys(codes))
 
 
-def known_error(msg: str) -> dict[str, str] | None:
-    text = _canonical_error(msg or "")
-    for pat, cause, fix in KNOWN_ERRORS:
-        m = pat.search(text)
-        if m:
+def _match_known(msg: str) -> tuple[str, str, str] | None:
+    """(cause, fix, fix template) of the first table entry the message matches — first with the codes it names in an
+    explicit notation, then also with bare hex numbers ('ADSError 1796 at offset 0x7' is 1796, not 7)."""
+    for bare in (False, True):
+        codes = _ads_codes(msg, bare)
+        text = msg + "".join(f" adserror {c}" for c in codes)
+        for pat, cause, fix in KNOWN_ERRORS:
+            m = pat.search(text)
+            if not m:
+                continue
             groups = [""] + [g or "" for g in m.groups()]
 
             def fill(t: str) -> str:            # {1}, {2}: the pattern's groups (other braces are text: {type, value})
                 return re.sub(r"\{(\d)\}", lambda g: groups[int(g.group(1))] if int(g.group(1)) < len(groups)
                               else g.group(0), t)
-            return {"cause": fill(cause), "fix": fill(fix)}
+            if callable(fix):
+                return fill(cause), fix(*groups[1:]), ""
+            return fill(cause), fill(fix), fix
+        if not any(_HEX.finditer(msg)):
+            break
     return None
+
+
+def known_error(msg: str) -> dict[str, str] | None:
+    k = _match_known(msg or "")
+    return None if k is None else {"cause": k[0], "fix": k[1]}
 
 
 def annotate(msg: str) -> str:
     """Append the known cause/fix to an error message unless the message already carries that fix."""
-    k = known_error(msg)
-    if not k:
+    m = _match_known(msg or "")
+    if not m:
         return msg
+    k = {"cause": m[0], "fix": m[1]}
     low = msg.lower()
-    tools = re.findall(r"\b[a-z]+_[a-z_]+\b", k["fix"])          # tool names the fix points at
+    # tool names the fix points at — from the template: a filled-in name from the message ('my_var') is not a tool
+    tools = re.findall(r"\b[a-z]+_[a-z_]+\b", m[2])
     if any(t in low for t in tools) or k["fix"][:30].lower() in low:
         return msg                                                # the message already says what to do
     return f"{msg} [known cause: {k['cause']}. fix: {k['fix']}]"
@@ -692,8 +731,10 @@ class Knowledge:
                 ignored[w] = "stop word"
             else:
                 informative.append(w)
+        if not informative and not phrases and len(words) == 1:
+            informative, ignored = list(words), {}       # one word ('WHILE', 'On'): searched as written
         err = known_error(q)
-        if err:
+        if err and _ERROR_MARKER.search(q):
             # N71: an error message: its words ('Cannot convert type … to type …') are not code words — they matched
             # every unit with TYPE or 'to' in it. In the code only the names it quotes mean something ('nFoo'), not
             # the elementary types and keywords it quotes ('BOOL', 'INT')
@@ -739,7 +780,7 @@ class Knowledge:
             out["words_ignored"] = {**ignored, **info.get("ignored", {})}
         if info.get("used") is not None and info.get("tier") == "some words":
             out["words_used"] = info["used"]
-        if info.get("too_common"):
+        if info.get("too_common") and info.get("tier") == "some words":
             out["words_too_common"] = info["too_common"]
         if base_note:
             out["note"] = base_note
@@ -749,7 +790,7 @@ class Knowledge:
         elif nproj and not hits and (phrases or informative):
             out["note"] = (f"no unit contains {', '.join(phrases + informative)} (name, declaration, code, comments of "
                            f"the {nproj} indexed folder(s))")
-        elif err and not informative:
+        elif err and not informative and not phrases:
             out["note"] = "an error message without a name to look for in the code: known_error has its cause and fix"
         if err:
             out["known_error"] = err
@@ -783,14 +824,20 @@ class Knowledge:
         if len(exact) > 1:
             total = self._count(con, None, where_extra, params_extra)
             used, ignored, common = [], {}, []
+            dfs: dict[str, int] = {}
             for t in phrases + words:
-                df = self._count(con, (ph(t) if t in phrases else ph(t) + "*"), where_extra, params_extra, t)
+                df = dfs[t] = self._count(con, (ph(t) if t in phrases else ph(t) + "*"), where_extra, params_extra, t)
                 if df == 0:
                     ignored[t] = "on no unit"
                 elif total >= 25 and df > COMMON_SHARE * total:
                     common.append(t)
                 else:
                     used.append(t)
+            if not used and common:
+                # every word is common: the least common still tells units apart better than nothing at all
+                least = min(dfs[t] for t in common)
+                used = [t for t in common if dfs[t] == least]
+                common = [t for t in common if t not in used]
             info.update(ignored=ignored, too_common=common, used=used)
             if used:
                 tiers.append(("some words", " OR ".join(ph(t) if t in phrases else ph(t) + "*" for t in used), used))
@@ -913,7 +960,8 @@ class Knowledge:
 
     HW_DETAILS = ("newest", "summary", "full")
 
-    def hw_lookup(self, query: str, limit: int = 5, revision: int | None = None, detail: str = "newest") -> dict[str, Any]:
+    def hw_lookup(self, query: str, limit: int = 5, revision: int | str | None = None,
+                  detail: str = "newest") -> dict[str, Any]:
         """N73: detail bounds the output — 'newest' (default): PDOs and CoE objects of the newest revision of each type
         (or of `revision`), the other revisions as a line each; 'summary': no PDO entries or CoE objects at all, only
         their counts; 'full': everything for every revision (an EL3356 with its revisions was a wall of repeats)."""
@@ -928,17 +976,31 @@ class Knowledge:
             idx = self.esi_index()
         else:
             idx = None
+        if isinstance(revision, str):
+            rs = revision.strip()
+            try:
+                revision = _hexint(rs) if rs[:2].lower() in ("#x", "0x") else int(rs)
+            except (TypeError, ValueError):
+                raise KnowledgeError(f"revision must be a number or '#x…' as hw_lookup shows it (got {revision!r})") from None
         pc = _hexint(q) if q.startswith(("#x", "0x", "#X")) else None
+        rev_sql, rev_p = (" AND revision = ?", [revision]) if revision is not None else ("", [])
         with self._db() as con:
             if pc is not None:
-                rows = con.execute("SELECT * FROM esi WHERE product_code=? ORDER BY revision DESC LIMIT 50", (pc,)).fetchall()
+                rows = con.execute(f"SELECT * FROM esi WHERE product_code=?{rev_sql} ORDER BY revision DESC LIMIT 50",
+                                   [pc, *rev_p]).fetchall()
             else:
-                rows = con.execute("SELECT * FROM esi WHERE type = ? COLLATE NOCASE ORDER BY revision DESC LIMIT 50", (q,)).fetchall()
+                rows = con.execute(f"SELECT * FROM esi WHERE type = ? COLLATE NOCASE{rev_sql} ORDER BY revision DESC "
+                                   "LIMIT 50", [q, *rev_p]).fetchall()
                 if not rows:
-                    rows = con.execute("SELECT * FROM esi WHERE type LIKE ? OR name LIKE ? ORDER BY type, revision DESC LIMIT 50",
-                                       (f"%{q}%", f"%{q}%")).fetchall()
-        if revision is not None:
-            rows = [r for r in rows if r["revision"] == revision]
+                    rows = con.execute(f"SELECT * FROM esi WHERE (type LIKE ? OR name LIKE ?){rev_sql} ORDER BY type, "
+                                       "revision DESC LIMIT 50", [f"%{q}%", f"%{q}%", *rev_p]).fetchall()
+        # the newest revision of every type first, then the older ones: older revisions of the first type used up
+        # the limit and the other types never showed
+        firsts, rest, seen_t = [], [], set()
+        for r in rows:
+            (rest if r["type"] in seen_t else firsts).append(r)
+            seen_t.add(r["type"])
+        rows = firsts + rest
         types = sorted({r["type"] for r in rows})
         out_rows = []
         newest_seen: set[str] = set()
@@ -964,7 +1026,7 @@ class Knowledge:
                                "devices": out_rows}
         if trimmed:
             res["detail_note"] = (f"{trimmed} device row(s) without their PDO entries and CoE objects (detail="
-                                  f"{detail!r}): detail='full', or revision=<#x…>, gives them")
+                                  f"{detail!r}): detail='full', or revision='#x…' (as shown), gives them")
         bad = sum(1 for d in out_rows for p in d.get("pdo", []) if p.get("unparsed"))
         if bad:
             res["parse_note"] = (f"{bad} PDO(s) could not be read from the ESI file (index or entries missing) — their raw "
