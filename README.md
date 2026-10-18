@@ -162,8 +162,8 @@ folder also holds the documentation its own tools build:
 | file in the knowledge folder | content | built by |
 |---|---|---|
 | `knowledge.db` | projects for `kb_search`, ESI devices for `hw_lookup`, known errors | the `kb_*` tools |
-| `helpviewer\infosys_en.db` | every Infosys page of the Help Viewer package (≈ 51,000 pages, 283 books) | `tools\infosys_local.py index` |
-| `manualsdb\manuals.db` | the PDF manuals in `manuals\` — page text, chapters, product codes | `tools\manuals_db.py update` |
+| `helpviewer\infosys_en.db` | every Infosys page of the Help Viewer package (≈ 51,000 pages, 283 books) | `skills\twincat-docs\builders\infosys_local.py index` (Python 3.12+) |
+| `manualsdb\manuals.db` | the PDF manuals in `manuals\` — page text, chapters, product codes | `skills\twincat-docs\builders\manuals_db.py update` (Python 3.12+) |
 | `sop\` | operator SOPs (Markdown) | by hand |
 
 `skills/twincat-docs/kb_docs.py` answers `docs_search`, `docs_declaration`, `docs_page`, `docs_books`,
@@ -172,7 +172,7 @@ folder also holds the documentation its own tools build:
 that exists in several libraries (`MC_MoveAbsolute` in Tc2_MC2 and Tc3_DriveMotionControl) is never resolved
 silently: the answer is `ambiguous` with the candidates. `kb_status` → `docs` shows both databases, the PDFs not
 indexed yet and the exact command for this folder; `hw_lookup` lists the manuals that mention a product code.
-The `infosys_*` tools stay as the fallback (their own index of the same package).
+The `infosys_*` tools stay as the fallback (their own index of the same package). The server reports the state of both databases at every connection, in `tc_doctor` (`offline_docs`) and in `kb_status` → `docs`: complete, outdated (the package changed), old format, incomplete, or a rebuild running or interrupted. Each answer's `source` carries the same state. Infosys links are kept: `docs_page` and `docs_declaration` return them as `links`, which `docs_page` opens.
 
 **Capture profiles** `rec_scan` · `rec_profile_save` · `rec_profile_list` · `rec_profile_get` · `rec_profile_delete` · `rec_profile_start` · `rec_profile_stop`
 

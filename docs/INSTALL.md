@@ -22,7 +22,7 @@ Code — it picks the tool. Replace `<CX_NETID>`, `<SOLUTION>` and `<PROJECT_DIR
 | recordings | `%USERPROFILE%\.twincat_mcp\recordings\<id>.jsonl` | one file per recording, can be large |
 | capture profiles | `%USERPROFILE%\.twincat_mcp\profiles\` | |
 | Infosys documentation index (`infosys_*` tools) | `<knowledge folder>\infosys\helpviewer-1033\` (else `%USERPROFILE%\.twincat_mcp\infosys\`) | SQLite + FTS5, built in the background |
-| knowledge folder (`kb_set_location`, e.g. `D:\TwinCAT-MCP\knowledge`) | `knowledge.db`; the offline documentation the `twincat-docs` skill reads: `helpviewer\infosys_en.db` (built by `tools\infosys_local.py index`), `manualsdb\manuals.db` (PDFs in `manuals\`, built by `tools\manuals_db.py update`), `sop\` | **you choose it**; `kb_status` → `docs` shows what is there |
+| knowledge folder (`kb_set_location`, e.g. `D:\TwinCAT-MCP\knowledge`) | `knowledge.db`; the offline documentation the `twincat-docs` skill reads: `helpviewer\infosys_en.db` and `manualsdb\manuals.db` (PDFs in `manuals\`), built by the builders shipped with the plugin (`skills\twincat-docs\builders`, Python 3.12+), `sop\` | **you choose it**; `kb_status` → `docs` shows what is there |
 | experiments (specs, runs, reports) | `<PROJECT_DIR>\experiments\` | next to the solution so they version with it |
 
 Nothing is installed system-wide, nothing listens on a port, and the server runs as your Windows

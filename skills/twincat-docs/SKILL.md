@@ -45,7 +45,8 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    ask), call again with `book=` or `ref=`, and say in the answer which library you used. Never write code against
    the first candidate by guess.
 4. `also_in` lists other books with a page of the same title. Mention it when the library matters.
-5. Every item has `ref` (book/pageid). Any `ref`, Infosys URL or `ms-xhelp:///?Id=…` link opens with `docs_page`.
+5. Every item has `ref` (book/pageid). Any `ref`, Infosys URL or `ms-xhelp:///?Id=…` link opens with `docs_page`. Follow a
+   page's `links` (`text`, `ref`) with `docs_page ref=…`.
 6. Cite `ref` and `url` in the answer.
 7. Queries are FTS5: words are ANDed, `"exact phrase"`, `OR`, `NOT`, `prefix*`. Code with punctuation is fine —
    invalid syntax is retried as a phrase, and `query_mode` says so.
@@ -65,8 +66,12 @@ indexed yet.
 
 | Database | Content | Built by |
 |---|---|---|
-| `<kb>\helpviewer\infosys_en.db` | all Infosys pages of the Help Viewer package (≈ 51,000 pages, 283 books) | `<kb>\tools\infosys_local.py index` (≈ 150 s; a no-op when the package is unchanged) |
-| `<kb>\manualsdb\manuals.db` | PDF manuals from `<kb>\manuals\`, one row per page, chapters, product codes | `<kb>\tools\manuals_db.py update` (needs PyMuPDF or pypdf) |
+| `<kb>\helpviewer\infosys_en.db` | all Infosys pages of the Help Viewer package (≈ 51,000 pages, 283 books) | `<skill folder>\builders\infosys_local.py index --kb <kb>` (Python 3.12+; ≈ 150 s; a no-op when the package is unchanged) |
+| `<kb>\manualsdb\manuals.db` | PDF manuals from `<kb>\manuals\`, one row per page, chapters, product codes | `<skill folder>\builders\manuals_db.py update --kb <kb>` (Python 3.12+; needs PyMuPDF or pypdf) |
+
+`status`, and `source.state` in every answer, say whether the index is `complete`, `outdated` (the package changed),
+`old_format`, `incomplete`, `missing`, or being rebuilt (`state_note`). When it is not `complete`, tell the user; the
+answer may come from an older package.
 
 `no_index` means the database is missing. Tell the user the build command from `hint`. Do not search the web
 instead without saying so.

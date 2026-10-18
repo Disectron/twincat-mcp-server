@@ -1,8 +1,9 @@
 """twincat-docs: offline Beckhoff documentation lookup, read-only, one JSON object per call.
 
 Reads the two databases of the local TwinCAT knowledge base (`<kb>`, see `status`):
-  <kb>\\helpviewer\\infosys_en.db   Beckhoff Infosys from the Help Viewer package, built by <kb>\\tools\\infosys_local.py index
-  <kb>\\manualsdb\\manuals.db       PDF hardware manuals, built by <kb>\\tools\\manuals_db.py update
+  <kb>\\helpviewer\\infosys_en.db   Beckhoff Infosys from the Help Viewer package, built by builders\\infosys_local.py index
+  <kb>\\manualsdb\\manuals.db       PDF hardware manuals, built by builders\\manuals_db.py update
+(the builders ship next to this script and need Python 3.12+; copies in <kb>\\tools\\ work the same)
 Nothing is written: both are opened with SQLite's read-only mode. Standard library only (Python >= 3.9, SQLite with
 FTS5 — the python.org builds have it).
 
@@ -33,7 +34,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "1"
+VERSION = "2"           # 2: index state in every answer, links as refs, builders shipped beside it
 FALLBACK_KB = r"D:\TwinCAT-MCP\knowledge"
 INFOSYS_DB = ("helpviewer", "infosys_en.db")
 MANUALS_DB = ("manualsdb", "manuals.db")

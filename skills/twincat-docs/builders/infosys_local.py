@@ -46,6 +46,7 @@ import json  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import sqlite3  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
 import zipfile  # noqa: E402
 from html.parser import HTMLParser  # noqa: E402
@@ -367,6 +368,8 @@ class BuildLock:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(json.dumps({"pid": os.getpid(), "started": time.strftime("%Y-%m-%d %H:%M:%S")}))
+                self._stop = threading.Event()
+                threading.Thread(target=self._beat_loop, name="heartbeat", daemon=True).start()
                 return self
             except FileExistsError:
                 age = time.time() - self.path.stat().st_mtime
@@ -386,7 +389,14 @@ class BuildLock:
         except OSError:
             pass
 
+    def _beat_loop(self) -> None:
+        # the heartbeat runs on its own: long single steps (fts optimize, link resolution, one huge PDF) must not
+        # make a live build look abandoned to a second run
+        while not self._stop.wait(15):
+            self.beat()
+
     def __exit__(self, *exc) -> None:
+        self._stop.set()
         self.path.unlink(missing_ok=True)
 
 
