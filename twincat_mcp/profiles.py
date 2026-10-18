@@ -223,7 +223,7 @@ class ProfileStore:
             try:
                 d = json.loads(p.read_text(encoding="utf-8"))
                 out.append({"name": d["name"], "count": len(d.get("items", [])), "description": d.get("description"),
-                            "source": d.get("source"), "updated": d.get("updated"),
+                            "source": d.get("source"), "updated": _iso(d.get("updated")),
                             "modes": sorted({i["mode"] for i in d.get("items", [])})})
             except (OSError, ValueError, KeyError):
                 out.append({"name": p.stem, "error": "unreadable"})
@@ -266,3 +266,11 @@ class ProfileStore:
         if cl.exists():
             cl.unlink()
         return existed
+
+
+def _iso(v: Any) -> Any:
+    """D28: profiles saved by older versions store epoch seconds, newer ones ISO text — list them all as ISO."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(v, _dt.timezone.utc).isoformat()
+    return v

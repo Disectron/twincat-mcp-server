@@ -126,6 +126,34 @@ _LICENSE_CODES = {
 }
 
 
+def _tcunit_publish_in_source(app: "App") -> dict[str, Any]:
+    """D40: TcUnit's xUnitEnablePublish as the PLC project source sets it: True / False (TcUnit referenced, parameter
+    absent or FALSE) / None (no source, or no TcUnit reference)."""
+    out: dict[str, Any] = {"value": None, "plcproj": None}
+    if app.proj.root is None:
+        out["why"] = "no project source"
+        return out
+    try:
+        app.proj._ensure()
+        files = [pp["file"] for pp in app.proj.plcproj]
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = str(exc)[:120]
+        return out
+    for f in files:
+        try:
+            txt = Path(f).read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        if not re.search(r'(?:Placeholder|Library)Reference\s+Include="TcUnit[",]', txt):
+            continue
+        m = re.search(r"<Key>\s*xUnitEnablePublish\s*</Key>\s*<Value>\s*(\w+)\s*</Value>", txt, re.I)
+        out.update({"plcproj": f, "value": bool(m and m.group(1).upper() == "TRUE"),
+                    "source": "parameter in the .plcproj" if m else "not set (TcUnit default FALSE)"})
+        return out
+    out["why"] = "no TcUnit reference in the project source"
+    return out
+
+
 def _call_port(fn: Any, a: tuple, kw: dict) -> Any:
     """The ADS port a backend call targets, passed by keyword or positionally (D24)."""
     if kw.get("port") is not None:
@@ -310,6 +338,10 @@ class App:
         st = dict(self.docs_bg)
         if st.get("started") and not st.get("finished"):
             st["running_for_s"] = round(time.time() - st["started"], 0)
+            if st.get("last_progress"):
+                # D25: progress inside a book too — a number that stops growing is a real stall
+                st["seconds_since_progress"] = round(time.time() - st["last_progress"], 0)
+        st.pop("last_progress", None)
         errs = [r for r in (st.get("result") or []) if isinstance(r, dict) and r.get("error")]
         if errs:
             st["errors"] = errs          # N21: a book that fails to index is reported, not silently retried
@@ -388,7 +420,13 @@ class App:
                 def prog(book: str, i: int, n: int) -> None:
                     self.docs_bg["done_books"], self.docs_bg["total_books"] = i, n
                     self.docs_bg["current_book"] = book
-                out.append(docs.index_all(prog))
+                    self.docs_bg["current_book_pages"] = None
+                    self.docs_bg["last_progress"] = time.time()
+
+                def page_prog(book: str, d: int, t: int) -> None:
+                    self.docs_bg["current_book_pages"] = f"{d}/{t}"
+                    self.docs_bg["last_progress"] = time.time()
+                out.append(docs.index_all(prog, page_prog))
             except Exception as exc:  # noqa: BLE001
                 out.append({"error": f"{type(exc).__name__}: {exc}"})
             finally:
@@ -1155,9 +1193,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         action name of the tool (e.g. 'xae_activate_configuration') and its target. For the XAE
         actions that act on the shell's target (activate, restart, deploy, tree_delete) the target
         must be the NetId XAE currently targets — a token for any other NetId is refused here, not
-        merely rejected later, so the agent cannot talk itself into a stale target."""
+        merely rejected later, so the agent cannot talk itself into a stale target. tcunit_run also takes the
+        NetId (D43). xae_tree_delete is a project edit: its target is the item path '<parent_path>^<name>' (D42)."""
         act = (action or "").strip()
-        if act in ("xae_activate_configuration", "xae_restart_twincat", "xae_deploy", "xae_tree_delete"):
+        if act in ("xae_activate_configuration", "xae_restart_twincat", "xae_deploy", "tcunit_run"):
             try:
                 real = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
             except ToolError as exc:
@@ -1871,17 +1910,37 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                     pass
             raise
         app.audit("rec_profile_start", {"profile": name, "recordings": [s0["id"] for s0 in started]}, OpClass.EDIT, "ok")
-        return {"profile": name, "recordings": started, "groups": len(started)}
+        out = {"profile": name, "recordings": started, "groups": len(started)}
+        if len(started) > 1 and not (start_when or prof.start_when):
+            # D29: groups are separate subscriptions and start one after another — say how far apart, from the PLC's
+            # own timestamps of each group's first sample
+            offs = await asyncio.to_thread(app.rec.start_offsets_ms, [s0["id"] for s0 in started], 3.0)
+            if offs:
+                spread = max(offs.values())
+                out["start_offsets_ms"] = offs
+                out["note"] = (f"the {len(started)} groups started up to {spread:g} ms apart (PLC time of each first "
+                               "sample): compare them over the common window, or give the profile a start_when trigger so "
+                               "every group starts on the same PLC event")
+        return out
 
     @mcp.tool(annotations=EDIT)
     async def rec_profile_stop(name: str) -> dict[str, Any]:
         """Stop every live recording started from this profile; returns per-recording status + stats."""
         out = []
-        for rid, rec in list(app.rec.recs.items()):
-            if rec.active and (rec.name or "").startswith(f"{name}/"):
+        mine = [(rid, rec) for rid, rec in list(app.rec.recs.items()) if (rec.name or "").startswith(f"{name}/")]
+        for rid, rec in mine:
+            if rec.active:
                 out.append(await app.rec_call(app.rec.stop, rid, "manual (rec_profile_stop)", timeout=60))
         if not out:
-            raise ToolError(f"no live recording of profile {name!r} (rec_list shows what is running)")
+            # D27: the profile's recordings already ended (duration / stop_when): give their final status, not an error
+            ended = sorted(mine, key=lambda x: getattr(x[1], "created", 0))
+            if ended:
+                last_t = getattr(ended[-1][1], "created", 0)
+                batch = [rid for rid, rec in ended if abs(getattr(rec, "created", 0) - last_t) < 30]
+                finals = [await app.mem_call(app.rec.status, rid) for rid in batch]
+                return {"profile": name, "stopped": [], "already_ended": finals,
+                        "note": "nothing was live: these recordings of the profile had already ended by themselves"}
+            raise ToolError(f"no recording of profile {name!r} in this session (rec_list shows what exists)")
         app.audit("rec_profile_stop", {"profile": name, "recordings": [o["id"] for o in out]}, OpClass.EDIT, "ok")
         return {"profile": name, "stopped": out}
 
@@ -3017,9 +3076,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def xae_diagnostics(tail_lines: int = 200) -> dict[str, Any]:
-        """Current error list (errors/warnings/messages with file:line) plus the tail of the
-        Build output pane, without rebuilding."""
-        errs = await app.xae_call(app.xae.errors, timeout=60)
+        """Current XAE Error List (errors/warnings/messages with file:line — TwinCAT's own entries too, read from the
+        list view when the automation interface reports none; this focuses the Error List window) merged with the
+        Build output pane, plus the pane's tail, without rebuilding. `source` names where each part came from."""
+        errs = await app.xae_call(app.xae.errors, True, timeout=60)
         out = await app.xae_call(app.xae.build_output, tail_lines, timeout=60)
         return {"errors": errs, "build_output": out}
 
@@ -3184,7 +3244,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=DESTR)
     async def xae_tree_delete(parent_path: str, name: str, confirm_token: str | None = None,
                               ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Delete a tree item (POU, box, task …). Destructive-class."""
+        """Delete a tree item (POU, box, task …). Destructive-class; the confirmation names the item:
+        tc_request_confirmation(action='xae_tree_delete', target='<parent_path>^<name>')."""
         tgt = f"{parent_path}^{name}"
         app.guard_safety_path(parent_path, "xae_tree_delete")
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_tree_delete", tgt, confirm_token)
@@ -3354,16 +3415,25 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                          remote_result_path: str | None = None, allow_target_mismatch: bool = False,
                          disable_io: bool = False, save_first: bool = True, confirm_token: str | None = None,
                          ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Full TcUnit cycle: build → boot project autostart+generate → activate → restart →
+        """Full TcUnit cycle: save (checked) → build → boot project autostart+generate → activate → restart →
         delete old result → wait for the xUnit file on the target → parse. Destructive-class
-        (it activates a configuration on the target). plc_project_path from xae_plc_projects."""
+        (it activates a configuration on the target): tc_request_confirmation(action='tcunit_run', target=<NetId
+        XAE targets>). plc_project_path from xae_plc_projects. TcUnit writes the result file only with its library
+        parameter GVL_Param_TcUnit.xUnitEnablePublish = TRUE (default FALSE): the run is refused before anything
+        is activated when the project source says FALSE, and stops waiting when the PLC reports FALSE (D40)."""
         tgt = (await app.xae_call(app.xae.target_get, timeout=60)).get("target_net_id", "")
         rp = remote_result_path or cfg.project.tcunit_remote_result
         if not rp.lower().endswith(".xml"):
             raise ToolError("remote_result_path must be the TcUnit xUnit .xml file")
+        pub = await asyncio.to_thread(_tcunit_publish_in_source, app)
+        if pub["value"] is False:
+            raise ToolError("tcunit_run: TcUnit's xUnitEnablePublish is FALSE in " + pub["plcproj"] + " (TcUnit default) — "
+                            "TcUnit would write no result file and the run would only wait. Set it in XAE: References → "
+                            "TcUnit → Parameters → GVL_Param_TcUnit.xUnitEnablePublish = TRUE, save, then tcunit_run. "
+                            "Nothing was built or activated.")
         await app.check_targets(tgt, allow_target_mismatch)
-        await app.permit(ctx, OpClass.DESTRUCTIVE, "tcunit_run", f"{tgt} {rp}", confirm_token)
-        steps: dict[str, Any] = {"target": tgt}
+        await app.permit(ctx, OpClass.DESTRUCTIVE, "tcunit_run", tgt, confirm_token)
+        steps: dict[str, Any] = {"target": tgt, "result_file": rp, "xunit_publish_in_source": pub}
         if save_first:
             steps["save"] = await app.save_verified("tcunit_run")        # D44: tcunit_run did not save at all
         if not skip_build:
@@ -3385,13 +3455,32 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)
         t0 = time.time()
+        # D40: the PLC's own view of the parameter — FALSE means no file will ever come, do not wait timeout_s for it
+        online = None
+        for _ in range(10):
+            try:
+                online = (await app.ads_call(app.ads.read, "GVL_Param_TcUnit.xUnitEnablePublish", timeout=10)).get("value")
+                break
+            except ToolError:
+                await asyncio.sleep(2.0)                       # the runtime may still be starting
+        steps["xunit_publish_online"] = online
+        if online is False:
+            app.audit("tcunit_run", {"target": tgt}, OpClass.DESTRUCTIVE, "publish-disabled", steps)
+            return {"ran": True, "result": None, "steps": steps,
+                    "note": "GVL_Param_TcUnit.xUnitEnablePublish is FALSE on the PLC: TcUnit ran but writes no result file. "
+                            "Set the library parameter to TRUE (References → TcUnit → Parameters), then tcunit_run again."}
         waited = await app.ads_call(app.files.wait_for_file, rp, timeout_s, 3.0, timeout=timeout_s + 30, slow=True)
         steps["wait"] = waited
         if not waited.get("exists"):
             app.audit("tcunit_run", {"target": tgt}, OpClass.DESTRUCTIVE, "timeout", steps)
+            try:
+                where = await app.ads_call(app.files.resolve_prefix_dir, "boot:", timeout=30) if rp.lower().startswith("boot:") else None
+            except ToolError:
+                where = None
             return {"ran": True, "result": None, "steps": steps,
-                    "note": "result file never appeared — is the TcUnit task running and the "
-                            "result path right? (default C:\\TwinCAT\\3.1\\Boot\\TcUnit_xUnit_testresults.xml)"}
+                    "note": f"result file {rp} never appeared" + (f" (boot: = {where} on this target)" if where else "") +
+                            " — is PRG_TcUnitRunner (TcUnit.RUN()) called from a running task, and is "
+                            "xUnitEnablePublish TRUE? (online: " + repr(online) + ")"}
         # TcUnit writes the file incrementally; give it a moment to finish
         await asyncio.sleep(2.0)
         f = await app.ads_call(app.files.read_file, rp, None, True, "utf-8", timeout=120)

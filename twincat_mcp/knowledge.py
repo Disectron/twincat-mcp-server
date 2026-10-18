@@ -523,12 +523,20 @@ class Knowledge:
 
     # -- K3 libraries --------------------------------------------------------------------
     def library_folders(self) -> list[Path]:
+        pd = os.environ.get("ProgramData") or r"C:\ProgramData"
         cands = [Path(d) for d in self.library_dirs] + [
+            # 3.1.4026 (XAE as its own package): the library repository moved to PlcEngineering (D38)
+            Path(pd) / "Beckhoff" / "TwinCAT" / "PlcEngineering" / "Managed Libraries",
+            Path(r"C:\ProgramData\Beckhoff\TwinCAT\PlcEngineering\Managed Libraries"),
             Path(r"C:\TwinCAT\3.1\Components\Plc\Managed Libraries"),
             Path(r"C:\Program Files (x86)\Beckhoff\TwinCAT\3.1\Components\Plc\Managed Libraries"),
             Path(r"C:\ProgramData\Beckhoff\TwinCAT\3.1\Components\Plc\Managed Libraries"),
         ]
-        return [c for c in cands if c.is_dir()]
+        out: list[Path] = []
+        for c in cands:
+            if c.is_dir() and c not in out:
+                out.append(c)
+        return out
 
     def installed_libraries(self) -> dict[str, dict[str, Any]]:
         """{lib_name_lower: {"name", "vendor", "versions": [...]}} from folder names only (no file is opened)."""
@@ -594,7 +602,8 @@ def _lib_row(name: str, resolution: str, kind: str, installed: dict[str, dict[st
             and (vendor or inst.get("vendor") or "").lower() == "system"):
         # N19: a placeholder's DefaultResolution is only the fallback — TwinCAT resolves it through the compiler's
         # placeholder profile first; "(System)" libraries (VisuElems …) are always profile-managed
-        row["effective"] = None
+        # N19b: with one installed version the profile can only resolve to it; with several, the profile decides
+        row["effective"] = versions[0] if len(versions) == 1 else "profile"
         row["info"] = (f"{lib} {req} (DefaultResolution) is not installed; TwinCAT resolves this placeholder through its "
                        f"placeholder profile first (installed: {versions}). Only a problem if the build reports it.")
     elif req != "*" and versions and req not in versions:

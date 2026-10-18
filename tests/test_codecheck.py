@@ -102,3 +102,21 @@ def test_d17_real_eq_ignores_assignments_and_bindings(idx):
     idx.scan()
     r = cc.lint(idx, "FB_Fill", rules=["real_eq"])
     assert r["by_rule"] == {"real_eq": 2}, r["items"]
+
+
+def test_d39_scaffold_uses_enum_members_and_names_failing_stubs(idx, project_dir):
+    """D39: an enum input was arranged as 'E_Command.0' (does not compile)."""
+    (project_dir / "Plc" / "DUTs" / "E_Command.TcDUT").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4026.12">\n'
+        '  <DUT Name="E_Command" Id="{aaaaaaaa-0000-0000-0000-0000000000e1}">\n'
+        "    <Declaration><![CDATA[{attribute 'qualified_only'}\n{attribute 'strict'}\nTYPE E_Command :\n(\n"
+        "\tNone := 0,   // nothing\n\tStart,\n\tStop\n) UINT;\nEND_TYPE\n]]></Declaration>\n  </DUT>\n</TcPlcObject>\n",
+        encoding="utf-8")
+    pou = Path(idx.get_unit("FB_Fill").file)
+    pou.write_text(pou.read_text().replace("\tbEnable", "\teCmd      : E_Command;\n\teOther    : E_Lib;\n\tbEnable", 1))
+    idx.refresh()
+    r = cc.tcunit_scaffold(idx, "FB_Fill", overwrite=True)
+    txt = Path(r["file"]).read_text()
+    assert "fbUut.eCmd := E_Command.None;" in txt and "E_Command.0" not in txt
+    assert "fbUut.eOther := 0 (* E_Lib: set a member *);" in txt
+    assert r["stubs_fail_until_written"] == ["Test_Start"] and "FAIL on purpose" in r["stub_note"]

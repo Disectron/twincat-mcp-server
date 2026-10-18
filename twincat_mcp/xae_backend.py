@@ -54,6 +54,7 @@ DISP_E_EXCEPTION = -2147352567          # 0x80020009 — with scode E_POINTER af
 E_POINTER = -2147467261                 # 0x80004003
 
 VS_WINDOW_ERRORLIST = "{D78612C7-9962-4B83-95D9-268046DAD23A}"
+VS_WINDOW_SOLUTION_EXPLORER = "{3AE79031-E1BC-11D0-8F78-00A0C9110057}"   # vsWindowKindSolutionExplorer
 VS_WINDOW_OUTPUT = "{34E76E81-EE4A-11D0-AE2E-00A0C90FFFC3}"
 ENVDTE80_TYPELIB = ("{1A31287A-4D7D-413E-8E32-3B374931BD89}", 0, 8, 0)
 
@@ -328,10 +329,13 @@ class XaeBackend:
             d["projects"] = prjs
         except Exception as exc:  # noqa: BLE001
             d["solution_error"] = _com_msg(exc)
-        if not d.get("solution_open"):
-            # no solution: say so instead of a stale project name and a raw COM exception (retest 0.7.1)
+        if not d.get("solution_open") or not str(d.get("solution") or "").strip():
+            # no solution (IsOpen false, or the shell's empty start state with FullName ""): say so instead of a
+            # stale project name and a raw COM exception (retest 0.7.1, 0.8.3)
             self.sysman = None
-            d["note"] = "no solution is open in the shell — xae_open_solution(path) or open one in XAE"
+            d["solution_open"] = False
+            d.pop("solution_error", None)
+            d["note"] = "no solution open in the shell — xae_open_solution(path) or open one in XAE"
             return d
         try:
             sm = self._sm()
@@ -339,7 +343,11 @@ class XaeBackend:
             d["target_net_id"] = sm.GetTargetNetId()
             d["twincat_started"] = bool(sm.IsTwinCATStarted())
         except Exception as exc:  # noqa: BLE001
-            d["sysman_error"] = _com_msg(exc)
+            if not any("tsproj" in str(p.get("file", "")).lower() or p.get("name") for p in d.get("projects") or []):
+                d["note"] = "the open solution has no TwinCAT project"
+            else:
+                d["note"] = "the TwinCAT project of the open solution is not reachable through the Automation Interface"
+            d["detail"] = _com_msg(exc)[:200]
         return d
 
     def _find_sysman(self) -> None:
@@ -527,30 +535,90 @@ class XaeBackend:
             pass
         return None
 
-    def _error_items(self) -> tuple[list[dict[str, Any]], str]:
-        """Return (items, source). Tries DTE2.ToolWindows.ErrorList, then the
-        ErrorList tool window object, then parses the Build output pane."""
+    def _error_items(self, view_copy: bool = False) -> tuple[list[dict[str, Any]], str]:
+        """Return (items, source). D20: the Error List is what the operator sees, so it is read first and by every
+        route there is — DTE2.ToolWindows.ErrorList (late-bound: the cached 7.0 gen_py wrapper has no ToolWindows),
+        the ErrorList window object, and when those report nothing a copy of the Error List view itself (its
+        TwinCAT entries — Scope, Measurement, system messages — are not always in ErrorItems). The Build output
+        pane is parsed as well and merged in, so a source that misses items does not hide them."""
         dte = self._need()
-        lvl = {1: "error", 2: "warning", 3: "message"}
-        # route 1: DTE2 cast
-        d2 = self._dte2()
-        if d2 is not None:
+        lvl = {1: "error", 2: "warning", 3: "message", 4: "message"}
+        found: list[dict[str, Any]] = []
+        used: list[str] = []
+
+        def take(items: list[dict[str, Any]], name: str) -> None:
+            if items:
+                used.append(f"{name}({len(items)})")
+                found.extend(items)
+
+        def enum(coll: Any) -> list[dict[str, Any]]:
+            return [self._error_item(coll.Item(i), lvl) for i in range(1, int(coll.Count) + 1)]
+        got = False
+        for name, get in (("DTE2.ToolWindows", lambda: self._dte2_late().ToolWindows.ErrorList.ErrorItems),
+                          ("DTE2.gen_py", lambda: self._dte2().ToolWindows.ErrorList.ErrorItems),
+                          ("Windows.ErrorList", lambda: dte.Windows.Item(VS_WINDOW_ERRORLIST).Object.ErrorItems)):
             try:
-                items = d2.ToolWindows.ErrorList.ErrorItems
-                return [self._error_item(items.Item(i), lvl) for i in range(1, items.Count + 1)], "DTE2.ToolWindows"
+                items = enum(get())
+            except Exception:  # noqa: BLE001
+                continue
+            take(items, name)
+            got = got or bool(items)
+            if items:
+                break
+        if not got and view_copy:              # moves the focus to the Error List: only when diagnostics ask for it
+            try:
+                take(self._error_list_copy(), "ErrorList(view copy)")
             except Exception:  # noqa: BLE001
                 pass
-        # route 2: window object
         try:
-            win = dte.Windows.Item(VS_WINDOW_ERRORLIST)
-            el = win.Object
-            items = el.ErrorItems
-            return [self._error_item(items.Item(i), lvl) for i in range(1, items.Count + 1)], "Windows.ErrorList"
+            out = _parse_build_output(self.build_output(tail_lines=2000)["text"])
         except Exception:  # noqa: BLE001
-            pass
-        # route 3: parse output pane
-        txt = self.build_output(tail_lines=2000)["text"]
-        return _parse_build_output(txt), "OutputPane"
+            out = []
+        seen = {(i.get("description", "").strip(), str(i.get("file", "")).lower(), int(i.get("line") or 0)) for i in found}
+        extra = [i for i in out if (i["description"].strip(), i["file"].lower(), i["line"]) not in seen]
+        take(extra, "OutputPane")
+        return found, " + ".join(used) if used else "none (Error List empty, nothing in the Build pane)"
+
+    def _dte2_late(self) -> Any:  # pragma: no cover
+        """DTE as a late-bound dispatch: members of the newer object model (ToolWindows) resolve by name."""
+        import win32com.client.dynamic  # type: ignore
+        return win32com.client.dynamic.Dispatch(self.dte._oleobj_)
+
+    def _error_list_copy(self) -> list[dict[str, Any]]:  # pragma: no cover — needs the shell and a clipboard
+        """Select all in the Error List and copy it (tab-separated, header row); the user's clipboard text is put back."""
+        import win32clipboard  # type: ignore
+        dte = self._need()
+        saved = None
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                saved = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+            except Exception:  # noqa: BLE001
+                saved = None
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            dte.Windows.Item(VS_WINDOW_ERRORLIST).Activate()
+            dte.ExecuteCommand("Edit.SelectAll")
+            dte.ExecuteCommand("Edit.Copy")
+            time.sleep(0.2)
+            win32clipboard.OpenClipboard()
+            try:
+                text = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+            finally:
+                win32clipboard.CloseClipboard()
+        finally:
+            if saved is not None:
+                try:
+                    win32clipboard.OpenClipboard()
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, saved)
+                finally:
+                    win32clipboard.CloseClipboard()
+        return _parse_error_list_copy(text or "")
 
     @staticmethod
     def _error_item(it: Any, lvl: dict[int, str]) -> dict[str, Any]:
@@ -568,8 +636,8 @@ class XaeBackend:
             "project": g("Project"),
         }
 
-    def errors(self) -> dict[str, Any]:
-        items, source = self._error_items()
+    def errors(self, view_copy: bool = False) -> dict[str, Any]:
+        items, source = self._error_items(view_copy)
         return {"count": len(items), "source": source, "items": items}
 
     def build_output(self, tail_lines: int = 200) -> dict[str, Any]:
@@ -645,7 +713,19 @@ class XaeBackend:
                 return None
             pname = str(projs[0].get("name") or "").removesuffix(" Project")
             want = {f"{pname} Project".lower(), pname.lower()}
-            se = dte.ToolWindows.SolutionExplorer
+            # #10: the cached 7.0 gen_py DTE wrapper has no ToolWindows (D20) — late-bound first, then the window object
+            se = None
+            for get in (lambda: self._dte2_late().ToolWindows.SolutionExplorer,
+                        lambda: dte.ToolWindows.SolutionExplorer,
+                        lambda: dte.Windows.Item(VS_WINDOW_SOLUTION_EXPLORER).Object):
+                try:
+                    se = get()
+                    se.UIHierarchyItems.Count
+                    break
+                except Exception:  # noqa: BLE001
+                    se = None
+            if se is None:
+                return None
 
             def walk(items, depth: int, trail: list[str]):
                 if depth > 7:
@@ -671,6 +751,15 @@ class XaeBackend:
                 return None
             item, trail = hit
             item.Select(1)   # vsUISelectionTypeSelect
+            # and, where the shell offers it, the explicit 'Set as Active PLC Project' on the selected node
+            for c in self.list_commands("active", 100).get("commands", []):
+                if re.search(r"set\s*as\s*active\s*plc\s*project|setactiveplcproject", c, re.I):
+                    try:
+                        self.command(c)
+                        trail.append(f"[{c}]")
+                    except XaeError:
+                        pass
+                    break
             return "\\".join(trail)
         except Exception:  # noqa: BLE001
             return None
@@ -1178,9 +1267,36 @@ class XaeBackend:
 
 
 # ----------------------------------------------------------------------------
+# 4024: 'C:\P\MAIN.TcPOU(12,5): error C0046: …';  4026: 'C:\P\FB_X.TcPOU@M_Run(9) : error: C0185 …' (D41)
 _RE_OUT_ERR = re.compile(
-    r"(?:^|[\s:>\]\)])(?P<level>error|warning)(?!\(s\))\s*(?P<code>[A-Z]{1,2}\d{1,5}|\d{1,5})?\s*:?\s+(?P<msg>\S.*)$", re.I)
-_RE_FILE_LINE = re.compile(r"(?P<file>[A-Za-z]:\\[^\(\[]+?\.(?:TcPOU|TcDUT|TcGVL|TcIO|tsproj|plcproj))\s*[\(\[]\s*(?P<line>\d+)")
+    r"(?:^|[\s:>\]\)])(?P<level>error|warning)(?!\(s\))\s*:?\s*(?P<code>[A-Z]{1,2}\d{1,5}|\d{1,5})?\s*:?\s+(?P<msg>\S.*)$", re.I)
+_RE_FILE_LINE = re.compile(r"(?P<file>(?:[A-Za-z]:|\\\\)\\[^\(\[@]+?\.(?:TcPOU|TcDUT|TcGVL|TcIO|TcTTO|TcVIS|tsproj|plcproj))"
+                           r"(?:@(?P<obj>[^\(\[\s]+))?\s*[\(\[]\s*(?P<line>\d+)(?:\s*,\s*(?P<col>\d+))?")
+
+
+def _parse_error_list_copy(text: str) -> list[dict[str, Any]]:
+    """The Error List copied as text: a header row (Severity, Code, Description, Project, File, Line, …) then one
+    tab-separated row per entry; column order follows the header."""
+    rows = [r for r in text.splitlines() if r.strip()]
+    if not rows:
+        return []
+    head = [h.strip().lower() for h in rows[0].split("\t")]
+    if "description" not in head:
+        return []
+    col = {h: i for i, h in enumerate(head)}
+
+    def g(cells: list[str], name: str) -> str:
+        i = col.get(name)
+        return cells[i].strip() if i is not None and i < len(cells) else ""
+    out = []
+    for r in rows[1:]:
+        c = r.split("\t")
+        sev = g(c, "severity").lower()
+        line = g(c, "line")
+        out.append({"level": "error" if sev.startswith("err") else "warning" if sev.startswith("warn") else "message",
+                    "description": g(c, "description"), "file": g(c, "file"), "line": int(line) if line.isdigit() else 0,
+                    "column": 0, "project": g(c, "project"), **({"code": g(c, "code")} if g(c, "code") else {})})
+    return out
 
 
 def _parse_build_output(text: str) -> list[dict[str, Any]]:
@@ -1190,15 +1306,20 @@ def _parse_build_output(text: str) -> list[dict[str, Any]]:
         if not m:
             continue
         f = _RE_FILE_LINE.search(ln)
-        items.append({
+        it = {
             "level": m.group("level").lower(),
             "description": m.group("msg").strip(),
             "file": f.group("file") if f else "",
             "line": int(f.group("line")) if f else 0,
-            "column": 0,
+            "column": int(f.group("col")) if f and f.group("col") else 0,
             "project": "",
             "raw": ln.strip(),
-        })
+        }
+        if m.group("code"):
+            it["code"] = m.group("code").upper()
+        if f and f.group("obj"):
+            it["object"] = f.group("obj")           # method / action / property inside the file (4026)
+        items.append(it)
     return items
 
 

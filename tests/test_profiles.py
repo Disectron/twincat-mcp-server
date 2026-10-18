@@ -140,15 +140,22 @@ async def test_profile_tools_e2e(monkeypatch, project_dir, tmp_path):
 
         lst = payload(await s.call_tool("rec_profile_list", {}))
         assert lst["profiles"][0]["name"] == "batch"
+        assert isinstance(lst["profiles"][0]["updated"], str) and "T" in lst["profiles"][0]["updated"]     # D28
 
         started = payload(await s.call_tool("rec_profile_start", {"name": "batch"}))
         assert started["groups"] == 2 and {r["mode"] for r in started["recordings"]} == {"cycle", "change"}
+        # D29: the profile has a stop_when but no start_when → the groups start apart; the response says by how much
+        offs = started.get("start_offsets_ms")
+        assert offs is None or (min(offs.values()) == 0 and "start_when" in started["note"]), started
         live = payload(await s.call_tool("rec_list", {}))
         assert sum(1 for r in live["session"] if (r.get("name") or "").startswith("batch/")) == 2
 
         stopped = payload(await s.call_tool("rec_profile_stop", {"name": "batch"}))
         assert len(stopped["stopped"]) == 2
-        res = await s.call_tool("rec_profile_stop", {"name": "batch"})
+        # D27: stopping again (or after the profile ended by itself) gives the final status, not "no live recording"
+        again = payload(await s.call_tool("rec_profile_stop", {"name": "batch"}))
+        assert again["stopped"] == [] and len(again["already_ended"]) == 2 and not any(x["active"] for x in again["already_ended"])
+        res = await s.call_tool("rec_profile_stop", {"name": "never-started"})
         assert res.is_error
 
         # project-side scan sees declarations without a PLC
@@ -160,3 +167,9 @@ async def test_profile_tools_e2e(monkeypatch, project_dir, tmp_path):
         assert gone.is_error and "not found" in gone.content[0].text
         res = await s.call_tool("rec_profile_get", {"name": "batch"})
         assert res.is_error and "no profile" in res.content[0].text
+
+
+def test_d28_updated_is_iso_for_old_epoch_profiles():
+    from twincat_mcp.profiles import _iso
+    assert _iso(0).startswith("1970-01-01T00:00:00") and _iso("2026-10-18T04:00:00+00:00") == "2026-10-18T04:00:00+00:00"
+    assert _iso(None) is None

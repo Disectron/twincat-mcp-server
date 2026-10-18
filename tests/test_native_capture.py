@@ -544,3 +544,17 @@ def test_release_exe_must_match_its_pinned_sha256(capture_exe, tmp_path):
     pin.write_text("0" * 64 + "  " + exe.name + "\n", encoding="ascii")
     ok, why, _ = NC.availability(exe, __version__)
     assert not ok and "does not match the SHA-256" in why
+
+
+def test_d32_snapshot_of_a_finished_native_recording_counts_its_events(rec):
+    """D32: rec_snapshot said events: 0 for a finished native recording while returning rows."""
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=0.2,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="d32", max_symbols=50,
+                   cycle_counter=None)
+    nrec = rec.recs[st["id"]]
+    t = time.time()
+    while time.time() - t < 20 and not nrec.proc.finished.is_set():
+        time.sleep(0.05)
+    nrec.events = 0                                   # nobody called status() since the start
+    snap = rec.snapshot(st["id"], 10, None)
+    assert snap["rows"] and snap["events"] > 0, snap

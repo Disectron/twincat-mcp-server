@@ -1811,7 +1811,13 @@ class Recorder:
 
     def snapshot(self, rid: str, last_n: int, symbols: list[str] | None) -> dict[str, Any]:
         rec = self._get(rid)
-        return {"id": rec.id, "active": rec.active, "events": rec.events, "rows": rec.snapshot(last_n, symbols)}
+        try:
+            # D32: a native recording's counters are refreshed by status() (the service / its footer); a finished one
+            # that nobody asked showed events: 0 next to its rows
+            n_ev = rec.status().get("events", rec.events)
+        except Exception:  # noqa: BLE001
+            n_ev = rec.events
+        return {"id": rec.id, "active": rec.active, "events": n_ev, "rows": rec.snapshot(last_n, symbols)}
 
     def stats(self, rid: str, symbols: list[str] | None, include_runs: bool, max_runs_out: int,
               exact: bool | None = None) -> dict[str, Any]:
@@ -2291,19 +2297,26 @@ class Recorder:
         is_bool = all(isinstance(r[2], bool) for r in runs)
         out: dict[str, Any] = {"id": rid, "symbol": symbol, "events": len(ev), "span_ms": round(span, 3), "runs": len(runs)}
         if is_bool:
-            highs = [(a, b) for a, b, v in runs[:-1] if v]        # last run has no known end
-            lows = [(a, b) for a, b, v in runs[:-1] if not v]
+            # the first run starts at the recording's first sample, the last has no end: neither is a measured pulse
+            inner = runs[1:-1]
+            highs = [(a, b) for a, b, v in inner if v]
+            lows = [(a, b) for a, b, v in inner if not v]
             hw = [b - a for a, b in highs]
             lw = [b - a for a, b in lows]
             starts = [a for a, _ in highs]
             periods = [b - a for a, b in zip(starts, starts[1:])]
+            # D26: duty over the pulse train (complete periods, rising edge to rising edge), not over the whole
+            # recording — the idle time before the first pulse made 54 % read as 30.6 %
+            duty = round(100 * sum(hw[:len(periods)]) / sum(periods), 2) if periods and sum(periods) > 0 else None
             out.update({
                 "pulses": len(highs),
                 "high_ms": _stat(hw), "low_ms": _stat(lw), "period_ms": _stat(periods),
                 "frequency_hz": round(1000.0 / (sum(periods) / len(periods)), 3) if periods else None,
-                "duty_percent": round(100 * sum(hw) / span, 2) if span > 0 and hw else None,
+                "duty_percent": duty,
+                "high_share_of_recording_percent": round(100 * sum(hw) / span, 2) if span > 0 and hw else None,
                 "first_pulses": [{"t_on_ms": round(a, 3), "t_off_ms": round(b, 3), "width_ms": round(b - a, 3)} for a, b in highs[:max_list]],
-                "note": "first/last runs are open-ended and excluded from width statistics",
+                "note": ("the first run (from the recording's first sample) and the last (no end) are open-ended and not "
+                         "counted; duty_percent = high time / period over complete periods"),
             })
         else:
             dw = [b - a for a, b, _ in runs[:-1]]
@@ -2311,6 +2324,32 @@ class Recorder:
                         "timeline": [{"t_start_ms": round(a, 3), "t_end_ms": round(b, 3), "dwell_ms": round(b - a, 3), "value": v}
                                      for a, b, v in runs[:max_list]]})
         return out
+
+    def start_offsets_ms(self, rids: list[str], timeout_s: float = 3.0) -> dict[str, float]:
+        """PLC time of each recording's first sample, relative to the earliest (D29); waits up to ``timeout_s``."""
+        deadline = time.monotonic() + timeout_s
+        ft: dict[str, int] = {}
+        while True:
+            for rid in rids:
+                if rid in ft:
+                    continue
+                rec = self.recs.get(rid)
+                v = getattr(rec, "t0_ft", None)
+                if not isinstance(v, int):
+                    try:
+                        t0 = _read_t0(self._path_for(rid)) or {}
+                    except RecorderError:
+                        t0 = {}
+                    v = t0.get("filetime")
+                if isinstance(v, int):
+                    ft[rid] = v
+            if len(ft) == len(rids) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        if len(ft) < 2:
+            return {}
+        lo = min(ft.values())
+        return {rid: round((v - lo) / 1e4, 3) for rid, v in ft.items()}
 
     def timing_of(self, rid: str, symbols: list[str]) -> dict[str, Any]:
         """How far the timestamps of ``symbols`` in this recording can be trusted relative to each other (D35).

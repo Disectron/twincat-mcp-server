@@ -895,3 +895,33 @@ async def test_d45_doctor_reports_config_mode_as_info(monkeypatch, project_dir):
             assert "PROBLEMS: target_state" in d["summary"] and "system mode RUN" in d["target_state"]
     finally:
         FakeConnection.shared_state.pop(10000, None)
+
+
+def test_d40_xunit_publish_is_read_from_the_project_source(project_dir):
+    """D40: TcUnit's xUnitEnablePublish defaults to FALSE → no result file; tcunit_run waited timeout_s for nothing."""
+    from twincat_mcp.server import App, _tcunit_publish_in_source
+    app = App(mk_cfg(project_dir))
+    assert _tcunit_publish_in_source(app)["value"] is None                       # no TcUnit reference
+    pp = project_dir / "Plc" / "Plc.plcproj"
+    base = pp.read_text()
+    ref = '<PlaceholderReference Include="TcUnit"><DefaultResolution>TcUnit, * (www.tcunit.org)</DefaultResolution>'
+    pp.write_text(base.replace('<PlaceholderReference Include="Tc2_Standard">', ref + '</PlaceholderReference>'
+                               '<PlaceholderReference Include="Tc2_Standard">'))
+    app.proj.scan()
+    r = _tcunit_publish_in_source(app)
+    assert r["value"] is False and "default FALSE" in r["source"]
+    pp.write_text(base.replace('<PlaceholderReference Include="Tc2_Standard">', ref +
+                               '<Parameters><Parameter ListName="GVL_Param_TcUnit"><Key>xUnitEnablePublish</Key>'
+                               '<Value>TRUE</Value></Parameter></Parameters></PlaceholderReference>'
+                               '<PlaceholderReference Include="Tc2_Standard">'))
+    assert _tcunit_publish_in_source(app)["value"] is True
+
+
+@pytest.mark.anyio
+async def test_d42_tree_delete_token_names_the_item(monkeypatch, project_dir):
+    """D42: tc_request_confirmation only issued a NetId token for xae_tree_delete while the tool checked the item path."""
+    install(monkeypatch)
+    async with client_for(build_server(mk_cfg(project_dir, mode="guarded"))) as s:
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_tree_delete",
+                                                                    "target": "TIPC^Plc^Plc Project^POUs^FB_Old"}))
+        assert tok["target"] == "TIPC^Plc^Plc Project^POUs^FB_Old" and "xae_target" not in tok

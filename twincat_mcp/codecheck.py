@@ -775,6 +775,10 @@ def tcunit_scaffold(idx: ProjectIndex, fb_name: str, out_dir: str | None = None,
     if dest.exists() and not overwrite:
         raise ProjectError(f"{dest} exists; pass overwrite=true")
     tests: list[tuple[str, str, str]] = []
+    _enum_cache: dict[str, str] = {}
+
+    def _default_for(type_str: str) -> str:            # noqa: F811 — the project-aware variant (D39)
+        return _default_in(idx, type_str, _enum_cache)
     # Arrange restates each input's declared initial value (fbUut.nPreset := 10, not 0) — a test that silently
     # overrides the FB's defaults tests a different FB
     inputs_arrange = "\n".join(f"\tfbUut.{v['name']} := {v['init'] if v.get('init') else _default_for(v['type'])};  // "
@@ -808,6 +812,11 @@ def tcunit_scaffold(idx: ProjectIndex, fb_name: str, out_dir: str | None = None,
     dest.write_text(_TCPOU_TMPL.format(name=suite, guid=uuid.uuid4(), decl=decl, impl=impl, methods=methods_xml,
                                        product_version=product_version), encoding="utf-8")
     result: dict[str, Any] = {"suite": suite, "file": str(dest), "tests": [t[0] for t in tests]}
+    stubs = [t[0] for t in tests if "AssertTrue(Condition := FALSE" in t[2]]
+    if stubs:
+        result["stubs_fail_until_written"] = stubs
+        result["stub_note"] = ("these tests FAIL on purpose until their assertion is written — a generated test that "
+                               "passes without checking anything would report coverage that does not exist")
     if add_to_plcproj:
         result["plcproj"] = _register_in_plcproj(idx, dest)
     result["next"] = [f"Add `{suite}();` to the TcUnit runner program (and TcUnit.RUN();)",
@@ -866,6 +875,42 @@ def _product_version(src: Path) -> str:
     return max(found, key=key) if found else "3.1.4024.12"
 
 
+_RE_ENUM_BODY = re.compile(r"TYPE\s+\w+\s*:\s*\((?P<body>.*?)\)\s*\w*\s*;?\s*END_TYPE", re.S | re.I)
+
+
+def _enum_first(idx: ProjectIndex, type_str: str) -> str | None:
+    """'E_Command.Idle' for an enum the project declares: the member with value 0, else the first member (D39: the
+    scaffold wrote 'E_Command.0', which does not compile)."""
+    try:
+        u = idx.units.get(type_str.strip().lower())
+    except Exception:  # noqa: BLE001
+        u = None
+    if u is None or not u.declaration:
+        return None
+    text = re.sub(r"\(\*.*?\*\)", "", re.sub(r"//[^\n]*", "", u.declaration), flags=re.S)
+    m = _RE_ENUM_BODY.search(text)
+    if not m:
+        return None
+    members = []
+    for part in m.group("body").split(","):
+        mm = re.match(r"\s*([A-Za-z_]\w*)\s*(?::=\s*([^,]+))?", part)
+        if mm:
+            members.append((mm.group(1), (mm.group(2) or "").strip()))
+    if not members:
+        return None
+    zero = next((n for n, v in members if v in ("0", "16#0", "2#0", "8#0")), None)
+    first_implicit = members[0][0] if not members[0][1] else None
+    return f"{u.name}.{zero or first_implicit or members[0][0]}"
+
+
+def _default_in(idx: ProjectIndex, type_str: str, cache: dict[str, str]) -> str:
+    key = type_str.lower()
+    if key not in cache:
+        e = _enum_first(idx, type_str)
+        cache[key] = e if e else _default_for(type_str)
+    return cache[key]
+
+
 def _default_for(type_str: str) -> str:
     up = type_str.upper().split("(")[0]
     if up == "BOOL":
@@ -879,7 +924,9 @@ def _default_for(type_str: str) -> str:
     if up.startswith(("INT", "UINT", "DINT", "UDINT", "SINT", "USINT", "LINT", "ULINT", "BYTE", "WORD", "DWORD", "LWORD")):
         return "0"
     if up.startswith("E_"):
-        return f"{type_str}.0"
+        # an enum the project does not declare (library): its members are unknown here — 0 is accepted for a
+        # non-strict enum; a {attribute 'strict'} enum needs a member name, which the comment asks for
+        return f"0 (* {type_str}: set a member *)"
     return "0"
 
 

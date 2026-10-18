@@ -609,3 +609,21 @@ def test_d34_d35_latency_ignores_initial_state_and_says_how_far_timestamps_hold(
     head["mode"] = "cycle"
     (rec.root / f"{rid}.jsonl").write_text(json.dumps(head) + "\n", encoding="utf-8")
     assert rec.timing_of(rid, ["MAIN.bPulse", "MAIN.bDone"])["trust"] == "exact"
+
+
+def test_d26_duty_over_the_pulse_train_not_the_idle_lead_in(rec, monkeypatch):
+    """D26: duty_percent over the whole span incl. the idle time before the first pulse (30.6 % instead of ≈ 54 %)."""
+    ev = [{"t_ms": 0.0, "symbol": "B", "value": False}]
+    t = 500.0                                                      # 500 ms idle lead-in
+    for _ in range(5):
+        ev += [{"t_ms": t, "symbol": "B", "value": True}, {"t_ms": t + 54.0, "symbol": "B", "value": False}]
+        t += 100.0
+    ev += [{"t_ms": t + 300.0, "symbol": "B", "value": False}]
+    monkeypatch.setattr(rec, "_events_for", lambda r, syms: list(ev))
+    p = rec.pulses("x", "B")
+    assert p["pulses"] == 5 and p["duty_percent"] == 54.0 and p["period_ms"]["mean"] == 100.0
+    assert p["high_share_of_recording_percent"] < 30
+    # a recording that starts while the signal is high: that first run is not a pulse of unknown width
+    ev2 = [{"t_ms": 0.0, "symbol": "B", "value": True}, {"t_ms": 7.0, "symbol": "B", "value": False}] + ev[1:]
+    monkeypatch.setattr(rec, "_events_for", lambda r, syms: list(ev2))
+    assert rec.pulses("x", "B")["pulses"] == 5

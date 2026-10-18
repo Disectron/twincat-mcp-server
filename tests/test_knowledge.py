@@ -130,6 +130,19 @@ def test_library_versions(kb, project_dir):
     assert "not installed on this PC" in libs["Tc2_Smtp"]["warning"]
     # N19: a (System) placeholder is resolved by the placeholder profile — information, not a build failure
     assert "warning" not in libs["VisuElems"] and "placeholder profile" in libs["VisuElems"]["info"]
+    # N19b: not null — the only installed version, or 'profile' when several could be chosen
+    inst = libs["VisuElems"]["installed"]
+    assert libs["VisuElems"]["effective"] == (inst[0] if len(inst) == 1 else "profile")
+
+
+def test_d38_library_repository_of_4026_is_scanned(kb, tmp_path, monkeypatch):
+    """D38: 4026 installs libraries to ProgramData\Beckhoff\TwinCAT\PlcEngineering\Managed Libraries."""
+    k, _ = kb
+    pd = tmp_path / "pd"
+    (pd / "Beckhoff" / "TwinCAT" / "PlcEngineering" / "Managed Libraries" / "www.tcunit.org" / "TcUnit" / "1.3.1").mkdir(parents=True)
+    monkeypatch.setenv("ProgramData", str(pd))
+    inst = k.installed_libraries()
+    assert inst["tcunit"]["versions"] == ["1.3.1"] and inst["tcunit"]["vendor"] == "www.tcunit.org"
 
 
 def test_n17_ads_error_6_explained_from_port_and_mode():

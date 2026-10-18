@@ -181,7 +181,7 @@ def test_build_parses_output_pane_when_error_list_unavailable(xae):
     r = be.build()
     assert not r["success"] and r["errors"] == 1 and r["warnings"] == 1
     assert r["items"][0]["file"].endswith("MAIN.TcPOU") and r["items"][0]["line"] == 12
-    assert r["error_source"] == "OutputPane"
+    assert r["error_source"] == "OutputPane(2)"
     assert ("build", True) in dte.Solution.SolutionBuild.calls
 
 
@@ -389,3 +389,82 @@ def test_d44_save_all_saves_what_saveall_left_and_reports_it(xae):
     assert r["dirty_before"] == [d1.FullName, d2.FullName] and r["dirty_after"] == [d2.FullName] and r["saved"] is False
     d2.stuck = False
     assert be.save_all() == {"saved": True, "dirty_before": [d2.FullName], "dirty_after": []}
+
+
+def test_d41_4026_compiler_lines_keep_file_object_and_line():
+    """D41: 4026 writes 'File.TcPOU@Method(9) : error: C0185 …' — file/line came back empty."""
+    txt = (r"1>C:\Prj\Untitled1\95_UnitTests\FB_CounterModule_Tests.TcPOU@Test_CountsRisingEdges(9) : error: C0185: "
+           r"It is not possible to perform component access '.' on 'fbUut'" "\n"
+           r"1>C:\Prj\Untitled1\POUs\MAIN.TcPOU(14) : warning: C0373: Unused variable 'x'" "\n"
+           r"1>C:\Prj\Untitled1\POUs\FB_A.TcPOU(3,7): error C0046: Identifier 'y' not defined" "\n")
+    a, b, c = X._parse_build_output(txt)
+    assert a["file"].endswith("FB_CounterModule_Tests.TcPOU") and a["object"] == "Test_CountsRisingEdges" and a["line"] == 9
+    assert a["level"] == "error" and a["code"] == "C0185" and a["description"].startswith("It is not possible")
+    assert b["level"] == "warning" and b["line"] == 14 and b["code"] == "C0373" and "object" not in b
+    assert c["line"] == 3 and c["column"] == 7 and c["code"] == "C0046"
+
+
+def test_d20_diagnostics_reads_the_error_list_view_and_merges_the_build_pane(xae, monkeypatch):
+    """D20: ErrorItems returned 0 while XAE showed TwinCAT warnings (Scope View 'Server Reset or a lost connection');
+    xae_diagnostics then reported only the Output pane."""
+    be, dte, sm = xae
+    empty = type("C", (), {"Count": 0, "Item": lambda self, i: None})()
+    tw = type("TW", (), {"ErrorList": type("EL", (), {"ErrorItems": empty})()})()
+    monkeypatch.setattr(be, "_dte2_late", lambda: type("D2", (), {"ToolWindows": tw})())
+    copied = ("Severity\tCode\tDescription\tProject\tFile\tLine\tSuppression State\n"
+              "Warning\t\tTwinCAT Measurement: Server Reset or a lost connection\tScope_Counter\t\t\t\n"
+              "Warning\t\tScope View: system changed\tScope_Counter\t\t\t\n"
+              "Error\tC0046\tIdentifier 'nFoo' not defined\tUntitled1\tC:\\P\\Plc\\POUs\\MAIN.TcPOU\t12\t\n")
+    monkeypatch.setattr(be, "_error_list_copy", lambda: X._parse_error_list_copy(copied))
+    dte._output = (r"1>C:\P\Plc\POUs\MAIN.TcPOU(12,5): error C0046: Identifier 'nFoo' not defined" "\n"
+                   r"1>C:\P\Plc\POUs\FB_A.TcPOU(3) : warning: C0373: Unused variable 'x'" "\n")
+    assert "view copy" not in be.errors()["source"]                             # a build does not grab the focus
+    e = be.errors(view_copy=True)
+    descs = [i["description"] for i in e["items"]]
+    assert e["count"] == 4 and "TwinCAT Measurement: Server Reset or a lost connection" in descs
+    assert descs.count("Identifier 'nFoo' not defined") == 1                     # the same entry from both: once
+    assert e["source"] == "ErrorList(view copy)(3) + OutputPane(1)", e["source"]
+    assert X._parse_error_list_copy("") == [] and X._parse_error_list_copy("no header\nrow") == []
+
+
+def test_n10_logout_selects_the_plc_project_without_toolwindows(xae, monkeypatch):
+    """#10: 4026 offers only PLC.Logoutfromnone until a PLC project is active; the node selection went through
+    dte.ToolWindows, which the cached 7.0 DTE wrapper does not have — so it never happened."""
+    be, dte, sm = xae
+    Cmd = lambda n: type("C", (), {"Name": n})()                                   # noqa: E731
+    dte.Commands = FakeProjects([Cmd("PLC.Logoutfromnone"), Cmd("File.SaveAll")])
+
+    class Node:
+        def __init__(self, name, kids=()):
+            self.Name, self.kids, self.selected = name, list(kids), False
+            self.UIHierarchyItems = self
+
+        Expanded = False
+        @property
+        def Count(self): return len(self.kids)
+        def Item(self, i): return self.kids[i - 1]
+
+        def Select(self, how):
+            self.selected = True
+            dte.Commands = FakeProjects([Cmd("PLC.LogoutfromPlc"), Cmd("File.SaveAll")])
+    proj = Node("Plc Project")
+    root = Node("root", [Node("Solution 'Machine'", [Node("Machine", [Node("PLC", [Node("Plc", [proj, Node("Plc Instance")])])])])])
+    orig_item = dte.Item
+
+    def item(guid):
+        if guid == X.VS_WINDOW_SOLUTION_EXPLORER:
+            return type("W", (), {"Object": root})()
+        return orig_item(guid)
+    monkeypatch.setattr(dte, "Item", item)
+    monkeypatch.setattr(be, "_dte2_late", lambda: (_ for _ in ()).throw(AttributeError("no ToolWindows")))
+    r = be.plc_action("logout")
+    assert proj.selected and r["command"] == "PLC.LogoutfromPlc" and r["selected_node"].endswith("Plc\\Plc Project"), r
+
+
+def test_xae_status_without_a_solution_says_so(xae):
+    """0.8.3: xae_status with no solution open returned the raw sysman_error."""
+    be, dte, sm = xae
+    be.attach()
+    dte.Solution.FullName = ""                     # the shell's empty start state: IsOpen may still say True
+    info = be.status()
+    assert info["solution_open"] is False and info["note"].startswith("no solution open") and "sysman_error" not in info

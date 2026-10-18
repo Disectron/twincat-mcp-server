@@ -867,8 +867,10 @@ class InfosysIndex:
             results.append(r)
         return {"books": results, "remaining_budget": budget}
 
-    def index_all(self, progress: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
-        """Local package only: index every TwinCAT 3 book (unchanged pages are skipped, so a repeat is cheap)."""
+    def index_all(self, progress: Callable[[str, int, int], None] | None = None,
+                  page_progress: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
+        """Local package only: index every TwinCAT 3 book (unchanged pages are skipped, so a repeat is cheap).
+        ``page_progress(book, pages_done, pages_todo)`` reports inside a book (D25: a large book looked stalled)."""
         if self.local is None:
             raise InfosysError("index_all needs the local Help Viewer package (docs.source = 'local')")
         sm = self.sitemap()
@@ -880,7 +882,7 @@ class InfosysIndex:
             if progress:
                 progress(bk, i, len(books))
             try:
-                r = self.index_book(bk)
+                r = self.index_book(bk, progress=(lambda d, t, _b=bk: page_progress(_b, d, t)) if page_progress else None)
             except Exception as exc:  # noqa: BLE001 — D25: one bad book must not end the run; it is reported
                 book_errors.append({"book": bk, "error": f"{type(exc).__name__}: {exc}"[:300]})
                 continue

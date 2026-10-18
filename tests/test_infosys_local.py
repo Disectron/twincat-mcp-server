@@ -115,7 +115,9 @@ def test_books_and_index_all_and_the_reindex_rule(idx, pkg, tmp_path):
     or re-installed package (new file date, same content) costs nothing; the index is portable."""
     b = idx.books()
     assert {x["book"] for x in b["books"]} == {"tcplclib_tc2_system", "tf5100_tc3_nc_i"}     # TC2 book dropped
-    r = idx.index_all()
+    seen: list[tuple[str, int, int]] = []
+    r = idx.index_all(page_progress=lambda b, d, t: seen.append((b, d, t)))
+    assert seen and all(0 < d <= t for _b, d, t in seen), "D25: progress inside a book"
     assert r["books"] == 2 and r["pages_indexed"] == 8 and r["book_errors"] == [] and idx.index_complete()
     assert idx.index_all()["pages_indexed"] == 0, "same package: nothing re-read"
     # same content, new file date (Help Viewer re-install, or the index copied to another PC): complete, nothing to do
