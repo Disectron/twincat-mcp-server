@@ -1,4 +1,4 @@
-# twincat-mcp 0.8.8 — tool reference
+# twincat-mcp 0.8.9 — tool reference
 
 155 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
@@ -44,7 +44,7 @@
 - `ads_task_stats` [R] — PLC task timing (TwinCAT_SystemInfoVarList._TaskInfo[n]): cycle time, last/min/max/mean execution time over `samples`, load %, cycle-time-exceeded counter delta — the FB's cost on the real-time task.
 - `ads_ping` [R] — ADS round-trip time statistics to the target (router/route/network health).
 - `ads_call_method` [W] — Invoke an FB method on the running PLC via ADS RPC. The method must carry {attribute 'TcRpcEnable'}. inputs: [{type:'LREAL', value: 12.5}, …] in VAR_INPUT order (use base types: INT not E_Enum); outputs: ['BOOL', …] in VAR_OUTPUT order. Write-class.
-- `ads_dump` [R] — Read EVERY variable on the PLC (all top-level symbols, fully expanded through the datatype table — structs, FB instances, arrays of structs) in one pass and write a nested JSON tree plus a flat CSV (path,type,value). pattern limits the roots ('MAIN.*', 'GVL_*'); system/library symbols excluded unless include_system.…
+- `ads_dump` [R] — Read EVERY variable on the PLC (all top-level symbols, fully expanded through the datatype table — structs, FB instances, arrays of structs) in one pass and write a nested JSON tree plus a flat CSV (path,type,value). pattern limits the roots ('MAIN.*', 'GVL_*'); system symbols excluded unless include_system. The…
 - `ads_leaves` [R] — Enumerate every scalar leaf under a symbol with byte offsets (datatype table): 'MAIN' → all program variables, 'MAIN.arrSteps' → arrSteps[1].nId … With values=true each leaf is decoded from one read of the whole symbol.
 - `ads_types` [R] — Runtime datatype table: describe one type (members with offsets/sizes, array bounds, enum literals, attributes) or list types matching a pattern.
 - `ads_discover` [R] — Broadcast search for TwinCAT targets on the local network (UDP 48899): NetId, host name, TwinCAT version, IP — the same thing XAE's 'Broadcast Search' does.

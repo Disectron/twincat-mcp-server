@@ -28,6 +28,13 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| 0.8.9 | Python 3.12 only: the existing plugin venv (built by 0.8.8) on the engineering PC | after `/plugin` update, the first start rebuilds the venv if it was not 3.12 (background install, reconnect); `tc_doctor` → `python` 3.12.10 |
+| 0.8.9 | R42 `ads_dump` on the TcUnit project (`GVL_TcUnit.TestSuiteAddresses`, 1,000 × POINTER TO FB_TestSuite) | `ads_dump()` defaults → `TestSuiteAddresses` 1,000 rows of `0x…` addresses, `MAIN.*` / `GVL_Test.*` present, JSON < 64 MB, no `.partial` left; a forced timeout → no final files, message names the phase |
+| 0.8.9 | R15 `plcopen_import(option='replace')` of a POU living in a folder | `added` names the copy, `replaced` names the original, `copies_removed` the copy; the original has the new text after save + build |
+| 0.8.9 | R41 level trigger with several notification blocks (simulator only) | `rec_start … start_when='MAIN.nCycle >= 0'` with symbols from two tasks/blocks → every block's first sample on the trigger cycle |
+| 0.8.9 | R32 wrapped type names on the real `.mshc` pages (synthetic HTML only) | `infosys_get_page ADSREAD` → `T_AmsNetId` in one piece; if not, one raw page HTML (Waiting on Ryan) |
+| 0.8.9 | N37 `manuals_db.py update` on the four manuals (first run reads all again) | EL3356 `toc` without `capacity` / `only)` / `parameterization` as level-1 chapters; `show EL3356 56` without the running header |
+| 0.8.9 | builders v2 on the real package (≈ 51,656 pages): first `index` upgrades the version-1 `infosys_en.db` (link table), swap while the MCP server is running | `<Python 3.12> builders\infosys_local.py index --kb D:\TwinCAT-MCP\knowledge` → "older index format", then `stats` → complete with `links_resolved`; reconnect → instructions line says complete |
 
 ## Waiting on Ryan
 
@@ -35,8 +42,10 @@ tool wishlist (2026-10-18).
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
 - D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
-- Retest of 0.8.8 (0.8.7 fixes + the twincat-docs skill and the kb_* items R33–R39).
-- D19 (ESI PDOs read empty): the `parse_note` / `unparsed` output of `hw_lookup` for the terminal, or the ESI file.
+- Retest of 0.8.9 (the 0.8.8 retest items R42, #10, R7, R41, R15, R23, R11, R24, R32, N31, N32, N34–N37; builders).
+- Copy `skills\twincat-docs\builders\*.py` over `D:\TwinCAT-MCP\knowledge\tools\` (infosys_local.py 2, manuals_db.py 3), README.md of the knowledge folder replaced by the updated one.
+- D19 (ESI PDOs read empty): the PDOs are template references (`Ref="TxEL3xxNComplex10-10V"`, `Chn`); the template
+  definition's format is unknown here — the ESI file that holds it (e.g. `C:\TwinCAT\3.1\Config\Io\EtherCAT\Beckhoff EL31xx.xml`).
 
 ## Decided (wishlist 2026-10-18)
 
@@ -64,7 +73,8 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 | #45 | Check all objects did not run — 0.8.7 calls `ITcPlcIECProject2.CheckAllObjects` first (unverified, above) |
 | infosys index twice | the `infosys_*` tools keep their own index of the Help Viewer package (`<kb>\infosys\helpviewer-1033`, ≈ 372 MB) next to `helpviewer\infosys_en.db`; one index (the tools reading `infosys_en.db`) is open — docs-skill spec §8 |
 | SOP indexing | `sop\*.md` listed by `kb_status`, not searchable yet (decided: index them; wishlist above) |
-| R32 (part) | Infosys page output: the "T_Ams NetId" table split — not fixed (the image placeholders and empty links of R32 are) |
+| R32 (part) | Infosys "T_Ams NetId" table split — 0.8.9 joins it when a page is read (declared name or Type column); the cause in the real HTML is not seen yet (unverified, above) |
+| D19 | ESI PDOs that are template references (`Ref=…`, `Chn`) are not resolved — waiting on the ESI file |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
 

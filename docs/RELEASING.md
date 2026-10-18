@@ -44,3 +44,4 @@ tag; `main` contains all of them.
 | 0.8.6 | rest of the 0.8.3 deep test: 4026 compiler lines, Error List, active PLC project, TcUnit checks, recorder/profile fixes, Infosys progress | 2026-10-18 |
 | 0.8.7 | 0.8.6 retest + robustness (R1–R32): output folders + overwrite, confirmation names, workers that never cancel a running job, argument/condition validation, Automation Interface PLC online commands, Infosys lookup tables, aligned profile groups | 2026-10-18 |
 | 0.8.8 | `twincat-docs` skill (offline Infosys + PDF manuals from the knowledge folder, read-only), `kb_*` tools aligned with the knowledge folder, R33–R39 | 2026-10-18 |
+| 0.8.9 | Python 3.12 only; 0.8.8 retest fixes (R42 dump pointers/budgets/streaming, #10, R15 verified replace, R41/R7, R23–R32, N31–N37) and the knowledge-folder builders in the plugin (Python 3.12 gate, atomic rebuild, real index state at every connection, links; manuals_db 3) | 2026-10-18 |
