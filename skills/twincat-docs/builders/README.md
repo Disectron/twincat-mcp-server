@@ -319,8 +319,9 @@ to the stub; a missing file is not created. `kb_status` → `docs.builders` show
 shipped file the next start replaces, `other` = left alone), `docs.builder_upkeep` what the last start did; the
 commands it suggests use the stub in `<kb>\tools\`, else the plugin's own builder (never a file it left alone).
 
-Without the plugin (a PC that only has the knowledge folder): put the builders themselves into `tools\` instead of the
-stubs; they work there as before.
+The builders run from the plugin folder they ship in (version 3 / 5 use the plugin's `twincat_mcp` package and
+`kb_docs.py` beside them); a copy on its own in `tools\` says so and stops. On a PC without the plugin, copy the whole
+plugin folder and run the builders from its `skills\twincat-docs\builders\`.
 
 Stored PDF paths are absolute. Moving the knowledge folder makes the next `update` index every manual again
 (accepted limitation).

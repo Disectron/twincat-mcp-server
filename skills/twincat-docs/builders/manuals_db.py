@@ -71,13 +71,18 @@ HERE = Path(__file__).resolve().parent
 PLUGIN_ROOT = HERE.parents[2]                 # <plugin>/skills/twincat-docs/builders → <plugin>
 if "twincat_mcp" not in sys.modules and (PLUGIN_ROOT / "twincat_mcp" / "kb_layout.py").is_file():
     sys.path.insert(0, str(PLUGIN_ROOT))
-from twincat_mcp import kb_layout as L  # noqa: E402 — where the index is: one place
+try:
+    from twincat_mcp import kb_layout as L  # noqa: E402
+except ImportError:                 # a copy of this file outside the plugin folder: it needs the plugin beside it
+    sys.exit("manuals_db.py runs from the twincat plugin's folder (it uses the plugin's twincat_mcp package and the "
+             "twincat-docs skill beside it): run <kb>\\tools\\manuals_db.py (the stub, which finds the installed plugin) or "
+             "<plugin>\\skills\\twincat-docs\\builders\\manuals_db.py — not a copy of it")
 
 BUILDER = "manuals_db.py"
 BUILDER_VERSION = "5"
 TEXT_FORMAT = "4"                # page text / toc rules; 4: invisible text (size 0, alpha 0) is not page text (N37).
-                                 # An index of another format stays in use, reported 'outdated', until `update` (or
-                                 # kb_rebuild('manuals')) reads every manual again. tests/test_builders.py fingerprints
+                                 # An index of another format stays in use, reported 'rebuild_needed', until `update`
+                                 # (or kb_rebuild('manuals')) reads every manual again. tests/test_formats.py fingerprints
                                  # the code that makes the text and fails when it changes without a new format
 FALLBACK_KB = Path(r"D:\TwinCAT-MCP\knowledge")
 HEARTBEAT_STALE_S = 300          # one large PDF can take a while: an update silent for this long is gone

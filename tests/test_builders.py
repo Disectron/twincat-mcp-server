@@ -155,6 +155,16 @@ def _wait_progress(lock: Path, proc: subprocess.Popen, timeout: float = 120) -> 
     return {}
 
 
+def _hold(proc: subprocess.Popen) -> None:
+    """Freeze a running build where it is (its lock's heartbeat then stays as it was): SIGSTOP, on Windows
+    NtSuspendProcess — without it a fast runner finishes the build before the state is looked at."""
+    if hasattr(signal, "SIGSTOP"):
+        os.kill(proc.pid, signal.SIGSTOP)
+    else:
+        import ctypes
+        assert ctypes.windll.ntdll.NtSuspendProcess(ctypes.c_void_p(int(proc._handle))) == 0
+
+
 def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, tmp_path):
     """Finding 2: an interrupted `index --force` left a half index that the next run called 'up to date'. The build
     writes index\\infosys-1033.db.building; the complete index stays in use; the next build resumes."""
@@ -173,9 +183,8 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     building, lock = db.with_name(db.name + ".building"), db.with_name(db.name + ".lock")
     first = _wait_progress(lock, proc)
-    if hasattr(signal, "SIGSTOP"):
-        os.kill(proc.pid, signal.SIGSTOP)    # hold the build where it is (its lock stays fresh for 120 s)
     assert first, "the rebuild never reported progress"
+    _hold(proc)                              # its lock stays fresh for 120 s
     running = state(kb)
     assert running["rebuild"]["state"] == "running" and running["state"] == "outdated", running
     assert "RUNNING" in running["message"] and running["pages"] == 8          # the complete index is still the one in use
@@ -210,6 +219,18 @@ def test_finished_rebuild_waiting_to_replace_is_swapped_in(kb, tmp_path):
     assert state(kb)["rebuild"]["state"] == "waiting_to_replace"
     p = build(kb, pkg)
     assert "replaced" in p.stdout and not building.exists() and state(kb)["state"] == "complete"
+
+
+def test_a_builder_copy_outside_the_plugin_says_so(tmp_path):
+    """Version 3 / 5 run the plugin's own code (twincat_mcp, kb_docs.py beside them): a copy on its own — no plugin
+    folder around it, nothing installed (-I -S) — stops with one line saying how to run it, not a traceback."""
+    import shutil
+    for n in ("infosys_local.py", "manuals_db.py"):
+        d = tmp_path / n.split(".")[0] / "tools"
+        d.mkdir(parents=True)
+        shutil.copy(B / n, d / n)
+        p = subprocess.run([sys.executable, "-I", "-S", str(d / n), "stats"], capture_output=True, text=True, timeout=60)
+        assert p.returncode == 1 and "runs from the twincat plugin's folder" in p.stderr and "Traceback" not in p.stderr, p.stderr
 
 
 def test_the_first_build_moves_an_old_layout_and_reports_the_second_index(kb, tmp_path):

@@ -59,9 +59,12 @@ PLUGIN_ROOT = HERE.parents[2]                 # <plugin>/skills/twincat-docs/bui
 # the extractor is the plugin's own package — this builder's plugin version, not whatever else is installed
 if "twincat_mcp" not in sys.modules and (PLUGIN_ROOT / "twincat_mcp" / "infosys.py").is_file():
     sys.path.insert(0, str(PLUGIN_ROOT))
-from twincat_mcp import helpviewer as HV  # noqa: E402
-from twincat_mcp import infosys_build as B  # noqa: E402
-from twincat_mcp import kb_layout as L  # noqa: E402
+try:
+    from twincat_mcp import helpviewer as HV, infosys_build as B, kb_layout as L  # noqa: E402
+except ImportError:                 # a copy of this file outside the plugin folder: it needs the plugin beside it
+    sys.exit("infosys_local.py runs from the twincat plugin's folder (it uses the plugin's twincat_mcp package and the "
+             "twincat-docs skill beside it): run <kb>\\tools\\infosys_local.py (the stub, which finds the installed plugin) or "
+             "<plugin>\\skills\\twincat-docs\\builders\\infosys_local.py — not a copy of it")
 
 
 def kb_root(arg: str | None) -> tuple[Path, str]:
