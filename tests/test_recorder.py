@@ -841,28 +841,59 @@ def test_python_post_trigger_end_waits_for_a_block_still_in_transit(rec, monkeyp
     assert rec.verify(st["id"])["verdict"] == "PASS"
 
 
-def test_python_rows_written_past_a_later_end_are_counted_and_skipped_by_every_reader(rec):
-    """Review 3: the Python recorder writes in ADS order — a block that ran ahead (unbatched) has rows past an end
-    that a batched block's stop_when sets later. They cannot be taken out of the sealed file: the footer counts them
-    and every reader (rec_read, rec_stats, export, rec_verify) skips rows past window_end_ms."""
-    st = _two_blocks(rec, stop_when=f"{CC} >= 50")
+def test_python_writes_in_plc_order_so_no_row_lies_past_a_later_end(rec, monkeypatch):
+    """Root of the 0.8.10 'rows_after_window' mitigation: the Python recorder wrote samples in ADS order, so a block
+    that ran ahead (unbatched) had rows past an end that a batched block's stop_when set later. Samples are now
+    released in PLC-time order once every delivering block has reached them: nothing past the end is written."""
+    st = _two_blocks(rec, stop_when=f"{CC} >= 50", max_delay_ms=100)
     c = _conn()
     for k in range(0, 61):
-        c.fire("MAIN.nCycle", k, ft(10 * k))              # ahead: written up to 600 ms …
-    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 61)
+        c.fire("MAIN.nCycle", k, ft(10 * k))              # ahead, up to 600 ms …
     for k in range(0, 61):
-        c.fire(CC, k, ft(10 * k))                         # … before the counter block's stop_when fires at 500 ms
+        c.fire(CC, k, ft(10 * k))                         # … the batched counter block comes after (within max_delay)
     assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
     out = rec.stop(st["id"])
-    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
-    assert footer["window_end_ms"] == 500.0 and footer["rows_after_window"] == 10, footer
-    assert "rows_after_window_at_least" not in footer and footer["label"] == "COMPLETE", footer
-    r = rec.read(st["id"], None, None, ["MAIN.nCycle", CC], 10_000, False)
-    assert max(row["t_ms"] for row in r["rows"]) == 500.0 and len(r["rows"]) == 102, len(r["rows"])
-    stx = rec.stats(st["id"], ["MAIN.nCycle"], False, 0, exact=True)
-    assert stx["symbols"]["MAIN.nCycle"]["count"] == 51 and stx["symbols"]["MAIN.nCycle"]["max"] == 50, stx
+    lines = Path(out["file"]).read_text(encoding="utf-8").splitlines()
+    footer = json.loads(lines[-1])
+    rows = [json.loads(ln) for ln in lines if ln.startswith("[")]
+    assert footer["window_end_ms"] == 500.0 and footer["label"] == "COMPLETE", footer
+    assert max(r[0] for r in rows) == 500.0 and len(rows) == 102, (max(r[0] for r in rows), len(rows))
+    assert [r[0] for r in rows] == sorted(r[0] for r in rows)          # the file is in PLC-time order
+    assert footer["after_limit"] >= 10 and "rows_after_window" not in footer and "late_samples" not in footer, footer
     v = rec.verify(st["id"])
-    assert v["verdict"] == "PASS" and v["timeline"]["rows_after_window"] == 10 and v["timeline"]["samples"] == 102, v
+    assert v["verdict"] == "PASS" and "rows_after_window" not in v["timeline"], v
+
+
+def test_python_block_silent_longer_than_the_horizon_does_not_hold_the_others(rec, monkeypatch):
+    """A block that delivers nothing for silent_s (a stopped task) no longer holds the other blocks back; what it
+    sends later is written as it comes and counted as late — the recording stays live, nothing is dropped."""
+    st = _two_blocks(rec)
+    c = _conn()
+    for k in range(0, 31):
+        c.fire("MAIN.nCycle", k, ft(10 * k))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 31, timeout=3)      # released after silent_s
+    for k in range(0, 31):
+        c.fire(CC, k, ft(10 * k))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 62, timeout=3)
+    out = rec.stop(st["id"])
+    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer["late_samples"] == 30 and footer["samples"] == 62, footer      # CC 0..290 came after nCycle 300
+
+
+def test_readers_take_the_footer_window_as_the_recording(rec, monkeypatch):
+    """Files written by 0.8.10's Python recorder could hold rows past window_end_ms: every reader takes the window
+    the footer names (rec_verify counts what lies outside it)."""
+    st = _two_blocks(rec)
+    c = _conn()
+    for k in range(0, 21):
+        c.fire("MAIN.nCycle", k, ft(10 * k))
+        c.fire(CC, k, ft(10 * k))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 42)
+    out = rec.stop(st["id"])
+    real = R.read_footer
+    monkeypatch.setattr(R, "read_footer", lambda p: {**(real(p) or {}), "window_end_ms": 150.0})
+    r = rec.read(st["id"], None, None, ["MAIN.nCycle"], 1000, False)
+    assert max(row["t_ms"] for row in r["rows"]) == 150.0 and len(r["rows"]) == 16
 
 
 def test_verify_of_a_change_recording_without_a_counter_is_inconclusive(rec):

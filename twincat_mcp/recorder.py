@@ -46,6 +46,7 @@ import base64
 import ctypes
 import datetime as dt
 import hashlib
+import heapq
 import hmac as _hmac
 import json
 import math
@@ -57,7 +58,6 @@ import stat
 import struct
 import threading
 import time
-from array import array
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,9 +75,6 @@ MAX_BLOCK_BYTES = 16384        # one notification never carries more than this
 QUEUE_BYTES = 256 << 20        # in-memory backlog cap per recording
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
 TAIL_WAIT_S = 1.0             # after the duration: wait at most this long for in-flight samples up to the cut
-
-
-RECENT_ROWS = 4096            # per block: rows remembered to count those written past a later end (≥ max_delay)
 
 
 def _ticks(ms: float) -> int:
@@ -327,24 +324,7 @@ class Block:
     error: str | None = None
     last_wall: float | None = None          # monotonic time the last sample arrived (D14: silence estimate)
     seen_t: float | None = None             # newest PLC time received, kept or not (an end is reached at or past it)
-    recent: Any = None                      # ring of the last RECENT_ROWS written stamps (rows past a later end)
-    recent_i: int = 0
-
-    def remember(self, t: float) -> None:
-        """The stamp of a row written to the file (the recorder only): rows of a block that ran ahead in ADS order can
-        lie past an end that is set later; rows_after counts them."""
-        if self.recent is None:
-            self.recent = array("d", [math.nan]) * RECENT_ROWS
-        self.recent[self.recent_i] = t
-        self.recent_i = (self.recent_i + 1) % RECENT_ROWS
-
-    def rows_after(self, end: float) -> tuple[int, bool]:
-        """(rows written with a stamp past `end`, exact?) — not exact when every remembered row is past it."""
-        if self.recent is None or self.last_t is None or _ticks(self.last_t) <= _ticks(end):
-            return 0, True
-        e = _ticks(end)
-        n = sum(1 for x in self.recent if x == x and _ticks(x) > e)
-        return n, n < RECENT_ROWS
+    late: int = 0                           # samples written before a row of another block with a later stamp
 
     def header(self) -> dict[str, Any]:
         return {"id": self.bid, "igrp": self.igrp, "ioffs": self.ioffs, "size": self.size,
@@ -652,6 +632,13 @@ class Recording:
         self._stop_cut_mono: float | None = None
         self.stop_wait_ms: float | None = None
         self._cut_lock = threading.Lock()     # the end (_cut_t, stop_at_cut, cut_by): ingest thread vs rec_stop
+        # PLC-order release (_ingest_loop): per block, the samples that wait for the other blocks
+        self._pending: dict[int, deque] = {}
+        self._heads: list[tuple[float, int]] = []
+        self._pending_n = 0
+        self._last_out_t: float | None = None
+        self._ingest_mono = time.monotonic()
+        self._silent_s = max(0.5, (50.0 * float(self.cycle_ms or 0) + 3.0 * self.max_delay_ms) / 1000.0)
         self._sha = hashlib.sha256()
         self._lines = 0
         self._bytes = 0
@@ -777,6 +764,7 @@ class Recording:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.path, "w", encoding="utf-8", newline="\n", buffering=1 << 16)
         self._write(json.dumps(self.header_dict(), default=str) + "\n")
+        self._ingest_mono = time.monotonic()
         self._thread = threading.Thread(target=self._ingest_loop, name=f"rec-{self.id}", daemon=True)
         self._thread.start()
 
@@ -805,6 +793,13 @@ class Recording:
 
     # ------------------------------------------------------------ ingest
     def _ingest_loop(self) -> None:
+        """Samples arrive in ADS order: one block's in PLC order, but another block's can come up to max_delay_ms
+        later (batching). Written in arrival order, a block that ran ahead had rows past an end that a batched block
+        set later (stop_when at 500 ms with rows up to 600 ms already in the file), and the trigger saw the blocks
+        out of step. So, like the native engine: every block sample waits in its block's queue and is released — to
+        the trigger, the file, the statistics, stop_when / max_events, the limits — in PLC-time order, once every
+        block that is delivering has been seen at or past it (_horizon). Poll rows (one source, this PC's clock)
+        go straight through."""
         released = False
         deadline = None
         while True:
@@ -813,28 +808,28 @@ class Recording:
                 released = True
                 self._release()              # no new samples; what is queued was taken before the stop
                 deadline = time.monotonic() + DRAIN_TIMEOUT_S
+            got = 0
             try:
-                item = self.q.get(timeout=0 if stopping else 0.25)
+                item = self.q.get(timeout=0 if (stopping or self._pending_n) else 0.25)
             except queue.Empty:
-                if stopping:
+                item = None
+            while item is not None:
+                self._arrive(item)
+                got += 1
+                if got >= 4096:
                     break
-                self._check_limits()
-                continue
-            if item is None:
-                continue
+                try:
+                    item = self.q.get_nowait()
+                except queue.Empty:
+                    item = None
             if stopping and deadline is not None and time.monotonic() > deadline:
-                self.dropped_on_stop += 1 + self.q.qsize()
+                self.dropped_on_stop += self.q.qsize() + self._pending_n
                 break
-            backlog = self.q.qsize()
-            if backlog > self.max_backlog:
-                self.max_backlog = backlog
-            light = backlog > 2_000          # under load: raw samples first, statistics later (from the file)
-            try:
-                self._handle(item, light)
-            except Exception as exc:  # noqa: BLE001 — a bad sample must not end the recording silently
-                if len(self.errors) < 20:
-                    self.errors.append(f"ingest: {type(exc).__name__}: {exc}")
-            if not stopping:
+            final = stopping and self.q.empty()
+            done = self._release_ordered(final)
+            if final and not self._pending_n:
+                break
+            if not stopping and not done:
                 self._check_limits()
             if self._fh and time.monotonic() - self._last_flush > 1.0:
                 self._write_chain()
@@ -842,24 +837,99 @@ class Recording:
                 self._last_flush = time.monotonic()
         self._finish()
 
-    def _handle(self, item: Any, light: bool) -> None:
+    def _arrive(self, item: Any) -> None:
+        """A sample is here: its time, the block's newest time seen, this PC's clock of its arrival. Poll rows are
+        handled at once; block samples wait in their block's queue (_release_ordered)."""
+        if item is None:
+            return
         ts, key, payload = item
         t = self._rel_ms(ts)
-        if key is not None:
-            blk = self.blocks[key]
-            if blk.seen_t is None or t > blk.seen_t:
-                blk.seen_t = t
-        if self._cut_t is not None and _ticks(t) > _ticks(self._cut_t):    # in ticks: 1.005 s × 1000 is 1004.99…
-            self.after_limit += 1
-            return
         if self.t0_mono is None:
             self.t0_mono = time.monotonic()
+        backlog = self.q.qsize() + self._pending_n
+        if backlog > self.max_backlog:
+            self.max_backlog = backlog
         if key is None:
-            self._handle_poll(t, payload, light)
-        else:
-            b = self.blocks[key]
-            b.last_wall = time.monotonic()
+            self._release_one(t, None, payload, backlog > 2_000)
+            return
+        b = self.blocks[key]
+        b.last_wall = time.monotonic()
+        if b.seen_t is None or t > b.seen_t:
+            b.seen_t = t
+        q = self._pending.setdefault(b.bid, deque())
+        if not q:
+            heapq.heappush(self._heads, (t, b.bid))
+        q.append((t, payload))
+        self._pending_n += 1
+
+    def backlog(self) -> int:
+        """Samples received but not in the file yet: queued, or waiting for the other blocks (PLC-order release)."""
+        return self.q.qsize() + self._pending_n
+
+    @property
+    def received_t(self) -> float:
+        """The newest PLC time received (ms since t0) — kept or not, written or still waiting for the other blocks.
+        What 'now' is for a client that compares PLC times (last_t is the newest one in the file)."""
+        seen = [b.seen_t for b in self.blocks if b.seen_t is not None]
+        return max(seen + [self.last_t])
+
+    def _horizon(self) -> float | None:
+        """The PLC time up to which every block has delivered: the smallest newest-seen time of the blocks that are
+        delivering. A block not seen yet is waited for; one that has delivered nothing for silent_s (a stopped task,
+        a change-mode block whose values do not change) no longer holds the others back — what it sends later is
+        written as it comes and counted as late. None: wait."""
+        now = time.monotonic()
+        w = math.inf
+        for b in self.timeline_blocks():
+            quiet = now - (b.last_wall if b.last_wall is not None else self._ingest_mono) > self._silent_s
+            if quiet:
+                continue
+            if b.seen_t is None:
+                return None
+            w = min(w, b.seen_t)
+        return w
+
+    def _release_ordered(self, final: bool) -> int:
+        """Release the waiting block samples up to the horizon (everything when final), oldest PLC time first; the
+        limits are checked after each one, so a sample past an end set by an earlier one is never written."""
+        if not self._pending_n:
+            return 0
+        w = math.inf if final else self._horizon()
+        if w is None:
+            return 0
+        n = 0
+        while self._heads:
+            t, bid = self._heads[0]
+            if t > w:
+                break
+            heapq.heappop(self._heads)
+            q = self._pending[bid]
+            t, payload = q.popleft()
+            self._pending_n -= 1
+            if q:
+                heapq.heappush(self._heads, (q[0][0], bid))
+            self._release_one(t, self.blocks[bid], payload, self._pending_n + self.q.qsize() > 2_000)
+            n += 1
+            if not final:
+                self._check_limits()
+        return n
+
+    def _release_one(self, t: float, b: Block | None, payload: Any, light: bool) -> None:
+        try:
+            if self._cut_t is not None and _ticks(t) > _ticks(self._cut_t):    # in ticks: 1.005 s × 1000 is 1004.99…
+                self.after_limit += 1
+                return
+            if b is None:
+                self._handle_poll(t, payload, light)
+                return
+            if self._last_out_t is not None and t < self._last_out_t:
+                b.late += 1
+            else:
+                self._last_out_t = t
             self._handle_block(t, b, payload, light)
+        except Exception as exc:  # noqa: BLE001 — a bad sample must not end the recording silently
+            if len(self.errors) < 20:
+                self.errors.append(f"ingest: {type(exc).__name__}: {exc}")
 
     WARMUP_MS = 200.0     # a level start_when waits at most this long (PLC time) for every block's first sample
 
@@ -907,7 +977,6 @@ class Recording:
 
     def _commit_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
         # timeline of what is IN the file (pre-trigger samples that were discarded are not part of it)
-        b.remember(t)
         if self.mode == "cycle":
             prev = b.last_t
             gap = b.note_stamp(t)
@@ -1116,16 +1185,9 @@ class Recording:
                           "sha256": digest}
                 if self.label_reason():
                     footer["label_reason"] = self.label_reason()
-                if self._cut_t is not None:
-                    # rows of a block that was ahead in ADS order, written before the end was known: in the file, not in
-                    # the recording — every reader skips rows past window_end_ms (the native engine writes in PLC order
-                    # and has none)
-                    after = [b.rows_after(self._cut_t) for b in self.blocks]
-                    n_after = sum(n for n, _ in after)
-                    if n_after:
-                        footer["rows_after_window"] = n_after
-                        if not all(ok for _, ok in after):
-                            footer["rows_after_window_at_least"] = True
+                late = sum(b.late for b in self.blocks)
+                if late:
+                    footer["late_samples"] = late          # written after a later stamp of another block (see _horizon)
                 footer.update(self.stop_and_trigger_notes())
                 if self.stall_cfg:
                     footer["stall_counter_block"] = self.stall_cfg.get("block")
@@ -1271,6 +1333,7 @@ class Recording:
                                   else "deferred (high rate: computed from the file by rec_stats)",
                 "events_per_s": round(self.events / elapsed, 1) if elapsed > 0 else 0.0,
                 "elapsed_s": round(elapsed, 2), "plc_span_s": round(self.last_t / 1000.0, 4),
+                "received_ms": round(self.received_t, 4), "pending": self.backlog(),
                 "armed": bool(self.active and self.armed and self.triggered_at is None),
                 "triggered_at_ms": None if self.triggered_at is None else round(self.triggered_at, 3),
                 "stop_reason": self.stop_reason, "file": str(self.path),

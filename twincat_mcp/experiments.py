@@ -1225,8 +1225,12 @@ class Runner:
                 except Exception:  # noqa: BLE001
                     break
                 span = st.get("plc_span_s")
-                q = getattr(self.d.rec.recs.get(rid), "q", None)
-                busy = q is not None and hasattr(q, "empty") and not q.empty()
+                # still on its way into the file: queued, or (Python engine, PLC-order release) waiting for the other
+                # blocks — the span of the file is not final while anything is
+                rec_obj = self.d.rec.recs.get(rid)
+                q = getattr(rec_obj, "q", None)
+                busy = (rec_obj.backlog() > 0 if hasattr(rec_obj, "backlog") else
+                        q is not None and hasattr(q, "empty") and not q.empty())
                 if isinstance(span, (int, float)) and span == last and not busy:
                     break
                 last = span if isinstance(span, (int, float)) else last
@@ -1269,8 +1273,13 @@ class Runner:
                 st = self.d.rec.status(rid)
             except Exception:  # noqa: BLE001
                 continue
+            # the newest PLC time received (Python engine), else the newest in the file: written in PLC order, the
+            # file lags what has arrived — 'now' taken from it put the stimulus too early
+            rcv = st.get("received_ms")
             span = st.get("plc_span_s")
-            if isinstance(span, (int, float)):
+            if isinstance(rcv, (int, float)):
+                best = max(best or 0.0, float(rcv))
+            elif isinstance(span, (int, float)):
                 best = max(best or 0.0, float(span) * 1000.0)
         return best if best is not None else self._rec_elapsed_ms(rec_ids)
 
