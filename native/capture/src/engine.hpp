@@ -142,7 +142,14 @@ private:
     int64_t cut_ = 0;                // duration / post-trigger end (inclusive)
     std::string cut_reason_;
     bool have_stop_ft_ = false;
-    std::atomic<bool> manual_stop_{false};   // R7: stopped by request — blocks end within an unsubscribe spread
+    std::atomic<bool> manual_stop_{false};   // stopped by request with no PLC end time (nothing delivered / armed)
+    // N56: a stop on request ends at a PLC time — the newest sample delivered when it was asked for. The notifications
+    // stay until every block reached it (at most max_delay + 1 s): each block is then complete up to the same end and
+    // the tail needs no allowance beyond one period (unsubscribing at once let blocks end max_delay apart)
+    std::atomic<bool> stop_cut_pending_{false};
+    std::chrono::steady_clock::time_point stop_cut_wall_;
+    bool stop_on_request_ = false;
+    double stop_wait_ms_ = -1;
     int64_t stop_ft_ = 0;            // stop_when / max_events sample
     bool armed_ = false;
     bool triggered_ = false;
@@ -160,6 +167,10 @@ private:
     size_t armed_seen_n_ = 0;
     int64_t armed_t0_ = 0;
     bool have_armed_t0_ = false;
+    // N61: the level condition was already true during that warm-up — a later trigger reports its delay, a trigger
+    // that never fires says it was true then (and false afterwards) instead of nothing
+    bool have_warm_true_ = false;
+    int64_t warm_true_ft_ = 0;
     uint64_t samples_ = 0, events_ = 0, after_limit_ = 0;
     int64_t last_emitted_ = 0;
     bool any_emitted_ = false;

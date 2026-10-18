@@ -139,11 +139,16 @@ def test_triggers_pre_and_stop(rec):
     rid = st["id"]
     assert st["armed"]
     c = _conn()
+    cc = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"     # recorded automatically: its own block
+    # cycle mode delivers every block every cycle (R41/N57: a level start_when waits for every block's first sample)
     for ms in range(0, 200, 10):
         c.fire("MAIN.nCycle", ms // 10, ft(ms))
+        c.fire(cc, ms // 10, ft(ms))
     c.fire("MAIN.bStart", True, ft(200))
+    c.fire(cc, 20, ft(200))
     for ms in range(210, 300, 10):
         c.fire("MAIN.nCycle", ms // 10, ft(ms))
+        c.fire(cc, ms // 10, ft(ms))
     c.fire("MAIN.fbFill.bDone", True, ft(300))
     assert wait_until(lambda: not rec.status(rid)["active"])
     s = rec.status(rid)
@@ -267,9 +272,13 @@ def test_post_trigger_window(rec):
                    duration_s=None, max_events=None, start_when="MAIN.bStart == TRUE", stop_when=None, pre_trigger_ms=0,
                    name=None, max_symbols=10, post_trigger_s=0.1)
     c = _conn()
+    cc = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"     # recorded automatically: its own block
+    c.fire(cc, 499, ft(4990))                                    # every block delivers (cycle mode)
     c.fire("MAIN.bStart", True, ft(5000))
+    c.fire(cc, 500, ft(5000))
     for ms in range(5010, 5300, 10):
         c.fire("MAIN.nCycle", ms, ft(ms))
+        c.fire(cc, ms // 10, ft(ms))
     assert wait_until(lambda: not rec.status(st["id"])["active"])
     s = rec.status(st["id"])
     assert s["stop_reason"].startswith("post_trigger 0.1s")
@@ -656,11 +665,12 @@ def test_n31_cycle_below_the_fastest_task_is_flagged(rec):
                 max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="n31", max_symbols=50)
     st = rec.start(**base)
     rec.stop(st["id"])
-    assert "below the fastest task of this runtime (10 ms)" in st["warning"] and st["fastest_task_ms"] == 10.0
-    assert "use cycle_ms=10" in st["warning"]
+    # no project task configuration here: compared with the fastest task, and the warning says so (N62)
+    assert "below the cycle of MAIN (no single task) (10 ms" in st["warning"] and st["fastest_task_ms"] == 10.0
+    assert "task configuration is not available" in st["warning"] and "use cycle_ms=10" in st["warning"]
     st = rec.start(**{**base, "cycle_ms": 10})
     rec.stop(st["id"])
-    assert "fastest task" not in st.get("warning", "") and "fastest_task_ms" not in st
+    assert "below the cycle" not in st.get("warning", "") and "fastest_task_ms" not in st
 
 
 def test_r13_snapshot_of_a_recording_from_an_earlier_session(rec, monkeypatch, tmp_path):
@@ -690,3 +700,245 @@ def test_d46_counter_check_segments_at_a_restart(rec, monkeypatch):
     assert c["expected_samples"] == 500 and c["completeness"] == 1.0 and c["segments"] == 2, c
     assert c["resets"][0]["from"] == 165_299 and c["resets"][0]["to"] == 1 and c["lossless_within_segments"]
     assert c["lossless"] is False
+
+
+# ---------------------------------------------------------------- 0.8.9 retest: N56–N63 (root fixes)
+CC = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"
+
+
+def _two_blocks(rec, **kw):
+    """MAIN.nCycle and the task's CycleCount: two notification blocks (64-byte slots far apart)."""
+    args = dict(symbols=["MAIN.nCycle", CC], prefix=None, pattern=None, mode="cycle", cycle_ms=10, duration_s=None,
+                max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=50,
+                cycle_counter=None)
+    args.update(kw)
+    return rec.start(**args)
+
+
+def test_n60_tail_and_head_counts_are_integer_ticks_like_the_engine():
+    """N60: (0.6 − 0.3) / 0.1 is 2.9999999999999996 in float ms → one missing sample less than the engine's
+    floor(3000 / 1000) − 1 on 100 ns ticks for the same file."""
+    b = R.Block(0, 0x4040, 0, 4, [])
+    b.first_t, b.last_t, b.min_step, b.samples = 0.0, 0.3, 0.1, 4
+    assert b.tail_missing(0.6) == 2                       # engine: (6000 − 3000) // 1000 − 1
+    assert b.head_missing(-0.3) == 3                      # engine: (0 − (−3000)) // 1000
+    assert b.missing(0.6, None) == 2
+
+
+def test_n56_python_stop_on_request_ends_at_a_plc_time_and_a_block_that_stopped_early_fails(rec):
+    """N56 (Python engine): rec_stop ends at the newest PLC time received; every block must reach it. A block that
+    stopped delivering 100 ms before the stop has lost those samples — FAIL, in the footer and in rec_verify."""
+    st = _two_blocks(rec)
+    c = _conn()
+    for ms in range(0, 310, 10):
+        c.fire("MAIN.nCycle", ms // 10, ft(ms))
+        if ms <= 200:
+            c.fire(CC, ms // 10, ft(ms))                  # the counter block goes quiet at 200 ms
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 52)
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer["window_end_ms"] == 300.0 and footer["stop_on_request"]["at_ms"] == 300.0, footer
+    assert footer["label"] == "INCOMPLETE" and footer["missing_samples"] == 9, footer      # (300 − 200) / 10 − 1
+    v = rec.verify(st["id"])
+    blk = {b["first"]: b for b in v["timeline"]["blocks"]}
+    assert blk[CC]["missing_tail"] == 9 and blk["MAIN.nCycle"]["missing_tail"] == 0
+    assert v["verdict"] == "FAIL" and v["block_ends"]["first_to_end"] == blk[CC]["block"], v
+
+
+def test_n56_python_lossless_stop_on_request_passes_with_allowance_one(rec):
+    st = _two_blocks(rec)
+    c = _conn()
+    for ms in range(0, 310, 10):
+        c.fire("MAIN.nCycle", ms // 10, ft(ms))
+        c.fire(CC, ms // 10, ft(ms))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 62)
+    out = rec.stop(st["id"], "manual (rec_stop)")
+    assert out["missing_samples"] == 0 and out["label"] == "COMPLETE", out
+    v = rec.verify(st["id"])
+    assert v["verdict"] == "PASS" and v["timeline"]["window_end_ms"] == 300.0 and v["block_ends"]["spread_ms"] == 0
+
+
+def test_n56_verify_of_a_legacy_stop_without_plc_end_is_inconclusive_not_pass(rec, monkeypatch):
+    """A file written by an engine that unsubscribed at once (≤ 0.8.9 native: manual_stop, no window end): the blocks
+    end where their unsubscription happened to be. rec_verify checks up to the earliest end and says the rest is
+    not verified — it does not lend the engine's max_delay allowance (900 lost samples passed)."""
+    st = _two_blocks(rec)
+    c = _conn()
+    for ms in range(0, 310, 10):
+        c.fire("MAIN.nCycle", ms // 10, ft(ms))
+        if ms <= 200:
+            c.fire(CC, ms // 10, ft(ms))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 52)
+    rec.recs[st["id"]].request_stop("legacy")            # stop now, no PLC end time
+    rec.stop(st["id"])
+    real = rec._integrity
+
+    def legacy(path):
+        out = real(path)
+        out["_footer_raw"] = {**(out["_footer_raw"] or {}), "manual_stop": True, "window_end_ms": None,
+                              "max_delay_ms": 1000.0, "verdict_hint": "PASS"}
+        return out
+    monkeypatch.setattr(rec, "_integrity", legacy)
+    v = rec.verify(st["id"])
+    assert v["timeline"]["window_end_ms"] == 200.0 and v["timeline"]["missing"] == 0
+    assert v["verdict"] == "INCONCLUSIVE" and "100 ms" in v["inconclusive"], v
+    assert v["block_ends"]["spread_ms"] == 100.0
+
+
+def test_n57_n63_python_trigger_keeps_the_trigger_cycle_when_the_trigger_block_is_batched(rec):
+    """N57: the trigger block's samples come in batches (max_delay 100 ms); the other block runs ahead. A fixed 50 ms
+    pre-trigger margin purged the other block's samples of the trigger cycle before the trigger was seen, and with
+    pre_trigger_ms 0 there was no head check. Both blocks must start at trigger − pre_trigger_ms."""
+    for pre in (0, 50):
+        st = _two_blocks(rec, start_when=f"{CC} >= 30", pre_trigger_ms=pre, max_delay_ms=100, post_trigger_s=0.15)
+        c = _conn()
+        held = []
+        for k in range(0, 60):
+            c.fire("MAIN.nCycle", k, ft(10 * k))
+            held.append(k)
+            if k % 10 == 9:                               # the counter block: 10 cycles per notification
+                for h in held:
+                    c.fire(CC, h, ft(10 * h))
+                held = []
+        assert wait_until(lambda: not rec.status(st["id"])["active"]), rec.status(st["id"])
+        s = rec.status(st["id"])
+        assert s["triggered_at_ms"] == 300.0, s
+        r = rec.read(st["id"], None, None, ["MAIN.nCycle", CC], 1000, False)
+        firsts = {}
+        for row in r["rows"]:
+            firsts.setdefault(row["symbol"], row["t_ms"])
+        assert firsts == {"MAIN.nCycle": 300.0 - pre, CC: 300.0 - pre}, (pre, firsts)
+        v = rec.verify(st["id"])
+        assert v["timeline"]["window_start_ms"] == 300.0 - pre
+        assert all(b["missing_head"] == 0 for b in v["timeline"]["blocks"]), v["timeline"]
+
+
+def test_n57_head_check_with_pre_trigger_zero(rec):
+    """With pre_trigger_ms 0 the window starts at the trigger: a block whose first sample comes later lost its head."""
+    st = _two_blocks(rec, start_when="MAIN.nCycle >= 3")
+    c = _conn()
+    for k in range(0, 12):
+        c.fire("MAIN.nCycle", k, ft(10 * k))
+        if k >= 6:                                         # the counter block misses cycles 3..5 after the trigger
+            c.fire(CC, k, ft(10 * k))
+        elif k < 3:
+            c.fire(CC, k, ft(10 * k))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 15)
+    out = rec.stop(st["id"])
+    assert out["triggered_at_ms"] == 30.0
+    v = rec.verify(st["id"])
+    blk = {b["first"]: b for b in v["timeline"]["blocks"]}
+    assert v["timeline"]["window_start_ms"] == 30.0 and blk[CC]["missing_head"] == 3 and v["verdict"] == "FAIL", v
+
+
+def test_n61_python_level_trigger_true_only_during_the_warmup_is_reported(rec):
+    """N61: start_when true only in the first cycles, before every block delivered — it does not fire, and the status
+    / footer say so instead of nothing; a trigger that fires after the warm-up reports its delay."""
+    st = _two_blocks(rec, start_when="MAIN.nCycle <= 2")
+    c = _conn()
+    for k in range(0, 40):                                  # the counter block starts at cycle 5 (late subscription)
+        c.fire("MAIN.nCycle", k, ft(10 * k))
+        if k >= 5:
+            c.fire(CC, k, ft(10 * k))
+    assert wait_until(lambda: rec.status(st["id"]).get("trigger_note"))
+    s = rec.status(st["id"])
+    assert s["armed"] and "did not fire" in s["trigger_note"] and s["start_when_warmup_true_ms"] == 0.0, s
+    rec.stop(st["id"])
+    st = _two_blocks(rec, start_when="MAIN.nCycle >= 0")
+    c = _conn()
+    for k in range(0, 20):
+        c.fire("MAIN.nCycle", k, ft(10 * k))
+        if k >= 3:
+            c.fire(CC, k, ft(10 * k))
+    assert wait_until(lambda: rec.status(st["id"]).get("triggered_at_ms") is not None)
+    s = rec.status(st["id"])
+    assert s["triggered_at_ms"] == 40.0 and s["trigger_delayed_ms"] == 40.0 and "fired 40 ms later" in s["trigger_note"], s
+    rec.stop(st["id"])
+
+
+def test_n58_export_never_writes_over_the_recording_or_a_sidecar(rec, tmp_path):
+    st = _two_blocks(rec)
+    c = _conn()
+    for ms in range(0, 50, 10):
+        c.fire("MAIN.nCycle", ms // 10, ft(ms))
+        c.fire(CC, ms // 10, ft(ms))
+    rec.stop(st["id"])
+    src = Path(rec.status(st["id"])["file"])
+    before = R.file_sha256(src)[0]
+    first = rec.export(st["id"], "csv_wide", None, None)
+    for target in (src, R.manifest_path(src), Path(first["provenance"]["file"]), src.with_name("other.jsonl")):
+        with pytest.raises(RecorderError, match="cannot be an export target"):
+            rec.export(st["id"], "csv_long", str(target), None, overwrite=True)
+    assert R.file_sha256(src)[0] == before
+
+
+def test_n59_a_failed_export_leaves_the_previous_one_intact(rec, monkeypatch):
+    st = _two_blocks(rec)
+    c = _conn()
+    for ms in range(0, 100, 10):
+        c.fire("MAIN.nCycle", ms // 10, ft(ms))
+        c.fire(CC, ms // 10, ft(ms))
+    rec.stop(st["id"])
+    first = rec.export(st["id"], "csv_wide", None, None)
+    old = Path(first["file"]).read_bytes()
+    old_prov = Path(first["provenance"]["file"]).read_bytes()
+    calls = {"n": 0}
+    real = R._flat
+
+    def boom(v):
+        calls["n"] += 1
+        if calls["n"] > 5:
+            raise OSError("disk full (simulated)")
+        return real(v)
+    monkeypatch.setattr(R, "_flat", boom)
+    with pytest.raises(OSError, match="disk full"):
+        rec.export(st["id"], "csv_wide", None, None, fill=True, overwrite=True)
+    assert Path(first["file"]).read_bytes() == old and Path(first["provenance"]["file"]).read_bytes() == old_prov
+    assert not [p for p in Path(first["file"]).parent.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_n62_cycle_compared_with_the_task_that_runs_the_program(rec, monkeypatch):
+    """N62: the warning compared with the runtime's fastest task — cycle_ms=1 on variables of a 10 ms task said
+    nothing when another task ran every 1 ms."""
+    man = rec._manifest(None)
+    man = {**man, "tasks": [{"index": 1, "name": "PlcTask", "cycle_time_ms": 10.0},
+                            {"index": 2, "name": "FastTask", "cycle_time_ms": 1.0}]}
+    monkeypatch.setattr(rec, "_manifest", lambda port=None: man)
+    owners = {"MAIN": ["PlcTask"]}
+    rec.task_of = lambda name: owners.get(name, [])
+    st = rec.start(symbols=["MAIN.nCycle", "GVL_Machine.nDrumsFilled"], prefix=None, pattern=None, mode="cycle",
+                   cycle_ms=1, duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0,
+                   name="n62", max_symbols=50, cycle_counter=None)
+    rec.stop(st["id"])
+    assert "below the cycle of MAIN (task PlcTask) (10 ms" in st["warning"], st.get("warning")
+    assert st["task_check"]["MAIN"] == {"task": "PlcTask", "cycle_ms": 10.0,
+                                        "basis": "its task in the project, cycle from the runtime"}
+    assert st["task_check"]["GVL_Machine"]["task"] is None and "GVL" in st["task_check"]["GVL_Machine"]["basis"]
+    assert "GVL_Machine" not in st["warning"]               # 1 ms = the fastest task: not below
+
+
+def test_n62_project_task_config_maps_programs_to_tasks(tmp_path):
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex
+    plc = tmp_path / "Plc"
+    (plc / "POUs").mkdir(parents=True)
+
+    def pou(name, impl):
+        (plc / "POUs" / f"{name}.TcPOU").write_text(
+            f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="{name}"><Declaration><![CDATA[PROGRAM {name}\n'
+            f'VAR\n  n : INT;\nEND_VAR]]></Declaration><Implementation><ST><![CDATA[{impl}]]></ST></Implementation></POU>'
+            '</TcPlcObject>', encoding="utf-8")
+    pou("MAIN", "PRG_Machine();\n// PRG_Fast(); is a comment")
+    pou("PRG_Machine", "n := n + 1;")
+    pou("PRG_Fast", "n := n + 1;")
+    idx = ProjectIndex(ProjectConfig(root=str(tmp_path)))
+    assert idx.tasks_of("MAIN") is None                      # no task configuration: cannot tell
+    for name, cyc, prog in (("PlcTask", 10000, "MAIN"), ("FastTask", 1000, "PRG_Fast")):
+        (plc / f"{name}.TcTTO").write_text(
+            f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><Task Name="{name}"><CycleTime>{cyc}</CycleTime>'
+            f'<Priority>20</Priority><PouCall><Name>{prog}</Name></PouCall></Task></TcPlcObject>', encoding="utf-8")
+    cfg = idx.task_config()
+    assert cfg["PlcTask"]["cycle_ms"] == 10.0 and cfg["FastTask"]["programs"] == ["PRG_Fast"]
+    assert idx.tasks_of("MAIN") == ["PlcTask"] and idx.tasks_of("PRG_Machine") == ["PlcTask"]   # called from MAIN
+    assert idx.tasks_of("PRG_Fast") == ["FastTask"]          # the commented call in MAIN does not count
+    assert idx.tasks_of("GVL_Machine") == []

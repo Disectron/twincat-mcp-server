@@ -203,6 +203,12 @@ class App:
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
         self.scope_runs: dict[str, dict[str, Any]] = {}     # recording id → Scope recording started with it
         self.rec.rcfg = cfg.recorder
+
+        # N62: the recorder compares cycle_ms with the task that runs each recorded program (project task config)
+        def _task_of(name: str) -> list[str] | None:
+            return self.proj.tasks_of(name)
+        _task_of.config = self.proj.task_config      # type: ignore[attr-defined]
+        self.rec.task_of = _task_of
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
         self.profiles = capture.ProfileStore(Path(cfg.safety.audit_log).parent / "profiles")

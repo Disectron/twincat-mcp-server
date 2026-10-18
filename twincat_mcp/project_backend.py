@@ -684,6 +684,60 @@ class ProjectIndex:
             raise ProjectError(f"edit produced invalid XML, reverted: {exc}") from exc
         return {"file": u.file, "changed": changed, "backup": str(bak), "eol": "CRLF" if eol == "\r\n" else "LF", "bom": bom}
 
+    # -- tasks (N62) ------------------------------------------------------------------------------------------
+    def task_config(self) -> dict[str, dict[str, Any]]:
+        """The PLC tasks of the project from its *.TcTTO files: {task: {"cycle_ms": float | None, "programs": [...],
+        "file": path}}. CycleTime in a .TcTTO is in microseconds; the programs are the task's PouCall entries."""
+        self._ensure()
+        out: dict[str, dict[str, Any]] = {}
+        if self.root is None:
+            return out
+        for f in sorted(self.root.rglob("*.TcTTO")) + sorted(self.root.rglob("*.tctto")):
+            if "_Boot" in f.parts or any(v.get("file") == str(f) for v in out.values()):
+                continue
+            try:
+                task = ET.fromstring(f.read_text(encoding="utf-8-sig", errors="replace")).find("Task")
+            except (ET.ParseError, OSError):
+                continue
+            if task is None:
+                continue
+            ct = (task.findtext("CycleTime") or "").strip()
+            progs = [(c.findtext("Name") or "").strip() for c in task.findall("PouCall")]
+            out[task.get("Name") or f.stem] = {"cycle_ms": int(ct) / 1000.0 if ct.isdigit() else None,
+                                               "programs": [p for p in progs if p], "file": str(f)}
+        return out
+
+    def tasks_of(self, unit_name: str) -> list[str] | None:
+        """The tasks that run a PROGRAM: it is in a task's PouCall, or a program of that task calls it (transitively,
+        from its body, actions and methods). [] when the name is no program (a GVL, an FB type: no owner of its own);
+        None when the project has no task configuration to tell."""
+        tasks = self.task_config()
+        if not tasks:
+            return None
+        u = self.units.get(unit_name.lower())
+        if u is None or u.kind != "PROGRAM":
+            return []
+        progs = {k: v for k, v in self.units.items() if v.kind == "PROGRAM"}
+        calls: dict[str, set[str]] = {}       # program → programs it calls
+        for key in progs:
+            body = " ".join(x.implementation for x in self.units.values()
+                            if x.name.lower() == key or (x.parent or "").lower() == key)
+            code = "\n".join(_strip_comments_line(ln) for ln in body.splitlines())
+            calls[key] = {o for o in progs if o != key and re.search(r"\b" + re.escape(progs[o].name) + r"\s*[(.]", code, re.I)}
+        owners = []
+        for tname, t in tasks.items():
+            seen: set[str] = set()
+            todo = [p.lower() for p in t["programs"]]
+            while todo:
+                p = todo.pop()
+                if p in seen:
+                    continue
+                seen.add(p)
+                todo.extend(calls.get(p, ()))
+            if unit_name.lower() in seen:
+                owners.append(tname)
+        return owners
+
     def read_file(self, rel_or_abs: str, max_chars: int = 200_000) -> dict[str, Any]:
         """Read a file inside the project root (or an allowed extra root). Anything outside is refused: this
         tool exists to read .TcPOU/.plcproj/.tsproj/HMI files, not C:\\Windows\\win.ini."""

@@ -607,21 +607,118 @@ def test_r41_trigger_keeps_every_block_from_the_trigger_cycle(capture_exe, tmp_p
     firsts = {}
     for t, k, b64 in rows:
         firsts.setdefault(k, (t, int.from_bytes(base64.b64decode(b64)[:4], "little")))
-    # both blocks start on the same cycle, the first one where every block delivers (here 2: block 1 starts at 1)
-    assert firsts["#0"] == firsts["#1"] and firsts["#0"][1] <= 2, firsts
+    # both blocks start on the same cycle, the first one where every block delivers: block 1 starts at cycle 1, and
+    # block 0's sample of cycle 1 is processed before block 1's (same time, block order) → the trigger is cycle 2
+    assert firsts["#0"] == firsts["#1"] and firsts["#0"][1] == 2, firsts
+    assert f["trigger_delayed_ms"] == 2.0, f
     assert f["verdict_hint"] == "PASS" and f["missing_samples"] == 0
 
 
-def test_r7_verify_uses_the_engines_tail_rule_for_a_stop_on_request(rec):
-    """R7: rec_stop said COMPLETE (the engine allows the unsubscribe order on a stop on request), rec_verify on the
-    same file said missing_tail 1 → FAIL although the counter was lossless."""
+def test_n56_stop_on_request_ends_at_a_plc_time_every_block_reaches(rec):
+    """R7 / N56: a stop on request ends at the newest PLC time delivered when it was asked for; the notifications stay
+    until every block delivered up to it, so the engine and rec_verify use the same allowance as any other end:
+    one period. (0.8.9 unsubscribed at once and allowed 3 periods + max_delay — 900 lost samples passed.)"""
     st = rec.start(symbols=["MAIN.nCycle", "MAIN.stRecipe"], prefix=None, pattern=None, mode="cycle", cycle_ms=1,
                    duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="r7",
-                   max_symbols=50)
+                   max_symbols=50, max_delay_ms=1000)
     time.sleep(0.6)
     fin = rec.stop(st["id"])
     assert fin["missing_samples"] == 0, fin
+    footer = json.loads(Path(fin["file"]).read_text(encoding="utf-8").splitlines()[-1])
+    assert footer["manual_stop"] is False and footer["stop_on_request"]["at_ms"] == footer["window_end_ms"], footer
     v = rec.verify(st["id"])
     assert v["timeline"]["missing"] == 0 and v["verdict"] == "PASS", v["timeline"]
-    footer = json.loads(Path(fin["file"]).read_text(encoding="utf-8").splitlines()[-1])
-    assert footer.get("manual_stop") is True and "max_delay_ms" in footer
+    assert v["timeline"]["window_end_ms"] == footer["window_end_ms"]
+    assert all(b["missing_tail"] == 0 for b in v["timeline"]["blocks"])
+
+
+def test_n56_n63_manual_stop_with_a_real_tail_drop_fails(capture_exe, tmp_path):
+    """N56: block 1 stops delivering 500 cycles before the end; max_delay 1 s. The 0.8.9 engine allowed
+    3 + max_delay/period = 1003 periods on a stop on request → PASS with 500 samples lost. Now the stop ends at the
+    newest PLC time, block 1 never reaches it → missing_tail 499, FAIL."""
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "n56", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 4, "leaves": 1},
+                                                {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4, "leaves": 1}],
+                              max_delay_100ns=10_000_000,
+                              sim={"speed": 200, "stop_after_cycles": 3000, "drop": [[1, 2500, 10_000_000]]}))
+        assert r["ok"], r
+        time.sleep(0.5)                                      # 3000 cycles at 200× ≈ 15 ms: the sim has stopped
+        f = s.call({"cmd": "stop", "reason": "requested"})["footer"]
+    finally:
+        s.close()
+    blocks = {b["id"]: b for b in f["blocks"]}
+    assert f["stop_on_request"]["at_ms"] == f["window_end_ms"] == 2999.0, f
+    assert blocks[1]["missing_tail"] == 499 and blocks[0]["missing_tail"] == 0, f["blocks"]
+    assert f["verdict_hint"] == "FAIL" and f["label"] == "INCOMPLETE"
+
+
+def test_n63_duration_end_keeps_allowance_one(capture_exe, tmp_path):
+    """stop_when / duration / max_events end at a PLC time too: one period of allowance, a block 3 cycles short →
+    missing_tail 2."""
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "n63", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 4, "leaves": 1},
+                                                {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4, "leaves": 1}],
+                              duration_s=0.5, max_delay_100ns=10_000_000,
+                              sim={"speed": 100, "drop": [[1, 498, 10_000_000]]}))
+        assert r["ok"], r
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    blocks = {b["id"]: b for b in f["blocks"]}
+    assert blocks[1]["missing_tail"] == 2 and f["verdict_hint"] == "FAIL", f["blocks"]
+
+
+def _first_cycles(path: Path) -> dict[str, int]:
+    firsts: dict[str, int] = {}
+    for t, k, b64 in _rows(path):
+        firsts.setdefault(k, int.from_bytes(base64.b64decode(b64)[:4], "little"))
+    return firsts
+
+
+def test_n57_n63_native_trigger_with_a_batched_trigger_block_and_pre_trigger(capture_exe, tmp_path):
+    """Parity with the Python engine (test_recorder.py::test_n57_n63_python_trigger_keeps_the_trigger_cycle_when_the_
+    trigger_block_is_batched): 10 ms cycle, the trigger block delivered in batches of 10 cycles (max_delay 100 ms),
+    start_when counter >= 30, pre_trigger 0 / 50 ms → both blocks start at cycle 30 − pre/10."""
+    for pre in (0, 50):
+        s = Svc(capture_exe)
+        try:
+            r = s.call(_start_cmd(tmp_path, f"n57_{pre}", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 4, "leaves": 1},
+                                                           {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4, "leaves": 1}],
+                                  cycle_100ns=100_000, max_delay_100ns=1_000_000, pre_trigger_ms=pre, post_trigger_s=0.15,
+                                  start_when={"block": 1, "off": 0, "type": "u32", "op": ">=", "value": 30},
+                                  sim={"speed": 20, "batch": [[1, 10]]}))
+            assert r["ok"], r
+            f = s.wait_event(30)["footer"]
+        finally:
+            s.close()
+        want = 30 - pre // 10
+        assert _first_cycles(tmp_path / f"n57_{pre}.jsonl") == {"#0": want, "#1": want}, (pre, f)
+        assert f["triggered_at_ms"] == 300.0 and all(b["missing_head"] == 0 for b in f["blocks"]), f
+
+
+def test_n61_native_level_trigger_true_only_during_the_warmup_is_reported(capture_exe, tmp_path):
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "n61a", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 4, "leaves": 1},
+                                                 {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4, "leaves": 1}],
+                              start_when={"block": 0, "off": 0, "type": "u32", "op": "<=", "value": 2},
+                              sim={"speed": 50, "late": [[1, 5]], "max_cycles": 400}))
+        assert r["ok"], r
+        time.sleep(0.4)
+        f = s.call({"cmd": "stop", "reason": "requested"})["footer"]
+    finally:
+        s.close()
+    assert f["start_when_warmup_true_ms"] == 0.0 and any("did not fire" in e for e in f["errors"]), f
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "n61b", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 4, "leaves": 1},
+                                                 {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4, "leaves": 1}],
+                              start_when={"block": 0, "off": 0, "type": "u32", "op": ">=", "value": 0},
+                              post_trigger_s=0.1, sim={"speed": 50, "late": [[1, 3]]}))
+        assert r["ok"], r
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    assert f["triggered_at_ms"] == 4.0 and f["trigger_delayed_ms"] == 4.0 and "already true" in f["trigger_note"], f
