@@ -21,6 +21,11 @@ tool wishlist (2026-10-18).
 | 0.8.6 | D20 Error List: late-bound `ToolWindows.ErrorList`, else the view copy (focus + clipboard, restored) | `xae_diagnostics` with Scope warnings in the Error List → they are in `items`, `source` names the route |
 | 0.8.6 | #10 Solution Explorer via the late-bound DTE / window object; 'Set as Active PLC Project' command | `xae_plc('logout')` while logged in → `command: PLC.Logoutfrom<name>`, `selected_node` set |
 | 0.8.6 | D41 4026 compiler line format | a build error in a method → `file`, `object`, `line`, `code` filled |
+| 0.8.7 | #10/#45 PLC online commands and Check all objects via the Automation Interface (`ConsumeXml` `<OnlineSettings><Commands>` on `TIPC^<Plc>^<Plc> Project`; `ITcPlcIECProject2.CheckAllObjects`) — `ResetColdCmd` is an assumed tag name | `xae_plc('login')` with no active PLC project → `route: automation_interface`; `xae_check_all_objects` → `route` names CheckAllObjects, errors in the Error List |
+| 0.8.7 | R14/R15 `plcopen_import` on the nested IEC project with `bFolderStructure` | import an exported POU with `options='replace'` → `added` empty, `duplicates_created` empty |
+| 0.8.7 | R7 native tail slack after a manual stop (hypothesis: blocks unsubscribed one after another; simulator test only) | `rec_start … cycle_ms=1`, `rec_stop` → `missing_tail` 0, `completeness` 1.0 |
+| 0.8.7 | D29 aligned profile groups (`_TaskInfo[1].CycleCount` trigger) | `rec_profile_start` on a change + cycle profile → `aligned.trigger`; both files start within one task cycle |
+| 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 
 ## Waiting on Ryan
 
@@ -28,7 +33,8 @@ tool wishlist (2026-10-18).
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
 - D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
-- Retest of 0.8.6.
+- Retest of 0.8.7.
+- D19 (ESI PDOs read empty): the `parse_note` / `unparsed` output of `hw_lookup` for the terminal, or the ESI file.
 
 ## Decided (wishlist 2026-10-18)
 
@@ -53,13 +59,14 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 | ID | What |
 |---|---|
 | R12 / A6 | `rec_verify` over many counters (pattern/list) and the 300 × 1 ms acceptance run per recording method; capacity documented — not built (`rec_verify` takes one counter) |
-| #45 | Check all objects does not run |
+| #45 | Check all objects did not run — 0.8.7 calls `ITcPlcIECProject2.CheckAllObjects` first (unverified, above) |
+| R32 (part) | Infosys page output: the "T_Ams NetId" table split — not fixed (the image placeholders and empty links of R32 are) |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
 
 ### From the 0.8.3 deep test
 
-All items fixed up to 0.8.6 except D5 (waiting on Ryan, above).
+All items fixed up to 0.8.7 except D5 and D19 (waiting on Ryan, above).
 
 ## On hold
 

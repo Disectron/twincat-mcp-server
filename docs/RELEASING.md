@@ -42,3 +42,4 @@ tag; `main` contains all of them.
 | 0.8.4 | 0.8.3 deep test: stalled PLC + re-subscription, honest live status, sealing of self-ended recordings, one pattern language rec_start/rec_scan, verified restart, Infosys index speed + reindex rule, ESI parsing | 2026-10-18 |
 | 0.8.5 | verified save before build/deploy/tcunit_run (D44); experiment measures honest (D33–D37); tc_doctor CONFIG as info (D45) | 2026-10-18 |
 | 0.8.6 | rest of the 0.8.3 deep test: 4026 compiler lines, Error List, active PLC project, TcUnit checks, recorder/profile fixes, Infosys progress | 2026-10-18 |
+| 0.8.7 | 0.8.6 retest + robustness (R1–R32): output folders + overwrite, confirmation names, workers that never cancel a running job, argument/condition validation, Automation Interface PLC online commands, Infosys lookup tables, aligned profile groups | 2026-10-18 |
