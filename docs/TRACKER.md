@@ -26,6 +26,8 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R7 native tail slack after a manual stop (hypothesis: blocks unsubscribed one after another; simulator test only) | `rec_start … cycle_ms=1`, `rec_stop` → `missing_tail` 0, `completeness` 1.0 |
 | 0.8.7 | D29 aligned profile groups (`_TaskInfo[1].CycleCount` trigger) | `rec_profile_start` on a change + cycle profile → `aligned.trigger`; both files start within one task cycle |
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
+| 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
+| 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
 
 ## Waiting on Ryan
 
@@ -33,7 +35,7 @@ tool wishlist (2026-10-18).
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
 - D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
-- Retest of 0.8.7.
+- Retest of 0.8.8 (0.8.7 fixes + the twincat-docs skill and the kb_* items R33–R39).
 - D19 (ESI PDOs read empty): the `parse_note` / `unparsed` output of `hw_lookup` for the terminal, or the ESI file.
 
 ## Decided (wishlist 2026-10-18)
@@ -60,6 +62,8 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 |---|---|
 | R12 / A6 | `rec_verify` over many counters (pattern/list) and the 300 × 1 ms acceptance run per recording method; capacity documented — not built (`rec_verify` takes one counter) |
 | #45 | Check all objects did not run — 0.8.7 calls `ITcPlcIECProject2.CheckAllObjects` first (unverified, above) |
+| infosys index twice | the `infosys_*` tools keep their own index of the Help Viewer package (`<kb>\infosys\helpviewer-1033`, ≈ 372 MB) next to `helpviewer\infosys_en.db`; one index (the tools reading `infosys_en.db`) is open — docs-skill spec §8 |
+| SOP indexing | `sop\*.md` listed by `kb_status`, not searchable yet (decided: index them; wishlist above) |
 | R32 (part) | Infosys page output: the "T_Ams NetId" table split — not fixed (the image placeholders and empty links of R32 are) |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |

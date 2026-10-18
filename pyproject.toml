@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twincat-mcp"
-version = "0.8.7"
+version = "0.8.8"
 description = "MCP server giving an AI agent full, audited control of a Beckhoff TwinCAT 3 engineering PC and its target IPC: ADS runtime, XAE Automation Interface, project files, TcUnit."
 readme = "README.md"
 requires-python = ">=3.10"

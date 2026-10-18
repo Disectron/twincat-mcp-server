@@ -2,7 +2,7 @@
   "name": "twincat-mcp",
   "description": "Beckhoff TwinCAT 3 tooling for Claude Code: the twincat-mcp server as an installable plugin.",
   "owner": { "name": "Ryan Harris / Transflo Pumps" },
-  "metadata": { "version": "0.8.7" },
+  "metadata": { "version": "0.8.8" },
   "plugins": [
     {
       "name": "twincat-mcp",
