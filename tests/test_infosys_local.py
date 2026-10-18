@@ -148,7 +148,7 @@ def test_books_and_index_all_and_the_reindex_rule(idx, pkg, tmp_path):
 
 # Fingerprint of the code that turns a page into stored rows. When this test fails: the extraction logic changed —
 # bump infosys.INDEXER_VERSION (every index is rebuilt once) and update the fingerprint below together.
-INDEXER_FINGERPRINT = (3, "fe0f3545b6a824a3")
+INDEXER_FINGERPRINT = (3, "ba51ea3a1ce20ebb")     # 3 is not released yet (0.8.9 shipped 2): one rebuild
 
 
 def _indexer_source_hash() -> str:

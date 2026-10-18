@@ -464,3 +464,67 @@ def test_content_sha_reads_every_line_end_as_lf(tmp_path):
         f = tmp_path / f"m{i}.py"
         f.write_bytes(data)
         assert K._content_sha(f) == want, i
+
+
+def test_n70_known_errors_in_every_notation_and_the_compiler_messages():
+    """N70: 'ADS error 1861' (a space) was not known, only 'ADSError 1861' and '0x745'; the compiler messages C0046 /
+    C0032 were not known at all. ADS codes are read in any notation; the compiler messages by their text."""
+    for q in ("ADS error 1861", "ADSError 1861", "0x745", "ADS-Error: 0x00000745", "error code 1861"):
+        k = K.known_error(q)
+        assert k and k["cause"].startswith("the target did not answer"), q
+    c46 = K.known_error("C0046: Identifier 'nFoo' not defined")
+    assert c46 and "'nFoo' is not declared" in c46["cause"] and "proj_search nFoo" in c46["fix"], c46
+    c32 = K.known_error("C0032: Cannot convert type 'BOOL' to type 'INT'")
+    assert c32 and "from BOOL to INT" in c32["cause"] and "BOOL_TO_INT" in c32["fix"], c32
+    assert K.known_error("HRESULT 0x6") is None                        # not every hex number is an ADS code
+    assert "{type, value}" in K.known_error("RPC call 'P.fb#M' failed: ADSError 1797 (0x705)")["fix"]   # braces kept
+
+
+def test_n71_n72_kb_search_stop_words_error_text_and_copy_names(kb, project_dir):
+    """N71: 'a the' searched the code for 'a' and 'the'; the C0032 text found units by 'to' / 'TYPE' alone.
+    N72: PRG_TcUnitRunner_9 (a copy name) found nothing and did not say why."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    k.add_project(str(project_dir), "sample")
+    with pytest.raises(K.KnowledgeError, match="only stop words"):
+        k.search("a the")
+    r = k.search("C0032: Cannot convert type 'BOOL' to type 'INT'")
+    assert r["known_error"] and r["hits"] == [] and "known_error has its cause" in r["note"], r
+    assert r["words_ignored"]["to"] == "stop word" and "error message" in r["words_ignored"]["type"], r
+    r = k.search("C0046: Identifier 'FB_Valve' not defined")              # the quoted name is looked for
+    assert r["known_error"] and r["hits"] and r["hits"][0]["unit"].startswith("FB_Valve"), r
+    r = k.search("how to open the valve")
+    assert {"how", "to", "the"} <= set(r["words_ignored"]) and r["hits"], r
+    r = k.search("FB_Valve_9")
+    assert r["hits"] and r["hits"][0]["unit"].startswith("FB_Valve") and r["hits"][0]["match"].startswith("base name")
+    assert "copy of (FB_Valve)" in r["note"], r
+    r = k.search("FB_Nothing_9")
+    assert r["hits"] == [] and "no unit contains FB_Nothing_9" in r["note"], r
+    r = k.search("ADS error 9999 zzqqxx")
+    assert r["known_error"] is None and "1861" in r["known_errors_covered"], r
+
+
+def test_n73_hw_lookup_output_size_is_controllable(kb):
+    """N73: every revision came with all its PDOs and CoE objects — EL3356-0010 / EL2407 were walls of repeats."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    k.hw_lookup("EL2008")
+    with k._db() as con:                                   # two older revisions of the same terminal
+        row = dict(con.execute("SELECT * FROM esi WHERE type='EL2008'").fetchone())
+        for rev in (row["revision"] - 1, row["revision"] - 2):
+            con.execute("INSERT INTO esi (type, name, product_code, revision, vendor, grp, file, pdo, coe) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", (row["type"], row["name"], row["product_code"], rev, row["vendor"],
+                                                      row["grp"], row["file"], row["pdo"], row["coe"]))
+    r = k.hw_lookup("EL2008", limit=5)
+    assert r["detail"] == "newest" and len(r["devices"]) == 3
+    assert "pdo" in r["devices"][0] and all("pdo" not in d and "coe_objects" not in d for d in r["devices"][1:])
+    assert all(d["pdo_count"] >= 1 and d["coe_count"] >= 1 for d in r["devices"]) and "detail='full'" in r["detail_note"]
+    s = k.hw_lookup("EL2008", limit=5, detail="summary")
+    assert all("pdo" not in d for d in s["devices"]) and len(json.dumps(s)) < len(json.dumps(r))
+    f = k.hw_lookup("EL2008", limit=5, detail="full")
+    assert all("pdo" in d and "coe_objects" in d for d in f["devices"]) and "detail_note" not in f
+    old = f["devices"][2]["revision"]
+    o = k.hw_lookup("EL2008", revision=int(old[2:], 16))
+    assert len(o["devices"]) == 1 and "pdo" in o["devices"][0]
+    with pytest.raises(K.KnowledgeError, match="detail must be one of"):
+        k.hw_lookup("EL2008", detail="all")

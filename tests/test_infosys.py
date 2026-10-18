@@ -388,3 +388,34 @@ def test_r32_retest_type_names_broken_across_lines_in_table_cells():
     assert rows["Y"] == "| Y | POINTER TO BYTE | ST_My Struct |"                  # no evidence outside a Type column
     assert rows["Z"].startswith("| Z | ST_AxisRef |") and "\\|" in rows["Z"]      # Type column; escaped pipe kept
     assert rows["Name"] == "| Name | Type | Description |"
+
+
+def test_n74_methods_and_properties_are_their_own_lists_not_descriptions():
+    """N74: FB_WG_ComboFilter's Methods (Name | Definition location | Description) and Properties (… | Access | …)
+    tables were read as variable descriptions — 'description' carried 'Configure()', 'Call()', 'Reset()' and the
+    properties. They are `methods` / `properties` now; `description` keeps only what no item carries."""
+    from twincat_mcp.infosys import html_to_doc, parse_declaration, _tidy_declaration
+
+    def table(head, *rows):
+        return ("<table><tr>" + "".join(f"<th>{h}</th>" for h in head) + "</tr>"
+                + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows) + "</table>")
+    h = ("<html><body><h1>FB_WG_ComboFilter</h1><p>PTn, moving average and notch filter in series.</p>"
+         "<pre>FUNCTION_BLOCK FB_WG_ComboFilter\nVAR_INPUT\n    stConfig : ST_WG_ComboFilter;\nEND_VAR\nVAR_OUTPUT\n"
+         "    bError : BOOL;\n    bConfigured : BOOL;\nEND_VAR</pre>"
+         + table(["Name", "Type", "Description"], ["stConfig", "ST_WG_ComboFilter", "Structure for configuring"])
+         + table(["Name", "Type", "Description"], ["bError", "BOOL", "TRUE, if an error occurs."],
+                 ["bConfigured", "BOOL", "TRUE if the configuration was successful."])
+         + table(["Name", "Definition location", "Description"], ["Configure()", "Local", "Loads a new configuration."],
+                 ["Call()", "Local", "Calculates the output signal."], ["Reset()", "Local", "Resets internal states."])
+         + table(["Name", "Type", "Access", "Definition location", "Initial value", "Description"],
+                 ["bTraceLevelDefault", "BOOL", "Get, Set", "Local", "TRUE", "TRUE, if eTraceLevel = Warning."])
+         + "</body></html>")
+    d = parse_declaration("FB_WG_ComboFilter", html_to_doc(h))
+    assert [m["name"] for m in d["methods"]] == ["Configure", "Call", "Reset"], d.get("methods")
+    assert d["methods"][2] == {"name": "Reset", "definition_location": "Local", "description": "Resets internal states."}
+    assert d["properties"] == [{"name": "bTraceLevelDefault", "type": "BOOL", "access": "Get, Set",
+                                "definition_location": "Local", "initial_value": "TRUE",
+                                "description": "TRUE, if eTraceLevel = Warning."}]
+    assert d["outputs"][0]["description"] == "TRUE, if an error occurs."
+    _tidy_declaration(d)
+    assert "description" not in d, d.get("description")          # no method or property list left in it

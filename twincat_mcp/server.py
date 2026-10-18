@@ -1514,20 +1514,28 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Search the code of the project folders the user added ("alarm handler", "FB_Valve", "CONCAT"): unit, kind,
         file and the matching declaration/code excerpts, best first. Units with EVERY word first, then every word as a
         prefix ('CounterMod' finds FB_CounterModule); only when none has them all, units with some words
-        (match='some words'). "quoted text" is a phrase. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
-        METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …; project = the folder (any
-        spelling) or its label; limit 1–200. Also returns the known cause/fix when the query is an error message.
+        (match='some words', with the words each unit holds; words on no unit or on most units are not used and
+        are listed). Stop words ('how', 'to', 'the') are not searched; a query of stop words only is refused. A copy
+        name (PRG_X_9) that no unit has falls back to the name it was copied from. "quoted text" is a phrase. kinds
+        (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION, METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT
+        (= every data type) …; project = the folder (any spelling) or its label; limit 1–200. An error message gives
+        its known cause/fix (ADS errors 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation — ADSError 1861,
+        ADS error 1861, 0x745 —, license, XAE busy / dialog / disconnected, logged in, compiler: identifier not
+        defined, cannot convert type, unknown type) and is searched only for the names it quotes.
         Beckhoff documentation is not here: the twincat-docs skill."""
         return await app.kb_call(app.kb.search, query, kinds, project, limit)
 
     @mcp.tool(annotations=READ)
-    async def hw_lookup(query: str, limit: int = 3, revision: int | None = None) -> dict[str, Any]:
+    async def hw_lookup(query: str, limit: int = 3, revision: int | None = None,
+                        detail: str = "newest") -> dict[str, Any]:
         """EtherCAT terminal/box data from the installed ESI files (K4): name, product code, revisions, PDOs with
         their entries (index, subindex, bit length, type), CoE objects. query = type ('EL2008'), part of a name, or a
-        product code ('#x07D83052'). The first call indexes TwinCAT's ESI folder into the knowledge database (can
-        take a minute). `manuals` names the indexed PDF manuals (knowledge folder, manuals_db.py) that mention the
-        product, with pages — the twincat-docs skill reads them."""
-        return await app.kb_call(app.kb.hw_lookup, query, limit, revision, timeout=900)
+        product code ('#x07D83052'). detail: 'newest' (default) = PDOs and CoE objects of the newest revision of each
+        type (or of `revision`), other revisions as one line each; 'summary' = counts only; 'full' = everything for
+        every revision. The first call indexes TwinCAT's ESI folder into the knowledge database (can take a minute).
+        `manuals` names the indexed PDF manuals (knowledge folder, manuals_db.py) that mention the product, with
+        pages — the twincat-docs skill reads them."""
+        return await app.kb_call(app.kb.hw_lookup, query, limit, revision, detail, timeout=900)
 
     async def tc_request_confirmation(action: str, target: str = "", args: dict[str, Any] | None = None) -> dict[str, Any]:
         act = (action or "").strip()
@@ -3208,8 +3216,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def infosys_declaration(symbol: str, library: str | None = None) -> dict[str, Any]:
         """Declaration of a library symbol as data: kind, inputs/outputs/in_out (name, type, default,
         description from the page's table), struct members, enum values, return type, EXTENDS /
-        IMPLEMENTS, plus the ST declaration text and the page URL. The thing to call before writing
-        code against an FB you have not used before."""
+        IMPLEMENTS, methods (name, definition location, description) and properties (type, access,
+        initial value) of an FB, plus the ST declaration text and the page URL. The thing to call
+        before writing code against an FB you have not used before."""
         return await app.docs_call("declaration", symbol, library, timeout=1800)
 
     @mcp.tool(annotations=READ)

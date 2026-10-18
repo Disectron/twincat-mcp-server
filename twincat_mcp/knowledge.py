@@ -30,6 +30,7 @@ import fnmatch
 import json
 import os
 import re
+import unicodedata
 import shutil
 import sqlite3
 import threading
@@ -120,7 +121,48 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, str]] = [(re.compile(p, re.I), c,
     (r"adserror 1796\b|0x704\b|not permitted",
      "reading/writing this index group/offset is not permitted (read-only area or protected symbol)",
      "write a writable symbol instead; check READONLY flags with ads_symbol_info"),
+    # N70: the TwinCAT compiler's messages, by their text (the C-numbers differ between builds; the text does not)
+    (r"identifier '([^']+)' (?:is )?not defined",
+     "'{1}' is not declared where it is used: a typo, a variable declared in another POU or GVL without the "
+     "qualifier, a library that is not referenced, or a namespace / qualified_only GVL ('GVL.{1}')",
+     "proj_search {1} (this project) / kb_search {1} (added folders) show where it is declared; declare it, qualify "
+     "it, or add the library (proj_libraries)"),
+    (r"cannot convert type '([^']+)' to type '([^']+)'",
+     "IEC 61131-3 has no implicit conversion from {1} to {2} here",
+     "convert explicitly: {1}_TO_{2}(…) (or declare both sides with the same type); for BOOL ↔ number use SEL / "
+     "an IF, or BOOL_TO_{2}"),
+    (r"unknown type:? '([^']+)'",
+     "the type '{1}' is not known to the compiler: a typo, a DUT not in the project, or a library not referenced",
+     "kb_search {1} / infosys_declaration {1} shows where it comes from; add the DUT or the library"),
 ]]
+KNOWN_ERRORS_COVERED = ("ADS errors 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation (ADSError 1861, "
+                        "ADS error 1861, ADS-Error: 1861, 0x745, 0x00000745); license; XAE busy / modal dialog / "
+                        "disconnected; logged in; compiler: identifier not defined (C0046), cannot convert type "
+                        "(C0032), unknown type")
+# N71: the words of a sentence around the names (folded: compared with _fold(word)); the same list as the docs skill
+STOP_WORDS = frozenset(unicodedata.normalize("NFKD", w).encode("ascii", "ignore").decode() for w in """
+a an and are as at be but by can cannot do does for from has have how i if in into is it its no not of on or so such
+that the their then there these this to was were what when where which while who why will with without you your
+der die das den dem des ein eine einer eines einem und oder ist sind wie was wann wo warum mit von zu zum zur im in
+am an auf aus bei für nicht kein keine ich es er sie wir ihr
+""".split())
+COMMON_SHARE = 0.2          # some-words tier: a word in more than this share of the units (≥ 25 units) is not used
+IEC_WORDS = frozenset("""
+BOOL BYTE WORD DWORD LWORD SINT USINT INT UINT DINT UDINT LINT ULINT REAL LREAL TIME LTIME DATE TOD TIME_OF_DAY DT
+DATE_AND_TIME STRING WSTRING POINTER REFERENCE ARRAY OF ANY TYPE END_TYPE STRUCT END_STRUCT VAR END_VAR VAR_INPUT
+VAR_OUTPUT VAR_IN_OUT VAR_GLOBAL VAR_TEMP VAR_STAT CONSTANT IF THEN ELSE ELSIF END_IF CASE END_CASE FOR TO BY DO
+END_FOR WHILE END_WHILE REPEAT UNTIL END_REPEAT RETURN EXIT TRUE FALSE AND OR XOR NOT MOD PROGRAM FUNCTION
+FUNCTION_BLOCK METHOD PROPERTY INTERFACE EXTENDS IMPLEMENTS THIS SUPER
+""".split())
+
+
+def _fold(w: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", w.lower()) if not unicodedata.combining(c))
+
+
+_ADS_CODE = re.compile(r"\bads[\s_-]*(?:error|fehler|err)\b[\s:#=-]*(?:code[\s:#=-]*)?(0x[0-9a-f]+|\d+)"
+                       r"|\berror[\s_-]*code[\s:#=-]*(0x[0-9a-f]+|\d+)", re.I)
+_HEX = re.compile(r"\b0x([0-9a-f]{1,8})\b", re.I)
 
 
 def ads6_context(port: int | None, mode: str | None) -> dict[str, str]:
@@ -140,10 +182,34 @@ def ads6_context(port: int | None, mode: str | None) -> dict[str, str]:
     return {"cause": f"nothing listens on AMS port {p} (TwinCAT is in {mode})", "fix": "check the port number"}
 
 
+def _canonical_error(msg: str) -> str:
+    """The message with every ADS error code it names appended as 'adserror <decimal>' — the table matches one
+    notation, the messages come in many: 'ADSError 1861' (pyads), 'ADS error 1861', 'ADS-Error: 1861', 'error code
+    1861', '0x745', '0x00000745' (N70: only the first and the hex form were known). A bare hex number counts when the
+    message mentions ADS or the number is an ADS device error (0x700–0x7FF) — not every HRESULT is an ADS code."""
+    codes: list[int] = []
+    for m in _ADS_CODE.finditer(msg):
+        v = m.group(1) or m.group(2)
+        codes.append(int(v, 16) if v.lower().startswith("0x") else int(v))
+    ads = re.search(r"\bads", msg, re.I) is not None
+    for m in _HEX.finditer(msg):
+        v = int(m.group(1), 16)
+        if ads or 0x700 <= v <= 0x7FF:
+            codes.append(v)
+    return msg + "".join(f" adserror {c}" for c in dict.fromkeys(codes))
+
+
 def known_error(msg: str) -> dict[str, str] | None:
+    text = _canonical_error(msg or "")
     for pat, cause, fix in KNOWN_ERRORS:
-        if pat.search(msg or ""):
-            return {"cause": cause, "fix": fix}
+        m = pat.search(text)
+        if m:
+            groups = [""] + [g or "" for g in m.groups()]
+
+            def fill(t: str) -> str:            # {1}, {2}: the pattern's groups (other braces are text: {type, value})
+                return re.sub(r"\{(\d)\}", lambda g: groups[int(g.group(1))] if int(g.group(1)) < len(groups)
+                              else g.group(0), t)
+            return {"cause": fill(cause), "fix": fill(fix)}
     return None
 
 
@@ -617,9 +683,34 @@ class Knowledge:
             else:
                 raise KnowledgeError(f"unknown kind {k!r}; kinds: {', '.join(UNIT_KINDS)} (FB = FUNCTION_BLOCK, "
                                      "DUT = every data type)")                                       # R39
+        # N71: words of the sentence around the names ('how', 'to', 'the', 'cannot') pick nothing in code: they are
+        # not searched for. A query of nothing else is refused (it matched every unit with 'to' in a comment)
+        ignored: dict[str, str] = {}
+        informative: list[str] = []
+        for w in words:
+            if _fold(w) in STOP_WORDS:
+                ignored[w] = "stop word"
+            else:
+                informative.append(w)
+        err = known_error(q)
+        if err:
+            # N71: an error message: its words ('Cannot convert type … to type …') are not code words — they matched
+            # every unit with TYPE or 'to' in it. In the code only the names it quotes mean something ('nFoo'), not
+            # the elementary types and keywords it quotes ('BOOL', 'INT')
+            quoted = [t for t in re.findall(r"'([A-Za-z_]\w*(?:\.\w+)*)'", q) if t.upper() not in IEC_WORDS]
+            for w in informative:
+                ignored.setdefault(w, "error message text (the cause / fix is in known_error)")
+            informative = [w for t in quoted for w in re.findall(r"\w+", t)]
+            for w in informative:
+                ignored.pop(w, None)
+            phrases = []
+        if not phrases and not informative and not err:
+            raise KnowledgeError(f"the query {q!r} has only stop words ({', '.join(ignored)}): kb_search looks for the "
+                                 "names and words of the code — give a unit or variable name, or specific words")
         with self._db() as con:
             nproj = con.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
             hits: list[dict[str, Any]] = []
+            info: dict[str, Any] = {}
             scope: list[str] = []
             if project:
                 m = self._match_projects(con, project)
@@ -627,32 +718,55 @@ class Knowledge:
                     raise KnowledgeError(f"no indexed project is {project!r} (path or label); indexed: "
                                          f"{self._project_list(con) or 'none'}")                    # R35 / R39
                 scope = [r["path"] for r in m]
-            if nproj:
-                hits = self._search_tiers(con, phrases, words, want_kinds, scope, limit)
-        err = known_error(q)
+            base_note = None
+            if nproj and (phrases or informative):
+                hits, info = self._search_tiers(con, phrases, informative, want_kinds, scope, limit)
+                if not hits:
+                    # N72: TwinCAT names a copy '<name>_<n>' (PRG_TcUnitRunner_9): no unit has that name — look for the
+                    # name it was copied from, and say so
+                    bases = {w: mm.group(1) for w in informative
+                             if (mm := re.fullmatch(r"(\w*[A-Za-z]\w*?)_(\d+)", w)) and len(mm.group(1)) >= 3}
+                    if bases:
+                        alt = [bases.get(w, w) for w in informative]
+                        hits, info = self._search_tiers(con, phrases, alt, want_kinds, scope, limit)
+                        if hits:
+                            for h in hits:
+                                h["match"] = "base name: " + h["match"]
+                            base_note = (f"no unit contains {', '.join(bases)}; these contain the name it is a copy "
+                                         f"of ({', '.join(bases.values())}) — TwinCAT names copies <name>_<n>")
         out: dict[str, Any] = {"query": q, "hits": hits, "projects_indexed": nproj}
-        if hits and all(h.get("match") == "some words" for h in hits):
-            out["note"] = ("no unit contains every word of the query; these contain some of them (best first) — "
-                           "fewer or more specific words help")
+        if ignored or info.get("ignored"):
+            out["words_ignored"] = {**ignored, **info.get("ignored", {})}
+        if info.get("used") is not None and info.get("tier") == "some words":
+            out["words_used"] = info["used"]
+        if info.get("too_common"):
+            out["words_too_common"] = info["too_common"]
+        if base_note:
+            out["note"] = base_note
+        elif hits and all(h.get("match") == "some words" for h in hits):
+            out["note"] = ("no unit contains every word of the query; these contain some of them (best first, "
+                           "'matched' names them) — fewer or more specific words help")
+        elif nproj and not hits and (phrases or informative):
+            out["note"] = (f"no unit contains {', '.join(phrases + informative)} (name, declaration, code, comments of "
+                           f"the {nproj} indexed folder(s))")
+        elif err and not informative:
+            out["note"] = "an error message without a name to look for in the code: known_error has its cause and fix"
         if err:
             out["known_error"] = err
+        elif re.search(r"\b(?:error|fehler|exception)\b|\b0x[0-9a-f]+\b|\bC\d{4}\b", q, re.I):
+            out["known_error"] = None
+            out["known_errors_covered"] = KNOWN_ERRORS_COVERED
         if not nproj:
             out["note"] = "no project folders in the knowledge base yet — kb_add_project(path) with a folder the user names"
         return out
 
     def _search_tiers(self, con: sqlite3.Connection, phrases: list[str], words: list[str], kinds: list[str],
-                      scope: list[str], limit: int) -> list[dict[str, Any]]:
+                      scope: list[str], limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """R36: every word first (exact, then as word prefixes: 'CounterMod' → CounterModule); only when no unit has
-        them all, units with some of them, marked match='some words'."""
+        them all, units with some of them, marked match='some words' with the words each one holds. N71: in that tier
+        a word on no unit, or on most units ('TYPE', 'BOOL', 'VAR' in a big project), picks nothing and is not used."""
         def ph(t: str) -> str:
             return '"' + t.replace('"', '""') + '"'
-        exact = [ph(t) for t in phrases + words]
-        prefix = [ph(t) for t in phrases] + [ph(w) + "*" for w in words]
-        tiers = [("all words", " AND ".join(exact))]
-        if words:
-            tiers.append(("all words (as prefixes)", " AND ".join(prefix)))
-        if len(exact) > 1:
-            tiers.append(("some words", " OR ".join(prefix)))
         where_extra, params_extra = "", []
         if scope:
             where_extra += f" AND project IN ({','.join('?' * len(scope))})"
@@ -660,26 +774,45 @@ class Knowledge:
         if kinds:
             where_extra += f" AND kind IN ({','.join('?' * len(kinds))})"
             params_extra += kinds
+        info: dict[str, Any] = {}
+        exact = [ph(t) for t in phrases + words]
+        prefix = [ph(t) for t in phrases] + [ph(w) + "*" for w in words]
+        tiers = [("all words", " AND ".join(exact), phrases + words)]
+        if words:
+            tiers.append(("all words (as prefixes)", " AND ".join(prefix), phrases + words))
+        if len(exact) > 1:
+            total = self._count(con, None, where_extra, params_extra)
+            used, ignored, common = [], {}, []
+            for t in phrases + words:
+                df = self._count(con, (ph(t) if t in phrases else ph(t) + "*"), where_extra, params_extra, t)
+                if df == 0:
+                    ignored[t] = "on no unit"
+                elif total >= 25 and df > COMMON_SHARE * total:
+                    common.append(t)
+                else:
+                    used.append(t)
+            info.update(ignored=ignored, too_common=common, used=used)
+            if used:
+                tiers.append(("some words", " OR ".join(ph(t) if t in phrases else ph(t) + "*" for t in used), used))
         hits: list[dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
-        for label, expr in tiers:
-            if hits and label == "some words":
+        for label, expr, terms in tiers:
+            if hits:
                 break
+            info["tier"] = label
             if self._fts:
-                sql = ("SELECT project, name, kind, file, snippet(units_fts, 4, '«', '»', ' … ', 12) AS decl, "
+                sql = ("SELECT rowid AS rid, project, name, kind, file, snippet(units_fts, 4, '«', '»', ' … ', 12) AS decl, "
                        "snippet(units_fts, 5, '«', '»', ' … ', 12) AS impl, bm25(units_fts, 0, 10, 0, 0, 3, 1, 2) AS score "
                        f"FROM units_fts WHERE units_fts MATCH ?{where_extra} ORDER BY score LIMIT ?")
                 params: list[Any] = [expr, *params_extra, limit]
             else:
-                terms = phrases + words
                 conds = " AND " if label != "some words" else " OR "
-                one = "(name LIKE ? ESCAPE '\\' OR declaration LIKE ? ESCAPE '\\' OR implementation LIKE ? ESCAPE '\\' OR comments LIKE ? ESCAPE '\\')"
-                sql = ("SELECT project, name, kind, file, substr(declaration,1,200) AS decl, substr(implementation,1,200) AS impl, "
-                       f"0 AS score FROM units WHERE ({conds.join([one] * len(terms))}){where_extra} LIMIT ?")
+                sql = ("SELECT rowid AS rid, project, name, kind, file, substr(declaration,1,200) AS decl, "
+                       "substr(implementation,1,200) AS impl, "
+                       f"0 AS score FROM units WHERE ({conds.join([self._LIKE_ONE] * len(terms))}){where_extra} LIMIT ?")
                 params = []
                 for t in terms:
-                    like = "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-                    params += [like] * 4
+                    params += [self._like(t)] * 4
                 params += [*params_extra, limit]
             try:
                 rows = con.execute(sql, params).fetchall()
@@ -690,11 +823,40 @@ class Knowledge:
                 if key in seen:
                     continue
                 seen.add(key)
-                hits.append({"project": r["project"], "unit": r["name"], "kind": r["kind"], "file": r["file"],
-                             "declaration": r["decl"], "code": r["impl"], "match": label})
+                h = {"project": r["project"], "unit": r["name"], "kind": r["kind"], "file": r["file"],
+                     "declaration": r["decl"], "code": r["impl"], "match": label}
+                if label == "some words":
+                    h["matched"] = [t for t in terms if self._row_has(con, r["rid"], t, t in phrases)]
+                hits.append(h)
                 if len(hits) >= limit:
-                    return hits
-        return hits
+                    break
+        return hits, info
+
+    _LIKE_ONE = ("(name LIKE ? ESCAPE '\\' OR declaration LIKE ? ESCAPE '\\' OR implementation LIKE ? ESCAPE '\\' "
+                 "OR comments LIKE ? ESCAPE '\\')")
+
+    @staticmethod
+    def _like(t: str) -> str:
+        return "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+    def _count(self, con: sqlite3.Connection, expr: str | None, where_extra: str, params_extra: list[Any],
+               term: str | None = None) -> int:
+        """Units (in scope) that hold the FTS expression (or the LIKE term without FTS); all units for None."""
+        if expr is None:
+            tbl = "units_fts" if self._fts else "units"
+            return con.execute(f"SELECT COUNT(*) FROM {tbl} WHERE 1=1{where_extra}", params_extra).fetchone()[0]
+        if self._fts:
+            return con.execute(f"SELECT COUNT(*) FROM units_fts WHERE units_fts MATCH ?{where_extra}",
+                               [expr, *params_extra]).fetchone()[0]
+        return con.execute(f"SELECT COUNT(*) FROM units WHERE {self._LIKE_ONE}{where_extra}",
+                           [self._like(term or "")] * 4 + params_extra).fetchone()[0]
+
+    def _row_has(self, con: sqlite3.Connection, rid: int, term: str, phrase: bool) -> bool:
+        if self._fts:
+            e = '"' + term.replace('"', '""') + '"' + ("" if phrase else "*")
+            return con.execute("SELECT 1 FROM units_fts WHERE rowid = ? AND units_fts MATCH ?", (rid, e)).fetchone() is not None
+        return con.execute(f"SELECT 1 FROM units WHERE rowid = ? AND {self._LIKE_ONE}",
+                           [rid] + [self._like(term)] * 4).fetchone() is not None
 
     # -- K4 hardware ---------------------------------------------------------------------
     def esi_folders(self) -> list[Path]:
@@ -749,10 +911,17 @@ class Knowledge:
         r = con.execute("SELECT v FROM meta WHERE k = 'esi_parser'").fetchone()
         return r is None or r[0] != str(ESI_PARSER_VERSION)
 
-    def hw_lookup(self, query: str, limit: int = 5, revision: int | None = None) -> dict[str, Any]:
+    HW_DETAILS = ("newest", "summary", "full")
+
+    def hw_lookup(self, query: str, limit: int = 5, revision: int | None = None, detail: str = "newest") -> dict[str, Any]:
+        """N73: detail bounds the output — 'newest' (default): PDOs and CoE objects of the newest revision of each type
+        (or of `revision`), the other revisions as a line each; 'summary': no PDO entries or CoE objects at all, only
+        their counts; 'full': everything for every revision (an EL3356 with its revisions was a wall of repeats)."""
         q = (query or "").strip()
         if not q:
             raise KnowledgeError("empty query (e.g. 'EL2008', 'EL3062', '#x0bf03052')")
+        if detail not in self.HW_DETAILS:
+            raise KnowledgeError(f"detail must be one of {list(self.HW_DETAILS)} (got {detail!r})")
         with self._db() as con:
             stale = self._esi_parser_stale(con)
         if self._esi_count() == 0 or stale:
@@ -772,14 +941,31 @@ class Knowledge:
             rows = [r for r in rows if r["revision"] == revision]
         types = sorted({r["type"] for r in rows})
         out_rows = []
+        newest_seen: set[str] = set()
+        trimmed = 0
         for r in rows[: max(1, min(limit, 20))]:
-            out_rows.append({"type": r["type"], "name": r["name"], "vendor": r["vendor"], "group": r["grp"],
-                             "product_code": f"#x{r['product_code']:08X}" if r["product_code"] is not None else None,
-                             "revision": f"#x{r['revision']:08X}" if r["revision"] is not None else None,
-                             "pdo": json.loads(r["pdo"] or "[]"), "coe_objects": json.loads(r["coe"] or "[]"),
-                             "file": r["file"]})
-        res: dict[str, Any] = {"query": q, "matches": len(rows), "types": types[:30], "devices": out_rows}
-        bad = sum(1 for d in out_rows for p in d["pdo"] if p.get("unparsed"))
+            pdo = json.loads(r["pdo"] or "[]")
+            coe = json.loads(r["coe"] or "[]")
+            d = {"type": r["type"], "name": r["name"], "vendor": r["vendor"], "group": r["grp"],
+                 "product_code": f"#x{r['product_code']:08X}" if r["product_code"] is not None else None,
+                 "revision": f"#x{r['revision']:08X}" if r["revision"] is not None else None,
+                 "pdo_count": len(pdo), "pdo_entries": sum(len(p.get("entries") or []) for p in pdo),
+                 "coe_count": len(coe), "file": r["file"]}
+            # the rows come newest revision first per type: the first one of a type is its newest
+            first_of_type = r["type"] not in newest_seen
+            newest_seen.add(r["type"])
+            if detail == "full" or (detail == "newest" and (first_of_type or revision is not None)):
+                d["pdo"] = pdo
+                d["coe_objects"] = coe
+            else:
+                trimmed += 1
+            out_rows.append(d)
+        res: dict[str, Any] = {"query": q, "matches": len(rows), "types": types[:30], "detail": detail,
+                               "devices": out_rows}
+        if trimmed:
+            res["detail_note"] = (f"{trimmed} device row(s) without their PDO entries and CoE objects (detail="
+                                  f"{detail!r}): detail='full', or revision=<#x…>, gives them")
+        bad = sum(1 for d in out_rows for p in d.get("pdo", []) if p.get("unparsed"))
         if bad:
             res["parse_note"] = (f"{bad} PDO(s) could not be read from the ESI file (index or entries missing) — their raw "
                                  "layout is under 'unparsed'; send it (or the ESI file) to get the parser fixed")

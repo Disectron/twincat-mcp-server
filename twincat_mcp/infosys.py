@@ -51,7 +51,8 @@ from typing import Any, Callable
 # _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
 # re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
 # changes without a bump.
-INDEXER_VERSION = 3          # 3: code without non-breaking spaces; the return value parsed into the header (R24)
+INDEXER_VERSION = 3          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
+                             #    Methods / Properties tables as their own lists (N74)
 
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
@@ -560,13 +561,60 @@ def _parse_vars(body: str) -> list[dict[str, Any]]:
     return out
 
 
+def _table_kind(rows: list[list[str]]) -> str | None:
+    """What a 'Name | …' table of a symbol page lists: 'properties' (an Access column: Get, Set), 'methods' (a
+    Definition location column, or every name written as a call 'Reset()'), 'vars' (inputs, outputs, members, enum
+    values), None (not a Name table)."""
+    if not rows:
+        return None
+    hdr = [c.strip().lower() for c in rows[0]]
+    if not hdr or "name" not in hdr[0]:
+        return None
+    if any("access" in h for h in hdr):
+        return "properties"
+    names = [r[0].strip() for r in rows[1:] if r and r[0].strip()]
+    if any("definition location" in h for h in hdr) or (names and all(n.endswith(")") for n in names)):
+        return "methods"
+    return "vars"
+
+
+def _member_tables(tables: list[list[list[str]]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """N74: the Methods and Properties tables of an FB page as their own lists — they were read as variable
+    descriptions, so 'description' carried the method list ('Configure()': …)."""
+    methods: list[dict[str, Any]] = []
+    props: list[dict[str, Any]] = []
+    for rows in tables:
+        kind = _table_kind(rows)
+        if kind not in ("methods", "properties"):
+            continue
+        hdr = [c.strip().lower() for c in rows[0]]
+
+        def col(r: list[str], *keys: str) -> str | None:
+            i = next((k for k, h in enumerate(hdr) if any(key in h for key in keys)), None)
+            return r[i].strip() if i is not None and i < len(r) and r[i].strip() else None
+        for r in rows[1:]:
+            if not r or not r[0].strip():
+                continue
+            name = re.sub(r"\s*\(\s*\)\s*$", "", r[0].strip())
+            if kind == "methods":
+                methods.append({"name": name, "definition_location": col(r, "definition location"),
+                                "description": col(r, "descr", "meaning", "comment")})
+            else:
+                props.append({"name": name, "type": col(r, "type"), "access": col(r, "access"),
+                              "definition_location": col(r, "definition location"),
+                              "initial_value": col(r, "initial value", "default"),
+                              "description": col(r, "descr", "meaning", "comment")})
+    return methods, props
+
+
 def _descriptions(tables: list[list[list[str]]]) -> dict[str, str]:
-    """Infosys description tables: header has Name | Type | Description (sometimes without Type)."""
+    """Infosys description tables of variables: header has Name | Type | Description (sometimes without Type) —
+    not the Methods / Properties tables (_member_tables)."""
     desc: dict[str, str] = {}
     for rows in tables:
-        hdr = [c.strip().lower() for c in rows[0]]
-        if not hdr or "name" not in hdr[0]:
+        if _table_kind(rows) != "vars":
             continue
+        hdr = [c.strip().lower() for c in rows[0]]
         di = next((i for i, h in enumerate(hdr) if "descr" in h or "meaning" in h or "comment" in h), len(hdr) - 1)
         for r in rows[1:]:
             if r and r[0].strip():
@@ -659,6 +707,11 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
         decl["declaration"] = ((f"{head} {decl['name']}  (* header reconstructed *)\n" if head else "")
                                + "\n".join(fragments))
     decl["description"] = desc
+    methods, props = _member_tables(doc.tables)
+    if methods:
+        decl["methods"] = methods
+    if props:
+        decl["properties"] = props
     short = decl["name"].split(".")[-1]
     if kind in ("Function", "Method"):
         # R24: Infosys documents the return value as a VAR_OUTPUT named like the function — it is the return type
