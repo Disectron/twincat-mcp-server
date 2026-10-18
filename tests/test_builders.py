@@ -1,7 +1,8 @@
 """The knowledge-folder builders shipped with the twincat-docs skill (skills/twincat-docs/builders): the Python 3.12
 minimum, the atomic rebuild and its real state, the filter before LIMIT, ambiguous names refused, links.
 
-On a Python older than 3.12 only the refusal is tested (CI runs 3.10 and 3.12, so both paths run on every push)."""
+Everything runs on Python 3.12 (the only version the project targets); the refusal on an older Python is tested by
+running each script with sys.version_info set to 3.11."""
 from __future__ import annotations
 
 import importlib.util
@@ -20,8 +21,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 B = ROOT / "skills" / "twincat-docs" / "builders"
 KBD = ROOT / "skills" / "twincat-docs" / "kb_docs.py"
-NEW_ENOUGH = sys.version_info >= (3, 12)
-needs312 = pytest.mark.skipif(not NEW_ENOUGH, reason="the builders need Python 3.12+ (refusal tested below)")
 
 
 def run(script: str, *args: str, timeout: float = 120) -> subprocess.CompletedProcess:
@@ -68,23 +67,44 @@ def state(kb: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------- 1. minimum Python
+def _as_python_311(path: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run a script the way Python 3.11 would reach its version check: sys.version_info reads 3.11."""
+    code = ("import sys; sys.version_info = (3, 11, 9, 'final', 0); "
+            f"sys.argv = [{str(path)!r}, *{list(args)!r}]; "
+            f"exec(compile(open({str(path)!r}, encoding='utf-8').read(), {str(path)!r}, 'exec'), "
+            f"{{'__name__': '__main__', '__file__': {str(path)!r}}})")
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+
+
 @pytest.mark.parametrize("script", ["infosys_local.py", "manuals_db.py"])
 def test_minimum_python_is_enforced_with_a_message(script):
-    p = run(script, "stats")
-    if NEW_ENOUGH:
-        assert "needs Python 3.12" not in p.stderr
-    else:
-        assert p.returncode == 1 and f"{script} needs Python 3.12 or newer" in p.stderr and "Traceback" not in p.stderr
+    assert "needs Python 3.12" not in run(script, "stats").stderr                 # this Python (3.12+) runs it
+    p = _as_python_311(B / script, "stats")
+    assert p.returncode == 1 and f"{script} needs Python 3.12 or newer" in p.stderr and "Traceback" not in p.stderr
+
+
+def test_kb_docs_launcher_and_server_refuse_an_older_python_with_a_message():
+    p = _as_python_311(KBD, "status")
+    assert p.returncode == 1 and "kb_docs.py needs Python 3.12 or newer" in p.stderr and "Traceback" not in p.stderr
+    p = _as_python_311(ROOT / "scripts" / "launch.py", "--src", str(ROOT), "--no-run")
+    assert p.returncode == 3 and "3.12+ required" in p.stderr and "Traceback" not in p.stderr
+    code = ("import sys, runpy; sys.version_info = (3, 11, 9, 'final', 0); sys.argv = ['twincat_mcp']; "
+            "runpy.run_module('twincat_mcp', run_name='__main__')")
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+                       cwd=str(ROOT))
+    assert p.returncode == 1 and "twincat-mcp needs Python 3.12 or newer" in p.stderr and "Traceback" not in p.stderr
 
 
 def test_builders_compile_on_this_python():
-    """The version check only helps if an older Python can compile the file to reach it."""
-    for f in ("infosys_local.py", "manuals_db.py"):
-        compile((B / f).read_text(encoding="utf-8"), f, "exec")
+    """The version check only helps if an older Python can compile the file to reach it (no 3.12-only syntax above
+    the check: checked with the 3.8 grammar)."""
+    import ast
+    for f in (B / "infosys_local.py", B / "manuals_db.py", KBD, ROOT / "scripts" / "launch.py",
+              ROOT / "twincat_mcp" / "__main__.py"):
+        ast.parse(f.read_text(encoding="utf-8"), str(f), feature_version=(3, 8))
 
 
 # ---------------------------------------------------------------------------------------------- 2. atomic rebuild + state
-@needs312
 def test_build_state_up_to_date_and_old_format(kb, tmp_path):
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
     p = build(kb, pkg)
@@ -112,7 +132,6 @@ def test_build_state_up_to_date_and_old_format(kb, tmp_path):
     assert "the Help Viewer package changed" in build(kb, pkg).stdout and state(kb)["pages"] == 9
 
 
-@needs312
 def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, tmp_path):
     """Finding 2: an interrupted `index --force` left a half index that the next run called 'up to date'."""
     pages = _fixture_pages()
@@ -168,7 +187,6 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
     assert st["state"] == "complete" and st["pages"] == len(big) and "rebuild" not in st and not building.exists()
 
 
-@needs312
 def test_finished_rebuild_waiting_to_replace_is_swapped_in(kb, tmp_path):
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
     assert build(kb, pkg).returncode == 0
@@ -182,7 +200,6 @@ def test_finished_rebuild_waiting_to_replace_is_swapped_in(kb, tmp_path):
 
 
 # ---------------------------------------------------------------------------------------------- 3. filter before LIMIT
-@needs312
 def test_book_filter_runs_before_the_limit(kb, tmp_path):
     pages = {f"aaa_other/1033/{100 + i}.html": f"<html><article><h1>Widget {i}</h1><p>Widget Widget</p></article></html>"
              for i in range(30)}
@@ -196,7 +213,6 @@ def test_book_filter_runs_before_the_limit(kb, tmp_path):
 
 
 # ---------------------------------------------------------------------------------------------- 4. ambiguity + 6. links
-@needs312
 def test_show_and_decl_refuse_ambiguous_names_and_show_links(kb, tmp_path):
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
     assert build(kb, pkg).returncode == 0
@@ -226,7 +242,6 @@ def test_show_and_decl_refuse_ambiguous_names_and_show_links(kb, tmp_path):
 
 
 # ---------------------------------------------------------------------------------------------- manuals
-@needs312
 def test_manuals_update_lock_state_and_doc_filter(tmp_path):
     pytest.importorskip("reportlab")
     pytest.importorskip("pypdf")
@@ -266,7 +281,6 @@ def _manuals_module():
     return mod
 
 
-@needs312
 def test_n37_running_headers_and_wrapped_headings(tmp_path):
     """N37: running headers / footers in the page text, glued to a heading ('Calibration and compensation4.4
     Calibration'); a heading wrapped over two lines became a level-1 chapter ('capacity')."""
@@ -298,7 +312,6 @@ def test_n37_running_headers_and_wrapped_headings(tmp_path):
     assert m._mend_toc(unnumbered) == unnumbered                       # only manuals that number their chapters
 
 
-@needs312
 def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
     pytest.importorskip("reportlab")
     pytest.importorskip("pypdf")
@@ -352,7 +365,6 @@ def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
     con.close()
 
 
-@needs312
 def test_n37_font_headings_wrapped_over_two_lines_are_one_entry(tmp_path):
     """PDFs without bookmarks (PyMuPDF font headings): the second line of a wrapped heading was a level-1 chapter."""
     pytest.importorskip("reportlab")

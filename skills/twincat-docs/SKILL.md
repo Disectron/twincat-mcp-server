@@ -12,8 +12,9 @@ and symbol table. They never return documentation. Names in Structured Text exam
 block `ADSREAD`. Look up `ADSREAD` here.
 
 ## How to call
-`kb_docs.py` sits in this skill's folder (the base directory shown when the skill loads). Run it with any Python
-≥ 3.9 (standard library only; `python`, else `py -3`, else the Python the twincat plugin was installed with):
+`kb_docs.py` sits in this skill's folder (the base directory shown when the skill loads). Run it with Python
+3.12 (standard library only; `python`, else `py -3.12`, else the Python the twincat plugin was installed with — an older
+Python gets one line saying so, not an answer):
 
 ```
 python "<skill folder>/kb_docs.py" <command> key=value … [--kb PATH]

@@ -295,3 +295,35 @@ def test_stamp_quick_path_skips_hashing(tmp_path, monkeypatch):
     assert not launch.needs_install(venv, launch.LazyStamp(src, "py")) and calls["n"] == 1
     f.write_text('__version__ = "9.9.9"\nX = 1\n')            # real change
     assert launch.needs_install(venv, launch.LazyStamp(src, "py"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake interpreters as shell scripts")
+def test_launch_rebuilds_a_venv_made_with_an_older_python(tmp_path):
+    """3.12 migration: a venv built by an earlier plugin on Python 3.10 / 3.11 still starts and has pip — it must
+    count as unusable (pip would refuse requires-python >= 3.12 and the old server would keep running)."""
+    import os
+    import stat
+    assert launch.MIN_PY == (3, 12)
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    for venv, body in ((old, 'import sys; sys.version_info = (3, 11, 9, "final", 0)\n'), (new, "")):
+        py = launch.venv_python(venv)
+        py.parent.mkdir(parents=True)
+        # a stand-in interpreter: the real one, with sys.version_info read as 3.11 for the "old" venv
+        py.write_text(f"#!/bin/sh\nexec {sys.executable} -c '{body}exec(compile(sys.argv[2], \"-c\", \"exec\"))' \"$@\"\n"
+                      if body else f"#!/bin/sh\nexec {sys.executable} \"$@\"\n")
+        py.chmod(py.stat().st_mode | stat.S_IXUSR)
+    assert launch.venv_ok(new) is True
+    assert launch.venv_ok(old) is False
+
+
+def test_python_minimum_is_312_everywhere():
+    """One Python version for everything: pyproject, launchers, manifests, CI."""
+    assert 'requires-python = ">=3.12"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "tomli" not in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "sys.version_info>=(3,12)" in (ROOT / "scripts" / "launch.cmd").read_text(encoding="utf-8")
+    assert "sys.version_info>=(3,12)" in (ROOT / "scripts" / "install.cmd").read_text(encoding="utf-8")
+    tpl = json.loads((ROOT / "packaging" / "mcpb" / "manifest.template.json").read_text(encoding="utf-8"))
+    assert tpl["compatibility"]["runtimes"]["python"] == ">=3.12"
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert 'python: ["3.12"]' in ci and '"3.9"' not in ci and '"3.10"' not in ci

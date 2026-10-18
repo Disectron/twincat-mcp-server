@@ -11,9 +11,9 @@ PDF text needs PyMuPDF or pypdf (see section 5).
 
 ## 1. Requirements and location
 
-- **Python 3.12 or newer.** Both scripts check the version first and refuse older versions with a message:
-  `infosys_local.py needs Python 3.12 or newer; this is 3.9.x ...`. The files still compile on older Pythons so
-  that the message is shown. Use the python.org build, for example
+- **Python 3.12** (the one version the plugin targets; newer is accepted). Both scripts check the version first and
+  refuse older versions with a message: `infosys_local.py needs Python 3.12 or newer; this is 3.11.x ...`. The files
+  still compile on older Pythons so that the message is shown. Use the python.org build, for example
   `C:\Users\<you>\AppData\Local\Programs\Python\Python312\python.exe`.
 - **Knowledge folder `<kb>`** is found in this order:
   1. `--kb PATH` on the command line,
@@ -334,4 +334,4 @@ Stored PDF paths are absolute. Moving the knowledge folder makes the next `updat
 - Infosys: images are dropped; tables are flattened to pipe rows (merged cells are not reconstructed). Links are kept
   in the `link` table; the body text shows only their text.
 - A version-1 index answers searches but has no links. `docs_page` on it says so (`links_note`).
-- The builders run on Python 3.12 and newer only. The test suite runs the builder tests on 3.12; older versions are checked for the refusal message only.
+- The builders run on Python 3.12 and newer only. The test suite runs on 3.12 (Windows and Linux); the refusal message is tested by running each script with `sys.version_info` set to 3.11.

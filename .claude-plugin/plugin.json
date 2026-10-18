@@ -39,7 +39,7 @@
     "python_exe": {
       "type": "string",
       "title": "Python executable",
-      "description": "64-bit Python 3.10+ used to bootstrap the server's private venv. 'python' if it is on PATH; otherwise the full path, e.g. C:\\Users\\me\\AppData\\Local\\Programs\\Python\\Python312\\python.exe. 'py' does not work here (it needs the -3 switch).",
+      "description": "64-bit Python 3.12 used to bootstrap the server's private venv. 'python' if it is on PATH; otherwise the full path, e.g. C:\\Users\\me\\AppData\\Local\\Programs\\Python\\Python312\\python.exe. 'py' does not work here (it needs the -3 switch).",
       "default": "python"
     },
     "ams_net_id": {

@@ -4,7 +4,7 @@ REM Creates a venv next to this repo and installs the server in editable mode.
 setlocal
 cd /d "%~dp0\.."
 where py >nul 2>nul && (set PY=py -3) || (set PY=python)
-%PY% -c "import sys,struct;assert sys.version_info>=(3,10),'Python 3.10+ required';print('Python',sys.version.split()[0],8*struct.calcsize('P'),'bit')" || exit /b 1
+%PY% -c "import sys,struct;assert sys.version_info>=(3,12),'Python 3.12+ required';print('Python',sys.version.split()[0],8*struct.calcsize('P'),'bit')" || exit /b 1
 if not exist .venv (%PY% -m venv .venv || exit /b 1)
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip >nul

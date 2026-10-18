@@ -4,7 +4,7 @@
   "display_name": "TwinCAT MCP",
   "version": "@VERSION@",
   "description": "Beckhoff TwinCAT 3: live PLC variables over ADS, real-time recording, XAE build/activate/deploy, .TcPOU editing, TcUnit, HMI bindings \u2014 151 audited tools.",
-  "long_description": "Gives Claude audited control of a TwinCAT 3 engineering PC and its target IPC. Read and write every PLC variable (nested structs, arrays, enums) over ADS, record symbols at PLC cycle resolution, run test scenarios against function blocks, build and activate from the open XAE shell, edit POUs, run TcUnit, cross-check HMI bindings. Writes are gated by a safety mode (readonly / guarded / full), allow/deny lists and per-machine confirmation tokens; every mutating call is written to a JSONL audit log.\n\nRequires: Windows engineering PC with TwinCAT XAE (or XAR) and a 64-bit Python 3.10+. First start creates a private virtualenv under %LOCALAPPDATA%\\twincat-mcp and installs the Python dependencies (needs PyPI access once, about a minute).",
+  "long_description": "Gives Claude audited control of a TwinCAT 3 engineering PC and its target IPC. Read and write every PLC variable (nested structs, arrays, enums) over ADS, record symbols at PLC cycle resolution, run test scenarios against function blocks, build and activate from the open XAE shell, edit POUs, run TcUnit, cross-check HMI bindings. Writes are gated by a safety mode (readonly / guarded / full), allow/deny lists and per-machine confirmation tokens; every mutating call is written to a JSONL audit log.\n\nRequires: Windows engineering PC with TwinCAT XAE (or XAR) and a 64-bit Python 3.12. First start creates a private virtualenv under %LOCALAPPDATA%\\twincat-mcp and installs the Python dependencies (needs PyPI access once, about a minute).",
   "author": {
     "name": "Ryan Harris / Transflo Pumps"
   },
@@ -52,7 +52,7 @@
       "win32"
     ],
     "runtimes": {
-      "python": ">=3.10"
+      "python": ">=3.12"
     }
   },
   "user_config": {
@@ -97,7 +97,7 @@
     "python_exe": {
       "type": "string",
       "title": "Python executable (optional)",
-      "description": "Full path to a 64-bit python.exe 3.10+. Leave empty to auto-detect (py -3, python on PATH, %LOCALAPPDATA%\\Programs\\Python).",
+      "description": "Full path to a 64-bit python.exe 3.12. Leave empty to auto-detect (py -3, python on PATH, %LOCALAPPDATA%\\Programs\\Python).",
       "required": false
     }
   },

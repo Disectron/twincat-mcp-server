@@ -18,13 +18,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-try:  # Python 3.11+
-    import tomllib  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - 3.10 fallback
-    try:
-        import tomli as tomllib  # type: ignore
-    except ModuleNotFoundError:
-        tomllib = None  # type: ignore
+import tomllib
 
 MODES = ("readonly", "guarded", "full")
 MODE_RANK = {m: i for i, m in enumerate(MODES)}
@@ -418,8 +412,6 @@ def load(path: str | os.PathLike | None = None) -> Config:
     cfg = Config()
     p = Path(path) if path else _find_config_file()
     if p and p.is_file():
-        if tomllib is None:
-            raise RuntimeError("TOML config needs tomllib (Python 3.11+) or the tomli package on 3.10: pip install tomli")
         with open(p, "rb") as fh:
             _apply_toml(cfg, tomllib.load(fh))
         cfg.config_file = str(p)

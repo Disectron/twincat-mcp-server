@@ -7,7 +7,7 @@
     {
       "name": "twincat-mcp",
       "source": "./",
-      "description": "MCP server + skill: live ADS reads/writes, recordings, XAE build/deploy, POU editing, TcUnit, HMI bindings. Windows engineering PC with TwinCAT XAE and Python 3.10+.",
+      "description": "MCP server + skill: live ADS reads/writes, recordings, XAE build/deploy, POU editing, TcUnit, HMI bindings. Windows engineering PC with TwinCAT XAE and Python 3.12.",
       "category": "industrial-automation",
       "tags": ["twincat", "beckhoff", "plc", "ads", "mcp"]
     }

@@ -1,5 +1,5 @@
-"""Standard-library smoke test of the twincat-docs script on its minimum Python (3.9; CI job docs-skill-min-python).
-No pytest and no plugin install needed: python tests/kb_docs_smoke.py"""
+"""Standard-library smoke test of the twincat-docs script as the skill runs it: a plain Python 3.12 with nothing
+installed (CI step "kb_docs.py without the plugin installed"). python tests/kb_docs_smoke.py"""
 import json
 import subprocess
 import sys

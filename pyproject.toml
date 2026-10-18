@@ -7,7 +7,7 @@ name = "twincat-mcp"
 version = "0.8.8"
 description = "MCP server giving an AI agent full, audited control of a Beckhoff TwinCAT 3 engineering PC and its target IPC: ADS runtime, XAE Automation Interface, project files, TcUnit."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Ryan Harris / Transflo Pumps" }]
 dependencies = [
@@ -16,7 +16,6 @@ dependencies = [
     "pywin32>=306; sys_platform == 'win32'",
     "uvicorn>=0.30",
     "pyyaml>=6",
-    "tomli>=2; python_version < '3.11'",
 ]
 
 [project.urls]

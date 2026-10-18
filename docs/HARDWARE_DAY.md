@@ -12,7 +12,7 @@ On the engineering PC, before anything else:
 |---|---|---|
 | TwinCAT XAE 4024+ with the solution open, PLC project activated on the CX | shell up, target RUN | every ADS and XAE tool assumes it |
 | ADS route PC → CX9020 | XAE System → Routes shows the CX, or `tc_doctor` `target_state` later | no route = every ADS call fails with 0x6 / 0x7 |
-| 64-bit Python 3.10+ | `python -c "import struct,sys;print(struct.calcsize('P')*8, sys.version)"` → `64 3.1x` | pyads loads the 64-bit `TcAdsDll.dll`; a 32-bit Python fails at import |
+| 64-bit Python 3.12 | `python -c "import struct,sys;print(struct.calcsize('P')*8, sys.version)"` → `64 3.12.x` | pyads loads the 64-bit `TcAdsDll.dll`; a 32-bit Python fails at import |
 | Claude Code ≥ 2.1, logged in, GitHub account able to read the repo | `claude --version` | plugin install pulls from GitHub |
 | XAE and Claude Code at the same elevation level (both normal, or both admin) | — | COM ROT does not cross the elevation boundary; `xae_attach` would not see the shell |
 

@@ -39,7 +39,7 @@ Extra: human-in-the-loop via **MCP elicitation** — when the client supports it
 ## Requirements
 
 * Windows 10/11 engineering PC with **TwinCAT XAE 3.1.4024+** (XAE Shell, 32-bit `TcXaeShell.DTE.15.0`, or 64-bit 4026 `TcXaeShell.DTE.17.0`, or VS 2019/2022/2026 with TwinCAT).
-* Python **3.10+ 64-bit** (3.11+ for TOML config). pywin32 and pyads are installed by `pip`.
+* Python **3.12 64-bit** (the one version the project targets and tests; 3.12 or newer is accepted, older ones are refused with a message). pywin32 and pyads are installed by `pip`.
 * An ADS route from this PC to the target (XAE → Choose Target → Add Route). `ads_routes` lists what exists.
 * Open the solution in XAE before using `xae_*` tools; the server attaches to the running instance (it can launch one, but attaching is faster and visible).
 
@@ -47,7 +47,7 @@ Linux/macOS: only `proj_*`, `tcunit_results(local_path/xml_text)` and the safety
 
 ## Install
 
-Three ways. All need a 64-bit Python 3.10+ on the engineering PC; nothing else is installed by hand — the
+Three ways. All need a 64-bit Python 3.12 on the engineering PC; nothing else is installed by hand — the
 launcher (`scripts/launch.py`) creates a private venv on first start and reinstalls only when the shipped
 sources change.
 

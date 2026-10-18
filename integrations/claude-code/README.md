@@ -8,7 +8,7 @@ user (so it sees your TwinCAT router, your ADS routes and your open XAE shell).
 ## 0. Prerequisites
 
 * TwinCAT XAE installed on this PC, an ADS route to the target (XAE → Choose Target).
-* Python 3.10+ 64-bit (`python --version`; the plugin runs `python` by default — set another
+* Python 3.12 64-bit (`python --version`; the plugin runs `python` by default — set another
   executable in `/plugin configure` if yours is only reachable as `py` or by full path).
 * Claude Code installed (`claude --version`), 2.1.275+ for the one-line install.
 
@@ -110,7 +110,7 @@ project root and the safety mode. Then:
 **Bundle:** `scripts\build-mcpb.cmd` → `dist\twincat-mcp-<version>.mcpb`. Claude Desktop → Settings →
 Extensions → drag the file in; the dialog asks for solution, AmsNetId, safety modes, optional config
 TOML and Python path. The bundle runs `cmd /d /c <ext>\server\launch.cmd`, which finds a 64-bit
-Python 3.10+ (`py -3`, `python`, `%LOCALAPPDATA%\Programs\Python\Python3*`) and bootstraps a venv in
+Python 3.12+ (`py -3`, `python`, `%LOCALAPPDATA%\Programs\Python\Python3*`) and bootstraps a venv in
 `%LOCALAPPDATA%\twincat-mcp\venv`. Logs: `%APPDATA%\Claude\logs\mcp-server-twincat-mcp.log`.
 Unverified on a real Windows box: the Python discovery in `launch.cmd` (run it once by hand with
 `--no-run`).

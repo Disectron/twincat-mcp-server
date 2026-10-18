@@ -53,9 +53,12 @@ on day one do it in XAE so there is one less variable.
 64 3.12.x ...
 ```
 
-Pass criterion: first token **64**, version **3.10 or newer**. If it prints `32`, or `python` is not
+Pass criterion: first token **64**, version **3.12 or newer** (3.12 is the version the project targets and tests). If it prints `32`, or `python` is not
 found, install 64-bit Python from python.org and tick both **Add python.exe to PATH** and **py launcher**.
 A 32-bit Python installs fine and then fails at the first ADS import, because `TcAdsDll.dll` is 64-bit.
+An older Python (3.10, 3.11) is refused with one line naming the version found. Coming from a plugin version before
+0.8.9 whose venv was built with an older Python: the launcher sees it and rebuilds the venv with the configured
+Python 3.12 on the next start (one background install, 1–2 min, then reconnect).
 
 `pip` must be able to reach PyPI once (venv build). Behind a corporate proxy set `HTTPS_PROXY` in the
 environment Claude Code is started from.

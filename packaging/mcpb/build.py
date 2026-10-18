@@ -2,13 +2,13 @@
 
 An .mcpb is a zip with ``manifest.json`` at its root (spec: github.com/anthropics/mcpb).
 Claude Desktop installs it by drag-and-drop (Settings → Extensions) and runs
-``server.mcp_config`` — here ``cmd /d /c server\\launch.cmd``, which finds a Python 3.10+,
+``server.mcp_config`` — here ``cmd /d /c server\\launch.cmd``, which finds a Python 3.12+,
 creates a private venv under %LOCALAPPDATA%\\twincat-mcp on first start, installs the
 sources shipped in ``server/src`` and hands stdio to ``python -m twincat_mcp``.
 
 Why not bundle the dependencies in server/lib as the spec suggests? pydantic-core and
-pywin32 are compiled per Python minor version; a bundle pinned to 3.12 breaks on 3.13.
-The venv bootstrap costs one pip run per PC and works with whatever 64-bit Python is there.
+pywin32 are compiled per Python minor version; a bundle pinned to one minor version breaks on the next.
+The venv bootstrap costs one pip run per PC and works with the 64-bit Python 3.12 that is there.
 
 Usage:  python packaging/mcpb/build.py [--out DIR] [--no-validate]
 The tool/prompt lists in the manifest are generated from the live server registry so

@@ -7,18 +7,22 @@ has ADS routes to live hardware).
 """
 from __future__ import annotations
 
-import argparse
-import logging
 import sys
 
-from .config import load
+if sys.version_info < (3, 12):   # before the package imports, so an older Python gets this line, not a traceback
+    sys.exit(f"twincat-mcp needs Python 3.12 or newer; this is {sys.version.split()[0]} ({sys.executable})")
+
+import argparse  # noqa: E402 — after the version check on purpose
+import logging  # noqa: E402
+
+from .config import load  # noqa: E402
 
 _ADS_DLL_HELP = (
     "twincat-mcp: pyads could not load TcAdsDll.dll (the Beckhoff ADS client library).\n"
     "  The DLL ships with TwinCAT XAE / XAR and with the free 'TC1000 | TC3 ADS' package; it is not on PyPI.\n"
     "  Fixes, in order of likelihood:\n"
     "    1. This Python is not 64-bit, or TwinCAT is not installed on this PC. Install TwinCAT XAE (or TC1000 ADS)\n"
-    "       and use a 64-bit Python 3.10+ (python -c \"import struct;print(struct.calcsize('P')*8)\" must print 64).\n"
+    "       and use a 64-bit Python 3.12+ (python -c \"import struct;print(struct.calcsize('P')*8)\" must print 64).\n"
     "    2. TwinCAT is installed but TWINCAT3DIR is not set in this process' environment: set it to the TwinCAT 3.1\n"
     "       folder (default C:\\TwinCAT\\3.1) so pyads finds <TWINCAT3DIR>\\..\\Common64\\TcAdsDll.dll.\n"
     "    3. Only the documentation / project-file tools are wanted on a PC without TwinCAT: not supported yet;\n"

@@ -38,7 +38,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-MIN_PY = (3, 10)
+MIN_PY = (3, 12)
 STAMP_NAME = ".twincat-mcp-stamp.json"
 LOCK_NAME = ".twincat-mcp-install.lock"
 INSTALL_LOG = "twincat-mcp-install.log"
@@ -209,11 +209,14 @@ def _run_quiet(cmd: list[str], **kw) -> int:
 
 
 def venv_ok(venv: Path) -> bool:
+    """The venv's interpreter starts, has pip, and is new enough: a venv built by an older plugin on Python 3.10 / 3.11
+    is rebuilt with the current base Python instead of failing in pip (requires-python >= 3.12)."""
     vp = venv_python(venv)
     if not vp.is_file():
         return False
+    check = f"import sys, pip; sys.exit(0 if sys.version_info >= {MIN_PY!r} else 3)"
     try:
-        return subprocess.call([str(vp), "-c", "import sys, pip"], stdout=subprocess.DEVNULL,
+        return subprocess.call([str(vp), "-c", check], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=60) == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -223,7 +226,7 @@ def ensure_venv(venv: Path, base_python: str) -> Path:
     if venv_ok(venv):
         return venv_python(venv)
     if venv.exists():
-        log(f"venv at {venv} is unusable (Python moved or upgraded?) — recreating")
+        log(f"venv at {venv} is unusable (Python moved, upgraded, or older than {MIN_PY[0]}.{MIN_PY[1]}) — recreating")
         import shutil
         shutil.rmtree(venv, ignore_errors=True)
     venv.parent.mkdir(parents=True, exist_ok=True)
@@ -346,7 +349,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 def main(argv: list[str] | None = None) -> int:
     args, server_args = parse_args(sys.argv[1:] if argv is None else argv)
     if sys.version_info < MIN_PY:
-        log(f"Python {sys.version.split()[0]} is too old; 3.10+ required (64-bit on Windows for TcAdsDll).")
+        log(f"Python {sys.version.split()[0]} ({sys.executable}) is too old; 3.12+ required (64-bit on Windows for "
+            "TcAdsDll). Point the plugin's 'python' setting (TCMCP_PYTHON for the .mcpb) at a Python 3.12 python.exe.")
         return 3
     src = Path(args.src).resolve() if args.src else default_src(Path(__file__))
     if not (src / "pyproject.toml").is_file() or not (src / PACKAGE_DIR).is_dir():

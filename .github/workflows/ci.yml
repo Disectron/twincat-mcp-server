@@ -11,13 +11,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python: ["3.10", "3.12"]
+        python: ["3.12"]          # the one Python the project targets (pyproject requires-python >= 3.12)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: kb_docs.py without the plugin installed (how the twincat-docs skill runs it)
+        run: python tests/kb_docs_smoke.py
       - name: Install
         run: python -m pip install --quiet -e ".[dev]"
       - name: Stand-in TcAdsDll.dll (Windows runner has no TwinCAT)
@@ -52,7 +54,7 @@ jobs:
           if command -v cygpath >/dev/null; then p=$(cygpath -w "$p"); fi
           echo "TCMCP_CAPTURE_EXE=$p" >> "$GITHUB_ENV"
       - name: Upload tcmcp-capture.exe
-        if: runner.os == 'Windows' && matrix.python == '3.12'
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: tcmcp-capture-windows-x64
@@ -105,34 +107,13 @@ jobs:
           set TCMCP_PYTHON=C:\nonexistent\python.exe
           scripts\launch.cmd --src . --venv %RUNNER_TEMP%\tcmcp-venv-cmd --no-run
 
-  docs-skill-min-python:
-    # the twincat-docs script promises Python 3.9 (standard library only), the knowledge-folder builders 3.12:
-    # both minimums are checked on every push (the 3.12 builder tests run in the test matrix above)
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-      - name: kb_docs.py on Python 3.9 (no install)
-        run: python tests/kb_docs_smoke.py
-      - name: builders refuse Python 3.9 with a message, not a traceback
-        shell: bash
-        run: |
-          for s in infosys_local.py manuals_db.py; do
-            if out=$(python "skills/twincat-docs/builders/$s" stats 2>&1); then echo "::error::$s ran on Python 3.9"; exit 1; fi
-            echo "$out" | grep -q "needs Python 3.12 or newer" || { echo "::error::$s on 3.9: $out"; exit 1; }
-            echo "$out" | grep -q Traceback && { echo "::error::$s printed a traceback"; exit 1; } || true
-          done
-
   plugin:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions/setup-node@v4
         with:
           node-version: "20"

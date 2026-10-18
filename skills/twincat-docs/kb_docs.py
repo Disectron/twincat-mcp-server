@@ -4,8 +4,8 @@ Reads the two databases of the local TwinCAT knowledge base (`<kb>`, see `status
   <kb>\\helpviewer\\infosys_en.db   Beckhoff Infosys from the Help Viewer package, built by builders\\infosys_local.py index
   <kb>\\manualsdb\\manuals.db       PDF hardware manuals, built by builders\\manuals_db.py update
 (the builders ship next to this script and need Python 3.12+; copies in <kb>\\tools\\ work the same)
-Nothing is written: both are opened with SQLite's read-only mode. Standard library only (Python >= 3.9, SQLite with
-FTS5 — the python.org builds have it).
+Nothing is written: both are opened with SQLite's read-only mode. Standard library only. Needs Python 3.12 or newer
+(checked at start, like the builders and the server), SQLite with FTS5 — the python.org builds have it.
 
 usage:
   python kb_docs.py <command> key=value ... [--kb PATH]
@@ -22,19 +22,26 @@ once as a literal phrase.
 """
 from __future__ import annotations
 
-import datetime as _dt
+import sys
+
+MIN_PYTHON = (3, 12)
+if sys.version_info < MIN_PYTHON:   # before anything else, so an older Python gets this message, not a traceback
+    sys.exit(f"kb_docs.py needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer; this is "
+             f"{sys.version.split()[0]} ({sys.executable}). Run it with a newer python.exe, e.g. "
+             r"C:\Users\<you>\AppData\Local\Programs\Python\Python312\python.exe")
+
+import datetime as _dt  # noqa: E402 — after the version check on purpose
 import difflib
 import fnmatch
 import json
 import os
 import re
 import sqlite3
-import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "2"           # 2: index state in every answer, links as refs, builders shipped beside it
+VERSION = "3"           # 2: index state in every answer, links as refs, builders shipped beside it; 3: Python 3.12+
 FALLBACK_KB = r"D:\TwinCAT-MCP\knowledge"
 INFOSYS_DB = ("helpviewer", "infosys_en.db")
 MANUALS_DB = ("manualsdb", "manuals.db")
