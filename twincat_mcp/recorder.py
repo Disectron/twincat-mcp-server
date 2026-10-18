@@ -871,7 +871,14 @@ class Recording:
                 except queue.Empty:
                     item = None
             if stopping and deadline is not None and time.monotonic() > deadline:
-                self.dropped_on_stop += self.q.qsize() + self._pending_n
+                n_q = 0
+                while True:                      # counted here as dropped_on_stop — taken out, so never counted twice
+                    try:
+                        self.q.get_nowait()
+                    except queue.Empty:
+                        break
+                    n_q += 1
+                self.dropped_on_stop += n_q + self._pending_n
                 break
             final = stopping and self.q.empty()
             self._maybe_check(final)
@@ -1396,6 +1403,16 @@ class Recording:
 
     def _finish(self) -> None:
         self._release()
+        # a notification in flight while the subscriptions were deleted can land after the last drain: received, past
+        # the end — counted, not lost from the accounting
+        late = 0
+        while True:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+            late += 1
+        self.after_limit += late
         self.stopped_mono = time.monotonic()
         self.stopped_at = time.time()
         with self._lock:

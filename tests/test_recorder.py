@@ -1314,15 +1314,17 @@ def test_r43_python_an_online_change_ends_at_the_last_verified_sample(rec):
     assert wait_until(lambda: rec.status(st["id"])["samples"] == 100)
     FakeConnection.symbol_version = 2                      # online change: version and online-change count move
     FakeConnection.shared_values[OC_CNT] = 4
-    for i in range(100, 200):
-        c.fire("MAIN.nCycle", i, ft(i))
+    # every sample the recorder RECEIVED after the change is counted; once it has seen the change and unsubscribed,
+    # the rest never reach it (Windows CI: 64 of the 100 had arrived — the loop is not faster than the version check)
+    delivered = sum(c.fire("MAIN.nCycle", i, ft(i)) for i in range(100, 200))
     assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=5)
     out = rec.stop(st["id"])
     f = _footer(out)
     assert "PLC program changed" in f["stop_reason"] and f["program_changed"]["symbol_version"] == [1, 2], f
     assert ":c3:" in f["stop_reason"] and ":c4:" in f["stop_reason"]          # the identity said which program
     assert f["window_end_ms"] == 99.0 and f["program_changed"]["after_ms"] == 99.0 and max(_rows_t(out)) == 99.0
-    assert f["after_limit"] == 100 and f["missing_samples"] == 0 and "unverified_rows" not in f
+    assert 1 <= delivered and f["after_limit"] == delivered, (delivered, f["after_limit"])
+    assert f["missing_samples"] == 0 and "unverified_rows" not in f
     assert f["program_watch"]["checked"] and f["program_watch"]["verified_to_ms"] == 99.0
     assert any("PLC program changed" in w for w in out.get("warnings", [])), out.get("warnings")
 

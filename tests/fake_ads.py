@@ -450,20 +450,25 @@ class FakeConnection:
 
     def _deliver(self, name, value, ts):
         off = _SYM_OFFSET.get(name, _EXTRA_OFFSET.get(name))
+        n = 0
         for h, (key, attr, cb) in list(getattr(self, "notifications", {}).items()):
             if key == name:
                 cb(type("N", (), {"h": h, "ts": ts, "value": value})(), name)
+                n += 1
             elif isinstance(key, tuple) and key[0] == "blk" and key[1] == 0x4040 and off is not None \
                     and key[2] <= off < key[2] + key[3]:
                 data = memory_image(key[2], key[3])
                 buf = ctypes.create_string_buffer(struct.pack("<IQI", h, ts, len(data)) + data)
                 ptr = ctypes.cast(buf, ctypes.POINTER(SAdsNotificationHeader))
                 cb(ptr, (key[1], key[2]))
+                n += 1
+        return n
 
     def fire(self, name, value, ts_filetime):
-        """Test helper: deliver a notification for `name` as the DLL would (block subscribers get the whole block)."""
+        """Test helper: deliver a notification for `name` as the DLL would (block subscribers get the whole block).
+        -> how many subscriptions it reached (0 once the recording unsubscribed)."""
         self.values[name] = value
-        self._deliver(name, value, ts_filetime)
+        return self._deliver(name, value, ts_filetime)
 
 
 _SYM_OFFSET = {n: i * 64 for i, (n, t, s, v, f) in enumerate(SYMBOLS)}
