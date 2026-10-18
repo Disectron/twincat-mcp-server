@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 import struct
 from typing import Any
 
@@ -101,6 +102,9 @@ EXTRA_SYMBOLS: dict[str, tuple[str, int, Any]] = {
     "TwinCAT_SystemInfoVarList._TaskInfo[1].RTViolation": ("BOOL", 1, False),
     "TwinCAT_SystemInfoVarList._TaskInfo[1].TaskName": ("STRING(63)", 64, "PlcTask"),
 }
+
+
+_DISPATCH = threading.RLock()     # one notification dispatcher: callbacks and deletions in turn (AdsLib)
 
 
 class FakeConnection:
@@ -443,7 +447,13 @@ class FakeConnection:
         return (h, h)
 
     def del_device_notification(self, nh, uh):
-        self.notifications.pop(nh, None)
+        # one dispatcher for callbacks and deletions (Beckhoff's AdsLib NotificationDispatcher holds one mutex for
+        # both): a deletion waits for a callback in progress, and no callback of a deleted handle runs after it
+        # returned. The fake called a callback it had listed before a deletion after it (release CI 0.8.11: 82
+        # delivered, 81 counted — the 82nd landed after the recording's footer); the recorder counts every sample
+        # that reaches it before its footer is written
+        with _DISPATCH:
+            self.notifications.pop(nh, None)
 
     def parse_notification(self, notification, plc_datatype, timestamp_as_filetime=False):
         return notification.h, notification.ts, notification.value
@@ -451,6 +461,10 @@ class FakeConnection:
     def _deliver(self, name, value, ts):
         off = _SYM_OFFSET.get(name, _EXTRA_OFFSET.get(name))
         n = 0
+        with _DISPATCH:
+            return self._deliver_locked(name, value, ts, off, n)
+
+    def _deliver_locked(self, name, value, ts, off, n):
         for h, (key, attr, cb) in list(getattr(self, "notifications", {}).items()):
             if key == name:
                 cb(type("N", (), {"h": h, "ts": ts, "value": value})(), name)
