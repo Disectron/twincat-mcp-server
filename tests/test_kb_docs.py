@@ -142,7 +142,7 @@ def test_manual_commands(kbdir):
     rc, r = run(kbdir, "manual_product", "code=EL3102")
     assert rc == 0 and r["items"][0]["pages"] == [2, 4]
     rc, r = run(kbdir, "manual_product", "code=EL9999")
-    assert rc == 0 and r["count"] == 0 and "manuals_db.py update" in r["hint"] and str(kbdir) in r["hint"]
+    assert rc == 0 and r["count"] == 0 and 'manuals_db.py" update --kb' in r["hint"] and str(kbdir) in r["hint"]
     rc, r = run(kbdir, "manual_page", "doc=CX9020", "pages=5-40")
     assert rc == 1 and r["error"] == "bad_param" and "at most 21" in r["message"]
     rc, r = run(kbdir, "manual_page", "doc=CX9020", "pages=4-9")
@@ -172,7 +172,8 @@ def test_commands_status_help_and_location(kbdir, tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
     rc, r = run(empty, "docs_search", "query=ADSREAD")
-    assert rc == 1 and r["error"] == "no_index" and "infosys_local.py index" in r["hint"] and str(empty) in r["hint"]
+    assert rc == 1 and r["error"] == "no_index" and 'builders' in r["hint"] and 'infosys_local.py" index --kb' in r["hint"]
+    assert str(empty) in r["hint"]
     rc, r = run(empty, "status")
     assert rc == 0 and "missing" in r["infosys"] and "missing" in r["manuals"]
     # the folder chosen with kb_set_location (pointer file), else TCMCP_KNOWLEDGE_DIR
@@ -199,7 +200,10 @@ def test_fixtures_have_the_builders_schema():
     c = sqlite3.connect(FIX / "helpviewer" / "infosys_en.db")
     cols = [r[1] for r in c.execute("PRAGMA table_info(page)")]
     assert cols == ["pid", "book", "title", "help_id", "toc_parent", "version", "crumb", "body"]
-    assert {r[0] for r in c.execute("SELECT key FROM meta")} == {"source", "lcid", "indexed"}
+    assert {r[0] for r in c.execute("SELECT key FROM meta")} >= {"source", "lcid", "indexed", "schema", "state", "pages",
+                                                                  "books", "links", "links_resolved", "mshc_path", "builder"}
+    assert [r[1] for r in c.execute("PRAGMA table_info(link)")] == ["book", "pid", "n", "text", "href", "hid",
+                                                                      "target_book", "target_pid"]
     m = sqlite3.connect(FIX / "manualsdb" / "manuals.db")
     assert [r[1] for r in m.execute("PRAGMA table_info(doc)")] == ["id", "path", "name", "size", "mtime", "sha256", "title",
                                                                      "pages", "text_pages", "indexed", "backend"]

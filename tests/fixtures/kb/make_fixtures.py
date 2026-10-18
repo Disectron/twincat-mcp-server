@@ -4,15 +4,17 @@ The twincat-docs skill reads databases made by <kb>\\tools\\infosys_local.py and
 fixtures in this folder were produced by those two scripts from the synthetic pages below, so the tests check the
 skill against the exact schema and text format of the builders, not against a copy of it.
 
-    python tests/fixtures/kb/make_fixtures.py --tools <folder with infosys_local.py + manuals_db.py> [--out tests/fixtures/kb]
+    python tests/fixtures/kb/make_fixtures.py [--tools <folder with infosys_local.py + manuals_db.py>] [--out tests/fixtures/kb]
 
-Needs reportlab (to write the PDF) and pypdf or PyMuPDF (manuals_db.py reads it). Page ids, titles and help ids are
+--tools defaults to the builders shipped with the skill (skills/twincat-docs/builders). Needs Python 3.12+ (the
+builders' minimum), reportlab (to write the PDF) and pypdf or PyMuPDF (manuals_db.py reads it). Page ids, titles and help ids are
 those the acceptance table of the docs-skill spec names, so the same calls work on fixture and real database.
 """
 from __future__ import annotations
 
 import argparse
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -75,7 +77,10 @@ PAGES = {
         + pre("fbRead( READ := FALSE );\nfbRead( NETID := '', PORT := 851, READ := TRUE );")),
     "tcplclib_tc2_system/1033/30866572.html": page(
         "ADSWRITE", "beckhoff-adswrite", "Tc2_System (TwinCAT v3.1.0)", ["PLC Lib: Tc2_System", "ADS", "ADSWRITE"],
-        "<h1>ADSWRITE</h1><p>The function block ADSWRITE writes data to an ADS device; it is the counterpart of ADSREAD.</p>"
+        "<h1>ADSWRITE</h1><p>The function block ADSWRITE writes data to an ADS device; it is the counterpart of "
+        "<a href='30866571.html'>ADSREAD</a>. Address: <a href='../tcplclib_tc2_system/1033/31059723.html'>T_AmsNetID</a>, "
+        "<a href='https://www.beckhoff.com/'>Beckhoff</a>, <a href='#top'>top</a>, "
+        "<a href='ms-xhelp:///?Id=beckhoff-not-in-package'>gone</a>.</p>"
         + pre("VAR_INPUT\n    WRITE : BOOL;\nEND_VAR")),
     "tcplclib_tc2_system_ex/1033/40000001.html": page(
         "ADS return codes", "beckhoff-ads-codes", "Tc2_System (TwinCAT v3.1.0)", ["PLC Lib: Tc2_System", "ADS return codes"],
@@ -115,7 +120,8 @@ def build_pdf(path: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tools", required=True, help="folder with infosys_local.py and manuals_db.py")
+    ap.add_argument("--tools", default=str(Path(__file__).resolve().parents[3] / "skills" / "twincat-docs" / "builders"),
+                    help="folder with infosys_local.py and manuals_db.py (default: the skill's builders)")
     ap.add_argument("--out", default=str(Path(__file__).parent))
     a = ap.parse_args()
     tools, out = Path(a.tools), Path(a.out)
@@ -129,6 +135,11 @@ def main() -> None:
         db.unlink(missing_ok=True)
         subprocess.run([sys.executable, str(tools / "infosys_local.py"), "--db", str(db), "index", "--mshc", str(mshc)],
                        check=True)
+        # the temp package is gone after the build: point the stored path at a stable stand-in
+        meta = sqlite3.connect(db)
+        meta.execute("UPDATE meta SET value = ? WHERE key = 'mshc_path'", ("C:/fixture/BKINFOSYS3_FIXTURE_EN-US.mshc",))
+        meta.commit()
+        meta.close()
         man = t / "manuals" / "IPC"
         man.mkdir(parents=True)
         build_pdf(man / "CX9020.pdf")

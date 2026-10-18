@@ -105,6 +105,30 @@ jobs:
           set TCMCP_PYTHON=C:\nonexistent\python.exe
           scripts\launch.cmd --src . --venv %RUNNER_TEMP%\tcmcp-venv-cmd --no-run
 
+  docs-skill-min-python:
+    # the twincat-docs script promises Python 3.9 (standard library only), the knowledge-folder builders 3.12:
+    # both minimums are checked on every push (the 3.12 builder tests run in the test matrix above)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: kb_docs.py on Python 3.9 (no install)
+        run: python tests/kb_docs_smoke.py
+      - name: builders refuse Python 3.9 with a message, not a traceback
+        shell: bash
+        run: |
+          for s in infosys_local.py manuals_db.py; do
+            if out=$(python "skills/twincat-docs/builders/$s" stats 2>&1); then echo "::error::$s ran on Python 3.9"; exit 1; fi
+            echo "$out" | grep -q "needs Python 3.12 or newer" || { echo "::error::$s on 3.9: $out"; exit 1; }
+            echo "$out" | grep -q Traceback && { echo "::error::$s printed a traceback"; exit 1; } || true
+          done
+
   plugin:
     runs-on: ubuntu-latest
     steps:

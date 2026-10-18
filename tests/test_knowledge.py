@@ -291,11 +291,14 @@ def test_status_reports_the_offline_documentation_layout(kb):
     assert d["skill"] == "twincat-docs" and str(K.docs_skill_path()) in d["call"] and str(loc) in d["call"]
     assert d["infosys"]["exists"] and d["infosys"]["pages"] == 8 and d["infosys"]["books"] == 6
     assert d["infosys"]["package"] == "BKINFOSYS3_FIXTURE_EN-US.mshc" and d["infosys"]["lcid"] == "1033"
+    assert d["infosys"]["state"] == "complete" and d["infosys"]["links_resolved"] == 3 and "command" not in d["infosys"]
     m = d["manuals"]
     assert m["manuals"] == 1 and m["pdfs_in_folder"] == 1 and m["not_indexed"] == ["EL3102.pdf"]
     assert m["indexed_but_gone"] == ["CX9020.pdf"]                   # the fixture's PDF path is not in this folder
-    assert "manuals_db.py" in m["update"]
-    assert d["tools"] == {"infosys_local.py": False, "manuals_db.py": True}
+    assert m["state"] == "pending" and 'manuals_db.py" update --kb' in m["command"] and "builders" in m["command"]
+    b = d["builders"]
+    assert b["infosys_local.py"]["shipped_version"] == "2" and b["infosys_local.py"]["copy_in_tools"] is None
+    assert b["manuals_db.py"]["copy_version"] == "1" and "version 1" in b["manuals_db.py"]["note"]   # an old copy in tools\
     assert d["sop"] == [str(Path("sop") / "scope" / "SOP-scope-display.md")]
     # read-only: nothing next to the databases was created
     assert sorted(p.name for p in (loc / "helpviewer").iterdir()) == ["infosys_en.db"]
@@ -305,7 +308,8 @@ def test_status_reports_the_offline_documentation_layout(kb):
 def test_set_location_names_the_docs_it_finds(kb):
     k, tmp = kb
     r = k.set_location(str(tmp / "empty_kb"))
-    assert r["docs"]["infosys"]["exists"] is False and "infosys_local.py" in r["docs"]["infosys"]["build"]
+    assert r["docs"]["infosys"]["exists"] is False and r["docs"]["infosys"]["state"] == "missing"
+    assert 'infosys_local.py" index --kb' in r["docs"]["infosys"]["command"]
     r2 = k.set_location(str(_kb_with_docs(tmp)))
     assert r2["docs"]["infosys"]["exists"] and r2["docs"]["manuals"]["exists"]
 

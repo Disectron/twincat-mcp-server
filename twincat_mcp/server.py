@@ -1006,10 +1006,23 @@ def _apply_tool_groups(mcp: MCPServer, cfg: Config) -> None:
             mcp.remove_tool(t.name)
 
 
+def connection_instructions(app: "App") -> str:
+    """INSTRUCTIONS plus the real state of the offline documentation, read when the server starts — i.e. at every
+    connection and reconnection of the client: a rebuild that is running, interrupted or outdated is said up front."""
+    try:
+        ds = app.kb.docs_status()
+    except Exception as exc:  # noqa: BLE001 — never block the start
+        return INSTRUCTIONS + f"\nOffline documentation: state not readable at this connection ({type(exc).__name__}: {exc}).\n"
+    line = f"\nOffline documentation, state at this connection ({ds.get('knowledge_folder', 'no folder')}): {ds['summary']}"
+    if not ds.get("ok") and ds.get("infosys_command"):
+        line += f" To rebuild: {ds['infosys_command']}."
+    return INSTRUCTIONS + line + "\n"
+
+
 def build_server(cfg: Config | None = None) -> MCPServer:
     cfg = cfg or load_config()
     app = App(cfg)
-    mcp = MCPServer("twincat-mcp", instructions=INSTRUCTIONS, version=__version__)
+    mcp = MCPServer("twincat-mcp", instructions=connection_instructions(app), version=__version__)
 
     # ======================================================================
     # tc_* meta
@@ -1089,6 +1102,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 rep["infosys"] = f"FAIL: {exc}"
         else:
             rep["infosys"] = f"FAIL: {app.docs_error}" if app.docs_error else "disabled"
+        try:
+            ds = await asyncio.to_thread(app.kb.docs_status)
+            rep["offline_docs"] = ds
+            # an index that exists but is not whole / current is worth a line; no folder or no index is not
+            if ds.get("infosys_state") in ("outdated", "incomplete", "old_format") or ds.get("infosys_rebuild"):
+                infos.append("offline docs: Infosys index " + ds["infosys"])
+        except Exception as exc:  # noqa: BLE001
+            rep["offline_docs"] = {"error": f"{type(exc).__name__}: {exc}"}
         problems = [k for k, v in rep.items() if isinstance(v, str) and v.startswith("FAIL")]
         if cfg.warnings:
             problems.append("config_FIX_THESE")

@@ -889,7 +889,7 @@ async def test_d45_doctor_reports_config_mode_as_info(monkeypatch, project_dir):
         async with client_for(build_server(mk_cfg(project_dir))) as s:
             d = payload(await s.call_tool("tc_doctor", {}))
             # (infosys may be a PROBLEM here: the test PC has no Help Viewer package)
-            assert "target_state" not in d["summary"] and "(info: TwinCAT in CONFIG — PLC runtime not running)" in d["summary"], d["summary"]
+            assert "target_state" not in d["summary"] and "(info: TwinCAT in CONFIG — PLC runtime not running" in d["summary"], d["summary"]
             assert d["target_state"]["twincat_mode"] == "CONFIG"
             FakeConnection.shared_state[10000] = (C.ADSSTATE_RUN, 0)        # RUN but no PLC answering: a real fault
             d = payload(await s.call_tool("tc_doctor", {}))
@@ -1025,3 +1025,36 @@ async def test_r5_datatype_table_unavailable_names_config_mode(monkeypatch, proj
             assert r.is_error and "TwinCAT is in CONFIG" in text(r), text(r)
     finally:
         FakeConnection.shared_state.pop(10000, None)
+
+
+@pytest.mark.anyio
+async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, project_dir, tmp_path):
+    """Finding 2: the real state of the offline index is known at every (re)connection — in the instructions the
+    server sends at initialize — and in tc_doctor; an interrupted rebuild is said up front."""
+    import shutil
+    import sqlite3
+    import time as _t
+    from tests.fake_ads import install
+    install(monkeypatch)
+    kb = tmp_path / "kb"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "kb", kb, ignore=shutil.ignore_patterns("*.py"))
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    srv = build_server(cfg)
+    ins = srv._lowlevel_server.instructions
+    assert "Offline documentation, state at this connection" in ins and "Infosys index: complete (8 pages" in ins
+    db = kb / "helpviewer" / "infosys_en.db"
+    shutil.copy(db, db.with_name(db.name + ".building"))
+    c = sqlite3.connect(db.with_name(db.name + ".building"))
+    c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [("state", "building"), ("pages_done", "4000"),
+                                                                ("pages_total", "51656"), ("heartbeat", f"{_t.time() - 900:.0f}")])
+    c.commit()
+    c.close()
+    srv = build_server(cfg)                                          # a reconnection = a new server process
+    ins = srv._lowlevel_server.instructions
+    assert "a rebuild was INTERRUPTED at 4000 of 51656 pages" in ins and "To rebuild:" in ins and "infosys_local.py" in ins
+    async with client_for(srv) as s:
+        d = payload(await s.call_tool("tc_doctor", {}))
+        assert d["offline_docs"]["infosys_rebuild"] == "interrupted" and "INTERRUPTED" in d["summary"]
+        st = payload(await s.call_tool("kb_status", {}))
+        assert st["docs"]["infosys"]["rebuild"]["state"] == "interrupted" and "command" in st["docs"]["infosys"]

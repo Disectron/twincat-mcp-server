@@ -432,17 +432,34 @@ class Knowledge:
         loc = loc or self.location()[0]
         if loc is None:
             return {"note": "no knowledge folder chosen yet"}
-        tools = loc / "tools"
         script = docs_skill_path()
+        inf, man, builders = _docs_parts(loc)
         out: dict[str, Any] = {"skill": "twincat-docs",
                                "call": (f'python "{script}" status --kb "{loc}"' if script else
                                         f'python "<twincat-docs skill folder>/kb_docs.py" status --kb "{loc}"'),
-                               "infosys": _infosys_info(loc / INFOSYS_DB[0] / INFOSYS_DB[1], tools, brief),
-                               "manuals": _manuals_info(loc / MANUALS_DB[0] / MANUALS_DB[1], loc / "manuals", tools, brief)}
+                               "infosys": inf, "manuals": man}
         if not brief:
-            out["tools"] = {n: (tools / n).is_file() for n in ("infosys_local.py", "manuals_db.py")}
+            out["builders"] = builders
             sop = loc / "sop"
             out["sop"] = sorted(str(f.relative_to(loc)) for f in sop.rglob("*.md"))[:50] if sop.is_dir() else []
+        return out
+
+    def docs_status(self) -> dict[str, Any]:
+        """The real state of the offline documentation, short: for tc_doctor and the instructions the server sends
+        at every (re)connection."""
+        loc = self.location()[0]
+        if loc is None:
+            return {"summary": "no knowledge folder chosen yet (kb_set_location) — no offline documentation", "ok": False}
+        inf, man, _b = _docs_parts(loc)
+        ok = inf.get("state") == "complete" and not inf.get("rebuild")
+        out: dict[str, Any] = {"knowledge_folder": str(loc), "infosys": inf.get("message"), "manuals": man.get("message"),
+                               "infosys_state": inf.get("state"), "manuals_state": man.get("state"), "ok": ok,
+                               "infosys_rebuild": (inf.get("rebuild") or {}).get("state"),
+                               "summary": f"Infosys index: {inf.get('message')}. Manuals: {man.get('message')}."}
+        if inf.get("command"):
+            out["infosys_command"] = inf["command"]
+        if man.get("command"):
+            out["manuals_command"] = man["command"]
         return out
 
     # -- K9 projects ---------------------------------------------------------------------
@@ -882,74 +899,85 @@ def _ro(db: Path) -> sqlite3.Connection:
     return con
 
 
-def _infosys_info(db: Path, tools: Path, brief: bool) -> dict[str, Any]:
-    out: dict[str, Any] = {"database": str(db), "exists": db.is_file()}
-    if not db.is_file():
-        out["build"] = (f'python "{tools / "infosys_local.py"}" index' if (tools / "infosys_local.py").is_file()
-                        else "build it with infosys_local.py index (tools folder of the knowledge base, see its README)")
-        return out
-    out["size_mb"] = round(db.stat().st_size / 1e6, 1)
-    if brief:
-        return out
+_KBD: dict[str, Any] = {}
+
+
+def kb_docs_module() -> Any | None:
+    """The twincat-docs skill's kb_docs.py, loaded as a module: its index_state / manuals_state / overview are the one
+    implementation of the rules (the builders' `stats --json` give the same answer)."""
+    p = docs_skill_path()
+    if p is None:
+        return None
+    key = f"{p}|{p.stat().st_mtime_ns}"
+    if _KBD.get("key") != key:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tcmcp_kb_docs", p)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _KBD.update(key=key, mod=mod)
+    return _KBD["mod"]
+
+
+def _builder_version(f: Path) -> str | None:
+    """Version of a builder copy in <kb>\\tools (version 1 had no BUILDER_VERSION line)."""
     try:
-        con = _ro(db)
-        try:
-            meta = {r[0]: r[1] for r in con.execute("SELECT key, value FROM meta")}
-            out["pages"] = con.execute("SELECT COUNT(*) FROM page").fetchone()[0]
-            out["books"] = con.execute("SELECT COUNT(DISTINCT book) FROM page").fetchone()[0]
-        finally:
-            con.close()
-        stamp = (meta.get("source") or "").split("|")
-        out.update({"package": stamp[0] or None, "indexed": meta.get("indexed"), "lcid": meta.get("lcid")})
-        if not stamp[0]:
-            out["incomplete"] = "no source stamp: the last infosys_local.py index did not finish — run it again with --force"
-    except sqlite3.Error as exc:
-        out["error"] = f"not readable as an infosys_local.py database: {exc}"
+        m = re.search(r'^BUILDER_VERSION = "(\d+)"', f.read_text(encoding="utf-8", errors="replace"), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else "1"
+
+
+def _builders(loc: Path) -> dict[str, Any]:
+    shipped = docs_skill_path()
+    bdir = shipped.parent / "builders" if shipped else None
+    out: dict[str, Any] = {}
+    for n in ("infosys_local.py", "manuals_db.py"):
+        plug = bdir / n if bdir and (bdir / n).is_file() else None
+        copy = loc / "tools" / n
+        e: dict[str, Any] = {"shipped": str(plug) if plug else None,
+                             "shipped_version": _builder_version(plug) if plug else None,
+                             "copy_in_tools": str(copy) if copy.is_file() else None}
+        if copy.is_file():
+            e["copy_version"] = _builder_version(copy)
+            if plug and e["copy_version"] != e["shipped_version"]:
+                e["note"] = (f"tools\\{n} is version {e['copy_version']}, the plugin ships version {e['shipped_version']} — "
+                             f"run the shipped one, or copy it into tools\\")
+        out[n] = e
     return out
 
 
-def _manuals_info(db: Path, folder: Path, tools: Path, brief: bool) -> dict[str, Any]:
-    out: dict[str, Any] = {"database": str(db), "exists": db.is_file(), "folder": str(folder)}
-    update = (f'"{tools / "manuals_db.py"}" update' if (tools / "manuals_db.py").is_file()
-              else "manuals_db.py update (tools folder of the knowledge base)")
-    on_disk = {norm_path(f): f for f in folder.rglob("*") if f.suffix.lower() == ".pdf" and f.is_file()} if folder.is_dir() else {}
-    out["pdfs_in_folder"] = len(on_disk)
-    if not db.is_file():
-        if on_disk:
-            out["build"] = f"python (with PyMuPDF or pypdf) {update}"
-        return out
-    out["size_mb"] = round(db.stat().st_size / 1e6, 1)
-    if brief:
-        return out
-    try:
-        con = _ro(db)
+def _cmd(builders: dict[str, Any], name: str, loc: Path, sub: str) -> str:
+    b = builders.get(name) or {}
+    script = b.get("shipped") or b.get("copy_in_tools") or name
+    return f'<Python 3.12+> "{script}" {sub} --kb "{loc}"'
+
+
+def _docs_parts(loc: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    idb, mdb = loc / INFOSYS_DB[0] / INFOSYS_DB[1], loc / MANUALS_DB[0] / MANUALS_DB[1]
+    builders = _builders(loc)
+    kd = kb_docs_module()
+    if kd is not None:
         try:
-            docs = [dict(r) for r in con.execute("SELECT path, name, size, mtime, pages, text_pages FROM doc")]
-        finally:
-            con.close()
-    except sqlite3.Error as exc:
-        out["error"] = f"not readable as a manuals_db.py database: {exc}"
-        return out
-    out["manuals"] = len(docs)
-    out["pages"] = sum(d["pages"] or 0 for d in docs)
-    known = {norm_path(d["path"]): d for d in docs}
-    # manuals_db.py update's own change test: size + mtime (it confirms with SHA-256 before re-indexing)
-    new = [f.name for k, f in on_disk.items() if k not in known]
-    changed = [f.name for k, f in on_disk.items() if k in known and
-               (known[k]["size"] != f.stat().st_size or known[k]["mtime"] != int(f.stat().st_mtime))]
-    gone = [d["name"] for k, d in known.items() if k not in on_disk]
-    scanned = [d["name"] for d in docs if not d["text_pages"]]
-    if new:
-        out["not_indexed"] = sorted(new)[:20]
-    if changed:
-        out["changed_since_index"] = sorted(changed)[:20]
-    if gone:
-        out["indexed_but_gone"] = sorted(gone)[:20]
-    if scanned:
-        out["no_text_layer"] = sorted(scanned)[:20]
-    if new or changed or gone:
-        out["update"] = f"python (with PyMuPDF or pypdf) {update}"
-    return out
+            inf = kd.index_state(idb)
+        except Exception as exc:  # noqa: BLE001
+            inf = {"database": str(idb), "state": "error", "message": f"not readable: {exc}"}
+        try:
+            man = kd.manuals_state(mdb, loc / "manuals")
+        except Exception as exc:  # noqa: BLE001
+            man = {"database": str(mdb), "state": "error", "message": f"not readable: {exc}"}
+    else:
+        inf = {"database": str(idb), "state": "unknown", "message": "the twincat-docs skill is not installed next to the server"}
+        man = {"database": str(mdb), "state": "unknown", "message": inf["message"]}
+    inf["exists"], man["exists"] = idb.is_file(), mdb.is_file()
+    if idb.is_file():
+        inf["size_mb"] = round(idb.stat().st_size / 1e6, 1)
+    if inf.get("state") != "complete" or inf.get("rebuild"):
+        inf["command"] = _cmd(builders, "infosys_local.py", loc, "index")
+    if man.get("state") != "up_to_date" or man.get("updating"):
+        man["command"] = _cmd(builders, "manuals_db.py", loc, "update") + "   (PDF text: pypdf, or PyMuPDF if you installed it)"
+    return inf, man, builders
 
 
 _PRODUCT = re.compile(r"^[A-Za-z]{1,4}\d{3,5}(?:-\d{4})?$")

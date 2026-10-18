@@ -38,9 +38,11 @@ FALLBACK_KB = r"D:\TwinCAT-MCP\knowledge"
 INFOSYS_DB = ("helpviewer", "infosys_en.db")
 MANUALS_DB = ("manualsdb", "manuals.db")
 WEB = "https://infosys.beckhoff.com/content/{lcid}/{book}/{pid}.html"
-BUILD_INFOSYS = r"python <kb>\tools\infosys_local.py index   (≈ 150 s, reads the Help Viewer package BKINFOSYS3*.mshc)"
-BUILD_MANUALS = (r"copy the PDF manuals into <kb>\manuals\ (sub-folders allowed), then: <python with PyMuPDF> "
-                 r"<kb>\tools\manuals_db.py update")
+BUILDERS = Path(__file__).resolve().parent / "builders"
+BUILD_INFOSYS = (f'<Python 3.12+> "{BUILDERS / "infosys_local.py"}" index --kb "<kb>"   (≈ 150 s, reads the Help Viewer '
+                 'package BKINFOSYS3*.mshc)')
+BUILD_MANUALS = (r"copy the PDF manuals into <kb>\manuals\ (sub-folders allowed), then: <Python 3.12+ with pypdf or "
+                 f'PyMuPDF> "{BUILDERS / "manuals_db.py"}" update --kb "<kb>"')
 
 RULES = [
     "Documentation questions use this skill; ads_* tools read the running PLC only and never return documentation.",
@@ -201,6 +203,162 @@ def ro_uri(db: Path) -> str:
     return "file:" + quote(s, safe="/:") + "?mode=ro"
 
 
+# ---------------------------------------------------------------------------------------------- the real index state
+# Same rules as the builders (builders/infosys_local.py and builders/manuals_db.py `stats --json`): a rebuild writes
+# <db>.building and replaces the index only when complete, so the live file is always a whole index; a .building file
+# whose heartbeat stopped is an interrupted rebuild. The twincat server's kb_status / tc_doctor and the instructions
+# it sends at every (re)connection use these functions too.
+SCHEMA_VERSION = "2"
+HEARTBEAT_STALE_S = 120
+MANUALS_HEARTBEAT_STALE_S = 300
+
+
+def _meta_of(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    try:
+        con = sqlite3.connect(ro_uri(path), uri=True, timeout=5)
+        try:
+            return {r[0]: r[1] for r in con.execute("SELECT key, value FROM meta")}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+
+
+def _stamp(p: Path) -> str:
+    st = p.stat()
+    return f"{p.name}|{st.st_size}|{int(st.st_mtime)}"
+
+
+def index_state(final: Path) -> dict[str, Any]:
+    building, lock = final.with_name(final.name + ".building"), final.with_name(final.name + ".lock")
+    now = time.time()
+    meta = _meta_of(final)
+    out: dict[str, Any] = {"database": str(final)}
+    if not final.is_file():
+        out["state"] = "missing"
+    elif not meta.get("source"):
+        out["state"] = "incomplete"
+    elif meta.get("schema") != SCHEMA_VERSION:
+        out["state"] = "old_format"
+    else:
+        out["state"] = "complete"
+        pkg = Path(meta["mshc_path"]) if meta.get("mshc_path") else None
+        if pkg is not None:
+            try:
+                if not pkg.is_file():
+                    out["package_note"] = f"the package it was built from is gone: {pkg}"
+                elif _stamp(pkg) != meta["source"]:
+                    out["state"] = "outdated"
+                    out["package_note"] = f"the Help Viewer package changed since the index was built: {pkg}"
+                else:
+                    newer = [x for x in pkg.parent.glob("BKINFOSYS3*.mshc")
+                             if x != pkg and x.stat().st_mtime > pkg.stat().st_mtime]
+                    if newer:
+                        out["state"] = "outdated"
+                        out["package_note"] = f"a newer package exists: {max(newer, key=lambda x: x.stat().st_mtime)}"
+            except OSError:
+                pass
+    for k in ("pages", "books", "links", "links_resolved", "indexed", "lcid", "builder", "mshc_path"):
+        if meta.get(k):
+            out[k] = int(meta[k]) if k in ("pages", "books", "links", "links_resolved") and meta[k].isdigit() else meta[k]
+    if meta.get("source"):
+        out["package"] = meta["source"].split("|")[0]
+    if building.is_file():
+        bm = _meta_of(building)
+        beat = max([float(bm.get("heartbeat") or 0)] + ([lock.stat().st_mtime] if lock.is_file() else []))
+        rb: dict[str, Any] = {"file": str(building), "pages_done": int(bm.get("pages_done") or 0),
+                              "pages_total": int(bm.get("pages_total") or 0), "started": bm.get("started"),
+                              "seconds_since_progress": round(now - beat) if beat else None}
+        if bm.get("state") == "complete":
+            rb["state"] = "waiting_to_replace"
+        elif beat and now - beat < HEARTBEAT_STALE_S:
+            rb["state"] = "running"
+        else:
+            rb["state"] = "interrupted"
+        out["rebuild"] = rb
+    out["message"] = index_message(out)
+    return out
+
+
+def index_message(s: dict[str, Any]) -> str:
+    live = {"missing": "no index yet", "incomplete": "INCOMPLETE (an earlier build stopped half-way) — run index",
+            "old_format": "complete text, older format without links — run index once to upgrade",
+            "complete": "complete", "outdated": "OUTDATED — " + s.get("package_note", "") + " — run index"}[s["state"]]
+    if s["state"] in ("complete", "outdated") and s.get("pages"):
+        live += f" ({s['pages']} pages, {s.get('books')} books, built {s.get('indexed')})"
+    rb = s.get("rebuild")
+    if rb:
+        prog = f"{rb['pages_done']} of {rb['pages_total']} pages"
+        live += {"running": f"; a rebuild is RUNNING ({prog}) — the index above stays in use until it is done",
+                 "interrupted": f"; a rebuild was INTERRUPTED at {prog} — the index above is still the one in use; "
+                                "run index to build again",
+                 "waiting_to_replace": "; a finished rebuild waits to replace it (the file was open) — run index again"
+                 }[rb["state"]]
+    return live
+
+
+def manuals_state(db: Path, folder: Path) -> dict[str, Any]:
+    out: dict[str, Any] = {"database": str(db), "folder": str(folder)}
+    try:
+        on_disk = {os.path.normcase(str(f)): f for f in folder.rglob("*")
+                   if f.suffix.lower() == ".pdf" and f.is_file()} if folder.is_dir() else {}
+    except OSError:
+        on_disk = {}
+    out["pdfs_in_folder"] = len(on_disk)
+    if not db.is_file():
+        out["state"] = "missing"
+        out["message"] = f"no manuals database yet ({len(on_disk)} PDFs in the folder) — run update"
+        return out
+    con = sqlite3.connect(ro_uri(db), uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    try:
+        docs = [dict(r) for r in con.execute("SELECT path, name, size, mtime, pages, text_pages FROM doc")]
+        try:
+            meta = {r[0]: r[1] for r in con.execute("SELECT key, value FROM meta")}
+        except sqlite3.OperationalError:
+            meta = {}
+    finally:
+        con.close()
+    known = {os.path.normcase(d["path"]): d for d in docs}
+    new = sorted(f.name for k, f in on_disk.items() if k not in known)
+    changed = sorted(f.name for k, f in on_disk.items() if k in known and
+                     (known[k]["size"] != f.stat().st_size or known[k]["mtime"] != int(f.stat().st_mtime)))
+    gone = sorted(d["name"] for k, d in known.items() if k not in on_disk)
+    out.update({"manuals": len(docs), "pages": sum(d["pages"] or 0 for d in docs), "not_indexed": new,
+                "changed_since_index": changed, "indexed_but_gone": gone,
+                "no_text_layer": sorted(d["name"] for d in docs if not d["text_pages"]),
+                "last_update": meta.get("last_update"), "last_result": meta.get("last_result")})
+    lock = db.with_name(db.name + ".lock")
+    beat = max(float(meta.get("heartbeat") or 0), lock.stat().st_mtime if lock.is_file() else 0)
+    if meta.get("state") == "updating":
+        out["updating"] = {"state": "running" if time.time() - beat < MANUALS_HEARTBEAT_STALE_S else "interrupted",
+                           "files_done": int(meta.get("files_done") or 0), "files_total": int(meta.get("files_total") or 0)}
+    pending = len(new) + len(changed) + len(gone)
+    out["state"] = "up_to_date" if not pending else "pending"
+    msg = f"{len(docs)} manuals, {out['pages']} pages indexed"
+    if pending:
+        msg += f"; {len(new)} new, {len(changed)} changed, {len(gone)} removed PDF(s) not reflected — run update"
+    if out.get("updating"):
+        u = out["updating"]
+        msg += (f"; an update is RUNNING ({u['files_done']} of {u['files_total']} files)" if u["state"] == "running" else
+                f"; the last update was INTERRUPTED at {u['files_done']} of {u['files_total']} files — run update")
+    out["message"] = msg
+    return out
+
+
+def overview(kb: Path) -> dict[str, Any]:
+    """Both databases of a knowledge folder, as the server reports them at each connection."""
+    i = index_state(kb / INFOSYS_DB[0] / INFOSYS_DB[1])
+    try:
+        m = manuals_state(kb / MANUALS_DB[0] / MANUALS_DB[1], kb / "manuals")
+    except sqlite3.Error as exc:
+        m = {"state": "error", "message": f"manuals database not readable: {exc}"}
+    return {"knowledge_base": str(kb), "infosys": i, "manuals": m,
+            "summary": f"Infosys index: {i['message']}. Manuals: {m['message']}."}
+
+
 class Ctx:
     def __init__(self, kb: Path, kb_source: str):
         self.kb, self.kb_source = kb, kb_source
@@ -246,9 +404,10 @@ class Ctx:
                                    "indexed": meta.get("indexed"), "lcid": meta.get("lcid") or "1033"}
             if len(parts) == 3 and parts[2].isdigit():
                 src["package_date"] = _dt.datetime.fromtimestamp(int(parts[2])).strftime("%Y-%m-%d")
-            if not stamp:
-                # infosys_local.py writes the source stamp last: without it the build never finished
-                src["incomplete"] = "the index has no source stamp — its build did not finish; rerun infosys_local.py index --force"
+            st = index_state(self.path(which))
+            src["state"] = st["state"]
+            if st["state"] != "complete" or st.get("rebuild"):
+                src["state_note"] = st["message"]          # the answer comes from this index — say what it is
         else:
             n, pages = con.execute("SELECT COUNT(*), COALESCE(SUM(pages), 0) FROM doc").fetchone()
             src = {"database": str(self.path(which)), "manuals": n, "pages": pages}
@@ -393,6 +552,27 @@ def _also_in(con: sqlite3.Connection, r: sqlite3.Row) -> list[dict[str, Any]]:
     return [{"ref": f"{x['book']}/{x['pid']}", "book": x["book"], "version": x["version"] or None} for x in _order(rows)]
 
 
+def _links(con: sqlite3.Connection, r: sqlite3.Row, within: str | None = None, limit: int = 30) -> list[dict[str, Any]] | None:
+    """The page's links that resolve to a page of the package (builder version 2), as refs docs_page opens.
+    within: only links whose text is in that part of the page. None: the index has no link table (version 1)."""
+    try:
+        rows = con.execute("SELECT text, target_book, target_pid FROM link WHERE book = ? AND pid = ? AND target_pid IS NOT NULL "
+                           "ORDER BY n", (r["book"], r["pid"])).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for x in rows:
+        ref = f"{x['target_book']}/{x['target_pid']}"
+        if ref in seen or (within is not None and x["text"] not in within):
+            continue
+        seen.add(ref)
+        out.append({"text": x["text"], "ref": ref})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _page_head(ctx: Ctx, r: sqlite3.Row) -> dict[str, Any]:
     return {"ref": f"{r['book']}/{r['pid']}", "title": r["title"], "book": r["book"], "version": r["version"] or None,
             "url": WEB.format(lcid=ctx.lcid(), book=r["book"], pid=r["pid"])}
@@ -464,6 +644,9 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = _page_head(ctx, r)
     out.update({"resolved_by": how, "intro": _intro(body), "declaration_blocks": shown,
                 "requirements": req.group(1).strip() if req else None, "also_in": _also_in(con, r)})
+    lk = _links(con, r)
+    if lk:
+        out["links"] = lk
     if rest:
         out["blocks_not_shown"] = f"{rest} more code block(s) — docs_page ref={out['ref']} for the whole page"
     if not blocks:
@@ -500,6 +683,11 @@ def cmd_docs_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     out = _page_head(ctx, r)
     out.update({"resolved_by": how, "breadcrumb": r["crumb"] or None, "outline": outline, "section": section,
                 "text": part, "chars": n, "offset": off, "next_offset": nxt, "truncated": nxt is not None})
+    lk = _links(con, r, within=part)
+    if lk is None:
+        out["links_note"] = "this index has no link table (built by infosys_local.py version 1) — rebuild it to follow links"
+    elif lk:
+        out["links"] = lk
     also = _also_in(con, r)
     if also:
         out["also_in"] = also
@@ -642,7 +830,10 @@ def cmd_manual_docs(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------------------------- status / help
 def cmd_status(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"knowledge_base": str(ctx.kb), "found_via": ctx.kb_source, "script_version": VERSION}
+    ov = overview(ctx.kb)
+    out["summary"] = ov["summary"]
     for which in ("infosys", "manuals"):
+        out[which + "_state"] = ov[which]
         try:
             src = dict(ctx.source(which))
             con = ctx.con(which)
