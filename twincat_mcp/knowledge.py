@@ -1297,6 +1297,7 @@ SHIPPED_BUILDERS: dict[str, dict[str, str]] = {
         "1682c747a8359454625d65eeb2c4831802e46e6a562848d1491d37049b49cf53": "2",   # e7e5b3f = release 0.8.9
         "864f9efc0bbebdde01ce54d6d47767f8d3c55eb11699a8971fb239550e8efdd0": "2",   # 1200fee (TCMCP_STUB_DIR)
         "fc62baf3e0ef001dff5ff7eee6f5d1ba8d07c9e654111092d81fe6c6bbee1cda": "2",   # release 0.8.10
+        "dfbed120f63d7cac155a48a936796b3384beac2d3b6419f8e8af04db7213ddfb": "3",   # release 0.8.11
     },
     "manuals_db.py": {
         "530a0c81b2dab0e6580d183348017dfbb7c05d795b6ceeb3808af934da3ab33d": "2",   # e92f196
@@ -1305,6 +1306,7 @@ SHIPPED_BUILDERS: dict[str, dict[str, str]] = {
         "217756a3d65af0755cce0100680bd1cc77934077a542e99ebfdd00a6e2de289c": "3",   # 08d3a44 = release 0.8.9
         "057677fad71344f574eaa97104d1e47ec8e556db5aa9341333abeab3e8990ebe": "3",   # 1200fee (TCMCP_STUB_DIR)
         "7f65bb454e0e57975ca5227fafce3b8db444dbcc334c990ab1da8359272fa341": "4",   # release 0.8.10
+        "cb18f84dd247bd5451cabb10055879c5210702a739cb1719d90fe42e85de66f8": "5",   # release 0.8.11
     },
 }
 SHIPPED_STUBS: dict[str, str] = {
