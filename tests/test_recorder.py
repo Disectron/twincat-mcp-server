@@ -787,8 +787,17 @@ def test_python_stop_when_ends_at_the_firing_sample_and_waits_for_the_other_bloc
     out = rec.stop(st["id"])
     footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
     assert footer["window_end_ms"] == 200.0 and footer["stop_at"]["by"] == "stop_when", footer
-    assert footer["label"] == "COMPLETE" and footer["missing_samples"] == 0 and footer["after_limit"] == 10, footer
+    assert footer["label"] == "COMPLETE" and footer["missing_samples"] == 0, footer
     assert footer["stop_reason"].startswith("stop_when")
+    # every block up to 200 ms is in the file, nothing after it. How many of the counter block's later samples were
+    # received before the notifications were removed (after_limit) depends on thread timing (0 on the Windows runner)
+    rows = [json.loads(ln) for ln in Path(out["file"]).read_text(encoding="utf-8").splitlines() if ln.startswith("[")]
+    per = {}
+    for r in rows:
+        if isinstance(r[1], str) and r[1].startswith("#"):
+            per.setdefault(r[1], []).append(r[0])
+    assert all(max(ts) == 200.0 and len(ts) == 21 for ts in per.values()) and len(per) == 2, per
+    assert 0 <= footer["after_limit"] <= 10
     v = rec.verify(st["id"])
     assert v["verdict"] == "PASS" and "tail_rule" not in v, v
 

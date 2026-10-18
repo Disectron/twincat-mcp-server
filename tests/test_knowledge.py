@@ -279,7 +279,8 @@ def _kb_with_docs(tmp: Path) -> Path:
     (loc / "sop" / "scope" / "SOP-scope-display.md").write_text("# Scope", encoding="utf-8")
     (loc / "tools").mkdir()
     shipped = K.builders_dir() / "manuals_db.py"              # a copy of the builder the plugin ships, CRLF on disk
-    (loc / "tools" / "manuals_db.py").write_bytes(shipped.read_bytes().replace(b"\n", b"\r\n"))
+    # (the checkout itself is CRLF on Windows: LF first, or the copy would be CR CR LF — a CI failure on Windows only)
+    (loc / "tools" / "manuals_db.py").write_bytes(shipped.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
     return loc
 
 
@@ -452,3 +453,14 @@ def test_builder_copies_become_stubs_once_and_are_reported(kb, tmp_path, monkeyp
     assert "left alone" in d["builders"]["infosys_local.py"]["note"]
     # the user's own script is never offered as the command — the plugin's builder is
     assert str(K.builders_dir() / "infosys_local.py") in d["infosys"]["command"]
+
+
+def test_content_sha_reads_every_line_end_as_lf(tmp_path):
+    """A shipped builder is recognised whatever its line ends: LF, CRLF (Windows checkout) or CR CR LF (a CRLF file
+    converted once more) — the Windows CI run of 0.8.10 failed on exactly that double conversion."""
+    src = (K.builders_dir() / "manuals_db.py").read_bytes().replace(b"\r\n", b"\n")
+    want = K._content_sha(K.builders_dir() / "manuals_db.py")
+    for i, data in enumerate((src, src.replace(b"\n", b"\r\n"), src.replace(b"\n", b"\r\r\n"))):
+        f = tmp_path / f"m{i}.py"
+        f.write_bytes(data)
+        assert K._content_sha(f) == want, i

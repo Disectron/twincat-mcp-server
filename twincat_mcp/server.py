@@ -1228,8 +1228,9 @@ def dump_timeout_message(p: dict[str, Any], limit_s: float) -> str:
     is already set when this runs: a dump that had not committed will not be kept; one that committed is."""
     el = time.time() - p.get("started", time.time())
     if p.get("phase") == "done":
+        # the paths as text: a list's repr doubles every backslash of a Windows path (C:\\Users\\…)
         return (f"ads_dump finished just as the {limit_s:.0f} s limit ran out ({el:.0f} s), so its result did not reach "
-                f"this call — the files WERE kept: {p.get('files')}")
+                f"this call — the files WERE kept: {', '.join(str(f) for f in p.get('files') or [])}")
     if p.get("phase") == "partial":
         return f"ads_dump finished just as the {limit_s:.0f} s limit ran out ({el:.0f} s), then: {p.get('error')}"
     where = (f" root {p.get('index')} of {p.get('of')} ({p.get('root')}), {p.get('leaves', 0)} leaves, "
