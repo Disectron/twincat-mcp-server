@@ -107,6 +107,10 @@ class XaeError(RuntimeError):
     pass
 
 
+class _ActedUnconfirmed(XaeError):
+    """A PLC online command was accepted but its state was not read back: it may have acted — never retried elsewhere."""
+
+
 def sta_init() -> None:  # pragma: no cover
     if IS_WIN:
         pythoncom.CoInitialize()
@@ -553,7 +557,7 @@ class XaeBackend:
             pass
         return None
 
-    def _error_items(self, view_copy: bool = False, pane_from: int | None = None) -> tuple[list[dict[str, Any]], str]:
+    def _error_items(self, view_copy: bool = False, pane_from: str | None = None) -> tuple[list[dict[str, Any]], str]:
         """Return (items, source). D20: the Error List is what the operator sees, so it is read first and by every
         route there is — DTE2.ToolWindows.ErrorList (late-bound: the cached 7.0 gen_py wrapper has no ToolWindows),
         the ErrorList window object, and when those report nothing a copy of the Error List view itself (its
@@ -589,13 +593,14 @@ class XaeBackend:
             except Exception:  # noqa: BLE001
                 pass
         try:
-            bo = self.build_output(tail_lines=2000)
-            text = bo["text"]
-            if pane_from is not None and bo.get("total_lines") is not None:
-                # only what was written after the marker (the tail holds the last min(total, 2000) lines)
-                lines = text.splitlines()
-                new = max(0, int(bo["total_lines"]) - int(pane_from))
-                text = "\n".join(lines[-new:]) if new else ""
+            if pane_from is not None:
+                # only what this command wrote: the pane's text after the marker (its text before the command) —
+                # or all of it when the command cleared or rewrote the pane (review of N82: a line count kept from
+                # before dropped the head of a pane that was cleared and refilled)
+                text = self._pane_text() or ""
+                text = text[len(pane_from):] if text.startswith(pane_from) else text
+            else:
+                text = self.build_output(tail_lines=2000)["text"]
             out = _parse_build_output(text)
         except Exception:  # noqa: BLE001
             out = []
@@ -661,29 +666,32 @@ class XaeBackend:
             "project": g("Project"),
         }
 
-    def errors(self, view_copy: bool = False, pane_from: int | None = None) -> dict[str, Any]:
+    def errors(self, view_copy: bool = False, pane_from: str | None = None) -> dict[str, Any]:
         items, source = self._error_items(view_copy, pane_from)
         return {"count": len(items), "source": source, "items": items}
 
-    def _pane_lines(self) -> int | None:
-        """How many lines the Build output pane holds now (a marker: what comes after is the next command's)."""
+    def _pane_text(self) -> str | None:
+        """The Build output pane's whole text now (the marker: what a command adds comes after it); None unreadable."""
         try:
-            return int(self.build_output(tail_lines=1).get("total_lines"))
+            return self._build_pane()
         except Exception:  # noqa: BLE001
             return None
 
-    def build_output(self, tail_lines: int = 200) -> dict[str, Any]:
+    def _build_pane(self) -> str:
         dte = self._need()
-        text = ""
+        win = dte.Windows.Item(VS_WINDOW_OUTPUT)
+        ow = win.Object
+        pane = ow.OutputWindowPanes.Item("Build")
+        doc = pane.TextDocument
+        sel = doc.Selection
+        sel.StartOfDocument(False)
+        sel.EndOfDocument(True)
+        return sel.Text or ""
+
+    def build_output(self, tail_lines: int = 200) -> dict[str, Any]:
+        self._need()                       # not attached: an error, as before — only the pane's own failure is a result
         try:
-            win = dte.Windows.Item(VS_WINDOW_OUTPUT)
-            ow = win.Object
-            pane = ow.OutputWindowPanes.Item("Build")
-            doc = pane.TextDocument
-            sel = doc.Selection
-            sel.StartOfDocument(False)
-            sel.EndOfDocument(True)
-            text = sel.Text or ""
+            text = self._build_pane()
         except Exception as exc:  # noqa: BLE001
             return {"text": "", "error": _com_msg(exc)}
         lines = text.splitlines()
@@ -827,6 +835,8 @@ class XaeBackend:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("%s: SilentMode could not be switched back to %s: %s", what, prev, exc)
 
+    ONLINE_STATE_WAIT_S = 5.0      # how long the state an ITcPlcOnline command leads to is awaited
+
     def _online_state(self, it: Any) -> dict[str, Any]:
         st = _try(lambda: int(it.OnlineApplicationState))
         return {"logged_in": _try(lambda: bool(it.IsLoggedIn)),
@@ -851,13 +861,26 @@ class XaeBackend:
             self._retry(lambda: _com_call(it, "Reset", _RESET_TYPE[action]), f"ITcPlcOnline.Reset({action})")
         else:
             return None
-        after = self._online_state(it)
         want_in = {"login": True, "online_change": True, "download": True, "logout": False}.get(action)
-        if want_in is not None and after["logged_in"] is not None and after["logged_in"] != want_in:
-            raise XaeError(f"ITcPlcOnline: {action} returned, but IsLoggedIn is {after['logged_in']} afterwards")
         want_state = {"start": "run", "stop": "stop"}.get(action)
-        if want_state and after["application_state"] not in (None, want_state):
-            raise XaeError(f"ITcPlcOnline: {action} returned, but the application is {after['application_state']}")
+
+        def reached(st: dict[str, Any]) -> bool:
+            return not ((want_in is not None and st["logged_in"] is not None and st["logged_in"] != want_in)
+                        or (want_state and st["application_state"] not in (None, want_state)))
+        # the state follows the call (Start is not yet RUN when it returns): read it again for a while
+        t_end = time.monotonic() + self.ONLINE_STATE_WAIT_S
+        after = self._online_state(it)
+        while not reached(after) and time.monotonic() < t_end:
+            time.sleep(0.25)
+            after = self._online_state(it)
+        if not reached(after):
+            # the call was accepted: it may have acted. No other route runs it again — a second reset or download
+            # would act twice (review of the TE1000 route)
+            raise _ActedUnconfirmed(
+                f"ITcPlcOnline.{action} on {target} returned, but {self.ONLINE_STATE_WAIT_S:g} s later the project is "
+                f"{'logged in' if after['logged_in'] else 'logged out' if after['logged_in'] is False else '(login unknown)'}"
+                f", application {after['application_state']} (before: {before}) — the command may have acted, so it "
+                "is not sent again through another route; check xae_status / ads_status")
         return {"action": action, "method": "ITcPlcOnline", "project": target, "ok": True, "before": before,
                 "after": after}
 
@@ -899,6 +922,8 @@ class XaeBackend:
                 r = self._plc_online(target, action)
             if r is not None:
                 return {**r, **sn}
+        except _ActedUnconfirmed:
+            raise
         except XaeError as exc:
             ai_note = f"ITcPlcOnline on {target}: {str(exc)[:200]}"
         tag = self._PLC_ONLINE_XML.get(action)
@@ -1647,7 +1672,7 @@ class XaeBackend:
         # was still reported, a recurring one counted once more per run. The Error List is cleared (as before a build)
         # and only the Build pane lines written after this point are read
         self._clear_error_list()
-        mark = self._pane_lines()
+        mark = self._pane_text()
         if len(nested) == 1:
             it = self._item(nested[0])
             try:
@@ -1873,25 +1898,35 @@ def _measurement_scope(obj: Any) -> Any:
     return ms if _has_member(ms, "StartRecord") else None
 
 
+_TKIND_ENUM = 0        # TYPEKIND: TKIND_ENUM = 0 (oaidl.h) — pythoncom.TKIND_ENUM, without importing pythoncom
+
+
 def _typelib_enum(obj: Any, enum_name: str) -> dict[str, int] | None:
     """{name: value} of an enum in the type library that defines this late-bound COM object's interface (what makepy
     reads); None when it cannot be read (no type info, not Windows, a test double)."""
     ole = getattr(obj, "_oleobj_", None)
     if ole is None:
         return None
+
+    def field(o: Any, index: int, name: str) -> Any:
+        # pywin32 gives TYPEATTR / VARDESC as tuples (genpy reads attr[7], vdesc[0], vdesc[1]); newer builds also name
+        # the fields — either form is read
+        try:
+            return o[index]
+        except (TypeError, IndexError, KeyError):
+            return getattr(o, name)
     try:
-        import pythoncom  # type: ignore
         tlib, _ = ole.GetTypeInfo().GetContainingTypeLib()
         for i in range(tlib.GetTypeInfoCount()):
-            if tlib.GetTypeInfoType(i) != pythoncom.TKIND_ENUM:
+            if tlib.GetTypeInfoType(i) != _TKIND_ENUM:
                 continue
             if str(tlib.GetDocumentation(i)[0]).upper() != enum_name.upper():
                 continue
             ti = tlib.GetTypeInfo(i)
             out: dict[str, int] = {}
-            for j in range(ti.GetTypeAttr().cVars):
+            for j in range(int(field(ti.GetTypeAttr(), 7, "cVars"))):        # TYPEATTR: cVars
                 vd = ti.GetVarDesc(j)
-                out[str(ti.GetNames(vd.memid)[0])] = int(vd.value)
+                out[str(ti.GetNames(field(vd, 0, "memid"))[0])] = int(field(vd, 1, "value"))   # VARDESC: memid, value
             return out
     except Exception:  # noqa: BLE001
         return None

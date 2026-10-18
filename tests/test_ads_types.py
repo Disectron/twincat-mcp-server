@@ -265,6 +265,55 @@ def test_d5_a_bool_member_reads_as_bool_on_every_path():
     assert [ts.decode_leaf(raw, lf) for lf in ts.leaves("GVL.stVisu", "ST_Visu")] == [True, 7]
 
 
+def test_d5_review_an_alias_of_an_unsigned_or_float_type_reads_as_its_base():
+    """Review of D5: decoding every scalar alias by its declared name read TYPE T_Level : UINT (40000) as -25536 and
+    TYPE T_Temp : REAL (1.5) as 1069547520 — the name is unknown, so its size picked a signed integer. An alias decodes
+    by the first elementary name of its chain; with none, by the entry's ADS data type id. BOOL (declared elementary,
+    listed as an alias of BYTE on 4026) stays BOOL."""
+    tbl = {
+        "uint": DtEntry("UINT", "", 2, 0, 18, 0, ""),
+        "t_level": DtEntry("T_Level", "UINT", 2, 0, 18, 0, ""),
+        "t_temp": DtEntry("T_Temp", "REAL", 4, 0, 4, 0, ""),                    # REAL itself not in the table
+        "t_count": DtEntry("T_Count", "T_Level", 2, 0, 18, 0, ""),               # an alias of an alias
+        "t_big": DtEntry("T_Big", "T_Unlisted", 4, 0, 19, 0, ""),                 # base unknown: the ADST id (UDINT)
+        "e_mode": DtEntry("E_Mode", "UINT", 2, 0, 18, 0, "", enum={40000: "High", 1: "Low"}),
+        "bool": DtEntry("BOOL", "BYTE", 1, 0, 17, 0, ""),
+        "st_m": DtEntry("ST_M", "", 17, 0, 65, 0, "", [], [
+            DtEntry("nLevel", "T_Level", 2, 0, 18, 0, ""), DtEntry("rTemp", "T_Temp", 4, 2, 4, 0, ""),
+            DtEntry("nCount", "T_Count", 2, 6, 18, 0, ""), DtEntry("nBig", "T_Big", 4, 8, 19, 0, ""),
+            DtEntry("eMode", "E_Mode", 2, 12, 18, 0, ""), DtEntry("bOn", "BOOL", 1, 14, 17, 0, "")], {}, {}),
+    }
+    ts = TypeSystem(tbl)
+    raw = (struct.pack("<H", 40000) + struct.pack("<f", 1.5) + struct.pack("<H", 65535) + struct.pack("<I", 3_000_000_000)
+           + struct.pack("<H", 40000) + bytes([1]) + bytes(2))
+    want = {"nLevel": 40000, "rTemp": 1.5, "nCount": 65535, "nBig": 3_000_000_000,
+            "eMode": {"value": 40000, "name": "High"}, "bOn": True}
+    assert ts.decode_tree(raw, "ST_M", size=17) == want
+    leaves = ts.leaves("GVL.stM", "ST_M")
+    assert {lf.path.rsplit(".", 1)[1]: ts.decode_leaf(raw, lf) for lf in leaves} == want
+
+
+def test_review_values_as_read_are_accepted_back_and_compared_by_their_value():
+    """Review: an enum read through the table is {value, name}, an array of them a list of those. A snapshot restore
+    wrote them back as they were read (int(dict) failed), expect == [1, 2, 0] compared dicts with ints, and
+    ads_wait_until's 'already true' check never matched an enum."""
+    from twincat_mcp import types_tc as T
+    from twincat_mcp.recorder import Condition
+    from twincat_mcp.testing import _cmp
+    arr = T.parse_type("ARRAY [1..3] OF E_State", 6, None)
+    read = [{"value": 1, "name": "A"}, {"value": 2, "name": "B"}, {"value": 0, "name": "Idle"}]
+    assert T.raw_value(read) == [1, 2, 0]
+    assert T.encode(T.parse_type("E_State", 2, 2), {"value": 2, "name": "B"}) == 2
+    assert T.encode(T.parse_type("TIME"), {"raw_ms": 1500, "text": "T#1s500ms"}) == 1500
+    assert T.encode(T.TcType("ARRAY [1..3] OF E_State", None, "array", 6, [(1, 3)], T.parse_type("E_State", 2, 2)),
+                    read) == [1, 2, 0]
+    assert arr is not None and _cmp("==", read, [1, 2, 0], None)
+    c = Condition("MAIN.eState", "==", 2)
+    assert c.test({"value": 2, "name": "Run"}) and not c.test({"value": 1, "name": "Stop"})
+    # a struct is a dict of its members — not unwrapped by its shape unless it is exactly a wrapper
+    assert T.raw_value({"nValue": 1, "sName": "x"}) == {"nValue": 1, "sName": "x"}
+
+
 def test_n50_unknown_names_are_not_guessed_when_the_table_knows_them():
     """N50: parse_type read any unknown name of 1/2/4/8 bytes as a signed integer: TYPE PT_X : POINTER TO FB_X came out
     as -114343571583168. It is flagged as a guess, and the table decodes it (an address); arrays of such elements

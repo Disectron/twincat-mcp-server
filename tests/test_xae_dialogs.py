@@ -57,3 +57,63 @@ async def test_n85_n87_a_dialog_holds_the_shell(monkeypatch, project_dir):
     assert r["y"] == 1 and r["open_dialogs"][0]["title"] == "Tools"
     with pytest.raises(ToolError, match="xae_restart_twincat refused: the XAE shell has a dialog open — 'Tools'"):
         app.refuse_if_dialog("xae_restart_twincat")
+
+
+@pytest.mark.anyio
+async def test_review_a_deploy_stops_before_the_next_step_when_a_dialog_waits(monkeypatch, project_dir):
+    """Review of N87: xae_deploy checked for a dialog only at its start; a dialog the build left open did not stop the
+    activation. Now each step waits 2 s for the watchdog's rules, then stops with what was done."""
+    from twincat_mcp.server import build_server
+    from tests.fake_ads import install
+    from tests.test_server_e2e import client_for, text
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    app = srv._tcmcp_app
+    dialogs: list[D.Dialog] = []
+    monkeypatch.setattr(app, "dialogs_now", lambda: [d.to_dict() for d in dialogs])
+    ran: list[str] = []
+
+    async def ok(*a, **kw):
+        return "PLC@192.168.0.10.1.1"
+
+    async def nothing(*a, **kw):
+        return None
+
+    async def saved(tool):
+        return {"saved": True}
+
+    async def xae_call(fn, *a, **kw):
+        ran.append(fn.__name__)
+        if fn.__name__ == "build":
+            dialogs.append(D.Dialog(90, 1, "TwinCAT", "Overwrite the boot project?", [(1, "Yes"), (2, "No")]))
+            return {"success": True, "errors": 0, "warnings": 0, "duration_s": 1.0}
+        return {}
+    for name, fn in (("xae_target_for", ok), ("check_targets", nothing), ("permit", nothing),
+                     ("save_verified", saved), ("xae_call", xae_call)):
+        monkeypatch.setattr(app, name, fn)
+    t0 = time.monotonic()
+    async with client_for(srv) as s:
+        res = await s.call_tool("xae_deploy", {"confirm_token": "x"})
+    t = text(res)
+    assert res.is_error and "xae_deploy before activation refused" in t and "'TwinCAT'" in t, t
+    assert "Done: save, build; nothing after that was started" in t and ran == ["build"], (t, ran)
+    assert time.monotonic() - t0 >= 2.0                                       # the rules had their 2 s
+    # a progress window (Cancel only) waits for no answer: not a reason to stop
+    dialogs[:] = [D.Dialog(91, 1, "Building", "", [(1, "Cancel")])]
+    ran.clear()
+
+    async def xae_call2(fn, *a, **kw):
+        ran.append(fn.__name__)
+        return {"success": True, "errors": 0, "warnings": 0, "duration_s": 1.0} if fn.__name__ == "build" else {}
+    monkeypatch.setattr(app, "xae_call", xae_call2)
+    monkeypatch.setattr(app, "restart_witness", lambda *a, **kw: _value({"mode": "RUN"}))
+    monkeypatch.setattr(app, "verify_target_after", lambda *a, **kw: _value(
+        {"verified": True, "target_mode": "RUN", "dialogs": [], "polls": 1, "modes_seen": ["CONFIG", "RUN"]}))
+    async with client_for(srv) as s:
+        r = await s.call_tool("xae_deploy", {"confirm_token": "x"})
+    assert not r.is_error, text(r)
+    assert ran == ["build", "activate_configuration", "restart_twincat"], ran
+
+
+async def _value(v):
+    return v

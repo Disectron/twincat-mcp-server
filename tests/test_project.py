@@ -276,3 +276,48 @@ def test_n88_readers_never_see_an_index_being_rebuilt(tmp_path, project_dir):
     for t in ts:
         t.join()
     assert not bad, bad[:3]
+
+
+def _obj(path, tag: str, name: str, decl: str, impl: str | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = f"<Implementation><ST><![CDATA[{impl}]]></ST></Implementation>" if impl is not None else ""
+    path.write_text('<?xml version="1.0" encoding="utf-8"?>\n<TcPlcObject Version="1.1.0.1">\n'
+                    f'  <{tag} Name="{name}" Id="{{aaaaaaaa-0000-0000-0000-0000000000{len(name):02d}}}">'
+                    f"<Declaration><![CDATA[{decl}]]></Declaration>{body}</{tag}>\n</TcPlcObject>\n", encoding="utf-8")
+
+
+def test_n92_review_strings_projects_and_duplicates(tmp_path, project_dir):
+    """Review of N92: (1) the comment pass cut code at a // inside a literal, so a GVL used as
+    CONCAT('//srv/share/', GVL_Paths.sShare) read as unreferenced; (2) with two PLC projects every root of the other
+    one read as 'not linked' on this port; (3) a name declared twice is never called missing."""
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex, not_on_target, st_strip
+    plc = project_dir / "Plc"
+    _obj(plc / "GVLs" / "GVL_Paths.TcGVL", "GVL", "GVL_Paths", "VAR_GLOBAL\n\tsShare : STRING;\nEND_VAR\n")
+    _obj(plc / "POUs" / "PRG_Paths.TcPOU", "POU", "PRG_Paths", "PROGRAM PRG_Paths\nVAR\n\tsPath : STRING;\nEND_VAR\n",
+         "sPath := CONCAT('//srv/share/', GVL_Paths.sShare); (* a ' in a comment *) sPath := '(*';")
+    two = project_dir / "Plc2"
+    (two / "Plc2.plcproj").parent.mkdir(parents=True, exist_ok=True)
+    (two / "Plc2.plcproj").write_text((plc / "Plc.plcproj").read_text(encoding="utf-8"), encoding="utf-8")
+    _obj(two / "POUs" / "MAIN2.TcPOU", "POU", "MAIN2", "PROGRAM MAIN2\nVAR\n\tn : INT;\nEND_VAR\n", "n := n + 1;")
+    _obj(two / "GVLs" / "GVL_Two.TcGVL", "GVL", "GVL_Two", "VAR_GLOBAL\n\tnX : INT;\nEND_VAR\n")
+    idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
+    assert st_strip("a := '//x'; // c\nb := '(*'; (* ' *) c") == "a := '//x';  \nb := '(*';   c"
+    assert st_strip("s := 'it''s'; t := '$'x'", blank_strings=True) == "s := ''''; t := ''"
+    ul = idx.unreferenced_gvls()
+    assert [x["gvl"] for x in ul["not_linked"]] == ["GVL_Two"], ul        # GVL_Paths: used inside the CONCAT line
+    decl = idx.declared_roots()
+    # the target on this port runs Plc (MAIN, GVL_Machine, PRG_Paths, GVL_Paths): Plc2's roots are not "missing"
+    r = not_on_target(decl, {"main", "gvl_machine", "prg_paths", "gvl_paths"})
+    assert r["roots"] == [] and r["plc_project"].endswith("Plc.plcproj") and r["not_judged"] is None, r
+    # a target whose symbols match both projects (or neither) is not judged at all
+    r2 = not_on_target(decl, {"main", "main2"})
+    assert r2["roots"] == [] and "2 PLC projects" in r2["not_judged"], r2
+    # Plc2 on its own port: GVL_Two is missing there
+    r3 = not_on_target(decl, {"main2"})
+    assert [m["root"] for m in r3["roots"]] == ["GVL_Two"] and r3["plc_project"].endswith("Plc2.plcproj")
+    # a duplicate name (two files) is never called missing
+    _obj(two / "GVLs" / "GVL_Machine.TcGVL", "GVL", "GVL_Machine", "VAR_GLOBAL\n\tnY : INT;\nEND_VAR\n")
+    idx.refresh()
+    r4 = not_on_target(idx.declared_roots(), {"main2"})
+    assert "GVL_Machine" not in [m["root"] for m in r4["roots"]], r4

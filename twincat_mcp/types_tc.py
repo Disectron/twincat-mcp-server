@@ -291,9 +291,36 @@ def parse_time_literal(text: str, nanoseconds: bool = False) -> int:
     return total_ns if nanoseconds else total_ns // 1_000_000
 
 
+# the shapes decode() wraps a scalar in: TIME/TOD {raw_ms, text}, DATE/DT {raw, text}, LTIME/LDATE… {raw_ns, text},
+# an enum (read through the datatype table) {value, name}
+_WRAPPED = (("raw_ms", "text"), ("raw", "text"), ("raw_ns", "text"), ("value", "name"))
+
+
+def raw_value(v: Any) -> Any:
+    """The number behind a decoded value: a TIME / DATE / … dict its raw count, an enum {value, name} its integer;
+    a list element by element (an array of enums or TIMEs). Only these exact two-key shapes are unwrapped — a struct
+    is a dict of its members and stays one (a struct of exactly the members 'value' and 'name' cannot be told from an
+    enum by its shape; where the type is known, encode() decides by the type instead)."""
+    if isinstance(v, dict) and len(v) == 2:
+        for k, other in _WRAPPED:
+            if k in v and other in v and isinstance(v[other], str) and isinstance(v[k], (int, float)) \
+                    and not isinstance(v[k], bool):
+                return v[k]
+        return v
+    if isinstance(v, (list, tuple)):
+        return [raw_value(x) for x in v]
+    return v
+
+
 def encode(tt: TcType, value: Any) -> Any:
-    """Accept friendly input and return what pyads expects for tt.ctype."""
+    """Accept friendly input and return what pyads expects for tt.ctype. A value as a read returned it is accepted
+    back (a snapshot restore, an experiment putting a factor back): the type decides what its wrapper is."""
     k = tt.kind
+    if isinstance(value, dict) and k not in ("array", "struct"):
+        key = {"time": "raw_ms", "tod": "raw_ms", "ltime": "raw_ns", "ltod": "raw_ns", "ldate": "raw_ns",
+               "ldt": "raw_ns", "date": "raw", "dt": "raw", "int": "value", "uint": "value", "enum": "value"}.get(k)
+        if key is not None and key in value:
+            value = value[key]
     if k == "array":
         if not isinstance(value, (list, tuple)):
             raise ValueError("array write needs a JSON list")

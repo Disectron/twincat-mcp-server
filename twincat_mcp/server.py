@@ -691,15 +691,15 @@ class App:
                 self.xae_held = None
         fut.add_done_callback(done)
 
-    def refuse_if_dialog(self, action: str) -> None:
+    def refuse_if_dialog(self, action: str, done: str = "Nothing was done.") -> None:
         """N87: the shell answers COM inside a modal loop, so an open dialog does not stop a call — but nothing that
-        changes the machine runs while one waits for an answer."""
-        live = self.dialogs_now()
+        changes the machine runs while one waits for an answer (a progress window, Cancel only, waits for none)."""
+        live = [d for d in self.dialogs_now() if _dialog_awaits(d)]
         if live:
             d = live[0]
             raise ToolError(f"{action} refused: the XAE shell has a dialog open — '{d.get('title')}' (buttons "
                             f"{d.get('buttons')}; text {str(d.get('text', ''))[:200]!r}). Answer it first "
-                            "(xae_dialog_resolve(button=...)), then retry. Nothing was done.")
+                            f"(xae_dialog_resolve(button=...)), then retry. {done}")
 
     async def xae_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
         job = getattr(fn, "__name__", "XAE call")
@@ -1490,13 +1490,15 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
     # N92: a root of the source with no symbol at all on the target — one line with its cause, not only its items
     try:
         decl = await app.proj_call(app.proj.declared_roots)
-        gone = not_on_target({k: d for k, d in decl.items() if k in roots}, await app.ads_call(app.ads.root_names,
-                                                                                              timeout=60))
+        nt = not_on_target({k: d for k, d in decl.items() if k in roots}, await app.ads_call(app.ads.root_names,
+                                                                                            timeout=60))
     except ToolError as exc:
         out["roots_not_on_target_error"] = f"not checked: {exc}"
     else:
-        if gone:
-            out["roots_not_on_target"] = gone
+        if nt["roots"]:
+            out["roots_not_on_target"] = nt["roots"]
+        if nt["not_judged"]:
+            out["roots_not_on_target_not_judged"] = nt["not_judged"]
     return out
 
 
@@ -3252,12 +3254,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if declared:
             # N92: a root of the source with no symbol on the target is named, with its cause (the same symbol table)
             try:
-                missing = not_on_target(declared, await app.ads_call(app.ads.root_names, timeout=60), pattern)
+                nt = not_on_target(declared, await app.ads_call(app.ads.root_names, timeout=60), pattern)
             except ToolError as exc:
                 res["not_on_target_error"] = f"not checked: {exc}"
             else:
+                missing = nt["roots"]
+                if nt["not_judged"]:
+                    res["not_on_target_not_judged"] = nt["not_judged"]
                 if missing:
                     res["not_on_target"] = missing
+                    if nt["plc_project"]:
+                        res["not_on_target_plc_project"] = nt["plc_project"]
                     res["not_on_target_warning"] = (
                         f"{len(missing)} program/GVL root(s) of the source have no symbol on the target "
                         f"({', '.join(m['root'] for m in missing[:5])}{' …' if len(missing) > 5 else ''}): not in this "
@@ -4188,18 +4195,36 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         await app.check_targets(tgt, allow_target_mismatch)
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_deploy", tgt, confirm_token)
         steps: dict[str, Any] = {}
+
+        async def halt_if_dialog(step: str) -> None:
+            # review of N87: a dialog a step left open (the build's, the boot project's) stops the deploy before the
+            # next step — it was checked only at the start, and the activation ran with the dialog waiting. The
+            # watchdog's rules answer theirs within 0.5 s: 2 s are given, as for a call (xae_call)
+            t_end = time.monotonic() + 2.0
+            while any(_dialog_awaits(d) for d in app.dialogs_now()) and time.monotonic() < t_end:
+                await asyncio.sleep(0.25)
+            try:
+                app.refuse_if_dialog(f"xae_deploy before {step}",
+                                     f"Done: {', '.join(steps) or 'nothing'}; nothing after that was started.")
+            except ToolError:
+                app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "dialog-open", steps)
+                raise
         steps["save"] = await app.save_verified("xae_deploy")
         if not skip_build:
+            await halt_if_dialog("build")
             b = await app.xae_call(app.xae.build, False, False, timeout=cfg.xae.build_timeout_s + 60)
-            steps["build"] = {k: b[k] for k in ("success", "errors", "warnings", "duration_s")}
+            steps["build"] = {k: b[k] for k in ("success", "errors", "warnings", "duration_s", "open_dialogs") if k in b}
             if not b["success"]:
                 steps["build"]["items"] = b["items"][:50]
                 app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "build-failed", steps)
                 return {"deployed": False, "steps": steps}
         if plc_project_path:
+            await halt_if_dialog("boot project")
             steps["boot_project"] = await app.xae_call(app.xae.boot_project, plc_project_path, True, True, False, timeout=300)
+        await halt_if_dialog("activation")
         before = await app.restart_witness()                  # R40: before the activation — what a restart must change
         steps["activate"] = await app.xae_call(app.xae.activate_configuration, timeout=600)
+        await halt_if_dialog("restart")
         t_restart = time.monotonic()
         steps["restart"] = await app.xae_call(app.xae.restart_twincat, timeout=300)
         await app.ads_call(app.ads.disconnect, timeout=10)

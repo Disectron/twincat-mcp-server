@@ -50,13 +50,7 @@ SYMFLAG = {
 
 
 def _same_value(a: Any, b: Any) -> bool:
-    def raw(v: Any) -> Any:
-        if isinstance(v, dict):
-            for k in ("raw_ms", "raw", "raw_ns", "value"):
-                if k in v:
-                    return v[k]
-        return v
-    a, b = raw(a), raw(b)
+    a, b = T.raw_value(a), T.raw_value(b)
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
     if isinstance(a, float) or isinstance(b, float):

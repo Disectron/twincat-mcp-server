@@ -436,14 +436,20 @@ class TypeSystem:
                 sub_entry = s if (s.subitems or s.dims) else None
                 d[s.name] = self.decode_tree(buf, s.type, off + s.offs, sub_entry, max_array, depth + 1, s.size or None)
             return d
-        if e.type and e.type.lower() != e.name.lower() and self.get(e.type) is not None and not e.enum:
+        if e.type and e.type.lower() != e.name.lower() and not e.enum:
             tgt = self.get(e.type)
-            if tgt is not None and not tgt.subitems and not tgt.dims and not tgt.enum:
-                # D5: a scalar alias is the leaf the dump decodes — the declared name (BOOL; on 4026 the table carries
-                # BOOL -> BYTE), the base type's storage. Following the alias read BOOL as a BYTE: 1 / 0
-                return self.decode_leaf(buf, Leaf("", e.name if entry is None else e.type, off, e.size or tgt.size,
-                                                  tgt.data_type or e.data_type, None))
-            return self.decode_tree(buf, e.type, off, None, max_array, depth + 1)
+            if tgt is not None and (tgt.subitems or tgt.dims or tgt.enum):
+                return self.decode_tree(buf, e.type, off, None, max_array, depth + 1)   # alias of a struct/array/enum
+            # a scalar alias decodes by the first ELEMENTARY name of its chain: the declared name when it is one (D5:
+            # the 4026 table lists BOOL as an alias of BYTE — following it read BOOL as 1 / 0), else the base it
+            # names (TYPE T_Level : UINT reads 40000, not -25536); with no elementary name in the chain, by the
+            # entry's ADS data type id (_decode_scalar) — never by a size guess
+            name = self.elementary_name(e.name if entry is None else e.type)
+            if name is not None:
+                return self._decode_scalar(buf, off, name, DtEntry(name, "", e.size or (tgt.size if tgt else 0), 0,
+                                                                   e.data_type, 0, ""), None)
+            if tgt is not None:
+                return self.decode_tree(buf, e.type, off, None, max_array, depth + 1)
         if (e.size or 0) > MAX_LEAF_BYTES:
             return not_expanded_value(buf[off:off + HEAD_BYTES], e.size, None, f"larger than {MAX_LEAF_BYTES} bytes")
         return self._decode_scalar(buf, off, e.name if entry is None else e.type, e, e.enum or None)
@@ -461,10 +467,27 @@ class TypeSystem:
             e = DtEntry(leaf.type, "", leaf.size, 0, leaf.data_type or (e.data_type if e else 0), 0, "", enum=dict(leaf.enum or {}))
         return self._decode_scalar(buf, leaf.offset, leaf.type, e, leaf.enum or (e.enum or None))
 
+    def elementary_name(self, name: str) -> str | None:
+        """The first name of an alias chain that parse_type decodes by itself (BOOL, UINT, STRING(20), …): the name
+        when it is one, else the base the table names for it, and so on; None when the chain reaches a struct, an
+        array, an enum or a name the table does not list."""
+        seen: set[str] = set()
+        while name and name.strip().lower() not in seen:
+            seen.add(name.strip().lower())
+            if T.is_elementary(T.parse_type(name)):
+                return name
+            ent = self.get(name)
+            if ent is None or ent.subitems or ent.dims or ent.enum or not ent.type or ent.type.lower() == name.lower():
+                return None
+            name = ent.type
+        return None
+
     @staticmethod
     def _decode_scalar(buf: bytes, off: int, type_name: str, e: DtEntry | None, enum: dict[int, str] | None) -> Any:
         size = e.size if e else None
-        tt = T.parse_type(type_name, size)
+        # the entry's ADS data type id decides a name parse_type does not know (an enum with an unsigned base, an alias
+        # whose base the table does not list) — the size alone read every such value as a signed integer
+        tt = T.parse_type(type_name, size, (e.data_type or None) if e else None)
         if tt.ctype is None or tt.opaque:
             if e is not None and e.data_type in (2, 3, 16, 17, 18, 19, 20, 21, 4, 5, 30, 31, 33):
                 return _decode_adst(buf, off, e.data_type, e.size, enum)

@@ -169,10 +169,8 @@ class Condition:
                 return False
             value = flat[self.index]
         try:
-            v = value["raw_ms"] if isinstance(value, dict) and "raw_ms" in value else value
-            v = v["raw"] if isinstance(v, dict) and "raw" in v else v
-            v = v["raw_ns"] if isinstance(v, dict) and "raw_ns" in v else v
-            return _OPS[self.op](v, self.value)
+            # an enum read through the datatype table is {value, name}: compared by its value like a TIME by its count
+            return _OPS[self.op](T.raw_value(value), self.value)
         except Exception:  # noqa: BLE001
             return False
 

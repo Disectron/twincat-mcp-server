@@ -71,14 +71,8 @@ def _address(v: Any, expected: bool = True) -> Any:
 
 
 def _raw(v: Any) -> Any:
-    """Decoded value → comparable raw (TIME dict → ms, etc.)."""
-    if isinstance(v, dict):
-        for k in ("raw_ms", "raw", "raw_ns"):
-            if k in v:
-                return v[k]
-        if "value" in v and "name" in v and len(v) == 2:       # an enum: {"value": 1, "name": "Bulk"}
-            return v["value"]
-    return v
+    """Decoded value → comparable raw (TIME dict → ms, an enum {value, name} → its value; arrays element by element)."""
+    return T.raw_value(v)
 
 
 def _cmp(op: str, actual: Any, expected: Any, tolerance: float | None) -> bool:

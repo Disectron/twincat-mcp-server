@@ -35,28 +35,55 @@ SRC_EXT = {".tcpou": "POU", ".tcdut": "DUT", ".tcgvl": "GVL", ".tcio": "Itf"}
 _SYMBOL_SECTIONS = {"PROGRAM": {"VAR", "VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_STAT", "VAR_INST"},
                     "GVL": {"VAR_GLOBAL"}}
 _RE_LINKALWAYS = re.compile(r"\{\s*attribute\s+'linkalways'\s*\}", re.I)
-_RE_ST_COMMENT = re.compile(r"\(\*.*?\*\)|//[^\n]*", re.S)
-_RE_ST_STRING = re.compile(r"'(?:\$.|[^'$])*'|\"(?:\$.|[^\"$])*\"")
+# ST comments and string literals in ONE pass, strings first: a // or (* inside a literal ('//srv/share/') is text,
+# a quote inside a comment is comment. Separate passes cut code at the // of a literal (review of N92)
+_RE_ST_TOKENS = re.compile(r"(?P<s>'(?:\$.|[^'$\n])*'|\"(?:\$.|[^\"$\n])*\")|\(\*.*?\*\)|//[^\n]*", re.S)
+
+
+def st_strip(code: str, *, blank_strings: bool = False, comment: str = " ") -> str:
+    """ST without its comments (each replaced by `comment`); string literals kept — or emptied to '' / "" with
+    blank_strings (their text is then never read as code)."""
+    def one(m: re.Match[str]) -> str:
+        lit = m.group("s")
+        if lit is None:
+            return comment
+        return lit[0] * 2 if blank_strings else lit
+    return _RE_ST_TOKENS.sub(one, code or "")
 
 
 def _no_comments(code: str) -> str:
     """ST without comments; string literals kept (an attribute pragma is quoted: {attribute 'linkalways'})."""
-    return _RE_ST_COMMENT.sub(" ", code or "")
+    return st_strip(code)
 
 
 def not_on_target(declared: dict[str, dict[str, Any]], on_target: set[str],
-                  pattern: str | None = None) -> list[dict[str, Any]]:
+                  pattern: str | None = None) -> dict[str, Any]:
     """N92: source roots (declared_roots) that hold symbols but have none on the target (on_target: the lower-case
-    first name segments of the runtime's symbol table). pattern (ads_dump's) limits it to the roots it selects. The
-    cause is named, never guessed past what is known: linkalways in the source rules out 'not linked'."""
+    first name segments of the runtime's symbol table) -> {roots, plc_project, not_judged}. pattern (ads_dump's)
+    limits it to the roots it selects. The cause is named, never guessed past what is known: linkalways in the source
+    rules out 'not linked'. A source with several PLC projects is judged only for the one the target's symbols show
+    to be running there (which project runs on which port is not read from the files); a name declared in two files
+    is never called missing."""
     import fnmatch
     head = None
     if pattern:
         pat = pattern.lower() if ("*" in pattern or "?" in pattern) else pattern.lower() + "*"
         head = pat.split(".", 1)[0]
-    out: list[dict[str, Any]] = []
+    res: dict[str, Any] = {"roots": [], "plc_project": None, "not_judged": None}
+    projects = {d["plc_project"] for d in declared.values() if d["symbol_vars"]}
+    if len(projects) > 1:
+        live = {d["plc_project"] for k, d in declared.items() if k in on_target and not d.get("ambiguous")}
+        if len(live) != 1:
+            res["not_judged"] = (f"the source holds {len(projects)} PLC projects and the target's symbols match "
+                                 f"{len(live)} of them — which one runs on this port is not known, so no root is "
+                                 "called missing")
+            return res
+        res["plc_project"] = next(iter(live))
+        declared = {k: d for k, d in declared.items() if d["plc_project"] == res["plc_project"]}
+    out: list[dict[str, Any]] = res["roots"]
     for key, d in sorted(declared.items()):
-        if not d["symbol_vars"] or key in on_target or (head is not None and not fnmatch.fnmatchcase(key, head)):
+        if not d["symbol_vars"] or d.get("ambiguous") or key in on_target \
+                or (head is not None and not fnmatch.fnmatchcase(key, head)):
             continue
         if d["linkalways"]:
             cause = ("declared with {attribute 'linkalways'} but not on the target: the target runs another program "
@@ -71,7 +98,7 @@ def not_on_target(declared: dict[str, dict[str, Any]], on_target: set[str],
                      "program than this source (download it)")
         out.append({"root": d["name"], "kind": d["kind"], "file": d["file"], "symbol_vars": d["symbol_vars"],
                     "cause": cause})
-    return out
+    return res
 
 
 _RE_VAR_BLOCK = re.compile(
@@ -259,8 +286,9 @@ class ProjectIndex:
         self._ensure()
         return self._declared(self.units)            # a published snapshot (N88): complete, never changed in place
 
-    @staticmethod
-    def _declared(units: dict[str, CodeUnit]) -> dict[str, dict[str, Any]]:
+    def _declared(self, units: dict[str, CodeUnit]) -> dict[str, dict[str, Any]]:
+        """plc_project: the .plcproj the unit's file belongs to; ambiguous: the name is declared in two files."""
+        dup = self.duplicates
         out: dict[str, dict[str, Any]] = {}
         for u in units.values():
             if u.parent or u.kind not in _SYMBOL_SECTIONS:
@@ -269,7 +297,8 @@ class ProjectIndex:
                     and "hide" not in {k.lower() for k in v.attrs}]
             out[u.name.lower()] = {"name": u.name, "kind": u.kind, "file": u.file, "symbol_vars": len(syms),
                                    "linkalways": bool(_RE_LINKALWAYS.search(_no_comments(u.declaration))),
-                                   "io_vars": sum(1 for v in syms if v.at and re.match(r"%[IQ]", v.at, re.I))}
+                                   "io_vars": sum(1 for v in syms if v.at and re.match(r"%[IQ]", v.at, re.I)),
+                                   "plc_project": self._plc_of(u.file), "ambiguous": u.name.lower() in dup}
         return out
 
     def unreferenced_gvls(self) -> dict[str, Any]:
@@ -278,33 +307,36 @@ class ProjectIndex:
         object nothing uses (live: build 0 errors, no symbol on the target). A name found anywhere counts as a
         reference (a local variable of the same name too), so this only names GVLs nothing can be using; GVLs with
         AT %I*/%Q* variables are listed apart — whether an I/O mapping keeps one linked is not checked here.
-        Visualisations and task configurations are searched as text."""
+        Visualisations and task configurations are searched as text. Only the GVL's own PLC project is searched — code
+        of another PLC project cannot reference it; a name declared in two files is not judged."""
         self._ensure()
         units = self.units                           # one snapshot for the roots and the texts searched (N88)
         decl = self._declared(units)
-        texts: list[tuple[str, str]] = [(u.name.lower(), _no_comments(u.declaration) + "\n" + _no_comments(u.implementation))
-                                        for u in units.values() if u.kind != "PARSE_ERROR"]
-        other = ""
+        texts: list[tuple[str, str | None, str]] = [
+            (u.name.lower(), self._plc_of(u.file), _no_comments(u.declaration) + "\n" + _no_comments(u.implementation))
+            for u in units.values() if u.kind != "PARSE_ERROR"]
+        other: dict[str | None, str] = {}
         if self.root is not None and self.root.is_dir():
             for p in self.root.rglob("*"):
-                if p.suffix.lower() in (".tcvis", ".tcvmo", ".tctto", ".tcgtlo") and p.is_file():
+                if p.suffix.lower() in (".tcvis", ".tcvmo", ".tctto") and p.is_file():
                     try:
-                        other += p.read_text(encoding="utf-8-sig", errors="replace") + "\n"
+                        plc = self._plc_of(p)
+                        other[plc] = other.get(plc, "") + p.read_text(encoding="utf-8-sig", errors="replace") + "\n"
                     except OSError:
                         pass
         found: list[dict[str, Any]] = []
         io: list[dict[str, Any]] = []
         for key, d in sorted(decl.items()):
-            if d["kind"] != "GVL" or not d["symbol_vars"] or d["linkalways"]:
+            if d["kind"] != "GVL" or not d["symbol_vars"] or d["linkalways"] or d["ambiguous"]:
                 continue
             u = units[key]
             names = [re.escape(u.name)]
             if not re.search(r"\{\s*attribute\s+'qualified_only'\s*\}", u.declaration, re.I):
                 names += [re.escape(v.name) for v in u.vars if v.section == "VAR_GLOBAL"]
             rx = re.compile(r"(?<![\w.])(?:" + "|".join(names) + r")\b", re.I)
-            own = key
-            if any(rx.search(t) for k, t in texts if k != own and not k.startswith(own + ".")) or \
-                    re.search(r"\b" + re.escape(u.name) + r"\.", other, re.I):
+            own, plc = key, d["plc_project"]
+            if any(rx.search(t) for k, kp, t in texts if kp == plc and k != own and not k.startswith(own + ".")) or \
+                    re.search(r"\b" + re.escape(u.name) + r"\.", other.get(plc, ""), re.I):
                 continue
             row = {"gvl": u.name, "file": u.file, "symbol_vars": d["symbol_vars"]}
             (io if d["io_vars"] else found).append(row if not d["io_vars"] else {**row, "io_vars": d["io_vars"]})

@@ -926,13 +926,25 @@ def test_te1000_itcplconline_is_the_first_route_and_its_state_is_read_back(xae):
     proj.Start = lambda: calls.append(("Start",)) or setattr(proj, "OnlineApplicationState", 1)
     proj.Stop = lambda: calls.append(("Stop",))                 # returns, but the application keeps running
     proj.Reset = lambda t: calls.append(("Reset", t))
+    be.ONLINE_STATE_WAIT_S = 0.6
     r = be.plc_action("download")
     assert r["method"] == "ITcPlcOnline" and calls[-1] == ("Login", 4) and r["after"]["logged_in"] is True
     assert be.plc_action("start")["after"]["application_state"] == "run"
     be.plc_action("reset_origin")
     assert calls[-1] == ("Reset", 2)
-    r = be.plc_action("stop")                                   # not proven: the next route, and why
-    assert r.get("method") != "ITcPlcOnline" and "the application is run" in str(r.get("automation_interface"))
+    # review: a command that was accepted but whose state never came is NOT sent again through ConsumeXml / the shell
+    # (a second reset or download would act twice) — it is reported as possibly done
+    consumed = []
+    proj.ConsumeXml = lambda xml: consumed.append(xml)
+    n_cmd = len(dte.commands)
+    with pytest.raises(X.XaeError, match=r"ITcPlcOnline.stop on .* returned, but 0.6 s later .* application run"
+                                         r".*not sent again"):
+        be.plc_action("stop")
+    assert calls[-1] == ("Stop",) and consumed == [] and len(dte.commands) == n_cmd
+    # a state that follows the call a moment later is awaited, not taken for a failure
+    import threading
+    proj.Stop = lambda: calls.append(("Stop",)) or threading.Timer(0.2, setattr, (proj, "OnlineApplicationState", 2)).start()
+    assert be.plc_action("stop")["after"]["application_state"] == "stop"
     assert be.plc_action("logout")["after"]["logged_in"] is False
 
 
@@ -955,6 +967,13 @@ def test_n82_check_all_objects_reads_only_its_own_messages_and_its_result(xae):
     dte.commands.clear()
     r = be.check_all_objects()
     assert r["passed"] is False and dte.commands == [] and [i["description"][:5] for i in r["items"]] == ["Ident"]
+    # review: a check that CLEARS the pane and writes fewer (or more) lines than were there keeps all of its own
+    many = "\n".join(f"line {i}" for i in range(40))
+    dte._output = many
+    proj.CheckAllObjects = lambda: setattr(
+        dte, "_output", "1>C:\\P\\Plc\\POUs\\FB_Z.TcPOU(7,1): error C0046: Identifier 'z' not defined") or False
+    r = be.check_all_objects()
+    assert [i["description"][:16] for i in r["items"]] == ["Identifier 'z' n"], r
 
 
 def test_n81_a_graphical_body_is_named_from_the_language_before_any_text(xae):
@@ -979,3 +998,46 @@ def test_silent_mode_is_on_only_during_a_confirmed_command(xae):
     seen.clear()
     be.activate_configuration()
     assert seen == [False]
+
+
+def test_review_plcimportoptions_are_read_from_the_type_library_as_pywin32_gives_them():
+    """Review: GetTypeAttr() / GetVarDesc() are tuples in pywin32 (genpy reads attr[7], vdesc[0], vdesc[1]); reading
+    .cVars / .memid / .value raised AttributeError, which was taken for 'no type library' — the branch never ran."""
+    names = {10: "PLCIMPORTOPTIONS_NONE", 11: "PLCIMPORTOPTIONS_REPLACE", 12: "PLCIMPORTOPTIONS_RENAME",
+             13: "PLCIMPORTOPTIONS_SKIP"}
+    vals = {10: 0, 11: 1, 12: 2, 13: 3}
+
+    class TI:
+        def GetTypeAttr(self):
+            return (None, 0, -1, -1, 4, 0, 0, 4, 0, 0, 4, 0, 1, 0, None, None)      # tuple: cVars at [7]
+
+        def GetVarDesc(self, j):
+            m = 10 + j
+            return (m, vals[m], None, 0, 2)                                         # (memid, value, elemdesc, flags, kind)
+
+        def GetNames(self, memid):
+            return (names[memid],)
+
+    class TL:
+        def GetTypeInfoCount(self):
+            return 2
+
+        def GetTypeInfoType(self, i):
+            return 3 if i == 0 else 0                                               # an interface, then the enum
+
+        def GetDocumentation(self, i):
+            return ("ITcSmTreeItem", "", 0, None) if i == 0 else ("PLCIMPORTOPTIONS", "", 0, None)
+
+        def GetTypeInfo(self, i):
+            return TI()
+
+    class Ole:
+        def GetTypeInfo(self):
+            return type("T", (), {"GetContainingTypeLib": lambda self: (TL(), 0)})()
+
+    obj = type("Item", (), {"_oleobj_": Ole()})()
+    assert X._typelib_enum(obj, "PLCIMPORTOPTIONS") == {"PLCIMPORTOPTIONS_NONE": 0, "PLCIMPORTOPTIONS_REPLACE": 1,
+                                                        "PLCIMPORTOPTIONS_RENAME": 2, "PLCIMPORTOPTIONS_SKIP": 3}
+    be = X.XaeBackend.__new__(X.XaeBackend)
+    m, src = be._import_options(obj)
+    assert m == {"none": 0, "replace": 1, "rename": 2, "skip": 3} and src.startswith("type library"), (m, src)

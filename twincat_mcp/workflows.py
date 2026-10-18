@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from . import codecheck
+from . import types_tc as T
 from .ads_backend import AdsError
 from .project_backend import ProjectError
 from .safety import OpClass
@@ -124,8 +125,8 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
         rep["resolution"] = {"error": str(exc)}
     live = rep.get("live") or {}
     if isinstance(live, dict) and "error" not in live and watch_ms > 0:
-        val = live.get("value")
-        if not isinstance(val, (dict, list)) or ("raw_ms" in val if isinstance(val, dict) else False):
+        val = T.raw_value(live.get("value"))          # TIME / enum wrappers: a scalar to watch
+        if not isinstance(val, (dict, list)):
             try:
                 w = await app.ads_call(app.ads.watch, [symbol], watch_ms, 20, True, timeout=watch_ms / 1000 + 30, slow=True)
                 rep["watch"] = {"changes": w["changes"], "samples": w["samples"][:50]}

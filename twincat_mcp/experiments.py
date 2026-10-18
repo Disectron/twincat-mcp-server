@@ -1514,14 +1514,10 @@ class Runner:
 
 
 def _unwrap(v: Any) -> Any:
-    """ads.read decodes TIME/DATE/… as dicts ({'raw_ms':…,'text':…}); writes want the raw number."""
-    if isinstance(v, dict):
-        for k in ("raw_ms", "raw", "raw_ns"):
-            if k in v:
-                return v[k]
-        if "value" in v and isinstance(v["value"], (int, float, bool, str)):
-            return v["value"]
-    return v
+    """ads.read decodes TIME/DATE/… as {'raw_ms': …, 'text': …} and an enum as {'value': …, 'name': …} — arrays of
+    them element by element; writes and comparisons want the raw numbers."""
+    from . import types_tc as T
+    return T.raw_value(v)
 
 
 def _same(a: Any, b: Any) -> bool:

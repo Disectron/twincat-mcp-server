@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .project_backend import ProjectIndex, CodeUnit, ProjectError
+from .project_backend import ProjectIndex, CodeUnit, ProjectError, st_strip
 
 # Default Hungarian-style prefixes (Beckhoff / common TwinCAT practice). Override
 # via ProjectConfig.naming_prefixes if the house style differs.
@@ -28,8 +28,6 @@ _RE_TODO = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b", re.I)
 _RE_REAL_EQ = re.compile(r"(\b[rf]\w*|\w*(?:Real|REAL)\w*)\s*(=|<>)\s*[\d\.]+|[\d]+\.\d+\s*(=|<>)", re.I)
 _RE_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 _RE_METHOD_CALL = re.compile(r"\b([A-Za-z_]\w*\^?)(?:\[[^\]]*\])?\.([A-Za-z_]\w*)\s*\(")
-_RE_COMMENT = re.compile(r"\(\*.*?\*\)|//[^\n]*", re.S)
-_RE_STRING = re.compile(r"'[^']*'")
 _RE_FOR = re.compile(r"\bFOR\s+(?P<var>[A-Za-z_]\w*)\s*:=\s*(?P<start>.+?)\s+TO\s+(?P<end>.+?)(?:\s+BY\s+(?P<step>.+?))?\s+DO\b", re.I | re.S)
 _RE_NEW = re.compile(r"__NEW\s*\(\s*([A-Za-z_]\w*)", re.I)
 _RE_DELETE = re.compile(r"__DELETE\s*\(", re.I)
@@ -38,7 +36,8 @@ UNSIGNED_TYPES = {"USINT", "UINT", "UDINT", "ULINT", "BYTE", "WORD", "DWORD", "L
 
 
 def strip_comments(code: str) -> str:
-    return _RE_STRING.sub("''", _RE_COMMENT.sub("", code or ""))
+    """Comments removed and string literals emptied, in one pass (a // inside '…' cut the line short before)."""
+    return st_strip(code, blank_strings=True, comment="")
 
 
 # ----------------------------------------------------------------------------
