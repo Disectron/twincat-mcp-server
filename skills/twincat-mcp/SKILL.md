@@ -5,6 +5,9 @@ description: Use when working on a Beckhoff TwinCAT 3 project with the `twincat`
 
 # twincat-mcp tool chains
 
+Documentation questions (library FBs, types, error codes, concepts, hardware manuals) → the **twincat-docs**
+skill, never the ads_* tools: those read the running PLC only.
+
 Always: `tc_doctor` once per session. Prefer reading over assuming. Writes are gated; never
 bypass by raw address. State the recording / snapshot ids you create.
 
@@ -53,10 +56,11 @@ previous batch's ids. Check `ads_task_stats` once with the profile live; thin it
 `xae_dialogs` → read title/buttons → `xae_dialog_resolve button=...` (machine-affecting prompts need confirmation).
 
 ## Library FB / type you have not used
+The twincat-docs skill first (`docs_declaration`, offline, every book). Fallback when its database is missing:
 `infosys_declaration <FB|ST_|E_>` (inputs/outputs with descriptions, struct members, enum values) →
 `infosys_search_code "<call pattern>"` for a working example → `infosys_get_page <symbol>` only when
-the prose matters. Unknown library: `infosys_books pattern=tcplclib_*` → `infosys_index <book>`.
-Never invent a library FB's pins; if `infosys_declaration` has no page, say so.
+the prose matters. Same name in several libraries: take the one `proj_libraries` lists for the project.
+Never invent a library FB's pins; if no page has them, say so.
 
 ## MES / C# side
 `ads_export types=[ST_Recipe,...] fmt=csharp` and `ads_export prefix=MAIN fmt=csharp_symbols` after every datatype change.

@@ -61,8 +61,8 @@ The repo is its own plugin marketplace (`.claude-plugin/`). Inside Claude Code:
 ```
 
 One step on Claude Code ≥ 2.1.275: `/plugin install twincat-mcp --marketplace Disectron/twincat-mcp-server`. The plugin brings
-the MCP server (named `twincat`, tools appear as `mcp__plugin_twincat-mcp_twincat__<tool>`), the `twincat-mcp`
-skill and the 5 prompts. `/plugin configure twincat-mcp@twincat-mcp` sets the Python executable (default
+the MCP server (named `twincat`, tools appear as `mcp__plugin_twincat-mcp_twincat__<tool>`), two skills —
+`twincat-mcp` (tool chains) and `twincat-docs` (offline Beckhoff documentation, below) — and the 5 prompts. `/plugin configure twincat-mcp@twincat-mcp` sets the Python executable (default
 `python`), default AmsNetId, start/ceiling safety mode and an optional config TOML; everything project-specific
 (solution path, allow/deny lists, HMI root) comes from `twincat_mcp.toml` in the folder you start `claude` in.
 First start takes about a minute (venv + pip); if that first session reports the server as failed, the venv is
@@ -156,6 +156,24 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **Knowledge base** `kb_set_location` · `kb_status` · `kb_add_project` · `kb_remove_project` · `kb_reindex` · `kb_search` · `hw_lookup` · `proj_libraries` — the database lives in a folder you name; only project folders you add are indexed
 
+**Offline documentation — skill `twincat-docs`** (no MCP tools; a read-only script the skill runs). The knowledge
+folder also holds the documentation its own tools build:
+
+| file in the knowledge folder | content | built by |
+|---|---|---|
+| `knowledge.db` | projects for `kb_search`, ESI devices for `hw_lookup`, known errors | the `kb_*` tools |
+| `helpviewer\infosys_en.db` | every Infosys page of the Help Viewer package (≈ 51,000 pages, 283 books) | `tools\infosys_local.py index` |
+| `manualsdb\manuals.db` | the PDF manuals in `manuals\` — page text, chapters, product codes | `tools\manuals_db.py update` |
+| `sop\` | operator SOPs (Markdown) | by hand |
+
+`skills/twincat-docs/kb_docs.py` answers `docs_search`, `docs_declaration`, `docs_page`, `docs_books`,
+`manual_search`, `manual_product`, `manual_toc`, `manual_page`, `manual_docs`, `status` as one JSON object each
+(standard library, opens both databases read-only, same ranking and page references as the builder scripts). A name
+that exists in several libraries (`MC_MoveAbsolute` in Tc2_MC2 and Tc3_DriveMotionControl) is never resolved
+silently: the answer is `ambiguous` with the candidates. `kb_status` → `docs` shows both databases, the PDFs not
+indexed yet and the exact command for this folder; `hw_lookup` lists the manuals that mention a product code.
+The `infosys_*` tools stay as the fallback (their own index of the same package).
+
 **Capture profiles** `rec_scan` · `rec_profile_save` · `rec_profile_list` · `rec_profile_get` · `rec_profile_delete` · `rec_profile_start` · `rec_profile_stop`
 
 **Infosys reference (TwinCAT 3)** `infosys_books` · `infosys_index` · `infosys_search_symbols` · `infosys_declaration` · `infosys_search` · `infosys_search_code` · `infosys_get_page`
@@ -172,7 +190,7 @@ Claude Code starts the server itself over stdio — no port, nothing on the netw
 
 Tool results reach Claude Code as the SDK's indented JSON text plus structured content; Claude Code shows them as collapsible tool-result blocks and the model summarises. For a human-readable handover use `tc_session_report` (markdown).
 
-Also in the repo: `skills/twincat-mcp/SKILL.md` (loaded by the plugin; or drop into `.claude/skills/`), `integrations/claude-code/CLAUDE.md.snippet` (conventions for every session), `integrations/claude-code/.mcp.json` template, `scripts\register-claude-code.cmd`.
+Also in the repo: `skills/twincat-mcp/SKILL.md` and `skills/twincat-docs/` (loaded by the plugin; or drop into `.claude/skills/`), `integrations/claude-code/CLAUDE.md.snippet` (conventions for every session), `integrations/claude-code/.mcp.json` template, `scripts\register-claude-code.cmd`.
 
 ## What 0.5.0 closes from the gap list
 

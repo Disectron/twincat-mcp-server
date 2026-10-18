@@ -21,7 +21,8 @@ Code — it picks the tool. Replace `<CX_NETID>`, `<SOLUTION>` and `<PROJECT_DIR
 | audit log (every write, every confirmation, every experiment write) | `%USERPROFILE%\.twincat_mcp\audit.jsonl` | append-only JSONL |
 | recordings | `%USERPROFILE%\.twincat_mcp\recordings\<id>.jsonl` | one file per recording, can be large |
 | capture profiles | `%USERPROFILE%\.twincat_mcp\profiles\` | |
-| Infosys documentation index | `%USERPROFILE%\.twincat_mcp\infosys\` | SQLite + FTS5, built on demand |
+| Infosys documentation index (`infosys_*` tools) | `<knowledge folder>\infosys\helpviewer-1033\` (else `%USERPROFILE%\.twincat_mcp\infosys\`) | SQLite + FTS5, built in the background |
+| knowledge folder (`kb_set_location`, e.g. `D:\TwinCAT-MCP\knowledge`) | `knowledge.db`; the offline documentation the `twincat-docs` skill reads: `helpviewer\infosys_en.db` (built by `tools\infosys_local.py index`), `manualsdb\manuals.db` (PDFs in `manuals\`, built by `tools\manuals_db.py update`), `sop\` | **you choose it**; `kb_status` → `docs` shows what is there |
 | experiments (specs, runs, reports) | `<PROJECT_DIR>\experiments\` | next to the solution so they version with it |
 
 Nothing is installed system-wide, nothing listens on a port, and the server runs as your Windows
@@ -148,8 +149,8 @@ lands in `%LOCALAPPDATA%\twincat-mcp\venv`. Python discovery order: the "Python 
     -- C:\tools\twincat-mcp\.venv\Scripts\python.exe -m twincat_mcp
 ```
 
-Tool names then lack the `plugin_` prefix (`mcp__twincat__tc_doctor`) and the skill is not installed;
-copy `skills\twincat-mcp\` to `%USERPROFILE%\.claude\skills\` if you want it.
+Tool names then lack the `plugin_` prefix (`mcp__twincat__tc_doctor`) and the skills are not installed;
+copy `skills\twincat-mcp\` and `skills\twincat-docs\` to `%USERPROFILE%\.claude\skills\` if you want them.
 
 ---
 

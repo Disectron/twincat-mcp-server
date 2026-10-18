@@ -136,7 +136,7 @@ def test_library_versions(kb, project_dir):
 
 
 def test_d38_library_repository_of_4026_is_scanned(kb, tmp_path, monkeypatch):
-    """D38: 4026 installs libraries to ProgramData\Beckhoff\TwinCAT\PlcEngineering\Managed Libraries."""
+    r"""D38: 4026 installs libraries to ProgramData\Beckhoff\TwinCAT\PlcEngineering\Managed Libraries."""
     k, _ = kb
     pd = tmp_path / "pd"
     (pd / "Beckhoff" / "TwinCAT" / "PlcEngineering" / "Managed Libraries" / "www.tcunit.org" / "TcUnit" / "1.3.1").mkdir(parents=True)
@@ -169,3 +169,154 @@ def test_r16_rpc_size_error_points_at_the_argument_list():
     m = K.annotate("RPC call 'P.fb#M' failed: ADSError 1797 (0x705) parameter size not correct (sent 1 input(s) = 4 bytes)")
     assert "VAR_INPUT in declaration order" in m and "write elements by index" not in m
     assert "write elements by index" in K.annotate("write MAIN.a failed: ADSError 1797 (0x705)")
+
+
+# ---------------------------------------------------------------------------------------------- 0.8.8: R33–R39
+def test_r33_whole_plugins_tree_is_refused(tmp_path, monkeypatch):
+    """R33: ~/.claude/plugins/data/… was accepted (only plugins/cache was blocked)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    for sub in ("cache", "data/twincat-mcp-twincat-mcp/kb", "marketplaces/x"):
+        probs = K.check_location(tmp_path / ".claude" / "plugins" / sub)
+        assert any("plugin/install folder" in p for p in probs), (sub, probs)
+    k = K.Knowledge(tmp_path / "home")
+    with pytest.raises(K.KnowledgeError, match="plugin"):
+        k.set_location(str(tmp_path / ".claude" / "plugins" / "data" / "kb"))
+    assert k.location()[0] is None                                   # nothing was switched
+
+
+def test_r34_reads_never_write_probe_and_parallel_searches_work(kb, project_dir, monkeypatch):
+    """R34: parallel kb_search calls raced on the write probe → 'no longer usable … kb_set_location'."""
+    import concurrent.futures as cf
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    k.add_project(str(project_dir), "sample")
+    writes: list[str] = []
+    real = Path.write_text
+
+    def spy(self, *a, **kw):
+        if self.name.startswith(".tcmcp_write_test"):
+            writes.append(self.name)
+        return real(self, *a, **kw)
+    monkeypatch.setattr(Path, "write_text", spy)
+    with cf.ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(lambda _i: k.search("FB_Valve"), range(16)))
+    assert all(r["hits"] for r in res) and writes == []
+    k.status()
+    assert writes == []
+    k.set_location(str(tmp / "kbdata"))                             # a choice does test writing, with a name of its own
+    assert len(writes) == 1 and writes[0] != ".tcmcp_write_test"
+
+
+def test_r35_one_project_per_folder_any_spelling_and_label(kb, project_dir, monkeypatch):
+    """R35: the same folder in another spelling was added twice; reindex/remove/search(project=) needed the exact
+    stored string and ignored the label. Windows folds case: simulated with a case-folding normcase."""
+    monkeypatch.setattr(K.os.path, "normcase", lambda s: s.lower())
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    first = k.add_project(str(project_dir), "P15")
+    n = first["reindexed"][0]["units"]
+    again = k.add_project(str(project_dir) + "/", None)
+    assert "already in the knowledge base" in again["note"]
+    st = k.status()
+    assert len(st["projects"]) == 1 and st["projects"][0]["label"] == "P15"
+    hits = k.search("FB_Valve")["hits"]
+    assert len({(h["unit"], h["file"]) for h in hits}) == len(hits)            # no hit twice
+    assert k.search("FB_Valve", project="p15")["hits"]                          # label, any case
+    assert k.search("FB_Valve", project=str(project_dir) + "/")["hits"]         # path, trailing separator
+    assert k.reindex(str(project_dir) + "/.")["reindexed"][0]["units"] == n
+    # a double entry from before 0.8.8 (another spelling stored) is merged by the next add
+    with k._db() as con:
+        con.execute("INSERT INTO projects(path, label, added) VALUES (?,?,?)", (str(project_dir).upper(), "dup", "x"))
+    assert "duplicate_projects" in k.status()
+    merged = k.add_project(str(project_dir))
+    assert merged["merged_duplicates"] == [str(project_dir).upper()] and len(k.status()["projects"]) == 1
+    rm = k.remove_project("P15")
+    assert rm["removed"] == [str(project_dir)] and k.status()["projects"] == []
+
+
+def test_r36_r37_r39_search_semantics_and_validation(kb, project_dir):
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    k.add_project(str(project_dir), "sample")
+    # every word first; a word that is only a prefix still finds the unit
+    allw = k.search("FB_Valve tOpen")["hits"]
+    assert allw and all(h["match"].startswith("all words") for h in allw)
+    pre = k.search("FB_Val")["hits"]
+    assert pre and pre[0]["match"] == "all words (as prefixes)" and pre[0]["unit"].startswith("FB_Valve")
+    some = k.search("FB_Valve zzqqxx_nothing")
+    assert some["hits"] and all(h["match"] == "some words" for h in some["hits"]) and "every word" in some["note"]
+    # R37: punctuation only
+    with pytest.raises(K.KnowledgeError, match="no searchable word"):
+        k.search(":=")
+    # R39: kinds, project, limit
+    with pytest.raises(K.KnowledgeError, match="unknown kind 'BANANA'"):
+        k.search("valve", kinds=["BANANA"])
+    assert k.search("FB_Valve", kinds=["fb"])["hits"][0]["kind"] == "FUNCTION_BLOCK"
+    with pytest.raises(K.KnowledgeError, match="no indexed project is 'NoSuchProject'.*sample"):
+        k.search("valve", project="NoSuchProject")
+    for bad in (0, -1, 201):
+        with pytest.raises(K.KnowledgeError, match="limit must be 1–200"):
+            k.search("valve", limit=bad)
+
+
+def test_r38_set_location_without_arguments_returns_the_current_one(kb):
+    k, tmp = kb
+    with pytest.raises(K.KnowledgeError, match="ASK THE USER"):
+        k.set_location(None)                                         # nothing chosen yet: still the question
+    k.set_location(str(tmp / "kbdata"))
+    r = k.set_location(None)
+    assert r["changed"] is False and r["location"] == str(tmp / "kbdata") and "unchanged" in r["note"]
+
+
+def _kb_with_docs(tmp: Path) -> Path:
+    import shutil
+    loc = tmp / "kbdocs"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "kb", loc, ignore=shutil.ignore_patterns("*.py", "__pycache__"))
+    (loc / "manuals" / "IO").mkdir(parents=True)
+    (loc / "manuals" / "IO" / "EL3102.pdf").write_bytes(b"%PDF-1.4 not indexed yet")
+    (loc / "sop" / "scope").mkdir(parents=True)
+    (loc / "sop" / "scope" / "SOP-scope-display.md").write_text("# Scope", encoding="utf-8")
+    (loc / "tools").mkdir()
+    (loc / "tools" / "manuals_db.py").write_text("# placeholder", encoding="utf-8")
+    return loc
+
+
+def test_status_reports_the_offline_documentation_layout(kb):
+    """kb_status names what the twincat-docs skill reads in the same folder (built by the folder's own tools)."""
+    k, tmp = kb
+    loc = _kb_with_docs(tmp)
+    k.set_location(str(loc))
+    d = k.status()["docs"]
+    assert d["skill"] == "twincat-docs" and str(K.DOCS_SKILL) in d["call"] and str(loc) in d["call"]
+    assert d["infosys"]["exists"] and d["infosys"]["pages"] == 8 and d["infosys"]["books"] == 6
+    assert d["infosys"]["package"] == "BKINFOSYS3_FIXTURE_EN-US.mshc" and d["infosys"]["lcid"] == "1033"
+    m = d["manuals"]
+    assert m["manuals"] == 1 and m["pdfs_in_folder"] == 1 and m["not_indexed"] == ["EL3102.pdf"]
+    assert m["indexed_but_gone"] == ["CX9020.pdf"]                   # the fixture's PDF path is not in this folder
+    assert "manuals_db.py" in m["update"]
+    assert d["tools"] == {"infosys_local.py": False, "manuals_db.py": True}
+    assert d["sop"] == [str(Path("sop") / "scope" / "SOP-scope-display.md")]
+    # read-only: nothing next to the databases was created
+    assert sorted(p.name for p in (loc / "helpviewer").iterdir()) == ["infosys_en.db"]
+    assert K.DOCS_SKILL.is_file()
+
+
+def test_set_location_names_the_docs_it_finds(kb):
+    k, tmp = kb
+    r = k.set_location(str(tmp / "empty_kb"))
+    assert r["docs"]["infosys"]["exists"] is False and "infosys_local.py" in r["docs"]["infosys"]["build"]
+    r2 = k.set_location(str(_kb_with_docs(tmp)))
+    assert r2["docs"]["infosys"]["exists"] and r2["docs"]["manuals"]["exists"]
+
+
+def test_hw_lookup_adds_the_manuals_that_mention_the_product(kb):
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    r = k.hw_lookup("EL2008")
+    assert "manuals" not in r and "no manuals database" in r["manuals_note"]
+    k.set_location(str(_kb_with_docs(tmp)))
+    r = k.hw_lookup("EL3102")                                  # not in this ESI, but a product code in the manual
+    assert r["matches"] == 0 and r["manuals"]["EL3102"][0]["doc"] == "CX9020.pdf"
+    assert r["manuals"]["EL3102"][0]["pages"] == [2, 4]
+    assert "no indexed manual mentions EL2008" in k.hw_lookup("EL2008")["manuals_note"]

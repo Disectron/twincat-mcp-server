@@ -92,8 +92,10 @@ exp_report. Runs are repeatable, metrics carry 95 % CIs, verdicts are pass/fail/
 report separates computed sections from interpretation. Use it for every "did the change help?"
 question instead of comparing two fills by eye.
 
-Reference: infosys_declaration <FB|struct|enum> gives the library symbol's declaration with
-descriptions; infosys_search_symbols / infosys_search / infosys_search_code / infosys_get_page
+Reference: documentation questions (library FBs, types, error codes, concepts, hardware manuals) go
+to the twincat-docs skill of this plugin (offline: <kb>\\helpviewer\\infosys_en.db + <kb>\\manualsdb\\manuals.db;
+kb_status shows them). The ads_* tools read the running PLC only and never return documentation.
+infosys_declaration <FB|struct|enum> gives the library symbol's declaration with descriptions; infosys_search_symbols / infosys_search / infosys_search_code / infosys_get_page
 look up Beckhoff Infosys (TwinCAT 3 only) from the Help Viewer package installed with XAE — indexed
 locally, no network (docs.source='web' uses the website instead). Use it before guessing a library FB's inputs.
 
@@ -361,6 +363,9 @@ class App:
             raise ToolError(str(exc)) from exc
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise ToolError(f"knowledge base call timed out after {timeout:.0f} s (still running in the background)") from exc
+        except sqlite3.Error as exc:
+            # R37: never an empty "Error executing tool" — say what the database said
+            raise ToolError(f"knowledge database error ({type(exc).__name__}): {exc or 'no detail'}") from exc
 
     async def rec_call(self, fn, *a, timeout: float = 60, **kw) -> Any:
         return await self.ads_call(fn, *a, timeout=timeout, slow=True, **kw)
@@ -1203,8 +1208,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def kb_status() -> dict[str, Any]:
         """Knowledge base: where it is stored (or the question to ask the user if no folder was chosen yet), the
-        project folders indexed for kb_search, ESI devices indexed for hw_lookup, known-error entries."""
-        return await app.kb_call(app.kb.status)
+        project folders indexed for kb_search, ESI devices indexed for hw_lookup, known-error entries — and under
+        `docs` the offline documentation in the same folder that the twincat-docs skill reads: helpviewer\\infosys_en.db
+        (Infosys, built by tools\\infosys_local.py), manualsdb\\manuals.db (PDF manuals, tools\\manuals_db.py) with the
+        PDFs not indexed yet, the SOPs, and the exact command that runs the skill's script on this folder."""
+        res = await app.kb_call(app.kb.status)
+        if app.docs is not None and isinstance(res.get("docs"), dict):
+            idx = Path(app.docs.dir) / "index.sqlite"
+            res["docs"]["infosys_tools_index"] = {
+                "database": str(idx), "size_mb": round(idx.stat().st_size / 1e6, 1) if idx.exists() else 0,
+                "note": "the infosys_* tools' own index of the same Help Viewer package (fallback); the twincat-docs "
+                        "skill reads helpviewer\\infosys_en.db"}
+        return res
 
     @mcp.tool(annotations=EDIT)
     async def kb_set_location(path: str | None = None, use_fallback: bool = False) -> dict[str, Any]:
@@ -1212,7 +1227,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         once the user agreed to D:\\TwinCAT-MCP\\knowledge). The folder is checked: local fixed drive (no network
         share / mapped drive / USB), not inside OneDrive/Dropbox/Google Drive/iCloud, not inside the plugin folder,
         writable, >= 1 GB free — a failing condition is named and nothing is changed. An existing database is never
-        moved or deleted."""
+        moved or deleted. Without arguments it returns the current location (and changes nothing)."""
         res = await app.kb_call(app.kb.set_location, path, use_fallback)
         app.audit("kb_set_location", {"path": path, "use_fallback": use_fallback}, OpClass.EDIT, "ok", res)
         return res
@@ -1240,8 +1255,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def kb_search(query: str, kinds: list[str] | None = None, project: str | None = None, limit: int = 20) -> dict[str, Any]:
         """Search the code of the project folders the user added ("alarm handler", "FB_Valve", "CONCAT"): unit, kind,
-        file and the matching declaration/code excerpts, best first. kinds filters (FUNCTION_BLOCK, METHOD, DUT,
-        GVL, …). Also returns the known cause/fix when the query is an error message."""
+        file and the matching declaration/code excerpts, best first. Units with EVERY word first, then every word as a
+        prefix ('CounterMod' finds FB_CounterModule); only when none has them all, units with some words
+        (match='some words'). "quoted text" is a phrase. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
+        METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …; project = the folder (any
+        spelling) or its label; limit 1–200. Also returns the known cause/fix when the query is an error message.
+        Beckhoff documentation is not here: the twincat-docs skill."""
         return await app.kb_call(app.kb.search, query, kinds, project, limit)
 
     @mcp.tool(annotations=READ)
@@ -1249,7 +1268,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """EtherCAT terminal/box data from the installed ESI files (K4): name, product code, revisions, PDOs with
         their entries (index, subindex, bit length, type), CoE objects. query = type ('EL2008'), part of a name, or a
         product code ('#x07D83052'). The first call indexes TwinCAT's ESI folder into the knowledge database (can
-        take a minute)."""
+        take a minute). `manuals` names the indexed PDF manuals (knowledge folder, manuals_db.py) that mention the
+        product, with pages — the twincat-docs skill reads them."""
         return await app.kb_call(app.kb.hw_lookup, query, limit, revision, timeout=900)
 
     @mcp.tool(annotations=READ)

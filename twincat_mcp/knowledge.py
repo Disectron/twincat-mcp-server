@@ -13,17 +13,28 @@ What it holds, and where each part comes from:
 
 The database lives in a folder the user chooses (kb_set_location). Conditions: local fixed drive (SQLite corrupts
 on network shares), not inside a cloud-synced folder (OneDrive/Dropbox/Google Drive lock and corrupt it), not inside
-the plugin folder (replaced on every update), writable, ≥ 1 GB free. If the user names none, the agent asks; the
-proposed fallback is D:\\TwinCAT-MCP\\knowledge (used only when the user agrees via kb_set_location(use_fallback=true)).
+the Claude plugins folder (cache/data are replaced or owned by the plugin manager), writable, ≥ 1 GB free. If the
+user names none, the agent asks; the proposed fallback is D:\\TwinCAT-MCP\\knowledge (used only when the user agrees
+via kb_set_location(use_fallback=true)).
+
+The same folder holds the offline documentation the twincat-docs skill reads (layout of the knowledge README):
+  knowledge.db                 this module (projects, ESI, known errors)
+  tools\\infosys_local.py       builds helpviewer\\infosys_en.db from the Help Viewer package
+  tools\\manuals_db.py          builds manualsdb\\manuals.db from the PDFs in manuals\\
+  sop\\                          operator SOPs (Markdown)
+kb_status reports all of it; hw_lookup adds the manuals that mention a product code (read-only).
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -32,13 +43,22 @@ FALLBACK_LOCATION = r"D:\TwinCAT-MCP\knowledge"
 MIN_FREE_BYTES = 1 << 30
 DB_NAME = "knowledge.db"
 POINTER_NAME = "knowledge_location.json"
+# the offline documentation next to knowledge.db (built by the knowledge folder's own tools, read by twincat-docs)
+INFOSYS_DB = ("helpviewer", "infosys_en.db")
+MANUALS_DB = ("manualsdb", "manuals.db")
+DOCS_SKILL = Path(__file__).resolve().parents[1] / "skills" / "twincat-docs" / "kb_docs.py"
+# project unit kinds kb_search can filter on (aliases: DUT = every data type, FB = FUNCTION_BLOCK)
+UNIT_KINDS = ("PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "PROPERTY", "GET", "SET", "ACTION", "TRANSITION",
+              "INTERFACE", "STRUCT", "UNION", "ENUM", "ALIAS", "GVL", "POU", "DUT")
+KIND_ALIASES = {"FB": ("FUNCTION_BLOCK",), "DUT": ("DUT", "STRUCT", "UNION", "ENUM", "ALIAS"), "ITF": ("INTERFACE",)}
 
 LOCATION_CONDITIONS = [
     "a folder on a local fixed drive of this PC (not a network share, mapped drive, NAS or USB stick — SQLite "
     "corrupts databases on network file systems, and a removable drive takes the database with it)",
     "not inside a cloud-synced folder (OneDrive, Dropbox, Google Drive, iCloud, Box) — the sync client locks and "
     "corrupts open database files",
-    "not inside the plugin / install folder (~/.claude/plugins/cache/…) — it is replaced on every update",
+    "not inside the Claude plugins folder (~/.claude/plugins/…: cache, data, marketplaces) or the server's install "
+    "folder — they are replaced or owned by the plugin manager",
     "writable by your Windows user",
     "at least 1 GB free",
 ]
@@ -135,8 +155,10 @@ class KnowledgeError(RuntimeError):
 _SYNC_MARKERS = ("onedrive", "dropbox", "google drive", "googledrive", "icloud", "icloud drive", "iclouddrive", "box sync", "box drive")
 
 
-def check_location(path: str | Path, plugin_dirs: list[Path] | None = None) -> list[str]:
-    """Every condition the folder fails, as plain sentences (empty list = usable)."""
+def check_location(path: str | Path, plugin_dirs: list[Path] | None = None, probe: bool = True,
+                   space: bool = True) -> list[str]:
+    """Every condition the folder fails, as plain sentences (empty list = usable). probe=False skips the write test
+    (R34: read-only calls must not write; parallel calls raced on one probe file), space=False the free-space test."""
     problems: list[str] = []
     p = Path(path).expanduser()
     if not p.is_absolute():
@@ -169,7 +191,9 @@ def check_location(path: str | Path, plugin_dirs: list[Path] | None = None) -> l
         od = os.environ.get(env)
         if od and low.startswith(od.lower().rstrip("\\/")):
             problems.append(f"it is inside the OneDrive folder ({od})")
-    plugin_dirs = list(plugin_dirs or []) + [Path.home() / ".claude" / "plugins" / "cache", Path(__file__).resolve().parents[1]]
+    # R33: the whole plugins tree — the data folder (~/.claude/plugins/data/…) was accepted while only cache/ was blocked
+    plugin_dirs = list(plugin_dirs or []) + [Path.home() / ".claude" / "plugins", Path(__file__).resolve().parents[1]]
+    plugin_dirs += [Path(os.environ[e]) for e in ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA") if os.environ.get(e)]
     for d in plugin_dirs:
         try:
             if p.resolve() == d.resolve() or d.resolve() in p.resolve().parents:
@@ -177,22 +201,45 @@ def check_location(path: str | Path, plugin_dirs: list[Path] | None = None) -> l
                 break
         except OSError:
             continue
-    if not problems:
+    if not problems and probe:
         try:
             p.mkdir(parents=True, exist_ok=True)
-            probe = p / ".tcmcp_write_test"
-            probe.write_text("x", encoding="ascii")
-            probe.unlink()
+            # R34 / N20: a name of its own per call — two calls (or two servers) never share the probe file
+            f = p / f".tcmcp_write_test_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}"
+            f.write_text("x", encoding="ascii")
+            f.unlink()
         except OSError as exc:
             problems.append(f"it is not writable ({exc})")
-        else:
-            try:
-                free = shutil.disk_usage(p).free
-                if free < MIN_FREE_BYTES:
-                    problems.append(f"only {free / (1 << 30):.2f} GB free (needs ≥ 1 GB)")
-            except OSError:
-                pass
+    elif not problems and not p.is_dir():
+        problems.append("the folder does not exist (moved or deleted?)")
+    if not problems and space:
+        try:
+            free = shutil.disk_usage(p).free
+            if free < MIN_FREE_BYTES:
+                problems.append(f"only {free / (1 << 30):.2f} GB free (needs ≥ 1 GB)")
+        except OSError:
+            pass
     return problems
+
+
+def norm_path(path: str | Path) -> str:
+    """R35: one spelling per folder — resolved, no trailing separator, and case-folded where the file system is
+    case-insensitive (Windows), so 'C:\\P15\\' and 'c:\\p15' are the same project."""
+    p = Path(path).expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        pass
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def display_path(path: str | Path) -> str:
+    p = Path(path).expanduser()
+    try:
+        p = p.resolve()            # Windows: the on-disk spelling of an existing folder
+    except OSError:
+        pass
+    return os.path.normpath(str(p))
 
 
 def _posix_fstype(p: Path) -> str | None:
@@ -251,7 +298,10 @@ class Knowledge:
         loc, _src = self.location()
         if loc is None:
             raise KnowledgeError(self.ask_text())
-        problems = check_location(loc)
+        # R34: no write test on the way in (a read must not write; parallel calls raced on one probe file) and no
+        # free-space test (a full disk is not a reason to move the knowledge base) — only a folder that is really
+        # gone or became a network/sync/plugin path is reported as unusable
+        problems = check_location(loc, probe=False, space=False)
         if problems:
             raise KnowledgeError(f"the knowledge folder {loc} is no longer usable: {'; '.join(problems)}. "
                                  "Ask the user for another folder and call kb_set_location(path=…).")
@@ -270,8 +320,14 @@ class Knowledge:
                 raise KnowledgeError("no D: drive on this PC — the fallback location does not exist; give a folder path")
             path = FALLBACK_LOCATION
         if not path:
-            raise KnowledgeError(self.ask_text())
-        p = Path(path).expanduser()
+            cur, src = self.location()
+            if cur is None:
+                raise KnowledgeError(self.ask_text())
+            # R38: asked without a folder while one is set — that is a question, not a reset
+            return {"location": str(cur), "database": str(cur / DB_NAME), "source": src, "changed": False,
+                    "note": "the location is unchanged — pass path=… (a folder the user named) to choose another one",
+                    "docs": self.docs_layout(cur, brief=True)}
+        p = Path(display_path(path))
         problems = check_location(p)
         if problems:
             raise KnowledgeError(f"{p} cannot hold the knowledge base: {'; '.join(problems)}. Conditions: "
@@ -286,6 +342,8 @@ class Knowledge:
                            "want to keep its contents (nothing is copied or deleted automatically)")
         with self._db():
             pass
+        out["changed"] = old is None or norm_path(old) != norm_path(p)
+        out["docs"] = self.docs_layout(p, brief=True)
         return out
 
     # -- database -------------------------------------------------------------------------
@@ -316,7 +374,7 @@ class Knowledge:
         if loc is None:
             out["action"] = self.ask_text()
             return out
-        problems = check_location(loc)
+        problems = check_location(loc, probe=False)          # R34: a status call writes nothing
         if problems:
             out["problems"] = problems
             return out
@@ -326,40 +384,107 @@ class Knowledge:
             out["esi_devices"] = con.execute("SELECT COUNT(*) FROM esi").fetchone()[0]
             out["esi_files"] = con.execute("SELECT COUNT(*) FROM esi_files").fetchone()[0]
             out["fts5"] = bool(self._fts)
+        dup: dict[str, list[str]] = {}
+        for pr in out["projects"]:
+            dup.setdefault(norm_path(pr["path"]), []).append(pr["path"])
+        twice = [v for v in dup.values() if len(v) > 1]
+        if twice:
+            out["duplicate_projects"] = (f"{twice} are the same folder (R35, added before 0.8.8 with another spelling) — "
+                                         "kb_add_project or kb_reindex on it merges them")
         out["known_errors"] = len(KNOWN_ERRORS)
+        out["docs"] = self.docs_layout(loc)
+        return out
+
+    # -- the offline documentation next to knowledge.db (read-only) ------------------------
+    def docs_layout(self, loc: Path | None = None, brief: bool = False) -> dict[str, Any]:
+        """What the twincat-docs skill finds in the knowledge folder: the two databases built by the folder's own
+        tools (tools\\infosys_local.py, tools\\manuals_db.py), the manuals not indexed yet, the SOPs."""
+        loc = loc or self.location()[0]
+        if loc is None:
+            return {"note": "no knowledge folder chosen yet"}
+        tools = loc / "tools"
+        out: dict[str, Any] = {"skill": "twincat-docs",
+                               "call": f'python "{DOCS_SKILL}" status --kb "{loc}"',
+                               "infosys": _infosys_info(loc / INFOSYS_DB[0] / INFOSYS_DB[1], tools, brief),
+                               "manuals": _manuals_info(loc / MANUALS_DB[0] / MANUALS_DB[1], loc / "manuals", tools, brief)}
+        if not brief:
+            out["tools"] = {n: (tools / n).is_file() for n in ("infosys_local.py", "manuals_db.py")}
+            sop = loc / "sop"
+            out["sop"] = sorted(str(f.relative_to(loc)) for f in sop.rglob("*.md"))[:50] if sop.is_dir() else []
         return out
 
     # -- K9 projects ---------------------------------------------------------------------
+    @staticmethod
+    def _match_projects(con: sqlite3.Connection, ref: str) -> list[dict[str, Any]]:
+        """Projects meant by `ref`: the same folder in any spelling (case, separators, trailing backslash), else the
+        label (case-insensitive)."""
+        rows = [dict(r) for r in con.execute("SELECT path, label, files FROM projects ORDER BY rowid")]
+        key = norm_path(ref)
+        hit = [r for r in rows if norm_path(r["path"]) == key]
+        if not hit:
+            hit = [r for r in rows if (r["label"] or "").strip().lower() == ref.strip().lower()]
+        return hit
+
+    def _drop_project(self, con: sqlite3.Connection, stored: str) -> int:
+        n = con.execute("DELETE FROM units WHERE project=?", (stored,)).rowcount
+        if self._fts:
+            con.execute("DELETE FROM units_fts WHERE project=?", (stored,))
+        con.execute("DELETE FROM projects WHERE path=?", (stored,))
+        return n
+
+    @staticmethod
+    def _project_list(con: sqlite3.Connection) -> list[str]:
+        return [f"{r['label']} ({r['path']})" for r in con.execute("SELECT path, label FROM projects ORDER BY path")]
+
     def add_project(self, path: str, label: str | None = None) -> dict[str, Any]:
-        p = Path(path).expanduser()
-        if not p.is_absolute() or not p.is_dir():
+        p = Path(display_path(path)) if path else Path("")
+        if not path or not p.is_absolute() or not p.is_dir():
             raise KnowledgeError(f"{path!r} is not an existing absolute folder")
+        merged: list[str] = []
         with self._db() as con:
-            con.execute("INSERT OR IGNORE INTO projects(path, label, added) VALUES (?,?,?)",
-                        (str(p), label or p.name, time.strftime("%Y-%m-%dT%H:%M:%S")))
-            if label:
-                con.execute("UPDATE projects SET label=? WHERE path=?", (label, str(p)))
-        return self.reindex(str(p))
+            same = self._match_projects(con, str(p))
+            same = [r for r in same if norm_path(r["path"]) == norm_path(p)]       # a label is no folder match here
+            if same:
+                keep = same[0]["path"]
+                for d in same[1:]:                                                  # R35: earlier double entries
+                    self._drop_project(con, d["path"])
+                    merged.append(d["path"])
+                if label:
+                    con.execute("UPDATE projects SET label=? WHERE path=?", (label, keep))
+            else:
+                keep = str(p)
+                con.execute("INSERT INTO projects(path, label, added) VALUES (?,?,?)",
+                            (keep, label or p.name, time.strftime("%Y-%m-%dT%H:%M:%S")))
+        res = self._reindex_rows([{"path": keep, "files": None}], force=True)
+        if same:
+            res["note"] = f"{keep} was already in the knowledge base — re-indexed it instead of adding it again"
+        if merged:
+            res["merged_duplicates"] = merged
+        return res
 
     def remove_project(self, path: str) -> dict[str, Any]:
-        p = str(Path(path).expanduser())
         with self._db() as con:
-            n = con.execute("DELETE FROM units WHERE project=?", (p,)).rowcount
-            if self._fts:
-                con.execute("DELETE FROM units_fts WHERE project=?", (p,))
-            found = con.execute("DELETE FROM projects WHERE path=?", (p,)).rowcount
-        if not found:
-            raise KnowledgeError(f"{p} is not in the knowledge base (kb_status lists the projects)")
-        return {"removed": p, "units_removed": n, "note": "only the index entries were removed; your files are untouched"}
+            hit = self._match_projects(con, path or "")
+            if not hit:
+                raise KnowledgeError(f"{path!r} is not in the knowledge base; indexed: {self._project_list(con) or 'none'}")
+            n = sum(self._drop_project(con, r["path"]) for r in hit)
+        return {"removed": [r["path"] for r in hit], "units_removed": n,
+                "note": "only the index entries were removed; your files are untouched"}
 
     def reindex(self, path: str | None = None) -> dict[str, Any]:
+        with self._db() as con:
+            if path:
+                rows = self._match_projects(con, path)
+                if not rows:
+                    raise KnowledgeError(f"{path!r} is not in the knowledge base (indexed: {self._project_list(con) or 'none'}); "
+                                         "kb_add_project first")
+            else:
+                rows = [dict(r) for r in con.execute("SELECT path, files FROM projects")]
+        return self._reindex_rows(rows, force=bool(path))
+
+    def _reindex_rows(self, rows: list[dict[str, Any]], force: bool) -> dict[str, Any]:
         from .config import ProjectConfig
         from .project_backend import ProjectIndex
-        with self._db() as con:
-            rows = [dict(r) for r in con.execute("SELECT path, files FROM projects" + (" WHERE path=?" if path else ""),
-                                                  ((str(Path(path).expanduser()),) if path else ()))]
-        if path and not rows:
-            raise KnowledgeError(f"{path} is not in the knowledge base; kb_add_project first")
         out = []
         for r in rows:
             root = Path(r["path"])
@@ -367,7 +492,7 @@ class Knowledge:
                 out.append({"project": r["path"], "error": "folder not found (moved or deleted?) — kb_remove_project or re-add"})
                 continue
             stamp = _tree_stamp(root)
-            if r.get("files") == stamp and path is None:
+            if r.get("files") == stamp and not force:
                 out.append({"project": r["path"], "unchanged": True})
                 continue
             idx = ProjectIndex(ProjectConfig(root=str(root)))
@@ -398,40 +523,104 @@ class Knowledge:
     def search(self, query: str, kinds: list[str] | None = None, project: str | None = None, limit: int = 20) -> dict[str, Any]:
         q = (query or "").strip()
         if not q:
-            raise KnowledgeError("empty query")
+            raise KnowledgeError("empty query — give words from the code, a unit name or an error message")
+        phrases = [x for x in re.findall(r'"([^"]+)"', q) if re.search(r"\w", x)]
+        words = [w for w in re.findall(r"\w+", re.sub(r'"[^"]*"', " ", q))]
+        if not phrases and not words:
+            # R37: ':=' used to reach FTS as MATCH '' and fail with an empty message
+            raise KnowledgeError(f"the query {q!r} has no searchable word: kb_search matches whole words and word "
+                                 "prefixes in the code; punctuation such as ':=' is not indexed — search for the names "
+                                 "around it (e.g. 'nCount')")
+        if not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise KnowledgeError(f"limit must be 1–200 (got {limit!r})")                          # R39
+        want_kinds: list[str] = []
+        for k in kinds or []:
+            ku = str(k).strip().upper()
+            if ku in KIND_ALIASES:
+                want_kinds += KIND_ALIASES[ku]
+            elif ku in UNIT_KINDS:
+                want_kinds.append(ku)
+            else:
+                raise KnowledgeError(f"unknown kind {k!r}; kinds: {', '.join(UNIT_KINDS)} (FB = FUNCTION_BLOCK, "
+                                     "DUT = every data type)")                                       # R39
         with self._db() as con:
             nproj = con.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
             hits: list[dict[str, Any]] = []
+            scope: list[str] = []
+            if project:
+                m = self._match_projects(con, project)
+                if not m:
+                    raise KnowledgeError(f"no indexed project is {project!r} (path or label); indexed: "
+                                         f"{self._project_list(con) or 'none'}")                    # R35 / R39
+                scope = [r["path"] for r in m]
             if nproj:
-                if self._fts:
-                    terms = " OR ".join(f'"{t}"' for t in re.findall(r"[\w]+", q))
-                    sql = ("SELECT project, name, kind, file, snippet(units_fts, 4, '«', '»', ' … ', 12) AS decl, "
-                           "snippet(units_fts, 5, '«', '»', ' … ', 12) AS impl, bm25(units_fts, 0, 10, 0, 0, 3, 1, 2) AS score "
-                           "FROM units_fts WHERE units_fts MATCH ?")
-                    params: list[Any] = [terms]
-                else:
-                    sql = ("SELECT project, name, kind, file, substr(declaration,1,200) AS decl, substr(implementation,1,200) AS impl, 0 AS score "
-                           "FROM units WHERE (name LIKE ? OR declaration LIKE ? OR implementation LIKE ? OR comments LIKE ?)")
-                    like = f"%{q}%"
-                    params = [like, like, like, like]
-                if project:
-                    sql += " AND project = ?"
-                    params.append(str(Path(project).expanduser()))
-                if kinds:
-                    sql += f" AND kind IN ({','.join('?' * len(kinds))})"
-                    params += [k.upper() for k in kinds]
-                sql += " ORDER BY score LIMIT ?"
-                params.append(int(min(max(limit, 1), 200)))
-                for r in con.execute(sql, params):
-                    hits.append({"project": r["project"], "unit": r["name"], "kind": r["kind"], "file": r["file"],
-                                 "declaration": r["decl"], "code": r["impl"]})
+                hits = self._search_tiers(con, phrases, words, want_kinds, scope, limit)
         err = known_error(q)
         out: dict[str, Any] = {"query": q, "hits": hits, "projects_indexed": nproj}
+        if hits and all(h.get("match") == "some words" for h in hits):
+            out["note"] = ("no unit contains every word of the query; these contain some of them (best first) — "
+                           "fewer or more specific words help")
         if err:
             out["known_error"] = err
         if not nproj:
             out["note"] = "no project folders in the knowledge base yet — kb_add_project(path) with a folder the user names"
         return out
+
+    def _search_tiers(self, con: sqlite3.Connection, phrases: list[str], words: list[str], kinds: list[str],
+                      scope: list[str], limit: int) -> list[dict[str, Any]]:
+        """R36: every word first (exact, then as word prefixes: 'CounterMod' → CounterModule); only when no unit has
+        them all, units with some of them, marked match='some words'."""
+        def ph(t: str) -> str:
+            return '"' + t.replace('"', '""') + '"'
+        exact = [ph(t) for t in phrases + words]
+        prefix = [ph(t) for t in phrases] + [ph(w) + "*" for w in words]
+        tiers = [("all words", " AND ".join(exact))]
+        if words:
+            tiers.append(("all words (as prefixes)", " AND ".join(prefix)))
+        if len(exact) > 1:
+            tiers.append(("some words", " OR ".join(prefix)))
+        where_extra, params_extra = "", []
+        if scope:
+            where_extra += f" AND project IN ({','.join('?' * len(scope))})"
+            params_extra += scope
+        if kinds:
+            where_extra += f" AND kind IN ({','.join('?' * len(kinds))})"
+            params_extra += kinds
+        hits: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for label, expr in tiers:
+            if hits and label == "some words":
+                break
+            if self._fts:
+                sql = ("SELECT project, name, kind, file, snippet(units_fts, 4, '«', '»', ' … ', 12) AS decl, "
+                       "snippet(units_fts, 5, '«', '»', ' … ', 12) AS impl, bm25(units_fts, 0, 10, 0, 0, 3, 1, 2) AS score "
+                       f"FROM units_fts WHERE units_fts MATCH ?{where_extra} ORDER BY score LIMIT ?")
+                params: list[Any] = [expr, *params_extra, limit]
+            else:
+                terms = phrases + words
+                conds = " AND " if label != "some words" else " OR "
+                one = "(name LIKE ? ESCAPE '\\' OR declaration LIKE ? ESCAPE '\\' OR implementation LIKE ? ESCAPE '\\' OR comments LIKE ? ESCAPE '\\')"
+                sql = ("SELECT project, name, kind, file, substr(declaration,1,200) AS decl, substr(implementation,1,200) AS impl, "
+                       f"0 AS score FROM units WHERE ({conds.join([one] * len(terms))}){where_extra} LIMIT ?")
+                params = []
+                for t in terms:
+                    like = "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                    params += [like] * 4
+                params += [*params_extra, limit]
+            try:
+                rows = con.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as exc:
+                raise KnowledgeError(f"search failed for {expr!r}: {exc}") from exc
+            for r in rows:
+                key = (r["project"], r["name"], r["file"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                hits.append({"project": r["project"], "unit": r["name"], "kind": r["kind"], "file": r["file"],
+                             "declaration": r["decl"], "code": r["impl"], "match": label})
+                if len(hits) >= limit:
+                    return hits
+        return hits
 
     # -- K4 hardware ---------------------------------------------------------------------
     def esi_folders(self) -> list[Path]:
@@ -524,6 +713,9 @@ class Knowledge:
             res["indexed_now"] = idx
         if not rows:
             res["note"] = "not in the installed ESI files — update the ESI (XAE: TwinCAT → EtherCAT Devices → Update Device Descriptions)"
+        # the PDF manuals of the knowledge folder (read-only, built by manuals_db.py) for the same product codes
+        codes = types[:3] or ([q.upper()] if _PRODUCT.match(q) else [])
+        res.update(manuals_for(self.location()[0], codes))
         return res
 
     def _esi_count(self) -> int:
@@ -631,6 +823,117 @@ def _tree_stamp(root: Path) -> str:
             st = f.stat()
             h.update(f"{f}:{st.st_size}:{st.st_mtime_ns}\n".encode())
     return h.hexdigest()
+
+
+def _ro(db: Path) -> sqlite3.Connection:
+    """The documentation databases belong to the knowledge folder's own tools: opened read-only, never changed here."""
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _infosys_info(db: Path, tools: Path, brief: bool) -> dict[str, Any]:
+    out: dict[str, Any] = {"database": str(db), "exists": db.is_file()}
+    if not db.is_file():
+        out["build"] = (f'python "{tools / "infosys_local.py"}" index' if (tools / "infosys_local.py").is_file()
+                        else "build it with infosys_local.py index (tools folder of the knowledge base, see its README)")
+        return out
+    out["size_mb"] = round(db.stat().st_size / 1e6, 1)
+    if brief:
+        return out
+    try:
+        con = _ro(db)
+        try:
+            meta = {r[0]: r[1] for r in con.execute("SELECT key, value FROM meta")}
+            out["pages"] = con.execute("SELECT COUNT(*) FROM page").fetchone()[0]
+            out["books"] = con.execute("SELECT COUNT(DISTINCT book) FROM page").fetchone()[0]
+        finally:
+            con.close()
+        stamp = (meta.get("source") or "").split("|")
+        out.update({"package": stamp[0] or None, "indexed": meta.get("indexed"), "lcid": meta.get("lcid")})
+        if not stamp[0]:
+            out["incomplete"] = "no source stamp: the last infosys_local.py index did not finish — run it again with --force"
+    except sqlite3.Error as exc:
+        out["error"] = f"not readable as an infosys_local.py database: {exc}"
+    return out
+
+
+def _manuals_info(db: Path, folder: Path, tools: Path, brief: bool) -> dict[str, Any]:
+    out: dict[str, Any] = {"database": str(db), "exists": db.is_file(), "folder": str(folder)}
+    update = (f'"{tools / "manuals_db.py"}" update' if (tools / "manuals_db.py").is_file()
+              else "manuals_db.py update (tools folder of the knowledge base)")
+    on_disk = {norm_path(f): f for f in folder.rglob("*") if f.suffix.lower() == ".pdf" and f.is_file()} if folder.is_dir() else {}
+    out["pdfs_in_folder"] = len(on_disk)
+    if not db.is_file():
+        if on_disk:
+            out["build"] = f"python (with PyMuPDF or pypdf) {update}"
+        return out
+    out["size_mb"] = round(db.stat().st_size / 1e6, 1)
+    if brief:
+        return out
+    try:
+        con = _ro(db)
+        try:
+            docs = [dict(r) for r in con.execute("SELECT path, name, size, mtime, pages, text_pages FROM doc")]
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        out["error"] = f"not readable as a manuals_db.py database: {exc}"
+        return out
+    out["manuals"] = len(docs)
+    out["pages"] = sum(d["pages"] or 0 for d in docs)
+    known = {norm_path(d["path"]): d for d in docs}
+    # manuals_db.py update's own change test: size + mtime (it confirms with SHA-256 before re-indexing)
+    new = [f.name for k, f in on_disk.items() if k not in known]
+    changed = [f.name for k, f in on_disk.items() if k in known and
+               (known[k]["size"] != f.stat().st_size or known[k]["mtime"] != int(f.stat().st_mtime))]
+    gone = [d["name"] for k, d in known.items() if k not in on_disk]
+    scanned = [d["name"] for d in docs if not d["text_pages"]]
+    if new:
+        out["not_indexed"] = sorted(new)[:20]
+    if changed:
+        out["changed_since_index"] = sorted(changed)[:20]
+    if gone:
+        out["indexed_but_gone"] = sorted(gone)[:20]
+    if scanned:
+        out["no_text_layer"] = sorted(scanned)[:20]
+    if new or changed or gone:
+        out["update"] = f"python (with PyMuPDF or pypdf) {update}"
+    return out
+
+
+_PRODUCT = re.compile(r"^[A-Za-z]{1,4}\d{3,5}(?:-\d{4})?$")
+
+
+def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
+    """Which indexed PDF manuals mention these product codes (manuals_db.py's product table: exact code or CODE-xxxx)."""
+    if loc is None or not codes:
+        return {}
+    db = loc / MANUALS_DB[0] / MANUALS_DB[1]
+    if not db.is_file():
+        return {"manuals_note": f"no manuals database at {db} — PDF manuals copied into {loc / 'manuals'} and indexed "
+                                "with manuals_db.py update show up here (and in the twincat-docs skill)"}
+    found: dict[str, list[dict[str, Any]]] = {}
+    try:
+        con = _ro(db)
+        try:
+            for code in codes[:3]:
+                c = code.strip().upper()
+                like = c.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "-%"
+                rows = con.execute("SELECT d.name, d.id, GROUP_CONCAT(p.page) AS pages, SUM(p.n) AS hits FROM product p "
+                                   "JOIN doc d ON d.id = p.doc WHERE p.code = ? OR p.code LIKE ? ESCAPE '\\' "
+                                   "GROUP BY p.doc ORDER BY hits DESC LIMIT 5", (c, like)).fetchall()
+                if rows:
+                    found[c] = [{"doc": r["name"], "doc_id": r["id"], "mentions": r["hits"],
+                                 "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})[:20]} for r in rows]
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return {"manuals_note": f"manuals database not readable: {exc}"}
+    if not found:
+        return {"manuals_note": f"no indexed manual mentions {', '.join(codes[:3])} — copy its PDF into "
+                                f"{loc / 'manuals'} and run manuals_db.py update"}
+    return {"manuals": found, "manuals_more": "twincat-docs skill: manual_search query=… doc=… / manual_page"}
 
 
 ESI_PARSER_VERSION = 3       # bump when _parse_esi's output changes: every ESI file is read again once
