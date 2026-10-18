@@ -74,6 +74,11 @@ MAX_BLOCK_BYTES = 16384        # one notification never carries more than this
 QUEUE_BYTES = 256 << 20        # in-memory backlog cap per recording
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
 TAIL_WAIT_S = 1.0             # after the duration: wait at most this long for in-flight samples up to the cut
+
+
+def _ticks(ms: float) -> int:
+    """PLC-relative ms (4 decimals in the file) → integer 100 ns ticks, the native engine's unit."""
+    return int(round(ms * 10_000))
 LIVE_VALUES_PER_S = 20_000     # above this (leaves × samples/s) nothing is decoded while recording (see Recording)
 _HDR_DATA_OFFSET = 16          # SAdsNotificationHeader: u32 handle, u64 timestamp, u32 size, data
 
@@ -342,29 +347,37 @@ class Block:
         self.samples += 1
         return missing
 
+    # N60: the counts below are integer arithmetic on 100 ns ticks — the native engine's units and formulas — so the
+    # same file gives the same numbers in both (float ms made 3.0 periods read as 2.9999 → one sample less).
     def missing(self, end_t: float | None = None, start_t: float | None = None) -> int:
-        """Holes between the first and last sample, plus — when the window end is known (duration / post-trigger
-        stop, or the other blocks' last sample) — the samples this block should have delivered after its last one
-        (field report N11: a recording that went quiet halfway must not look complete). One period of slack."""
+        """Holes between the first and last sample, plus the samples this block should have delivered before its first
+        one (window start known: trigger − pre_trigger_ms) and after its last one (window end known: the stop's PLC
+        time, duration / post-trigger cut, or the other blocks' last sample) — field report N11: a recording that went
+        quiet halfway must not look complete. One period of allowance at the tail, none at the head."""
         if self.samples < 2 or not self.min_step or self.first_t is None or self.last_t is None:
             return 0
-        expected = round((self.last_t - self.first_t) / self.min_step) + 1
+        step = _ticks(self.min_step)
+        if step <= 0:
+            return 0
+        expected = int(math.floor((_ticks(self.last_t) - _ticks(self.first_t)) / step + 0.5)) + 1   # llround
         inner = max(0, expected - self.samples)
         return inner + self.tail_missing(end_t) + self.head_missing(start_t)
 
     def head_missing(self, start_t: float | None) -> int:
-        """Samples the window needed before this block's first one (a pre-trigger buffer that was not full yet)."""
+        """Samples the window needed before this block's first one: floor((first − start) / period), as the engine."""
         if start_t is None or not self.min_step or self.first_t is None or self.first_t <= start_t:
             return 0
-        return int((self.first_t - start_t + 1e-6) / self.min_step)
+        step = _ticks(self.min_step)
+        return (_ticks(self.first_t) - _ticks(start_t)) // step if step > 0 else 0
 
-    def tail_missing(self, end_t: float | None, slack: float = 1) -> int:
-        """Samples missing after this block's last one up to the window end. slack: periods that are not a loss —
-        one by default; for a stop on request of the native engine the blocks are unsubscribed one after another
-        (R7), so 3 + the notification delay in periods, the rule the engine applies itself."""
+    def tail_missing(self, end_t: float | None) -> int:
+        """Samples missing after this block's last one up to the window end, one period of allowance:
+        floor((end − last) / period) − 1, as the engine. No other allowance: a stop on request ends at a PLC time
+        both engines wait for (N56), so a block that ends early has lost samples."""
         if end_t is None or not self.min_step or self.last_t is None or end_t <= self.last_t:
             return 0
-        return max(0, int((end_t - self.last_t) / self.min_step - slack))
+        step = _ticks(self.min_step)
+        return max(0, (_ticks(end_t) - _ticks(self.last_t)) // step - 1) if step > 0 else 0
 
 
 # ------------------------------------------------------------------ selection patterns (A5)
@@ -541,6 +554,20 @@ class Recording:
         self.max_backlog = 0
         self.live_stats = True               # decode + statistics while recording (False: deferred to the file)
         self._cut_t: float | None = None     # drain only samples up to this PLC-relative time
+        # N57: notifications are batched up to max_delay_ms; the pre-trigger buffer keeps that much skew as margin
+        self.max_delay_ms = float(meta.get("max_delay_ms") or 0.0) if isinstance(meta, dict) else 0.0
+        # R41 / N61: a level start_when fires once every block has delivered (cycle mode), as the native engine
+        self._armed_seen: set[int] = set()
+        self._armed_t0: float | None = None
+        self.warmup_true_at: float | None = None   # start_when was true here, before every block had delivered
+        self.warmup_lapsed = False                  # … and was false when every block had delivered (not fired)
+        self.trigger_delayed_ms: float | None = None
+        # N56: a stop on request ends at a PLC time — the newest sample received when it was asked for — and the
+        # notifications stay until every block has delivered up to it (bounded), like the duration end (N13)
+        self._recv_max_ts: int | None = None
+        self.stop_at_cut = False
+        self._stop_cut_mono: float | None = None
+        self.stop_wait_ms: float | None = None
         self._tail_wait: float | None = None  # monotonic time the duration was reached (N13 tail wait)
         self._cut_now = False                 # discard the backlog (limit reached at a known sample)
         self._sha = hashlib.sha256()
@@ -674,6 +701,8 @@ class Recording:
     def enqueue(self, ts: int | float, key: Any, payload: Any) -> None:
         """ADS callback thread (block notification: key = block id, payload = raw bytes) or poll thread
         (key = None, payload = {name: value}). Only enqueues — the callback must return at once."""
+        if key is not None and (self._recv_max_ts is None or ts > self._recv_max_ts):
+            self._recv_max_ts = ts                   # newest PLC time received (a stop on request ends there)
         try:
             self.q.put_nowait((ts, key, payload))
         except queue.Full:
@@ -749,19 +778,40 @@ class Recording:
             b.last_wall = time.monotonic()
             self._handle_block(t, b, payload, light)
 
+    WARMUP_MS = 200.0     # a level start_when waits at most this long (PLC time) for every block's first sample
+
     def _handle_block(self, t: float, b: Block, data: bytes, light: bool) -> None:
         if self.armed:
             self.pre.append((t, b, data))
-            # R41: blocks arrive with a skew (block 1's sample of cycle t+1 before block 0's trigger sample of cycle t);
-            # purging against the newest stamp of any block lost block 1's trigger-cycle sample. Keep a margin and
-            # commit only what lies inside the window.
-            while self.pre and t - self.pre[0][0] > self.pre_trigger_ms + 50.0:
+            # R41 / N57: blocks arrive with a skew — a block's samples can come up to max_delay_ms (ADS batching) after
+            # another block's newer ones. Purging against the newest stamp of any block with a fixed 50 ms dropped the
+            # other blocks' samples of the trigger cycle when the trigger block was the late one. Keep
+            # max_delay_ms + 50 ms as margin (the native engine's rule) and commit only what lies inside the window.
+            margin = self.max_delay_ms + 50.0
+            while self.pre and t - self.pre[0][0] > self.pre_trigger_ms + margin:
                 self.pre.popleft()
+            self._armed_seen.add(b.bid)
+            if self._armed_t0 is None:
+                self._armed_t0 = t
             sw = self.start_when
             if sw is not None and sw.symbol in self.slot_of and self.slot_of[sw.symbol][0] is b:
-                if sw.fires(self.slot_of[sw.symbol][1].decode(data)):
+                fires = sw.fires(self.slot_of[sw.symbol][1].decode(data))
+                # R41: in cycle mode every block delivers every cycle; a level condition true at the very start would
+                # open the window before the other blocks' first samples. Fire on the first cycle all blocks deliver
+                # (at most WARMUP_MS after arming). Change mode delivers on change only: no such wait there.
+                all_live = (self.mode != "cycle" or sw.edge or len(self._armed_seen) >= len(self.blocks)
+                            or t - self._armed_t0 > self.WARMUP_MS)
+                if fires and not all_live:
+                    if self.warmup_true_at is None:
+                        self.warmup_true_at = t                  # N61: remembered, reported if it never fires
+                    return
+                if not fires and all_live and self.warmup_true_at is not None:
+                    self.warmup_lapsed = True
+                if fires:
                     self.armed = False
                     self.triggered_at = t
+                    if self.warmup_true_at is not None:
+                        self.trigger_delayed_ms = round(t - self.warmup_true_at, 4)
                     pre, self.pre = list(self.pre), deque()
                     for pt, pb, pd in pre:
                         if pt >= t - self.pre_trigger_ms:
@@ -861,6 +911,14 @@ class Recording:
     def _check_limits(self) -> None:
         if self._stop.is_set():
             return
+        if self.stop_at_cut:
+            # N56: stop on request — every block delivers up to the stop's PLC time, or the wait (max_delay + 1 s)
+            # ends and what is missing is missing (tail, allowance 1)
+            waited = time.monotonic() - (self._stop_cut_mono or time.monotonic())
+            if self._tail_reached(self._cut_t) or waited >= TAIL_WAIT_S + self.max_delay_ms / 1000.0:
+                self.stop_wait_ms = round(waited * 1000.0, 1)
+                self._stop.set()
+            return
         mono = (time.monotonic() - self.t0_mono) if self.t0_mono is not None else None
         if self.post_trigger_s and self.triggered_at is not None and (self.last_t - self.triggered_at) / 1000.0 >= self.post_trigger_s:
             self.stop_reason = f"post_trigger {self.post_trigger_s}s after the start_when trigger"
@@ -889,10 +947,25 @@ class Recording:
             return True
         return all(b.last_t is None or not b.min_step or b.tail_missing(cut) == 0 for b in self.blocks)
 
-    def request_stop(self, reason: str = "requested") -> None:
-        if not self._stop.is_set():
-            self.stop_reason = self.stop_reason or reason
-            self._stop.set()
+    def request_stop(self, reason: str = "requested", at_plc_time: bool = False) -> None:
+        """at_plc_time (rec_stop): N56 — the recording ends at the newest PLC time received now; the notifications stay
+        until every block has delivered up to it (at most max_delay_ms + 1 s), samples after it are not part of the
+        recording (after_limit). Unsubscribing at once let each block end where its notification happened to be —
+        max_delay_ms apart — so the end of the window could not be checked. Otherwise: stop now."""
+        if self._stop.is_set():
+            return
+        if self.stop_at_cut:
+            if not at_plc_time:
+                self._stop.set()          # a plain stop while waiting for the tail: stop now
+            return
+        self.stop_reason = self.stop_reason or reason
+        if (at_plc_time and self.mode == "cycle" and self.blocks and not self.armed and self._cut_t is None
+                and self.t0_ft is not None and self._recv_max_ts is not None):
+            self._cut_t = self._rel_ms(self._recv_max_ts)
+            self._stop_cut_mono = time.monotonic()
+            self.stop_at_cut = True
+            return
+        self._stop.set()
 
     def _release(self) -> None:
         cb = self.on_finish
@@ -933,10 +1006,12 @@ class Recording:
                           "dropped_on_stop": self.dropped_on_stop, "after_limit": self.after_limit,
                           "unsubscribed": self.unsubscribed, "stop_reason": self.stop_reason,
                           "window_end_ms": self._cut_t, "window_start_ms": self.window_start(), "engine": "python",
+                          "max_delay_ms": self.max_delay_ms,
                           "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "lines": self._lines,
                           "sha256": digest}
                 if self.label_reason():
                     footer["label_reason"] = self.label_reason()
+                footer.update(self.stop_and_trigger_notes())
                 if self.stall_cfg:
                     footer["stall_counter_block"] = self.stall_cfg.get("block")
                 if self.key:
@@ -960,17 +1035,37 @@ class Recording:
               and (self.start_when is None or self.triggered_at is not None) and not self.stalled_now())
         return "COMPLETE" if ok else "INCOMPLETE"
 
+    def stop_and_trigger_notes(self) -> dict[str, Any]:
+        """N56 / N61: what the end of a stop on request and the start_when warm-up did — in the footer and rec_status."""
+        out: dict[str, Any] = {}
+        if self.stop_at_cut:
+            out["stop_on_request"] = {"at_ms": self._cut_t, "waited_ms": self.stop_wait_ms,
+                                      "rule": "ends at the newest PLC time received when the stop was asked for; every "
+                                              "block must deliver up to it (allowance 1 period)"}
+        if self.trigger_delayed_ms is not None:
+            out["trigger_delayed_ms"] = self.trigger_delayed_ms
+            out["trigger_note"] = (f"start_when was already true at {self.warmup_true_at:.4f} ms, before every block had "
+                                   f"delivered; it fired {self.trigger_delayed_ms:g} ms later, on the first cycle all "
+                                   "blocks delivered (the window cannot start before a block's first sample)")
+        elif self.start_when is not None and self.triggered_at is None and self.warmup_lapsed:
+            out["trigger_note"] = (f"start_when was true at {self.warmup_true_at:.4f} ms during the warm-up (before every "
+                                   f"block had delivered, at most {self.WARMUP_MS:g} ms) and false afterwards — it did "
+                                   "not fire")
+            out["start_when_warmup_true_ms"] = self.warmup_true_at
+        return out
+
     @property
     def active(self) -> bool:
         return self.stopped_at is None
 
     # ------------------------------------------------------------ views
     def window_start(self) -> float | None:
-        """Start of the window that must be complete: trigger − pre_trigger_ms for triggered recordings (samples the
-        pre-trigger buffer could not hold count as missing_head); None otherwise (each block from its first sample)."""
-        if self.triggered_at is None or not self.pre_trigger_ms:
+        """Start of the window that must be complete: trigger − pre_trigger_ms for triggered recordings — also with
+        pre_trigger_ms 0 (N57: the window then starts at the trigger, and a block whose first sample comes later has
+        lost its head); None for untriggered recordings (each block from its first sample)."""
+        if self.triggered_at is None:
             return None
-        return self.triggered_at - self.pre_trigger_ms
+        return self.triggered_at - (self.pre_trigger_ms or 0.0)
 
     def window_end(self) -> float | None:
         """End of the recorded window in PLC-relative ms: the duration / post-trigger cut, else the latest sample of
@@ -1052,6 +1147,7 @@ class Recording:
             st["stalled_since_ms"] = round(self._stall_adv_t, 4)
         if self.label_reason():
             st["label_reason"] = self.label_reason()
+        st.update(self.stop_and_trigger_notes())
         if self.unsubscribed:
             st["unsubscribed_symbols"] = self.unsubscribed[:50]
         if self.blocks:
@@ -1217,6 +1313,32 @@ def manifest_path(path: Path) -> Path:
 def provenance_path(export: Path) -> Path:
     """<export>.provenance.json next to an exported file (x.wide.csv → x.wide.csv.provenance.json)."""
     return export.with_name(export.name + ".provenance.json")
+
+
+def _export_target_refusal(out: Path, src: Path) -> str | None:
+    """N58: an export writes a CSV; it never writes over a recording or a record about one — the source's own .jsonl,
+    its manifest, any provenance file, or another recording (a .jsonl with a recording header). None = allowed."""
+    try:
+        o, s_ = out.resolve(), src.resolve()
+    except OSError:
+        o, s_ = out.absolute(), src.absolute()
+    if o == s_:
+        return "it is the recording itself"
+    if o == manifest_path(s_) or o.name.endswith(MANIFEST_SUFFIX):
+        return "it is a recording's manifest (sidecar)"
+    if o.name.endswith(".provenance.json"):
+        return "it is a provenance file (sidecar of an export)"
+    if o.suffix.lower() == ".jsonl":
+        if o.is_file():
+            try:
+                with open(o, encoding="utf-8") as fh:
+                    first = fh.readline()
+                if '"symbols"' in first or '"format"' in first:
+                    return "it is a recording (.jsonl)"
+            except OSError:
+                return "it is a .jsonl file that cannot be read"
+        return "a .jsonl name is reserved for recordings; exports are .csv"
+    return None
 
 
 _FT_EPOCH = dt.datetime(1601, 1, 1, tzinfo=dt.timezone.utc)
@@ -1682,20 +1804,69 @@ class Recorder:
         if mode == "cycle" and rate > 20_000 and st.get("engine") != "native":
             warns.append(f"{notifs} notifications every {cycle_ms} ms: above what this PC was measured to ingest. "
                          "Watch missing_samples / backlog in rec_status, or select fewer, contiguous variables.")
-        # N31: cycle_ms 0.1 on a PLC whose fastest task runs every 1 ms was accepted silently ("20000 notifications/s")
-        man = (getattr(rec, "meta", None) or {}).get("manifest") or {}
-        cycles = [float(t["cycle_time_ms"]) for t in (man.get("tasks") if isinstance(man.get("tasks"), list) else [])
-                  if isinstance(t, dict) and isinstance(t.get("cycle_time_ms"), (int, float)) and t["cycle_time_ms"] > 0]
-        if cycles and cycle_ms < min(cycles) - 1e-9:
-            fastest = min(cycles)
-            st["fastest_task_ms"] = fastest
-            warns.append(f"cycle_ms {cycle_ms:g} is below the fastest task of this runtime ({fastest:g} ms): no "
-                         f"variable changes faster than its task, so {'samples repeat the same PLC cycle' if mode != 'change' else 'the extra checks find nothing new'} "
-                         f"and the rate above ({st['notifications_per_s']} notifications/s) is load, not resolution — "
-                         f"use cycle_ms={fastest:g} or a multiple of it")
+        # N31 / N62: a variable changes only when the task that writes it runs. cycle_ms below that task's cycle samples
+        # the same PLC cycle again (load, not resolution). Compared with the task that runs each recorded program
+        # (from the project's task configuration); a GVL has no single owner — compared with the fastest task.
+        chk = self._task_check(rec, syms, cycle_ms)
+        if chk["checked"]:
+            st["task_check"] = chk["checked"]
+        if chk.get("fastest_task_ms") is not None:
+            st["fastest_task_ms"] = chk["fastest_task_ms"]
+        effect = "samples repeat the same PLC cycle" if mode != "change" else "the extra checks find nothing new"
+        for w in chk["below"]:
+            warns.append(f"cycle_ms {cycle_ms:g} is below the cycle of {w['what']} ({w['cycle_ms']:g} ms, {w['basis']}): "
+                         f"{effect} and the rate above ({st['notifications_per_s']} notifications/s) is load, not "
+                         f"resolution — use cycle_ms={w['cycle_ms']:g} or a multiple of it for these variables")
         if warns:
             st["warning"] = " | ".join(warns)
         return st
+
+    # set by the server from the project index: name of a program → the tasks that run it ([] = no program, e.g. a
+    # GVL; None = the project has no task configuration). N62.
+    task_of: Callable[[str], list[str] | None] | None = None
+
+    def _task_check(self, rec: Any, syms: list[SymbolEntry], cycle_ms: float) -> dict[str, Any]:
+        man = (getattr(rec, "meta", None) or {}).get("manifest") or {}
+        rt = {str(t.get("name") or "").lower(): float(t["cycle_time_ms"])
+              for t in (man.get("tasks") if isinstance(man.get("tasks"), list) else [])
+              if isinstance(t, dict) and isinstance(t.get("cycle_time_ms"), (int, float)) and t["cycle_time_ms"] > 0}
+        fastest = min(rt.values()) if rt else None
+        checked: dict[str, Any] = {}
+        below: list[dict[str, Any]] = []
+        roots = sorted({x.name.split(".", 1)[0] for x in syms if not _is_system_root(x.name)})
+        cfg: dict[str, dict[str, Any]] = {}
+        for r in roots:
+            owners = None
+            if self.task_of is not None:
+                try:
+                    owners = self.task_of(r)
+                except Exception:  # noqa: BLE001 — no project: the fastest task is the comparison
+                    owners = None
+            if owners:
+                if not cfg and self.task_of is not None:
+                    cfg = getattr(self.task_of, "config", lambda: {})() or {}
+                cyc = []
+                for o in owners:
+                    c = rt.get(o.lower())
+                    if c is None:
+                        c = (cfg.get(o) or {}).get("cycle_ms")
+                    if c:
+                        cyc.append((c, o))
+                if cyc:
+                    c, o = min(cyc)
+                    basis = "its task in the project, cycle from the runtime" if o.lower() in rt else "its task in the project"
+                    checked[r] = {"task": o, "cycle_ms": c, "basis": basis}
+                    if cycle_ms < c - 1e-9:
+                        below.append({"what": f"{r} (task {o})", "cycle_ms": c, "basis": basis})
+                    continue
+            if fastest is None:
+                continue
+            why = ("a GVL / no program: written by any task — compared with the fastest task" if owners == [] else
+                   "the project's task configuration is not available — compared with the fastest task")
+            checked[r] = {"task": None, "cycle_ms": fastest, "basis": why}
+            if cycle_ms < fastest - 1e-9:
+                below.append({"what": f"{r} (no single task)", "cycle_ms": fastest, "basis": why})
+        return {"checked": checked, "below": below, "fastest_task_ms": fastest if below else None}
 
     def _start_notifications(self, rec: Recording, port: int | None, allow_partial: bool, max_delay_ms: float) -> None:
         base = self.ads.conn(port)
@@ -1814,7 +1985,13 @@ class Recorder:
             st["stats_note"] = "native engine: rec_stats(id, symbols=[…]) computes exact statistics from the file"
             return st
         if rec.active:
-            rec.request_stop(reason)          # reason first: a limit check racing the release must not claim the stop
+            # reason first: a limit check racing the release must not claim the stop. N56: in cycle mode the stop ends
+            # at the newest PLC time received now; the ingest thread ends the recording once every block delivered up
+            # to it (at most max_delay_ms + 1 s) — the notifications stay registered until then
+            rec.request_stop(reason, at_plc_time=True)
+            if rec.stop_at_cut:
+                rec._stop.wait(timeout=TAIL_WAIT_S + rec.max_delay_ms / 1000.0 + 5.0)
+                rec.request_stop(reason)      # the wait is over in any case
             if rec.mode != "poll":
                 self._stop_notifications(rec)
             if rec._poll_thread:
@@ -2032,6 +2209,9 @@ class Recorder:
         if fmt == "jsonl":
             return {"id": rid, "file": str(path), "format": "jsonl", "note": "already on disk in this format"}
         out = Path(out_path) if out_path else path.with_suffix(f".{'wide' if fmt == 'csv_wide' else 'long'}.csv")
+        bad = _export_target_refusal(out, path)
+        if bad:
+            raise RecorderError(f"{out} cannot be an export target: {bad} — whatever overwrite says (nothing was written)")
         params = {"fmt": fmt, "symbols": symbols, "fill": fill}
         replaced = None
         if out.exists():
@@ -2061,7 +2241,32 @@ class Recorder:
         import csv
         n = 0
         rows_written = 0
-        with open(out, "w", newline="", encoding="utf-8") as fo:
+        # N59: written next to the target and moved over it only when complete — a failure halfway (disk full, a bad
+        # value, a crash) leaves the previous export as it was, never a truncated file under its name
+        tmp = out.with_name(f".{out.name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
+        counts = {"rows": 0, "values": 0}
+        try:
+            with open(tmp, "w", newline="", encoding="utf-8") as fo:
+                self._write_export(fo, csv, fmt, path, want, cols, expand, t0, fill, counts)
+            rows_written, n = counts["rows"], counts["values"]
+            footer = read_footer(path)
+            prov = self._provenance(path, out, footer, params,
+                                    {"rows": rows_written, "values": n, "columns": len(cols) if fmt == "csv_wide" else 4},
+                                    data_file=tmp)
+            make_writable(out)
+            os.replace(tmp, out)
+            self._write_provenance(out, prov)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        return self._export_result(rid, out, fmt, header, rows_written, n, t0, footer, fill, replaced, prov)
+
+    def _write_export(self, fo: Any, csv: Any, fmt: str, path: Path, want: set[str] | None, cols: list[str],
+                      expand: dict[str, list[str]], t0: int | None, fill: bool, counts: dict[str, int]) -> None:
+        if True:
             w = csv.writer(fo)
             plc_col = ["plc_filetime", "time_utc"] if t0 is not None else []
             w.writerow(["t_ms", *plc_col, *cols] if fmt == "csv_wide" else ["t_ms", *plc_col, "symbol", "value"])
@@ -2069,12 +2274,11 @@ class Recorder:
             row_t: float | None = None
 
             def flush() -> None:
-                nonlocal rows_written
                 if row_t is None:
                     return
                 ft = _ft_cols(t0 + int(round(row_t * 1e4))) if t0 is not None else []
                 w.writerow([row_t, *ft, *[cur.get(c, "") for c in cols]])
-                rows_written += 1
+                counts["rows"] += 1
 
             for t, nme, v in iter_events(path, want):
                 if fmt == "csv_wide":
@@ -2092,11 +2296,14 @@ class Recorder:
                 else:
                     ft = _ft_cols(t0 + int(round(t * 1e4))) if t0 is not None else []
                     w.writerow([t, *ft, nme, _flat(v)])
-                    rows_written += 1
-                n += 1
+                    counts["rows"] += 1
+                counts["values"] += 1
             if fmt == "csv_wide":
                 flush()
-        footer = read_footer(path)
+
+    def _export_result(self, rid: str, out: Path, fmt: str, header: dict[str, Any], rows_written: int, n: int,
+                       t0: int | None, footer: dict[str, Any] | None, fill: bool, replaced: str | None,
+                       prov: dict[str, Any]) -> dict[str, Any]:
         out_d: dict[str, Any] = {"id": rid, "file": str(out), "format": fmt, "rows": rows_written, "values": n,
                                  "time_source": header.get("time_source", "plc"),
                                  "note": ("one row per sample time; empty cell = no sample of that variable at that time"
@@ -2113,9 +2320,7 @@ class Recorder:
         else:
             out_d["complete"] = False
             out_d["note"] += "; no footer: the recording is still running or the process died before it ended"
-        # R10: the export is a derived file — record exactly what it was derived from and how
-        prov = self._provenance(path, out, footer, params,
-                                {"rows": rows_written, "values": n, "columns": len(cols) if fmt == "csv_wide" else 4})
+        # R10: the export is a derived file — its provenance records exactly what it was derived from and how
         out_d["provenance"] = {k: prov[k] for k in ("file", "source_sha256", "source_label", "export_sha256")}
         if replaced:
             out_d["replaced"] = replaced
@@ -2124,10 +2329,11 @@ class Recorder:
         return out_d
 
     def _provenance(self, src: Path, out: Path, footer: dict[str, Any] | None, params: dict[str, Any],
-                    counts: dict[str, Any]) -> dict[str, Any]:
+                    counts: dict[str, Any], data_file: Path | None = None) -> dict[str, Any]:
+        """The provenance record of an export (data_file: where its bytes are now, if not at out yet)."""
         pp = provenance_path(out)
         ssha, ssize = file_sha256(src)
-        esha, esize = file_sha256(out)
+        esha, esize = file_sha256(data_file or out)
         f = footer or {}
         p: dict[str, Any] = {"_provenance": 1, "export_file": out.name, "export_sha256": esha, "export_bytes": esize,
                              "source_file": str(src), "source_sha256": ssha, "source_bytes": ssize,
@@ -2138,11 +2344,18 @@ class Recorder:
                              "created": dt.datetime.now(dt.timezone.utc).isoformat()}
         if self.key:
             p["hmac"] = _manifest_sig(self.key, p)
-        make_writable(pp)
-        with open(pp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(p, indent=1, default=str) + "\n")
         p["file"] = str(pp)
         return p
+
+    @staticmethod
+    def _write_provenance(out: Path, prov: dict[str, Any]) -> None:
+        pp = provenance_path(out)
+        body = {k: v for k, v in prov.items() if k != "file"}
+        tmp = pp.with_name(f".{pp.name}.{os.getpid()}.tmp")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(body, indent=1, default=str) + "\n")
+        make_writable(pp)
+        os.replace(tmp, pp)
 
     def _settle(self, rec: Any) -> None:
         """Wait until a recording's own threads are done with its file (footer written, sealed): a recording that ended
@@ -2309,28 +2522,46 @@ class Recorder:
                     b = blocks.get(int(k[1:]))
                     if b is not None:
                         b.note_stamp(t)
+            # N56: an independent check of the file — its own window, one allowance for every recording; the engine's
+            # footer gives the window bounds (PLC times), never a tolerance
             rep = []
             tot_s = tot_m = 0
-            lasts = [b.last_t for b in blocks.values() if b.last_t is not None]
-            end = (footer or {}).get("window_end_ms") or (max(lasts) if lasts else None)
-            start = (footer or {}).get("window_start_ms")
-            manual = bool((footer or {}).get("manual_stop"))
-            delay = float((footer or {}).get("max_delay_ms") or 0)
-            if manual:
-                out["tail_rule"] = ("stop on request: each block may end up to 3 periods + the notification delay "
-                                    f"({delay:g} ms) before the latest one — the unsubscribe order, not a loss (R7)")
+            ends = {b.bid: b.last_t for b in blocks.values() if b.last_t is not None}
+            ft_ = footer or {}
+            end = ft_.get("window_end_ms")
+            start = ft_.get("window_start_ms")
+            legacy_stop = bool(ft_.get("manual_stop")) and end is None
+            if end is None and ends:
+                # a stop without a PLC end time. Written by an engine before the stop at a PLC time (≤ 0.8.9 native,
+                # manual_stop): each block ended where its unsubscription happened to be, so the window ends at the
+                # earliest block end — the last time every block is known to have delivered. Otherwise the latest end.
+                end = min(ends.values()) if legacy_stop else max(ends.values())
+            if ends:
+                first_end = min(ends, key=lambda k: ends[k])
+                spread = max(ends.values()) - min(ends.values())
+                periods = [b.min_step for b in blocks.values() if b.min_step]
+                out["block_ends"] = {"first_to_end": first_end, "spread_ms": round(spread, 4),
+                                     "ends_ms": {str(k): round(v, 4) for k, v in sorted(ends.items())}}
+                if legacy_stop:
+                    out["tail_rule"] = (
+                        "stop on request by an engine that unsubscribed at once (no PLC end time in the footer): the "
+                        f"window is checked up to the earliest block end ({end:.4f} ms, block {first_end}); the "
+                        f"{spread:g} ms after it differ per block and cannot be told from a loss")
+                    if periods and spread > max(periods) + 1e-6:
+                        out["inconclusive"] = (f"the blocks ended {spread:g} ms apart (more than one period): the last "
+                                               f"{spread:g} ms of block(s) other than {first_end} are not verified")
             for b in blocks.values():
-                slack = (3 + delay / b.min_step) if manual and b.min_step else 1
-                tail = b.tail_missing(end, slack)
-                m = b.missing(end, start) - b.tail_missing(end) + tail
+                m = b.missing(end, start)
                 tot_s += b.samples
                 tot_m += m
                 rep.append({"block": b.bid, "first": b.slots[0].name if b.slots else None, "symbols": len(b.slots),
                             "samples": b.samples, "missing": m, "missing_head": b.head_missing(start),
-                            "missing_tail": tail,
+                            "missing_tail": b.tail_missing(end),
+                            "end_ms": None if b.last_t is None else round(b.last_t, 4),
                             "period_ms": None if b.min_step is None else round(b.min_step, 4),
                             "duplicate_stamps": b.dup_stamps, "first_gaps": b.gaps[:5]})
-            out["timeline"] = {"samples": tot_s, "missing": tot_m,
+            out["timeline"] = {"samples": tot_s, "missing": tot_m, "window_start_ms": start, "window_end_ms": end,
+                               "allowance": "1 period at the end of each block, none inside or at the start",
                                "completeness": round(tot_s / (tot_s + tot_m), 6) if tot_s + tot_m else None,
                                "blocks": rep[:50]}
         elif header.get("mode") != "cycle":
@@ -2394,9 +2625,11 @@ class Recorder:
         tl = out.get("timeline") or {}
         cn = out.get("counter") or {}
         ft = footer or {}
-        out["verdict"] = ("PASS" if ok and not tl.get("missing") and cn.get("lossless", True) and not ft.get("dropped")
-                          and not ft.get("dropped_on_stop") and not ft.get("overflow_samples") and not ft.get("stalls")
-                          and ft.get("verdict_hint", "PASS") == "PASS" else "FAIL")
+        passed = (ok and not tl.get("missing") and cn.get("lossless", True) and not ft.get("dropped")
+                  and not ft.get("dropped_on_stop") and not ft.get("overflow_samples") and not ft.get("stalls")
+                  and ft.get("verdict_hint", "PASS") == "PASS"          # the engine's findings can only add a FAIL
+                  and not (tl.get("samples") == 0 and "blocks" in tl))  # nothing recorded is not a pass
+        out["verdict"] = "FAIL" if not passed else ("INCONCLUSIVE" if out.get("inconclusive") else "PASS")
         return out
 
     # ------------------------------------------------------------ analysis

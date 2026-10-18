@@ -564,7 +564,16 @@ void Engine::process(size_t b, int64_t ft, const uint8_t* d, uint32_t n) {
             have_armed_t0_ = true;
         }
         const bool all_live = armed_seen_n_ >= blocks_.size() || ft - armed_t0_ > 2000000;
-        if (start_when_.block == b && (start_when_.edge || all_live) && start_when_.fires(d, n)) {
+        bool fire = false;
+        if (start_when_.block == b && start_when_.fires(d, n)) {
+            if (start_when_.edge || all_live) {
+                fire = true;
+            } else if (!have_warm_true_) {
+                have_warm_true_ = true;        // N61: true before every block delivered — remembered, reported
+                warm_true_ft_ = ft;
+            }
+        }
+        if (fire) {
             armed_ = false;
             triggered_ = true;
             trig_ft_ = ft;
@@ -637,6 +646,11 @@ void Engine::writer_loop() {
         }
         if (stopping) {
             W = i64max;
+            wait_for_block = false;
+        }
+        if (stop_cut_pending_.load() &&
+            now - stop_cut_wall_ > std::chrono::seconds(1) + std::chrono::nanoseconds(max_delay_ * 100)) {
+            W = cut_;                      // N56: the wait is over: write what is up to the cut, block by block
             wait_for_block = false;
         }
         size_t done = 0;
@@ -726,6 +740,18 @@ void Engine::writer_loop() {
                     finish_now(r, cut_, true);
                 }
             }
+            // N56: a stop on request — every block delivers up to the stop's PLC time (process() ends the recording at
+            // the first sample after it), or the wait (max_delay + 1 s) ends: then what is up to the cut is written and
+            // the rest of a block that did not get there is its tail (missing, allowance 1)
+            if (!finish_req_.load() && stop_cut_pending_.load() &&
+                now - stop_cut_wall_ > std::chrono::seconds(1) + std::chrono::nanoseconds(max_delay_ * 100)) {
+                bool left = false;
+                for (auto& bp : blocks_) {
+                    SampleRing& r = bp->ring;
+                    if (r.head() != r.tail() && r.ft_at(r.tail()) <= cut_) left = true;
+                }
+                if (!left) finish_now(cut_reason_, cut_, true);
+            }
             if (fh_ && now - last_flush_ > std::chrono::seconds(1)) {
                 if (have_t0_) write_chain();
                 std::fflush(fh_);
@@ -772,12 +798,9 @@ int64_t Engine::tail_missing(const BState& s, int64_t end, bool have_end) const 
         return (end - ws_) / step_of(s) + 1;   // never delivered: the whole window is missing
     }
     if (end <= s.last_ft) return 0;
-    // one period of slack, as the Python recorder. R7: a stop on request (rec_stop, "run ended") unsubscribes the
-    // blocks one after another, so each block's last sample may lie a few cycles before the latest — that is the
-    // unsubscribe order, not a lost sample. The slack then covers the batching delay plus three cycles.
-    int64_t slack = 1;
-    if (manual_stop_.load() && !have_stop_ft_) slack = 3 + max_delay_ / std::max<int64_t>(1, step_of(s));
-    return std::max<int64_t>(0, (end - s.last_ft) / step_of(s) - slack);
+    // one period of allowance, the same rule as the Python recorder and rec_verify. A stop on request ends at a PLC
+    // time every block is waited for (N56), so no other allowance exists: a block that ends early has lost samples.
+    return std::max<int64_t>(0, (end - s.last_ft) / step_of(s) - 1);
 }
 
 int64_t Engine::window_end(bool& have) const {
@@ -841,6 +864,11 @@ void Engine::finish() {
             errors_.push_back("block " + std::to_string(bp->spec.id) + ": " + std::to_string(bp->size_mismatch) +
                               " samples with a size other than the block size");
     if (start_when_.set && !triggered_) errors_.push_back("start_when never fired: nothing recorded after the trigger");
+    if (start_when_.set && !triggered_ && have_warm_true_ && have_t0_)
+        errors_.push_back("start_when was true at " + ms(warm_true_ft_) + " ms during the warm-up (before every block had "
+                          "delivered, at most 200 ms) and false afterwards — it did not fire");
+    if (stop_on_request_)
+        stop_wait_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stop_cut_wall_).count();
     if (fh_ && have_t0_ && stall_open_) close_stall(have_end ? std::max(end, stall_adv_ft_) : blocks_[stall_block_]->last_ft);
     for (auto& n : resub_notes_) errors_.push_back(n);
     if (!resub_error_.empty()) errors_.push_back("re-registering the notifications failed " + std::to_string(resub_failures_) +
@@ -892,6 +920,20 @@ void Engine::finish() {
     f.raw("window_start_ms", have_ws_ && have_t0_ ? ms(ws_) : "null");
     f.raw("window_end_ms", have_end && have_t0_ ? ms(end) : "null");
     if (triggered_) f.raw("triggered_at_ms", ms(trig_ft_));
+    if (triggered_ && have_warm_true_) {
+        f.raw("trigger_delayed_ms", jnum(double(trig_ft_ - warm_true_ft_) / 1e4, 6));
+        f.str("trigger_note", "start_when was already true at " + ms(warm_true_ft_) + " ms, before every block had "
+              "delivered; it fired on the first cycle all blocks delivered (the window cannot start before a block's "
+              "first sample)");
+    }
+    if (start_when_.set && !triggered_ && have_warm_true_ && have_t0_) f.raw("start_when_warmup_true_ms", ms(warm_true_ft_));
+    if (stop_on_request_ && have_t0_) {
+        JObj so;
+        so.raw("at_ms", ms(cut_)).d("waited_ms", stop_wait_ms_, 3)
+            .str("rule", "ends at the newest PLC time delivered when the stop was asked for; every block must deliver "
+                         "up to it (allowance 1 period)");
+        f.raw("stop_on_request", so.done());
+    }
     f.d("completeness", comp, 8).str("verdict_hint", pass ? "PASS" : "FAIL").str("label", pass ? "COMPLETE" : "INCOMPLETE")
         .u("gap_markers", gap_markers_).u("chain_checkpoints", chains_)
         .u("stalls", stalls_).u("stalled_samples", stalled_samples_).d("stall_s", double(stall_100ns_) / 1e7, 8)
@@ -951,6 +993,11 @@ std::string Engine::status() {
     if (stall_open_ && have_t0_) o.raw("stalled_since_ms", ms(stall_adv_ft_));
     o.u("resubscriptions", source_ ? source_->resubscriptions() : 0);
     if (!resub_error_.empty()) o.str("resubscribe_error", resub_error_);
+    if (have_warm_true_ && have_t0_) {
+        o.raw("start_when_warmup_true_ms", ms(warm_true_ft_));
+        if (triggered_) o.raw("trigger_delayed_ms", jnum(double(trig_ft_ - warm_true_ft_) / 1e4, 6));
+    }
+    if (stop_cut_pending_.load() && have_t0_) o.raw("stopping_at_ms", ms(cut_));
     if (stop_reason_.empty()) o.null("stop_reason");
     else o.str("stop_reason", stop_reason_);
     std::vector<std::string> errs;
@@ -968,13 +1015,49 @@ std::string Engine::stop(const std::string& reason) {
         return o.done();
     }
     if (!finished_.load()) {
+        bool at_cut = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (stop_reason_.empty()) stop_reason_ = reason;
+            // N56: end at the newest PLC time delivered so far; keep the notifications until every block reached it
+            if (!armed_ && have_t0_ && !finish_req_.load() && !stop_cut_pending_.load()) {
+                int64_t newest = 0;
+                bool have = false;
+                for (auto& bp : blocks_) {
+                    const BState& s = *bp;
+                    const uint64_t h = s.ring.head();
+                    int64_t f = 0;
+                    bool hf = false;
+                    if (h != s.ring.tail()) {
+                        f = s.ring.ft_at(h - 1);
+                        hf = true;
+                    } else if (s.consumed_any) {
+                        f = s.consumed_ft;
+                        hf = true;
+                    }
+                    if (hf && (!have || f > newest)) {
+                        newest = f;
+                        have = true;
+                    }
+                }
+                if (have) {
+                    if (!have_cut_ || newest < cut_) {
+                        cut_ = newest;
+                        have_cut_ = true;
+                        cut_reason_ = reason;
+                    }
+                    stop_on_request_ = true;
+                    stop_cut_wall_ = std::chrono::steady_clock::now();
+                    stop_cut_pending_.store(true);
+                    at_cut = true;
+                }
+            }
         }
-        manual_stop_.store(true);
-        unsubscribe_once();        // no new samples; what the rings hold was taken before the stop
-        stop_req_.store(true);
+        if (!at_cut) {
+            manual_stop_.store(true);  // nothing delivered yet / still armed: no window end to wait for
+            unsubscribe_once();        // no new samples; what the rings hold was taken before the stop
+            stop_req_.store(true);
+        }
     }
     if (writer_.joinable()) writer_.join();
     JObj o;

@@ -4,6 +4,8 @@
 //   "sim": {"start_ft": <FILETIME>, "speed": <x real time, 0 = flat out>, "stop_after_cycles": n,
 //           "drop": [[block, first_cycle, last_cycle], ...], "late": [[block, cycles], ...], "fail_block": k,
 //           "max_cycles": n,
+//           "batch": [[block, cycles], ...]       (that block's samples are held and delivered together every `cycles`
+//                                                  cycles, after the other blocks' — ADS batching with max_delay)
 //           "skew": [[block, cycles], ...]        (that block's notifications run `cycles` ahead and arrive first in
 //                                                  each cycle: its sample of cycle c+n comes before the others' of c),
 //           "freeze": [first_cycle, last_cycle]   (PLC STOP: samples keep coming, every value frozen),
@@ -43,6 +45,9 @@ public:
         if (const JVal* l = sim.get("late"))
             for (auto& r : l->a)
                 if (r.a.size() == 2) late_.push_back({r.a[0].i, r.a[1].i, 0});
+        if (const JVal* bt = sim.get("batch"))
+            for (auto& r : bt->a)
+                if (r.a.size() == 2 && r.a[1].i > 0) batch_.push_back({r.a[0].i, r.a[1].i, 0});
         if (const JVal* k = sim.get("skew"))
             for (auto& r : k->a)
                 if (r.a.size() == 2) skew_.push_back({r.a[0].i, r.a[1].i, 0});
@@ -138,9 +143,16 @@ private:
                 for (int64_t cyc = (c == 0 ? 0 : c + sk.first); cyc <= c + sk.first; ++cyc) emit(static_cast<size_t>(sk.block), cyc);
             }
             for (size_t k = 0; k < blocks_.size(); ++k) {
-                bool skewed = false;
+                bool skewed = false, batched = false;
                 for (auto& sk : skew_) skewed = skewed || sk.block == static_cast<int64_t>(k);
-                if (!skewed) emit(k, c);
+                for (auto& bt : batch_) batched = batched || bt.block == static_cast<int64_t>(k);
+                if (!skewed && !batched) emit(k, c);
+            }
+            // batched blocks: every `cycles` cycles, the held cycles in order, after the others of this cycle
+            for (auto& bt : batch_) {
+                if (bt.block < 0 || bt.block >= static_cast<int64_t>(blocks_.size())) continue;
+                if ((c + 1) % bt.first == 0)
+                    for (int64_t cyc = c + 1 - bt.first; cyc <= c; ++cyc) emit(static_cast<size_t>(bt.block), cyc);
             }
             (void)ft;
             ++c;
@@ -166,7 +178,7 @@ private:
     std::atomic<bool> dead_{false};
     uint64_t resubs_ = 0;
     double speed_ = 1.0;
-    std::vector<Range> drops_, late_, skew_;   // skew_: {block, cycles ahead, unused}
+    std::vector<Range> drops_, late_, skew_, batch_;   // skew_: {block, cycles ahead, unused}; batch_: {block, cycles}
     std::vector<BlockSpec> blocks_;
     Sink* sink_ = nullptr;
     std::atomic<bool> run_{false};
