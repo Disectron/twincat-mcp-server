@@ -63,6 +63,9 @@ class Check:
 MANUAL: dict[str, str] = {
     "kb_set_location": "only with a folder you name (kb_status says what to ask); then kb_status shows the database",
     "kb_status": "after kb_set_location: location, projects, ESI devices",
+    "kb_rebuild": "only when kb_status shows an index rebuild_needed / outdated: kb_rebuild(index='infosys'|'manuals'|"
+                  "'esi') asks for approval (or takes a confirm_token); kb_status then shows the build running, "
+                  "then complete",
     "kb_add_project": "with a project folder you name; then kb_search for an FB name you know",
     "kb_remove_project": "remove the folder you added; kb_search no longer finds it",
     "kb_reindex": "after editing a POU in an added folder",

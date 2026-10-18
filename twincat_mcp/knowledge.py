@@ -17,12 +17,15 @@ the Claude plugins folder (cache/data are replaced or owned by the plugin manage
 user names none, the agent asks; the proposed fallback is D:\\TwinCAT-MCP\\knowledge (used only when the user agrees
 via kb_set_location(use_fallback=true)).
 
-The same folder holds the offline documentation the twincat-docs skill reads (layout of the knowledge README):
-  knowledge.db                 this module (projects, ESI, known errors)
-  tools\\infosys_local.py       builds helpviewer\\infosys_en.db from the Help Viewer package
-  tools\\manuals_db.py          builds manualsdb\\manuals.db from the PDFs in manuals\\
-  sop\\                          operator SOPs (Markdown)
-kb_status reports all of it; hw_lookup adds the manuals that mention a product code (read-only).
+The folder's layout and rules are permanent (docs/KNOWLEDGE_BASE.md; kb_layout names every path):
+  index\\knowledge.db           this module (projects, ESI)
+  index\\infosys-<lcid>.db      the one Infosys index (infosys_* tools and the twincat-docs skill), infosys_build
+  index\\manuals.db             the PDFs in manuals\\, tools\\manuals_db.py
+  manuals\\, sop\\               the user's (read, never written)
+  tools\\                        builder stubs
+kb_status reports all of it; hw_lookup adds the manuals that mention a product code (read-only). A rebuild of an
+index that exists runs only when the user approves it (kb_rebuild) or runs the builder; the first build of one that
+does not exist yet starts by itself.
 """
 from __future__ import annotations
 
@@ -40,14 +43,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from . import kb_layout as L
+
 FALLBACK_LOCATION = r"D:\TwinCAT-MCP\knowledge"
 MIN_FREE_BYTES = 1 << 30
-DB_NAME = "knowledge.db"
 POINTER_NAME = "knowledge_location.json"
-# the offline documentation next to knowledge.db (built by the plugin's builders — <kb>\\tools holds stubs that run them —
-# read by twincat-docs)
-INFOSYS_DB = ("helpviewer", "infosys_en.db")
-MANUALS_DB = ("manualsdb", "manuals.db")
 _SKILL_REL = Path("skills") / "twincat-docs" / "kb_docs.py"
 
 
@@ -393,6 +393,8 @@ class Knowledge:
         self.home = home
         self.configured = location
         self.esi_dirs = esi_dirs or []
+        self.docs_local: Any = None            # the Help Viewer package the server reads (set by the server)
+        self.last_layout: dict[str, Any] | None = None
         self.library_dirs = library_dirs or []
         self._fts: bool | None = None
         self.last_upkeep: dict[str, Any] | None = None
@@ -456,7 +458,7 @@ class Knowledge:
             if cur is None:
                 raise KnowledgeError(self.ask_text())
             # R38: asked without a folder while one is set — that is a question, not a reset
-            return {"location": str(cur), "database": str(cur / DB_NAME), "source": src, "changed": False,
+            return {"location": str(cur), "database": str(L.locate(cur, "knowledge")), "source": src, "changed": False,
                     "note": "the location is unchanged — pass path=… (a folder the user named) to choose another one",
                     "docs": self.docs_layout(cur, brief=True)}
         if not Path(path).expanduser().is_absolute():
@@ -470,10 +472,11 @@ class Knowledge:
         self.home.mkdir(parents=True, exist_ok=True)
         self._pointer().write_text(json.dumps({"path": str(p), "chosen": time.strftime("%Y-%m-%dT%H:%M:%S")}), encoding="utf-8")
         self._fts = None
-        out: dict[str, Any] = {"location": str(p), "database": str(p / DB_NAME)}
-        if old is not None and old != p and (old / DB_NAME).exists():
-            out["note"] = (f"the previous database stays at {old / DB_NAME}; move it into the new folder yourself if you "
-                           "want to keep its contents (nothing is copied or deleted automatically)")
+        self.layout(p)                               # the permanent layout in the new folder (docs/KNOWLEDGE_BASE.md)
+        out: dict[str, Any] = {"location": str(p), "database": str(L.locate(p, "knowledge"))}
+        if old is not None and old != p and L.locate(old, "knowledge").exists():
+            out["note"] = (f"the previous database stays at {L.locate(old, 'knowledge')}; move it into the new folder "
+                           "yourself if you want to keep its contents (nothing is copied or deleted automatically)")
         with self._db():
             pass
         out["changed"] = old is None or norm_path(old) != norm_path(p)
@@ -495,9 +498,27 @@ class Knowledge:
         self.last_upkeep = res
         return res
 
+    def layout(self, loc: Path | None = None) -> dict[str, Any]:
+        """The permanent layout (docs/KNOWLEDGE_BASE.md): every index moved from its old place into index\\ — once,
+        a rename, never a copy, never over a file — and index\\README.md. Run before anything opens an index (server
+        start, kb_set_location). Never raises; nothing is deleted."""
+        loc = loc or self.location()[0]
+        out: dict[str, Any] = {}
+        if loc is None or not Path(loc).is_dir():
+            return out
+        try:
+            out["moves"] = L.migrate(Path(loc))
+            out["readme_written"] = L.write_index_readme(Path(loc))
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = f"{type(exc).__name__}: {exc}"
+        self.last_layout = out
+        return out
+
     # -- database -------------------------------------------------------------------------
     def _db(self) -> "_Conn":
-        return _Conn(self.require() / DB_NAME, self)
+        p = L.locate(self.require(), "knowledge")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return _Conn(p, self)
 
     def _init(self, con: sqlite3.Connection) -> None:
         con.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
@@ -531,7 +552,7 @@ class Knowledge:
         if low:
             out["warning"] = low[0] + " — reads keep working; indexing may fail"
         with self._db() as con:
-            out["database"] = str(loc / DB_NAME)
+            out["database"] = str(L.locate(loc, "knowledge"))
             out["projects"] = [dict(r) for r in con.execute("SELECT path, label, added, indexed, units FROM projects ORDER BY path")]
             out["esi_devices"] = con.execute("SELECT COUNT(*) FROM esi").fetchone()[0]
             out["esi_files"] = con.execute("SELECT COUNT(*) FROM esi_files").fetchone()[0]
@@ -544,7 +565,21 @@ class Knowledge:
             out["duplicate_projects"] = (f"{twice} are the same folder (R35, added before 0.8.8 with another spelling) — "
                                          "kb_add_project on it merges them into one")
         out["known_errors"] = len(KNOWN_ERRORS)
+        out["esi"] = self.esi_state()
         out["docs"] = self.docs_layout(loc)
+        lay: dict[str, Any] = {"index": str(L.index_dir(loc)), "rules": "docs/KNOWLEDGE_BASE.md in the plugin; "
+                               "index\\README.md in the folder"}
+        moves = (getattr(self, "last_layout", None) or {}).get("moves", [])
+        if [m for m in moves if m.get("state") == "moved"]:
+            lay["moved_into_index"] = [m for m in moves if m.get("state") == "moved"]
+        if [m for m in moves if m.get("state") == "in use"]:
+            lay["not_moved_yet"] = [m for m in moves if m.get("state") == "in use"]
+        obsolete = L.obsolete_files(loc)
+        if obsolete:
+            lay["obsolete_files"] = obsolete
+            lay["obsolete_note"] = ("files the plugin no longer reads — it never deletes them (rule 7): delete them "
+                                    "yourself when you like (" + ", ".join(f"{o['size_mb']} MB" for o in obsolete) + ")")
+        out["layout"] = lay
         return out
 
     # -- the offline documentation next to knowledge.db (read-only) ------------------------
@@ -555,7 +590,7 @@ class Knowledge:
         if loc is None:
             return {"note": "no knowledge folder chosen yet"}
         script = docs_skill_path()
-        inf, man, builders = _docs_parts(loc)
+        inf, man, builders = _docs_parts(loc, getattr(self, "docs_local", None))
         out: dict[str, Any] = {"skill": "twincat-docs",
                                "call": (f'python "{script}" status --kb "{loc}"' if script else
                                         f'python "<twincat-docs skill folder>/kb_docs.py" status --kb "{loc}"'),
@@ -574,7 +609,7 @@ class Knowledge:
         loc = self.location()[0]
         if loc is None:
             return {"summary": "no knowledge folder chosen yet (kb_set_location) — no offline documentation", "ok": False}
-        inf, man, _b = _docs_parts(loc)
+        inf, man, _b = _docs_parts(loc, getattr(self, "docs_local", None))
         ok = inf.get("state") == "complete" and not inf.get("rebuild")
         out: dict[str, Any] = {"knowledge_folder": str(loc), "infosys": inf.get("message"), "manuals": man.get("message"),
                                "infosys_state": inf.get("state"), "manuals_state": man.get("state"), "ok": ok,
@@ -921,37 +956,83 @@ class Knowledge:
         return out
 
     def esi_index(self, force: bool = False) -> dict[str, Any]:
+        """Read the ESI files into the index: the files new or changed since the last run (all with force), in ONE
+        transaction — a reader sees the old rows or the new ones, never half (rule 6; knowledge.db also holds the
+        project folders, so it is not swapped as a file). Run by the first hw_lookup on an empty index, and by
+        kb_rebuild(index='esi') — never by itself for an index that exists (a new parser or new files: esi_state says
+        so until the user approves)."""
         folders = self.esi_folders()
         if not folders:
             raise KnowledgeError("no ESI folder found (looked in TwinCAT's Config\\Io\\EtherCAT folders); set knowledge.esi_dirs")
         files = sorted({f for d in folders for f in d.glob("*.xml")})
-        done = skipped = devices = 0
+        indexed = devices = skipped = 0
         errors: list[str] = []
+        # ONE transaction: the rows of each file are written as it is parsed (memory: one file at a time — the
+        # Beckhoff ESI folder holds hundreds of MB) and committed together at the end; knowledge.db is WAL, so a
+        # reader keeps seeing the rows of before until the commit. Any error before it: nothing changes.
         with self._db() as con:
-            # an index built by an older ESI parser is re-read once (D19: PDOs/CoE were empty)
             if self._esi_parser_stale(con):
-                force = True
+                force = True                         # another parser's rows: every file is read again
             known = {r["file"]: r["mtime"] for r in con.execute("SELECT file, mtime FROM esi_files")}
-        for f in files:
-            mt = f.stat().st_mtime
-            if not force and known.get(str(f)) == mt:
-                skipped += 1
-                continue
-            try:
-                rows = list(_parse_esi(f))
-            except ET.ParseError as exc:
-                errors.append(f"{f.name}: {exc}")
-                continue
-            with self._db() as con:
+            gone = sorted(set(known) - {str(f) for f in files})
+            for f in files:
+                mt = f.stat().st_mtime
+                if not force and known.get(str(f)) == mt:
+                    skipped += 1
+                    continue
+                try:
+                    rows = list(_parse_esi(f))
+                except ET.ParseError as exc:
+                    errors.append(f"{f.name}: {exc}")    # its earlier rows stay; esi_state reports it as changed
+                    continue
                 con.execute("DELETE FROM esi WHERE file=?", (str(f),))
                 con.executemany("INSERT INTO esi VALUES (?,?,?,?,?,?,?,?,?)", rows)
                 con.execute("INSERT OR REPLACE INTO esi_files VALUES (?,?,?)", (str(f), mt, len(rows)))
-            done += 1
-            devices += len(rows)
-        with self._db() as con:
+                indexed += 1
+                devices += len(rows)
+            for g in gone:
+                con.execute("DELETE FROM esi WHERE file=?", (g,))
+                con.execute("DELETE FROM esi_files WHERE file=?", (g,))
             con.execute("INSERT OR REPLACE INTO meta VALUES ('esi_parser', ?)", (str(ESI_PARSER_VERSION),))
-        return {"folders": [str(d) for d in folders], "files": len(files), "indexed": done, "unchanged": skipped,
-                "devices_added": devices, "errors": errors[:20]}
+        return {"folders": [str(d) for d in folders], "files": len(files), "indexed": indexed, "unchanged": skipped,
+                "removed": len(gone), "devices_added": devices, "errors": errors[:20]}
+
+    def esi_state(self) -> dict[str, Any]:
+        """missing | complete | rebuild_needed (built by another ESI parser) | outdated (ESI files added, changed or
+        removed since) — an index that exists stays in use as it is until kb_rebuild(index='esi') is approved."""
+        try:
+            folders = self.esi_folders()
+            files = {str(f): f.stat().st_mtime for d in folders for f in d.glob("*.xml")}
+            with self._db() as con:
+                n = con.execute("SELECT COUNT(*) FROM esi").fetchone()[0]
+                stale = self._esi_parser_stale(con)
+                parser = con.execute("SELECT v FROM meta WHERE k = 'esi_parser'").fetchone()
+                known = {r["file"]: r["mtime"] for r in con.execute("SELECT file, mtime FROM esi_files")}
+        except KnowledgeError as exc:
+            return {"state": "unknown", "message": str(exc)}
+        new = [f for f in files if f not in known]
+        changed = [f for f in files if f in known and known[f] != files[f]]
+        gone = [f for f in known if f not in files]
+        out: dict[str, Any] = {"devices": n, "files_indexed": len(known), "files_in_folders": len(files),
+                               "folders": [str(d) for d in folders]}
+        if n == 0 and not known:
+            out["state"] = "missing"
+            out["message"] = "no ESI index yet — the first hw_lookup builds it"
+            return out
+        msgs = []
+        if stale:
+            out["state"] = "rebuild_needed"
+            msgs.append(f"in use as it is, a REBUILD is due — built by ESI parser {parser[0] if parser else 'unknown'}, "
+                        f"this plugin's is {ESI_PARSER_VERSION}")
+        if new or changed or gone:
+            out.setdefault("state", "outdated")
+            out["new_files"], out["changed_files"], out["removed_files"] = len(new), len(changed), len(gone)
+            msgs.append(f"in use as it is, OUTDATED — {len(new)} new, {len(changed)} changed, {len(gone)} removed ESI "
+                        "file(s) not in it")
+        out.setdefault("state", "complete")
+        out["message"] = (f"{n} devices from {len(known)} files" + ("; " + "; ".join(msgs) if msgs else "")
+                          + (" — the rebuild runs once approved: kb_rebuild(index='esi')" if msgs else ""))
+        return out
 
     @staticmethod
     def _esi_parser_stale(con: sqlite3.Connection) -> bool:
@@ -970,12 +1051,9 @@ class Knowledge:
             raise KnowledgeError("empty query (e.g. 'EL2008', 'EL3062', '#x0bf03052')")
         if detail not in self.HW_DETAILS:
             raise KnowledgeError(f"detail must be one of {list(self.HW_DETAILS)} (got {detail!r})")
-        with self._db() as con:
-            stale = self._esi_parser_stale(con)
-        if self._esi_count() == 0 or stale:
-            idx = self.esi_index()
-        else:
-            idx = None
+        # the first build of the ESI index starts by itself; an index that exists is never rebuilt unasked (a new
+        # parser or new files: esi_state in the answer says so — kb_rebuild(index='esi') once approved)
+        idx = self.esi_index() if self._esi_count() == 0 else None
         if isinstance(revision, str):
             rs = revision.strip()
             try:
@@ -1033,6 +1111,10 @@ class Knowledge:
                                  "layout is under 'unparsed'; send it (or the ESI file) to get the parser fixed")
         if idx:
             res["indexed_now"] = idx
+        else:
+            st = self.esi_state()
+            if st.get("state") not in ("complete", "missing"):
+                res["esi_index_note"] = st["message"]          # rule 6: an answer from an index that is not current
         if not rows:
             res["note"] = "not in the installed ESI files — update the ESI (XAE: TwinCAT → EtherCAT Devices → Update Device Descriptions)"
         # the PDF manuals of the knowledge folder (read-only, built by manuals_db.py) for the same product codes.
@@ -1375,29 +1457,35 @@ def _cmd(builders: dict[str, Any], name: str, loc: Path, sub: str) -> str:
     return f'<Python 3.12+> "{script}" {sub} --kb "{loc}"'
 
 
-def _docs_parts(loc: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    idb, mdb = loc / INFOSYS_DB[0] / INFOSYS_DB[1], loc / MANUALS_DB[0] / MANUALS_DB[1]
+def _docs_parts(loc: Path, local: Any = None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """The two documentation indexes of the knowledge folder, as every reader reports them: Infosys
+    (infosys_build.state — local: the Help Viewer package the server reads) and manuals (the docs skill's
+    manuals_state), with the command that rebuilds one that is not complete."""
+    from . import infosys_build as IB
+    idb, mdb = L.locate(loc, "infosys"), L.locate(loc, "manuals")
     builders = _builders(loc)
+    try:
+        inf = IB.state(idb, local=local)
+    except Exception as exc:  # noqa: BLE001
+        inf = {"database": str(idb), "state": "error", "message": f"not readable: {exc}"}
     kd = kb_docs_module()
     if kd is not None:
-        try:
-            inf = kd.index_state(idb)
-        except Exception as exc:  # noqa: BLE001
-            inf = {"database": str(idb), "state": "error", "message": f"not readable: {exc}"}
         try:
             man = kd.manuals_state(mdb, loc / "manuals")
         except Exception as exc:  # noqa: BLE001
             man = {"database": str(mdb), "state": "error", "message": f"not readable: {exc}"}
     else:
-        inf = {"database": str(idb), "state": "unknown", "message": "the twincat-docs skill is not installed next to the server"}
-        man = {"database": str(mdb), "state": "unknown", "message": inf["message"]}
+        man = {"database": str(mdb), "state": "unknown", "message": "the twincat-docs skill is not installed next to the server"}
     inf["exists"], man["exists"] = idb.is_file(), mdb.is_file()
     if idb.is_file():
         inf["size_mb"] = round(idb.stat().st_size / 1e6, 1)
-    if inf.get("state") != "complete" or inf.get("rebuild"):
-        inf["command"] = _cmd(builders, "infosys_local.py", loc, "index")
-    if man.get("state") != "up_to_date" or man.get("updating"):
-        man["command"] = _cmd(builders, "manuals_db.py", loc, "update") + "   (PDF text: pypdf, or PyMuPDF if you installed it)"
+    rb = (inf.get("rebuild") or {}).get("state")
+    if rb != "running" and (inf.get("state") != "complete" or rb in ("interrupted", "waiting_to_replace")):
+        inf["command"] = (_cmd(builders, "infosys_local.py", loc, "index")
+                          + "   (or kb_rebuild(index='infosys'), which asks for approval)")
+    if man.get("state") != "complete" and (man.get("updating") or {}).get("state") != "running":
+        man["command"] = (_cmd(builders, "manuals_db.py", loc, "update") + "   (PDF text: pypdf, or PyMuPDF if you "
+                          "installed it; or kb_rebuild(index='manuals'), which asks for approval)")
     return inf, man, builders
 
 
@@ -1425,7 +1513,7 @@ def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
     """Which indexed PDF manuals mention these product codes (manuals_db.py's product table: exact code or CODE-xxxx)."""
     if loc is None or not codes:
         return {}
-    db = loc / MANUALS_DB[0] / MANUALS_DB[1]
+    db = L.locate(loc, "manuals")
     if not db.is_file():
         return {"manuals_note": f"no manuals database at {db} — PDF manuals copied into {loc / 'manuals'} and indexed "
                                 "with manuals_db.py update show up here (and in the twincat-docs skill)"}

@@ -1,23 +1,20 @@
-"""Rebuild the knowledge-base fixtures (helpviewer/infosys_en.db, manualsdb/manuals.db) with the REAL builders.
+"""The knowledge-base fixture (index/infosys-1033.db, index/manuals.db), built with the REAL code at test time.
 
-The twincat-docs skill reads databases made by <kb>\\tools\\infosys_local.py and <kb>\\tools\\manuals_db.py. The
-fixtures in this folder were produced by those two scripts from the synthetic pages below, so the tests check the
-skill against the exact schema and text format of the builders, not against a copy of it.
+The twincat-docs skill and the infosys_* tools read one Infosys index — the plugin's extractor
+(twincat_mcp.infosys_build) on a Help Viewer package — and the manuals index of builders/manuals_db.py. The fixture is
+made from the synthetic pages and the PDF below by exactly that code (tests/conftest.py: kb_fixture), so the tests
+check the readers against the current format, never against a stored copy of an older one.
 
-    python tests/fixtures/kb/make_fixtures.py [--tools <folder with infosys_local.py + manuals_db.py>] [--out tests/fixtures/kb]
+    python tests/fixtures/kb/make_fixtures.py --out <folder>        (to look at it)
 
---tools defaults to the builders shipped with the skill (skills/twincat-docs/builders). Needs Python 3.12+ (the
-builders' minimum), reportlab (to write the PDF) and pypdf or PyMuPDF (manuals_db.py reads it). Page ids, titles and help ids are
-those the acceptance table of the docs-skill spec names, so the same calls work on fixture and real database.
+Needs Python 3.12+, reportlab (to write the PDF) and pypdf or PyMuPDF (manuals_db.py reads it). Page ids, titles and
+help ids are those the acceptance table of the docs-skill spec names, so the same calls work on fixture and real index.
 """
 from __future__ import annotations
 
 import argparse
-import shutil
-import sqlite3
 import subprocess
 import sys
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -118,38 +115,40 @@ def build_pdf(path: Path) -> None:
     c.save()
 
 
+PACKAGE_NAME = "BKINFOSYS3_FIXTURE_EN-US.mshc"
+
+
+def write_package(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as z:
+        for name, html in PAGES.items():
+            z.writestr(name, html)
+    return path
+
+
+def make_kb(out: Path, tools: Path | None = None) -> Path:
+    """A knowledge folder at `out`: the package in out/_package, index/infosys-1033.db built by the plugin's
+    infosys_build, manuals/IPC/CX9020.pdf and index/manuals.db built by the manuals builder (its CLI)."""
+    root = Path(__file__).resolve().parents[3]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from twincat_mcp import infosys_build, kb_layout
+    tools = tools or root / "skills" / "twincat-docs" / "builders"
+    out.mkdir(parents=True, exist_ok=True)
+    pkg = write_package(out / "_package" / PACKAGE_NAME)
+    infosys_build.build(kb_layout.index_file(out, "infosys"), pkg, "1033", built_by="fixture", log=lambda s: None)
+    man = out / "manuals" / "IPC"
+    man.mkdir(parents=True, exist_ok=True)
+    build_pdf(man / "CX9020.pdf")
+    subprocess.run([sys.executable, str(tools / "manuals_db.py"), "update", "--kb", str(out)], check=True,
+                   capture_output=True)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tools", default=str(Path(__file__).resolve().parents[3] / "skills" / "twincat-docs" / "builders"),
-                    help="folder with infosys_local.py and manuals_db.py (default: the skill's builders)")
-    ap.add_argument("--out", default=str(Path(__file__).parent))
-    a = ap.parse_args()
-    tools, out = Path(a.tools), Path(a.out)
-    with tempfile.TemporaryDirectory() as td:
-        t = Path(td)
-        mshc = t / "BKINFOSYS3_FIXTURE_EN-US.mshc"
-        with zipfile.ZipFile(mshc, "w") as z:
-            for name, html in PAGES.items():
-                z.writestr(name, html)
-        db = out / "helpviewer" / "infosys_en.db"
-        db.unlink(missing_ok=True)
-        subprocess.run([sys.executable, str(tools / "infosys_local.py"), "--db", str(db), "index", "--mshc", str(mshc)],
-                       check=True)
-        # the temp package is gone after the build: point the stored path at a stable stand-in
-        meta = sqlite3.connect(db)
-        meta.execute("UPDATE meta SET value = ? WHERE key = 'mshc_path'", ("C:/fixture/BKINFOSYS3_FIXTURE_EN-US.mshc",))
-        meta.commit()
-        meta.close()
-        man = t / "manuals" / "IPC"
-        man.mkdir(parents=True)
-        build_pdf(man / "CX9020.pdf")
-        mdb = out / "manualsdb" / "manuals.db"
-        mdb.unlink(missing_ok=True)
-        subprocess.run([sys.executable, str(tools / "manuals_db.py"), "--db", str(mdb), "update", "--dir", str(t / "manuals")],
-                       check=True)
-    for p in out.rglob("*.db-journal"):
-        p.unlink()
-    shutil.rmtree(out / "__pycache__", ignore_errors=True)
+    ap.add_argument("--out", required=True)
+    print(make_kb(Path(ap.parse_args().out)))
 
 
 if __name__ == "__main__":

@@ -22,7 +22,9 @@ Needs Python 3.12 or newer (checked at start). PyMuPDF is not part of the twinca
 
 The knowledge folder (<kb>) is --kb, else the environment variable TCMCP_KNOWLEDGE_DIR, else the folder chosen with
 the twincat plugin's kb_set_location, else the folder above this script when it is a knowledge folder, else
-D:\\TwinCAT-MCP\\knowledge. PDFs: <kb>\\manuals (--dir), database: <kb>\\manualsdb\\manuals.db (--db).
+D:\\TwinCAT-MCP\\knowledge. PDFs: <kb>\\manuals (--dir), database: <kb>\\index\\manuals.db (--db) — the layout of
+docs/KNOWLEDGE_BASE.md in the twincat plugin. `update` writes <db>.building and replaces the index only when it is
+complete (the old one stays in use until then; an interrupted update replaces nothing).
 
 Version 2 (2026-10-18), changes against version 1:
   - refuses to run below Python 3.12 with a message (the file compiles on older versions, so the message is shown)
@@ -38,6 +40,10 @@ Version 4 (2026-10-18): page text format 3 — running headers, footers and marg
   removed; table header rows repeated at the top of continuation pages stay. The font-heading toc is read without
   them. The text-repetition rule remains only for a backend without text positions. An index of format 1 or 2 is
   reported as outdated and read again on update.
+Version 5 (0.8.11): page text format 4 — invisible text (font size 0, fully transparent) is not page text: Beckhoff
+  puts a size-0 copy of the running header under every heading, which doubled headings and toc titles (N37). The
+  index lives in <kb>\\index\\manuals.db (moved there once from manualsdb\\); an update builds <db>.building from a copy
+  of the index and swaps it in when complete. `stats` is the twincat-docs skill's state (one implementation).
 Stored paths stay absolute (moving the knowledge folder re-indexes every manual on the next update).
 """
 from __future__ import annotations
@@ -61,9 +67,18 @@ import threading  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
+HERE = Path(__file__).resolve().parent
+PLUGIN_ROOT = HERE.parents[2]                 # <plugin>/skills/twincat-docs/builders → <plugin>
+if "twincat_mcp" not in sys.modules and (PLUGIN_ROOT / "twincat_mcp" / "kb_layout.py").is_file():
+    sys.path.insert(0, str(PLUGIN_ROOT))
+from twincat_mcp import kb_layout as L  # noqa: E402 — where the index is: one place
+
 BUILDER = "manuals_db.py"
-BUILDER_VERSION = "4"
-TEXT_FORMAT = "3"                # page text / toc rules; an index written with another one is read again on update
+BUILDER_VERSION = "5"
+TEXT_FORMAT = "4"                # page text / toc rules; 4: invisible text (size 0, alpha 0) is not page text (N37).
+                                 # An index of another format stays in use, reported 'outdated', until `update` (or
+                                 # kb_rebuild('manuals')) reads every manual again. tests/test_builders.py fingerprints
+                                 # the code that makes the text and fails when it changes without a new format
 FALLBACK_KB = Path(r"D:\TwinCAT-MCP\knowledge")
 HEARTBEAT_STALE_S = 300          # one large PDF can take a while: an update silent for this long is gone
 
@@ -82,14 +97,14 @@ def kb_root(arg: str | None) -> tuple[Path, str]:
     except (OSError, ValueError):
         pass
     # the folder above <kb>\\tools\\<this script> — or above the builder stub in <kb>\\tools\\ that runs this script
-    up = Path(os.environ.get("TCMCP_STUB_DIR") or Path(__file__).resolve().parent).resolve().parent
-    if (up / "knowledge.db").is_file() or (up / "manualsdb").is_dir():
+    up = Path(os.environ.get("TCMCP_STUB_DIR") or HERE).resolve().parent
+    if L.is_knowledge_folder(up):
         return up, "folder above the script"
     return FALLBACK_KB, "default"
 
 
 def _db(args) -> Path:
-    return Path(args.db) if args.db else kb_root(args.kb)[0] / "manualsdb" / "manuals.db"
+    return Path(args.db) if args.db else L.locate(kb_root(args.kb)[0], "manuals")
 
 
 def _dir(args) -> Path:
@@ -123,12 +138,24 @@ class Span:
         self.blank = not text.strip()     # a space in its own font run: part of the text, not of the layout
 
 
+def _visible(size, alpha) -> bool:
+    """N37 (format 4): Beckhoff PDFs carry invisible text — under every heading a copy of the running header at font
+    size 0 ('4.2.2 Signal flow diagram' + '| Signal flow diagram' at 0.0 pt), which doubled headings and TOC titles.
+    The page text is what is drawn: text of size 0 draws nothing, fully transparent text (alpha 0) nothing visible."""
+    try:
+        if size is not None and float(size) <= 0:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return alpha is None or alpha != 0
+
+
 def _spans_pymupdf(page) -> tuple[list[Span], float]:
     out: list[Span] = []
     for bi, b in enumerate(page.get_text("dict").get("blocks", [])):
         for li, ln in enumerate(b.get("lines", [])):
             for s in ln.get("spans", []):
-                if not s["text"]:
+                if not s["text"] or not _visible(s.get("size"), s.get("alpha")):
                     continue
                 # a whitespace-only span is kept: a space set in another font than the words around it ('bold
                 # regular-space bold') is the only space between them — dropping it glued 'Note that' into 'Notethat'.
@@ -151,6 +178,8 @@ def _spans_pypdf(page) -> tuple[list[Span], float]:
         y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
         x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
         scale = abs(tm[3] * cm[3]) or abs(tm[0] * cm[0]) or 1.0
+        if not _visible(float(font_size or 0) * scale, None):
+            return
         try:
             base = str(font_dict.get("/BaseFont", "")) if font_dict is not None else ""
         except Exception:  # noqa: BLE001
@@ -622,12 +651,47 @@ def _meta(con, **kv) -> None:
     con.commit()
 
 
+def _replace(src: Path, dst: Path, wait_s: float = 60.0) -> bool:
+    """os.replace with retries: on Windows the live index cannot be replaced while a reader has it open."""
+    t0 = time.time()
+    while True:
+        try:
+            os.replace(src, dst)
+            return True
+        except PermissionError:
+            if time.time() - t0 > wait_s:
+                return False
+            time.sleep(1.0)
+
+
 def cmd_update(args) -> None:
     folder = _dir(args)
     folder.mkdir(parents=True, exist_ok=True)
-    db = _db(args)
+    if not args.db:
+        for m in L.migrate(kb_root(args.kb)[0]):         # the layout of docs/KNOWLEDGE_BASE.md, once
+            print(f"layout: {m['from']} → {m.get('to') or m['state']} ({m.get('why') or m['state']})")
+    db = _db(args) if args.db else L.index_file(kb_root(args.kb)[0], "manuals")
+    building = db.with_name(db.name + ".building")
+    if db.is_file() and not args.force:
+        st = manuals_state(db, folder)
+        if st["state"] == "complete" and not st.get("updating"):
+            print(f"up to date: {db} — {st['message']}")        # nothing copied, nothing replaced
+            return
     with UpdateLock(db) as lock:
-        _update(args, folder, db, lock)
+        for p in (building, building.with_name(building.name + "-journal")):
+            p.unlink(missing_ok=True)                   # this update's own work file, left by one that was interrupted
+        if db.is_file():                                # the update works on a copy: the index stays in use meanwhile
+            src = sqlite3.connect(ro_uri(db), uri=True, timeout=30)
+            dst = sqlite3.connect(str(building))
+            try:
+                src.backup(dst)
+            finally:
+                src.close()
+                dst.close()
+        _update(args, folder, building, lock)
+        if not _replace(building, db):
+            sys.exit(f"the update is complete ({building}) but {db} is open in another program — close it (MCP "
+                     "tools, kb_docs.py) and run update again")
 
 
 def _update(args, folder: Path, db: Path, lock: "UpdateLock") -> None:
@@ -684,6 +748,7 @@ def _update(args, folder: Path, db: Path, lock: "UpdateLock") -> None:
     _meta(con, state="idle", files_done=len(found), heartbeat=f"{time.time():.0f}",
           last_update=time.strftime("%Y-%m-%d %H:%M:%S"),
           last_result=f"{added} added, {changed} updated, {removed} removed, {unchanged} unchanged, {failed} failed")
+    con.close()
     print(f"done: {added} added, {changed} updated, {removed} removed, {unchanged} unchanged, {failed} failed "
           f"— folder {folder}")
 
@@ -784,56 +849,13 @@ def ro_uri(db: Path) -> str:
 
 
 def manuals_state(db: Path, folder: Path) -> dict:
-    """The real state: what is indexed, what in the folder is not (new / changed / gone, by size + mtime like
-    update), and an update that is running or was interrupted. Same rules as the twincat-docs skill's status."""
-    out: dict = {"database": str(db), "folder": str(folder)}
-    on_disk = {os.path.normcase(str(f)): f for f in folder.rglob("*") if f.suffix.lower() == ".pdf" and f.is_file()} if folder.is_dir() else {}
-    out["pdfs_in_folder"] = len(on_disk)
-    if not db.is_file():
-        out["state"] = "missing"
-        out["message"] = f"no manuals database yet ({len(on_disk)} PDFs in the folder) — run update"
-        return out
-    con = sqlite3.connect(ro_uri(db), uri=True, timeout=5)
-    con.row_factory = sqlite3.Row
-    try:
-        docs = [dict(r) for r in con.execute("SELECT path, name, size, mtime, pages, text_pages FROM doc")]
-        try:
-            meta = {r[0]: r[1] for r in con.execute("SELECT key, value FROM meta")}
-        except sqlite3.OperationalError:
-            meta = {}                                       # built by version 1
-    finally:
-        con.close()
-    known = {os.path.normcase(d["path"]): d for d in docs}
-    new = sorted(f.name for k, f in on_disk.items() if k not in known)
-    changed = sorted(f.name for k, f in on_disk.items() if k in known and
-                     (known[k]["size"] != f.stat().st_size or known[k]["mtime"] != int(f.stat().st_mtime)))
-    gone = sorted(d["name"] for k, d in known.items() if k not in on_disk)
-    out.update({"manuals": len(docs), "pages": sum(d["pages"] or 0 for d in docs), "not_indexed": new,
-                "changed_since_index": changed, "indexed_but_gone": gone,
-                "no_text_layer": sorted(d["name"] for d in docs if not d["text_pages"]),
-                "last_update": meta.get("last_update"), "last_result": meta.get("last_result")})
-    lock = db.with_name(db.name + ".lock")
-    beat = max(float(meta.get("heartbeat") or 0), lock.stat().st_mtime if lock.is_file() else 0)
-    if meta.get("state") == "updating":
-        out["updating"] = {"state": "running" if time.time() - beat < HEARTBEAT_STALE_S else "interrupted",
-                         "files_done": int(meta.get("files_done") or 0), "files_total": int(meta.get("files_total") or 0)}
-    pending = len(new) + len(changed) + len(gone)
-    fmt = meta.get("text_format") or "1"
-    old_text = bool(docs) and fmt != TEXT_FORMAT
-    out["text_format"] = fmt
-    out["state"] = "pending" if pending else "outdated" if old_text else "up_to_date"
-    msg = f"{len(docs)} manuals, {out['pages']} pages indexed"
-    if pending:
-        msg += f"; {len(new)} new, {len(changed)} changed, {len(gone)} removed PDF(s) not reflected — run update"
-    if old_text:
-        msg += (f"; page text format {fmt}, this builder writes {TEXT_FORMAT} (running headers removed, wrapped "
-                "headings joined) — run update, it reads every manual again")
-    if out.get("updating"):
-        u = out["updating"]
-        msg += (f"; an update is RUNNING ({u['files_done']} of {u['files_total']} files)" if u["state"] == "running" else
-                f"; the last update was INTERRUPTED at {u['files_done']} of {u['files_total']} files — run update")
-    out["message"] = msg
-    return out
+    """The real state — the twincat-docs skill's implementation (kb_docs.manuals_state), the one every reader uses."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tcmcp_kb_docs_manuals", HERE.parent / "kb_docs.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod.manuals_state(db, folder)
 
 
 def cmd_stats(args) -> None:
@@ -853,7 +875,7 @@ def main() -> None:
     # --kb / --db work before or after the command (update --kb D:\\kb as well as --kb D:\\kb update)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--kb", default=argparse.SUPPRESS, help="knowledge folder (default: see above)")
-    common.add_argument("--db", default=argparse.SUPPRESS, help="database (default <kb>\\manualsdb\\manuals.db)")
+    common.add_argument("--db", default=argparse.SUPPRESS, help="database (default <kb>\\index\\manuals.db)")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
     sub = ap.add_subparsers(dest="cmd", required=True)
     _sub = sub.add_parser

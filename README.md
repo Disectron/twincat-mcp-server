@@ -154,25 +154,29 @@ Env vars override `twincat_mcp.toml` (`./`, `~/.twincat_mcp/config.toml`, or `TC
 
 **Experiments** `exp_template` · `exp_validate` · `exp_save` · `exp_list` · `exp_get` · `exp_runs` · `exp_run[dry_run]` · `exp_status` · `exp_abort` · `exp_evaluate` · `exp_report` · `exp_compare`
 
-**Knowledge base** `kb_set_location` · `kb_status` · `kb_add_project` · `kb_remove_project` · `kb_reindex` · `kb_search` · `hw_lookup` · `proj_libraries` — the database lives in a folder you name; only project folders you add are indexed
+**Knowledge base** `kb_set_location` · `kb_status` · `kb_rebuild` · `kb_add_project` · `kb_remove_project` · `kb_reindex` · `kb_search` · `hw_lookup` · `proj_libraries` — the database lives in a folder you name; only project folders you add are indexed
 
 **Offline documentation — skill `twincat-docs`** (no MCP tools; a read-only script the skill runs). The knowledge
-folder also holds the documentation its own tools build:
+folder has one fixed layout (0.8.11; the rules are `docs/KNOWLEDGE_BASE.md`):
 
-| file in the knowledge folder | content | built by |
+| in the knowledge folder | content | built by |
 |---|---|---|
-| `knowledge.db` | projects for `kb_search`, ESI devices for `hw_lookup`, known errors | the `kb_*` tools |
-| `helpviewer\infosys_en.db` | every Infosys page of the Help Viewer package (≈ 51,000 pages, 283 books) | `skills\twincat-docs\builders\infosys_local.py index` (Python 3.12+) |
-| `manualsdb\manuals.db` | the PDF manuals in `manuals\` — page text, chapters, product codes | `skills\twincat-docs\builders\manuals_db.py update` (Python 3.12+) |
-| `sop\` | operator SOPs (Markdown) | by hand |
+| `index\infosys-1033.db` | the TwinCAT 3 books of the Help Viewer package — the one Infosys index, read by the `infosys_*` tools and the skill | the plugin, the first time by itself; later `tools\infosys_local.py index` or `kb_rebuild(index='infosys')` |
+| `index\manuals.db` | the PDF manuals in `manuals\` — page text, chapters, product codes | `tools\manuals_db.py update` or `kb_rebuild(index='manuals')` (Python 3.12+ with pypdf or PyMuPDF) |
+| `index\knowledge.db` | projects for `kb_search`, ESI devices for `hw_lookup` | the `kb_*` tools; the ESI part the first `hw_lookup`, later `kb_rebuild(index='esi')` |
+| `manuals\`, `sop\` | your PDFs and SOPs (Markdown) | you — the plugin never writes there |
+| `tools\` | builder stubs that run the plugin's builders | the plugin (only files it shipped are replaced) |
 
 `skills/twincat-docs/kb_docs.py` answers `docs_search`, `docs_declaration`, `docs_page`, `docs_books`,
 `manual_search`, `manual_product`, `manual_toc`, `manual_page`, `manual_docs`, `status` as one JSON object each
-(standard library, opens both databases read-only, same ranking and page references as the builder scripts). A name
-that exists in several libraries (`MC_MoveAbsolute` in Tc2_MC2 and Tc3_DriveMotionControl) is never resolved
-silently: the answer is `ambiguous` with the candidates. `kb_status` → `docs` shows both databases, the PDFs not
-indexed yet and the exact command for this folder; `hw_lookup` lists the manuals that mention a product code.
-The `infosys_*` tools stay as the fallback (their own index of the same package). The server reports the state of both databases at every connection, in `tc_doctor` (`offline_docs`) and in `kb_status` → `docs`: complete, outdated (the package changed), old format, incomplete, or a rebuild running or interrupted. Each answer's `source` carries the same state. Infosys links are kept: `docs_page` and `docs_declaration` return them as `links`, which `docs_page` opens.
+(standard library, opens both indexes read-only). A name that exists in several libraries (`MC_MoveAbsolute` in
+Tc2_MC2 and Tc3_DriveMotionControl) is never resolved silently: the answer is `ambiguous` with the candidates.
+`kb_status` → `docs` shows both indexes, the PDFs not indexed yet and the exact command for this folder; `hw_lookup`
+lists the manuals that mention a product code. Every index is `complete`, `rebuild_needed` (another format) or
+`outdated` (the source changed) — the last two are used as they are until you approve the rebuild — or `missing`,
+plus a build running, interrupted or waiting to replace it; the server reports it at every connection, in
+`tc_doctor` (`offline_docs`), in `kb_status` and in each answer's `source`. Links are stored as page addresses:
+`docs_page` and `docs_declaration` return them as `links`, which `docs_page` opens.
 
 **Capture profiles** `rec_scan` · `rec_profile_save` · `rec_profile_list` · `rec_profile_get` · `rec_profile_delete` · `rec_profile_start` · `rec_profile_stop`
 
@@ -388,10 +392,13 @@ an index:
   ≈ 280 books). It is a zip of `<book>/1033/<pageid>.html` with the **same page ids as the website**, so
   every page is stored under its real `https://infosys.beckhoff.com/content/1033/<book>/<id>.html` URL.
   `docs.source = "local"` (default): no network call at all, no web fallback; the newest package is found
-  automatically (`[docs] mshc` to pin one); every TwinCAT 3 book is indexed in the background on first use
-  (default books first), into `<knowledge location>\infosys\helpviewer-1033` when a knowledge base folder is
-  chosen. A Help Viewer content update changes the package stamp and re-indexes everything; an unchanged
-  package is never re-read. Results carry the page's doc version (`Microsoft.Help.DisplayVersion`) and
+  automatically (`[docs] mshc` to pin one). **One index** (0.8.11, rules in `docs/KNOWLEDGE_BASE.md`): every
+  TwinCAT 3 book of the package, built as a whole in its own process into `<knowledge folder>\index\infosys-1033.db`
+  (without a knowledge folder: `<cache_dir>\helpviewer-1033\index.sqlite`) — the same file the `infosys_*` tools
+  and the twincat-docs skill read. The first build starts by itself; after that a new package or a plugin update
+  that changes the stored format is reported (`tc_doctor`, `kb_status`, every answer) and the index is used as it
+  is until you approve `kb_rebuild(index='infosys')` or run `tools\infosys_local.py index`; the rebuild replaces
+  the index only when it is complete. Results carry the page's doc version (`Microsoft.Help.DisplayVersion`) and
   `source.modified` — **the package is as old as the last Help Viewer update on this PC**; check that date
   before trusting a page about a new build or library version. `infosys_get_page` reads any page in the package,
   indexed or not, with its breadcrumb. `docs.source = "web"` brings back the behaviour below.
@@ -418,9 +425,10 @@ an index:
   fetches them for title/excerpt and caches them. `backend` in the result says which path answered.
   `docs.web_fallback=false` turns it off.
 
-Config (`[docs]` in the TOML / `TCMCP_DOCS*`): `source` (local | web), `mshc`, `enabled`, `books` (indexed first), `exclude_books`
-(regexes), `tc3_only`, `max_workers` (≤16; be polite), `max_index_pages`, `sitemap_ttl_days`,
-`web_fallback`, `cache_dir`. Nothing here touches a PLC; all seven tools are read-only class.
+Config (`[docs]` in the TOML / `TCMCP_DOCS*`): `source` (local | web), `mshc`, `enabled`, `cache_dir`; for the web
+source `books` (indexed first), `exclude_books` (regexes), `tc3_only`, `max_workers` (≤16; be polite),
+`max_index_pages`, `sitemap_ttl_days`, `web_fallback` — the local index holds every TwinCAT 3 book whatever they
+say. The `infosys_*` tools are read-only class; `kb_rebuild` is control class and always asks for approval.
 
 ## A debugging session
 

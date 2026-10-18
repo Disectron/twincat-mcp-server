@@ -28,6 +28,13 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| 0.8.11 | layout move on the real knowledge folder (first server start after the update) | `index\` holds `knowledge.db`, `manuals.db`, `infosys-1033.db` (renamed from `knowledge.db`, `manualsdb\`, `infosys\helpviewer-1033\index.sqlite`), `index\README.md`; `kb_status` → `layout.obsolete_files` lists `helpviewer\infosys_en.db` (≈ 288 MB), nothing deleted; your `manuals\`, `sop\`, `tools\*OLD.py` untouched |
+| 0.8.11 | Infosys format 4: the moved index reads `rebuild_needed`, answers as it is; `kb_rebuild(index='infosys')` approved | before approval no build starts (also across a restart); after: `tc_doctor` → rebuild running with pages done, the old index answers meanwhile, then `complete`, format 4; time and size of the build; on Windows the swap while the server reads (`replaced`, or `waiting_to_replace` → swapped at the next start) |
+| 0.8.11 | N77 / N79 on the real index: `infosys_declaration FB_WG_ComboFilter`, a property with a linked type; `docs_search "how to a the"` | property `type` plain text + `type_ref`; the stop-word query refused like `kb_search` |
+| 0.8.11 | N37 format 4 on the four manuals (`kb_rebuild(index='manuals')` approved) | EL3356 headings and toc titles once (no invisible `\| Signal flow diagram` copy); `manuals_db.py stats` → complete, text_format 4 |
+| 0.8.11 | N76 `ads_dump(max_total_mb=…)` with a limit below the full size, and one above it by less than the footer | `written_mib` ≤ the limit; `limit_counts` = CSV + JSON on disk; skipped roots in the footer; a limit below the files' frame refused |
+| 0.8.11 | reads by name after an online change / activate that moves variables (`ads_read`, `ads_watch`, `rec_start` poll) | the new address is used at once (`symbol_version` changes); no value of a neighbour variable |
+| 0.8.11 | N75 / N5: `xae_deploy` and `xae_restart_twincat` from RUN | the after-witness is from the runtime that came back (values, not all null); `steps.restart.duration_s` lasts until RUN was seen again, `command_s` the shell part |
 | 0.8.10 | N38 `plcopen_import(option='replace')` on the real shell (A7): export `95_UnitTests.PRG_TcUnitRunner`, import `replace` | `replaced` + `header_renamed` (`PRG_TcUnitRunner_1` → `PRG_TcUnitRunner`), `checked_against: xml`; disk file `PROGRAM PRG_TcUnitRunner`; no `_1` in tree / `.plcproj`; `xae_build` 0 errors. If refused: the error names the differing line — that is TwinCAT's transformation, report it |
 | 0.8.10 | R40 restart proof (B6): `xae_deploy` from CONFIG ×3, from RUN ×3, `xae_restart_twincat` from RUN | `deployed` / `restarted` true every time; `steps.verify.transition_by` mode_change (from CONFIG) or witness/poll (from RUN); `ads_status` RUN |
 | 0.8.10 | N41 / N42 `xae_plc` with two PLC projects (or one) | without `plc_project_path` and two projects → refused; token via `tc_request_confirmation(action='xae_plc', args={...})` → `login:<project>@<NetId>`; a token for B never acts on A |
@@ -55,6 +62,8 @@ tool wishlist (2026-10-18).
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
 - D5 (BOOL members inside structs read as 1/0): the exact call and output — the fake decodes them as true/false.
+- Retest of 0.8.11 (the 0.8.11 rows above; approve the Infosys and manuals rebuilds to format 4; delete
+  `helpviewer\infosys_en.db` when you like).
 - Retest of 0.8.10 (N38, R40, N41, N42/N40/N69, R24, N37/N66, N64/N68, N65, N67, N46, N39/N47–N55, N56–N63, and the review fixes: recorder blocks with < 2 samples, Python stop_when end, dump names, restart proof without a counter reset = "cannot tell"; the hardware rows above).
 - D19 (ESI PDOs read empty): the PDOs are template references (`Ref="TxEL3xxNComplex10-10V"`, `Chn`); the template
   definition's format is unknown here — the ESI file that holds it (e.g. `C:\TwinCAT\3.1\Config\Io\EtherCAT\Beckhoff EL31xx.xml`).
@@ -73,7 +82,8 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 | `rec_engine_status` / `rec_engine_install` | rejected — exe ships in the plugin since 0.8.1; `tc_doctor` shows it |
 | tool groups that load together | rejected as a server feature — deferred loading is the client's; `[server] tool_groups` exists |
 | `kb_add_note` | index `.md` under the knowledge folder (SOPs) instead; results labelled operator SOP / Beckhoff doc / known error |
-| hardware manuals | plugin reads `manualsdb\manuals.db` (built by `manuals_db.py`); PyMuPDF (AGPL-3.0) stays out of the public plugin |
+| hardware manuals | plugin reads `index\manuals.db` (built by `manuals_db.py`); PyMuPDF (AGPL-3.0) stays out of the public plugin |
+| knowledge base rules (2026-10-18) | `docs/KNOWLEDGE_BASE.md`: one `index\` folder, one index per source, normalised once at index time, format fingerprints in tests, first build automatic and every later rebuild only after approval (`kb_rebuild`), nothing deleted by the plugin — changes need Ryan's approval |
 | Infosys source | local Help Viewer package, no network (0.8.3) |
 | profiler | `prof_task` first (no code change, `_TaskInfo` via the lossless recorder); per-POU instrumentation later, method per target (CX9020 / WEC7 Arm has no `GETCPUACCOUNT`/`PROFILER` → `FB_CXProfiler`, wall-clock); budgets on max + `CycleTimeExceeded`, not p99; CIs with batch means (autocorrelated cycles); verify that `GETCPUACCOUNT` excludes pre-emption before relying on it; evaluate TE1210 |
 
@@ -83,10 +93,8 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 |---|---|
 | R12 / A6 | `rec_verify` over many counters (pattern/list) and the 300 × 1 ms acceptance run per recording method; capacity documented — not built (`rec_verify` takes one counter) |
 | #45 | Check all objects did not run — 0.8.7 calls `ITcPlcIECProject2.CheckAllObjects` first (unverified, above) |
-| infosys index twice | the `infosys_*` tools keep their own index of the Help Viewer package (`<kb>\infosys\helpviewer-1033`, ≈ 372 MB) next to `helpviewer\infosys_en.db`; one index (the tools reading `infosys_en.db`) is open — docs-skill spec §8 |
 | SOP indexing | `sop\*.md` listed by `kb_status`, not searchable yet (decided: index them; wishlist above) |
-| R32 (part) | Infosys "T_Ams NetId" table split — 0.8.9 joins it when a page is read (declared name or Type column), verified in the 0.8.9 retest; the cause in the raw HTML is still not seen |
-| infosys NBSP | the knowledge-folder index (`infosys_en.db`, builder) stores code with non-breaking spaces; `kb_docs.py` cleans them when it reads — the builder should store plain spaces (index format change, rebuild) |
+| R32 (part) | Infosys "T_Ams NetId" table split — joined when the index is built since 0.8.11 (format 4; 0.8.9 joined it when a page was read), verified in the 0.8.9 retest; the cause in the raw HTML is still not seen |
 | D19 | ESI PDOs that are template references (`Ref=…`, `Chn`) are not resolved — waiting on the ESI file |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |

@@ -66,17 +66,19 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 `<kb>` is the knowledge folder of the twincat plugin. It comes from `--kb PATH`, else the environment variable
 `TCMCP_KNOWLEDGE_DIR`, else the folder chosen with `kb_set_location`, else `D:\TwinCAT-MCP\knowledge`. A folder
 set in `twincat_mcp.toml` (`[knowledge] location`) is not seen by the script: take the exact command from the twincat
-server's `kb_status` → `docs.call` (it carries `--kb`). `kb_status` also shows both databases and the PDFs not
+server's `kb_status` → `docs.call` (it carries `--kb`). `kb_status` also shows both indexes and the PDFs not
 indexed yet.
 
-| Database | Content | Built by |
+| Index | Content | Built by |
 |---|---|---|
-| `<kb>\helpviewer\infosys_en.db` | all Infosys pages of the Help Viewer package (≈ 51,000 pages, 283 books) | `<skill folder>\builders\infosys_local.py index --kb <kb>` (Python 3.12+; ≈ 150 s; a no-op when the package is unchanged) |
-| `<kb>\manualsdb\manuals.db` | PDF manuals from `<kb>\manuals\`, one row per page, chapters, product codes | `<skill folder>\builders\manuals_db.py update --kb <kb>` (Python 3.12+; needs PyMuPDF or pypdf) |
+| `<kb>\index\infosys-1033.db` | the TwinCAT 3 books of the Help Viewer package — the same index the twincat server's `infosys_*` tools read | the plugin itself the first time; later `<kb>\tools\infosys_local.py index` or `kb_rebuild(index='infosys')` (minutes) |
+| `<kb>\index\manuals.db` | PDF manuals from `<kb>\manuals\`, one row per page, chapters, product codes | `<kb>\tools\manuals_db.py update` or `kb_rebuild(index='manuals')` (Python 3.12+ with PyMuPDF or pypdf) |
 
-`status`, and `source.state` in every answer, say whether the index is `complete`, `outdated` (the package changed),
-`old_format`, `incomplete`, `missing`, or being rebuilt (`state_note`). When it is not `complete`, tell the user; the
-answer may come from an older package.
+`status`, and `source.state` in every answer, give the state of the index: `complete`; `rebuild_needed` (built by
+another format) or `outdated` (the package or the PDFs changed) — both are used as they are; or `missing`. A build
+in progress, interrupted or waiting to replace the index is in `state_note`. When it is not `complete`, tell the user
+and that the rebuild runs only once they approve it (`kb_rebuild`, or the command in `hint`); the answer may come
+from an older package or format.
 
-`no_index` means the database is missing. Tell the user the build command from `hint`. Do not search the web
-instead without saying so.
+`no_index` means the index is missing. Tell the user the build command from `hint`. Do not search the web instead
+without saying so.

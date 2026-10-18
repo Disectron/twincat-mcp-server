@@ -93,7 +93,7 @@ report separates computed sections from interpretation. Use it for every "did th
 question instead of comparing two fills by eye.
 
 Reference: documentation questions (library FBs, types, error codes, concepts, hardware manuals) go
-to the twincat-docs skill of this plugin (offline: <kb>\\helpviewer\\infosys_en.db + <kb>\\manualsdb\\manuals.db;
+to the twincat-docs skill of this plugin (offline: <kb>\\index\\infosys-1033.db + <kb>\\index\\manuals.db;
 kb_status shows them). The ads_* tools read the running PLC only and never return documentation.
 infosys_declaration <FB|struct|enum> gives the library symbol's declaration with descriptions; infosys_search_symbols / infosys_search / infosys_search_code / infosys_get_page
 look up Beckhoff Infosys (TwinCAT 3 only) from the Help Viewer package installed with XAE — indexed
@@ -263,11 +263,13 @@ TOKEN_TARGET_DOC = {
     "ipc_write_file / ipc_delete_file / ipc_start_process": "the remote path", "ipc_eventlog": "the log name",
     "ipc_reboot": "the literal 'target'", "rec_delete": "the recording id", "tc_set_mode": "the mode",
     "tc_allow_write": "the pattern ('-pattern' to remove)", "exp_run": "the experiment name",
+    "kb_rebuild": "the index: 'infosys', 'manuals' or 'esi'",
 }
 TOKEN_TARGET_ARGS = {"xae_target": "net_id", "ads_plc_state": "action", "ads_system_mode": "action",
                      "ads_connect": "ams_net_id", "ads_add_route_to_plc": "plc_ip", "ipc_write_file": "path",
                      "ipc_delete_file": "path", "ipc_start_process": "path", "ipc_eventlog": "log",
-                     "ipc_reboot": "", "rec_delete": "id", "tc_set_mode": "mode", "exp_run": "name"}
+                     "ipc_reboot": "", "rec_delete": "id", "tc_set_mode": "mode", "exp_run": "name",
+                     "kb_rebuild": "index"}
 
 
 def _plc_iec_path(path: str) -> str:
@@ -294,6 +296,8 @@ class App:
         self.ads.interface_hint = self.is_source_interface
         from .config import _home
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
+        # the permanent layout of the knowledge folder (docs/KNOWLEDGE_BASE.md) before anything opens an index
+        self.kb.layout()
         # the builder stubs in <kb>\tools run this plugin's builders: record where they are, turn old copies into stubs
         threading.Thread(target=self._builder_upkeep, name="tcmcp-builders", daemon=True).start()
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
@@ -314,12 +318,17 @@ class App:
         threading.Thread(target=self._seal_sweep, name="tcmcp-seal-sweep", daemon=True).start()
         self.docs: InfosysIndex | None = None
         self.docs_error: str | None = None
+        self.docs_build_target: Path | None = None     # where a build of the local package's index writes
+        self.infosys_build_proc: Any = None
         if cfg.docs.enabled:
             try:
                 local = None
                 cache = cfg.docs.cache_dir
+                db_file: Path | None = None
                 if cfg.docs.source == "local":
                     from . import helpviewer as HV
+                    from . import infosys_build as IB
+                    from . import kb_layout as L
                     pk = HV.find_packages(cfg.docs.mshc)
                     if not pk:
                         where = cfg.docs.mshc or " / ".join(str(r) for r in HV.catalog_roots())
@@ -328,15 +337,21 @@ class App:
                             f"found under {where}. Install the TwinCAT documentation for the Help Viewer, set "
                             "[docs] mshc = '<path to the .mshc>', or docs.source = 'web' to use infosys.beckhoff.com.")
                     local = HV.HelpViewerSource(pk[0])
-                    # the full package index (≈ 50k pages) belongs next to the knowledge base when one is chosen
+                    # ONE index of the package (docs/KNOWLEDGE_BASE.md): <kb>\index\infosys-<lcid>.db, built as a whole
+                    # by infosys_build and only read here; without a knowledge folder, in the server's own folder
                     kb_dir = self.kb.location()[0]
-                    base = Path(cache) if (cfg.docs_cache_explicit or kb_dir is None) else kb_dir / "infosys"
-                    cache = str(base / f"helpviewer-{local.lcid}")
+                    if kb_dir is not None:
+                        db_file = L.locate(kb_dir, "infosys", local.lcid)
+                        self.docs_build_target = L.index_file(kb_dir, "infosys", local.lcid)
+                    else:
+                        db_file = self.docs_build_target = Path(cache) / f"helpviewer-{local.lcid}" / "index.sqlite"
+                    IB.prepare_for_readers(db_file)
+                    self.kb.docs_local = local
                 self.docs = InfosysIndex(cache, books=cfg.docs.books, exclude_books=cfg.docs.exclude_books,
                                          tc3_only=cfg.docs.tc3_only, max_workers=cfg.docs.max_workers,
                                          max_index_pages=cfg.docs.max_index_pages, sitemap_ttl_days=cfg.docs.sitemap_ttl_days,
                                          web_fallback=cfg.docs.web_fallback, fetch_timeout_s=cfg.docs.fetch_timeout_s,
-                                         local=local)
+                                         local=local, db_file=db_file, read_only=local is not None)
             except Exception as exc:  # noqa: BLE001 — a broken cache dir / missing package must not take the server down
                 self.docs_error = str(exc)
                 log.warning("infosys index disabled: %s", exc)
@@ -348,11 +363,114 @@ class App:
         self.started = time.time()
 
     def _warm_docs(self) -> None:
+        if self.docs is not None and self.docs.local is not None:
+            try:
+                self.infosys_upkeep()
+            except Exception as exc:  # noqa: BLE001 — the tools work without it; tc_doctor shows the state
+                log.warning("infosys index upkeep: %s", exc)
         try:
             r = self.docs.warm()
             self.docs_warm = {"state": "warm", **r}
         except Exception as exc:  # noqa: BLE001
             self.docs_warm = {"state": "failed", "error": str(exc)[:160]}
+
+    # --- the Infosys index of the local package (docs/KNOWLEDGE_BASE.md rule 6) ---------------------------------
+    def infosys_upkeep(self) -> dict[str, Any]:
+        """At start: a finished build that could not be swapped in (an approved one, or the first) is swapped in; the
+        FIRST build of an index that does not exist yet starts by itself. An index that exists is never rebuilt
+        here — a new format or another package is reported until kb_rebuild is approved."""
+        from . import infosys_build as IB
+        assert self.docs is not None and self.docs.local is not None and self.docs_build_target is not None
+        out: dict[str, Any] = {}
+        done = IB.finish_pending(self.docs_build_target, self.docs.local)
+        if done:
+            out["finished_pending"] = done
+            if done.get("replaced") and self.docs.db_file != self.docs_build_target:
+                self.docs.db_file = self.docs_build_target
+            self.docs._probe()
+        if not self.docs.db_file.is_file():
+            out["first_build"] = self.spawn_infosys_build(first=True)
+        return out
+
+    def spawn_infosys_build(self, force: bool = False, first: bool = False) -> dict[str, Any]:
+        """The build of the local package's index, in its own process (the parse is CPU-bound for minutes: in the
+        server it would take the time of the ADS and recorder threads) — the builder the knowledge folder's stub runs,
+        with this server's Python. It survives a restart of the server; its state is infosys_build.state."""
+        import subprocess
+        from . import infosys_build as IB
+        if self.docs is None or self.docs.local is None or self.docs_build_target is None:
+            return {"started": False, "error": "no local Help Viewer package (docs.source = 'local')"}
+        b = K.builders_dir()
+        if b is None or not (b / "infosys_local.py").is_file():
+            return {"started": False, "error": "the plugin's builders (skills/twincat-docs/builders) were not found"}
+        target = self.docs_build_target
+        st = IB.state(target, local=self.docs.local)
+        if (st.get("rebuild") or {}).get("state") == "running":
+            return {"started": False, "already_running": st["rebuild"], "message": st["message"]}
+        if st["state"] == "complete" and not force:
+            return {"started": False, "up_to_date": True, "message": st["message"]}
+        logs = Path(self.cfg.safety.audit_log).parent / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log_file = logs / "infosys-build.log"
+        lang = {"1033": "en", "1031": "de"}.get(self.docs.local.lcid, "en")
+        cmd = [sys.executable, str(b / "infosys_local.py"), "index", "--db", str(target), "--mshc",
+               str(self.docs.local.path), "--lang", lang, "--built-by", f"twincat-mcp {__version__}"]
+        if force:
+            cmd.append("--force")
+        kw: dict[str, Any] = {}
+        if os.name == "nt":
+            kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000      # CREATE_NO_WINDOW
+        else:
+            kw["start_new_session"] = True
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_file, "ab") as fh:
+            fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} {'first build' if first else 'rebuild'}: "
+                     f"{' '.join(cmd)}\n".encode())
+            fh.flush()
+            self.infosys_build_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh,
+                                                       stderr=subprocess.STDOUT, cwd=str(target.parent), **kw)
+        log.info("infosys index: %s started (pid %s) → %s", "first build" if first else "rebuild",
+                 self.infosys_build_proc.pid, target)
+        return {"started": True, "pid": self.infosys_build_proc.pid, "index": str(target), "log": str(log_file),
+                "why": "no index yet" if first else (st.get("reason") or st["state"]) if not force else "forced",
+                "note": "the current index (if any) stays in use until the new one is complete; kb_status / tc_doctor "
+                        "show the progress"}
+
+    def spawn_manuals_update(self, force: bool = False) -> dict[str, Any]:
+        """manuals_db.py update for the knowledge folder in its own process, with this server's Python — when that
+        Python can read PDFs (pypdf or PyMuPDF); otherwise the command for the user's Python."""
+        import importlib.util
+        import subprocess
+        loc = self.kb.location()[0]
+        b = K.builders_dir()
+        if loc is None or b is None:
+            return {"started": False, "error": "no knowledge folder chosen yet" if loc is None else
+                    "the plugin's builders (skills/twincat-docs/builders) were not found"}
+        kd = K.kb_docs_module()
+        if kd is not None:
+            from . import kb_layout as L
+            st = kd.manuals_state(L.locate(loc, "manuals"), loc / "manuals")
+            if (st.get("updating") or {}).get("state") == "running":
+                return {"started": False, "already_running": st["updating"], "message": st["message"]}
+            if st["state"] == "complete" and not force:
+                return {"started": False, "up_to_date": True, "message": st["message"]}
+        cmd = [sys.executable, str(b / "manuals_db.py"), "update", "--kb", str(loc)] + (["--force"] if force else [])
+        if not any(importlib.util.find_spec(m) for m in ("pymupdf", "fitz", "pypdf")):
+            return {"started": False, "error": f"this server's Python ({sys.executable}) has no PDF library (pypdf or "
+                    "PyMuPDF) — run the update with your own Python 3.12 that has one",
+                    "command": f'<Python 3.12+ with pypdf or PyMuPDF> "{loc / "tools" / "manuals_db.py"}" update --kb "{loc}"'}
+        logs = Path(self.cfg.safety.audit_log).parent / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log_file = logs / "manuals-update.log"
+        kw: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000} if os.name == "nt" \
+            else {"start_new_session": True}
+        with open(log_file, "ab") as fh:
+            fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(cmd)}\n".encode())
+            fh.flush()
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, cwd=str(loc), **kw)
+        self.manuals_update_proc = p
+        return {"started": True, "pid": p.pid, "log": str(log_file),
+                "note": "the current manuals index stays in use until the update is complete; kb_status shows it"}
 
     def _builder_upkeep(self) -> None:
         res = self.kb.builder_upkeep(__version__)
@@ -486,6 +604,15 @@ class App:
         return await self.ads_call(fn, *a, timeout=timeout, slow=True, **kw)
 
     def docs_index_status(self) -> dict[str, Any]:
+        if self.docs is not None and self.docs.local is not None and self.docs_build_target is not None:
+            # the local package's index: its real state (a build runs in its own process, also across restarts)
+            from . import infosys_build as IB
+            st = IB.state(self.docs_build_target, local=self.docs.local)
+            p = self.infosys_build_proc
+            if p is not None:
+                rc = p.poll()
+                st["started_here"] = {"pid": p.pid, "exit_code": rc} if rc is not None else {"pid": p.pid, "running": True}
+            return st
         st = dict(self.docs_bg)
         if st.get("started") and not st.get("finished"):
             st["running_for_s"] = round(time.time() - st["started"], 0)
@@ -519,8 +646,7 @@ class App:
         if self.docs is None or self.docs_bg.get("started"):
             return
         if self.docs.local is not None:
-            self._start_local_index_bg()
-            return
+            return                    # the local package: one index built as a whole (infosys_upkeep, kb_rebuild)
         try:
             have = set(self.docs.indexed_books())
         except Exception:  # noqa: BLE001
@@ -545,47 +671,6 @@ class App:
 
         threading.Thread(target=_run, name="infosys-default-index", daemon=True).start()
 
-    def _start_local_index_bg(self) -> None:
-        """Local Help Viewer package: the default books first (what most lookups need), then every other TwinCAT 3
-        book, in a daemon thread. A package already indexed at the same stamp is skipped outright."""
-        docs = self.docs
-        assert docs is not None and docs.local is not None
-        try:
-            if docs.index_complete():          # same package content, same indexer version: nothing to do
-                return
-        except Exception:  # noqa: BLE001
-            return
-        self.docs_bg = {"started": time.time(), "finished": None, "books": ["all books of " + docs.local.path.name],
-                        "done_books": 0, "total_books": None, "result": None}
-
-        def _run() -> None:
-            out: list[dict[str, Any]] = []
-            try:
-                for b in self.cfg.docs.books:
-                    try:
-                        r = docs.index_book(b)
-                        out.append({k: r.get(k) for k in ("book", "fetched", "seconds")})
-                    except Exception as exc:  # noqa: BLE001
-                        out.append({"book": b, "error": str(exc)})
-
-                def prog(book: str, i: int, n: int) -> None:
-                    self.docs_bg["done_books"], self.docs_bg["total_books"] = i, n
-                    self.docs_bg["current_book"] = book
-                    self.docs_bg["current_book_pages"] = None
-                    self.docs_bg["last_progress"] = time.time()
-
-                def page_prog(book: str, d: int, t: int) -> None:
-                    self.docs_bg["current_book_pages"] = f"{d}/{t}"
-                    self.docs_bg["last_progress"] = time.time()
-                out.append(docs.index_all(prog, page_prog))
-            except Exception as exc:  # noqa: BLE001
-                out.append({"error": f"{type(exc).__name__}: {exc}"})
-            finally:
-                self.docs_bg["result"] = out
-                self.docs_bg["finished"] = time.time()
-
-        threading.Thread(target=_run, name="infosys-helpviewer-index", daemon=True).start()
-
     async def docs_call(self, fn, *a, timeout: float = 120, **kw) -> Any:
         """Infosys lookups: local package (or network) + SQLite, off the event loop; no ADS/COM worker involved."""
         if self.docs is None:
@@ -598,13 +683,15 @@ class App:
         except InfosysError as exc:
             raise ToolError(str(exc) or f"{type(exc).__name__} (no message)") from exc
         except sqlite3.OperationalError as exc:
+            if self.docs.local is not None:
+                raise ToolError(f"Infosys index not readable ({exc}) — {self.docs_index_status().get('message')}") from exc
             st = self.docs_index_status()
             busy = st.get("started") and not st.get("finished")
             raise ToolError(f"Infosys index busy ({exc})" + (f" — {', '.join(st.get('books') or [])} being indexed in the background "
                             f"({st.get('running_for_s', 0):.0f} s so far); retry in a moment or search with web_fallback=true" if busy else "")) from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise ToolError(f"Infosys call exceeded {timeout:.0f} s" + (" (the package index is still being built — retry "
-                            "in a minute)" if self.docs.local is not None else " (slow network? smaller max_pages?)")) from exc
+            raise ToolError(f"Infosys call exceeded {timeout:.0f} s" + (" (slow network? smaller max_pages?)"
+                            if self.docs.local is None else "")) from exc
         except Exception as exc:  # noqa: BLE001 — never an empty error message to the client
             raise ToolError(f"Infosys lookup failed: {type(exc).__name__}: {exc}") from exc
         st = self.docs_bg
@@ -1058,7 +1145,8 @@ class App:
                 raise ToolError(str(exc)) from exc
         # elicitation path — the prompt must read as what it is: a safety confirmation, with the exact effect
         effect = ACTION_EFFECTS.get(action, "changes the state of the machine or project")
-        kind = "DESTRUCTIVE" if op is OpClass.DESTRUCTIVE else "MACHINE CONTROL"
+        kind = ("DESTRUCTIVE" if op is OpClass.DESTRUCTIVE else
+                "KNOWLEDGE BASE" if action.startswith("kb_") else "MACHINE CONTROL")
         prompt = (f"{kind}: {action}\n"
                   f"Target: {target or '(current target)'}\n"
                   f"Machine: {scope}   Mode: {self.guard.mode}\n"
@@ -1213,6 +1301,8 @@ CODE_EDIT_ACTIONS = frozenset({"xae_pou_set", "xae_pou_create", "proj_set_code",
 
 # what the confirmation prompt says will happen
 ACTION_EFFECTS = {
+    "kb_rebuild": "rebuilds a knowledge-base index from its source on this PC; the current index stays in use until the "
+                  "new one is complete, then replaces it — nothing else is changed or deleted (docs/KNOWLEDGE_BASE.md)",
     "xae_activate_configuration": "overwrites the boot configuration on the target; the runtime goes to CONFIG/restart",
     "xae_restart_twincat": "restarts the TwinCAT runtime on the target: the PLC stops and starts, outputs drop during the restart",
     "xae_deploy": "build + activate + restart on the target: the running program is replaced and the PLC restarts",
@@ -1274,7 +1364,8 @@ def connection_instructions(app: "App") -> str:
         return INSTRUCTIONS + f"\nOffline documentation: state not readable at this connection ({type(exc).__name__}: {exc}).\n"
     line = f"\nOffline documentation, state at this connection ({ds.get('knowledge_folder', 'no folder')}): {ds['summary']}"
     if not ds.get("ok") and ds.get("infosys_command"):
-        line += f" To rebuild: {ds['infosys_command']}."
+        line += (" An index that exists is rebuilt only when the user approves it (docs/KNOWLEDGE_BASE.md): tell the user, "
+                 "and on approval kb_rebuild(index='infosys') — or the user runs " + ds["infosys_command"] + ".")
     return INSTRUCTIONS + line + "\n"
 
 
@@ -1351,22 +1442,27 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         rep["config_file"] = cfg.config_file
         if app.docs is not None:
             try:
-                rep["infosys"] = {"source": app.docs.source(), "cache": str(app.docs.dir), "fts5": app.docs.has_fts,
-                                  "complete": await asyncio.to_thread(app.docs.index_complete) if app.docs.local is not None else None,
-                                  "indexed_books": len(await asyncio.to_thread(app.docs.indexed_books))
-                                  if app.docs.local is not None else await asyncio.to_thread(app.docs.indexed_books),
-                                  "background_index": app.docs_index_status(), "warm": app.docs_warm,
-                                  "default_books": cfg.docs.books}
-            except ToolError as exc:
+                if app.docs.local is not None:
+                    # one index of the local package (docs/KNOWLEDGE_BASE.md): its state, read-only here
+                    rep["infosys"] = {"source": app.docs.source(), "index": str(app.docs.db_file),
+                                      "state": await asyncio.to_thread(app.docs_index_status), "warm": app.docs_warm}
+                else:
+                    rep["infosys"] = {"source": app.docs.source(), "cache": str(app.docs.dir), "fts5": app.docs.has_fts,
+                                      "indexed_books": await asyncio.to_thread(app.docs.indexed_books),
+                                      "background_index": app.docs_index_status(), "warm": app.docs_warm,
+                                      "default_books": cfg.docs.books}
+            except (ToolError, InfosysError) as exc:
                 rep["infosys"] = f"FAIL: {exc}"
         else:
             rep["infosys"] = f"FAIL: {app.docs_error}" if app.docs_error else "disabled"
         try:
             ds = await asyncio.to_thread(app.kb.docs_status)
             rep["offline_docs"] = ds
-            # an index that exists but is not whole / current is worth a line; no folder or no index is not
-            if ds.get("infosys_state") in ("outdated", "incomplete", "old_format") or ds.get("infosys_rebuild"):
+            # an index that exists but is not the current one, or a build, is worth a line; no folder is not
+            if ds.get("infosys_state") in ("outdated", "rebuild_needed") or ds.get("infosys_rebuild"):
                 infos.append("offline docs: Infosys index " + ds["infosys"])
+            if ds.get("manuals_state") in ("outdated", "rebuild_needed"):
+                infos.append("offline docs: manuals index " + ds["manuals"])
         except Exception as exc:  # noqa: BLE001
             rep["offline_docs"] = {"error": f"{type(exc).__name__}: {exc}"}
         problems = [k for k, v in rep.items() if isinstance(v, str) and v.startswith("FAIL")]
@@ -1487,18 +1583,40 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # ---- knowledge base (decisions 2026-10-17) -----------------------------
     @mcp.tool(annotations=READ)
     async def kb_status() -> dict[str, Any]:
-        """Knowledge base: where it is stored (or the question to ask the user if no folder was chosen yet), the
-        project folders indexed for kb_search, ESI devices indexed for hw_lookup, known-error entries — and under
-        `docs` the offline documentation in the same folder that the twincat-docs skill reads: helpviewer\\infosys_en.db
-        (Infosys, built by tools\\infosys_local.py), manualsdb\\manuals.db (PDF manuals, tools\\manuals_db.py) with the
-        PDFs not indexed yet, the SOPs, and the exact command that runs the skill's script on this folder."""
-        res = await app.kb_call(app.kb.status)
-        if app.docs is not None and isinstance(res.get("docs"), dict):
-            idx = Path(app.docs.dir) / "index.sqlite"
-            res["docs"]["infosys_tools_index"] = {
-                "database": str(idx), "size_mb": round(idx.stat().st_size / 1e6, 1) if idx.exists() else 0,
-                "note": "the infosys_* tools' own index of the same Help Viewer package (fallback); the twincat-docs "
-                        "skill reads helpviewer\\infosys_en.db"}
+        """Knowledge base (layout and rules: docs/KNOWLEDGE_BASE.md): where it is (or the question to ask the user if
+        no folder was chosen yet), the project folders indexed for kb_search, the ESI index for hw_lookup — and under
+        `docs` the documentation indexes the infosys_* tools and the twincat-docs skill read: index\\infosys-<lcid>.db
+        (the one Infosys index) and index\\manuals.db (PDF manuals, with the PDFs not in it yet), the SOPs, and the
+        command that runs the skill's script on this folder. Each index: complete, or rebuild_needed / outdated (in use
+        as it is until the user approves kb_rebuild), or a build running / interrupted. `layout` lists files the
+        plugin no longer reads (never deleted by it) with their size."""
+        return await app.kb_call(app.kb.status)
+
+    @mcp.tool(annotations=CONTROL)
+    async def kb_rebuild(index: str, force: bool = False, confirm_token: str | None = None,
+                         ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Rebuild one index of the knowledge folder from its source on this PC — ONLY with the user's approval
+        (docs/KNOWLEDGE_BASE.md rule 6: the user is asked, or pass the confirm_token of
+        tc_request_confirmation(action='kb_rebuild', args={'index': …})). index: 'infosys' (the Help Viewer package,
+        the plugin's extractor, in its own process — minutes; the current index stays in use until the new one is
+        complete and then replaces it), 'manuals' (the PDFs in manuals\\, in its own process), 'esi' (TwinCAT's ESI
+        files, now, in one transaction). Without force an index that is complete and current is left as it is.
+        Nothing is deleted. kb_status / tc_doctor show the progress."""
+        idx = (index or "").strip().lower()
+        if idx not in ("infosys", "manuals", "esi"):
+            raise ToolError(f"index must be 'infosys', 'manuals' or 'esi' (got {index!r})")
+        await app.permit(ctx, OpClass.CONTROL, "kb_rebuild", idx, confirm_token, mode_gate=False)
+        if idx == "infosys":
+            if app.docs is None or app.docs.local is None:
+                raise ToolError("no index of a local Help Viewer package here (docs.source = 'local' and a package are "
+                                "needed) — " + (app.docs_error or "docs.source = 'web' keeps a web cache, not an index"))
+            res = await asyncio.to_thread(app.spawn_infosys_build, force)
+        elif idx == "manuals":
+            res = await asyncio.to_thread(app.spawn_manuals_update, force)
+        else:
+            res = await app.kb_call(app.kb.esi_index, force, timeout=1800)
+        app.audit("kb_rebuild", {"index": idx, "force": force}, OpClass.CONTROL,
+                  "ok" if res.get("started", True) or res.get("up_to_date") else "not-started", res)
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -3219,10 +3337,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def infosys_index(book: str, force: bool = False, max_pages: int | None = None) -> dict[str, Any]:
-        """Index a book (or glob, e.g. 'tcplclib_tc3_*'): pages new or changed since the last run, title/kind/library/
-        declaration, full-text index. With the local Help Viewer package every book is indexed in the background on
-        first use anyway (≈ 50k pages, a few minutes); this indexes one book now. With docs.source='web' it fetches
-        from infosys.beckhoff.com (Tc2_System ≈ 300 pages ≈ 30-60 s)."""
+        """docs.source='web': index a book (or glob, e.g. 'tcplclib_tc3_*') from infosys.beckhoff.com — pages new or
+        changed since the last run (Tc2_System ≈ 300 pages ≈ 30-60 s). The local Help Viewer package (default) has
+        ONE index of every book, built as a whole (the first time by itself, later with kb_rebuild(index='infosys')
+        once approved) — this tool then changes nothing and says so."""
         if any(c in book for c in "*?"):
             return await app.docs_call("index_books", book, force, max_pages, timeout=3600)
         return await app.docs_call("index_book", book, force, max_pages, timeout=1800)

@@ -1,13 +1,20 @@
 # Builders: infosys_local.py and manuals_db.py
 
-Two standalone scripts that build the offline documentation databases read by the `twincat-docs` skill
-(`kb_docs.py`) and by the twincat MCP server. `infosys_local.py` version 2, `manuals_db.py` version 4 (plugin 0.8.10). Standard library only, except that
-PDF text needs PyMuPDF or pypdf (see section 5).
+Two scripts that build the knowledge folder's documentation indexes, read by the `twincat-docs` skill (`kb_docs.py`)
+and by the twincat MCP server. `infosys_local.py` version 3, `manuals_db.py` version 5 (plugin 0.8.11). The layout,
+the states and when an index is rebuilt follow the ground rules in the plugin's `docs/KNOWLEDGE_BASE.md`; the paths
+come from `twincat_mcp/kb_layout.py`, which the server, `kb_docs.py` and both builders import.
 
 | script | reads | writes |
 |---|---|---|
-| `infosys_local.py` | Beckhoff Infosys package `BKINFOSYS3*.mshc` (Microsoft Help Viewer) | `<kb>\helpviewer\infosys_en.db` |
-| `manuals_db.py` | PDF files under `<kb>\manuals\` (sub-folders allowed) | `<kb>\manualsdb\manuals.db` |
+| `infosys_local.py` | Beckhoff Infosys package `BKINFOSYS3*.mshc` (Microsoft Help Viewer) | `<kb>\index\infosys-1033.db` (`--lang de`: `infosys-1031.db`) |
+| `manuals_db.py` | PDF files under `<kb>\manuals\` (sub-folders allowed) | `<kb>\index\manuals.db` |
+
+`infosys_local.py` runs the plugin's own extractor (`twincat_mcp.infosys_build`, from the plugin folder the builder
+ships in): the one Infosys index, the same file the `infosys_*` tools read. Version 2 built a second, different index
+(`helpviewer\infosys_en.db`); nothing reads it any more — `kb_status` lists it with its size for you to delete. Both
+builders need the plugin folder they ship in (`twincat_mcp\` beside `skills\`); PDF text needs PyMuPDF or pypdf
+(section 5).
 
 ## 1. Requirements and location
 
@@ -20,14 +27,16 @@ PDF text needs PyMuPDF or pypdf (see section 5).
   2. the environment variable `TCMCP_KNOWLEDGE_DIR`,
   3. the folder chosen with the plugin's `kb_set_location` (pointer file `~\.twincat_mcp\knowledge_location.json`,
      or `%TCMCP_HOME%\knowledge_location.json` when `TCMCP_HOME` is set),
-  4. the folder above the script, when that folder is a knowledge folder (it contains `helpviewer\` or `knowledge.db`
-     for `infosys_local.py`; `manualsdb\` or `knowledge.db` for `manuals_db.py`). This is why a builder in `<kb>\tools\`
+  4. the folder above the script, when that folder is a knowledge folder (it contains `index\` — or, before the
+     move into `index\`, `knowledge.db`, `helpviewer\` or `manualsdb\`). This is why a builder in `<kb>\tools\`
      works, and the stub there (section 6: it sets `TCMCP_STUB_DIR`, so "the script" means the stub),
   5. `D:\TwinCAT-MCP\knowledge` (the default, `FALLBACK_KB` in each script).
 - `--kb` and `--db` may be given before or after the command: `--kb D:\kb index` and `index --kb D:\kb` are the same.
-- In a new folder, neither `helpviewer\` nor `knowledge.db` exists yet, so the folder-above lookup does not apply.
-  Pass `--kb` on the first run.
-- Each script has its own `--db` override: the database file itself.
+- In a new folder `index\` does not exist yet, so the folder-above lookup does not apply. Pass `--kb` on the first run.
+- Each script has its own `--db` override: the index file itself.
+- **Layout move, once.** `index` / `update` first move an index found in an older place into `index\`
+  (`manualsdb\manuals.db`, `knowledge.db` at the top, `infosys\helpviewer-1033\index.sqlite`) — a rename on the
+  same drive, never a copy, never over an existing file; each move is printed as `layout: …`.
 
 ## 2. infosys_local.py
 
@@ -55,76 +64,51 @@ python infosys_local.py books --filter "tc3_*"
 python infosys_local.py stats --json
 ```
 
-`--lang de` builds `helpviewer\infosys_de.db`. The plugin's `kb_docs.py` reads `infosys_en.db` only.
+`--lang de` builds `index\infosys-1031.db`. The server and `kb_docs.py` read the language of the package the server
+uses (English: `infosys-1033.db`).
 
-- `index` reads the newest `BKINFOSYS3*.mshc` in `ContentStore\EN-US` (DE-DE for `--lang de`) unless `--mshc` is given.
-  Takes about 150 s for the full package.
+- `index` reads the newest `BKINFOSYS3*.mshc` of every Help Viewer catalog unless `--mshc` is given. The whole
+  package takes minutes (the extractor converts every TwinCAT 3 book; TwinCAT 2 books are left out).
 - `search` takes FTS5 syntax: words are ANDed, `"exact phrase"`, `OR`, `NOT`, `prefix*`.
   `--book` is a glob on the book slug, case-insensitive. It filters inside the query, before the row limit.
   When more hits exist, the output ends with `(N of TOTAL hits)`.
-- `show` and `decl` take a REF: Infosys URL, `book/pageid`, bare page id, or exact title (case-insensitive).
-  If several pages share the name, the command prints the candidates (`book/pageid`, title, version) and exits
-  with code 1. Nothing is shown. Pick one and call again with `book/pageid` or `--book`.
-- `decl` prints the intro, every code block, the Requirements / Prerequisites / Voraussetzungen section,
-  `Also in:` (other books with a page of the same title) and `Links:`.
-- `show` prints the links of the part shown, as `text → book/pageid`.
+- `show` and `decl` take a REF: Infosys URL, `book/pageid`, bare page id, ms-xhelp link or exact title
+  (case-insensitive). If several pages share the name, the command prints the candidates and exits with code 1
+  (`nothing was chosen`). Pick one and call again with `book/pageid` or `--book`.
+- `search` / `show` / `decl` / `books` are the skill's commands (`kb_docs.py docs_search`, `docs_page`,
+  `docs_declaration`, `docs_books`) printed as text — the same answers.
 
-### Index logic (`index`)
+### Index logic (`index`) — `twincat_mcp/infosys_build.py`
 
-1. **Locking.** One build at a time, through `<db>.lock` (`infosys_en.db.lock`). The lock file holds pid and start time.
-   Its modification time is the heartbeat, refreshed every 15 s by the running build (also during long single steps
-   such as `fts optimize`). A lock whose heartbeat is older than **120 s** belongs to a dead build and is taken over. A live lock makes the command stop with
-   `another index build is running (pid …)`.
-2. **Finished rebuild waiting.** If `<db>.building` is complete for the current package, the command only swaps it in
-   (`replaced … with the rebuild finished earlier`) without reading the package again.
-3. **Up to date.** If `meta.source` equals the package stamp, `schema` is 2 and `state` is `complete`, the command
-   prints `up to date` and stops. `--force` rebuilds anyway.
-4. **Build.** A leftover `<db>.building` is deleted. The new index is written to `<db>.building` (never to the live
-   file). For every `.html`/`.htm` in the package:
-   - `book` = first path part, `pid` = file stem.
-   - metadata from the first 6,000 chars (`<meta name=… content=…>`, first occurrence wins), breadcrumb from the first 12,000 chars.
-   - body text: from `<article` (else `<body`), converted to compact text. `h1–h4` → `#`…`####`; `p/div/li/br/dt/dd` → new line
-     (`li` → `- `); `<pre>` → fenced block; tables → `| cell | cell |` rows (`|` in a cell → `/`);
-     `script/style/header/nav/footer/head` skipped; images dropped; links keep their **text** in the body.
-   - every `<a href>` goes to the `link` table (see schema). ms-xhelp ids are resolved through `page.help_id`;
-     relative and Infosys-URL links are resolved to `book/pageid`. Links to pages not in the package, and external links,
-     keep only `href`.
-   - progress (`pages_done`, `pages_total`, `heartbeat`) is written to `<db>.building` every 2,000 pages.
-5. **Finish.** `UPDATE` resolves the links, the counts are written to `meta`, `fts optimize` runs, `state` becomes `complete`.
-6. **Swap.** `<db>.building` replaces `infosys_en.db` with `os.replace`. If a reader (an MCP tool, `kb_docs.py`) holds the
-   live file open on Windows, the replace is retried for up to **60 s**. If it still fails, the finished file waits in
-   `<db>.building` and the command says so. The next `index` swaps it in without re-reading the package.
+1. **Locking.** One build at a time, through `<db>.lock`, created exclusively. It holds JSON (pid, start, phase,
+   `pages_done`, `pages_total`) — the progress the readers show; its modification time is the heartbeat, refreshed
+   every 15 s (also during long single steps such as the link pass and `fts optimize`). A lock whose heartbeat is
+   older than **120 s** belongs to a build that is gone and is taken over. A live lock makes the command stop with
+   `another build is running (pid …)`.
+2. **Finished build waiting.** If `<db>.building` is complete, of this format and of the current package, it is
+   only swapped in (`replaced … with the build finished earlier`) without reading the package again.
+3. **Up to date.** The index is `complete` (section 4): the command prints `up to date` and stops. `--force` builds
+   anyway.
+4. **Build.** An interrupted `<db>.building` of the same format and package is **resumed** (`resuming the
+   interrupted build`; pages already in it are skipped); one of another format or package is deleted. The
+   pages are converted by the plugin's extractor into `<db>.building` (never into the live file), normalised once
+   (rule 4 of `KNOWLEDGE_BASE.md`): plain spaces, no invisible marks, no image placeholders or empty links, table
+   cells as plain text, relative links resolved to page addresses while parsing, ms-xhelp links after the pages are
+   in (`resolve_help_links`; an id the package does not have stays as it is).
+5. **Finish.** Counts, `source_stamp`, `package_file`, `built` and `state = complete` go to `meta`; `fts optimize`;
+   rollback-journal mode, so readers open the file read-only with no side files.
+6. **Swap.** `<db>.building` replaces the index with `os.replace`. If a reader holds the live file open on Windows,
+   the replace is retried for up to **60 s**; if it still fails, the finished file waits as `<db>.building` and is
+   swapped in at the next server start or `index`, without reading the package again.
 
-An interrupted build (also one run with `--force`) never replaces the live index. The last complete index stays in use.
+An interrupted or failed build never replaces the live index. The last complete index stays in use.
 
-### Schema (version 2)
+### Schema
 
-```sql
-meta(key PRIMARY KEY, value)
-  -- schema (2), source (package stamp "<file>|<size>|<mtime>"), lcid (1033|1031), indexed, state (building|complete),
-  -- pages, books, links, links_resolved, mshc_path, builder ("infosys_local.py 2"), python, started, heartbeat,
-  -- pages_done, pages_total, pid
-page(pid, book, title, help_id, toc_parent, version, crumb, body, PRIMARY KEY(book, pid))
-  -- index page_title (title), page_help (help_id)
-fts  USING fts5(title, body, book UNINDEXED, pid UNINDEXED, tokenize='unicode61 remove_diacritics 2')
-link(book, pid, n, text, href, hid, target_book, target_pid)
-  -- index link_page (book, pid); n = position of the link on the page; hid = ms-xhelp id;
-  -- target_book / target_pid NULL when the link is external or points to a page not in the package
-```
-
-A version-1 index has no `link` table and no `schema` meta key. Its body text is the same, so it still answers searches.
-
-### Query logic
-
-| Command | Logic | Output |
-|---|---|---|
-| `search QUERY [--book GLOB] [--limit 10]` | FTS5 `MATCH`, ranked by `bm25(fts, 8.0, 1.0)` (title weighs 8× body). `--book` is added to the `WHERE` clause (`fnm(book, GLOB)`), so the limit applies after the filter. The total is counted with the same filter | one line per hit: `title \| book/pid \| snippet` (snippet: body, 18 tokens, hits in `[ ]`); `(N of TOTAL hits)` when cut |
-| `show REF [--section NAME] [--max 4000] [--book GLOB]` | REF resolution as described under Commands. `--section`: keep only the heading blocks whose heading contains NAME. Cut at `--max` chars with the remaining count. Ambiguous REF → candidates, exit 1 | header (`title \| book/pid \| version` + web URL), the text, `Links:` for the part shown |
-| `decl SYMBOL [--book GLOB]` | same resolution; prints the intro (≤ 400 chars, text before the first code block), every fenced code block, the Requirements section, `Also in:`, `Links:` | the cheapest answer for inputs/outputs/struct members and the TwinCAT / library version |
-| `books [--filter GLOB]` | `GROUP BY book` | `book  pages` |
-| `stats [--json]` | state from `index_state` (section 4) | one line; with `--json` the full state object |
-
-QUERY is FTS5 syntax: words are ANDed, `"exact phrase"`, `OR`, `NOT`, `prefix*`.
+The plugin's Infosys index (`twincat_mcp/infosys.py`): `pages` (url, book, title, kind, Markdown, declaration JSON,
+doc version …), `pages_fts` (FTS5 over title, text, code), `catalog`, `code_blocks`, `helpids` (Help Viewer id →
+page URL), `books`, `meta`. `meta.indexer_version` is the format (`infosys.INDEXER_VERSION`, 4 in 0.8.11);
+`meta.source_stamp` the package's content stamp; `meta.built_by` the builder or plugin version that built it.
 
 ## 3. manuals_db.py
 
@@ -162,20 +146,25 @@ python manuals_db.py stats --json
 1. **Locking.** One update at a time through `<db>.lock` (`manuals.db.lock`). Heartbeat: the lock's modification time
    (refreshed every 15 s by the running update) and `meta.heartbeat` (before each file). A lock silent for **300 s** is
    taken over. A live lock makes the command stop.
-2. **Removed files.** Documents in the database whose path is no longer on disk are deleted (`removed`).
-3. **Each PDF on disk:**
+2. **A copy.** The update works on `<db>.building`, a copy of the index in use (SQLite backup); the index stays in
+   use meanwhile. A `.building` left by an interrupted update is discarded first — the copy is taken again from the
+   index in use, so the PDFs already in it are not read again.
+3. **Removed files.** Documents whose path is no longer on disk are deleted (`removed`).
+4. **Each PDF on disk:**
    - known and **size + mtime unchanged** → skipped (`unchanged`); the file is not read.
    - otherwise SHA-256 of the file; known and **same hash** → mtime updated, skipped (`unchanged`).
-   - otherwise (new or changed; or everything with `--force`, or everything when the database was written with an
-     older page text format, see below): old rows dropped, file indexed, committed **per file**.
+   - otherwise (new or changed; or everything with `--force`, or everything when the index was written with another
+     page text format, see below): old rows dropped, file indexed, committed per file in the copy.
      An exception rolls back that file only and is reported as `FAILED`; the run continues.
-   - progress is kept: a file committed before an interruption is `unchanged` on the next run.
-4. `fts optimize` when anything changed. `meta.last_update`, `meta.last_result`
+5. `fts optimize` when anything changed. `meta.last_update`, `meta.last_result`
    (`N added, N updated, N removed, N unchanged, N failed`) and `meta.text_format` are written.
-5. **Page text format.** `TEXT_FORMAT` (currently `3`) names the page text and toc rules below. A database whose
-   `meta.text_format` differs (a version 1 or 2 database has none: format `1`; version 3 wrote `2`) is reported as
-   `outdated`, and the next `update` reads every manual again (`page text format 2 -> 3: every manual is read again`). An interrupted run, or a re-read in which a manual failed (that manual keeps its old rows), leaves
-   the old format in `meta`, so the next run reads all manuals again.
+6. **Swap.** The copy replaces `manuals.db` (`os.replace`, retried for 60 s while a reader has it open on Windows).
+   If it still fails, the command says so and nothing is replaced; run `update` again once the readers are closed.
+7. **Page text format.** `TEXT_FORMAT` (currently `4`) names the page text and toc rules below. An index whose
+   `meta.text_format` differs (a version 1 or 2 database has none: format `1`) is reported as `rebuild_needed` and
+   used as it is; the next `update` reads every manual again (`page text format 3 -> 4: every manual is read again`).
+   A re-read in which a manual failed (that manual keeps its old rows) leaves the old format in `meta`, so the next
+   run reads all manuals again.
 
 ### Index logic per PDF
 
@@ -186,6 +175,9 @@ python manuals_db.py stats --json
   pypdf `extract_text(visitor_text=…)` (every text operation with its text matrix; the visited pieces joined give
   exactly `extract_text()`). Cleaning: soft hyphens removed, `ﬁ/ﬂ` expanded, hyphenated line breaks joined
   (`exam-\nple` → `example`), runs of spaces/tabs collapsed, blank lines collapsed.
+- What is drawn is the page text (format 4, N37): text of font size 0 and fully transparent text (alpha 0) are left
+  out — Beckhoff PDFs carry under every heading an invisible copy of the running header (`| Signal flow diagram` at
+  0.0 pt), which doubled headings and toc titles.
 - Running headers, footers and margin labels (format 3) are found by their **place**, not by their text — Beckhoff
   prints the current *section* title in the header (`| Signal flow diagram`, a different text in every section, on
   some pages on the same baseline as a heading) and a footer whose page number comes first on some pages
@@ -230,7 +222,7 @@ python manuals_db.py stats --json
   `\b((EL|ELM|ELX|ES|EK|EP|EPP|EPI|ER|EQ|EM|EJ|EZ|EX|KL|KM|KS|BK|BC|BX|CX|CP|CU|C6|C7|AX|AMP|AM|AG|AT|FC|IP|IL|IE|LC|TF|TE|TC|ZB|ZK|ZS)\d{3,5}(-\d{4})?)\b`
 - Pages with no text are stored. A PDF with no text at all is flagged `no text layer (scanned?)`. OCR is not included.
 
-### Schema (version 4; tables unchanged since version 2)
+### Schema (version 5; tables unchanged since version 2)
 
 ```sql
 doc(id PRIMARY KEY, path UNIQUE, name, size, mtime, sha256, title, pages, text_pages, indexed, backend)
@@ -240,8 +232,8 @@ toc(doc, level, title, page)
 product(code, doc, page, n)                          -- INDEX on code
 fts  USING fts5(text, section, doc UNINDEXED, page UNINDEXED, tokenize='unicode61 remove_diacritics 2')
 meta(key PRIMARY KEY, value)
-  -- state (updating | idle), pid, started, folder, builder ("manuals_db.py 4"), files_total, files_done, heartbeat,
-  -- last_update, last_result, text_format ("3")
+  -- state (updating | idle), pid, started, folder, builder ("manuals_db.py 5"), files_total, files_done, heartbeat,
+  -- last_update, last_result, text_format ("4")
 ```
 
 A version-1 database has no `meta` table; the next `update` creates it.
@@ -259,45 +251,37 @@ A version-1 database has no `meta` table; the next `update` creates it.
 
 ## 4. Index state
 
-Both scripts report the real state with `stats` (and `--json`). The same rules are used by `kb_docs.py status`,
-by the server at every connection (instructions line `Offline documentation, state at this connection (<kb>): …`),
-by `tc_doctor` (`offline_docs`) and by `kb_status` → `docs`.
+Both scripts report the real state with `stats` (and `--json`). The same code gives it to `kb_docs.py status` (and
+`source.state` in every answer), to the server at every connection (instructions line `Offline documentation, state
+at this connection (<kb>): …`), to `tc_doctor` (`offline_docs`) and to `kb_status` → `docs`.
 
-### infosys_en.db (`infosys_local.py stats`)
+| state | meaning | what happens |
+|---|---|---|
+| `complete` | built by this format from the source that is here | nothing |
+| `rebuild_needed` | built by another format (a plugin update changed what is stored), or never finished | used as it is until the rebuild is approved |
+| `outdated` | the source changed: another Help Viewer package; PDFs added, changed or removed | used as it is until the rebuild is approved |
+| `missing` | no index file | Infosys: the server's first build starts by itself; manuals: `update` |
+
+A rebuild runs only when you run the command (`index`, `update`) or approve `kb_rebuild(index='infosys'|'manuals')`.
+
+Build in progress (shown in addition to the state; `rebuild` for Infosys, `updating` for manuals):
 
 | state | meaning | what to do |
 |---|---|---|
-| `complete` | built from the current package, schema 2 | nothing |
-| `outdated` | the package file changed since the build, or a newer `BKINFOSYS3*.mshc` exists in its folder. The old index stays in use | `index` |
-| `old_format` | complete text, version-1 build: no `link` table, so no links | `index` once (upgrades it) |
-| `incomplete` | a version-1 build that stopped half-way | `index` |
-| `missing` | no index file | `index` |
+| `running` | a build is working; heartbeat younger than 120 s (manuals: 300 s) | wait; the live index stays in use |
+| `interrupted` | `<db>.building` exists, no heartbeat | the next `index` resumes it; the next `update` starts again from the index in use |
+| `waiting_to_replace` | Infosys: the finished build could not replace the live file (a reader had it open) | swapped in at the next server start or `index` |
 
-Rebuild in progress (shown in addition to the state):
-
-| rebuild state | meaning | what to do |
-|---|---|---|
-| `running` | a build is working; heartbeat younger than 120 s | wait; the live index stays in use |
-| `interrupted` | `<db>.building` exists, no heartbeat for 120 s | `index` builds again (the leftover is deleted) |
-| `waiting_to_replace` | the finished rebuild could not replace the live file (a reader had it open) | `index` swaps it in |
-
-The `stats` output also shows the package path and the counts (`links`, `links_resolved`, `builder`).
-
-### manuals.db (`manuals_db.py stats --json`)
-
-`state` is `up_to_date`, `pending` or `outdated`. `outdated`: every PDF is indexed, but with an older page text format
-(`text_format` in the output; `update` reads every manual again). `pending` lists the PDFs that are not reflected in
-the database:
+Infosys `stats` also shows the format, the package and the counts (`links`, `links_resolved`, `built_by`). Manuals
+`stats --json` lists:
 
 | field | meaning |
 |---|---|
-| `not_indexed` | PDF in `manuals\`, not in the database (new) |
-| `changed_since_index` | size or mtime differs from the database |
-| `indexed_but_gone` | in the database, file no longer on disk |
+| `not_indexed` | PDF in `manuals\`, not in the index (new) |
+| `changed_since_index` | size or mtime differs from the index |
+| `indexed_but_gone` | in the index, file no longer on disk |
 | `no_text_layer` | indexed, but no page has text (scanned?) |
-| `updating` | `state` `running` or `interrupted`, with `files_done` of `files_total`. Interrupted: run `update` again |
-
-Pending and outdated items are fixed by `update`.
+| `text_format`, `text_format_expected` | the index's page text format and the builder's |
 
 ## 5. PyMuPDF and pypdf
 
@@ -345,14 +329,13 @@ Stored PDF paths are absolute. Moving the knowledge folder makes the next `updat
 
 | when | do |
 |---|---|
-| new or changed PDF | copy into `<kb>\manuals\…` → `manuals_db.py update --kb <kb>` |
-| Help Viewer package updated (TwinCAT / XAE update) | `infosys_local.py index --kb <kb>` (no-op when unchanged) |
-| `stats` says `outdated`, `old_format`, `incomplete`, `missing` | `index` |
-| `stats` says a rebuild is `interrupted` | `index` |
-| `stats` says `waiting_to_replace` | `index` (close programs that read the database first, if it says it is still open) |
-| an update is `interrupted` | `manuals_db.py update` |
+| new or changed PDF | copy into `<kb>\manuals\…` → `tools\manuals_db.py update` (or approve `kb_rebuild(index='manuals')`) |
+| Help Viewer package updated (TwinCAT / XAE update) | `tools\infosys_local.py index` (or approve `kb_rebuild(index='infosys')`) |
+| a state `rebuild_needed` / `outdated` | the same commands; until then the index is used as it is |
+| a build is `interrupted` | `index` resumes it; `update` starts again from the index in use |
+| `waiting_to_replace` | close the programs that read the index, then `index` (or restart the server) |
 | a PDF gives bad chapters | `toc DOC`; bookmarks win over font detection |
-| rebuild from scratch | delete the `.db` file (and any `.building` / `.lock` beside it), then `index` / `update --force` |
+| rebuild from scratch | `index --force` / `update --force` |
 | move the knowledge folder | `--kb`, `TCMCP_KNOWLEDGE_DIR` or `kb_set_location` to the new folder; manuals re-index (section 6) |
 
 ## 8. Limits
@@ -362,9 +345,8 @@ Stored PDF paths are absolute. Moving the knowledge folder makes the next `updat
   the factor changed in `_toc_from_fonts`.
 - A heading whose title starts with a number followed by a capital (`24V …`) can be read as a chapter number `24`.
 - Scanned PDFs have no text layer; OCR is not included.
-- Infosys: images are dropped; tables are flattened to pipe rows (merged cells are not reconstructed). Links are kept
-  in the `link` table; the body text shows only their text.
-- A version-1 index answers searches but has no links. `docs_page` on it says so (`links_note`).
+- Infosys: images are dropped; tables are stored as pipe rows with plain-text cells (merged cells are not
+  reconstructed); a cell's link is kept as the page of its type (`type_ref`), page links in the Markdown.
 - Running headers are found by position (format 3): a header that is not set apart from the body (no larger gap
   to the first body line than between body lines) or that is on fewer than 40 % of the pages stays in the text.
 - The builders run on Python 3.12 and newer only. The test suite runs on 3.12 (Windows and Linux); the refusal message is tested by running each script with `sys.version_info` set to 3.11.

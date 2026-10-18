@@ -81,7 +81,7 @@ def test_location_must_be_chosen_and_checked(kb, monkeypatch):
     assert Path(r["database"]).exists() and k.status()["source"].startswith("chosen")
     # a second choice never moves or deletes the first database
     r2 = k.set_location(str(tmp / "kbdata2"))
-    assert "previous database stays" in r2["note"] and (tmp / "kbdata" / K.DB_NAME).exists()
+    assert "previous database stays" in r2["note"] and (tmp / "kbdata" / "index" / "knowledge.db").exists()
 
 
 def test_pattern_search_only_over_added_projects(kb, project_dir):
@@ -269,10 +269,13 @@ def test_r38_set_location_without_arguments_returns_the_current_one(kb):
     assert r["changed"] is False and r["location"] == str(tmp / "kbdata") and "unchanged" in r["note"]
 
 
-def _kb_with_docs(tmp: Path) -> Path:
+def _kb_with_docs(tmp: Path, kb_fixture: Path) -> Path:
+    """The knowledge folder of tests/fixtures/kb (indexes built by the real code, conftest.kb_fixture) plus a PDF
+    not indexed yet, an SOP and an old builder copy in tools\\."""
     import shutil
     loc = tmp / "kbdocs"
-    shutil.copytree(Path(__file__).parent / "fixtures" / "kb", loc, ignore=shutil.ignore_patterns("*.py", "__pycache__"))
+    shutil.copytree(kb_fixture, loc, ignore=shutil.ignore_patterns("_package"))
+    shutil.rmtree(loc / "manuals")                    # the indexed PDF is not in this folder: reported as gone
     (loc / "manuals" / "IO").mkdir(parents=True)
     (loc / "manuals" / "IO" / "EL3102.pdf").write_bytes(b"%PDF-1.4 not indexed yet")
     (loc / "sop" / "scope").mkdir(parents=True)
@@ -284,46 +287,53 @@ def _kb_with_docs(tmp: Path) -> Path:
     return loc
 
 
-def test_status_reports_the_offline_documentation_layout(kb):
-    """kb_status names what the twincat-docs skill reads in the same folder (built by the folder's own tools)."""
+def test_status_reports_the_offline_documentation_layout(kb, kb_fixture):
+    """kb_status names what the twincat-docs skill reads in the same folder (the plugin's builders, run directly or
+    through the stubs in tools\\) — and every index in index\\ (docs/KNOWLEDGE_BASE.md)."""
     k, tmp = kb
-    loc = _kb_with_docs(tmp)
+    loc = _kb_with_docs(tmp, kb_fixture)
     k.set_location(str(loc))
     d = k.status()["docs"]
     assert d["skill"] == "twincat-docs" and str(K.docs_skill_path()) in d["call"] and str(loc) in d["call"]
     assert d["infosys"]["exists"] and d["infosys"]["pages"] == 8 and d["infosys"]["books"] == 6
-    assert d["infosys"]["package"] == "BKINFOSYS3_FIXTURE_EN-US.mshc" and d["infosys"]["lcid"] == "1033"
-    assert d["infosys"]["state"] == "complete" and d["infosys"]["links_resolved"] == 3 and "command" not in d["infosys"]
+    assert Path(d["infosys"]["package"]).name == "BKINFOSYS3_FIXTURE_EN-US.mshc" and d["infosys"]["lcid"] == "1033"
+    assert d["infosys"]["state"] == "complete" and d["infosys"]["format"] == d["infosys"]["format_expected"]
+    assert d["infosys"]["links"] == 2 and d["infosys"]["links_resolved"] == 1 and "command" not in d["infosys"]
+    assert Path(d["infosys"]["database"]) == loc / "index" / "infosys-1033.db"
     m = d["manuals"]
     assert m["manuals"] == 1 and m["pdfs_in_folder"] == 1 and m["not_indexed"] == ["EL3102.pdf"]
     assert m["indexed_but_gone"] == ["CX9020.pdf"]                   # the fixture's PDF path is not in this folder
     # the old copy in tools\ became the stub when the folder was chosen: the command runs it from the knowledge folder
-    assert m["state"] == "pending" and m["command"].startswith(f'<Python 3.12+> "{loc / "tools" / "manuals_db.py"}" update --kb')
+    assert m["state"] == "outdated" and m["command"].startswith(f'<Python 3.12+> "{loc / "tools" / "manuals_db.py"}" update --kb')
+    assert Path(m["database"]) == loc / "index" / "manuals.db"
     b = d["builders"]
-    assert b["infosys_local.py"]["shipped_version"] == "2" and b["infosys_local.py"]["copy_in_tools"] is None
+    assert b["infosys_local.py"]["shipped_version"] == "3" and b["infosys_local.py"]["copy_in_tools"] is None
     assert b["manuals_db.py"]["copy_kind"] == "stub" and "nothing to update" in b["manuals_db.py"]["note"]
     assert (loc / "tools" / f"manuals_db.py.v{K._builder_version(K.builders_dir() / 'manuals_db.py')}.bak").is_file()
     assert d["sop"] == [str(Path("sop") / "scope" / "SOP-scope-display.md")]
-    # read-only: nothing next to the databases was created
-    assert sorted(p.name for p in (loc / "helpviewer").iterdir()) == ["infosys_en.db"]
+    # read-only: nothing next to the indexes was created (kb_set_location wrote index\\README.md and knowledge.db)
+    assert sorted(p.name for p in (loc / "index").iterdir()) == ["README.md", "infosys-1033.db", "knowledge.db",
+                                                                 "manuals.db"]
+    assert k.status()["layout"]["index"] == str(loc / "index") and "obsolete_files" not in k.status()["layout"]
     assert K.docs_skill_path().is_file()
 
 
-def test_set_location_names_the_docs_it_finds(kb):
+def test_set_location_names_the_docs_it_finds(kb, kb_fixture):
     k, tmp = kb
     r = k.set_location(str(tmp / "empty_kb"))
     assert r["docs"]["infosys"]["exists"] is False and r["docs"]["infosys"]["state"] == "missing"
     assert 'infosys_local.py" index --kb' in r["docs"]["infosys"]["command"]
-    r2 = k.set_location(str(_kb_with_docs(tmp)))
+    r2 = k.set_location(str(_kb_with_docs(tmp, kb_fixture)))
     assert r2["docs"]["infosys"]["exists"] and r2["docs"]["manuals"]["exists"]
 
 
-def test_hw_lookup_adds_the_manuals_that_mention_the_product(kb):
+def test_hw_lookup_adds_the_manuals_that_mention_the_product(kb, kb_fixture):
     k, tmp = kb
     k.set_location(str(tmp / "kbdata"))
     r = k.hw_lookup("EL2008")
     assert "manuals" not in r and "no manuals database" in r["manuals_note"]
-    k.set_location(str(_kb_with_docs(tmp)))
+    assert str(tmp / "kbdata" / "index" / "manuals.db") in r["manuals_note"]
+    k.set_location(str(_kb_with_docs(tmp, kb_fixture)))
     r = k.hw_lookup("EL3102")                                  # not in this ESI, but a product code in the manual
     assert r["matches"] == 0 and r["manuals"]["EL3102"][0]["doc"] == "CX9020.pdf"
     assert r["manuals"]["EL3102"][0]["pages"] == [2, 4]
@@ -371,7 +381,8 @@ def test_review_relative_paths_shared_labels_low_space_and_configured_folder(kb,
     monkeypatch.setattr(K.shutil, "disk_usage", real)
     # a location configured in the TOML that does not exist yet is created on first use
     k2 = K.Knowledge(tmp_path / "home2", str(tmp_path / "configured_kb"))
-    assert k2.status()["database"].endswith(K.DB_NAME) and (tmp_path / "configured_kb").is_dir()
+    assert Path(k2.status()["database"]) == tmp_path / "configured_kb" / "index" / "knowledge.db"
+    assert (tmp_path / "configured_kb").is_dir()
 
 
 def test_ro_uri_quotes_and_handles_posix_paths(tmp_path):
@@ -391,14 +402,14 @@ def test_a_chosen_folder_that_was_deleted_is_reported_not_recreated(kb):
     assert not (tmp / "kbgone").exists()
 
 
-def test_n34_hw_lookup_takes_the_order_code_out_of_the_esi_type(kb, monkeypatch):
+def test_n34_hw_lookup_takes_the_order_code_out_of_the_esi_type(kb, kb_fixture, monkeypatch):
     """N34: hw_lookup CX9020 looked up the ESI device name 'CX9020 EtherCAT slave' in the manuals (no match)."""
     k, tmp = kb
     (tmp / "esi" / "Beckhoff CX.xml").write_text(
         '<?xml version="1.0"?><EtherCATInfo><Vendor><Id>#x2</Id><Name>Beckhoff</Name></Vendor><Descriptions><Devices>'
         '<Device><Type ProductCode="#x23446052" RevisionNo="#x1">CX9020 EtherCAT slave</Type>'
         '<Name LcId="1033">CX9020 EtherCAT slave</Name></Device></Devices></Descriptions></EtherCATInfo>', encoding="utf-8")
-    k.set_location(str(_kb_with_docs(tmp)))
+    k.set_location(str(_kb_with_docs(tmp, kb_fixture)))
     r = k.hw_lookup("CX9020")
     assert r["types"] == ["CX9020 EtherCAT slave"]
     assert r["manuals"]["CX9020"][0]["doc"] == "CX9020.pdf" and "manuals_note" not in r
@@ -583,3 +594,48 @@ def test_review_hw_lookup_revision_text_and_newest_of_every_type_first(kb):
     assert [d["revision"] for d in o["devices"]] == [old] and "pdo" in o["devices"][0]
     with pytest.raises(K.KnowledgeError, match="revision must be"):
         k.hw_lookup("EL2008", revision="banana")
+
+
+def test_esi_index_is_built_once_by_itself_and_rebuilt_only_when_asked(kb, monkeypatch):
+    """docs/KNOWLEDGE_BASE.md rule 6 for knowledge.db's ESI part: the first hw_lookup builds the index; an index that
+    exists is used as it is — new ESI files or another parser are reported (esi_state, the answer's esi_index_note)
+    until kb_rebuild(index='esi') runs esi_index — in one transaction: an error part-way changes nothing."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    assert k.esi_state()["state"] == "missing"
+    assert k.hw_lookup("EL2008")["indexed_now"]["devices_added"] == 2
+    st = k.esi_state()
+    assert st["state"] == "complete" and st["devices"] == 2 and st["files_indexed"] == 1
+    # a new ESI file: reported, not read by a lookup
+    (tmp / "esi" / "Beckhoff EL1xxx.xml").write_text(ESI.replace("EL2008", "EL1008").replace("EL3062", "EL1018")
+                                                     .replace("#x07d83052", "#x03f03052").replace("#x0bf03052", "#x03fa3052"),
+                                                     encoding="utf-8")
+    st = k.esi_state()
+    assert st["state"] == "outdated" and st["new_files"] == 1 and "kb_rebuild(index='esi')" in st["message"]
+    r = k.hw_lookup("EL1008")
+    assert r["matches"] == 0 and "indexed_now" not in r and "OUTDATED" in r["esi_index_note"]
+    # another parser's rows: a rebuild is due, every file is read again — but only when asked
+    with k._db() as con:
+        con.execute("UPDATE meta SET v = '1' WHERE k = 'esi_parser'")
+    assert k.esi_state()["state"] == "rebuild_needed" and "ESI parser 1" in k.esi_state()["message"]
+    # one transaction: a failure on the second file leaves the index exactly as it was
+    real = K._parse_esi
+    calls = []
+
+    def flaky(f):
+        calls.append(f)
+        if len(calls) == 2:
+            raise OSError("disk read error")
+        return real(f)
+    monkeypatch.setattr(K, "_parse_esi", flaky)
+    with pytest.raises(OSError):
+        k.esi_index()
+    assert k.esi_state()["state"] == "rebuild_needed" and k.esi_state()["devices"] == 2
+    monkeypatch.setattr(K, "_parse_esi", real)
+    r = k.esi_index()
+    assert r["indexed"] == 2 and r["devices_added"] == 4
+    assert k.esi_state()["state"] == "complete" and k.hw_lookup("EL1008")["matches"] == 1
+    # a removed file: its rows go with the next rebuild
+    (tmp / "esi" / "Beckhoff EL1xxx.xml").unlink()
+    assert k.esi_state()["removed_files"] == 1
+    assert k.esi_index()["removed"] == 1 and k.esi_state()["state"] == "complete" and k.esi_state()["devices"] == 2

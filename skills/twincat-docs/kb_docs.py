@@ -1,11 +1,15 @@
 """twincat-docs: offline Beckhoff documentation lookup, read-only, one JSON object per call.
 
-Reads the two databases of the local TwinCAT knowledge base (`<kb>`, see `status`):
-  <kb>\\helpviewer\\infosys_en.db   Beckhoff Infosys from the Help Viewer package, built by builders\\infosys_local.py index
-  <kb>\\manualsdb\\manuals.db       PDF hardware manuals, built by builders\\manuals_db.py update
+Reads two indexes of the local TwinCAT knowledge base (`<kb>`, see `status`; the layout and rules:
+docs/KNOWLEDGE_BASE.md of the twincat plugin):
+  <kb>\\index\\infosys-<lcid>.db   Beckhoff Infosys from the Help Viewer package — the same index the plugin's infosys_*
+                                 tools read, built by the plugin's extractor (builders\\infosys_local.py index)
+  <kb>\\index\\manuals.db         PDF hardware manuals, built by builders\\manuals_db.py update
 (the builders ship next to this script and need Python 3.12+; <kb>\\tools\\ holds stubs that run them)
-Nothing is written: both are opened with SQLite's read-only mode. Standard library only. Needs Python 3.12 or newer
-(checked at start, like the builders and the server), SQLite with FTS5 — the python.org builds have it.
+Nothing is written: both are opened with SQLite's read-only mode, and what they hold is shown as stored (it is
+normalised when indexed, never repaired here). Standard library only (and the plugin's own twincat_mcp package beside
+this skill). Needs Python 3.12 or newer (checked at start, like the builders and the server), SQLite with FTS5 — the
+python.org builds have it.
 
 usage:
   python kb_docs.py <command> key=value ... [--kb PATH]
@@ -14,11 +18,10 @@ usage:
 Exit code 0 with the answer, 1 with {"error": code, "message": ..., [...]}. Values with spaces go in quotes:
   python kb_docs.py docs_search "query=fbRead( READ := FALSE )" limit=3
 
-The query and ranking logic is the one of infosys_local.py / manuals_db.py (same bm25 weights, snippet sizes, page
-reference resolution, manual matching, product-code lookup); differences, all deliberate: a name that exists in
-several books is never resolved silently (error 'ambiguous' with the candidates), filters are applied before the row
-limit so 'total' is exact, out-of-range parameters are refused instead of clamped, an invalid FTS5 query is retried
-once as a literal phrase.
+Deliberate behaviour: a name that exists in several books is never resolved silently (error 'ambiguous' with the
+candidates), filters are applied before the row limit so 'total' is exact, out-of-range parameters are refused instead
+of clamped, an invalid FTS5 query is retried once as a literal phrase, a query of nothing but stop words is refused
+(the rule of the twincat server's kb_search).
 """
 from __future__ import annotations
 
@@ -41,14 +44,20 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "3"           # 2: index state in every answer, links as refs, builders shipped beside it; 3: Python 3.12+
+VERSION = "4"           # 2: index state in every answer, links as refs, builders shipped beside it; 3: Python 3.12+
+                        # 4: the plugin's one Infosys index (index\\infosys-<lcid>.db), the permanent layout (0.8.11)
 FALLBACK_KB = r"D:\TwinCAT-MCP\knowledge"
-INFOSYS_DB = ("helpviewer", "infosys_en.db")
-MANUALS_DB = ("manualsdb", "manuals.db")
 WEB = "https://infosys.beckhoff.com/content/{lcid}/{book}/{pid}.html"
 BUILDERS = Path(__file__).resolve().parent / "builders"
-BUILD_INFOSYS = (f'<Python 3.12+> "{BUILDERS / "infosys_local.py"}" index --kb "<kb>"   (≈ 150 s, reads the Help Viewer '
-                 'package BKINFOSYS3*.mshc)')
+_PLUGIN = Path(__file__).resolve().parents[2]          # <plugin>/skills/twincat-docs/kb_docs.py → <plugin>
+# the plugin's own package beside this skill (this version's rules) — unless this runs inside the server, which has it
+if "twincat_mcp" not in sys.modules and (_PLUGIN / "twincat_mcp" / "kb_layout.py").is_file() and str(_PLUGIN) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN))
+from twincat_mcp import infosys_build as IB  # noqa: E402 — the index's state: one implementation for every reader
+from twincat_mcp import kb_layout as L  # noqa: E402 — where everything is: one place
+BUILD_INFOSYS = (f'<Python 3.12+> "{BUILDERS / "infosys_local.py"}" index --kb "<kb>"   (reads the Help Viewer package '
+                 "BKINFOSYS3*.mshc with the plugin's extractor; or approve kb_rebuild(index='infosys') in the twincat "
+                 "server)")
 BUILD_MANUALS = (r"copy the PDF manuals into <kb>\manuals\ (sub-folders allowed), then: <Python 3.12+ with pypdf or "
                  f'PyMuPDF> "{BUILDERS / "manuals_db.py"}" update --kb "<kb>"')
 
@@ -65,8 +74,10 @@ RULES = [
     "(query_mode says so).",
     "Ranges are checked, not clamped: limit 1-50, max_chars 200-20000, offset >= 0, depth 1-6, at most 21 pages.",
     "Long pages: section= first (outline lists them), then offset=next_offset.",
-    "Nothing found -> say so. Then the twincat server's infosys_* tools; a missing manual -> the user copies the PDF "
-    "into <kb>\\manuals\\ and runs manuals_db.py update.",
+    "Nothing found -> say so. A missing manual -> the user copies the PDF into <kb>\\manuals\\ and runs "
+    "manuals_db.py update (or approves kb_rebuild(index='manuals')).",
+    "source.state other than 'complete' (rebuild_needed, outdated) -> say so: the answer comes from that index as it "
+    "is, and the rebuild runs only once the user approves it (kb_rebuild, or the command in source.state_note).",
     "Read-only: nothing here changes the databases.",
 ]
 
@@ -212,109 +223,42 @@ def ro_uri(db: Path) -> str:
 
 
 # ---------------------------------------------------------------------------------------------- the real index state
-# Same rules as the builders (builders/infosys_local.py and builders/manuals_db.py `stats --json`): a rebuild writes
-# <db>.building and replaces the index only when complete, so the live file is always a whole index; a .building file
-# whose heartbeat stopped is an interrupted rebuild. The twincat server's kb_status / tc_doctor and the instructions
-# it sends at every (re)connection use these functions too.
-SCHEMA_VERSION = "2"
-HEARTBEAT_STALE_S = 120
+# The Infosys index: twincat_mcp.infosys_build.state — the one implementation (the server's kb_status / tc_doctor, the
+# instructions it sends at every (re)connection, the builder's `stats` and every answer here use it). The manuals
+# index: manuals_state below (the builder's `stats --json` gives the same answer). Both follow the rules: a rebuild
+# writes <db>.building and replaces the index only when complete, so the live file is always a whole index.
 MANUALS_HEARTBEAT_STALE_S = 300
-MANUALS_TEXT_FORMAT = "3"          # manuals_db.py TEXT_FORMAT: page text / toc rules
+
+
+def _builder_text_format() -> str:
+    """manuals_db.py's TEXT_FORMAT — read from the builder shipped beside this script, never a copy of the number."""
+    try:
+        m = re.search(r'^TEXT_FORMAT = "(\d+)"', (BUILDERS / "manuals_db.py").read_text(encoding="utf-8"), re.M)
+    except OSError:
+        return "?"
+    return m.group(1) if m else "?"
+
+
+MANUALS_TEXT_FORMAT = _builder_text_format()
 
 
 def _meta_of(path: Path) -> dict[str, str]:
-    if not path.is_file():
-        return {}
-    try:
-        con = sqlite3.connect(ro_uri(path), uri=True, timeout=5)
-        try:
-            return {r[0]: r[1] for r in con.execute("SELECT key, value FROM meta")}
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return {}
-
-
-def _stamp(p: Path) -> str:
-    st = p.stat()
-    return f"{p.name}|{st.st_size}|{int(st.st_mtime)}"
+    return IB.read_meta(path)
 
 
 def index_state(final: Path) -> dict[str, Any]:
-    building, lock = final.with_name(final.name + ".building"), final.with_name(final.name + ".lock")
-    now = time.time()
-    meta = _meta_of(final)
-    out: dict[str, Any] = {"database": str(final)}
-    if not final.is_file():
-        out["state"] = "missing"
-    elif not meta.get("source"):
-        out["state"] = "incomplete"
-    elif meta.get("schema") != SCHEMA_VERSION:
-        out["state"] = "old_format"
-    else:
-        out["state"] = "complete"
-        pkg = Path(meta["mshc_path"]) if meta.get("mshc_path") else None
-        if pkg is not None:
-            try:
-                if not pkg.is_file():
-                    out["package_note"] = f"the package it was built from is gone: {pkg}"
-                elif _stamp(pkg) != meta["source"]:
-                    out["state"] = "outdated"
-                    out["package_note"] = f"the Help Viewer package changed since the index was built: {pkg}"
-                else:
-                    newer = [x for x in pkg.parent.glob("BKINFOSYS3*.mshc")
-                             if x != pkg and x.stat().st_mtime > pkg.stat().st_mtime]
-                    if newer:
-                        out["state"] = "outdated"
-                        out["package_note"] = f"a newer package exists: {max(newer, key=lambda x: x.stat().st_mtime)}"
-            except OSError:
-                pass
-    for k in ("pages", "books", "links", "links_resolved", "indexed", "lcid", "builder", "mshc_path"):
-        if meta.get(k):
-            out[k] = int(meta[k]) if k in ("pages", "books", "links", "links_resolved") and meta[k].isdigit() else meta[k]
-    if meta.get("source"):
-        out["package"] = meta["source"].split("|")[0]
-    if building.is_file():
-        bm = _meta_of(building)
-        beat = max([float(bm.get("heartbeat") or 0)] + ([lock.stat().st_mtime] if lock.is_file() else []))
-        rb: dict[str, Any] = {"file": str(building), "pages_done": int(bm.get("pages_done") or 0),
-                              "pages_total": int(bm.get("pages_total") or 0), "started": bm.get("started"),
-                              "seconds_since_progress": round(now - beat) if beat else None}
-        if bm.get("state") == "complete":
-            # finished. While its builder still holds the lock it is swapping the file in (or retrying while a reader
-            # has the live index open): running. Only once the builder is gone does the finished file WAIT — 'run
-            # index again' was said for a build that was just being put in place
-            alive = lock.is_file() and now - lock.stat().st_mtime < HEARTBEAT_STALE_S
-            rb["state"] = "running" if alive else "waiting_to_replace"
-            if alive:
-                rb["phase"] = "replacing the live index"
-        elif beat and now - beat < HEARTBEAT_STALE_S:
-            rb["state"] = "running"
-        else:
-            rb["state"] = "interrupted"
-        out["rebuild"] = rb
-    out["message"] = index_message(out)
-    return out
+    return IB.state(final)
 
 
 def index_message(s: dict[str, Any]) -> str:
-    live = {"missing": "no index yet", "incomplete": "INCOMPLETE (an earlier build stopped half-way) — run index",
-            "old_format": "complete text, older format without links — run index once to upgrade",
-            "complete": "complete", "outdated": "OUTDATED — " + s.get("package_note", "") + " — run index"}[s["state"]]
-    if s["state"] in ("complete", "outdated") and s.get("pages"):
-        live += f" ({s['pages']} pages, {s.get('books')} books, built {s.get('indexed')})"
-    rb = s.get("rebuild")
-    if rb:
-        prog = f"{rb['pages_done']} of {rb['pages_total']} pages"
-        live += {"running": f"; a rebuild is RUNNING ({prog}) — the index above stays in use until it is done",
-                 "interrupted": f"; a rebuild was INTERRUPTED at {prog} — the index above is still the one in use; "
-                                "run index to build again",
-                 "waiting_to_replace": "; a finished rebuild waits to replace it (the file was open) — run index again"
-                 }[rb["state"]]
-    return live
+    return IB.message(s)
 
 
 def manuals_state(db: Path, folder: Path) -> dict[str, Any]:
+    """The manuals index: missing | complete | outdated (PDFs added, changed or removed since) | rebuild_needed (built
+    by another page text format) — an index that is not complete stays in use as it is until an update runs
+    (approved: kb_rebuild(index='manuals'), or tools\\manuals_db.py update) — plus an update in progress or abandoned
+    (<db>.building, its lock the heartbeat)."""
     out: dict[str, Any] = {"database": str(db), "folder": str(folder)}
     try:
         on_disk = {os.path.normcase(str(f)): f for f in folder.rglob("*")
@@ -322,9 +266,24 @@ def manuals_state(db: Path, folder: Path) -> dict[str, Any]:
     except OSError:
         on_disk = {}
     out["pdfs_in_folder"] = len(on_disk)
+    building, lock = db.with_name(db.name + ".building"), db.with_name(db.name + ".lock")
+    upd: dict[str, Any] | None = None
+    if building.is_file() or lock.is_file():
+        bm = _meta_of(building)
+        beat = lock.stat().st_mtime if lock.is_file() else None
+        alive = beat is not None and time.time() - beat < MANUALS_HEARTBEAT_STALE_S
+        upd = {"state": "running" if alive else "interrupted", "files_done": int(bm.get("files_done") or 0),
+               "files_total": int(bm.get("files_total") or 0)}
+        if not alive and not building.is_file():
+            upd = None
     if not db.is_file():
         out["state"] = "missing"
-        out["message"] = f"no manuals database yet ({len(on_disk)} PDFs in the folder) — run update"
+        out["message"] = (f"no manuals index yet ({len(on_disk)} PDFs in the folder) — tools\\manuals_db.py update, or "
+                          "kb_rebuild(index='manuals')")
+        if upd:
+            out["updating"] = upd
+            out["message"] += (f"; an update is RUNNING ({upd['files_done']} of {upd['files_total']} files)"
+                               if upd["state"] == "running" else "; an update was INTERRUPTED")
         return out
     con = sqlite3.connect(ro_uri(db), uri=True, timeout=5)
     con.row_factory = sqlite3.Row
@@ -345,35 +304,36 @@ def manuals_state(db: Path, folder: Path) -> dict[str, Any]:
                 "changed_since_index": changed, "indexed_but_gone": gone,
                 "no_text_layer": sorted(d["name"] for d in docs if not d["text_pages"]),
                 "last_update": meta.get("last_update"), "last_result": meta.get("last_result")})
-    lock = db.with_name(db.name + ".lock")
-    beat = max(float(meta.get("heartbeat") or 0), lock.stat().st_mtime if lock.is_file() else 0)
-    if meta.get("state") == "updating":
-        out["updating"] = {"state": "running" if time.time() - beat < MANUALS_HEARTBEAT_STALE_S else "interrupted",
-                           "files_done": int(meta.get("files_done") or 0), "files_total": int(meta.get("files_total") or 0)}
     pending = len(new) + len(changed) + len(gone)
     fmt = meta.get("text_format") or "1"
     old_text = bool(docs) and fmt != MANUALS_TEXT_FORMAT
     out["text_format"] = fmt
-    out["state"] = "pending" if pending else "outdated" if old_text else "up_to_date"
+    out["text_format_expected"] = MANUALS_TEXT_FORMAT
+    out["state"] = "rebuild_needed" if old_text else "outdated" if pending else "complete"
     msg = f"{len(docs)} manuals, {out['pages']} pages indexed"
-    if pending:
-        msg += f"; {len(new)} new, {len(changed)} changed, {len(gone)} removed PDF(s) not reflected — run update"
     if old_text:
-        msg += (f"; page text format {fmt}, the builder writes {MANUALS_TEXT_FORMAT} (running headers removed, "
-                "wrapped headings joined) — run update, it reads every manual again")
-    if out.get("updating"):
-        u = out["updating"]
-        msg += (f"; an update is RUNNING ({u['files_done']} of {u['files_total']} files)" if u["state"] == "running" else
-                f"; the last update was INTERRUPTED at {u['files_done']} of {u['files_total']} files — run update")
+        msg += (f"; in use as it is, a REBUILD is due — page text format {fmt}, the builder writes "
+                f"{MANUALS_TEXT_FORMAT} (every manual is read again)")
+    if pending:
+        msg += (f"; in use as it is, OUTDATED — {len(new)} new, {len(changed)} changed, {len(gone)} removed PDF(s) "
+                "not in it")
+    if old_text or pending:
+        msg += " — the update runs once approved: kb_rebuild(index='manuals'), or tools\\manuals_db.py update"
+    if upd:
+        out["updating"] = upd
+        msg += (f"; an update is RUNNING ({upd['files_done']} of {upd['files_total']} files) — the index above stays "
+                "in use until it is done" if upd["state"] == "running" else
+                f"; an update was INTERRUPTED at {upd['files_done']} of {upd['files_total']} files — the index above "
+                "is still the one in use")
     out["message"] = msg
     return out
 
 
 def overview(kb: Path) -> dict[str, Any]:
-    """Both databases of a knowledge folder, as the server reports them at each connection."""
-    i = index_state(kb / INFOSYS_DB[0] / INFOSYS_DB[1])
+    """Both indexes of a knowledge folder, as the server reports them at each connection."""
+    i = index_state(L.locate(kb, "infosys"))
     try:
-        m = manuals_state(kb / MANUALS_DB[0] / MANUALS_DB[1], kb / "manuals")
+        m = manuals_state(L.locate(kb, "manuals"), kb / "manuals")
     except sqlite3.Error as exc:
         m = {"state": "error", "message": f"manuals database not readable: {exc}"}
     return {"knowledge_base": str(kb), "infosys": i, "manuals": m,
@@ -381,14 +341,16 @@ def overview(kb: Path) -> dict[str, Any]:
 
 
 class Ctx:
-    def __init__(self, kb: Path, kb_source: str):
+    def __init__(self, kb: Path, kb_source: str, infosys_db: Path | None = None):
         self.kb, self.kb_source = kb, kb_source
+        self.infosys_db = infosys_db               # an explicit index file (the builder's --db)
         self._con: dict[str, sqlite3.Connection] = {}
         self._src: dict[str, dict[str, Any]] = {}
 
     def path(self, which: str) -> Path:
-        sub, name = INFOSYS_DB if which == "infosys" else MANUALS_DB
-        return self.kb / sub / name
+        if which == "infosys" and self.infosys_db is not None:
+            return self.infosys_db
+        return L.locate(self.kb, "infosys" if which == "infosys" else "manuals")
 
     def con(self, which: str) -> sqlite3.Connection:
         if which in self._con:
@@ -396,46 +358,51 @@ class Ctx:
         p = self.path(which)
         build = BUILD_INFOSYS if which == "infosys" else BUILD_MANUALS
         if not p.is_file():
-            raise Err("no_index", f"no {'Infosys' if which == 'infosys' else 'manuals'} database at {p} "
-                      f"(knowledge base {self.kb}, from {self.kb_source})",
+            more = ""
+            if which == "infosys":
+                more = " — " + IB.state(p)["message"]          # the first build may be running
+            raise Err("no_index", f"no {'Infosys' if which == 'infosys' else 'manuals'} index at {p} "
+                      f"(knowledge base {self.kb}, from {self.kb_source}){more}",
                       hint=f"build it: {build}; another knowledge folder: --kb PATH "
                            "(the twincat server's kb_status shows the one it uses)")
         con = sqlite3.connect(ro_uri(p), uri=True, timeout=5)
         con.row_factory = sqlite3.Row
+        fts = "pages_fts" if which == "infosys" else "fts"
         try:   # N65: the index's own term statistics (in memory, temp schema) — before the connection turns query-only
-            con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.fts_vocab USING fts5vocab(main, 'fts', 'row')")
+            con.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS temp.fts_vocab USING fts5vocab(main, '{fts}', 'row')")
         except sqlite3.Error:
             pass
         con.execute("PRAGMA query_only = 1")
         con.create_function("fnm", 2, lambda s, pat: int(fnmatch.fnmatch((s or "").lower(), (pat or "").lower())),
                             deterministic=True)
-        need = {"meta", "page", "fts"} if which == "infosys" else {"doc", "page", "toc", "product", "fts"}
+        need = {"meta", "pages", "pages_fts"} if which == "infosys" else {"doc", "page", "toc", "product", "fts"}
         have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")}
         if not need <= have:
-            raise Err("no_index", f"{p} is not a {'infosys_local.py' if which == 'infosys' else 'manuals_db.py'} database "
+            raise Err("no_index", f"{p} is not a{'n Infosys' if which == 'infosys' else ' manuals_db.py'} index "
                       f"(tables missing: {sorted(need - have)})", hint=f"rebuild it: {build}")
         self._con[which] = con
         return con
 
     def source(self, which: str) -> dict[str, Any]:
+        """What every answer carries: the index it came from — and, when that index is not the current one, what it
+        is (rule 6: an index of an older format or source is used as it is, and said so)."""
         if which in self._src:
             return self._src[which]
         con = self.con(which)
         if which == "infosys":
             meta = {r[0]: r[1] for r in con.execute("SELECT key, value FROM meta")}
-            stamp = meta.get("source") or ""
-            parts = stamp.split("|")
-            src: dict[str, Any] = {"database": str(self.path(which)), "package": parts[0] or None,
-                                   "indexed": meta.get("indexed"), "lcid": meta.get("lcid") or "1033"}
-            if len(parts) == 3 and parts[2].isdigit():
-                src["package_date"] = _dt.datetime.fromtimestamp(int(parts[2])).strftime("%Y-%m-%d")
+            src: dict[str, Any] = {"database": str(self.path(which)),
+                                   "package": Path(meta["package"]).name if meta.get("package") else None,
+                                   "package_date": meta.get("package_date"), "indexed": meta.get("built"),
+                                   "lcid": meta.get("lcid") or "1033"}
             st = index_state(self.path(which))
-            src["state"] = st["state"]
-            if st["state"] != "complete" or st.get("rebuild"):
-                src["state_note"] = st["message"]          # the answer comes from this index — say what it is
         else:
             n, pages = con.execute("SELECT COUNT(*), COALESCE(SUM(pages), 0) FROM doc").fetchone()
             src = {"database": str(self.path(which)), "manuals": n, "pages": pages}
+            st = manuals_state(self.path(which), self.kb / "manuals")
+        src["state"] = st["state"]
+        if st["state"] != "complete" or st.get("rebuild") or st.get("updating"):
+            src["state_note"] = st["message"]          # the answer comes from this index — say what it is
         self._src[which] = src
         return src
 
@@ -457,7 +424,8 @@ def one_line(s: str | None) -> str:
     return _WS.sub(" ", s or "").strip()
 
 
-def clean(s: str | None) -> str:
+def query_text(s: str | None) -> str:
+    """A query as typed or pasted: a non-breaking space in it is a space (the indexes hold none)."""
     return (s or "").replace("\xa0", " ")
 
 
@@ -513,31 +481,37 @@ def _term_df(con: sqlite3.Connection, word: str, prefix: bool) -> int | None:
         return None
 
 
-def _page_count(con: sqlite3.Connection) -> int:
+def _page_count(con: sqlite3.Connection, fts: str = "fts") -> int:
     try:
-        return int(con.execute("SELECT COUNT(*) FROM fts").fetchone()[0])
+        # the Infosys index's pages_fts reads its text from pages: count the pages themselves
+        return int(con.execute("SELECT COUNT(*) FROM " + ("pages" if fts == "pages_fts" else fts)).fetchone()[0])
     except sqlite3.Error:
         return 0
 
 
 def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, extra: list[Any],
-                 limit: int, title_key: str | None = None) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
+                 limit: int, title_key: str | None = None, fts: str = "fts"
+                 ) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
     """N36/N65: a question in words falls back in steps, and only on words that can pick a page:
       1. every word as written (stop words included: a precise query stays precise);
       2. every informative word that occurs in the index — stop words, 1-2 letter words and words on no page dropped;
       3. those words as prefixes (a word is kept when some term starts with it: 'Diagnos' -> diagnostics);
       4. some of them (OR) — without words that are on more than 20 % of the pages.
-    Nothing informative left: no hits (never 49,096 'some words' hits for 'how to zzqxv a the'). A page whose title
-    is one of the query words ranks first ('ADSREAD xyzqq' -> ADSREAD before AdsReadDeviceInfo). FTS5 syntax or code
-    punctuation runs as written (run_fts, with the phrase retry).
+    Nothing informative left: no hits (never 49,096 'some words' hits for 'how to zzqxv a the'). N79: a query of
+    nothing but stop words ('how to a the') is refused, as the twincat server's kb_search refuses it — one word alone
+    ('the') is searched as written. A page whose title is one of the query words ranks first ('ADSREAD xyzqq' ->
+    ADSREAD before AdsReadDeviceInfo). FTS5 syntax or code punctuation runs as written (run_fts, with the phrase retry).
     -> (rows, total, mode, expression, info: words used / ignored with the reason)."""
-    q = clean(query).strip()
+    q = query_text(query).strip()
     if not natural(q):
         rows, mode, expr = run_fts(con, sql, query, extra + [limit])
         return rows, con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr, {}
     words = [w for w in re.findall(r"[^\W_]+(?:_[^\W_]+)*", q)]
     if not words:
         raise Err("empty_query", f"the query {query!r} has no searchable word (punctuation is not indexed)")
+    if len(words) > 1 and all(_fold(w) in STOP_WORDS for w in words):
+        raise Err("empty_query", f"the query {query!r} has only stop words ({', '.join(words)}): they are on almost "
+                  "every page and pick none — give a name, a product code or specific words")
 
     def ph(w: str) -> str:
         return '"' + w.replace('"', '""') + '"'
@@ -557,7 +531,7 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
             pref.append(w)
         else:
             ignored[w] = "on no page"
-    n_pages = _page_count(con)
+    n_pages = _page_count(con, fts)
     common = {w for w in pref if n_pages and (_term_df(con, w, False) or 0) > COMMON_SHARE * n_pages}
     tiers = [("all words", " ".join(ph(w) for w in words), words)]
     if pref and pref != words:                 # without the stop words / words on no page, exactly as written
@@ -586,12 +560,13 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
     return [], 0, tiers[-1][0], tiers[-1][1], info
 
 
-def matched_words(con: sqlite3.Connection, rowid: int, words: list[str]) -> list[str]:
+def matched_words(con: sqlite3.Connection, rowid: int, words: list[str], fts: str = "fts") -> list[str]:
     """Which of the words (as prefixes) the page with this fts rowid holds — shown per hit in the some-words tier."""
     out = []
     for w in words:
         try:
-            if con.execute("SELECT 1 FROM fts WHERE rowid = ? AND fts MATCH ?", (rowid, '"' + w.replace('"', '""') + '"*')).fetchone():
+            if con.execute(f"SELECT 1 FROM {fts} WHERE rowid = ? AND {fts} MATCH ?",
+                           (rowid, '"' + w.replace('"', '""') + '"*')).fetchone():
                 out.append(w)
         except sqlite3.Error:
             pass
@@ -601,7 +576,7 @@ def matched_words(con: sqlite3.Connection, rowid: int, words: list[str]) -> list
 def run_fts(con: sqlite3.Connection, sql: str, query: str, extra: list[Any]) -> tuple[list[sqlite3.Row], str, str]:
     """Run an FTS5 statement whose first parameter is the MATCH expression. -> (rows, mode, expression used).
     Invalid FTS5 syntax is retried once as a literal phrase (rule 7)."""
-    q = clean(query).strip()
+    q = query_text(query).strip()
     if not q:
         raise Err("empty_query", "the query is empty")
     if not has_words(q):
@@ -623,8 +598,14 @@ def run_fts(con: sqlite3.Connection, sql: str, query: str, extra: list[Any]) -> 
 
 
 # ---------------------------------------------------------------------------------------------- Infosys
+# the plugin's index: pages(url, book, page_id, title, version, crumb, markdown, kind, library, …), pages_fts
+# (title, text, code — external content), helpids(help_id, url). A page row as the commands use it:
+_PAGE = "SELECT rowid AS rid, url, book, page_id AS pid, title, version, crumb, markdown AS body, kind, library FROM pages"
+_LINK_MD = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+
+
 def _books(con: sqlite3.Connection) -> list[str]:
-    return [r[0] for r in con.execute("SELECT DISTINCT book FROM page ORDER BY book")]
+    return [r[0] for r in con.execute("SELECT DISTINCT book FROM pages ORDER BY book")]
 
 
 def _check_book_glob(con: sqlite3.Connection, pattern: str | None) -> None:
@@ -642,7 +623,7 @@ def _cand(ctx: Ctx, r: sqlite3.Row) -> dict[str, Any]:
 
 
 def _order(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
-    # infosys_local.py's preference: library pages (tcplclib_*) first, then the shortest book name
+    # library pages (tcplclib_*) first, then the shortest book name
     return sorted(rows, key=lambda c: (not c["book"].startswith("tcplclib_"), len(c["book"]), c["book"], c["pid"]))
 
 
@@ -650,33 +631,36 @@ def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref") -> tuple[sq
     """Page for a reference: ms-xhelp id → Infosys URL → book/pid → bare pid → exact title (case-insensitive).
     -> (row, how it was resolved). Several pages → Err('ambiguous') with candidates (rule 3)."""
     con = ctx.con("infosys")
-    s = clean(ref).strip()
+    s = query_text(ref).strip()
     if not s:
         raise Err("bad_param", f"{what} is empty")
     m = _MSXHELP.search(s)
     if m:
-        hid = m.group(1)
-        rows = con.execute("SELECT * FROM page WHERE help_id = ?", (hid,)).fetchall() or \
-            con.execute("SELECT * FROM page WHERE help_id = ? COLLATE NOCASE", (hid,)).fetchall()
+        hid = m.group(1).strip().lower()
+        try:
+            urls = [r[0] for r in con.execute("SELECT url FROM helpids WHERE help_id = ?", (hid,))]
+        except sqlite3.OperationalError:
+            urls = []
+        rows = [r for u in urls for r in con.execute(f"{_PAGE} WHERE url = ?", (u,)).fetchall()]
         return _pick(ctx, rows, ref, None, "ms-xhelp id", what)
     m = _URL.search(s)
     if m:
-        rows = con.execute("SELECT * FROM page WHERE book = ? AND pid = ?", (m.group(1), m.group(2))).fetchall()
+        rows = con.execute(f"{_PAGE} WHERE book = ? AND page_id = ?", (m.group(1).lower(), m.group(2))).fetchall()
         return _pick(ctx, rows, ref, None, "Infosys URL", what)
     if "/" in s and not s.startswith("/"):
         b, p = s.split("/", 1)
-        rows = con.execute("SELECT * FROM page WHERE book = ? AND pid = ?", (b, p)).fetchall()
+        rows = con.execute(f"{_PAGE} WHERE book = ? AND page_id = ?", (b, p)).fetchall()
         if not rows:
-            rows = con.execute("SELECT * FROM page WHERE book = ? COLLATE NOCASE AND pid = ?", (b, p)).fetchall()
+            rows = con.execute(f"{_PAGE} WHERE book = ? COLLATE NOCASE AND page_id = ?", (b, p)).fetchall()
         if rows or p.isdigit():
             return _pick(ctx, rows, ref, None, "book/pageid", what)
         # not book/pageid: a title with a slash ('Send/Receive') — go on to the title lookup
     if s.isdigit():
-        rows = [r for r in con.execute("SELECT * FROM page WHERE pid = ?", (s,)).fetchall()
+        rows = [r for r in con.execute(f"{_PAGE} WHERE page_id = ?", (s,)).fetchall()
                 if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())]
         return _pick(ctx, rows, ref, book, "page id", what)
     _check_book_glob(con, book)
-    rows = [r for r in con.execute("SELECT * FROM page WHERE title = ? COLLATE NOCASE", (s,)).fetchall()
+    rows = [r for r in con.execute(f"{_PAGE} WHERE title = ? COLLATE NOCASE", (s,)).fetchall()
             if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())]
     return _pick(ctx, rows, ref, book, "title", what)
 
@@ -687,16 +671,15 @@ def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: st
     if not rows:
         con = ctx.con("infosys")
         near = []
-        word = clean(ref).strip()
+        word = query_text(ref).strip()
         if how == "title" and len(word) >= 3 and has_words(word):
-            # N35: the FTS title column, not a LIKE scan over every page body (9.6 s on the real package)
+            # N35: the FTS title column, not a LIKE scan over every page body
             expr = "title : " + " ".join('"' + w.replace('"', '""') + '"*' for w in re.findall(r"[^\W_]+", word))
             try:
-                hits = con.execute("SELECT book, pid FROM fts WHERE fts MATCH ? LIMIT 200", (expr,)).fetchall()
+                hits = [r[0] for r in con.execute("SELECT rowid FROM pages_fts WHERE pages_fts MATCH ? LIMIT 200", (expr,))]
             except sqlite3.OperationalError:
                 hits = []
-            rows_near = [con.execute("SELECT * FROM page WHERE book = ? AND pid = ?", (h["book"], h["pid"])).fetchone()
-                         for h in hits[:200]]
+            rows_near = [con.execute(f"{_PAGE} WHERE rowid = ?", (h,)).fetchone() for h in hits]
             near = [_cand(ctx, r) for r in _order([r for r in rows_near if r is not None])
                     if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())][:8]
         raise Err("not_found", f"no page for {what} {ref!r}" + (f" in books {book!r}" if book else "") + f" (looked up as {how})",
@@ -708,29 +691,28 @@ def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: st
 
 
 def _also_in(con: sqlite3.Connection, r: sqlite3.Row) -> list[dict[str, Any]]:
-    rows = con.execute("SELECT book, pid, title, version FROM page WHERE title = ? COLLATE NOCASE AND NOT (book = ? AND pid = ?)",
+    rows = con.execute(f"{_PAGE} WHERE title = ? COLLATE NOCASE AND NOT (book = ? AND page_id = ?)",
                        (r["title"], r["book"], r["pid"])).fetchall()
     return [{"ref": f"{x['book']}/{x['pid']}", "book": x["book"], "version": x["version"] or None} for x in _order(rows)]
 
 
-def _links(con: sqlite3.Connection, r: sqlite3.Row, within: str | None = None, limit: int = 30) -> list[dict[str, Any]] | None:
-    """The page's links that resolve to a page of the package (builder version 2), as refs docs_page opens.
-    within: only links whose text is in that part of the page. None: the index has no link table (version 1)."""
-    try:
-        rows = con.execute("SELECT text, target_book, target_pid FROM link WHERE book = ? AND pid = ? AND target_pid IS NOT NULL "
-                           "ORDER BY n", (r["book"], r["pid"])).fetchall()
-    except sqlite3.OperationalError:
-        return None
+def _links(con: sqlite3.Connection, text: str, limit: int = 30) -> list[dict[str, Any]]:
+    """The links in this text that lead to a page of the index, as refs docs_page opens (the stored text holds every
+    link as a page URL — resolved when the index was built)."""
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
-    for x in rows:
-        ref = f"{x['target_book']}/{x['target_pid']}"
-        if ref in seen or (within is not None and x["text"] not in within):
+    for m in _LINK_MD.finditer(text or ""):
+        u = _URL.search(m.group(2))
+        if not u:
+            continue
+        ref = f"{u.group(1).lower()}/{u.group(2)}"
+        if ref in seen:
             continue
         seen.add(ref)
-        out.append({"text": x["text"], "ref": ref})
-        if len(out) >= limit:
-            break
+        if con.execute("SELECT 1 FROM pages WHERE book = ? AND page_id = ?", (u.group(1).lower(), u.group(2))).fetchone():
+            out.append({"text": m.group(1), "ref": ref})
+            if len(out) >= limit:
+                break
     return out
 
 
@@ -742,26 +724,27 @@ def _page_head(ctx: Ctx, r: sqlite3.Row) -> dict[str, Any]:
 def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
     _check_book_glob(con, a["book"])
-    where = "fts MATCH ?" + (" AND fnm(book, ?)" if a["book"] else "")
+    where = "pages_fts MATCH ?" + (" AND fnm(p.book, ?)" if a["book"] else "")
     extra = [a["book"]] if a["book"] else []
     rows, total, mode, expr, info = search_tiers(
-        con, "SELECT fts.rowid AS rid, book, pid, title, snippet(fts, 1, '[', ']', '…', 18) AS s, "
-             f"bm25(fts, 8.0, 1.0) AS r FROM fts WHERE {where} ORDER BY r LIMIT ?",
-        f"SELECT COUNT(*) FROM fts WHERE {where}", a["query"], extra, a["limit"], title_key="title")
+        con, "SELECT pages_fts.rowid AS rid, p.book, p.page_id AS pid, p.title, p.version, "
+             "snippet(pages_fts, 2, '[', ']', '…', 18) AS s, bm25(pages_fts, 0.0, 8.0, 1.0, 1.0) AS r "
+             f"FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {where} ORDER BY r LIMIT ?",
+        f"SELECT COUNT(*) FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {where}", a["query"], extra,
+        a["limit"], title_key="title", fts="pages_fts")
     items = []
     for r in rows:
-        v = con.execute("SELECT version FROM page WHERE book = ? AND pid = ?", (r["book"], r["pid"])).fetchone()
         it = {"ref": f"{r['book']}/{r['pid']}", "title": r["title"], "book": r["book"],
-              "version": (v[0] if v else None) or None, "excerpt": one_line(r["s"]),
+              "version": r["version"] or None, "excerpt": one_line(r["s"]),
               "url": WEB.format(lcid=ctx.lcid(), book=r["book"], pid=r["pid"]), "score": float(f"{-r['r']:.4g}")}
         if mode.startswith("some words"):
-            it["matched"] = matched_words(con, r["rid"], info.get("words_used") or [])
+            it["matched"] = matched_words(con, r["rid"], info.get("words_used") or [], fts="pages_fts")
         items.append(it)
     out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info, "count": len(items), "total": total,
                            "truncated": total > len(items), "items": items, "source": ctx.source("infosys")}
     if not items:
         out["hint"] = ("no page contains these words" + (f" in books {a['book']!r}" if a["book"] else "")
-                       + " — try fewer or other words, OR, prefix*; then the twincat server's infosys_search")
+                       + " — try fewer or other words, OR, prefix*")
     return out
 
 
@@ -796,8 +779,8 @@ def _intro(body: str) -> str:
 def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
     r, how = resolve(ctx, a["symbol"], a["book"], what="symbol")
-    body = clean(r["body"])
-    blocks = [b.strip("\n") for b in re.findall(r"```\n(.*?)\n```", body, re.S)]
+    body = r["body"] or ""
+    blocks = [b.strip("\n") for b in re.findall(r"```[^\n`]*\n(.*?)\n```", body, re.S)]
     shown, used, rest = [], 0, 0
     for b in blocks:
         if used + len(b) > 12000 and shown:
@@ -809,7 +792,7 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = _page_head(ctx, r)
     out.update({"resolved_by": how, "intro": _intro(body), "declaration_blocks": shown,
                 "requirements": req.group(1).strip() if req else None, "also_in": _also_in(con, r)})
-    lk = _links(con, r)
+    lk = _links(con, body)
     if lk:
         out["links"] = lk
     if rest:
@@ -823,7 +806,7 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 def cmd_docs_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
     r, how = resolve(ctx, a["ref"], a["book"])
-    body = clean(r["body"])
+    body = r["body"] or ""
     secs = _sections(body)
     outline = [h for h, _ in secs if h]
     text, section = body, None
@@ -848,10 +831,8 @@ def cmd_docs_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     out = _page_head(ctx, r)
     out.update({"resolved_by": how, "breadcrumb": r["crumb"] or None, "outline": outline, "section": section,
                 "text": part, "chars": n, "offset": off, "next_offset": nxt, "truncated": nxt is not None})
-    lk = _links(con, r, within=part)
-    if lk is None:
-        out["links_note"] = "this index has no link table (built by infosys_local.py version 1) — rebuild it to follow links"
-    elif lk:
+    lk = _links(con, part)
+    if lk:
         out["links"] = lk
     also = _also_in(con, r)
     if also:
@@ -863,7 +844,7 @@ def cmd_docs_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 def cmd_docs_books(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
     books = [{"book": r["book"], "pages": r["n"]}
-             for r in con.execute("SELECT book, COUNT(*) AS n FROM page GROUP BY book ORDER BY book")
+             for r in con.execute("SELECT book, COUNT(*) AS n FROM pages GROUP BY book ORDER BY book")
              if not a["filter"] or fnmatch.fnmatch(r["book"].lower(), a["filter"].lower())]
     out: dict[str, Any] = {"count": len(books), "books": books, "source": ctx.source("infosys")}
     if a["filter"] and not books:
@@ -1017,8 +998,8 @@ def cmd_status(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
             src = dict(ctx.source(which))
             con = ctx.con(which)
             if which == "infosys":
-                src["pages"] = con.execute("SELECT COUNT(*) FROM page").fetchone()[0]
-                src["books"] = con.execute("SELECT COUNT(DISTINCT book) FROM page").fetchone()[0]
+                src["pages"] = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+                src["books"] = con.execute("SELECT COUNT(DISTINCT book) FROM pages").fetchone()[0]
             else:
                 src["text_pages"] = con.execute("SELECT COALESCE(SUM(text_pages), 0) FROM doc").fetchone()[0]
                 src["product_codes"] = con.execute("SELECT COUNT(DISTINCT code) FROM product").fetchone()[0]

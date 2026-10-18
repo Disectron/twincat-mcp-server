@@ -65,7 +65,8 @@ source = "local"                   # local = the Help Viewer package XAE install
                                    # web   = infosys.beckhoff.com (sitemap, page fetches, DuckDuckGo fallback)
 # mshc = 'C:\ProgramData\Microsoft\HelpLibrary2\Catalogs\VisualStudio15\ContentStore\EN-US\BKINFOSYS3_VS_100_EN-US.2.mshc'
 #                                  # default: the newest BKINFOSYS3*.mshc under %ProgramData%\Microsoft\HelpLibrary2
-#                                  # local index (≈ 50k pages): <knowledge location>\infosys\helpviewer-1033, else cache_dir
+#                                  # local: ONE index of every TwinCAT 3 book, <knowledge folder>\index\infosys-1033.db
+#                                  # (else cache_dir); books / exclude_books / tc3_only below apply to source = "web"
 books = ["tcplclib_tc2_system", "tcplclib_tc2_standard", "tcplclib_tc2_utilities", "tcplclib_tc3_module",
          "tcplclib_tc2_math", "tcplclib_tc2_iofunctions", "tcplclib_tc3_eventlogger", "tcplclib_tc3_jsonxml"]
 # exclude_books = ["^tf5", "^el\\d"]  # regexes on the book slug, on top of the TwinCAT 2 filter

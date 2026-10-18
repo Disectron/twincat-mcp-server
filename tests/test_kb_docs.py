@@ -1,6 +1,6 @@
-"""twincat-docs skill script (skills/twincat-docs/kb_docs.py) against databases built by the real knowledge-folder
-tools (tests/fixtures/kb, see make_fixtures.py): the acceptance table of the docs-skill spec, the error contract, and
-that nothing is ever written."""
+"""twincat-docs skill script (skills/twincat-docs/kb_docs.py) against indexes built by the real code at test time
+(tests/conftest.py kb_fixture, tests/fixtures/kb/make_fixtures.py): the plugin's one Infosys index and the manuals
+index — the acceptance table of the docs-skill spec, the error contract, and that nothing is ever written."""
 from __future__ import annotations
 
 import hashlib
@@ -19,10 +19,8 @@ FIX = Path(__file__).parent / "fixtures" / "kb"
 
 
 @pytest.fixture
-def kbdir(tmp_path):
-    d = tmp_path / "kb"
-    shutil.copytree(FIX, d, ignore=shutil.ignore_patterns("*.py", "__pycache__"))
-    return d
+def kbdir(kb_copy):
+    return kb_copy
 
 
 def run(kb: Path | None, *args: str, env: dict[str, str] | None = None) -> tuple[int, dict]:
@@ -199,34 +197,41 @@ def test_read_only_nothing_changes(kbdir):
     assert _digest(kbdir) == before
 
 
-def test_fixtures_have_the_builders_schema():
-    """The fixtures come from infosys_local.py / manuals_db.py (make_fixtures.py) — their tables are what the script reads."""
+def test_fixtures_have_the_indexes_schema(kb_fixture):
+    """The fixture comes from the real code (make_fixtures.py): the plugin's Infosys index (the one the infosys_* tools
+    read too) and manuals_db.py's — their tables are what the script reads, in the permanent layout."""
     import sqlite3
-    c = sqlite3.connect(FIX / "helpviewer" / "infosys_en.db")
-    cols = [r[1] for r in c.execute("PRAGMA table_info(page)")]
-    assert cols == ["pid", "book", "title", "help_id", "toc_parent", "version", "crumb", "body"]
-    assert {r[0] for r in c.execute("SELECT key FROM meta")} >= {"source", "lcid", "indexed", "schema", "state", "pages",
-                                                                  "books", "links", "links_resolved", "mshc_path", "builder"}
-    assert [r[1] for r in c.execute("PRAGMA table_info(link)")] == ["book", "pid", "n", "text", "href", "hid",
-                                                                      "target_book", "target_pid"]
-    m = sqlite3.connect(FIX / "manualsdb" / "manuals.db")
+    from twincat_mcp import infosys as inf
+    c = sqlite3.connect(kb_fixture / "index" / "infosys-1033.db")
+    cols = [r[1] for r in c.execute("PRAGMA table_info(pages)")]
+    assert cols[:12] == ["url", "book", "page_id", "lastmod", "title", "kind", "library", "markdown", "text", "code",
+                         "decl", "fetched"] and {"version", "crumb"} <= set(cols)
+    meta = {r[0]: r[1] for r in c.execute("SELECT key, value FROM meta")}
+    assert meta["indexer_version"] == str(inf.INDEXER_VERSION) and meta["state"] == "complete"
+    assert {"source_stamp", "package", "package_file", "pages", "books", "built", "built_by", "lcid", "links",
+            "links_resolved"} <= set(meta)
+    names = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
+    assert {"pages_fts", "helpids", "catalog", "code_blocks"} <= names
+    assert str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal"     # readers open it read-only
+    m = sqlite3.connect(kb_fixture / "index" / "manuals.db")
     assert [r[1] for r in m.execute("PRAGMA table_info(doc)")] == ["id", "path", "name", "size", "mtime", "sha256", "title",
                                                                      "pages", "text_pages", "indexed", "backend"]
     assert [r[1] for r in m.execute("PRAGMA table_info(product)")] == ["code", "doc", "page", "n"]
+    assert not (kb_fixture / "helpviewer").exists() and not (kb_fixture / "manualsdb").exists()
 
 
 def test_review_help_slash_titles_code_headings_and_check_order(kbdir, tmp_path):
     rc, r = run(kbdir, "--help")
     assert rc == 0 and "commands" in r
     # a title with '/' is not mistaken for book/pageid; a '# ' line inside a code block is not a heading
-    import sqlite3
-    db = kbdir / "helpviewer" / "infosys_en.db"
-    c = sqlite3.connect(db)
-    body = "# Send/Receive\nIntro.\n\n## Sample\n```\n# not a heading\nx := 1;\n```\n\n## Notes\nend"
-    c.execute("INSERT INTO page VALUES (?,?,?,?,?,?,?,?)", ("50000001", "tf6310_tc3_tcpip", "Send/Receive", "h-sr", "", "TF6310", "", body))
-    c.execute("INSERT INTO fts(title, body, book, pid) VALUES (?,?,?,?)", ("Send/Receive", body, "tf6310_tc3_tcpip", "50000001"))
-    c.commit()
-    c.close()
+    from twincat_mcp.infosys import InfosysIndex, html_to_doc
+    url = "https://infosys.beckhoff.com/content/1033/tf6310_tc3_tcpip/50000001.html"
+    ix = InfosysIndex(db_file=kbdir / "index" / "infosys-1033.db")       # the copy, written the way a build writes
+    page = ("<html><body><h1>Send/Receive</h1><p>Intro.</p><h2>Sample</h2><pre># not a heading\nx := 1;</pre>"
+            "<h2>Notes</h2><p>end</p></body></html>")
+    with ix._db() as con:
+        ix._store(con, url, "", html_to_doc(page, base_url=url))
+    del ix
     rc, r = run(kbdir, "docs_page", "ref=Send/Receive")
     assert rc == 0 and r["ref"] == "tf6310_tc3_tcpip/50000001" and r["outline"] == ["Send/Receive", "Sample", "Notes"]
     rc, r = run(kbdir, "docs_page", "ref=Send/Receive", "section=Sample")
@@ -300,6 +305,19 @@ def test_n65_fallback_drops_stop_words_absent_and_common_words_and_ranks_the_tit
     assert info["words_ignored"] == {"zzz": "on no page"} and total == 2 and rows[0]["title"] == "ADSREAD"
     rows, total, mode, _expr, info = m.search_tiers(con, sql, cnt, "every common", [], 5, title_key="title")
     assert rows and "words_too_common" not in info          # both words common: the AND tiers still answer
+
+
+def test_n79_a_query_of_only_stop_words_is_refused_like_kb_search(kbdir):
+    """N79: 'how to a the' ran as 'all words' (1,205 hits; 'the' 44,472) while kb_search refuses such a query — one
+    rule in both: nothing but stop words is refused; one word alone is searched as written."""
+    rc, r = run(kbdir, "docs_search", "query=how to a the")
+    assert rc == 1 and r["error"] == "empty_query" and "only stop words" in r["message"]
+    rc, r = run(kbdir, "manual_search", "query=the and")
+    assert rc == 1 and r["error"] == "empty_query"
+    rc, r = run(kbdir, "docs_search", "query=the")
+    assert rc == 0 and r["query_mode"] == "all words"
+    rc, r = run(kbdir, "docs_search", "query=how to zzqxv a the")            # one informative word: not refused
+    assert rc == 0 and r["count"] == 0
 
 
 def test_stop_words_are_compared_folded():

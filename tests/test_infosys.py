@@ -258,7 +258,7 @@ def test_declaration_shipped_as_div_br_instead_of_pre():
     assert "Does things." in d.markdown and d.markdown.count("\n|") >= 2, "tables stay multi-line"
 
 
-def test_r17_to_r22_code_search(idx):
+def test_r17_to_r22_code_search(idx, tmp_path, monkeypatch):
     """R17: code stored with non-breaking spaces never matched a query with a space. R19: LIMIT before the language
     filter. R21: limit 0 / -1 / 1000. R22: unknown language → 0 and a wrong hint; unlabelled samples unreachable."""
     idx.index_book("tcplclib_tc2_system")
@@ -270,11 +270,15 @@ def test_r17_to_r22_code_search(idx):
             idx.search_code("fbAdsRead", limit=bad)
     r = idx.search_code("NoSuchThing(")
     assert r["count"] == 0 and "hint" in r
-    # \xa0 in a stored sample (the Help Viewer pages: 21,166 of 24,960)
-    with idx._db() as con:
-        con.execute("UPDATE pages SET code = replace(code, 'READ:=TRUE', 'READ\u00a0:=\u00a0TRUE'), fetched = fetched + 1")
-        con.execute("INSERT OR REPLACE INTO meta VALUES ('pages_gen', '99')")
-    assert idx.search_code("READ := TRUE")["count"] == 1
+    # R17 at the root: a page whose code is indented with non-breaking spaces (the Help Viewer pages: 21,166 of
+    # 24,960) is stored with plain spaces — a query typed with spaces finds it, nothing is repaired when it is read
+    url = next(u for u, h in F.PAGES.items() if "READ:=TRUE" in h)
+    monkeypatch.setitem(F.PAGES, url, F.PAGES[url].replace("READ:=TRUE", "READ\u00a0:=\u00a0TRUE"))
+    nb = InfosysIndex(tmp_path / "docs_nb", fetcher=FakeFetcher(), books=["tcplclib_tc2_system"], max_workers=2)
+    nb.index_book("tcplclib_tc2_system")
+    with nb._db() as con:
+        assert not [r[0] for r in con.execute("SELECT code FROM pages") if "\xa0" in (r[0] or "")]
+    assert nb.search_code("READ := TRUE")["count"] == 1
     langs = idx.code_languages()
     assert idx.search_code("fbAdsRead", language="ST")["count"] == 1 and set(langs) == {"st"}
     with idx._db() as con:                                         # the derived blocks were replaced, not duplicated
@@ -369,10 +373,10 @@ def test_r23_ambiguous_declaration_names_the_other_libraries(idx):
 
 def test_r32_retest_type_names_broken_across_lines_in_table_cells():
     """R32 (0.8.8 retest): 'T_Ams NetId' — a type wrapped in a narrow table column (<br>, two <p>, zero-width
-    space) came out with a space. Mended when a page is read (the stored index is not rebuilt for it): joined on
-    evidence (the page's code declares the name) or in a Type column at a camel-case boundary; IEC keywords and
-    prose keep their spaces."""
-    from twincat_mcp.infosys import _clean_md, html_to_doc
+    space) came out with a space. Joined when the page is converted (format 4; nothing is repaired when it is read):
+    on evidence (the page's code declares the name) or in a Type column at a camel-case boundary; IEC keywords and
+    prose keep their spaces. The Markdown and the table data (the declaration's source) agree."""
+    from twincat_mcp.infosys import html_to_doc
     h = ("<html><body><h1>ADSREAD</h1><pre>VAR_INPUT\n NETID : T_AmsNetId;\n PORT : T_AmsPort;\nEND_VAR</pre>"
          "<table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
          "<tr><td>NETID</td><td>T_Ams<br/>NetId</td><td>AMS address as T_Ams NetId.</td></tr>"
@@ -380,8 +384,11 @@ def test_r32_retest_type_names_broken_across_lines_in_table_cells():
          "<tr><td>X</td><td>ARRAY [1..2] OF<br/>BYTE</td><td>zero\u200bwidth soft\u00adhyphen</td></tr>"
          "<tr><td>Y</td><td>POINTER TO<br>BYTE</td><td>ST_My<br>Struct</td></tr>"
          "<tr><td>Z</td><td>ST_Axis<br>Ref</td><td>x a \\| b</td></tr></table></body></html>")
-    md = _clean_md(html_to_doc(h).markdown)
+    doc = html_to_doc(h)
+    md = doc.markdown
     rows = {r.split(" | ")[0].lstrip("| "): r for r in md.splitlines() if r.startswith("| ")}
+    data = {r[0]: r for r in doc.tables[0]}
+    assert data["NETID"][1] == "T_AmsNetId" and data["PORT"][1] == "T_AmsPort" and data["Z"][1] == "ST_AxisRef"
     assert rows["NETID"] == "| NETID | T_AmsNetId | AMS address as T_AmsNetId. |"
     assert rows["PORT"] == "| PORT | T_AmsPort | Input Output |"                  # prose keeps its break as a space
     assert rows["X"] == "| X | ARRAY [1..2] OF BYTE | zerowidth softhyphen |"
@@ -419,6 +426,35 @@ def test_n74_methods_and_properties_are_their_own_lists_not_descriptions():
     assert d["outputs"][0]["description"] == "TRUE, if an error occurs."
     _tidy_declaration(d)
     assert "description" not in d, d.get("description")          # no method or property list left in it
+
+
+def test_n77_table_cells_are_plain_text_and_the_type_page_is_type_ref():
+    """N77: a type cell that linked its type came out as '[ST_WG_Config](https://…/123.html)' in `type` — the name
+    and the link in one string. A cell is plain text (rule 4: the index stores it so); the type's page, when the cell
+    links one, is `type_ref` — for variables and for properties."""
+    from twincat_mcp.infosys import html_to_doc, parse_declaration
+    base = "https://infosys.beckhoff.com/content/1033/tcplclib_tc3_waveform/100.html"
+    h = ("<html><body><h1>FB_WG_Filter</h1><pre>FUNCTION_BLOCK FB_WG_Filter\nVAR_INPUT\n    stConfig : ST_WG_Config;\n"
+         "    nCount : UDINT;\nEND_VAR</pre>"
+         "<table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
+         "<tr><td>stConfig</td><td><a href='200.html'>ST_WG_Config</a></td><td>Configuration, see <a href='200.html'>"
+         "ST_WG_Config</a>.</td></tr><tr><td>nCount</td><td>UDINT</td><td>Number of samples</td></tr></table>"
+         "<h2>Properties</h2><table><tr><th>Name</th><th>Type</th><th>Access</th><th>Description</th></tr>"
+         "<tr><td>eTraceLevel</td><td><a href='../tcplclib_tc3_eventlogger/1033/300.html'>TcEventSeverity</a></td>"
+         "<td>Get, Set</td><td>Trace level</td></tr></table></body></html>")
+    doc = html_to_doc(h, base, package=True)
+    d = parse_declaration("FB_WG_Filter", doc)
+    C = "https://infosys.beckhoff.com/content/1033/"
+    st = next(i for i in d["inputs"] if i["name"] == "stConfig")
+    assert st["type"] == "ST_WG_Config" and st["type_ref"] == C + "tcplclib_tc3_waveform/200.html", st
+    assert st["description"] == "Configuration, see ST_WG_Config."                  # a cell: plain text
+    assert "type_ref" not in next(i for i in d["inputs"] if i["name"] == "nCount")
+    assert d["properties"] == [{"name": "eTraceLevel", "type": "TcEventSeverity", "access": "Get, Set",
+                                "definition_location": None, "initial_value": None, "description": "Trace level",
+                                "type_ref": C + "tcplclib_tc3_eventlogger/300.html"}]
+    assert all("](" not in c for row in doc.tables[0] for c in row)
+    # the page text keeps the links (Markdown), the cells do not
+    assert f"[ST_WG_Config]({C}tcplclib_tc3_waveform/200.html)" in doc.markdown
 
 
 def test_n74_interface_page_methods_by_their_heading():

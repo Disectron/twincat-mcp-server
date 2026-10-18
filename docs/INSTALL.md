@@ -21,8 +21,8 @@ Code — it picks the tool. Replace `<CX_NETID>`, `<SOLUTION>` and `<PROJECT_DIR
 | audit log (every write, every confirmation, every experiment write) | `%USERPROFILE%\.twincat_mcp\audit.jsonl` | append-only JSONL |
 | recordings | `%USERPROFILE%\.twincat_mcp\recordings\<id>.jsonl` | one file per recording, can be large |
 | capture profiles | `%USERPROFILE%\.twincat_mcp\profiles\` | |
-| Infosys documentation index (`infosys_*` tools) | `<knowledge folder>\infosys\helpviewer-1033\` (else `%USERPROFILE%\.twincat_mcp\infosys\`) | SQLite + FTS5, built in the background |
-| knowledge folder (`kb_set_location`, e.g. `D:\TwinCAT-MCP\knowledge`) | `knowledge.db`; the offline documentation the `twincat-docs` skill reads: `helpviewer\infosys_en.db` and `manualsdb\manuals.db` (PDFs in `manuals\`), built by the builders shipped with the plugin (`skills\twincat-docs\builders`, Python 3.12+), `sop\` | **you choose it**; `kb_status` → `docs` shows what is there |
+| Infosys documentation index (`infosys_*` tools and the `twincat-docs` skill — one index) | `<knowledge folder>\index\infosys-1033.db` (without a knowledge folder `%USERPROFILE%\.twincat_mcp\infosys\helpviewer-1033\index.sqlite`) | SQLite + FTS5; the first build starts by itself, later ones once you approve `kb_rebuild` |
+| knowledge folder (`kb_set_location`, e.g. `D:\TwinCAT-MCP\knowledge`) | `index\` (the plugin's: `infosys-1033.db`, `manuals.db` of the PDFs in `manuals\`, `knowledge.db` of your projects and the ESI files), `manuals\` and `sop\` (yours, never written), `tools\` (builder stubs). Rules: `docs/KNOWLEDGE_BASE.md` | **you choose it**; `kb_status` shows every index and its state |
 | experiments (specs, runs, reports) | `<PROJECT_DIR>\experiments\` | next to the solution so they version with it |
 
 Nothing is installed system-wide, nothing listens on a port, and the server runs as your Windows

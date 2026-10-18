@@ -1204,31 +1204,29 @@ async def test_r5_datatype_table_unavailable_names_config_mode(monkeypatch, proj
 
 
 @pytest.mark.anyio
-async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, project_dir, tmp_path):
+async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, project_dir, kb_copy):
     """Finding 2: the real state of the offline index is known at every (re)connection — in the instructions the
-    server sends at initialize — and in tc_doctor; an interrupted rebuild is said up front."""
-    import shutil
+    server sends at initialize — and in tc_doctor; an interrupted rebuild is said up front, with the approval rule."""
     import sqlite3
-    import time as _t
     from tests.fake_ads import install
     install(monkeypatch)
-    kb = tmp_path / "kb"
-    shutil.copytree(Path(__file__).parent / "fixtures" / "kb", kb, ignore=shutil.ignore_patterns("*.py"))
+    kb = kb_copy
     cfg = mk_cfg(project_dir)
     cfg.knowledge.location = str(kb)
     srv = build_server(cfg)
     ins = srv._lowlevel_server.instructions
     assert "Offline documentation, state at this connection" in ins and "Infosys index: complete (8 pages" in ins
-    db = kb / "helpviewer" / "infosys_en.db"
-    shutil.copy(db, db.with_name(db.name + ".building"))
-    c = sqlite3.connect(db.with_name(db.name + ".building"))
-    c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [("state", "building"), ("pages_done", "4000"),
-                                                                ("pages_total", "51656"), ("heartbeat", f"{_t.time() - 900:.0f}")])
+    db = kb / "index" / "infosys-1033.db"
+    building = db.with_name(db.name + ".building")
+    building.write_bytes(db.read_bytes())
+    c = sqlite3.connect(building)
+    c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [("state", "building"), ("pages_total", "51656")])
     c.commit()
     c.close()
     srv = build_server(cfg)                                          # a reconnection = a new server process
     ins = srv._lowlevel_server.instructions
-    assert "a rebuild was INTERRUPTED at 4000 of 51656 pages" in ins and "To rebuild:" in ins and "infosys_local.py" in ins
+    assert "a build was INTERRUPTED at 8 of 51656 pages" in ins and "infosys_local.py" in ins
+    assert "rebuilt only when the user approves it" in ins and "kb_rebuild(index='infosys')" in ins
     async with client_for(srv) as s:
         d = payload(await s.call_tool("tc_doctor", {}))
         assert d["offline_docs"]["infosys_rebuild"] == "interrupted" and "INTERRUPTED" in d["summary"]

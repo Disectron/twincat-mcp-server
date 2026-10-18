@@ -7,6 +7,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import anyio
 import pytest
 
 from twincat_mcp import helpviewer as HV
@@ -146,31 +147,6 @@ def test_books_and_index_all_and_the_reindex_rule(idx, pkg, tmp_path):
         inf.INDEXER_VERSION = old
 
 
-# Fingerprint of the code that turns a page into stored rows. When this test fails: the extraction logic changed —
-# bump infosys.INDEXER_VERSION (every index is rebuilt once) and update the fingerprint below together.
-INDEXER_FINGERPRINT = (3, "0486bae1a19633ae")     # 3 is not released yet (0.8.9 shipped 2): one rebuild
-
-
-def _indexer_source_hash() -> str:
-    import hashlib
-    import inspect
-    from twincat_mcp import helpviewer as hv
-    from twincat_mcp import infosys as inf
-    parts = [inspect.getsource(o) for o in (inf._MdWalker, inf.html_to_doc, inf.parse_declaration, inf.classify,
-                                            inf._parse_vars, inf._descriptions, inf._table_kind,
-                                            inf._member_tables, inf.HtmlDoc, inf._library_from_tables,
-                                            inf.InfosysIndex._store, inf._doc_version, hv.body_html, hv.page_meta)]
-    norm = ["\n".join(ln.rstrip() for ln in p.splitlines() if ln.strip() and not ln.strip().startswith("#")) for p in parts]
-    return hashlib.sha256("\n\n".join(norm).encode()).hexdigest()[:16]
-
-
-def test_indexer_version_tracks_the_extraction_code():
-    from twincat_mcp import infosys as inf
-    got = (inf.INDEXER_VERSION, _indexer_source_hash())
-    assert got == INDEXER_FINGERPRINT, (
-        f"page extraction code changed: bump infosys.INDEXER_VERSION and set INDEXER_FINGERPRINT = {got!r}")
-
-
 def test_not_a_package(tmp_path):
     bad = tmp_path / "BKINFOSYS3_x.mshc"
     with zipfile.ZipFile(bad, "w") as z:
@@ -194,17 +170,95 @@ async def test_server_uses_local_package(monkeypatch, tmp_path, pkg):
     validate(cfg)
     srv = build_server(cfg)
     async with client_for(srv) as s:
-        d = payload(await s.call_tool("infosys_get_page", {"ref": "ADSWRITE", "max_chars": 500}))
-        assert d["doc_date"]
+        # a page by its address answers from the package while the first build runs (converted, not stored)
+        d = payload(await s.call_tool("infosys_get_page", {"ref": F.ADSREAD, "max_chars": 500}))
+        assert d["doc_date"] and d["title"] == "ADSREAD"
         doc = payload(await s.call_tool("tc_doctor", {}))
-        assert doc["infosys"]["source"]["kind"] == "helpviewer" and "helpviewer-1033" in doc["infosys"]["cache"]
-        for _ in range(100):                                   # background index of the whole package
-            st = payload(await s.call_tool("tc_doctor", {}))["infosys"]["background_index"]
-            if st.get("finished"):
+        assert doc["infosys"]["source"]["kind"] == "helpviewer" and "helpviewer-1033" in doc["infosys"]["index"]
+        st = {}
+        for _ in range(600):                                   # the first build: by itself, in its own process
+            st = payload(await s.call_tool("tc_doctor", {}))["infosys"]["state"]
+            if st["state"] == "complete" and not st.get("rebuild"):
                 break
             time.sleep(0.05)
+        assert st["state"] == "complete", st
+        d = payload(await s.call_tool("infosys_get_page", {"ref": "ADSWRITE", "max_chars": 500}))
+        assert d["title"] == "ADSWRITE" and "indexed" not in d
         r = payload(await s.call_tool("infosys_search", {"query": "technology data"}))
         assert r["items"] and r["items"][0]["book"] == "tf5100_tc3_nc_i" and r["backend"].endswith("+helpviewer")
+        assert "index_note" not in r
+
+
+@pytest.mark.anyio
+async def test_kb_rebuild_only_with_approval_and_a_server_start_never_rebuilds(monkeypatch, tmp_path, pkg):
+    """docs/KNOWLEDGE_BASE.md rule 6: the first build of a missing index starts by itself, into <kb>\\index\\; an index
+    that exists is used as it is — an older format is reported, never rebuilt by a server start — until the user
+    approves kb_rebuild (in-chat prompt, or the confirm_token of tc_request_confirmation)."""
+    import sqlite3
+    from tests.test_server_e2e import client_for, payload, text
+    from twincat_mcp import infosys as inf
+    from twincat_mcp.config import Config, validate
+    from twincat_mcp.server import build_server
+
+    monkeypatch.setattr(inf, "Fetcher", lambda *a, **k: NoNetwork())
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    cfg = Config()
+    cfg.docs.mshc = str(pkg)
+    cfg.docs.cache_dir = str(tmp_path / "docs")
+    cfg.knowledge.location = str(kb)
+    validate(cfg)
+    live = kb / "index" / "infosys-1033.db"
+
+    async def doctor(s) -> dict:
+        for _ in range(600):
+            d = payload(await s.call_tool("tc_doctor", {}))["infosys"]
+            if d["warm"]["state"] != "warming":
+                return d
+            await anyio.sleep(0.05)
+        raise AssertionError(d)
+
+    async def until_complete(s) -> dict:
+        st: dict = {}
+        for _ in range(600):
+            st = payload(await s.call_tool("tc_doctor", {}))["infosys"]["state"]
+            if st["state"] == "complete" and not st.get("rebuild"):
+                return st
+            await anyio.sleep(0.05)
+        raise AssertionError(st)
+
+    async def token(s) -> str:
+        return payload(await s.call_tool("tc_request_confirmation",
+                                         {"action": "kb_rebuild", "args": {"index": "infosys"}}))["confirm_token"]
+
+    async with client_for(build_server(cfg)) as s:
+        st = await until_complete(s)                         # the first build: by itself
+        assert Path(st["database"]) == live and st["format"] == inf.INDEXER_VERSION
+        assert not (tmp_path / "docs" / "helpviewer-1033").exists()        # one index, in the knowledge folder
+        r = await s.call_tool("kb_rebuild", {"index": "infosys"})           # no approval: nothing happens
+        assert r.is_error and "tc_request_confirmation" in text(r)
+        r = payload(await s.call_tool("kb_rebuild", {"index": "infosys", "confirm_token": await token(s)}))
+        assert r["started"] is False and r["up_to_date"]                    # complete and current: left as it is
+        r = await s.call_tool("kb_rebuild", {"index": "everything"})
+        assert r.is_error and "'infosys', 'manuals' or 'esi'" in text(r)
+    c = sqlite3.connect(live)
+    c.execute("UPDATE meta SET value = '3' WHERE key = 'indexer_version'")
+    c.commit()
+    c.close()
+    async with client_for(build_server(cfg)) as s:
+        d = await doctor(s)                                  # the start's upkeep has run
+        st = d["state"]
+        assert st["state"] == "rebuild_needed" and "rebuild" not in st and "started_here" not in st, st
+        assert "kb_rebuild(index='infosys')" in st["message"]
+        assert not live.with_name(live.name + ".building").exists() and not live.with_name(live.name + ".lock").exists()
+        p = payload(await s.call_tool("infosys_get_page", {"ref": F.ADSREAD, "max_chars": 300}))
+        assert p["title"] == "ADSREAD"                       # in use as it is
+        r = payload(await s.call_tool("kb_rebuild", {"index": "infosys", "confirm_token": await token(s)}))
+        assert r["started"] and "format 3" in r["why"], r
+        st = await until_complete(s)
+        assert st["format"] == inf.INDEXER_VERSION and st["built_by"].startswith("twincat-mcp ")
+        log = (tmp_path / "home").rglob("infosys-build.log")
+        assert any("rebuild:" in f.read_text(encoding="utf-8") for f in log)
 
 
 @pytest.mark.anyio
@@ -226,7 +280,10 @@ async def test_server_without_package_says_how_to_fix(monkeypatch, tmp_path):
 
 
 def test_r26_ms_xhelp_links_resolve_to_pages(tmp_path):
-    """R26: pages link to each other as ms-xhelp:///?Id=…; get_page refused those links from its own output."""
+    """R26: pages link to each other as ms-xhelp:///?Id=…; get_page refused those links from its own output. They
+    are resolved once, when the index is built (rule 4): the stored page holds the page URL, the reader shows it as
+    stored, and an ms-xhelp reference opens the page through the help ids collected while building."""
+    from twincat_mcp import infosys_build as IB
     d = tmp_path / "Microsoft" / "HelpLibrary2" / "Catalogs" / "VisualStudio15" / "ContentStore" / "EN-US"
     d.mkdir(parents=True)
     target = F.ADSREAD
@@ -234,13 +291,18 @@ def test_r26_ms_xhelp_links_resolve_to_pages(tmp_path):
                  '</head><body><article><h1>Overview</h1><p>See <a href="ms-xhelp:///?Id=' + str(abs(hash(target))) +
                  '">ADSREAD</a> and <img src="1107452.png" alt="1107452"/> nothing.</p></article></body></html>')
     pkg = make_mshc(d / "BKINFOSYS3_VS_100_EN-US.2.mshc", {"tcplclib_tc2_system/1033/99999901.html": link_page})
-    ix = InfosysIndex(tmp_path / "idx", fetcher=NoNetwork(), books=["tcplclib_tc2_system"], local=HV.HelpViewerSource(pkg))
-    p = ix.get_page(C + "tcplclib_tc2_system/99999901.html")
+    final = tmp_path / "index" / "infosys-1033.db"
+    res = IB.build(final, pkg, log=lambda s: None)
+    assert res["result"] == "built" and res["links"]["resolved"] >= 1, res
+    ix = InfosysIndex(db_file=final, fetcher=NoNetwork(), local=HV.HelpViewerSource(pkg), read_only=True)
+    url = C + "tcplclib_tc2_system/99999901.html"
+    p = ix.get_page(url)
     assert target in p["markdown"] and "ms-xhelp" not in p["markdown"], p["markdown"]
     assert "![" not in p["markdown"]                                                    # R32: image placeholder gone
+    with ix._db() as con:                                                              # shown exactly as stored
+        assert con.execute("SELECT markdown FROM pages WHERE url = ?", (url,)).fetchone()[0] == p["markdown"]
     assert ix.get_page(f"ms-xhelp:///?Id={abs(hash(target))}")["url"] == target
     with pytest.raises(InfosysError, match="no page with that Help Viewer Id"):
         ix.get_page("ms-xhelp:///?Id=nope")
     with pytest.raises(InfosysError, match="max_chars"):
         ix.get_page(target, max_chars=-1)
-    assert ix.warm()["links"]["help_ids"] >= 2

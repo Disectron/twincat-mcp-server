@@ -1,5 +1,7 @@
 """The knowledge-folder builders shipped with the twincat-docs skill (skills/twincat-docs/builders): the Python 3.12
-minimum, the atomic rebuild and its real state, the filter before LIMIT, ambiguous names refused, links.
+minimum, the atomic rebuild and its real state (infosys_local.py builds the plugin's one Infosys index with the plugin's
+extractor, twincat_mcp.infosys_build), the permanent layout (index\\), the filter before LIMIT, ambiguous names
+refused, links.
 
 Everything runs on Python 3.12 (the only version the project targets); the refusal on an older Python is tested by
 running each script with sys.version_info set to 3.11."""
@@ -53,8 +55,12 @@ def mshc(path: Path, pages: dict[str, str]) -> Path:
 @pytest.fixture
 def kb(tmp_path):
     k = tmp_path / "kb"
-    (k / "helpviewer").mkdir(parents=True)
+    k.mkdir(parents=True)
     return k
+
+
+def live(kb: Path) -> Path:
+    return kb / "index" / "infosys-1033.db"
 
 
 def build(kb: Path, pkg: Path, *extra: str) -> subprocess.CompletedProcess:
@@ -106,24 +112,26 @@ def test_builders_compile_on_this_python():
 
 
 # ---------------------------------------------------------------------------------------------- 2. atomic rebuild + state
-def test_build_state_up_to_date_and_old_format(kb, tmp_path):
+def test_build_state_up_to_date_rebuild_needed_and_outdated(kb, tmp_path):
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
     p = build(kb, pkg)
     assert p.returncode == 0, p.stderr
     s = state(kb)
-    assert s["state"] == "complete" and s["pages"] == 8 and s["links_resolved"] == 3 and "rebuild" not in s
+    assert s["state"] == "complete" and s["pages"] == 8 and "rebuild" not in s, s
+    assert s["links"] == 2 and s["links_resolved"] == 1          # ms-xhelp links (relative ones: resolved while parsed)
     assert "up to date" in build(kb, pkg).stdout
-    # a version-1 index (no schema, no link table) is never "up to date": index upgrades it
-    db = kb / "helpviewer" / "infosys_en.db"
-    c = sqlite3.connect(db)
-    c.execute("DELETE FROM meta WHERE key = 'schema'")
-    c.execute("DROP TABLE link")
+    # an index of an older format is used as it is and said to need a rebuild — never rebuilt by a reader
+    c = sqlite3.connect(live(kb))
+    c.execute("UPDATE meta SET value = '3' WHERE key = 'indexer_version'")
     c.commit()
     c.close()
-    assert state(kb)["state"] == "old_format"
-    assert kbdocs(kb, "docs_page", "ref=tcplclib_tc2_system/30866572")["links_note"].startswith("this index has no link table")
+    s = state(kb)
+    assert s["state"] == "rebuild_needed" and "format 3" in s["message"] and "kb_rebuild" in s["message"]
+    src = kbdocs(kb, "docs_books")["source"]
+    assert src["state"] == "rebuild_needed" and "REBUILD" in src["state_note"]
+    assert kbdocs(kb, "docs_page", "ref=tcplclib_tc2_system/30866572")["title"] == "ADSWRITE"     # still answers
     p = build(kb, pkg)
-    assert "older index format" in p.stdout and state(kb)["state"] == "complete"
+    assert "format 3, this plugin writes" in p.stdout and state(kb)["state"] == "complete"
     # the package changed since the build → outdated, and index rebuilds
     time.sleep(1.1)
     mshc(pkg, {**_fixture_pages(), "tcplclib_new/1033/1.html": "<html><article><h1>New</h1></article></html>"})
@@ -133,34 +141,38 @@ def test_build_state_up_to_date_and_old_format(kb, tmp_path):
     assert "the Help Viewer package changed" in build(kb, pkg).stdout and state(kb)["pages"] == 9
 
 
+def _wait_progress(lock: Path, proc: subprocess.Popen, timeout: float = 120) -> dict:
+    """The build's own progress (its lock file), read directly: stats in a subprocess could look too late."""
+    t0 = time.time()
+    while time.time() - t0 < timeout and proc.poll() is None:
+        try:
+            info = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            info = {}
+        if int(info.get("pages_done") or 0) > 0:
+            return info
+        time.sleep(0.02)
+    return {}
+
+
 def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, tmp_path):
-    """Finding 2: an interrupted `index --force` left a half index that the next run called 'up to date'."""
+    """Finding 2: an interrupted `index --force` left a half index that the next run called 'up to date'. The build
+    writes index\\infosys-1033.db.building; the complete index stays in use; the next build resumes."""
     pages = _fixture_pages()
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", pages)
     assert build(kb, pkg).returncode == 0
-    db = kb / "helpviewer" / "infosys_en.db"
+    db = live(kb)
     big = dict(pages)
-    filler = "<p>" + "lorem ipsum dolor sit amet " * 400 + "</p>"
-    for i in range(12000):
+    filler = "<p>" + "lorem ipsum dolor sit amet " * 100 + "</p>"
+    for i in range(4000):
         big[f"tcplclib_bulk/1033/{900000 + i}.html"] = f"<html><article><h1>Bulk {i}</h1>{filler}</article></html>"
     time.sleep(1.1)
     mshc(pkg, big)
     env = {k: v for k, v in os.environ.items() if k not in ("TCMCP_KNOWLEDGE_DIR", "TCMCP_HOME")}
     proc = subprocess.Popen([sys.executable, str(B / "infosys_local.py"), "--kb", str(kb), "index", "--mshc", str(pkg), "--force"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-    building = db.with_name(db.name + ".building")
-    # synchronise on the builder's own progress line (written right after it stored pages_done), then hold it there:
-    # polling `stats` (a subprocess each time) could first look when the build was already finished — the CI runner
-    # saw it complete and swapping in
-    first = b""
-    t0 = time.time()
-    while time.time() - t0 < 120:
-        line = proc.stdout.readline()
-        if not line:
-            break
-        if re.match(rb"\s+\d+/\d+ pages", line):
-            first = line
-            break
+    building, lock = db.with_name(db.name + ".building"), db.with_name(db.name + ".lock")
+    first = _wait_progress(lock, proc)
     if hasattr(signal, "SIGSTOP"):
         os.kill(proc.pid, signal.SIGSTOP)    # hold the build where it is (its lock stays fresh for 120 s)
     assert first, "the rebuild never reported progress"
@@ -169,26 +181,21 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
     assert "RUNNING" in running["message"] and running["pages"] == 8          # the complete index is still the one in use
     # a second build while one runs is refused
     second = build(kb, pkg)
-    assert second.returncode == 1 and "another index build is running" in second.stderr
+    assert second.returncode == 1 and "another build is running" in second.stderr
     proc.kill()
     proc.wait(30)
     assert building.is_file()
-    # the reader keeps answering from the complete index; the stopped rebuild shows as interrupted once its heartbeat
-    # is old (simulated: age the heartbeat and the lock)
-    c = sqlite3.connect(building)
-    c.execute("UPDATE meta SET value = ? WHERE key = 'heartbeat'", (f"{time.time() - 600:.0f}",))
-    c.commit()
-    c.close()
-    lock = db.with_name(db.name + ".lock")
+    # the reader keeps answering from the complete index; the stopped build shows as interrupted once its heartbeat
+    # (the lock's modification time) is old — simulated
     if lock.exists():
         os.utime(lock, (time.time() - 600, time.time() - 600))
     st = state(kb)
-    assert st["rebuild"]["state"] == "interrupted" and st["pages"] == 8 and "INTERRUPTED" in st["message"]
+    assert st["rebuild"]["state"] == "interrupted" and st["pages"] == 8 and "INTERRUPTED" in st["message"], st
     assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "interrupted"
     assert kbdocs(kb, "docs_declaration", "symbol=ADSWRITE")["ref"] == "tcplclib_tc2_system/30866572"
-    # the next plain `index` builds again — never "up to date" over a half index
+    # the next plain `index` builds again — resuming the interrupted build, never "up to date" over a half index
     p = run("infosys_local.py", "--kb", str(kb), "index", "--mshc", str(pkg), timeout=600)
-    assert p.returncode == 0 and "up to date" not in p.stdout, p.stderr
+    assert p.returncode == 0 and "up to date" not in p.stdout and "resuming" in p.stdout, (p.stdout, p.stderr)
     st = state(kb)
     assert st["state"] == "complete" and st["pages"] == len(big) and "rebuild" not in st and not building.exists()
 
@@ -196,13 +203,31 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
 def test_finished_rebuild_waiting_to_replace_is_swapped_in(kb, tmp_path):
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
     assert build(kb, pkg).returncode == 0
-    db = kb / "helpviewer" / "infosys_en.db"
+    db = live(kb)
     building = db.with_name(db.name + ".building")
     import shutil
     shutil.copy(db, building)              # a complete rebuild that could not replace the live file (held open)
     assert state(kb)["rebuild"]["state"] == "waiting_to_replace"
     p = build(kb, pkg)
     assert "replaced" in p.stdout and not building.exists() and state(kb)["state"] == "complete"
+
+
+def test_the_first_build_moves_an_old_layout_and_reports_the_second_index(kb, tmp_path):
+    """The permanent layout (docs/KNOWLEDGE_BASE.md): an index in an old place is moved into index\\ once — a rename,
+    never a copy — and the builder's old second index (helpviewer\\infosys_en.db) is reported, never deleted."""
+    from twincat_mcp import kb_layout as L
+    old = kb / "manualsdb" / "manuals.db"
+    old.parent.mkdir(parents=True)
+    sqlite3.connect(old).close()
+    second = kb / "helpviewer" / "infosys_en.db"
+    second.parent.mkdir(parents=True)
+    second.write_bytes(b"x" * 2000)
+    pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
+    p = build(kb, pkg)
+    assert p.returncode == 0 and "layout:" in p.stdout, p.stdout
+    assert (kb / "index" / "manuals.db").is_file() and not old.exists()
+    obs = L.obsolete_files(kb)
+    assert [Path(o["path"]).name for o in obs] == ["infosys_en.db"] and second.exists()
 
 
 # ---------------------------------------------------------------------------------------------- 3. filter before LIMIT
@@ -224,7 +249,7 @@ def test_show_and_decl_refuse_ambiguous_names_and_show_links(kb, tmp_path):
     assert build(kb, pkg).returncode == 0
     for cmd in ("show", "decl"):
         p = run("infosys_local.py", "--kb", str(kb), cmd, "MC_MoveAbsolute")
-        assert p.returncode == 1 and "2 pages match 'MC_MoveAbsolute' — nothing shown" in p.stderr
+        assert p.returncode == 1 and "2 pages match" in p.stderr and "nothing was chosen" in p.stderr, p.stderr
         assert "tcplclib_tc2_mc2/70094731" in p.stderr and "tcplclib_tc3_drivemotioncontrol/8280601227" in p.stderr
         assert p.stdout == ""
     p = run("infosys_local.py", "--kb", str(kb), "decl", "MC_MoveAbsolute", "--book", "tcplclib_tc3_*")
@@ -233,12 +258,16 @@ def test_show_and_decl_refuse_ambiguous_names_and_show_links(kb, tmp_path):
     assert "Links: ADSREAD → tcplclib_tc2_system/30866571; T_AmsNetID → tcplclib_tc2_system/31059723" in p.stdout
     p = run("infosys_local.py", "--kb", str(kb), "show", "ms-xhelp:///?Id=beckhoff-f599-48a7-92f2-48aa9133ca8a")
     assert p.stdout.startswith("T_AmsNetID | tcplclib_tc2_system/31059723")
-    c = sqlite3.connect(kb / "helpviewer" / "infosys_en.db")
-    rows = c.execute("SELECT text, href, target_book, target_pid FROM link WHERE pid = '30866572' ORDER BY n").fetchall()
-    assert rows == [("ADSREAD", "30866571.html", "tcplclib_tc2_system", "30866571"),
-                    ("T_AmsNetID", "../tcplclib_tc2_system/1033/31059723.html", "tcplclib_tc2_system", "31059723"),
-                    ("Beckhoff", "https://www.beckhoff.com/", None, None), ("top", "#top", None, None),
-                    ("gone", "ms-xhelp:///?Id=beckhoff-not-in-package", None, None)]
+    # links are stored as page addresses (rule 4): relative ones resolved while parsed, ms-xhelp ones after the
+    # build; external links and anchors as they are; an id the package does not have stays as it is
+    c = sqlite3.connect(live(kb))
+    md = c.execute("SELECT markdown FROM pages WHERE page_id = '30866572'").fetchone()[0]
+    C = "https://infosys.beckhoff.com/content/1033/tcplclib_tc2_system/"
+    assert f"[ADSREAD]({C}30866571.html)" in md and f"[T_AmsNetID]({C}31059723.html)" in md
+    assert "[Beckhoff](https://www.beckhoff.com/)" in md and "[top](#top)" in md
+    assert "[gone](ms-xhelp:///?Id=beckhoff-not-in-package)" in md
+    md = c.execute("SELECT markdown FROM pages WHERE page_id = '30866571'").fetchone()[0]
+    assert f"[T_AmsNetID]({C}31059723.html)" in md and "ms-xhelp" not in md
     # the reader hands the links out as refs docs_page opens
     r = kbdocs(kb, "docs_page", "ref=tcplclib_tc2_system/30866572")
     assert r["links"] == [{"text": "ADSREAD", "ref": "tcplclib_tc2_system/30866571"},
@@ -260,11 +289,17 @@ def test_manuals_update_lock_state_and_doc_filter(tmp_path):
     p = run("manuals_db.py", "update", "--kb", str(kb))
     assert p.returncode == 0 and "1 added" in p.stdout, p.stderr
     st = json.loads(run("manuals_db.py", "stats", "--json", "--kb", str(kb)).stdout)
-    assert st["state"] == "up_to_date" and st["manuals"] == 1 and st["last_result"].startswith("1 added")
-    # the reader computes the same state
-    assert kbdocs(kb, "status")["manuals_state"]["state"] == "up_to_date"
+    assert st["state"] == "complete" and st["manuals"] == 1 and st["last_result"].startswith("1 added")
+    assert Path(st["database"]) == kb / "index" / "manuals.db"
+    # the reader computes the same state (one implementation)
+    assert kbdocs(kb, "status")["manuals_state"]["state"] == "complete"
+    # a complete index is left as it is: no copy, no swap
+    db = kb / "index" / "manuals.db"
+    before = (db.stat().st_ino, db.stat().st_mtime_ns)
+    p = run("manuals_db.py", "update", "--kb", str(kb))
+    assert p.returncode == 0 and p.stdout.startswith("up to date") and (db.stat().st_ino, db.stat().st_mtime_ns) == before
     # a second update while one runs is refused
-    lock = kb / "manualsdb" / "manuals.db.lock"
+    lock = kb / "index" / "manuals.db.lock"
     lock.write_text("{}", encoding="utf-8")
     p = run("manuals_db.py", "update", "--kb", str(kb))
     assert p.returncode == 1 and "another update is running" in p.stderr
@@ -272,7 +307,7 @@ def test_manuals_update_lock_state_and_doc_filter(tmp_path):
     # a new PDF is reported before anyone runs update
     mod.build_pdf(kb / "manuals" / "IPC" / "CX9021.pdf")
     st = json.loads(run("manuals_db.py", "stats", "--json", "--kb", str(kb)).stdout)
-    assert st["state"] == "pending" and st["not_indexed"] == ["CX9021.pdf"] and "run update" in st["message"]
+    assert st["state"] == "outdated" and st["not_indexed"] == ["CX9021.pdf"] and "manuals_db.py update" in st["message"]
     assert run("manuals_db.py", "update", "--kb", str(kb)).returncode == 0
     p = run("manuals_db.py", "search", "watchdog", "--doc", "CX9021", "--kb", str(kb))
     assert "CX9021.pdf | p4" in p.stdout and "CX9020.pdf" not in p.stdout
@@ -339,23 +374,23 @@ def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
         c.showPage()
     c.save()
     assert run("manuals_db.py", "update", "--kb", str(kb)).returncode == 0
-    db = kb / "manualsdb" / "manuals.db"
+    db = kb / "index" / "manuals.db"
     con = sqlite3.connect(db)
     texts = [r[0] for r in con.execute("SELECT text FROM page ORDER BY page")]
     assert texts and all("Calibration and compensation" not in t and "Version" not in t for t in texts), texts
     assert all("strain gauge bridge" in t for t in texts)
-    assert con.execute("SELECT value FROM meta WHERE key='text_format'").fetchone()[0] == "3"
-    # an index written by the old builder (no text_format) is outdated, and update reads every manual again
+    assert con.execute("SELECT value FROM meta WHERE key='text_format'").fetchone()[0] == _manuals_module().TEXT_FORMAT
+    # an index written by the old builder (no text_format) needs a rebuild — in use as it is until update runs
     con.execute("DELETE FROM meta WHERE key='text_format'")
     con.commit()
     con.close()
     st = json.loads(run("manuals_db.py", "stats", "--json", "--kb", str(kb)).stdout)
-    assert st["state"] == "outdated" and "page text format 1" in st["message"]
-    assert kbdocs(kb, "status")["manuals_state"]["state"] == "outdated"
+    assert st["state"] == "rebuild_needed" and "page text format 1" in st["message"] and "kb_rebuild" in st["message"]
+    assert kbdocs(kb, "status")["manuals_state"]["state"] == "rebuild_needed"
     p = run("manuals_db.py", "update", "--kb", str(kb))
     assert "every manual is read again" in p.stdout and "1 updated" in p.stdout, p.stdout
     st = json.loads(run("manuals_db.py", "stats", "--json", "--kb", str(kb)).stdout)
-    assert st["state"] == "up_to_date"
+    assert st["state"] == "complete" and not (kb / "index" / "manuals.db.building").exists()
     # review: a manual that fails during the re-read keeps its old rows — the format is not stamped, so the next
     # update reads every manual again instead of calling the old rows current
     con = sqlite3.connect(db)
@@ -496,7 +531,7 @@ def test_stub_runs_the_plugins_builder_for_the_folder_above_it(tmp_path):
     import shutil as _sh
     kb = tmp_path / "kb"
     (kb / "tools").mkdir(parents=True)
-    (kb / "manualsdb").mkdir()
+    (kb / "index").mkdir()
     (kb / "manuals").mkdir()
     for n in ("infosys_local.py", "manuals_db.py"):
         _sh.copy(B / "stub.py", kb / "tools" / n)
@@ -512,12 +547,14 @@ def test_stub_runs_the_plugins_builder_for_the_folder_above_it(tmp_path):
         d.mkdir(parents=True)
         for n in ("infosys_local.py", "manuals_db.py"):
             _sh.copy(B / n, d / n)
+        _sh.copy(KBD, d.parent / "kb_docs.py")                         # a plugin folder: the skill and the package
+        _sh.copytree(ROOT / "twincat_mcp", cache / ver / "twincat_mcp", ignore=_sh.ignore_patterns("__pycache__", "bin"))
     p = subprocess.run([sys.executable, str(kb / "tools" / "manuals_db.py"), "stats", "--json"], capture_output=True,
                        encoding="utf-8", env={**env, "TCMCP_STUB_VERBOSE": "1"}, timeout=60)
     assert p.returncode == 0, p.stderr
     assert "0.8.10" in p.stderr and "plugin cache" in p.stderr
     st = json.loads(p.stdout)
-    assert Path(st["database"]) == kb / "manualsdb" / "manuals.db" and Path(st["folder"]) == kb / "manuals"
+    assert Path(st["database"]) == kb / "index" / "manuals.db" and Path(st["folder"]) == kb / "manuals"
     # 3. the pointer the server writes wins over the cache
     from twincat_mcp import knowledge as K
     tch = Path(env["TCMCP_HOME"])
@@ -563,19 +600,14 @@ def test_finished_rebuild_is_running_while_its_builder_swaps_it_in(kb, tmp_path)
     import shutil
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
     assert build(kb, pkg).returncode == 0
-    db = kb / "helpviewer" / "infosys_en.db"
+    db = live(kb)
     building, lock = db.with_name(db.name + ".building"), db.with_name(db.name + ".lock")
     shutil.copyfile(db, building)
-    c = sqlite3.connect(building)
-    c.execute("INSERT OR REPLACE INTO meta VALUES('state', 'complete')")
-    c.execute("INSERT OR REPLACE INTO meta VALUES('heartbeat', ?)", (f"{time.time():.0f}",))
-    c.commit()
-    c.close()
-    lock.write_text(json.dumps({"pid": 1, "started": "now"}), encoding="utf-8")
+    lock.write_text(json.dumps({"pid": 1, "started": "now", "phase": "replacing the live index"}), encoding="utf-8")
     st = state(kb)
     assert st["rebuild"]["state"] == "running" and st["rebuild"]["phase"] == "replacing the live index", st
     assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "running"
     lock.unlink()                                          # the builder is gone: the finished file waits
     st = state(kb)
-    assert st["rebuild"]["state"] == "waiting_to_replace" and "run index again" in st["message"], st
+    assert st["rebuild"]["state"] == "waiting_to_replace" and "swapped in at the next server start" in st["message"], st
     assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "waiting_to_replace"

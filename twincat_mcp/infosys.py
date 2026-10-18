@@ -51,8 +51,14 @@ from typing import Any, Callable
 # _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
 # re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
 # changes without a bump.
-INDEXER_VERSION = 3          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
+INDEXER_VERSION = 4          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
                              #    Methods / Properties tables as their own lists (N74)
+                             # 4: everything a reader used to repair is stored repaired (docs/KNOWLEDGE_BASE.md rule 4):
+                             #    no invisible marks, image placeholders or empty links; links resolved to page URLs
+                             #    (relative ones while parsing, ms-xhelp ones after the build); table cells plain text
+                             #    for the declaration (N77: a type is its name, its page in type_ref) and type names
+                             #    split in narrow columns joined (R32); enum values numbered, comments as descriptions
+                             #    (R25), no repeated description dict
 
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
@@ -81,48 +87,66 @@ def _check_limit(limit: Any, hi: int = 50, name: str = "limit") -> int:
     return limit
 
 
-_IMG = re.compile(r"!\[\d*\]\([^)]*\)|!\[\d+\]")
-_EMPTY_LINK = re.compile(r"\[\s*\]\([^)]*\)")
 _XHELP = re.compile(r"ms-xhelp:///?\?Id=([^)\s\"'&#]+)", re.I)
+# a link while a page is converted: \ue001 text \ue002 href \ue003 (private-use marks: the text keeps its own
+# brackets); _md_links turns them into [text](href), _plain into the text alone
+_LINK = re.compile("\ue001([^\ue001\ue002]*)\ue002([^\ue003]*)\ue003")
+_STRAY = re.compile("\ue002[^\ue003]*\ue003")
 
 
-def _clean_md(md: str) -> str:
-    """R32: image placeholders ('![1107452]', also in headings) and empty links are noise in a text answer; type names
-    wrapped in narrow table columns are joined again (_mend_md_tables). Done when a page is read, so a stored index
-    is never rebuilt for it."""
-    md = md.translate(_INVISIBLE)                       # zero-width spaces / soft hyphens: line-break hints
-    md = _IMG.sub("", md)
-    md = _EMPTY_LINK.sub("", md)
-    md = re.sub(r"^(#+)\s{2,}", r"\1 ", md, flags=re.M)
-    return _mend_md_tables(md)
+def _md_links(s: str) -> str:
+    """Link marks → [text](href); a link without text (an image link whose image says nothing) is dropped."""
+    prev = None
+    while prev != s:
+        prev = s
+        s = _LINK.sub(lambda m: f"[{m.group(1).strip()}]({m.group(2)})" if m.group(1).replace("\ue000", "").strip()
+                      else " ", s)
+    s = _STRAY.sub("", s).replace("\ue001", "")         # a link split over two blocks: its text, without the link
+    return s.replace("\ue004", "**").replace("\ue005", "`")
 
 
-def _mend_md_tables(md: str) -> str:
-    """R32 (0.8.8 retest): 'T_Ams NetId' — a type name broken across lines in a narrow table column (<br>, two <p>)
-    is stored with a space. Two or three fragments of a cell are joined when the page's own code declares the joined
-    name, or — in a Type column — when they meet at a camel-case boundary and none is an IEC keyword; inside longer
-    cells only on that evidence. Everything else keeps its space."""
-    if "|" not in md:
-        return md
-    idents = {w.lower() for code in re.findall(r"```[^\n]*\n(.*?)```", md, re.S) for w in re.findall(r"[A-Za-z_]\w*", code)}
-    lines = md.split("\n")
-    types: set[int] = set()
-    header = False
-    for i, ln in enumerate(lines):
-        if not ln.startswith("|"):
-            header = False
-            continue
-        cells = [c.strip() for c in re.split(r"(?<!\\)\|", ln.strip())[1:-1]]
-        if not header:                                  # first row of a table
-            types = {j for j, h in enumerate(cells) if _TYPE_HEADER.match(h.strip("*` ").strip())}
-            header = True
-            continue
-        if all(re.fullmatch(r"-+", c) for c in cells):
-            continue
-        mended = [_mend_cell(c, idents, j in types) for j, c in enumerate(cells)]
-        if mended != cells:
-            lines[i] = "| " + " | ".join(mended) + " |"
-    return "\n".join(lines)
+def _plain(s: str) -> str:
+    """Link marks → the link text alone (table cells as data, N77)."""
+    prev = None
+    while prev != s:
+        prev = s
+        s = _LINK.sub(lambda m: m.group(1), s)
+    return _STRAY.sub("", s).replace("\ue001", "").replace("\ue004", "").replace("\ue005", "")
+
+
+def _first_href(s: str) -> str | None:
+    """The target of the first link that has text (an image-only link says nothing)."""
+    for m in _LINK.finditer(s):
+        if m.group(1).replace("\ue000", "").strip():
+            return m.group(2)
+    return None
+
+
+_PKG_REL = re.compile(r"^(?:\.\./)*(?:([^/?#:]+)/(?:\d{4}/)?)?(\d+)\.html?(?:[?#].*)?$", re.I)
+
+
+def resolve_href(href: str, base_url: str | None, package: bool) -> str:
+    """A link target as a page address, when it can be one: in a Help Viewer package page a relative link is
+    '[../][<book>/][<lcid>/]<id>.htm' (the package layout) — the page's Infosys URL; on a web page the URL relative to
+    the page. ms-xhelp links are resolved after the build (resolve_help_links); anchors, mail and other schemes stay."""
+    h = html.unescape(href or "").strip()
+    if not h or h.startswith("#") or _XHELP.search(h) or re.match(r"^[a-z][a-z0-9+.-]*:", h, re.I):
+        return h
+    if base_url is None:
+        return h
+    if package:
+        b = book_of(base_url)
+        m = _PKG_REL.match(h)
+        if b and m:
+            lcid = base_url[len(f"{INFOSYS}/content/"):].split("/", 1)[0]
+            return f"{INFOSYS}/content/{lcid}/{(m.group(1) or b[0]).lower()}/{m.group(2)}.html"
+        return h
+    return urllib.parse.urljoin(base_url, h)
+
+
+def _text_of(markdown: str) -> str:
+    """The searchable text of a page: its Markdown without the code blocks (those are the code column)."""
+    return re.sub(r"```.*?```", " ", markdown, flags=re.S)
 
 
 def _bump_gen(con: Any) -> None:
@@ -191,16 +215,21 @@ class HtmlDoc:
     title: str = ""
     markdown: str = ""
     code_blocks: list[tuple[str, str]] = field(default_factory=list)   # (language, code)
-    tables: list[list[list[str]]] = field(default_factory=list)          # table -> rows -> cells
+    tables: list[list[list[str]]] = field(default_factory=list)          # table -> rows -> cells (plain text, N77)
     headings: list[tuple[int, str]] = field(default_factory=list)
     table_titles: list[str] = field(default_factory=list)               # per table: the heading above it ('Methods')
     meta: dict[str, str] = field(default_factory=dict)                   # <meta name=…> (Help Viewer pages)
     crumb: str = ""                                                      # breadcrumb (Help Viewer pages)
+    table_links: list[list[list[str | None]]] = field(default_factory=list)   # per cell: its first link target
+
+
+_TABLE_MARK = "\ue010"          # placeholder of table k in the output until result() renders it: \ue010k\ue010
 
 
 class _MdWalker(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, base_url: str | None = None, package: bool = False) -> None:
         super().__init__(convert_charrefs=True)
+        self.base_url, self.package = base_url, package
         self.doc = HtmlDoc()
         self.out: list[str] = []
         self.inline: list[str] = []
@@ -221,19 +250,23 @@ class _MdWalker(HTMLParser):
 
     # -- helpers --------------------------------------------------------------
     def _flush(self) -> None:
-        text = " ".join("".join(self.inline).split())
+        raw = "".join(self.inline)
         self.inline = []
-        if not text.replace("\ue000", "").strip():
-            return
         if self.cell is not None:
-            self.cell.append(_nobr(text))
+            text = " ".join(raw.split())
+            if _plain(text).replace("\ue000", "").strip():
+                self.cell.append(text)           # links stay marked: a cell is rendered twice (result)
+            return
+        text = " ".join(_md_links(raw).split())
+        if not text.replace("\ue000", "").strip():
             return
         if self.heading:
             text = _nobr(text)
             self.out.append("#" * self.heading + " " + text)
-            self.doc.headings.append((self.heading, text))
+            plain = _nobr(_plain(" ".join(raw.split())))
+            self.doc.headings.append((self.heading, plain))
             if self.heading == 1 and not self.doc.title:
-                self.doc.title = text
+                self.doc.title = plain
             return
         if self.list_stack:
             kind, n = self.list_stack[-1]
@@ -244,18 +277,54 @@ class _MdWalker(HTMLParser):
         self.out.append(text)   # paragraph: keep the markers until result() decides code vs prose
 
     def _emit_table(self) -> None:
-        rows = [r for r in (self.table or []) if any(c.strip() for c in r)]
+        rows = [r for r in (self.table or []) if any(_plain(c).strip() for c in r)]
         self.table = None
         if not rows:
             return
         width = max(len(r) for r in rows)
         rows = [r + [""] * (width - len(r)) for r in rows]
-        self.doc.tables.append(rows)
+        self.doc.tables.append(rows)            # marked cells; result() makes them plain and renders the table
         self.doc.table_titles.append(self.doc.headings[-1][1] if self.doc.headings else "")
-        esc = lambda c: c.replace("|", "\\|")  # noqa: E731
-        lines = ["| " + " | ".join(esc(c) for c in rows[0]) + " |", "|" + "---|" * width]
-        lines += ["| " + " | ".join(esc(c) for c in r) + " |" for r in rows[1:]]
-        self.out.append("\n".join(lines))
+        self.out.append(f"{_TABLE_MARK}{len(self.doc.tables) - 1}{_TABLE_MARK}")
+
+    def _render_tables(self) -> None:
+        """Tables once every code block of the page is known: the cells as plain text (the declaration's data, N77)
+        with the first link of each cell aside, type names split in a narrow column joined (R32, on the evidence of
+        the page's own code), and the Markdown table with its links."""
+        idents = {w.lower() for _l, code in self.doc.code_blocks for w in re.findall(r"[A-Za-z_]\w*", code)}
+        md: dict[int, str] = {}
+        for k, rows in enumerate(self.doc.tables):
+            plain_hdr = [_nobr(_plain(c)) for c in rows[0]]
+            types = {j for j, h in enumerate(plain_hdr) if _TYPE_HEADER.match(h.strip("*` ").strip())}
+            plain_rows, link_rows, md_rows = [], [], []
+            for i, r in enumerate(rows):
+                pr, lr, mr = [], [], []
+                for j, c in enumerate(r):
+                    p = _nobr(_plain(c))
+                    rich = _nobr(_md_links(c))
+                    if i:
+                        mended = _mend_cell(p, idents, j in types)
+                        if mended != p:
+                            href = _first_href(c)
+                            if rich == p:              # a cell without markup: the Markdown shows the joined name
+                                rich = mended
+                            elif href is not None and rich == f"[{p}]({href})":     # the cell is one link
+                                rich = f"[{mended}]({href})"
+                        p = mended
+                    pr.append(p)
+                    lr.append(_first_href(c))
+                    mr.append(rich)
+                plain_rows.append(pr)
+                link_rows.append(lr)
+                md_rows.append(mr)
+            self.doc.tables[k] = plain_rows
+            self.doc.table_links.append(link_rows)
+            esc = lambda c: c.replace("|", "\\|")  # noqa: E731
+            width = len(md_rows[0])
+            lines = ["| " + " | ".join(esc(c) for c in md_rows[0]) + " |", "|" + "---|" * width]
+            lines += ["| " + " | ".join(esc(c) for c in r) + " |" for r in md_rows[1:]]
+            md[k] = "\n".join(lines)
+        self.out = [md[int(b[1:-1])] if b.startswith(_TABLE_MARK) else b for b in self.out]
 
     # -- parser callbacks -------------------------------------------------------
     def handle_starttag(self, tag, attrs):
@@ -306,21 +375,22 @@ class _MdWalker(HTMLParser):
             self.inline.append(" \ue000 ")   # line-break marker (private-use char: str.split() keeps it); becomes a newline if the block turns out to be code
             return
         if tag == "a" and a.get("href"):
-            self.href.append(a["href"])
-            self.inline.append("[")
+            self.href.append(resolve_href(a["href"], self.base_url, self.package))
+            self.inline.append("\ue001")
             return
         if tag == "img":
-            alt = (a.get("alt") or "").strip()
-            if alt:
+            # an image is its alt text when that says something; Help Viewer alts are image ids ('1107452'): nothing
+            alt = (a.get("alt") or "").translate(_INVISIBLE).strip()
+            if alt and not alt.isdigit():
                 self.inline.append(f"![{alt}]")
             return
         if tag == "code":
             self.code_inline += 1
-            self.inline.append("`")
+            self.inline.append("\ue005")         # '`' in Markdown, nothing in a plain table cell
             return
         if tag in ("b", "strong"):
             self.bold += 1
-            self.inline.append("**")
+            self.inline.append("\ue004")         # '**' in Markdown, nothing in a plain table cell
             return
         if tag in _BLOCK:
             self._flush()
@@ -373,15 +443,15 @@ class _MdWalker(HTMLParser):
             return
         if tag == "a" and self.href:
             href = self.href.pop()
-            self.inline.append(f"]({href})")
+            self.inline.append(f"\ue002{href}\ue003")
             return
         if tag == "code" and self.code_inline:
             self.code_inline -= 1
-            self.inline.append("`")
+            self.inline.append("\ue005")
             return
         if tag in ("b", "strong") and self.bold:
             self.bold -= 1
-            self.inline.append("**")
+            self.inline.append("\ue004")
             return
         if tag in _BLOCK:
             self._flush()
@@ -390,17 +460,19 @@ class _MdWalker(HTMLParser):
         if self.skip:
             return
         if self.in_title:
-            self.title_buf.append(data)
+            self.title_buf.append(data.translate(_INVISIBLE))
             return
         if self.pre:
             self.pre_buf.append(data)
             return
-        self.inline.append(data)
+        # zero-width spaces, joiners and soft hyphens are line-break hints of the page layout, not text
+        self.inline.append(data.translate(_INVISIBLE))
 
     def result(self) -> HtmlDoc:
         self._flush()
         if self.table is not None:
             self._emit_table()
+        self._render_tables()
         if not self.doc.title and self.doc.headings:
             self.doc.title = self.doc.headings[0][1]
         if not self.doc.title:
@@ -445,7 +517,7 @@ def _doc_version(raw: str | None) -> str | None:
 
 # blanks other than the space that Help Viewer pages put into code (indentation), and zero-width marks
 _CODE_SPACES = str.maketrans({**{c: " " for c in "\u00a0\u2007\u202f\u2002\u2003\u2009\u200a"},
-                              **{c: None for c in "\u200b\u2060\ufeff"}})
+                              **{c: None for c in "\u200b\u200c\u200d\u2060\ufeff\u00ad"}})
 
 
 def _nobr(text: str) -> str:
@@ -494,9 +566,11 @@ def _guess_lang(code: str) -> str:
     return ""
 
 
-def html_to_doc(raw: bytes | str) -> HtmlDoc:
+def html_to_doc(raw: bytes | str, base_url: str | None = None, package: bool = False) -> HtmlDoc:
+    """A page as stored: Markdown with every link a page address where it can be one (base_url: the page's URL;
+    package: a Help Viewer package page, whose relative links follow the package layout)."""
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
-    w = _MdWalker()
+    w = _MdWalker(base_url, package)
     w.feed(text)
     w.close()
     return w.result()
@@ -589,10 +663,12 @@ def _table_kind(rows: list[list[str]], title: str = "") -> str | None:
     return "vars"
 
 
-def _member_tables(tables: list[list[list[str]]], titles: list[str] | None = None
+def _member_tables(tables: list[list[list[str]]], titles: list[str] | None = None,
+                   links: list[list[list[str | None]]] | None = None
                    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """N74: the Methods and Properties tables of an FB / interface page as their own lists — they were read as
-    variable descriptions, so 'description' carried the method list ('Configure()': …)."""
+    variable descriptions, so 'description' carried the method list ('Configure()': …). N77: a property's type is its
+    name (the cells are plain text); the page of the type, when the cell links to one, is type_ref."""
     methods: list[dict[str, Any]] = []
     props: list[dict[str, Any]] = []
     for k, rows in enumerate(tables):
@@ -600,11 +676,15 @@ def _member_tables(tables: list[list[list[str]]], titles: list[str] | None = Non
         if kind not in ("methods", "properties"):
             continue
         hdr = [c.strip().lower() for c in rows[0]]
+        lk = links[k] if links and k < len(links) else None
+
+        def idx(*keys: str) -> int | None:
+            return next((i for i, h in enumerate(hdr) if any(key in h for key in keys)), None)
 
         def col(r: list[str], *keys: str) -> str | None:
-            i = next((k for k, h in enumerate(hdr) if any(key in h for key in keys)), None)
+            i = idx(*keys)
             return r[i].strip() if i is not None and i < len(r) and r[i].strip() else None
-        for r in rows[1:]:
+        for n, r in enumerate(rows[1:], 1):
             if not r or not r[0].strip():
                 continue
             name = re.sub(r"\s*\(\s*\)\s*$", "", r[0].strip())
@@ -612,11 +692,34 @@ def _member_tables(tables: list[list[list[str]]], titles: list[str] | None = Non
                 methods.append({"name": name, "definition_location": col(r, "definition location"),
                                 "description": col(r, "descr", "meaning", "comment")})
             else:
-                props.append({"name": name, "type": col(r, "type"), "access": col(r, "access"),
-                              "definition_location": col(r, "definition location"),
-                              "initial_value": col(r, "initial value", "default"),
-                              "description": col(r, "descr", "meaning", "comment")})
+                p = {"name": name, "type": col(r, "type"), "access": col(r, "access"),
+                     "definition_location": col(r, "definition location"),
+                     "initial_value": col(r, "initial value", "default"),
+                     "description": col(r, "descr", "meaning", "comment")}
+                ti = idx("type")
+                ref = lk[n][ti] if lk is not None and ti is not None and n < len(lk) and ti < len(lk[n]) else None
+                if ref:
+                    p["type_ref"] = ref
+                props.append(p)
     return methods, props
+
+
+def _type_refs(tables: list[list[list[str]]], titles: list[str] | None = None,
+               links: list[list[list[str | None]]] | None = None) -> dict[str, str]:
+    """N77: the page of a variable's type, when its row of a description table links the type: {name: url}."""
+    out: dict[str, str] = {}
+    for k, rows in enumerate(tables):
+        if _table_kind(rows, (titles or [])[k] if titles and k < len(titles) else "") != "vars" or not links \
+                or k >= len(links):
+            continue
+        ti = next((i for i, h in enumerate(c.strip().lower() for c in rows[0]) if _TYPE_HEADER.match(h)), None)
+        if ti is None:
+            continue
+        for n, r in enumerate(rows[1:], 1):
+            ref = links[k][n][ti] if n < len(links[k]) and ti < len(links[k][n]) else None
+            if r and r[0].strip() and ref:
+                out.setdefault(r[0].strip(), ref)
+    return out
 
 
 def _descriptions(tables: list[list[list[str]]], titles: list[str] | None = None) -> dict[str, str]:
@@ -719,11 +822,17 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
         decl["declaration"] = ((f"{head} {decl['name']}  (* header reconstructed *)\n" if head else "")
                                + "\n".join(fragments))
     decl["description"] = desc
-    methods, props = _member_tables(doc.tables, doc.table_titles)
+    methods, props = _member_tables(doc.tables, doc.table_titles, doc.table_links)
     if methods:
         decl["methods"] = methods
     if props:
         decl["properties"] = props
+    refs = _type_refs(doc.tables, doc.table_titles, doc.table_links)
+    if refs:
+        for key in ("inputs", "outputs", "in_out", "members"):
+            for it in decl[key]:
+                if refs.get(it["name"]):
+                    it["type_ref"] = refs[it["name"]]
     short = decl["name"].split(".")[-1]
     if kind in ("Function", "Method"):
         # R24: Infosys documents the return value as a VAR_OUTPUT named like the function — it is the return type
@@ -736,6 +845,7 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
         if decl["return_type"] and decl["declaration"]:
             decl["declaration"] = _return_in_header(decl["declaration"], short, decl["return_type"],
                                                     "FUNCTION" if kind == "Function" else "METHOD")
+    _tidy_declaration(decl)                 # rule 4: stored as every reader needs it
     return decl
 
 
@@ -760,9 +870,9 @@ def _return_in_header(text: str, short: str, rtype: str, kw: str) -> str:
 
 
 def _tidy_declaration(decl: dict[str, Any]) -> None:
-    """Output-time additions to a stored declaration (no page is parsed again): R25 implicit enum values are
-    numbered and the declaration's (* … *) comments become descriptions; R32 the per-name 'description' dict repeats
-    what the items carry. (R24, the return value, is the parser's job: parse_declaration.)"""
+    """The last step of parse_declaration (index time, format 4): R25 implicit enum values are numbered and the
+    declaration's (* … *) comments become descriptions; R32 the per-name 'description' dict loses what the items
+    carry already."""
     name = decl.get("name") or ""
     if decl.get("kind") == "Enum" and decl.get("enum_values"):
         comments: dict[str, str] = {}
@@ -840,17 +950,31 @@ def book_category(book: str) -> str:
 # the index
 # ---------------------------------------------------------------------------
 class InfosysIndex:
-    def __init__(self, cache_dir: str | Path, fetcher: Fetcher | None = None, books: list[str] | None = None,
+    def __init__(self, cache_dir: str | Path | None = None, fetcher: Fetcher | None = None, books: list[str] | None = None,
                  exclude_books: list[str] | None = None, tc3_only: bool = True, max_workers: int = 6,
                  max_index_pages: int = 4000, sitemap_ttl_days: int = 7, web_fallback: bool = True,
-                 fetch_timeout_s: float = 20.0, local: Any = None):
+                 fetch_timeout_s: float = 20.0, local: Any = None, db_file: str | Path | None = None,
+                 read_only: bool = False):
         # local: a helpviewer.HelpViewerSource — the installed Help Viewer package replaces the website entirely
         # (page list, page content); nothing is fetched from the network and there is no web fallback.
+        # db_file: the index file (default <cache_dir>/index.sqlite — the web cache).
+        # read_only (docs/KNOWLEDGE_BASE.md): the knowledge folder's index of the local package is built as a whole by
+        # infosys_build (written as <index>.building, swapped in when complete) and only READ here — never changed,
+        # never rebuilt in place; an index of an older format is read as it is and said to need a rebuild.
         self.local = local
         if local is not None:
             web_fallback = False
-        self.dir = Path(cache_dir)
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        if db_file is not None:
+            self.db_file = Path(db_file)
+            self.dir = self.db_file.parent
+        elif cache_dir is not None:
+            self.dir = Path(cache_dir)
+            self.db_file = self.dir / "index.sqlite"
+        else:
+            raise ValueError("InfosysIndex needs cache_dir or db_file")
+        if not read_only:
+            self.dir.mkdir(parents=True, exist_ok=True)
         self.fetch = fetcher or Fetcher(fetch_timeout_s)
         self.default_books = list(books or [])
         self.exclude = [re.compile(p, re.I) for p in (exclude_books or [])]
@@ -865,7 +989,13 @@ class InfosysIndex:
         self._index_lock = threading.RLock()   # one book indexes at a time: a background default index and an explicit
                                                # infosys_index of the same book must not both write (SQLite busy → 30 s stalls)
         self._fts: bool | None = None
-        self._init_db()
+        self._has_helpids = False
+        self._probed_sig: tuple[int, int, int] | None = None
+        self.format: int | None = None         # the index's format (INDEXER_VERSION it was built with)
+        if read_only:
+            self._probe()
+        else:
+            self._init_db()
 
     # -- storage ----------------------------------------------------------------
     # -- derived lookup tables (R17–R22): what is indexed, small enough to search cold -----------------------------
@@ -887,7 +1017,10 @@ class InfosysIndex:
         """)
 
     def sync_derived(self) -> dict[str, Any]:
-        """Bring catalog / code_blocks in step with the pages table (cheap when nothing changed)."""
+        """Bring catalog / code_blocks in step with the pages table (cheap when nothing changed). A read-only index
+        has them from its build."""
+        if self.read_only:
+            return {"changed": False, "read_only": True}
         t0 = time.time()
         with self._derived_lock, self._db() as con:
             self._init_derived(con)
@@ -914,7 +1047,6 @@ class InfosysIndex:
                     if not block.strip():
                         continue
                     lang, _, code = block.partition("\n")
-                    code = code.replace("\xa0", " ")
                     con.execute("INSERT INTO code_blocks(page_rowid, url, title, library, lang, code) VALUES (?,?,?,?,?,?)",
                                 (row["rowid"], row["url"], row["title"], row["library"], lang.strip(), code))
                     added += 1
@@ -924,19 +1056,58 @@ class InfosysIndex:
                 "seconds": round(time.time() - t0, 2)}
 
     def warm(self) -> dict[str, Any]:
-        """R18 at start: bring the derived lookup tables up to date (the first search then reads only them), and
-        the ms-xhelp link map (R26) when the package is new."""
-        out = self.sync_derived()
-        if self.local is not None:
-            try:
-                out["links"] = self.build_link_map()
-            except Exception as exc:  # noqa: BLE001
-                out["links"] = {"error": str(exc)[:160]}
-        return out
+        """R18 at start: the first search reads only the derived lookup tables — read them once now (and, for the
+        web cache, bring them up to date)."""
+        if not self.read_only:
+            return self.sync_derived()
+        if not self.db_file.is_file():
+            return {"index": "none yet"}
+        t0 = time.time()
+        with self._db() as con:
+            names = {r[0] for r in con.execute("SELECT name FROM sqlite_master")}
+            n = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("catalog", "code_blocks") if t in names}
+        return {"read": n, "seconds": round(time.time() - t0, 2)}
 
     def _db(self):
-        """Context manager: connection that commits and closes on exit."""
-        return _Conn(self.dir / "index.sqlite")
+        """Context manager: connection that commits and closes on exit (read-only: opened read-only)."""
+        if self.read_only:
+            sig = self._file_sig()
+            if sig is None:
+                raise InfosysError(self.missing_text())
+            if sig != self._probed_sig:               # a build swapped a new index in (or the first one appeared)
+                self._probe()
+        return _Conn(self.db_file, read_only=self.read_only)
+
+    def _file_sig(self) -> tuple[int, int, int] | None:
+        try:
+            st = self.db_file.stat()
+        except OSError:
+            return None
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def missing_text(self) -> str:
+        from . import infosys_build as B
+        st = B.state(self.db_file)
+        return f"no Infosys index yet ({self.db_file}): {st['message']}"
+
+    def _probe(self) -> None:
+        """Read-only: what the index file offers — nothing is created or changed."""
+        self._probed_sig = self._file_sig()
+        if self._probed_sig is None:
+            self._fts, self.format = None, None
+            return
+        with _Conn(self.db_file, read_only=True) as con:
+            names = {r[0] for r in con.execute("SELECT name FROM sqlite_master")}
+            self._fts = "pages_fts" in names
+            self._has_helpids = "helpids" in names
+            r = con.execute("SELECT value FROM meta WHERE key = 'indexer_version'").fetchone() if "meta" in names else None
+        self.format = int(r[0]) if r is not None and str(r[0]).isdigit() else None
+
+    def _writable(self, what: str) -> None:
+        if self.read_only:
+            raise InfosysError(f"{what}: the index of the local Help Viewer package is built as a whole, outside the "
+                               "tools that read it — kb_rebuild(index='infosys') (asks for approval), or "
+                               "tools\\infosys_local.py index in the knowledge folder. Nothing was changed.")
 
     def _init_db(self) -> None:
         with self._db() as con:
@@ -968,10 +1139,13 @@ class InfosysIndex:
                     con.execute("INSERT INTO pages_fts(pages_fts) VALUES ('rebuild')")
             except sqlite3.OperationalError:
                 self._fts = False
+            con.execute("CREATE TABLE IF NOT EXISTS helpids(help_id TEXT PRIMARY KEY, url TEXT)")
+            self._has_helpids = True
             r = con.execute("SELECT value FROM meta WHERE key = 'indexer_version'").fetchone()
             have = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
             if have and (r is None or r[0] != str(INDEXER_VERSION)):
-                # rows built by other extraction logic: rebuild once (the page identity alone would keep them)
+                # a writable index is the web cache, or a .building file that infosys_build resumes (it never resumes
+                # one of another format): rows built by other extraction logic are dropped once
                 con.execute("DELETE FROM pages")
                 con.execute("DELETE FROM books")
                 con.execute("DELETE FROM meta WHERE key = 'source_stamp'")
@@ -980,6 +1154,7 @@ class InfosysIndex:
                 _bump_gen(con)
             if r is None or r[0] != str(INDEXER_VERSION):
                 con.execute("INSERT OR REPLACE INTO meta VALUES ('indexer_version', ?)", (str(INDEXER_VERSION),))
+        self.format = INDEXER_VERSION
 
     @property
     def has_fts(self) -> bool:
@@ -1071,7 +1246,11 @@ class InfosysIndex:
         decl = parse_declaration(title, doc)
         kind = decl["kind"]
         library = _library_from_tables(doc.tables) or library_from_book(bk[0])
-        text = re.sub(r"```.*?```", " ", doc.markdown, flags=re.S)
+        text = _text_of(doc.markdown)
+        hid = (doc.meta.get("Microsoft.Help.Id") or "").strip().lower()
+        if hid and self._has_helpids:
+            # the page's Help Viewer id: ms-xhelp links to it are resolved once every page is in (resolve_help_links)
+            con.execute("INSERT OR REPLACE INTO helpids VALUES (?, ?)", (hid, url))
         code = CODE_SEP.join(f"{lang}\n{c}" for lang, c in doc.code_blocks)
         has_decl = kind != "Page" and decl["declaration"] is not None
         version = _doc_version(doc.meta.get("Microsoft.Help.DisplayVersion"))
@@ -1092,25 +1271,29 @@ class InfosysIndex:
 
     def _fetch_doc(self, url: str) -> HtmlDoc:
         if self.local is None:
-            return html_to_doc(self.fetch.get(url))
+            return html_to_doc(self.fetch.get(url), base_url=url)
         from .helpviewer import body_html, page_meta
         try:
             raw = self.local.get(url)
         except Exception as exc:  # noqa: BLE001 — HelpViewerError
             raise InfosysError(str(exc)) from exc
         text, crumb = body_html(raw)
-        doc = html_to_doc(text)
+        doc = html_to_doc(text, base_url=url, package=True)
         doc.meta = page_meta(raw)
-        doc.crumb = crumb
+        doc.crumb = " ".join(crumb.translate(_INVISIBLE).split())
         if doc.meta.get("Title") and (not doc.title or doc.title.lower().startswith("beckhoff information system")):
-            doc.title = doc.meta["Title"].strip()
+            doc.title = " ".join(html.unescape(doc.meta["Title"]).translate(_INVISIBLE).split())
         return doc
 
     def _answer_meta(self) -> dict[str, Any]:
         """D3: what every answer carries — the date of the documentation it came from (a local package can be months
         old) and how much is indexed; the full book list and source block live in tc_doctor / infosys_books."""
         if self.local is not None:
-            return {"doc_date": self.local.describe()["modified"], "indexed_books_count": len(self.indexed_books())}
+            out = {"doc_date": self.local.describe()["modified"], "indexed_books_count": len(self.indexed_books())}
+            note = self.index_note()
+            if note:
+                out["index_note"] = note          # rule 6: an answer from an index that is not the current one says so
+            return out
         return {"indexed_books_count": len(self.indexed_books())}
 
     def source(self) -> dict[str, Any]:
@@ -1123,6 +1306,7 @@ class InfosysIndex:
                    progress: Callable[[int, int], None] | None = None) -> dict[str, Any]:
         """Fetch every page of a book that is new or whose sitemap lastmod changed. Serialised: a second
         caller for the same book waits and then finds the pages unchanged."""
+        self._writable(f"indexing {book}")
         with self._index_lock:
             return self._index_book(book, force, max_pages, progress)
 
@@ -1204,6 +1388,7 @@ class InfosysIndex:
         ``page_progress(book, pages_done, pages_todo)`` reports inside a book (D25: a large book looked stalled)."""
         if self.local is None:
             raise InfosysError("index_all needs the local Help Viewer package (docs.source = 'local')")
+        self._writable("indexing the package")
         sm = self.sitemap()
         books = sorted({b[0] for u in sm if (b := book_of(u)) and self.book_allowed(b[0])})
         t0 = time.time()
@@ -1253,6 +1438,18 @@ class InfosysIndex:
             return self.indexed_stamp() == self.local.content_stamp() and self._meta("indexer_version") == str(INDEXER_VERSION)
         except Exception:  # noqa: BLE001
             return False
+
+    def index_note(self) -> str | None:
+        """Rule 6: what every answer from a read-only index says when that index is not the current one — an older
+        format, another package — or not there yet. None when it is current."""
+        if not self.read_only:
+            return None
+        from . import infosys_build as B
+        try:
+            st = B.state(self.db_file, local=self.local)
+        except Exception as exc:  # noqa: BLE001
+            return f"index state not readable: {exc}"
+        return None if st["state"] == "complete" and not st.get("rebuild") else st["message"]
 
     def _meta(self, key: str) -> str | None:
         with self._db() as con:
@@ -1437,21 +1634,37 @@ class InfosysIndex:
         except InfosysError:
             sm = {}   # the page itself may still be reachable; sitemap only drives cache invalidation
         lastmod = sm.get(url, "")
-        with self._db() as con:
-            row = con.execute("SELECT * FROM pages WHERE url = ?", (url,)).fetchone()
+        row: Any = None
+        if not (self.read_only and not self.db_file.is_file()):
+            with self._db() as con:
+                row = con.execute("SELECT * FROM pages WHERE url = ?", (url,)).fetchone()
         if self.local is not None and url not in sm:
             raise InfosysError(f"{url} is not in the local Help Viewer package ({self.local.path.name}, "
                                f"{self.local.describe()['modified']}) — no web lookup in local mode")
-        if row is None or refresh or (lastmod and row["lastmod"] != lastmod):
+        indexed = True
+        if self.read_only:
+            if row is None or refresh:
+                # a page the index does not hold (a book the build leaves out, or no index yet): converted from the
+                # package as it is, the same way the build converts it — not stored (the index is built as a whole)
+                doc = self._fetch_doc(url)
+                bk = book_of(url) or ("", "")
+                row = {"title": doc.title or url, "kind": parse_declaration(doc.title or url, doc)["kind"],
+                       "library": _library_from_tables(doc.tables) or library_from_book(bk[0]), "book": bk[0],
+                       "lastmod": "", "markdown": self._links_to_urls(doc.markdown),
+                       "version": _doc_version(doc.meta.get("Microsoft.Help.DisplayVersion")), "crumb": doc.crumb or None}
+                indexed = False
+        elif row is None or refresh or (lastmod and row["lastmod"] != lastmod):
             doc = self._fetch_doc(url)
             with self._db() as con, self._lock:
                 self._store(con, url, lastmod, doc)
                 _bump_gen(con)
                 row = con.execute("SELECT * FROM pages WHERE url = ?", (url,)).fetchone()
-        md = self._links_to_urls(_clean_md(row["markdown"] or ""))
+        md = row["markdown"] or ""
         out = {"url": url, "title": row["title"], "kind": row["kind"], "library": row["library"], "book": row["book"],
                "lastmod": row["lastmod"] or None, "in_sitemap": url in sm,
                "markdown": md[:max_chars], "truncated": len(md) > max_chars, "chars": len(md)}
+        if not indexed:
+            out["indexed"] = False
         if self.local is not None:
             out["lastmod"] = None
             out["version"] = row["version"]
@@ -1497,7 +1710,6 @@ class InfosysIndex:
         others = sorted(r["library"] for r in same if r["library"])
         if others:
             decl["also_in"] = others              # the other libraries with a symbol of this name
-        _tidy_declaration(decl)
         if self.local is not None:
             with self._db() as con:
                 v = con.execute("SELECT version FROM pages WHERE url = ?", (row["url"],)).fetchone()
@@ -1507,49 +1719,59 @@ class InfosysIndex:
         return decl
 
     # -- ms-xhelp links (R26) ------------------------------------------------------
-    # Help Viewer pages link to each other as ms-xhelp:///?Id=<Microsoft.Help.Id>. The Id → page map is read once from
-    # the package (page meta only, nothing is indexed again) and kept in the database for that package content.
-    def _helpid_map(self, con: Any) -> bool:
-        if self.local is None:
-            return False
-        if getattr(self, "_helpids_ok", None) == id(self.local):
-            return True
-        con.execute("CREATE TABLE IF NOT EXISTS helpids(help_id TEXT PRIMARY KEY, url TEXT)")
-        stamp = self.local.content_stamp()
-        r = con.execute("SELECT value FROM meta WHERE key = 'helpids_stamp'").fetchone()
-        if r is not None and r[0] == stamp:
-            self._helpids_ok = id(self.local)
-            return True
-        with self._derived_lock:
-            from .helpviewer import page_meta
-            con.execute("DELETE FROM helpids")
-            for url in self.local.entries():
-                try:
-                    hid = page_meta(self.local.get(url)).get("Microsoft.Help.Id")
-                except Exception:  # noqa: BLE001
-                    continue
-                if hid:
-                    con.execute("INSERT OR IGNORE INTO helpids VALUES (?, ?)", (hid.strip().lower(), url))
-            con.execute("INSERT OR REPLACE INTO meta VALUES ('helpids_stamp', ?)", (stamp,))
-        self._helpids_ok = id(self.local)
-        return True
-
-    def build_link_map(self) -> dict[str, Any]:
+    # Help Viewer pages link to each other as ms-xhelp:///?Id=<Microsoft.Help.Id>. Every page's id goes into helpids
+    # while it is stored; once all pages are in, resolve_help_links writes the page URLs into the stored text (rule 4).
+    def resolve_help_links(self) -> dict[str, Any]:
+        """ms-xhelp links → page URLs in the stored Markdown, text and declarations — once, at the end of a build.
+        A link to an id the package does not have stays as it is. -> counts."""
+        self._writable("resolving links")
         t0 = time.time()
+        found = resolved = pages = 0
         with self._db() as con:
-            ok = self._helpid_map(con)
-            n = con.execute("SELECT COUNT(*) FROM helpids").fetchone()[0] if ok else 0
-        return {"help_ids": n, "seconds": round(time.time() - t0, 2)}
+            ids = {r[0]: r[1] for r in con.execute("SELECT help_id, url FROM helpids")}
+
+            def sub(m: re.Match) -> str:
+                nonlocal found, resolved
+                found += 1
+                u = ids.get(urllib.parse.unquote(m.group(1)).strip().lower())
+                if u is None:
+                    return m.group(0)
+                resolved += 1
+                return u
+            rows = con.execute("SELECT rowid, url, title, markdown, text, code, decl FROM pages WHERE "
+                               "markdown LIKE '%ms-xhelp%' OR decl LIKE '%ms-xhelp%'").fetchall()
+            for r in rows:
+                md = _XHELP.sub(sub, r["markdown"] or "")
+                decl = _XHELP.sub(sub, r["decl"]) if r["decl"] else r["decl"]
+                if md == (r["markdown"] or "") and decl == r["decl"]:
+                    continue
+                text = _text_of(md)
+                if self._fts:
+                    con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code) VALUES "
+                                "('delete', ?, ?, ?, ?, ?)", (r["rowid"], r["url"], r["title"], r["text"], r["code"]))
+                con.execute("UPDATE pages SET markdown = ?, text = ?, decl = ? WHERE rowid = ?",
+                            (md, text, decl, r["rowid"]))
+                if self._fts:
+                    con.execute("INSERT INTO pages_fts(rowid, url, title, text, code) VALUES (?,?,?,?,?)",
+                                (r["rowid"], r["url"], r["title"], text, r["code"]))
+                pages += 1
+            con.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            [("links", str(found)), ("links_resolved", str(resolved))])
+        return {"pages": pages, "links": found, "resolved": resolved, "help_ids": len(ids),
+                "seconds": round(time.time() - t0, 1)}
 
     def _xhelp_url(self, hid: str) -> str | None:
         hid = urllib.parse.unquote(hid).strip().lower()
+        if not self.db_file.is_file():
+            return None
         with self._db() as con:
-            if not self._helpid_map(con):
+            if con.execute("SELECT 1 FROM sqlite_master WHERE name = 'helpids'").fetchone() is None:
                 return None
             r = con.execute("SELECT url FROM helpids WHERE help_id = ?", (hid,)).fetchone()
         return r[0] if r else None
 
     def _links_to_urls(self, md: str) -> str:
+        """ms-xhelp links of a page converted now (one the index does not hold), through the index's help ids."""
         if "ms-xhelp" not in md or self.local is None:
             return md
         cache: dict[str, str | None] = {}
@@ -1695,12 +1917,24 @@ class InfosysIndex:
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+def ro_uri(db: Path) -> str:
+    """SQLite read-only URI: 'file:/C:/x.db?mode=ro' ('file:////server/share/x.db' for UNC paths, which Path.as_uri
+    turns into a host part SQLite refuses)."""
+    s = str(Path(db).resolve()).replace("\\", "/")
+    s = "//" + s if s.startswith("//") else (s if s.startswith("/") else "/" + s)
+    return "file:" + urllib.parse.quote(s, safe="/:") + "?mode=ro"
+
+
 class _Conn:
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, path: Path, read_only: bool = False):
+        self.path, self.read_only = path, read_only
         self.con: sqlite3.Connection | None = None
 
     def __enter__(self) -> sqlite3.Connection:
+        if self.read_only:
+            self.con = sqlite3.connect(ro_uri(self.path), uri=True, timeout=30, check_same_thread=False)
+            self.con.row_factory = sqlite3.Row
+            return self.con
         self.con = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
         try:
@@ -1762,7 +1996,7 @@ def _glob_to_re(pattern: str) -> str:
 def _summary(markdown: str | None, n: int = 220) -> str:
     if not markdown:
         return ""
-    for block in markdown.translate(_INVISIBLE).split("\n\n"):
+    for block in markdown.split("\n\n"):
         b = block.strip()
         if not b or b.startswith("#") or b.startswith("```") or b.startswith("|") or b.startswith("!["):
             continue
