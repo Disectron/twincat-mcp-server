@@ -428,7 +428,7 @@ async def test_write_refusals_round2(monkeypatch, project_dir):
         ok = payload(await s.call_tool("ads_write", {"name": "PRG_Test.eCmd", "value": "E_FillState.Fine"}))   # #61
         assert ok["read_back"] == 2 and ok["written"] == 2
         r = payload(await s.call_tool("ads_read", {"name": "PRG_Test.ipModule"}))                              # #64
-        assert r["value"] is None and "INTERFACE" in r["note"]
+        assert r["value"] == "0x0000000000000000" and "INTERFACE" in r["note"]           # N51: unassigned = address 0
         # #54: one bad item → nothing written, every problem named
         r = await s.call_tool("ads_write_many", {"values": {"MAIN.nCycle": 1, "GVL_Machine.MAX_MODULES": 3, "MAIN.sLabel": "y" * 20}})
         assert r.is_error and "nothing was written" in text(r) and "MAX_MODULES" in text(r) and "sLabel" in text(r)
@@ -444,7 +444,8 @@ async def test_write_refusals_round2(monkeypatch, project_dir):
 
 def test_pointer_format():
     from twincat_mcp import types_tc as T
-    assert T.fmt_pointer(0) is None
+    assert T.fmt_pointer(0) == "0x0000000000000000" and T.fmt_pointer(0, 4) == "0x00000000"     # N51: NULL is the address 0
+    assert T.fmt_pointer(None) is None and T.fmt_pointer("x") is None             # no integer: no address
     assert T.fmt_pointer(-114343974404328) == "0xFFFF98002F3C4018"[:2] + format((-114343974404328) & (2**64 - 1), "016X")
     assert T.fmt_pointer(0x1234, 4) == "0x00001234"
 
@@ -694,7 +695,7 @@ async def test_interfaces_known_from_source(monkeypatch, project_dir):
         r = payload(await s.call_tool("ads_read", {"name": "PRG_Test.ipThing"}))
         assert r["value"] == "0x" + format(-114343974404328 & (2**64 - 1), "016X") and "INTERFACE" in r["note"]
         a = payload(await s.call_tool("ads_read", {"name": "PRG_Test.aThings"}))
-        assert a["value"][0] is None and a["value"][1].startswith("0xFFFF")
+        assert a["value"][0] == "0x0000000000000000" and a["value"][1].startswith("0xFFFF")
         for name, val in (("PRG_Test.ipThing", 12345), ("PRG_Test.aThings", [0, 0])):
             w = await s.call_tool("ads_write", {"name": name, "value": val})
             assert w.is_error and "INTERFACE (declared in the project source)" in text(w), text(w)

@@ -46,7 +46,7 @@ from .safety import Guard, OpClass, SafetyError
 from .worker import SerialWorker, WorkerBusy
 import pyads
 
-from .ads_backend import AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
+from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeBackend, XaeError, sta_init, sta_teardown
 from .project_backend import ProjectIndex, ProjectError, parse_tcunit_xml
@@ -1018,6 +1018,20 @@ def _apply_tool_groups(mcp: MCPServer, cfg: Config) -> None:
         grp = t.name.split("_", 1)[0]
         if grp not in want:
             mcp.remove_tool(t.name)
+
+
+def dump_timeout_message(p: dict[str, Any], limit_s: float) -> str:
+    """What a timed-out ads_dump tells the client, from the state read under the commit lock (N52). The cancel event
+    is already set when this runs: a dump that had not committed will not be kept; one that committed is."""
+    el = time.time() - p.get("started", time.time())
+    if p.get("phase") == "done":
+        return (f"ads_dump finished just as the {limit_s:.0f} s limit ran out ({el:.0f} s), so its result did not reach "
+                f"this call — the files WERE kept: {p.get('files')}")
+    where = (f" root {p.get('index')} of {p.get('of')} ({p.get('root')}), {p.get('leaves', 0)} leaves, "
+             f"{p.get('written_mib', 0)} MiB written" if p.get("root") else "")
+    return (f"ads_dump did not finish within {limit_s:.0f} s ({el:.0f} s): it was {p.get('phase', '?')}{where} — the "
+            "time went into the dump itself, not into ADS (other ADS calls keep answering). It is being stopped and its "
+            "partial files are removed; nothing is kept. Narrow it with pattern= or lower max_leaves / max_total_mb.")
 
 
 def connection_instructions(app: "App") -> str:
@@ -2489,12 +2503,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def ads_dump(pattern: str | None = None, include_system: bool = False, out_dir: str | None = None,
                        max_total_mb: int = 64, max_leaves: int = 500_000) -> dict[str, Any]:
         """Read EVERY variable on the PLC (all top-level symbols, fully expanded through the
-        datatype table — structs, FB instances, arrays of structs) in one pass and write a nested
-        JSON tree plus a flat CSV (path,type,value). pattern limits the roots ('MAIN.*', 'GVL_*');
-        system symbols excluded unless include_system. The project's own programs and GVLs come first, library
-        globals (GVL_TcUnit …) last. POINTER TO / REFERENCE TO / INTERFACE values are addresses — the target is never
-        expanded. max_leaves bounds CSV and JSON together, max_total_mb what is written; a cut dump says
-        truncated with skipped_roots. Returns counts, largest_roots, file paths and a 50-leaf preview."""
+        datatype table — structs, FB instances, arrays of structs) in one pass and write a flat CSV
+        (path,type,value,note) and a nested JSON tree built from the same values, so the two files never disagree.
+        pattern limits the roots ('MAIN.*', 'GVL_*'); system symbols excluded unless include_system. With a project
+        configured its own programs and GVLs come first; without one the order is alphabetical (origin unknown).
+        POINTER TO / REFERENCE TO / INTERFACE values are addresses (NULL = 0x0000…0000) — the target is never
+        expanded. An array beyond 4096 elements or a value beyond 64 KiB is not expanded: both files show the same
+        {not_expanded, bytes, elements, head_hex}. Big symbols are read in 256 KiB pieces. max_leaves bounds CSV and
+        JSON together; max_total_mb (MiB) bounds the bytes written, checked after every row. complete=false names
+        every root that is missing or cut (skipped_roots) and every root that could not be read (failed_roots, also
+        in the CSV note column and the JSON footer). Returns counts, largest_roots, file paths and a 50-leaf
+        preview."""
         od = str(app.out_path(out_dir, what="dump folder", is_dir=True)) if out_dir else str(Path(cfg.safety.audit_log).parent / "dumps")
         if not 1 <= max_total_mb <= 4096 or not 1 <= max_leaves <= 5_000_000:
             raise ToolError("max_total_mb must be 1..4096 and max_leaves 1..5,000,000")
@@ -2503,19 +2522,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             if app.proj.root is not None:
                 await asyncio.to_thread(app.proj.ensure_fresh)
                 own = {u.name.lower() for u in app.proj.units.values() if u.kind in ("PROGRAM", "GVL")} or None
-        except Exception:  # noqa: BLE001 — ordering is a nicety; without the project the heuristic applies
+        except Exception:  # noqa: BLE001 — ordering is a nicety; without the project the order is alphabetical
             own = None
 
         def on_timeout() -> str:
-            p = dict(getattr(app.ads, "dump_progress", {}) or {})
-            el = time.time() - p.get("started", time.time())
-            return (f"ads_dump did not finish within 900 s ({el:.0f} s): it was {p.get('phase', '?')}"
-                    + (f" root {p.get('index')} of {p.get('of')} ({p.get('root')}), {p.get('leaves', 0)} leaves, "
-                       f"{p.get('written_mb', 0)} MB written" if p.get("root") else "")
-                    + " — the time went into the dump itself, not into ADS (other ADS calls keep answering). It is being "
-                      "stopped and its partial files are removed; nothing is kept. Narrow it with pattern= or lower "
-                      "max_leaves / max_total_mb.")
-        return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * 1024 * 1024, max_leaves,
+            # N52: the verdict is read under the dump's commit lock — "kept" only if it was renamed into place
+            return dump_timeout_message(app.ads.dump_outcome(), 900)
+        return await app.ads_call(app.ads.dump, pattern, include_system, od, max_total_mb * MIB, max_leaves,
                                   cancel=app.ads_bulk_worker.cancel_event, own_roots=own, timeout=900, bulk=True,
                                   timeout_msg=on_timeout)
 

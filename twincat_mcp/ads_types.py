@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from . import types_tc as T
 
@@ -57,7 +57,24 @@ def is_interface(e: "DtEntry | None") -> bool:
     return bool(e.flags & F_TCCOMIFACEPTR) or (bool(e.flags & F_METHODINFOS) and not e.subitems and not e.dims
                                                and not e.enum and e.size in (4, 8))
 MAX_ARRAY_ELEMENTS = 4096                # per expansion of a single array (guard)
+MAX_LEAF_BYTES = 65536                   # a single leaf larger than this is not decoded (N47): its head is shown
+HEAD_BYTES = 64                          # how much of a value that is not expanded is shown (hex)
 _RE_INDIRECT = re.compile(r"^\s*(POINTER|REFERENCE)\s+TO\b", re.I)
+
+
+class WalkCancelled(Exception):
+    """The caller's cancel callback fired during a leaf walk (N55: a timed-out dump stops inside one huge root)."""
+
+
+def not_expanded_value(head: bytes, size: int, elements: int | None, reason: str) -> dict[str, Any]:
+    """N48: the one representation of a value that is not decoded in full — an array beyond MAX_ARRAY_ELEMENTS or a
+    leaf beyond MAX_LEAF_BYTES. decode_leaf (CSV, ads_leaves) and decode_tree (JSON of ads_read) both return this,
+    so two outputs of the same bytes never disagree. Only the first HEAD_BYTES are needed (and read)."""
+    out: dict[str, Any] = {"not_expanded": reason, "bytes": size}
+    if elements is not None:
+        out["elements"] = elements
+    out["head_hex"] = bytes(head[:HEAD_BYTES]).hex()
+    return out
 
 
 @dataclass
@@ -209,6 +226,16 @@ class Leaf:
     data_type: int
     enum: dict[int, str] | None = None
     note: str | None = None
+    elements: int | None = None   # an array of this many elements that is not expanded (beyond MAX_ARRAY_ELEMENTS)
+
+    @property
+    def not_expanded(self) -> bool:
+        return self.elements is not None or self.size > MAX_LEAF_BYTES
+
+    @property
+    def need(self) -> int:
+        """Bytes needed to decode this leaf: the head only for a value that is not expanded."""
+        return min(self.size, HEAD_BYTES) if self.not_expanded else self.size
 
 
 class TypeSystem:
@@ -221,31 +248,45 @@ class TypeSystem:
     def is_indirect(self, e: DtEntry | None, type_name: str | None = None) -> bool:
         """POINTER TO / REFERENCE TO / INTERFACE: the value is an address, never the pointee (R42: a POINTER TO
         FB_TestSuite entry carries the pointee as its base type and was expanded as the whole FB at the pointer's
-        8 bytes — fabricated members, 4.7 GB of JSON for 1,000 pointers)."""
-        if e is not None and (e.flags & F_REFERENCETO or is_interface(e)):
+        8 bytes — fabricated members, 4.7 GB of JSON for 1,000 pointers). N50: the alias chain is followed, so
+        TYPE PT_X : POINTER TO FB_X (and an alias of that) is an indirection too."""
+        if type_name and _RE_INDIRECT.match(type_name):
             return True
-        for n in (type_name, e.name if e is not None else None):
-            if n and _RE_INDIRECT.match(n):
+        cur, hops = e, 0
+        while cur is not None and hops <= 16:
+            if cur.flags & F_REFERENCETO or is_interface(cur):
                 return True
-        if e is not None and e.size in (4, 8) and e.type and not e.subitems and not e.dims and not e.enum:
-            tgt = self.get(e.type)
-            if tgt is not None and (tgt.size or 0) > e.size and (tgt.subitems or tgt.dims):
+            if cur.name and _RE_INDIRECT.match(cur.name):
+                return True
+            # a struct, an array (its type is the ELEMENT type), an enum or a base type: not an alias
+            if cur.subitems or cur.dims or cur.enum or not cur.type or cur.type.lower() == cur.name.lower():
+                return False
+            if _RE_INDIRECT.match(cur.type):
+                return True                                    # TYPE PT_X : POINTER TO FB_X
+            nxt = self.get(cur.type)
+            if cur.size in (4, 8) and nxt is not None and (nxt.size or 0) > cur.size and (nxt.subitems or nxt.dims):
                 return True          # a pointer-sized "alias" of a bigger structured type is an indirection
+            cur, hops = nxt, hops + 1                          # follow the alias: TYPE A : B
         return False
 
     # ---------------------------------------------------------------- expand
     def leaves(self, root_path: str, type_name: str, max_leaves: int = 200_000,
-               base_offset: int = 0, max_array: int = MAX_ARRAY_ELEMENTS, size: int | None = None) -> list[Leaf]:
+               base_offset: int = 0, max_array: int = MAX_ARRAY_ELEMENTS, size: int | None = None,
+               cancel: Callable[[], bool] | None = None) -> list[Leaf]:
         """size: the root's own size (the symbol's) — used where the table has no entry for its type (a POINTER TO
-        is 4 bytes on a 32-bit runtime such as the CX9020, 8 on x64)."""
+        is 4 bytes on a 32-bit runtime such as the CX9020, 8 on x64). cancel: polled during the walk; True raises
+        WalkCancelled (N55)."""
         out: list[Leaf] = []
-        self._expand(root_path, type_name, base_offset, out, max_leaves, max_array, None, 0, size)
+        self._expand(root_path, type_name, base_offset, out, max_leaves, max_array, None, 0, size, cancel)
         return out
 
     def _expand(self, path: str, type_name: str, off: int, out: list[Leaf], max_leaves: int, max_array: int,
-                entry: DtEntry | None, depth: int, size_hint: int | None = None) -> None:
+                entry: DtEntry | None, depth: int, size_hint: int | None = None,
+                cancel: Callable[[], bool] | None = None) -> None:
         if len(out) >= max_leaves or depth > 32:
             return
+        if cancel is not None and len(out) % 1024 == 0 and cancel():
+            raise WalkCancelled(f"cancelled while listing the leaves of {path} ({len(out)} so far)")
         e = entry or self.get(type_name)
         if e is None:
             # unknown to the table: treat as scalar by name; the declared size (member / element / symbol) wins over
@@ -264,7 +305,7 @@ class TypeSystem:
                 # type lives in that top-level entry (or in the name "ARRAY [..] OF X")
                 top = self.get(e.type)
                 if top is not None and top.dims:
-                    self._expand(path, e.type, off, out, max_leaves, max_array, None, depth + 1)
+                    self._expand(path, e.type, off, out, max_leaves, max_array, None, depth + 1, None, cancel)
                     return
                 m = T._RE_ARRAY.match(e.type)
                 elem_type = m.group(2).strip() if m else e.type
@@ -276,7 +317,8 @@ class TypeSystem:
             elem_size = e.size // count if count else 0
             if count > max_array:
                 out.append(Leaf(path, e.name if entry is None else f"ARRAY OF {elem_type}", off, e.size, e.data_type, None,
-                                f"array with {count} elements not expanded (limit {max_array}); read it directly"))
+                                f"array with {count} elements not expanded (limit {max_array}); read it directly",
+                                elements=count))
                 return
             # iterate multi-dim indices row-major
             idx = [lb for lb, _ in e.dims]
@@ -290,7 +332,7 @@ class TypeSystem:
                 coords.reverse()
                 sub_path = f"{path}[{','.join(str(c) for c in coords)}]"
                 self._expand(sub_path, elem_type, off + linear * elem_size, out, max_leaves, max_array, None, depth + 1,
-                             elem_size or None)
+                             elem_size or None, cancel)
                 if len(out) >= max_leaves:
                     return
             return
@@ -300,7 +342,7 @@ class TypeSystem:
                     continue
                 sub_entry = s if (s.subitems or s.dims) else None
                 self._expand(f"{path}.{s.name}", s.type, off + s.offs, out, max_leaves, max_array, sub_entry, depth + 1,
-                             s.size or None)
+                             s.size or None, cancel)
                 if len(out) >= max_leaves:
                     return
             return
@@ -311,7 +353,7 @@ class TypeSystem:
                 # scalar alias: keep the declared name (BOOL, T_MaxString), take the storage from the base type
                 out.append(Leaf(path, e.name, off, e.size or tgt.size, tgt.data_type or e.data_type, None))
                 return
-            self._expand(path, e.type, off, out, max_leaves, max_array, None, depth + 1)
+            self._expand(path, e.type, off, out, max_leaves, max_array, None, depth + 1, None, cancel)
             return
         out.append(Leaf(path, e.name if entry is None else e.type, off, e.size, e.data_type, e.enum or None))
 
@@ -340,7 +382,8 @@ class TypeSystem:
             if count <= 0:
                 return []
             if count > max_array:
-                return {"array_elements": count, "note": "not expanded", "raw_hex": buf[off:off + e.size].hex()[:512]}
+                return not_expanded_value(buf[off:off + HEAD_BYTES], e.size, count,
+                                          f"array with {count} elements (limit {max_array}); read it directly")
             elem_size = e.size // count
             flat = [self.decode_tree(buf, elem_type, off + i * elem_size, None, max_array, depth + 1, elem_size or None)
                     for i in range(count)]
@@ -357,9 +400,16 @@ class TypeSystem:
             return d
         if e.type and e.type.lower() != e.name.lower() and self.get(e.type) is not None and not e.enum:
             return self.decode_tree(buf, e.type, off, None, max_array, depth + 1)
+        if (e.size or 0) > MAX_LEAF_BYTES:
+            return not_expanded_value(buf[off:off + HEAD_BYTES], e.size, None, f"larger than {MAX_LEAF_BYTES} bytes")
         return self._decode_scalar(buf, off, e.name if entry is None else e.type, e, e.enum or None)
 
     def decode_leaf(self, buf: bytes, leaf: "Leaf") -> Any:
+        """The value of one leaf from buf (buf holds at least leaf.offset + leaf.need bytes)."""
+        if leaf.not_expanded:
+            reason = (f"array with {leaf.elements} elements (limit {MAX_ARRAY_ELEMENTS}); read it directly"
+                      if leaf.elements is not None else f"larger than {MAX_LEAF_BYTES} bytes")
+            return not_expanded_value(buf[leaf.offset:leaf.offset + HEAD_BYTES], leaf.size, leaf.elements, reason)
         e = self.get(leaf.type)
         if self.is_indirect(e, leaf.type) and leaf.size in (4, 8):
             return T.fmt_pointer(int.from_bytes(buf[leaf.offset:leaf.offset + leaf.size], "little"), leaf.size)

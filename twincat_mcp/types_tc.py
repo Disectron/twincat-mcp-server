@@ -155,14 +155,16 @@ def _fmt_ltime_ns(ns: int) -> str:
 
 
 def fmt_pointer(value: Any, size: int | None = 8) -> str | None:
-    """An address as the PLC shows it: 0x-hex of the full width, None for a null pointer/interface."""
+    """An address as the PLC shows it: 0x-hex of the full width. A NULL pointer / unassigned interface is the address
+    0 and prints as such (0x00000000 / 0x0000000000000000) — never None, which elsewhere means "no value" (an empty
+    cell, an unreadable leaf): N51. None only when there is no integer to format."""
     try:
         iv = int(value)
     except (TypeError, ValueError):
         return None
     width = (size or 8)
     iv &= (1 << (8 * width)) - 1          # a signed read of a high address must not print negative
-    return None if iv == 0 else f"0x{iv:0{2 * width}X}"
+    return f"0x{iv:0{2 * width}X}"
 
 
 def decode(tt: TcType, value: Any) -> Any:

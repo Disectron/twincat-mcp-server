@@ -233,7 +233,7 @@ def test_r42_dump_budget_order_streaming_and_no_rename_after_the_call_ended(ads,
     doc = json.loads(open(full["json"], encoding="utf-8").read())             # streamed root by root, still one JSON
     names = list(doc["values"])
     assert names[0].startswith("PRG_Test.") and doc["leaves"] == full["leaves"] and doc["truncated"] is False
-    assert doc["values"]["PRG_Test.pData"] is None                              # POINTER TO INT: the address (0)
+    assert doc["values"]["PRG_Test.pData"] == "0x0000000000000000"                # POINTER TO INT: the address 0 (N51), not null
     # one leaf budget for CSV and JSON: a cut dump names what is missing
     cut = ads.dump(None, False, str(out), max_leaves=5)
     assert cut["truncated"] and cut["leaves"] == 5 and cut["skipped_total"] >= 1 and "max_leaves 5" in cut["truncated_reason"]
@@ -285,3 +285,173 @@ def test_r42_review_dump_json_is_strict_for_nan_and_infinity():
     txt = _json_strict(v)
     assert "NaN" in txt and json.loads(txt, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c))) == \
         {"r": "NaN", "a": [1.5, "Infinity", "-Infinity"], "s": "x"}
+
+
+# ---------------------------------------------------------------------------------------------- 0.8.9 retest (dump)
+def _add_symbols(monkeypatch, symbols, types=()):
+    """Append symbols (name, type, size, raw bytes | callable(offset, n) | None) and datatype entries to the fake."""
+    from tests import fake_ads as F
+    from tests.fake_ads import encode_entry
+    monkeypatch.setattr(F, "SYMBOLS", F.SYMBOLS + [(n, t, sz, None, 0) for n, t, sz, _raw in symbols])
+    monkeypatch.setattr(F, "DATATYPES", F.DATATYPES + list(types))
+    monkeypatch.setattr(F, "DATATYPE_BLOB", b"".join(encode_entry(e) for e in F.DATATYPES))
+    monkeypatch.setattr(F, "RAW_IMAGES", {**F.RAW_IMAGES, **{n: raw for n, _t, _s, raw in symbols if raw is not None}})
+
+
+def _files(res):
+    import csv
+    import json
+    rows = list(csv.reader(open(res["csv"], encoding="utf-8", newline="")))
+    return rows, json.loads(open(res["json"], encoding="utf-8").read())
+
+
+def test_n39_n49_big_root_is_read_in_pieces_and_an_unreadable_root_is_named(ads, tmp_path, monkeypatch):
+    """N39: a 320 KB root was fetched in one ADS read → ADS 1802 'out of memory'. N49: such a root was only in
+    `errors` — not in skipped_roots, truncated false, neither file mentioned it."""
+    from tests.fake_ads import FakeConnection, _dt
+    blk = _dt("ST_Blk", "", 80, subs=[_dt("sName", "STRING(79)", 80, 0, 30)])
+    arr = _dt("ARRAY [1..4000] OF ST_Blk", "ST_Blk", 320_000, dims=[(1, 4000)])
+    s79 = _dt("STRING(79)", "", 80, dtype=30)
+    image = b"".join(f"blk{i}".encode().ljust(80, b"\x00") for i in range(1, 4001))
+    _add_symbols(monkeypatch, [("GVL_Bad.nX", "UDINT", 4, None), ("GVL_Big.aBlk", arr.name, 320_000, image)],
+                 [blk, arr, s79])
+    FakeConnection.max_read_bytes = 300_000                  # like the router: one huge request fails with 1802
+    FakeConnection.fail_reads = {"GVL_Bad.nX"}               # this one cannot be read at all
+    res = ads.dump("GVL_B*", False, str(tmp_path))
+    rows, doc = _files(res)
+    vals = {r[0]: r for r in rows[1:]}
+    # every element arrived, also the one that straddles the 256 KiB piece boundary (offset 262,080)
+    assert vals["GVL_Big.aBlk[3277].sName"][2] == "blk3277" and vals["GVL_Big.aBlk[4000].sName"][2] == "blk4000"
+    assert doc["values"]["GVL_Big.aBlk"][3276]["sName"] == "blk3277"
+    big_reads = [n for name, _off, n in FakeConnection.read_log if name == "GVL_Big.aBlk"]
+    assert len(big_reads) >= 2 and max(big_reads) <= 256 * 1024
+    # the unreadable root: result, JSON footer, JSON node and a CSV row all say so
+    assert res["complete"] is False and res["failed_roots"][0]["root"] == "GVL_Bad.nX" and "1802" in res["failed_roots"][0]["error"]
+    assert any(s["root"] == "GVL_Bad.nX" and s["reason"].startswith("not read") for s in res["skipped_roots"])
+    assert doc["complete"] is False and doc["failed_roots"][0]["root"] == "GVL_Bad.nX"
+    assert "_not_read" in doc["values"]["GVL_Bad.nX"]
+    assert vals["GVL_Bad.nX"][3].startswith("NOT READ") and vals["GVL_Bad.nX"][2] == ""
+
+
+def test_n47_budget_holds_per_row_and_a_huge_leaf_is_never_read_whole(ads, tmp_path, monkeypatch):
+    """N47: the budget was checked at root start and every 256 leaves → < 256 big rows, or one huge leaf (an 8 MiB
+    ring buffer) was read into RAM and written whole."""
+    from tests.fake_ads import FakeConnection, _dt
+    ring = _dt("ARRAY [0..8388607] OF BYTE", "BYTE", 8 * 1024 * 1024, dtype=17, dims=[(0, 8 * 1024 * 1024)])
+    names = _dt("ARRAY [1..200] OF STRING(255)", "STRING(255)", 200 * 256, dims=[(1, 200)])
+    s255 = _dt("STRING(255)", "", 256, dtype=30)
+    _add_symbols(monkeypatch, [("GVL_Ring.aBuf", ring.name, 8 * 1024 * 1024,
+                                lambda off, n: bytes((off + k) % 251 for k in range(n))),
+                               ("GVL_Str.aNames", names.name, 200 * 256, (b"x" * 255 + b"\x00") * 200)],
+                 [ring, names, s255])
+    res = ads.dump("GVL_Ring.*", False, str(tmp_path), max_total_bytes=256 * 1024)
+    assert res["csv_bytes"] + res["json_bytes"] < 4096 and res["bytes_read"] <= 64
+    assert sum(n for name, _o, n in FakeConnection.read_log if name == "GVL_Ring.aBuf") <= 64
+    small = ads.dump("GVL_Str.*", False, str(tmp_path / "s"), max_total_bytes=16 * 1024)
+    assert small["truncated"] and small["complete"] is False
+    assert small["csv_bytes"] + small["json_bytes"] < 16 * 1024 + 2 * 300        # at most one row past the limit
+
+
+def test_n48_a_value_that_is_not_expanded_is_the_same_in_csv_and_json(ads, tmp_path, monkeypatch):
+    """N48: JSON wrote raw_hex[:512] 'not expanded', CSV decoded the whole array (3.1 MB cell)."""
+    import json
+    import struct
+    from tests.fake_ads import _dt
+    arr = _dt("ARRAY [1..100000] OF UDINT", "UDINT", 400_000, dtype=19, dims=[(1, 100000)])
+    _add_symbols(monkeypatch, [("GVL_Q.aWords", arr.name, 400_000, struct.pack("<100000I", *range(100000)))], [arr])
+    res = ads.dump("GVL_Q.*", False, str(tmp_path))
+    rows, doc = _files(res)
+    row = next(r for r in rows if r[0] == "GVL_Q.aWords")
+    assert json.loads(row[2]) == doc["values"]["GVL_Q.aWords"]
+    m = doc["values"]["GVL_Q.aWords"]
+    assert m["elements"] == 100000 and m["bytes"] == 400_000 and m["head_hex"] == struct.pack("<16I", *range(16)).hex()
+    assert "not expanded" in row[3] and res["bytes_read"] < 1024             # only the head was read
+
+
+def test_n52_rename_is_both_or_neither_and_the_timeout_verdict_matches_the_files(ads, tmp_path, monkeypatch):
+    """N52: a failed second os.replace left the CSV renamed and was reported as an ADS error; a cancel arriving while
+    the files were being renamed left both files although the client was told nothing is kept."""
+    import os
+    import threading
+    from twincat_mcp.server import dump_timeout_message
+    real = os.replace
+    calls = []
+
+    def second_fails(a, b):
+        calls.append((a, b))
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real(a, b)
+    monkeypatch.setattr(os, "replace", second_fails)
+    with pytest.raises(AdsError, match="a file error, not an ADS error"):
+        ads.dump("MAIN.*", False, str(tmp_path / "a"))
+    assert sorted(p.name for p in (tmp_path / "a").iterdir()) == []            # neither file, no .partial
+    # the timeout fires while the dump is committing: it committed, and the verdict says the files were kept
+    ev = threading.Event()
+
+    def cancel_during_rename(a, b):
+        ev.set()
+        return real(a, b)
+    monkeypatch.setattr(os, "replace", cancel_during_rename)
+    res = ads.dump("MAIN.*", False, str(tmp_path / "b"), cancel=ev)
+    out = ads.dump_outcome()
+    assert out["phase"] == "done" and os.path.isfile(res["csv"]) and os.path.isfile(res["json"])
+    assert "WERE kept" in dump_timeout_message(out, 900) and res["csv"] in dump_timeout_message(out, 900)
+    # cancelled before the commit: nothing kept, and the verdict says so
+    monkeypatch.setattr(os, "replace", real)
+    ev2 = threading.Event()
+    realdump = ads._dump
+
+    def then_cancel(*a, **kw):
+        r = realdump(*a, **kw)
+        ev2.set()
+        return r
+    monkeypatch.setattr(ads, "_dump", then_cancel)
+    with pytest.raises(AdsError, match="cancelled"):
+        ads.dump("MAIN.*", False, str(tmp_path / "c"), cancel=ev2)
+    assert list((tmp_path / "c").iterdir()) == [] and "nothing is kept" in dump_timeout_message(ads.dump_outcome(), 900)
+
+
+def test_n53_sizes_are_utf8_bytes_in_mib(ads, tmp_path, monkeypatch):
+    """N53: csv_bytes counted characters; the limit is MiB but progress divided by 1e6."""
+    import os
+    from tests.fake_ads import _dt
+    s20 = _dt("STRING(20)", "", 21, dtype=30)
+    raw = "Grüße ok".encode("latin-1").ljust(21, b"\x00")
+    _add_symbols(monkeypatch, [("GVL_Txt.sName", "STRING(20)", 21, raw)], [s20])
+    res = ads.dump("GVL_Txt.*", False, str(tmp_path))
+    assert res["csv_bytes"] == os.path.getsize(res["csv"]) and res["json_bytes"] == os.path.getsize(res["json"])
+    assert res["limit_mib"] == 64 and "Grüße" in open(res["csv"], encoding="utf-8").read()
+
+
+def test_n54_without_a_project_the_order_is_not_guessed_from_names(ads, tmp_path, monkeypatch):
+    """N54: user GVLs named Param_*, Constants*, Global_Version* were ranked as library roots and dumped last."""
+    _add_symbols(monkeypatch, [("ConstantsUser.nY", "UDINT", 4, None), ("Param_Machine.nX", "UDINT", 4, None)])
+    res = ads.dump(None, False, str(tmp_path))
+    names = list(_files(res)[1]["values"])
+    assert names == sorted(names, key=str.lower) and names[0] == "ConstantsUser.nY"
+    assert "unknown" in res["order"]
+    own = ads.dump(None, False, str(tmp_path / "p"), own_roots={"param_machine"})
+    assert list(_files(own)[1]["values"])[0] == "Param_Machine.nX" and "own programs" in own["order"]
+
+
+def test_n55_a_cancel_stops_inside_a_root(ads, tmp_path, monkeypatch):
+    """N55: cancel was checked only between roots / every 2048 rows; one big root ran on after the timeout."""
+    import struct
+    import threading
+    from tests.fake_ads import _dt
+    from twincat_mcp import ads_backend as AB
+    ev = threading.Event()
+    arr = _dt("ARRAY [1..3000] OF UDINT", "UDINT", 12_000, dtype=19, dims=[(1, 3000)])
+    image = struct.pack("<3000I", *range(3000))
+
+    def first_read_times_out(off, n):
+        ev.set()                                   # the client's timeout fires while the root is being read
+        return image[off:off + n]
+    _add_symbols(monkeypatch, [("GVL_C.aVals", arr.name, 12_000, first_read_times_out)], [arr])
+    seen = []
+    real = AB._csv_val
+    monkeypatch.setattr(AB, "_csv_val", lambda v: seen.append(1) or real(v))
+    with pytest.raises(AdsError, match="cancelled"):
+        ads.dump("GVL_C.*", False, str(tmp_path), cancel=ev)
+    assert len(seen) < 300, len(seen)                 # stopped within the root, not after it
