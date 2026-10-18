@@ -1431,13 +1431,27 @@ class InfosysIndex:
                 "seconds": round(time.time() - t0, 1), "removed_books": gone, "source": self.source()}
 
     def index_complete(self) -> bool:
-        """The whole package is in the index, built by this indexer version."""
+        """The whole package is in the index, built by this indexer version. A reader (read-only, the server) asks
+        infosys_build.state — the one rule every reader uses; the writer (a build's own .building) asks its progress."""
         if self.local is None:
             return False
         try:
+            if self.read_only:
+                from . import infosys_build as B
+                return B.state(self.db_file, local=self.local)["state"] == "complete"
             return self.indexed_stamp() == self.local.content_stamp() and self._meta("indexer_version") == str(INDEXER_VERSION)
         except Exception:  # noqa: BLE001
             return False
+
+    def _not_indexed_hint(self) -> str:
+        """What to do when a lookup found nothing and the index may not hold everything."""
+        if self.local is None:
+            return "infosys_index(book=...) indexes a book first; infosys_books lists them"
+        if self.read_only:
+            note = self.index_note()
+            return ("the index is not complete" + (f" ({note})" if note else "") + " — a rebuild runs only once the "
+                    "user approves kb_rebuild(index='infosys')")
+        return "the package is still being indexed"
 
     def index_note(self) -> str | None:
         """Rule 6: what every answer from a read-only index says when that index is not the current one — an older
@@ -1449,7 +1463,7 @@ class InfosysIndex:
             st = B.state(self.db_file, local=self.local)
         except Exception as exc:  # noqa: BLE001
             return f"index state not readable: {exc}"
-        return None if st["state"] == "complete" and not st.get("rebuild") else st["message"]
+        return st["message"] if B.problem(st) else None
 
     def _meta(self, key: str) -> str | None:
         with self._db() as con:
@@ -1617,8 +1631,7 @@ class InfosysIndex:
                 complete = False
             res["hint"] = ((f"no code sample in the complete index contains {q!r}"                    # R20
                             + ("" if ignore_spacing else " — ignore_spacing=true also matches other spacing"))
-                           if complete else "code search covers indexed books only — infosys_index(book=...) first, "
-                           "or wait for the background index (tc_doctor → infosys)")
+                           if complete else "code search covers indexed pages only — " + self._not_indexed_hint())
         return res
 
     def code_languages(self) -> dict[str, int]:
@@ -1689,8 +1702,7 @@ class InfosysIndex:
                 complete = self.local is not None and self.index_complete()
                 raise InfosysError(f"no symbol page titled {s!r}" + (f" in {library}" if library else "") +
                                    (f"; near: {[it['name'] for it in found['items']]}" if found["items"] else
-                                    (" in the complete index" if complete else
-                                     "; index the library first (infosys_index) or check infosys_books")))
+                                    (" in the complete index" if complete else "; " + self._not_indexed_hint())))
             with self._db() as con:
                 row = con.execute("SELECT url, title, kind, library, decl FROM pages WHERE url = ?", (exact[0]["url"],)).fetchone()
             rows = [row]

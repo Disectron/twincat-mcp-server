@@ -1204,6 +1204,44 @@ async def test_r5_datatype_table_unavailable_names_config_mode(monkeypatch, proj
 
 
 @pytest.mark.anyio
+async def test_the_first_manuals_build_starts_by_itself_and_only_the_first(monkeypatch, project_dir, tmp_path):
+    """Rule 6: the first build of a missing index starts by itself — manuals too, when manuals\\ holds PDFs and the
+    server's Python reads PDFs; an index that exists (even outdated) is left to the user's approval."""
+    pytest.importorskip("pypdf")
+    pytest.importorskip("reportlab")
+    import importlib.util
+    import time as _t
+    from tests.fake_ads import install
+    install(monkeypatch)
+    spec = importlib.util.spec_from_file_location("mkfix_e2e", Path(__file__).parent / "fixtures" / "kb" / "make_fixtures.py")
+    mk = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mk)
+    kb = tmp_path / "kb"
+    (kb / "manuals" / "IPC").mkdir(parents=True)
+    mk.build_pdf(kb / "manuals" / "IPC" / "CX9020.pdf")
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    build_server(cfg)
+    db = kb / "index" / "manuals.db"
+    t0 = _t.time()
+    while _t.time() - t0 < 60 and not db.exists():
+        _t.sleep(0.1)
+    from twincat_mcp import kb_lock
+    while _t.time() - t0 < 60 and kb_lock.held(db.with_name(db.name + ".lock")):
+        _t.sleep(0.1)
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        st = payload(await s.call_tool("kb_status", {}))["docs"]["manuals"]
+        assert st["state"] == "complete" and st["manuals"] == 1, st
+    mk.build_pdf(kb / "manuals" / "IPC" / "CX9021.pdf")            # outdated now: not rebuilt by a start
+    before = db.stat().st_mtime_ns
+    build_server(cfg)
+    _t.sleep(1.5)
+    assert db.stat().st_mtime_ns == before and not kb_lock.held(db.with_name(db.name + ".lock"))
+
+
+@pytest.mark.anyio
 async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, project_dir, kb_copy):
     """Finding 2: the real state of the offline index is known at every (re)connection — in the instructions the
     server sends at initialize — and in tc_doctor; an interrupted rebuild is said up front, with the approval rule."""
@@ -1221,6 +1259,10 @@ async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, proje
     building.write_bytes(db.read_bytes())
     c = sqlite3.connect(building)
     c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [("state", "building"), ("pages_total", "51656")])
+    c.commit()
+    c.close()
+    c = sqlite3.connect(db)                                          # the index in use: an older format (approved
+    c.execute("UPDATE meta SET value = '3' WHERE key = 'indexer_version'")   # rebuild interrupted half-way)
     c.commit()
     c.close()
     srv = build_server(cfg)                                          # a reconnection = a new server process

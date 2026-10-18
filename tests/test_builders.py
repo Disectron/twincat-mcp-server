@@ -209,6 +209,75 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
     assert st["state"] == "complete" and st["pages"] == len(big) and "rebuild" not in st and not building.exists()
 
 
+def _as_building(db: Path, **meta: str) -> Path:
+    """A copy of an index as the build's work file, with meta changed (a build left behind)."""
+    import shutil
+    building = db.with_name(db.name + ".building")
+    shutil.copy(db, building)
+    c = sqlite3.connect(building)
+    c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", list(meta.items()))
+    c.commit()
+    c.close()
+    return building
+
+
+def test_an_interrupted_build_next_to_a_complete_index_is_neither_stuck_nor_nagging(kb, tmp_path):
+    """Review: an interrupted `index --force` with the package unchanged said 'INTERRUPTED — the next build resumes it'
+    forever, and `index` only printed 'up to date'. Now it is stale (the index in use is complete and current): not a
+    problem for any reader; a plain build discards it, `index --force` resumes it."""
+    pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
+    assert build(kb, pkg).returncode == 0
+    db = live(kb)
+    building = _as_building(db, state="building", target_stamp=sqlite3.connect(db).execute(
+        "SELECT value FROM meta WHERE key = 'source_stamp'").fetchone()[0])
+    sqlite3.connect(building).execute("DELETE FROM meta WHERE key = 'source_stamp'").connection.commit()
+    st = state(kb)
+    assert st["state"] == "complete" and st["rebuild"]["state"] == "stale", st
+    assert "complete and current" in st["message"] and "kb_rebuild" not in st["message"]
+    assert kbdocs(kb, "docs_books")["source"].get("state_note") is None            # answers carry no note
+    p = build(kb, pkg, "--force")
+    assert p.returncode == 0 and "resuming" in p.stdout and not building.exists(), p.stdout
+    building = _as_building(db, state="building")
+    p = build(kb, pkg)
+    assert "discarded" in p.stdout and "up to date" in p.stdout and not building.exists(), p.stdout
+    assert "rebuild" not in state(kb)
+
+
+def test_a_finished_build_of_another_package_is_never_said_to_be_swapped_in(kb, tmp_path):
+    """Review: a complete .building of another format or package read 'waiting to replace — swapped in at the next
+    server start', which no start or build would ever do. It is stale, and the next build discards it."""
+    pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
+    assert build(kb, pkg).returncode == 0
+    building = _as_building(live(kb), source_stamp="content:another-package", package_file="x|1|1")
+    st = state(kb)
+    assert st["rebuild"]["state"] == "stale" and "another format or package" in st["message"], st
+    building2 = _as_building(live(kb), indexer_version="3")
+    assert state(kb)["rebuild"]["state"] == "stale"
+    p = build(kb, pkg)
+    assert "discarded" in p.stdout and not building.exists() and not building2.exists()
+
+
+def test_a_reader_without_the_server_sees_a_replaced_package(kb, tmp_path):
+    """Review: after the Help Viewer package was replaced (old file deleted, a newer one in the same folder) the skill
+    and `stats` said complete while the server said outdated — two rules. One rule now: the newest package of the
+    catalogs and of the folder the index was built from; the same file unchanged is the same package, anything else is
+    decided by the content."""
+    folder = tmp_path / "EN-US"
+    folder.mkdir()
+    old = mshc(folder / "BKINFOSYS3_VS_100_EN-US.1.mshc", _fixture_pages())
+    assert build(kb, old).returncode == 0
+    assert state(kb)["state"] == "complete"
+    os.utime(old, (time.time() - 60, time.time() - 60))             # touched: the content decides — still the same
+    assert state(kb)["state"] == "complete"
+    old.unlink()
+    time.sleep(1.1)
+    mshc(folder / "BKINFOSYS3_VS_100_EN-US.2.mshc",
+         {**_fixture_pages(), "tcplclib_new/1033/1.html": "<html><article><h1>New</h1></article></html>"})
+    st = state(kb)
+    assert st["state"] == "outdated" and "EN-US.2.mshc" in st["reason"], st
+    assert kbdocs(kb, "docs_books")["source"]["state"] == "outdated"
+
+
 def test_finished_rebuild_waiting_to_replace_is_swapped_in(kb, tmp_path):
     pkg = mshc(tmp_path / "BKINFOSYS3_T_EN-US.mshc", _fixture_pages())
     assert build(kb, pkg).returncode == 0
@@ -319,12 +388,19 @@ def test_manuals_update_lock_state_and_doc_filter(tmp_path):
     before = (db.stat().st_ino, db.stat().st_mtime_ns)
     p = run("manuals_db.py", "update", "--kb", str(kb))
     assert p.returncode == 0 and p.stdout.startswith("up to date") and (db.stat().st_ino, db.stat().st_mtime_ns) == before
-    # a second update while one runs is refused
+    # a second update while one runs is refused — "runs" is the operating-system lock held, not a file that exists:
+    # an old lock file nobody holds blocks nothing
+    from twincat_mcp import kb_lock
     lock = kb / "index" / "manuals.db.lock"
-    lock.write_text("{}", encoding="utf-8")
-    p = run("manuals_db.py", "update", "--kb", str(kb))
-    assert p.returncode == 1 and "another update is running" in p.stderr
-    lock.unlink()
+    lock.write_text('{"pid": 1, "started": "long ago"}', encoding="utf-8")
+    os.utime(lock, (0, 0))
+    assert kbdocs(kb, "status")["manuals_state"].get("updating") is None
+    with kb_lock.IndexLock(lock) as lk:
+        lk.update(files_done=3, files_total=9)
+        assert kbdocs(kb, "status")["manuals_state"]["updating"]["state"] == "running"
+        p = run("manuals_db.py", "update", "--kb", str(kb))
+        assert p.returncode == 1 and "another update is running" in p.stderr, p.stderr
+    assert lock.read_text() == "" and kbdocs(kb, "status")["manuals_state"].get("updating") is None
     # a new PDF is reported before anyone runs update
     mod.build_pdf(kb / "manuals" / "IPC" / "CX9021.pdf")
     st = json.loads(run("manuals_db.py", "stats", "--json", "--kb", str(kb)).stdout)
@@ -372,6 +448,36 @@ def test_n37_running_headers_and_wrapped_headings(tmp_path):
                                 (1, "Appendix", 90), (2, "4.13 Settings and Parameterization", 63)]
     unnumbered = [(1, "Intro", 1), (1, "details", 1)]
     assert m._mend_toc(unnumbered) == unnumbered                       # only manuals that number their chapters
+
+
+@pytest.mark.parametrize("backend", ["pypdf", "pymupdf"])
+def test_n37_text_at_size_zero_is_dropped_and_an_ocr_text_layer_is_kept(tmp_path, backend):
+    """N37 (format 4): under each heading Beckhoff PDFs carry the running header again at font size 0 — not page text.
+    Invisible text of a real size is: a scanned manual's OCR layer (render mode 3; PyMuPDF reports alpha 0) is the only
+    text it has (review: an alpha-0 rule emptied such manuals with PyMuPDF and not with pypdf)."""
+    lib = pytest.importorskip(backend)
+    pytest.importorskip("reportlab")
+    from reportlab.pdfgen import canvas
+    pdf = tmp_path / "n37.pdf"
+    c = canvas.Canvas(str(pdf))
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(72, 760, "4.2.2 Signal flow diagram")
+    t = c.beginText(72, 760)
+    t.setFont("Helvetica", 0)
+    t.textLine("| Signal flow diagram")
+    c.drawText(t)
+    t = c.beginText(72, 700)
+    t.setFont("Helvetica", 11)
+    t.setTextRenderMode(3)
+    t.textLine("EL3356 OCR layer text")
+    c.drawText(t)
+    c.showPage()
+    c.save()
+    m = _manuals_module()
+    page = lib.PdfReader(str(pdf)).pages[0] if backend == "pypdf" else lib.open(str(pdf))[0]
+    spans, _h = (m._spans_pypdf if backend == "pypdf" else m._spans_pymupdf)(page)
+    texts = [sp.text.strip() for sp in spans]
+    assert texts == ["4.2.2 Signal flow diagram", "EL3356 OCR layer text"], texts
 
 
 def test_n37_pdf_running_header_removed_and_old_text_format_reread(tmp_path):
@@ -624,11 +730,12 @@ def test_finished_rebuild_is_running_while_its_builder_swaps_it_in(kb, tmp_path)
     db = live(kb)
     building, lock = db.with_name(db.name + ".building"), db.with_name(db.name + ".lock")
     shutil.copyfile(db, building)
-    lock.write_text(json.dumps({"pid": 1, "started": "now", "phase": "replacing the live index"}), encoding="utf-8")
-    st = state(kb)
-    assert st["rebuild"]["state"] == "running" and st["rebuild"]["phase"] == "replacing the live index", st
-    assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "running"
-    lock.unlink()                                          # the builder is gone: the finished file waits
-    st = state(kb)
+    from twincat_mcp import kb_lock
+    with kb_lock.IndexLock(lock) as lk:                    # a builder that holds the lock, putting the file in place
+        lk.update(phase="replacing the live index")
+        st = state(kb)
+        assert st["rebuild"]["state"] == "running" and st["rebuild"]["phase"] == "replacing the live index", st
+        assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "running"
+    st = state(kb)                                         # the builder is gone: the finished file waits
     assert st["rebuild"]["state"] == "waiting_to_replace" and "swapped in at the next server start" in st["message"], st
     assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "waiting_to_replace"

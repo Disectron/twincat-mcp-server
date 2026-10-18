@@ -610,7 +610,8 @@ class Knowledge:
         if loc is None:
             return {"summary": "no knowledge folder chosen yet (kb_set_location) — no offline documentation", "ok": False}
         inf, man, _b = _docs_parts(loc, getattr(self, "docs_local", None))
-        ok = inf.get("state") == "complete" and not inf.get("rebuild")
+        from . import infosys_build as IB
+        ok = not IB.problem(inf)
         out: dict[str, Any] = {"knowledge_folder": str(loc), "infosys": inf.get("message"), "manuals": man.get("message"),
                                "infosys_state": inf.get("state"), "manuals_state": man.get("state"), "ok": ok,
                                "infosys_rebuild": (inf.get("rebuild") or {}).get("state"),
@@ -1257,8 +1258,9 @@ _KBD: dict[str, Any] = {}
 
 
 def kb_docs_module() -> Any | None:
-    """The twincat-docs skill's kb_docs.py, loaded as a module: its index_state / manuals_state / overview are the one
-    implementation of the rules (the builders' `stats --json` give the same answer)."""
+    """The twincat-docs skill's kb_docs.py, loaded as a module: its manuals_state is the one implementation of the
+    manuals index's state (manuals_db.py `stats --json` gives the same answer); the Infosys index's state is
+    infosys_build.state, used by every reader directly."""
     p = docs_skill_path()
     if p is None:
         return None

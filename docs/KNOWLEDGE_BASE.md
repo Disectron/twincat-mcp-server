@@ -48,8 +48,10 @@ resolved to page addresses. Readers never repair stored data; a fix to what is s
 
 ## 5. Format contract
 
-- Every index records in its `meta` table: its format version, the stamp of the source it was built from, the
-  version of the plugin that built it, and its state.
+- Every index records its format version, what it was built from and who built it (builder and plugin version):
+  `infosys-<lcid>.db` the package's content stamp and file; `manuals.db` each PDF's path, size, modification time
+  and SHA-256; `knowledge.db` each ESI file's path and modification time (the ESI parser version is its format).
+  An index a build can leave half-done also records its state.
 - Adding a table or a column needs no new format version; changing or removing one does.
 - A test fingerprints the code that produces each format and fails when that code changes without a new format
   version (Infosys extraction, manuals text, ESI parser).
@@ -57,7 +59,11 @@ resolved to page addresses. Readers never repair stored data; a fix to what is s
 
 ## 6. Rebuilds
 
-- **The first build** of an index that does not exist yet starts by itself (there is nothing to keep).
+- **The first build** of an index that does not exist yet starts by itself (there is nothing to keep): Infosys at
+  server start or when a knowledge folder is chosen, manuals at server start when `manuals\` holds PDFs and the
+  server's Python can read them, ESI at the first `hw_lookup`.
+- **One build at a time**: a build holds an operating-system lock on `<index>.lock` for its whole life; the
+  operating system releases it however the build ends, so whether a build runs is known, never guessed.
 - **A new format, or a changed source** (a new Help Viewer package, new or changed PDFs, new ESI files): the index
   is reported as `rebuild_needed` / `outdated`, with the reason, in `kb_status`, `tc_doctor` and every
   documentation answer — and **stays in use as it is until Ryan approves the rebuild** (`kb_rebuild`, which asks
@@ -79,8 +85,9 @@ Files the plugin no longer reads (an old second index, an old copy left beside a
 
 What the plugin itself does replace, and nothing else:
 - an index, by its complete rebuild — the first build, or one Ryan approved (rule 6);
-- its own `<index>.building` and `<index>.lock`: a build resumes or replaces the `.building` of an interrupted
-  build, and the lock of a build that is gone;
+- its own `<index>.building`: a build resumes the `.building` of an interrupted build of the same format and
+  source, and discards one of another format or source (or one left next to a complete, current index);
+  `<index>.lock` stays (empty when no build runs);
 - a builder copy in `tools\` that the plugin shipped, by the stub (the old file is kept as `<name>.v<version>.bak`);
 - an index in an old place, moved into `index\` once (rule 1) — a rename, nothing is copied or lost.
 

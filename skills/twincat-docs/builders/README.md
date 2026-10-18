@@ -80,11 +80,11 @@ uses (English: `infosys-1033.db`).
 
 ### Index logic (`index`) — `twincat_mcp/infosys_build.py`
 
-1. **Locking.** One build at a time, through `<db>.lock`, created exclusively. It holds JSON (pid, start, phase,
-   `pages_done`, `pages_total`) — the progress the readers show; its modification time is the heartbeat, refreshed
-   every 15 s (also during long single steps such as the link pass and `fts optimize`). A lock whose heartbeat is
-   older than **120 s** belongs to a build that is gone and is taken over. A live lock makes the command stop with
-   `another build is running (pid …)`.
+1. **Locking.** One build at a time: an operating-system lock on `<db>.lock` (`twincat_mcp/kb_lock.py`; POSIX
+   `flock`, Windows `msvcrt.locking`), held for the life of the build and released by the operating system however
+   it ends. A second build stops with `another build is running (pid …)`; readers know a build runs by finding the
+   lock held — no heartbeat, no stale lock to take over. The file holds the progress as JSON (pid, start, phase,
+   `pages_done`, `pages_total`); it is never deleted and is empty when no build runs.
 2. **Finished build waiting.** If `<db>.building` is complete, of this format and of the current package, it is
    only swapped in (`replaced … with the build finished earlier`) without reading the package again.
 3. **Up to date.** The index is `complete` (section 4): the command prints `up to date` and stops. `--force` builds
@@ -143,9 +143,8 @@ python manuals_db.py stats --json
 
 ### Update logic (`update [--dir PATH] [--force]`)
 
-1. **Locking.** One update at a time through `<db>.lock` (`manuals.db.lock`). Heartbeat: the lock's modification time
-   (refreshed every 15 s by the running update) and `meta.heartbeat` (before each file). A lock silent for **300 s** is
-   taken over. A live lock makes the command stop.
+1. **Locking.** One update at a time: the same operating-system lock on `<db>.lock` (`manuals.db.lock`) as the
+   Infosys build. A second update stops; `stats` shows the running one.
 2. **A copy.** The update works on `<db>.building`, a copy of the index in use (SQLite backup); the index stays in
    use meanwhile. A `.building` left by an interrupted update is discarded first — the copy is taken again from the
    index in use, so the PDFs already in it are not read again.
@@ -260,7 +259,7 @@ at this connection (<kb>): …`), to `tc_doctor` (`offline_docs`) and to `kb_sta
 | `complete` | built by this format from the source that is here | nothing |
 | `rebuild_needed` | built by another format (a plugin update changed what is stored), or never finished | used as it is until the rebuild is approved |
 | `outdated` | the source changed: another Help Viewer package; PDFs added, changed or removed | used as it is until the rebuild is approved |
-| `missing` | no index file | Infosys: the server's first build starts by itself; manuals: `update` |
+| `missing` | no index file | the server's first build starts by itself (manuals: when `manuals\` holds PDFs and the server's Python reads PDFs); or `index` / `update` |
 
 A rebuild runs only when you run the command (`index`, `update`) or approve `kb_rebuild(index='infosys'|'manuals')`.
 
@@ -268,9 +267,10 @@ Build in progress (shown in addition to the state; `rebuild` for Infosys, `updat
 
 | state | meaning | what to do |
 |---|---|---|
-| `running` | a build is working; heartbeat younger than 120 s (manuals: 300 s) | wait; the live index stays in use |
-| `interrupted` | `<db>.building` exists, no heartbeat | the next `index` resumes it; the next `update` starts again from the index in use |
+| `running` | a build holds the lock | wait; the live index stays in use |
+| `interrupted` | `<db>.building` exists and no build holds the lock | the next `index` resumes it; the next `update` starts again from the index in use |
 | `waiting_to_replace` | Infosys: the finished build could not replace the live file (a reader had it open) | swapped in at the next server start or `index` |
+| `stale` | Infosys: a `.building` of another format or package, or one left next to a complete, current index | nothing — the next build discards it (`index --force` resumes a same-package one) |
 
 Infosys `stats` also shows the format, the package and the counts (`links`, `links_resolved`, `built_by`). Manuals
 `stats --json` lists:

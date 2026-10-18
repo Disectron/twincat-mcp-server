@@ -82,23 +82,34 @@ def migrate(kb: Path, lcids: tuple[str, ...] = (DEFAULT_LCID,)) -> list[dict[str
                                 "why": f"{new.name} already exists in index\\ — the old file is not used (delete it)"})
                     continue
                 new.parent.mkdir(parents=True, exist_ok=True)
-                moved: list[str] = []
-                try:
-                    os.rename(old, new)
-                    moved.append(old.name)
-                    for sfx in SIDECARS:
-                        side = old.with_name(old.name + sfx)
-                        if side.exists():
-                            try:
-                                os.rename(side, new.with_name(new.name + sfx))
-                                moved.append(side.name)
-                            except OSError:
-                                pass
-                    out.append({"index": kind, "from": str(old), "to": str(new), "state": "moved", "files": moved})
-                except OSError as exc:
-                    out.append({"index": kind, "from": str(old), "state": "in use",
-                                "why": f"not moved now ({exc.strerror or exc}); moved at a later start"})
+                out.append(_move_db(kind, old, new))
     return out
+
+
+def _move_db(kind: str, old: Path, new: Path) -> dict[str, Any]:
+    """One SQLite file with its side files, all or nothing: a WAL-mode database without its -wal loses its last
+    commits, so the side files go first and the main file last; any rename that fails puts back what was moved. No
+    destination may exist (os.rename replaces one on POSIX: checked before anything moves)."""
+    pairs = [(old.with_name(old.name + s), new.with_name(new.name + s)) for s in SIDECARS
+             if old.with_name(old.name + s).exists()] + [(old, new)]
+    there = [str(d) for _s, d in pairs if d.exists()]
+    if there:
+        return {"index": kind, "from": str(old), "state": "left",
+                "why": f"not moved: {', '.join(there)} already exists (nothing is moved over a file)"}
+    done: list[tuple[Path, Path]] = []
+    try:
+        for src, dst in pairs:
+            os.rename(src, dst)
+            done.append((src, dst))
+    except OSError as exc:
+        for src, dst in reversed(done):
+            try:
+                os.rename(dst, src)
+            except OSError:
+                pass
+        return {"index": kind, "from": str(old), "state": "in use",
+                "why": f"not moved now ({exc.strerror or exc}); moved at a later start"}
+    return {"index": kind, "from": str(old), "to": str(new), "state": "moved", "files": [s.name for s, _d in done]}
 
 
 def obsolete_files(kb: Path) -> list[dict[str, Any]]:

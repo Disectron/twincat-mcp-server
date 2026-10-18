@@ -60,7 +60,7 @@ PLUGIN_ROOT = HERE.parents[2]                 # <plugin>/skills/twincat-docs/bui
 if "twincat_mcp" not in sys.modules and (PLUGIN_ROOT / "twincat_mcp" / "infosys.py").is_file():
     sys.path.insert(0, str(PLUGIN_ROOT))
 try:
-    from twincat_mcp import helpviewer as HV, infosys_build as B, kb_layout as L  # noqa: E402
+    from twincat_mcp import __version__ as PLUGIN_VERSION, helpviewer as HV, infosys_build as B, kb_layout as L  # noqa: E402
 except ImportError:                 # a copy of this file outside the plugin folder: it needs the plugin beside it
     sys.exit("infosys_local.py runs from the twincat plugin's folder (it uses the plugin's twincat_mcp package and the "
              "twincat-docs skill beside it): run <kb>\\tools\\infosys_local.py (the stub, which finds the installed plugin) or "
@@ -90,7 +90,7 @@ def kb_root(arg: str | None) -> tuple[Path, str]:
 def db_path(args) -> Path:
     if args.db:
         return Path(args.db)
-    return L.index_file(kb_root(args.kb)[0], "infosys", LANGS[args.lang])
+    return L.locate(kb_root(args.kb)[0], "infosys", LANGS[args.lang])   # the file the readers read
 
 
 def cmd_index(args) -> int:
@@ -106,7 +106,7 @@ def cmd_index(args) -> int:
         return 1
     try:
         res = B.build(db_path(args), pk[0], lcid, force=args.force,
-                      built_by=args.built_by or f"{BUILDER} {BUILDER_VERSION}", log=lambda s: print(s, flush=True))
+                      built_by=args.built_by or f"{BUILDER} {BUILDER_VERSION} (twincat-mcp {PLUGIN_VERSION})", log=lambda s: print(s, flush=True))
     except (B.BuildError, HV.HelpViewerError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

@@ -2,29 +2,93 @@
 each format — it fails when that code changes without a new format version, so a change to what is stored can never
 reach an index silently (and an index of an older format is reported as needing a rebuild, never rebuilt unasked).
 
+What is fingerprinted is found, not listed: starting from the functions that write an index, every module-level
+function, class, method (self.x) and constant they reach — through any depth — is part of it (_closure). A helper or
+a table added to the path tomorrow is covered without editing this file. EXCLUDE names the few things on that path
+that decide nothing stored: connection handling, error types, the web sitemap parser.
+
 When one of these fails: the stored content changed. Bump the format named in the message (at most once per index per
 release, rule 6) and set the new fingerprint printed by the failure."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import inspect
+import re
 import sys
+import textwrap
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (4, "9e39afc8bf71b1c3")
-MANUALS_FINGERPRINT = ("4", "8d9ac4107c60f0d8")
-ESI_FINGERPRINT = (3, "5bc82867a5b9433d")
+INFOSYS_FINGERPRINT = (4, "8769f95d966b84f4")
+MANUALS_FINGERPRINT = ("4", "5039656cc9a5f9a2")
+ESI_FINGERPRINT = (3, "010bd7d7a6b1ea08")      # parser unchanged since 0.8.10 (version 3)
+
+EXCLUDE = frozenset({
+    "_db", "_Conn", "_file_sig", "_probe", "_writable", "missing_text", "ro_uri", "source", "has_fts", "_bump_gen",
+    "InfosysError", "HelpViewerError", "_sitemap_locs", "_sitemap_urlset",
+    "connect", "_meta",
+})
 
 
-def _digest(objs) -> str:
-    parts = [inspect.getsource(o) if not isinstance(o, str) else o for o in objs]
-    norm = ["\n".join(ln.rstrip() for ln in p.splitlines() if ln.strip() and not ln.strip().startswith("#"))
-            for p in parts]
-    return hashlib.sha256("\n\n".join(norm).encode()).hexdigest()[:16]
+def _closure(roots: list, modules: list) -> dict[str, str]:
+    """{name: source or constant} of everything the roots reach through module-level names of `modules` and the
+    methods of their own classes."""
+    mods = {m.__name__ for m in modules}
+    found: dict[str, str] = {}
+    todo = list(roots)
+
+    def owner(fn):
+        q = getattr(fn, "__qualname__", "")
+        cls = sys.modules[fn.__module__].__dict__.get(q.split(".")[0]) if "." in q else None
+        return cls if inspect.isclass(cls) else None
+
+    def value(name: str, val) -> None:
+        if name in EXCLUDE or isinstance(val, types.ModuleType):
+            return
+        if inspect.isfunction(val) or inspect.isclass(val):
+            if getattr(val, "__module__", None) in mods:
+                todo.append(val)
+        elif isinstance(val, re.Pattern):
+            found.setdefault(name, repr((val.pattern, val.flags)))
+        elif isinstance(val, (str, bytes, int, float, bool, tuple)):
+            found.setdefault(name, repr(val))
+        elif isinstance(val, (set, frozenset)):
+            found.setdefault(name, repr(sorted(map(repr, val))))
+        elif isinstance(val, dict):
+            found.setdefault(name, repr(sorted((repr(k), repr(v)) for k, v in val.items())))
+
+    while todo:
+        obj = todo.pop()
+        key = obj.__qualname__
+        if key in found or obj.__name__ in EXCLUDE:
+            continue
+        src = textwrap.dedent(inspect.getsource(obj))
+        found[key] = "\n".join(ln.rstrip() for ln in src.splitlines() if ln.strip() and not ln.strip().startswith("#"))
+        g = obj.__globals__ if inspect.isfunction(obj) else sys.modules[obj.__module__].__dict__
+        cls = owner(obj) if inspect.isfunction(obj) else None
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Name) and node.id in g:
+                value(node.id, g[node.id])
+            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                base = node.value.id
+                if base in ("self", "cls") and cls is not None and node.attr not in EXCLUDE:
+                    m = inspect.getattr_static(cls, node.attr, None)
+                    m = m.__func__ if isinstance(m, (staticmethod, classmethod)) else m
+                    m = m.fget if isinstance(m, property) else m
+                    if inspect.isfunction(m):
+                        todo.append(m)
+                elif base in g and isinstance(g[base], types.ModuleType) and g[base].__name__ in mods:
+                    value(node.attr, getattr(g[base], node.attr, None))
+    return found
+
+
+def _digest(found: dict[str, str]) -> str:
+    return hashlib.sha256("\n\n".join(f"{k}\n{v}" for k, v in sorted(found.items())).encode()).hexdigest()[:16]
 
 
 def _manuals_module():
@@ -36,36 +100,45 @@ def _manuals_module():
     return mod
 
 
-def test_infosys_format_tracks_the_extraction_code():
-    """Everything that decides what a page becomes in index\\infosys-<lcid>.db: the HTML walker, the link, cell and
-    declaration rules, what is stored and the help-link pass of the build."""
+def infosys_code() -> dict[str, str]:
+    """What a page of the local package becomes in index\\infosys-<lcid>.db: the package reader, the books chosen,
+    the HTML walker, links, cells, declarations, the help-link pass and the lookup tables."""
     from twincat_mcp import helpviewer as hv
     from twincat_mcp import infosys as inf
-    code = [inf._MdWalker, inf.html_to_doc, inf.HtmlDoc, inf._md_links, inf._plain, inf._first_href, inf.resolve_href,
-            inf._nobr, inf._mend_cell, inf._guess_lang, inf.parse_declaration, inf.classify, inf._parse_vars,
-            inf._descriptions, inf._table_kind, inf._member_tables, inf._type_refs, inf._library_from_tables,
-            inf._return_in_header, inf._tidy_declaration, inf._doc_version, inf._text_of, inf.InfosysIndex._store,
-            inf.InfosysIndex._fetch_doc, inf.InfosysIndex.resolve_help_links, hv.body_html, hv.page_meta,
-            inf._LINK.pattern, inf._STRAY.pattern, inf._PKG_REL.pattern, inf._XHELP.pattern, inf._TYPE_HEADER.pattern,
-            repr(sorted(inf._INVISIBLE.items())), repr(sorted(inf._CODE_SPACES.items())), repr(sorted(inf._IEC_WORDS))]
-    got = (inf.INDEXER_VERSION, _digest(code))
+    return _closure([inf.InfosysIndex.index_all, inf.InfosysIndex._store, inf.InfosysIndex.resolve_help_links,
+                     inf.InfosysIndex.sync_derived, inf.html_to_doc, inf.parse_declaration, inf.classify,
+                     hv.HelpViewerSource], [inf, hv])
+
+
+def test_infosys_format_tracks_the_extraction_code():
+    from twincat_mcp import infosys as inf
+    got = (inf.INDEXER_VERSION, _digest(infosys_code()))
     assert got == INFOSYS_FINGERPRINT, (
         f"Infosys extraction code changed: bump infosys.INDEXER_VERSION and set INFOSYS_FINGERPRINT = {got!r}")
 
 
 def test_manuals_text_format_tracks_the_text_code():
     m = _manuals_module()
-    code = [m.Span, m._visible, m._spans_pymupdf, m._spans_pypdf, m._running, m._page_text, m._open_pdf,
-            m._toc_from_fonts, m._first_title, m._join_wrapped, m._mend_toc, m._norm_line, m._page_number_like,
-            m._strip_running, m._clean, m._sections, m.index_pdf, m.PRODUCT_RE.pattern, m._NUM.pattern,
-            m._GLUED.pattern, m._TOC_NUM.pattern]
-    got = (m.TEXT_FORMAT, _digest(code))
+    got = (m.TEXT_FORMAT, _digest(_closure([m.index_pdf], [m])))
     assert got == MANUALS_FINGERPRINT, (
         f"manuals page text code changed: bump manuals_db.TEXT_FORMAT and set MANUALS_FINGERPRINT = {got!r}")
 
 
 def test_esi_parser_version_tracks_the_parser():
     from twincat_mcp import knowledge as K
-    got = (K.ESI_PARSER_VERSION, _digest([K._parse_esi, K._text, K._deep_text, K._kids, K._ln, K._hexint]))
+    got = (K.ESI_PARSER_VERSION, _digest(_closure([K._parse_esi], [K])))
     assert got == ESI_FINGERPRINT, (
         f"ESI parser changed: bump knowledge.ESI_PARSER_VERSION and set ESI_FINGERPRINT = {got!r}")
+
+
+def test_the_closure_reaches_what_decides_stored_content():
+    """Review: a fixed list missed _SKIP, _PREFIX_KIND, book selection … — changing any of them changes what is stored.
+    The closure must reach them (and a new helper on the path without anyone listing it)."""
+    found = infosys_code()
+    for name in ("_SKIP", "_PREFIX_KIND", "_BLOCK", "_HEAD_RE", "_SECTION_RE", "_VARLINE_RE", "_STRUCT_RE", "_ENUM_RE",
+                 "_IDENT", "_TABLE_MARK", "_VERSIONISH", "CODE_SEP", "_ident_matches", "book_of", "library_from_book",
+                 "InfosysIndex.book_allowed", "is_tc2_book", "TC2_BOOK_RES", "_MdWalker", "_type_refs",
+                 "InfosysIndex.sitemap", "HelpViewerSource"):
+        assert name in found, name
+    for name in EXCLUDE:
+        assert name not in found and f"InfosysIndex.{name}" not in found, name

@@ -162,7 +162,7 @@ folder has one fixed layout (0.8.11; the rules are `docs/KNOWLEDGE_BASE.md`):
 | in the knowledge folder | content | built by |
 |---|---|---|
 | `index\infosys-1033.db` | the TwinCAT 3 books of the Help Viewer package — the one Infosys index, read by the `infosys_*` tools and the skill | the plugin, the first time by itself; later `tools\infosys_local.py index` or `kb_rebuild(index='infosys')` |
-| `index\manuals.db` | the PDF manuals in `manuals\` — page text, chapters, product codes | `tools\manuals_db.py update` or `kb_rebuild(index='manuals')` (Python 3.12+ with pypdf or PyMuPDF) |
+| `index\manuals.db` | the PDF manuals in `manuals\` — page text, chapters, product codes | the plugin, the first time by itself; later `tools\manuals_db.py update` or `kb_rebuild(index='manuals')` (Python 3.12+ with pypdf or PyMuPDF) |
 | `index\knowledge.db` | projects for `kb_search`, ESI devices for `hw_lookup` | the `kb_*` tools; the ESI part the first `hw_lookup`, later `kb_rebuild(index='esi')` |
 | `manuals\`, `sop\` | your PDFs and SOPs (Markdown) | you — the plugin never writes there |
 | `tools\` | builder stubs that run the plugin's builders | the plugin (only files it shipped are replaced) |

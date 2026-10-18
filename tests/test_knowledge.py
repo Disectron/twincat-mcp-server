@@ -312,8 +312,9 @@ def test_status_reports_the_offline_documentation_layout(kb, kb_fixture):
     assert (loc / "tools" / f"manuals_db.py.v{K._builder_version(K.builders_dir() / 'manuals_db.py')}.bak").is_file()
     assert d["sop"] == [str(Path("sop") / "scope" / "SOP-scope-display.md")]
     # read-only: nothing next to the indexes was created (kb_set_location wrote index\\README.md and knowledge.db)
-    assert sorted(p.name for p in (loc / "index").iterdir()) == ["README.md", "infosys-1033.db", "knowledge.db",
-                                                                 "manuals.db"]
+    assert sorted(p.name for p in (loc / "index").iterdir()) == ["README.md", "infosys-1033.db", "infosys-1033.db.lock",
+                                                                 "knowledge.db", "manuals.db", "manuals.db.lock"]
+    assert (loc / "index" / "manuals.db.lock").read_text() == ""          # the builds' locks: kept, empty
     assert k.status()["layout"]["index"] == str(loc / "index") and "obsolete_files" not in k.status()["layout"]
     assert K.docs_skill_path().is_file()
 

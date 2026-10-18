@@ -250,7 +250,8 @@ async def test_kb_rebuild_only_with_approval_and_a_server_start_never_rebuilds(m
         st = d["state"]
         assert st["state"] == "rebuild_needed" and "rebuild" not in st and "started_here" not in st, st
         assert "kb_rebuild(index='infosys')" in st["message"]
-        assert not live.with_name(live.name + ".building").exists() and not live.with_name(live.name + ".lock").exists()
+        from twincat_mcp import kb_lock
+        assert not live.with_name(live.name + ".building").exists() and not kb_lock.held(live.with_name(live.name + ".lock"))
         p = payload(await s.call_tool("infosys_get_page", {"ref": F.ADSREAD, "max_chars": 300}))
         assert p["title"] == "ADSREAD"                       # in use as it is
         r = payload(await s.call_tool("kb_rebuild", {"index": "infosys", "confirm_token": await token(s)}))
@@ -259,6 +260,47 @@ async def test_kb_rebuild_only_with_approval_and_a_server_start_never_rebuilds(m
         assert st["format"] == inf.INDEXER_VERSION and st["built_by"].startswith("twincat-mcp ")
         log = (tmp_path / "home").rglob("infosys-build.log")
         assert any("rebuild:" in f.read_text(encoding="utf-8") for f in log)
+
+
+@pytest.mark.anyio
+async def test_the_index_follows_the_knowledge_folder_chosen_while_the_server_runs(monkeypatch, tmp_path, pkg):
+    """Review: with the folder chosen after the start, the server kept reading and building its own-folder index until
+    a restart (and an index whose move into index\\ waited was read at one path and built at another). One path for
+    reading and building, set again when the folder is chosen; a folder without an index gets its first build."""
+    from tests.test_server_e2e import client_for, payload
+    from twincat_mcp import infosys as inf
+    from twincat_mcp.config import Config, validate
+    from twincat_mcp.server import build_server
+
+    monkeypatch.setattr(inf, "Fetcher", lambda *a, **k: NoNetwork())
+    cfg = Config()
+    cfg.docs.mshc = str(pkg)
+    cfg.docs.cache_dir = str(tmp_path / "docs")
+    validate(cfg)
+
+    async def until_complete(s) -> dict:
+        st: dict = {}
+        for _ in range(600):
+            st = payload(await s.call_tool("tc_doctor", {}))["infosys"]["state"]
+            if st["state"] == "complete" and not st.get("rebuild"):
+                return st
+            await anyio.sleep(0.05)
+        raise AssertionError(st)
+
+    async with client_for(build_server(cfg)) as s:
+        st = await until_complete(s)
+        assert Path(st["database"]) == tmp_path / "docs" / "helpviewer-1033" / "index.sqlite"
+        kb = tmp_path / "kb"
+        kb.mkdir()
+        r = payload(await s.call_tool("kb_set_location", {"path": str(kb)}))
+        assert r["infosys_index"]["infosys_index"] == str(kb / "index" / "infosys-1033.db")
+        assert r["infosys_index"]["first_build"]["started"], r["infosys_index"]
+        st = await until_complete(s)
+        assert Path(st["database"]) == kb / "index" / "infosys-1033.db"
+        d = payload(await s.call_tool("tc_doctor", {}))["infosys"]
+        assert d["index"] == str(kb / "index" / "infosys-1033.db")
+        p = payload(await s.call_tool("infosys_get_page", {"ref": F.ADSREAD, "max_chars": 300}))
+        assert p["title"] == "ADSREAD" and "index_note" not in p
 
 
 @pytest.mark.anyio

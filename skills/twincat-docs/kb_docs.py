@@ -55,6 +55,7 @@ if "twincat_mcp" not in sys.modules and (_PLUGIN / "twincat_mcp" / "kb_layout.py
     sys.path.insert(0, str(_PLUGIN))
 from twincat_mcp import infosys_build as IB  # noqa: E402 — the index's state: one implementation for every reader
 from twincat_mcp import kb_layout as L  # noqa: E402 — where everything is: one place
+from twincat_mcp import kb_lock as KL  # noqa: E402 — whether a build runs: the OS lock, never a guess
 BUILD_INFOSYS = (f'<Python 3.12+> "{BUILDERS / "infosys_local.py"}" index --kb "<kb>"   (reads the Help Viewer package '
                  "BKINFOSYS3*.mshc with the plugin's extractor; or approve kb_rebuild(index='infosys') in the twincat "
                  "server)")
@@ -226,8 +227,8 @@ def ro_uri(db: Path) -> str:
 # The Infosys index: twincat_mcp.infosys_build.state — the one implementation (the server's kb_status / tc_doctor, the
 # instructions it sends at every (re)connection, the builder's `stats` and every answer here use it). The manuals
 # index: manuals_state below (the builder's `stats --json` gives the same answer). Both follow the rules: a rebuild
-# writes <db>.building and replaces the index only when complete, so the live file is always a whole index.
-MANUALS_HEARTBEAT_STALE_S = 300
+# writes <db>.building and replaces the index only when complete, so the live file is always a whole index; a running
+# build holds an operating-system lock on <db>.lock (twincat_mcp.kb_lock).
 
 
 def _builder_text_format() -> str:
@@ -268,14 +269,11 @@ def manuals_state(db: Path, folder: Path) -> dict[str, Any]:
     out["pdfs_in_folder"] = len(on_disk)
     building, lock = db.with_name(db.name + ".building"), db.with_name(db.name + ".lock")
     upd: dict[str, Any] | None = None
-    if building.is_file() or lock.is_file():
+    alive = KL.held(lock)
+    if alive or building.is_file():
         bm = _meta_of(building)
-        beat = lock.stat().st_mtime if lock.is_file() else None
-        alive = beat is not None and time.time() - beat < MANUALS_HEARTBEAT_STALE_S
         upd = {"state": "running" if alive else "interrupted", "files_done": int(bm.get("files_done") or 0),
                "files_total": int(bm.get("files_total") or 0)}
-        if not alive and not building.is_file():
-            upd = None
     if not db.is_file():
         out["state"] = "missing"
         out["message"] = (f"no manuals index yet ({len(on_disk)} PDFs in the folder) — tools\\manuals_db.py update, or "
@@ -401,7 +399,7 @@ class Ctx:
             src = {"database": str(self.path(which)), "manuals": n, "pages": pages}
             st = manuals_state(self.path(which), self.kb / "manuals")
         src["state"] = st["state"]
-        if st["state"] != "complete" or st.get("rebuild") or st.get("updating"):
+        if (IB.problem(st) if which == "infosys" else st["state"] != "complete" or st.get("updating")):
             src["state_note"] = st["message"]          # the answer comes from this index — say what it is
         self._src[which] = src
         return src

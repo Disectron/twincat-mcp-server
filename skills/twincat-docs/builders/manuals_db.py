@@ -60,10 +60,10 @@ import argparse  # noqa: E402 — after the version check on purpose
 import fnmatch  # noqa: E402
 import hashlib  # noqa: E402
 import json  # noqa: E402
+import math  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import sqlite3  # noqa: E402
-import threading  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -72,7 +72,7 @@ PLUGIN_ROOT = HERE.parents[2]                 # <plugin>/skills/twincat-docs/bui
 if "twincat_mcp" not in sys.modules and (PLUGIN_ROOT / "twincat_mcp" / "kb_layout.py").is_file():
     sys.path.insert(0, str(PLUGIN_ROOT))
 try:
-    from twincat_mcp import kb_layout as L  # noqa: E402
+    from twincat_mcp import __version__ as PLUGIN_VERSION, kb_layout as L, kb_lock as L_lock  # noqa: E402
 except ImportError:                 # a copy of this file outside the plugin folder: it needs the plugin beside it
     sys.exit("manuals_db.py runs from the twincat plugin's folder (it uses the plugin's twincat_mcp package and the "
              "twincat-docs skill beside it): run <kb>\\tools\\manuals_db.py (the stub, which finds the installed plugin) or "
@@ -80,12 +80,11 @@ except ImportError:                 # a copy of this file outside the plugin fol
 
 BUILDER = "manuals_db.py"
 BUILDER_VERSION = "5"
-TEXT_FORMAT = "4"                # page text / toc rules; 4: invisible text (size 0, alpha 0) is not page text (N37).
+TEXT_FORMAT = "4"                # page text / toc rules; 4: text set at font size 0 is not page text (N37).
                                  # An index of another format stays in use, reported 'rebuild_needed', until `update`
                                  # (or kb_rebuild('manuals')) reads every manual again. tests/test_formats.py fingerprints
                                  # the code that makes the text and fails when it changes without a new format
 FALLBACK_KB = Path(r"D:\TwinCAT-MCP\knowledge")
-HEARTBEAT_STALE_S = 300          # one large PDF can take a while: an update silent for this long is gone
 
 
 def kb_root(arg: str | None) -> tuple[Path, str]:
@@ -143,16 +142,15 @@ class Span:
         self.blank = not text.strip()     # a space in its own font run: part of the text, not of the layout
 
 
-def _visible(size, alpha) -> bool:
-    """N37 (format 4): Beckhoff PDFs carry invisible text — under every heading a copy of the running header at font
-    size 0 ('4.2.2 Signal flow diagram' + '| Signal flow diagram' at 0.0 pt), which doubled headings and TOC titles.
-    The page text is what is drawn: text of size 0 draws nothing, fully transparent text (alpha 0) nothing visible."""
+def _visible(size) -> bool:
+    """N37 (format 4): Beckhoff PDFs carry under every heading a copy of the running header at font size 0
+    ('4.2.2 Signal flow diagram' + '| Signal flow diagram' at 0.0 pt), which doubled headings and TOC titles. Text set
+    at size 0 is not page text. Invisible text of a real size stays: it is how a scanned PDF carries its OCR text
+    layer (render mode 3 — PyMuPDF reports it with alpha 0), the only text such a manual has."""
     try:
-        if size is not None and float(size) <= 0:
-            return False
+        return size is None or float(size) > 0
     except (TypeError, ValueError):
-        pass
-    return alpha is None or alpha != 0
+        return True
 
 
 def _spans_pymupdf(page) -> tuple[list[Span], float]:
@@ -160,7 +158,7 @@ def _spans_pymupdf(page) -> tuple[list[Span], float]:
     for bi, b in enumerate(page.get_text("dict").get("blocks", [])):
         for li, ln in enumerate(b.get("lines", [])):
             for s in ln.get("spans", []):
-                if not s["text"] or not _visible(s.get("size"), s.get("alpha")):
+                if not s["text"] or not _visible(s.get("size")):
                     continue
                 # a whitespace-only span is kept: a space set in another font than the words around it ('bold
                 # regular-space bold') is the only space between them — dropping it glued 'Note that' into 'Notethat'.
@@ -182,14 +180,16 @@ def _spans_pypdf(page) -> tuple[list[Span], float]:
             return
         y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
         x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
-        scale = abs(tm[3] * cm[3]) or abs(tm[0] * cm[0]) or 1.0
-        if not _visible(float(font_size or 0) * scale, None):
+        # the drawn size: the font size times the length of the text space's vertical unit in device space (any
+        # rotation; a matrix that collapses it draws nothing — size 0, N37)
+        size = float(font_size or 0) * math.hypot(tm[2] * cm[0] + tm[3] * cm[2], tm[2] * cm[1] + tm[3] * cm[3])
+        if not _visible(size):
             return
         try:
             base = str(font_dict.get("/BaseFont", "")) if font_dict is not None else ""
         except Exception:  # noqa: BLE001
             base = ""
-        out.append(Span(round(height - y, 1), round(x, 1), round(float(font_size or 0) * scale, 1),
+        out.append(Span(round(height - y, 1), round(x, 1), round(size, 1),
                         "bold" in base.lower(), text, (len(out),)))
     page.extract_text(visitor_text=visit)
     return out, height
@@ -611,44 +611,23 @@ def index_pdf(con, path: Path, sha: str) -> dict:
             "running_spans": running}
 
 
-class UpdateLock:
-    """One update at a time: <db>.lock created exclusively; a lock silent for HEARTBEAT_STALE_S is taken over."""
+class UpdateLock(L_lock.IndexLock):
+    """One update at a time: an operating-system lock on <db>.lock (twincat_mcp.kb_lock), held for the life of the
+    update and released by the OS however the process ends — a running update is known, never guessed."""
 
     def __init__(self, db: Path):
-        self.path = db.with_name(db.name + ".lock")
+        super().__init__(db.with_name(db.name + ".lock"))
 
     def __enter__(self) -> "UpdateLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        for _ in range(2):
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(json.dumps({"pid": os.getpid(), "started": time.strftime("%Y-%m-%d %H:%M:%S")}))
-                self._stop = threading.Event()
-                threading.Thread(target=self._beat_loop, name="heartbeat", daemon=True).start()
-                return self
-            except FileExistsError:
-                age = time.time() - self.path.stat().st_mtime
-                if age < HEARTBEAT_STALE_S:
-                    sys.exit(f"another update is running (last progress {age:.0f} s ago) — wait for it; `stats` shows it")
-                self.path.unlink(missing_ok=True)
-        sys.exit(f"cannot take the update lock {self.path}")
+        try:
+            super().__enter__()
+        except L_lock.Held as h:
+            sys.exit(f"another update is running (pid {h.info.get('pid')}, started {h.info.get('started')}) — wait for "
+                     "it; `stats` shows it")
+        return self
 
     def beat(self) -> None:
-        try:
-            os.utime(self.path)
-        except OSError:
-            pass
-
-    def _beat_loop(self) -> None:
-        # the heartbeat runs on its own: long single steps (fts optimize, link resolution, one huge PDF) must not
-        # make a live build look abandoned to a second run
-        while not self._stop.wait(15):
-            self.beat()
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        self.path.unlink(missing_ok=True)
+        self.update(beat=time.strftime("%H:%M:%S"))
 
 
 def _meta(con, **kv) -> None:
@@ -671,11 +650,12 @@ def _replace(src: Path, dst: Path, wait_s: float = 60.0) -> bool:
 
 def cmd_update(args) -> None:
     folder = _dir(args)
-    folder.mkdir(parents=True, exist_ok=True)
+    if not folder.is_dir():                             # the user's folder: read, never created or written (rule 1)
+        sys.exit(f"no manuals folder {folder} — copy the PDF manuals there (sub-folders allowed), then run update")
     if not args.db:
         for m in L.migrate(kb_root(args.kb)[0]):         # the layout of docs/KNOWLEDGE_BASE.md, once
             print(f"layout: {m['from']} → {m.get('to') or m['state']} ({m.get('why') or m['state']})")
-    db = _db(args) if args.db else L.index_file(kb_root(args.kb)[0], "manuals")
+    db = _db(args)                                       # the file the readers read (L.locate)
     building = db.with_name(db.name + ".building")
     if db.is_file() and not args.force:
         st = manuals_state(db, folder)
@@ -710,7 +690,7 @@ def _update(args, folder: Path, db: Path, lock: "UpdateLock") -> None:
               "(running headers/footers removed, wrapped headings joined)")
     added = changed = unchanged = removed = failed = 0
     _meta(con, state="updating", pid=os.getpid(), started=time.strftime("%Y-%m-%d %H:%M:%S"), files_total=len(found),
-          files_done=0, heartbeat=f"{time.time():.0f}", folder=str(folder), builder=f"{BUILDER} {BUILDER_VERSION}")
+          files_done=0, heartbeat=f"{time.time():.0f}", folder=str(folder), builder=f"{BUILDER} {BUILDER_VERSION} (twincat-mcp {PLUGIN_VERSION})")
     for path_s in sorted(set(known) - set(found)):
         _drop(con, known[path_s]["id"]); removed += 1
         print(f"removed  {Path(path_s).name}")

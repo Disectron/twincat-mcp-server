@@ -337,14 +337,7 @@ class App:
                             f"found under {where}. Install the TwinCAT documentation for the Help Viewer, set "
                             "[docs] mshc = '<path to the .mshc>', or docs.source = 'web' to use infosys.beckhoff.com.")
                     local = HV.HelpViewerSource(pk[0])
-                    # ONE index of the package (docs/KNOWLEDGE_BASE.md): <kb>\index\infosys-<lcid>.db, built as a whole
-                    # by infosys_build and only read here; without a knowledge folder, in the server's own folder
-                    kb_dir = self.kb.location()[0]
-                    if kb_dir is not None:
-                        db_file = L.locate(kb_dir, "infosys", local.lcid)
-                        self.docs_build_target = L.index_file(kb_dir, "infosys", local.lcid)
-                    else:
-                        db_file = self.docs_build_target = Path(cache) / f"helpviewer-{local.lcid}" / "index.sqlite"
+                    db_file = self.docs_target(local)
                     IB.prepare_for_readers(db_file)
                     self.kb.docs_local = local
                 self.docs = InfosysIndex(cache, books=cfg.docs.books, exclude_books=cfg.docs.exclude_books,
@@ -375,6 +368,36 @@ class App:
             self.docs_warm = {"state": "failed", "error": str(exc)[:160]}
 
     # --- the Infosys index of the local package (docs/KNOWLEDGE_BASE.md rule 6) ---------------------------------
+    def docs_target(self, local: Any) -> Path:
+        """ONE file for the local package's index, read and built at the same place: <kb>\\index\\infosys-<lcid>.db —
+        or, while its move into index\\ waits (the old file was in use), the old file itself; without a knowledge
+        folder, the server's own folder. Sets docs_build_target."""
+        from . import kb_layout as L
+        kb_dir = self.kb.location()[0]
+        if kb_dir is not None:
+            self.docs_build_target = L.locate(kb_dir, "infosys", local.lcid)
+        else:
+            self.docs_build_target = Path(self.cfg.docs.cache_dir) / f"helpviewer-{local.lcid}" / "index.sqlite"
+        return self.docs_build_target
+
+    def docs_retarget(self) -> dict[str, Any] | None:
+        """After kb_set_location: the index moves with the knowledge folder — read (and built) from the new folder at
+        once; a folder without one gets its first build (rule 6). None when there is no local package."""
+        if self.docs is None or self.docs.local is None:
+            return None
+        from . import infosys_build as IB
+        before = self.docs.db_file
+        target = self.docs_target(self.docs.local)
+        if target == before:
+            return None
+        IB.prepare_for_readers(target)
+        self.docs.db_file = target
+        self.docs._probed_sig = None
+        out: dict[str, Any] = {"infosys_index": str(target), "was": str(before)}
+        if not target.is_file():
+            out["first_build"] = self.spawn_infosys_build(first=True)
+        return out
+
     def infosys_upkeep(self) -> dict[str, Any]:
         """At start: a finished build that could not be swapped in (an approved one, or the first) is swapped in; the
         FIRST build of an index that does not exist yet starts by itself. An index that exists is never rebuilt
@@ -385,8 +408,6 @@ class App:
         done = IB.finish_pending(self.docs_build_target, self.docs.local)
         if done:
             out["finished_pending"] = done
-            if done.get("replaced") and self.docs.db_file != self.docs_build_target:
-                self.docs.db_file = self.docs_build_target
             self.docs._probe()
         if not self.docs.db_file.is_file():
             out["first_build"] = self.spawn_infosys_build(first=True)
@@ -407,8 +428,9 @@ class App:
         st = IB.state(target, local=self.docs.local)
         if (st.get("rebuild") or {}).get("state") == "running":
             return {"started": False, "already_running": st["rebuild"], "message": st["message"]}
-        if st["state"] == "complete" and not force:
+        if st["state"] == "complete" and not force and not st.get("rebuild"):
             return {"started": False, "up_to_date": True, "message": st["message"]}
+        # a build left behind (interrupted, finished but not swapped in, stale) is the builder's to finish or discard
         logs = Path(self.cfg.safety.audit_log).parent / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         log_file = logs / "infosys-build.log"
@@ -472,7 +494,25 @@ class App:
         return {"started": True, "pid": p.pid, "log": str(log_file),
                 "note": "the current manuals index stays in use until the update is complete; kb_status shows it"}
 
+    def manuals_first_build(self) -> dict[str, Any] | None:
+        """Rule 6: the first build of a manuals index that does not exist yet starts by itself — when the knowledge
+        folder has PDFs in manuals\\ and this server's Python can read them. An index that exists is left to the user's
+        approval. None when there is nothing to do."""
+        from . import kb_layout as L
+        loc = self.kb.location()[0]
+        if loc is None or not (loc / "manuals").is_dir() or L.locate(loc, "manuals").exists():
+            return None
+        if not any(p.suffix.lower() == ".pdf" for p in (loc / "manuals").rglob("*")):
+            return None
+        return self.spawn_manuals_update()
+
     def _builder_upkeep(self) -> None:
+        try:
+            first = self.manuals_first_build()
+            if first:
+                log.info("manuals index: first build %s", "started" if first.get("started") else first)
+        except Exception as exc:  # noqa: BLE001 — a convenience; kb_status shows the state either way
+            log.warning("manuals first build: %s", exc)
         res = self.kb.builder_upkeep(__version__)
         for n, v in (res.get("tools") or {}).items():
             if isinstance(v, dict) and v.get("state") == "replaced":
@@ -1459,7 +1499,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             ds = await asyncio.to_thread(app.kb.docs_status)
             rep["offline_docs"] = ds
             # an index that exists but is not the current one, or a build, is worth a line; no folder is not
-            if ds.get("infosys_state") in ("outdated", "rebuild_needed") or ds.get("infosys_rebuild"):
+            if ds.get("infosys_state") in ("outdated", "rebuild_needed") or ds.get("infosys_rebuild") in (
+                    "running", "interrupted", "waiting_to_replace"):
                 infos.append("offline docs: Infosys index " + ds["infosys"])
             if ds.get("manuals_state") in ("outdated", "rebuild_needed"):
                 infos.append("offline docs: manuals index " + ds["manuals"])
@@ -1627,6 +1668,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         writable, >= 1 GB free — a failing condition is named and nothing is changed. An existing database is never
         moved or deleted. Without arguments it returns the current location (and changes nothing)."""
         res = await app.kb_call(app.kb.set_location, path, use_fallback)
+        moved = await asyncio.to_thread(app.docs_retarget)
+        if moved:
+            res["infosys_index"] = moved
         app.audit("kb_set_location", {"path": path, "use_fallback": use_fallback}, OpClass.EDIT, "ok", res)
         return res
 
