@@ -24,16 +24,21 @@ async def test_acceptance_runs_against_fakes(monkeypatch, project_dir, tmp_path)
     from tests.fake_ads import FakeConnection
     stop = asyncio.Event()
 
+    import time as _time
+    c = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"
+    t0 = int(_time.time() * 1e7) + 116444736000000000
+
     async def pump():
+        # a 10 ms task with its own clock: every step is exactly 5 cycles and 50 ms of PLC time, whatever the host's
+        # sleep jitter (Windows: ~15.6 ms) — the counter, its timestamps and the other symbols agree (D29, rec_verify)
         i = 0
         while not stop.is_set():
             i += 1
-            FakeConnection.broadcast("MAIN.nCycle", 42 + (i % 3))
-            FakeConnection.broadcast("MAIN.bStart", bool(i % 2))
-            # the task's cycle counter (10 ms task, 5 cycles per 50 ms) — aligned profiles start on it (D29)
-            c = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"
-            FakeConnection.shared_values[c] = FakeConnection.shared_values.get(c, 123456) + 5
-            FakeConnection.broadcast(c, FakeConnection.shared_values[c])
+            ts = t0 + i * 500_000
+            FakeConnection.broadcast("MAIN.nCycle", 42 + (i % 3), ts)
+            FakeConnection.broadcast("MAIN.bStart", bool(i % 2), ts)
+            FakeConnection.shared_values[c] = 123456 + 5 * i
+            FakeConnection.broadcast(c, FakeConnection.shared_values[c], ts)
             await asyncio.sleep(0.05)
     task = asyncio.create_task(pump())
     try:

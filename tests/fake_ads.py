@@ -228,10 +228,11 @@ class FakeConnection:
         FakeConnection.broadcast(name, value)
 
     @classmethod
-    def broadcast(cls, name, value):
-        """Deliver change notifications on every connection that subscribed to `name`."""
+    def broadcast(cls, name, value, ts=None):
+        """Deliver change notifications on every connection that subscribed to `name` (ts: FILETIME, default now)."""
         import time as _t
-        ts = int(_t.time() * 1e7) + 116444736000000000
+        if ts is None:
+            ts = int(_t.time() * 1e7) + 116444736000000000
         for inst in list(cls.instances):
             inst._deliver(name, value, ts)
 
