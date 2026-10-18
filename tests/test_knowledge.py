@@ -278,8 +278,8 @@ def _kb_with_docs(tmp: Path) -> Path:
     (loc / "sop" / "scope").mkdir(parents=True)
     (loc / "sop" / "scope" / "SOP-scope-display.md").write_text("# Scope", encoding="utf-8")
     (loc / "tools").mkdir()
-    (loc / "tools" / "manuals_db.py").write_text('"""Hardware manual bank: index the PDF manuals (version 1 copy)."""\n',
-                                                 encoding="utf-8")
+    shipped = K.builders_dir() / "manuals_db.py"              # a copy of the builder the plugin ships, CRLF on disk
+    (loc / "tools" / "manuals_db.py").write_bytes(shipped.read_bytes().replace(b"\n", b"\r\n"))
     return loc
 
 
@@ -301,7 +301,7 @@ def test_status_reports_the_offline_documentation_layout(kb):
     b = d["builders"]
     assert b["infosys_local.py"]["shipped_version"] == "2" and b["infosys_local.py"]["copy_in_tools"] is None
     assert b["manuals_db.py"]["copy_kind"] == "stub" and "nothing to update" in b["manuals_db.py"]["note"]
-    assert (loc / "tools" / "manuals_db.py.v1.bak").is_file()
+    assert (loc / "tools" / f"manuals_db.py.v{K._builder_version(K.builders_dir() / 'manuals_db.py')}.bak").is_file()
     assert d["sop"] == [str(Path("sop") / "scope" / "SOP-scope-display.md")]
     # read-only: nothing next to the databases was created
     assert sorted(p.name for p in (loc / "helpviewer").iterdir()) == ["infosys_en.db"]
@@ -401,34 +401,54 @@ def test_n34_hw_lookup_takes_the_order_code_out_of_the_esi_type(kb, monkeypatch)
     r = k.hw_lookup("CX9020")
     assert r["types"] == ["CX9020 EtherCAT slave"]
     assert r["manuals"]["CX9020"][0]["doc"] == "CX9020.pdf" and "manuals_note" not in r
+    # N67 (0.8.9 retest): CX9020-0130 found nothing although CX9020.pdf names CX9020 94 times
+    m = K.manuals_for(k.location()[0], ["CX9020-0130"])
+    assert m["manuals"]["CX9020-0130"][0]["doc"] == "CX9020.pdf"
+    assert m["manuals"]["CX9020-0130"][0]["matched_as"].startswith("base product CX9020")
 
 
-def test_builder_copies_become_stubs_once_and_are_reported(kb, tmp_path):
-    """The knowledge folder's tools\\ copies had to be replaced by hand after every plugin update. The server now
-    turns copies of the builders (any version) into the stub that runs the plugin's builders; the copy is kept as a
-    .bak; anything else in tools\\ is left alone."""
+def test_builder_copies_become_stubs_once_and_are_reported(kb, tmp_path, monkeypatch):
+    """N64 (0.8.9 retest): a file counted as a plugin copy when its first docstring line matched — the user's own
+    14 kB infosys_local.py / manuals_db.py (0.8.8 shipped no builders) were replaced. Now only a file this plugin
+    shipped (known sha256, CRLF read as LF) is replaced; everything else is left alone and reported.
+    N68: kb_set_location writes the pointer the stubs follow before it installs them."""
+    import hashlib
     k, tmp = kb
     loc = tmp / "kbfolder"
     (loc / "tools").mkdir(parents=True)
-    v1 = ('"""Search the locally installed Beckhoff Infosys (Microsoft Help Viewer package) with compact, low-token '
-          'output.\n"""\nprint("version 1")\n')
-    (loc / "tools" / "infosys_local.py").write_text(v1, encoding="utf-8")
-    (loc / "tools" / "manuals_db.py").write_text("# my own script\n", encoding="utf-8")
+    own = ('"""Search the locally installed Beckhoff Infosys (Microsoft Help Viewer package) with compact, low-token '
+           'output.\n"""\nprint("my own version 1")\n')
+    (loc / "tools" / "infosys_local.py").write_text(own, encoding="utf-8")
+    old_shipped = b'"""Hardware manual bank: an older release of the builder"""\r\nBUILDER_VERSION = "2"\r\n'
+    (loc / "tools" / "manuals_db.py").write_bytes(old_shipped)
+    monkeypatch.setitem(K.SHIPPED_BUILDERS, "manuals_db.py",
+                        {**K.SHIPPED_BUILDERS["manuals_db.py"],
+                         hashlib.sha256(old_shipped.replace(b"\r\n", b"\n")).hexdigest(): "2"})
+    assert not (k.home / "plugin_location.json").exists()
     r = k.set_location(str(loc))
     st = r["builder_stubs"]
-    assert st["infosys_local.py"]["state"] == "replaced" and st["infosys_local.py"]["was"] == "copy version 1"
-    assert Path(st["infosys_local.py"]["backup"]).read_text(encoding="utf-8") == v1
-    assert st["manuals_db.py"]["state"] == "left alone"
-    assert (loc / "tools" / "manuals_db.py").read_text(encoding="utf-8") == "# my own script\n"
-    assert K.builder_kind(loc / "tools" / "infosys_local.py", "infosys_local.py") == ("stub", "1")
+    assert (k.home / "plugin_location.json").is_file()                   # N68: pointer first
+    assert st["infosys_local.py"]["state"] == "left alone" and "not a file this plugin shipped" in st["infosys_local.py"]["reason"]
+    assert (loc / "tools" / "infosys_local.py").read_text(encoding="utf-8") == own          # the user's file is untouched
+    assert "stub.py" in st["infosys_local.py"]["to_use_the_plugin_builders"]
+    assert st["manuals_db.py"]["state"] == "replaced" and st["manuals_db.py"]["was"] == "shipped version 2"
+    assert Path(st["manuals_db.py"]["backup"]).read_bytes() == old_shipped
+    assert K.builder_kind(loc / "tools" / "manuals_db.py", "manuals_db.py") == ("stub", "1")
+    # an edited copy of the shipped builder is the user's file now: left alone
+    edited = (K.builders_dir() / "infosys_local.py").read_text(encoding="utf-8") + "\n# my change\n"
+    (loc / "tools" / "infosys_local.py").write_text(edited, encoding="utf-8")
+    assert K.builder_kind(loc / "tools" / "infosys_local.py", "infosys_local.py") == ("other", None)
     # every later start: nothing to do; the pointer for the stubs is written once per plugin location/version
     up = k.builder_upkeep("9.9.9")
-    assert up["tools"]["infosys_local.py"] == {"state": "stub", "stub_version": "1"} and up["pointer_written"] is True
+    assert up["tools"]["manuals_db.py"] == {"state": "stub", "stub_version": "1"} and up["pointer_written"] is True
+    assert up["tools"]["infosys_local.py"]["state"] == "left alone"
     assert k.builder_upkeep("9.9.9")["pointer_written"] is False
     ptr = json.loads((k.home / "plugin_location.json").read_text(encoding="utf-8"))
     assert Path(ptr["builders"]) == K.builders_dir() and ptr["version"] == "9.9.9"
     d = k.docs_layout(loc)
-    b = d["builders"]["infosys_local.py"]
+    b = d["builders"]["manuals_db.py"]
     assert b["copy_kind"] == "stub" and "nothing to update" in b["note"]
-    assert d["builders"]["manuals_db.py"]["copy_kind"] == "other"
-    assert d["infosys"]["command"].startswith(f'<Python 3.12+> "{loc / "tools" / "infosys_local.py"}" index')   # stable path
+    assert d["builders"]["infosys_local.py"]["copy_kind"] == "other"
+    assert "left alone" in d["builders"]["infosys_local.py"]["note"]
+    # the user's own script is never offered as the command — the plugin's builder is
+    assert str(K.builders_dir() / "infosys_local.py") in d["infosys"]["command"]

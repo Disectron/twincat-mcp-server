@@ -33,7 +33,7 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 | Concept, how-to, error text, anything else in Infosys | `docs_search query=… [book=glob] [limit=1-50]` → `ref` → `docs_page ref=… section=…` |
 | A page or a link from an answer | `docs_page ref=<book/pageid, Infosys URL, page id, exact title, ms-xhelp link> [section=] [offset=] [max_chars=200-20000]` |
 | Which books exist | `docs_books filter=tcplclib_tc2_*` |
-| Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx) |
+| Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so) |
 | Hardware: LEDs, wiring, diagnostics, error codes | `manual_search query=… [doc=CX9020]` → `manual_page doc=… pages=N-M` (≤ 21 pages) |
 | Chapters of a manual | `manual_toc doc=CX9020 [depth=1-6]` |
 | Which manuals are indexed | `manual_docs [filter=…]` |
@@ -50,7 +50,11 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    page's `links` (`text`, `ref`) with `docs_page ref=…`.
 6. Cite `ref` and `url` in the answer.
 7. Queries are FTS5: words are ANDed, `"exact phrase"`, `OR`, `NOT`, `prefix*`. Code with punctuation is fine —
-   invalid syntax is retried as a phrase, and `query_mode` says so.
+   invalid syntax is retried as a phrase, and `query_mode` says so. A question in plain words falls back step by step
+   (`query_mode`): all words → all words found in the index → as prefixes → some words. Stop words, words shorter than
+   3 letters and words on no page are dropped first (`words_ignored` gives the reason), and in the some-words step a
+   word on more than 20 % of the pages does not pick pages (`words_too_common`); each hit then lists the words it holds
+   (`matched`). Nothing informative left → no hits: say so instead of reading unrelated pages.
 8. Ranges are refused, not clamped. Read the `message` and correct the call. Do not retry it unchanged.
 9. Long pages: `section=` first (the `outline` lists the headings), then `offset=<next_offset>`. Never page through
    a whole book.

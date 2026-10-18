@@ -141,6 +141,11 @@ def test_manual_commands(kbdir):
     assert rc == 0 and r["code"] == "CX9020" and r["items"][0]["doc"] == "CX9020.pdf" and r["items"][0]["pages"] == [1, 2, 3, 4]
     rc, r = run(kbdir, "manual_product", "code=EL3102")
     assert rc == 0 and r["items"][0]["pages"] == [2, 4]
+    # N67: a variant no manual names falls back to the base product the manual is written for
+    rc, r = run(kbdir, "manual_product", "code=CX9020-0130")
+    assert rc == 0 and r["items"][0]["doc"] == "CX9020.pdf" and r["matched_as"].startswith("base product CX9020")
+    rc, r = run(kbdir, "manual_product", "code=EL9999-0010")
+    assert rc == 0 and r["count"] == 0 and "matched_as" not in r
     rc, r = run(kbdir, "manual_product", "code=EL9999")
     assert rc == 0 and r["count"] == 0 and 'manuals_db.py" update --kb' in r["hint"] and str(kbdir) in r["hint"]
     rc, r = run(kbdir, "manual_page", "doc=CX9020", "pages=5-40")
@@ -235,7 +240,9 @@ def test_n36_questions_in_words_fall_back_and_n35_near_is_quick(kbdir):
     """N36: `LED diagnostics` / `microSD boot card` gave 0 although each word finds the page — words were only ANDed.
     N35: not_found took 9.6 s on the real package (a LIKE scan of every page body for `near`)."""
     rc, r = run(kbdir, "manual_search", "query=watchdog diagnostics nonexistentword")
-    assert rc == 0 and r["query_mode"].startswith("some words") and r["items"][0]["page"] == 4
+    # N65: a word on no page is dropped before anything else is relaxed
+    assert rc == 0 and r["query_mode"] == "all words found in the index" and r["items"][0]["page"] == 4
+    assert r["words_used"] == ["watchdog", "diagnostics"] and r["words_ignored"] == {"nonexistentword": "on no page"}
     rc, r = run(kbdir, "manual_search", "query=Diagnos LED")
     assert rc == 0 and r["query_mode"] == "all words (as prefixes)" and r["items"][0]["page"] in (3, 4)
     rc, r = run(kbdir, "docs_search", "query=reads ADS device")
@@ -249,3 +256,47 @@ def test_n36_questions_in_words_fall_back_and_n35_near_is_quick(kbdir):
     assert rc == 0 and r["count"] == 0 and "hint" in r
     rc, r = run(kbdir, "docs_declaration", "symbol=MC_MoveAbs")
     assert rc == 1 and len(r["near"]) == 2 and r["elapsed_ms"] < 2000
+
+
+def _kbd_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("kb_docs_mod", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_n65_fallback_drops_stop_words_absent_and_common_words_and_ranks_the_title_first(kbdir):
+    """0.8.9 retest N65: the fallback tiers turned every word into a prefix, stop words included —
+    'how to zzqxv a the' gave 'some words', 49,096 hits, top 'How To'; 'ADSREAD xyzqq' ranked AdsReadDeviceInfo
+    above ADSREAD."""
+    rc, r = run(kbdir, "docs_search", "query=how to zzqxv a the")
+    assert rc == 0 and r["count"] == 0 and r["total"] == 0
+    assert r["words_ignored"] == {"how": "stop word", "to": "stop word", "zzqxv": "on no page", "a": "stop word",
+                                  "the": "stop word"}
+    rc, r = run(kbdir, "docs_search", "query=ADSREAD xyzqq")
+    assert rc == 0 and r["query_mode"] == "all words found in the index" and r["items"][0]["title"] == "ADSREAD"
+    # the some-words tier: which words each hit holds; a word on most pages does not pick pages there
+    rc, r = run(kbdir, "docs_search", "query=MC_MoveAbsolute ADSWRITE")
+    assert rc == 0 and r["query_mode"].startswith("some words")
+    assert all(it["matched"] and set(it["matched"]) <= {"MC_MoveAbsolute", "ADSWRITE"} for it in r["items"])
+    # unit level: a page titled like a query word ranks first even when another page mentions the word more often
+    import sqlite3
+    m = _kbd_module()
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.execute("CREATE VIRTUAL TABLE fts USING fts5(title, body, book UNINDEXED, pid UNINDEXED)")
+    con.execute("INSERT INTO fts VALUES ('AdsReadDeviceInfo', ?, 'b', '1')", (" ".join(["ADSREAD"] * 30),))
+    con.execute("INSERT INTO fts VALUES ('ADSREAD', 'reads data with ADSREAD and more words around it here', 'b', '2')")
+    for i in range(8):
+        con.execute("INSERT INTO fts VALUES (?, 'the common words of every page', 'b', ?)", (f"Page {i}", str(10 + i)))
+    con.execute("CREATE VIRTUAL TABLE temp.fts_vocab USING fts5vocab(main, 'fts', 'row')")
+    sql = "SELECT rowid AS rid, title, bm25(fts, 8.0, 1.0) AS r FROM fts WHERE fts MATCH ? ORDER BY r LIMIT ?"
+    cnt = "SELECT COUNT(*) FROM fts WHERE fts MATCH ?"
+    rows, total, mode, _expr, info = m.search_tiers(con, sql, cnt, "ADSREAD xyzqq", [], 5, title_key="title")
+    assert mode == "all words found in the index" and [x["title"] for x in rows][:2] == ["ADSREAD", "AdsReadDeviceInfo"]
+    rows, total, mode, _expr, info = m.search_tiers(con, sql, cnt, "common ADSREAD zzz", [], 5, title_key="title")
+    assert mode.startswith("some words") and info["words_too_common"] == ["common"] and info["words_used"] == ["ADSREAD"]
+    assert info["words_ignored"] == {"zzz": "on no page"} and total == 2 and rows[0]["title"] == "ADSREAD"
+    rows, total, mode, _expr, info = m.search_tiers(con, sql, cnt, "every common", [], 5, title_key="title")
+    assert rows and "words_too_common" not in info          # both words common: the AND tiers still answer

@@ -32,6 +32,12 @@ Version 2 (2026-10-18), changes against version 1:
 Version 3 (2026-10-18): page text format 2 — running headers, footers and margin labels (lines at the top or bottom
   of a page that repeat on many pages) are removed from the page text, also where glued to a heading; a heading
   wrapped over two lines is one toc entry. An index of format 1 is reported as outdated and read again on update.
+Version 4 (2026-10-18): page text format 3 — running headers, footers and margin labels are found by their place on
+  the page (same baseline near the top or bottom edge on most pages, set apart from the body), not by repeated text:
+  section titles in the header, footers whose page number comes first, and a header on a heading's baseline are
+  removed; table header rows repeated at the top of continuation pages stay. The font-heading toc is read without
+  them. The text-repetition rule remains only for a backend without text positions. An index of format 1 or 2 is
+  reported as outdated and read again on update.
 Stored paths stay absolute (moving the knowledge folder re-indexes every manual on the next update).
 """
 from __future__ import annotations
@@ -56,8 +62,8 @@ import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 BUILDER = "manuals_db.py"
-BUILDER_VERSION = "3"
-TEXT_FORMAT = "2"                # page text / toc rules; an index written with another one is read again on update
+BUILDER_VERSION = "4"
+TEXT_FORMAT = "3"                # page text / toc rules; an index written with another one is read again on update
 FALLBACK_KB = Path(r"D:\TwinCAT-MCP\knowledge")
 HEARTBEAT_STALE_S = 300          # one large PDF can take a while: an update silent for this long is gone
 
@@ -107,23 +113,157 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 
 
 # ---------------------------------------------------------------- PDF backends
+class Span:
+    """One piece of text with its place on the page: baseline y from the TOP of the page (pt), x, font size, bold,
+    and the PDF backend's line it belongs to (PyMuPDF block/line; pypdf: one text operation)."""
+    __slots__ = ("y", "x", "size", "bold", "text", "line")
+
+    def __init__(self, y: float, x: float, size: float, bold: bool, text: str, line: tuple):
+        self.y, self.x, self.size, self.bold, self.text, self.line = y, x, size, bold, text, line
+
+
+def _spans_pymupdf(page) -> tuple[list[Span], float]:
+    out: list[Span] = []
+    for bi, b in enumerate(page.get_text("dict").get("blocks", [])):
+        for li, ln in enumerate(b.get("lines", [])):
+            for s in ln.get("spans", []):
+                if not s["text"].strip():
+                    continue
+                ox, oy = s.get("origin") or (s["bbox"][0], s["bbox"][3])
+                out.append(Span(round(oy, 1), round(ox, 1), round(s["size"], 1), bool(s["flags"] & 16), s["text"],
+                                (bi, li)))
+    return out, float(page.rect.height)
+
+
+def _spans_pypdf(page) -> tuple[list[Span], float]:
+    """pypdf reports every text operation to a visitor with its text matrix; joining the visited pieces gives exactly
+    extract_text(), so the page text is rebuilt from the pieces that are not a running header or footer."""
+    height = float(page.mediabox.height)
+    out: list[Span] = []
+
+    def visit(text, cm, tm, font_dict, font_size):
+        if not text:
+            return
+        y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+        x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+        scale = abs(tm[3] * cm[3]) or abs(tm[0] * cm[0]) or 1.0
+        try:
+            base = str(font_dict.get("/BaseFont", "")) if font_dict is not None else ""
+        except Exception:  # noqa: BLE001
+            base = ""
+        out.append(Span(round(height - y, 1), round(x, 1), round(float(font_size or 0) * scale, 1),
+                        "bold" in base.lower(), text, (len(out),)))
+    page.extract_text(visitor_text=visit)
+    return out, height
+
+
+def _running(pages: list[tuple[list[Span], float]]) -> list[set[int]]:
+    """N37/N66 (format 3): running headers, footers and margin labels are found by their PLACE, not by their text —
+    Beckhoff prints the current section title at the top of every page ('| Signal flow diagram', a different text in
+    every section) and a footer whose page number comes first on some pages ('56 Version: 4.8.0 EL3356-00x0').
+    A span is running when, near the top or bottom edge (outer 15 % of the page), text of the same size sits on the
+    same baseline (within 2 pt) on at least 40 % of the pages with text (and 3 pages), and that baseline is set apart
+    from the body: the nearest line towards the middle of the page is at least 1.6 line pitches away on most of those
+    pages. The body's first line and a table header row repeated at the top of continuation pages are followed by the
+    next line at one pitch, so they stay. A heading that happens to share the header's baseline has another size and
+    stays. -> per page, the indexes of the running spans."""
+    import statistics
+    text_pages = [i for i, (sp, _h) in enumerate(pages) if sp]
+    need = max(3, -(-len(text_pages) * 2 // 5))
+    drops: list[set[int]] = [set() for _ in pages]
+    if len(text_pages) < 3:
+        return drops
+    pitches = []
+    for sp, _h in pages:
+        ys = sorted({round(s.y) for s in sp})
+        pitches += [b - a for a, b in zip(ys, ys[1:]) if 2 <= b - a <= 40]
+    pitch = statistics.median(pitches) if pitches else 12.0
+    apart = max(1.6 * pitch, 6.0)
+    # candidates: (side, size) -> baselines on every page, clustered within 2 pt
+    cand: dict[tuple, list[tuple[float, int, int]]] = {}
+    for pi, (sp, h) in enumerate(pages):
+        for si, s in enumerate(sp):
+            side = "top" if s.y < 0.15 * h else "bottom" if s.y > 0.85 * h else None
+            if side:
+                cand.setdefault((side, round(s.size * 2) / 2), []).append((s.y, pi, si))
+    clusters: list[tuple[str, list[tuple[float, int, int]]]] = []
+    for (side, _size), items in cand.items():
+        items.sort()
+        group: list[tuple[float, int, int]] = []
+        for it in items:
+            if group and it[0] - group[0][0] > 2.0:
+                clusters.append((side, group))
+                group = []
+            group.append(it)
+        if group:
+            clusters.append((side, group))
+    frequent = [c for c in clusters if len({pi for _y, pi, _si in c[1]}) >= need]
+    # from the body outwards: a cluster that passed is transparent for the clusters further out (a header of two
+    # lines); one that failed (the body's first lines) is not — the lines behind it stay too
+    frequent.sort(key=lambda c: (c[0], -c[1][0][0] if c[0] == "top" else c[1][0][0]))
+    passed: set[tuple[int, int]] = set()
+    for side, group in frequent:
+        pages_in = {pi for _y, pi, _si in group}
+        mine = {(pi, si) for _y, pi, si in group}
+        ok = 0
+        for pi in pages_in:
+            sp, _h = pages[pi]
+            ys = [y for y, p_, _si in group if p_ == pi]
+            yc = sum(ys) / len(ys)
+            others = [s.y for si, s in enumerate(sp)
+                      if (pi, si) not in passed and (pi, si) not in mine and abs(s.y - yc) > 2.0]
+            towards = [y - yc for y in others if y > yc] if side == "top" else [yc - y for y in others if y < yc]
+            if not towards or min(towards) >= apart:
+                ok += 1
+        if ok >= 0.6 * len(pages_in):
+            passed |= mine
+            for _y, pi, si in group:
+                drops[pi].add(si)
+    return drops
+
+
+def _page_text(spans: list[Span], drop: set[int], by_line: bool) -> str:
+    """The page text without the running spans. PyMuPDF (by_line): spans of one line joined as they are, lines on the
+    same baseline side by side in x order (as get_text('text', sort=True) does), rows top-down. pypdf: the visited
+    pieces in order (they carry the line breaks)."""
+    keep = [s for i, s in enumerate(spans) if i not in drop]
+    if not by_line:
+        return "".join(s.text for s in keep)
+    lines: dict[tuple, list[Span]] = {}
+    for s in keep:
+        lines.setdefault(s.line, []).append(s)
+    items = sorted(((min(x.y for x in ln), min(x.x for x in ln), "".join(x.text for x in sorted(ln, key=lambda z: z.x)))
+                    for ln in lines.values()), key=lambda t: (t[0], t[1]))
+    rows: list[list[tuple[float, float, str]]] = []
+    for it in items:
+        if rows and abs(it[0] - rows[-1][0][0]) <= 2.0:
+            rows[-1].append(it)
+        else:
+            rows.append([it])
+    return "\n".join(" ".join(t for _y, _x, t in sorted(r, key=lambda z: z[1])) for r in rows)
+
+
 def _open_pdf(path: Path):
-    """-> (backend name, page count, list of (level, title, page), iterator of page texts)."""
+    """-> (backend name, page count, toc [(level, title, page)], page texts without running headers/footers, title,
+    number of running spans removed — None when the backend gave no positions)."""
     try:
         try:
             import pymupdf
         except ImportError:
             import fitz as pymupdf  # PyMuPDF < 1.24
         d = pymupdf.open(str(path))
+        pages = [_spans_pymupdf(p) for p in d]
+        drops = _running(pages)
         toc = [(lvl, title.strip(), pg) for lvl, title, pg in d.get_toc(simple=True)]
         backend = "pymupdf"
         if not toc:
-            toc = _toc_from_fonts(d)
+            toc = _toc_from_fonts(pages, drops)
             backend = "pymupdf+font-headings"
         meta_title = (d.metadata or {}).get("title") or ""
         if not meta_title:   # first large line on page 1 (Beckhoff: "Manual | EN" … product name)
             meta_title = _first_title(d)
-        return backend, d.page_count, toc, (p.get_text("text", sort=True) for p in d), meta_title
+        texts = [_page_text(sp, dr, True) for (sp, _h), dr in zip(pages, drops)]
+        return backend, d.page_count, toc, texts, meta_title, sum(len(x) for x in drops)
     except ImportError:
         pass
     try:
@@ -147,32 +287,42 @@ def _open_pdf(path: Path):
     except Exception:  # noqa: BLE001
         pass
     meta_title = str((r.metadata or {}).get("/Title") or "")
-    return "pypdf", len(r.pages), toc, ((p.extract_text() or "") for p in r.pages), meta_title
+    try:
+        pages = [_spans_pypdf(p) for p in r.pages]
+    except Exception:  # noqa: BLE001 — no positions from this pypdf: the text-repetition fallback in index_pdf
+        return "pypdf", len(r.pages), toc, [(p.extract_text() or "") for p in r.pages], meta_title, None
+    drops = _running(pages)
+    texts = [_page_text(sp, dr, False) for (sp, _h), dr in zip(pages, drops)]
+    return "pypdf", len(r.pages), toc, texts, meta_title, sum(len(x) for x in drops)
 
 
 _NUM = re.compile(r"^\d+(?:\.\d+)*\.?$")
 _GLUED = re.compile(r"^(\d+(?:\.\d+)*)\.?\s*([A-ZÄÖÜ].*)$")
 
 
-def _toc_from_fonts(d) -> list[tuple[int, str, int]]:
-    """Chapter headings for PDFs without bookmarks: bold lines ≥ 1.5 × the body font size. A line holding only a
-    chapter number ('4.2') is joined with the heading that follows; the level comes from the number's depth,
-    else from the font-size rank."""
+def _toc_from_fonts(pages: list[tuple[list[Span], float]], drops: list[set[int]]) -> list[tuple[int, str, int]]:
+    """Chapter headings for PDFs without bookmarks: bold lines >= 1.5 x the body font size, read without the running
+    header/footer spans (a header on the heading's baseline was glued into the title: '1.1 Product overview| Product
+    overview'). A line holding only a chapter number ('4.2') is joined with the heading that follows; the level comes
+    from the number's depth, else from the font-size rank."""
     from collections import Counter
     sizes: Counter = Counter()
     lines_per_page = []
-    for p in d:
+    for (sp, _h), dr in zip(pages, drops):
+        by_line: dict[tuple, list[Span]] = {}
+        for i, s in enumerate(sp):
+            if i not in dr:
+                by_line.setdefault(s.line, []).append(s)
         lines = []
-        for b in p.get_text("dict").get("blocks", []):
-            for ln in b.get("lines", []):
-                spans = [s for s in ln.get("spans", []) if s["text"].strip()]
-                if not spans:
-                    continue
-                txt = "".join(s["text"] for s in spans).strip()
-                size = round(max(s["size"] for s in spans), 1)
-                bold = any(s["flags"] & 16 for s in spans)
-                sizes[size] += len(txt)
-                lines.append((size, bold, txt))
+        for key in sorted(by_line, key=lambda k: (min(x.y for x in by_line[k]), min(x.x for x in by_line[k]))):
+            spans = sorted(by_line[key], key=lambda z: z.x)
+            txt = "".join(s.text for s in spans).strip()
+            if not txt:
+                continue
+            size = max(s.size for s in spans)
+            bold = any(s.bold for s in spans)
+            sizes[size] += len(txt)
+            lines.append((size, bold, txt))
         lines_per_page.append(lines)
     if not sizes:
         return []
@@ -260,9 +410,24 @@ def _norm_line(s: str) -> str:
     return re.sub(r"\d+", "#", " ".join(s.split())).strip().lower()
 
 
+def _page_number_like(occ: list[tuple[int, tuple[int, ...]]], tolerance: int) -> bool:
+    """occ = (page index, numbers in the line) per page: True when the numbers are the same on every page, or when
+    exactly one position k changes with the page (number_k - page index constant) and the rest stay."""
+    if len({nums for _pg, nums in occ}) <= tolerance:
+        return True
+    width = {len(nums) for _pg, nums in occ}
+    if len(width) != 1:
+        return False
+    for k in range(width.pop()):
+        if len({nums[:k] + (nums[k] - pg,) + nums[k + 1:] for pg, nums in occ}) <= tolerance:
+            return True
+    return False
+
+
 def _strip_running(pages: list[str], chapter_titles: set[str],
                    headings: frozenset[str] = frozenset()) -> tuple[list[str], list[str]]:
-    """N37: running headers, footers and margin labels ('Commissioning', 'EL3356 Version: 2.4  79') were part of the
+    """FALLBACK only — used when the PDF backend gives no text positions (the rule by position is _running).
+    N37: running headers, footers and margin labels ('Commissioning', 'EL3356 Version: 2.4  79') were part of the
     page text and glued to headings ('Calibration and compensation4.4 Calibration'). A line among the first or last
     three of a page whose text (digits as '#') repeats there on 3 pages and 5 % of the pages — or on 2 when it is a
     chapter title — is removed (signal words like NOTE / WARNING are never); such a header glued to the start of a line is cut off when
@@ -274,12 +439,11 @@ def _strip_running(pages: list[str], chapter_titles: set[str],
     edge = lambda ls: [i for i, ln in enumerate(ls) if ln.strip()][:_HEAD_LINES] + \
         [i for i, ln in enumerate(ls) if ln.strip()][-_HEAD_LINES:]            # noqa: E731
     seen: Counter = Counter()
-    nums: dict[str, set] = {}
+    nums: dict[str, list] = {}
     for pg, ls in enumerate(split):
         for h, raw in {_norm_line(ls[i]): ls[i] for i in edge(ls)}.items():
             seen[h] += 1
-            nums.setdefault(h, set()).add(tuple(int(x) - pg * (k == len(re.findall(r"\d+", raw)) - 1)
-                                                for k, x in enumerate(re.findall(r"\d+", raw))))
+            nums.setdefault(h, []).append((pg, tuple(int(x) for x in re.findall(r"\d+", raw))))
     often = max(3, -(-len(pages) * 5 // 100))                                   # 3, or 5 % of the pages
 
     def running(h: str, n: int) -> bool:
@@ -289,8 +453,9 @@ def _strip_running(pages: list[str], chapter_titles: set[str],
             return False                                  # a numbered heading of the toc (or its first line)
         if h not in chapter_titles and any(t.endswith(" " + h) for t in headings):
             return False                                  # the second line of a wrapped heading
-        # numbers that differ from page to page: only a page number (its last number grows with the page) qualifies
-        return len(nums[h]) <= max(1, n // 5)
+        # numbers that differ from page to page: only a page number qualifies — ONE of the numbers (first, last or any:
+        # '56 Version: 4.8.0 ...' or '... Version: 4.8.0 57') grows with the page, the others stay
+        return _page_number_like(nums[h], max(1, n // 5))
     heads = {h for h, n in seen.items() if running(h, n)}
     if not heads:
         return pages, []
@@ -371,7 +536,7 @@ def _drop(con, doc_id: int) -> None:
 
 
 def index_pdf(con, path: Path, sha: str) -> dict:
-    backend, n, toc, texts, meta_title = _open_pdf(path)
+    backend, n, toc, texts, meta_title, running = _open_pdf(path)
     st = path.stat()
     cur = con.execute("INSERT INTO doc(path, name, size, mtime, sha256, title, pages, text_pages, indexed, backend) "
                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -381,8 +546,12 @@ def index_pdf(con, path: Path, sha: str) -> dict:
     toc = _mend_toc(toc)
     secs = _sections(toc, n)
     con.executemany("INSERT INTO toc VALUES(?,?,?,?)", [(doc_id, lvl, t, pg) for lvl, t, pg in toc])
-    chapters = {_norm_line(_TOC_NUM.sub("", t)) for lvl, t, _ in toc if lvl <= 2}
-    pages, heads = _strip_running(list(texts), chapters, frozenset(_norm_line(t) for _, t, _ in toc))
+    if running is None:      # no text positions from this backend: the text-repetition fallback
+        chapters = {_norm_line(_TOC_NUM.sub("", t)) for lvl, t, _ in toc if lvl <= 2}
+        pages, heads = _strip_running(list(texts), chapters, frozenset(_norm_line(t) for _, t, _ in toc))
+        running = len(heads)
+    else:
+        pages = list(texts)
     text_pages = 0
     for pg, raw in enumerate(pages, 1):
         t = _clean(raw)
@@ -396,7 +565,7 @@ def index_pdf(con, path: Path, sha: str) -> dict:
         con.executemany("INSERT INTO product VALUES(?,?,?,?)", [(c, doc_id, pg, k) for c, k in counts.items()])
     con.execute("UPDATE doc SET text_pages=? WHERE id=?", (text_pages, doc_id))
     return {"id": doc_id, "pages": n, "text_pages": text_pages, "toc": len(toc), "backend": backend,
-            "running_lines": len(heads)}
+            "running_spans": running}
 
 
 class UpdateLock:
@@ -497,7 +666,7 @@ def _update(args, folder: Path, db: Path, lock: "UpdateLock") -> None:
             added += 1
         note = "  (no text layer: scanned?)" if r["text_pages"] == 0 else ""
         print(f"{'updated ' if old else 'added   '} {p.name}: {r['pages']} pages, {r['toc']} bookmarks, "
-              f"{r['running_lines']} running header/footer lines, {time.time() - t0:.1f} s{note}")
+              f"{r['running_spans']} running header/footer pieces removed, {time.time() - t0:.1f} s{note}")
     con.commit()
     if added or changed or removed:
         con.execute("INSERT INTO fts(fts) VALUES('optimize')"); con.commit()
