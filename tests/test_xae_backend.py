@@ -929,6 +929,15 @@ def test_te1000_itcplconline_is_the_first_route_and_its_state_is_read_back(xae):
     proj.Stop = lambda: calls.append(("Stop",))                 # returns, but the application keeps running
     proj.Reset = lambda t: calls.append(("Reset", t))
     be.ONLINE_STATE_WAIT_S = 0.6
+    # 0.8.12 retest: Stop while logged out returned and did nothing — refused first, through no route at all
+    consumed0 = []
+    proj.ConsumeXml = lambda xml: consumed0.append(xml)
+    for act in ("stop", "start", "reset_cold"):
+        with pytest.raises(X.XaeError, match=rf"not logged in — {act} acts on the project's online session: xae_plc "
+                                             "login first.*Nothing was done"):
+            be.plc_action(act)
+    assert calls == [] and consumed0 == [] and dte.commands == []
+    del proj.ConsumeXml
     r = be.plc_action("download")
     assert r["method"] == "ITcPlcOnline" and calls[-1] == ("Login", 4) and r["after"]["logged_in"] is True
     assert be.plc_action("start")["after"]["application_state"] == "run"

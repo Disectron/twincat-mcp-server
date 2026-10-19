@@ -111,6 +111,10 @@ class _ActedUnconfirmed(XaeError):
     """A PLC online command was accepted but its state was not read back: it may have acted — never retried elsewhere."""
 
 
+class _NeedsLogin(XaeError):
+    """Start / Stop / Reset asked of a project that is not logged in: refused before any route runs it."""
+
+
 def sta_init() -> None:  # pragma: no cover
     if IS_WIN:
         pythoncom.CoInitialize()
@@ -943,6 +947,11 @@ class XaeBackend:
         if not _has_prop(it, "IsLoggedIn"):
             return None
         before = self._online_state(it)
+        if before["logged_in"] is False and (action in ("start", "stop") or action in _RESET_TYPE):
+            # 0.8.12 retest: Stop while logged out returned and did nothing; the error then said only that the state
+            # did not change. Start / Stop / Reset act on the online session of the project
+            raise _NeedsLogin(f"{target} is not logged in — {action} acts on the project's online session: xae_plc "
+                           f"login first (ads_plc_state switches run/stop over ADS without a login). Nothing was done.")
         if action in _LOGIN_FLAGS:
             if before["logged_in"] and action == "download":
                 return None              # logged in already: a download is the shell's PLC.Download (DTE route)
@@ -1016,7 +1025,7 @@ class XaeBackend:
                 r = self._plc_online(target, action)
             if r is not None:
                 return {**r, **sn}
-        except _ActedUnconfirmed:
+        except (_ActedUnconfirmed, _NeedsLogin):
             raise
         except XaeError as exc:
             ai_note = f"ITcPlcOnline on {target}: {str(exc)[:200]}"

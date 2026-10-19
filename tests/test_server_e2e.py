@@ -1145,6 +1145,10 @@ async def test_n40_n42_token_targets_are_computed_by_the_server(monkeypatch, pro
         # two projects and only the action given: the error says what is missing, before any token exists
         r = await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "target": "login"})
         assert r.is_error and "2 PLC projects" in text(r) and "plc_project_path" in text(r)
+        # the tool itself: the missing PLC project is said first, the guard's refusal after it (N41/N42 polish)
+        r = await s.call_tool("xae_plc", {"action": "login"})
+        assert r.is_error and "xae_plc: 2 PLC projects" in text(r) and done[-1:] == [("download", "TIPC^PlcB")]
+        assert "target=''" not in text(r) and "needs a confirm_token too" in text(r)
         # a partial hand-written target is completed (one project): no retry needed
         projects[:] = ["TIPC^PlcA^PlcA Project"]
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "target": "login"}))

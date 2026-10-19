@@ -331,6 +331,7 @@ def test_block_notification_gaps_are_counted_and_file_is_provable(rec):
     assert gl == [{"block": 0, "kind": "gap", "t_from": 299.0, "t_to": 320.0, "missing": 20},
                   {"block": 0, "kind": "gap", "t_from": 776.0, "t_to": 778.0, "missing": 1}]
     assert out["label"] == "INCOMPLETE"
+    assert out["label_reason"] == "21 sample(s) missing from the PLC timeline (gap markers in the file)"   # D13 polish
     v = rec.verify(st["id"], counter="MAIN.nCycle")
     assert v["integrity"] == "intact" and v["timeline"]["missing"] == 21 and v["verdict"] == "FAIL"
     assert v["counter"]["missing_samples"] == 21 and v["counter"]["step"] == 1 and not v["counter"]["lossless"]

@@ -1087,12 +1087,28 @@ void Engine::finish() {
     const uint64_t good = samples_ > stalled_samples_ ? samples_ - stalled_samples_ : 0;
     const double comp = (samples_ + miss) ? double(good) / double(samples_ + static_cast<uint64_t>(miss)) : 0.0;
     const bool pass = samples_ > 0 && miss == 0 && ovf == 0 && mismatch == 0 && (!start_when_.set || triggered_) && stalls_ == 0;
-    std::string label_reason;
+    // every cause of an INCOMPLETE label, in the conditions of `pass` (D11/D13 polish: only the STOP was named — a
+    // RUN->CONFIG->RUN gap counted against the label but was said only in `errors`)
+    std::vector<std::string> why;
     if (stalls_ > 0 && have_t0_) {
-        label_reason = "PLC stopped (cycle counter frozen) ";
+        std::string st = "PLC stopped (cycle counter frozen) ";
         for (size_t k = 0; k < stall_list_.size() && k < 5; ++k)
-            label_reason += (k ? ", " : "") + ms(stall_list_[k].first) + "-" + ms(stall_list_[k].second) + " ms";
+            st += (k ? ", " : "") + ms(stall_list_[k].first) + "-" + ms(stall_list_[k].second) + " ms";
+        why.push_back(st);
     }
+    if (samples_ == 0) why.push_back("no sample recorded");
+    if (miss > 0) {
+        const uint64_t resubs = source_ ? source_->resubscriptions() : 0;
+        why.push_back(std::to_string(miss) + " sample(s) missing from the PLC timeline (head " + std::to_string(head) +
+                      ", gaps " + std::to_string(gaps) + ", tail " + std::to_string(tail) + "; gap markers in the file)" +
+                      (resubs ? "; the notifications stopped and were registered again " + std::to_string(resubs) +
+                                " time(s)" : std::string()));
+    }
+    if (ovf > 0) why.push_back(std::to_string(ovf) + " sample(s) lost to a full ring (overflow intervals)");
+    if (mismatch > 0) why.push_back(std::to_string(mismatch) + " sample(s) with a size other than the block size");
+    if (start_when_.set && !triggered_) why.push_back("start_when never fired");
+    std::string label_reason;
+    for (size_t k = 0; k < why.size(); ++k) label_reason += (k ? "; " : "") + why[k];
     // head / tail holes as markers too (block order), then the footer's digest covers them
     if (fh_ && have_t0_) {
         for (auto& bp : blocks_) {
@@ -1193,7 +1209,7 @@ void Engine::finish() {
         .u("gap_markers", gap_markers_).u("chain_checkpoints", chains_)
         .u("stalls", stalls_).u("stalled_samples", stalled_samples_).d("stall_s", double(stall_100ns_) / 1e7, 8)
         .u("resubscriptions", source_ ? source_->resubscriptions() : 0);
-    if (!label_reason.empty()) f.str("label_reason", label_reason);
+    if (!pass && !label_reason.empty()) f.str("label_reason", label_reason);
     if (stall_block_ >= 0) f.u("stall_counter_block", blocks_[stall_block_]->spec.id);
     f.raw("blocks", jarr(bl)).raw("errors", jarr(errs));
     if (!key_error_.empty()) f.str("key_error", key_error_);

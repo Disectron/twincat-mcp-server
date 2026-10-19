@@ -501,6 +501,7 @@ class Knowledge:
         except Exception as exc:  # noqa: BLE001 — a convenience; the tools work without it
             res["error"] = f"{type(exc).__name__}: {exc}"
         self.last_upkeep = res
+        self.last_upkeep_at = time.strftime("%Y-%m-%dT%H:%M:%S")
         return res
 
     def layout(self, loc: Path | None = None) -> dict[str, Any]:
@@ -602,8 +603,20 @@ class Knowledge:
                                "infosys": inf, "manuals": man}
         if not brief:
             out["builders"] = builders
-            if getattr(self, "last_upkeep", None):
-                out["builder_upkeep"] = self.last_upkeep        # this server start: pointer written, copies replaced
+            up = getattr(self, "last_upkeep", None)
+            if up:
+                # N64 polish: this is what the server START did; the file may have changed since (an edited stub is
+                # 'other' in `builders`, while the start's entry still said 'stub') — said as such, actions only
+                view: dict[str, Any] = {"at_server_start": getattr(self, "last_upkeep_at", None),
+                                        **{k: v for k, v in up.items() if k != "tools"}}
+                tools = up.get("tools")
+                if isinstance(tools, dict):
+                    acted = {n: e for n, e in tools.items() if not (isinstance(e, dict) and e.get("state") == "stub")}
+                    view["tools"] = acted or "nothing to do: the stubs were in place"
+                elif tools is not None:
+                    view["tools"] = tools
+                view["note"] = "what the server did at its start — `builders` above is the state of the files now"
+                out["builder_upkeep"] = view
             sop = loc / "sop"
             out["sop"] = sorted(str(f.relative_to(loc)) for f in sop.rglob("*.md"))[:50] if sop.is_dir() else []
         return out

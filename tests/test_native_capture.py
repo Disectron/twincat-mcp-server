@@ -248,6 +248,9 @@ def test_d13_outage_resubscribes_and_marks_the_gap(capture_exe, tmp_path):
     assert gaps and gaps[0]["kind"] == "gap" and gaps[0]["t_from"] == 490.0 and gaps[0]["missing"] >= 140
     assert any("registered again" in e for e in f["errors"])
     assert f["stop_reason"] == "duration 4s"                          # the window was completed after the outage
+    # D13 polish: the reason of the label names the gap and the re-registration, not only `errors`
+    assert "sample(s) missing from the PLC timeline" in f["label_reason"], f["label_reason"]
+    assert "registered again 1 time(s)" in f["label_reason"]
 
 
 def test_r5_gap_markers_where_samples_are_missing(capture_exe, tmp_path):

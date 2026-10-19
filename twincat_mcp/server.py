@@ -327,6 +327,10 @@ def _plc_iec_path(path: str) -> str:
     return _plc_split(path)[1]
 
 
+class TargetArgsError(ToolError):
+    """token_target: the shell answered, but the arguments name no target (N41/N42: which PLC project)."""
+
+
 class App:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -1319,6 +1323,12 @@ class App:
                 self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope())
             except SafetyError as exc:
                 self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
+                if isinstance(xae_exc, TargetArgsError) and "needs a confirm_token" in str(exc):
+                    # N41/N42 polish: the shell answered, the arguments do not name a target — that reason first; the
+                    # guard's "needs a confirm_token … target ''" suggested a token for '', which can never be right
+                    raise ToolError(f"{xae_exc} — nothing was done. It needs a confirm_token too, issued for its "
+                                    f"target once the arguments name one: tc_request_confirmation(action={action!r}, "
+                                    "args={…the same arguments…})") from exc
                 raise ToolError(f"{exc} (target not known: {str(xae_exc)[:200]})") from exc
             raise
 
@@ -1350,7 +1360,7 @@ class App:
         if action == "xae_plc":
             act = str(a.get("action") or "")
             if not act:
-                raise ToolError("xae_plc's token names the action: pass args={'action': 'login', 'plc_project_path': …}")
+                raise TargetArgsError("xae_plc's token names the action: pass args={'action': 'login', 'plc_project_path': …}")
             path = a.get("plc_project_path")
             # N78: the token names a PLC project of the open solution — one that does not exist gets no token (and
             # the tool, which computes its target the same way, refuses it before anything is done)
@@ -1359,12 +1369,12 @@ class App:
                 want = _plc_iec_path(str(path))
                 hit = [p for p in projs if p.lower() == want.lower()]
                 if not hit:
-                    raise ToolError(f"no PLC project {str(path)!r} in the open solution — its PLC projects: {projs} "
+                    raise TargetArgsError(f"no PLC project {str(path)!r} in the open solution — its PLC projects: {projs} "
                                     "(xae_plc_projects lists them)")
                 proj = hit[0]
             else:
                 if len(projs) != 1:
-                    raise ToolError(f"{len(projs)} PLC projects — xae_plc needs plc_project_path, and its token names it: "
+                    raise TargetArgsError(f"{len(projs)} PLC projects — xae_plc needs plc_project_path, and its token names it: "
                                     f"{projs}")
                 proj = projs[0]
             return f"{act}:{proj}@{await self._xae_netid()}"
