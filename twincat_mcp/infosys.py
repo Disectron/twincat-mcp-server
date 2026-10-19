@@ -51,7 +51,7 @@ from typing import Any, Callable
 # _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
 # re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
 # changes without a bump.
-INDEXER_VERSION = 4          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
+INDEXER_VERSION = 5          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
                              #    Methods / Properties tables as their own lists (N74)
                              # 4: everything a reader used to repair is stored repaired (docs/KNOWLEDGE_BASE.md rule 4):
                              #    no invisible marks, image placeholders or empty links; links resolved to page URLs
@@ -59,6 +59,10 @@ INDEXER_VERSION = 4          # 3: code without non-breaking spaces; the return v
                              #    for the declaration (N77: a type is its name, its page in type_ref) and type names
                              #    split in narrow columns joined (R32); enum values numbered, comments as descriptions
                              #    (R25), no repeated description dict
+                             # 5: a page's kind and return type from the evidence for its own symbol (N103: the header
+                             #    as a heading 'FUNCTION MEMCPY : UDINT' / 'MEMSET FUNCTION: UDINT', the 'Return value'
+                             #    table); IEC headers in capitals only; a sentence title documents no symbol (N101:
+                             #    'Attribute 'linkalways'' is a Page); the declaration's name is the symbol
 
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
@@ -579,9 +583,21 @@ def html_to_doc(raw: bytes | str, base_url: str | None = None, package: bool = F
 # ---------------------------------------------------------------------------
 # IEC declaration extraction
 # ---------------------------------------------------------------------------
+# N103 / N101: an IEC header is written in capitals (Beckhoff's code, whatever language label the page gives it —
+# 'METHOD Release : HRESULT' is marked cpp); a case-insensitive match read C# 'Type type' as TYPE and JavaScript
+# 'function' as FUNCTION
 _HEAD_RE = re.compile(
     r"^\s*(?:\{[^}]*\}\s*)*(FUNCTION_BLOCK|FUNCTION|PROGRAM|METHOD|PROPERTY|INTERFACE|TYPE|VAR_GLOBAL|ACTION)\b\s*"
-    r"(?:(?:ABSTRACT|FINAL|INTERNAL|PUBLIC|PRIVATE|PROTECTED)\s+)*([A-Za-z_][\w]*)?(.*)$", re.I | re.M)
+    r"(?:(?:ABSTRACT|FINAL|INTERNAL|PUBLIC|PRIVATE|PROTECTED)\s+)*([A-Za-z_][\w]*)?(.*)$", re.M)
+_POU_KW = r"FUNCTION_BLOCK|FUNCTION|PROGRAM|METHOD|PROPERTY|INTERFACE|ACTION"
+# the header as a heading or a title: 'FUNCTION MEMCPY : UDINT', 'FUNCTION DCTIME_TO_DCTIME64: T_DCTIME64' …
+_HEAD_TEXT = re.compile(rf"^({_POU_KW})\s+(?:(?:ABSTRACT|FINAL|INTERNAL|PUBLIC|PRIVATE|PROTECTED)\s+)*"
+                        r"([A-Za-z_][\w.]*)\s*(?::\s*(\S.*?))?\s*$")
+# … and with the name first: 'MEMSET FUNCTION: UDINT', 'MEMCMP FUNCTION: DINT'
+_HEAD_TEXT_AFTER = re.compile(r"^([A-Za-z_][\w.]*)\s+(FUNCTION_BLOCK|FUNCTION)\s*(?::\s*(\S.*?))?\s*$")
+_RETURN_TITLES = ("return value", "return values", "rückgabewert", "return parameter")
+_KIND_OF = {"FUNCTION_BLOCK": "FunctionBlock", "FUNCTION": "Function", "PROGRAM": "Program", "METHOD": "Method",
+            "PROPERTY": "Property", "INTERFACE": "Interface", "ACTION": "Action", "VAR_GLOBAL": "GlobalVariable"}
 _SECTION_RE = re.compile(r"^\s*(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR)\b[^\n]*\n(.*?)^\s*END_VAR", re.I | re.M | re.S)
 _STRUCT_RE = re.compile(r"STRUCT\b(.*?)END_STRUCT", re.I | re.S)
 _ENUM_RE = re.compile(r":\s*\((.*?)\)\s*(?:[A-Za-z_]\w*\s*)?(?::=\s*\w+)?\s*;", re.S)
@@ -592,36 +608,145 @@ _PREFIX_KIND = (("FB_", "FunctionBlock"), ("F_", "Function"), ("ST_", "Struct"),
                 ("T_", "Alias"), ("U_", "Union"), ("ITc", "Interface"), ("P_", "Program"), ("PRG_", "Program"))
 
 
+def page_symbols(title: str) -> set[str]:
+    """The symbol(s) a page documents, from its title (lower case, the last part of a dotted name): 'MEMCPY',
+    'FB_X.Start', 'FUNCTION F_GetVersionTcUtilities', 'F_GetCycleTime()', 'GetHMI (4.1)', 'Data type
+    __SYSTEM.ExceptionCode', 'KL6inData, KL6outData'. A title that is a sentence ('Attribute 'linkalways'',
+    'Transmitting structures to the PLC', 'AdsClient Class') documents no IEC symbol: its code is an example (N101)."""
+    t = " ".join((title or "").split())
+    m = re.match(rf"^(?:{_POU_KW}|TYPE)\s+(.+)$", t)
+    if m:
+        t = m.group(1)
+    t = re.sub(r"^(?:Data\s*type|Datentyp)\s+", "", t, flags=re.I)
+    t = re.sub(r"\s*\(\s*\)\s*$", "", t)                       # F_GetCycleTime()
+    t = re.sub(r"\s*\(\s*v?\d+(?:\.\d+)*\s*\)\s*$", "", t)        # GetHMI (4.1)
+    parts = [x.strip() for x in t.split(",")]
+    if parts and all(re.fullmatch(r"[A-Za-z_][\w.]*", x) for x in parts):
+        return {x.rsplit(".", 1)[-1].lower() for x in parts}
+    return set()
+
+
+def symbol_name(title: str) -> str | None:
+    """The one symbol a page documents, as its title writes it ('FUNCTION F_GetVersionTcUtilities' →
+    'F_GetVersionTcUtilities', 'F_GetCycleTime()' → 'F_GetCycleTime', 'FB_X.Start'); None for a sentence title or
+    one naming several symbols."""
+    syms = page_symbols(title)
+    if len(syms) != 1:
+        return None
+    want = next(iter(syms))
+    return next((x for x in re.findall(r"[A-Za-z_][\w.]*", title or "") if x.rsplit(".", 1)[-1].lower() == want), None)
+
+
 def _ident_matches(ident: str, title: str) -> bool:
-    t = title.strip().split()[0] if title.strip() else ""
-    return ident.lower() in (t.lower(), t.rsplit(".", 1)[-1].lower())
+    return bool(ident) and ident.lower() in page_symbols(title)
 
 
-def classify(title: str, code_blocks: list[tuple[str, str]]) -> str:
-    name = title.strip()
+def _kind_of_type(code: str, at: int) -> str:
+    seg = code[at:at + 400].upper()
+    if re.search(r"\bSTRUCT\b", seg):
+        return "Struct"
+    if re.search(r"\bUNION\b", seg):
+        return "Union"
+    if re.search(r":\s*\(", seg):
+        return "Enum"
+    return "Alias"
+
+
+def _intro_text(markdown: str) -> str:
+    """The page's first paragraphs, before its first sub-heading (what it says it is)."""
+    body = re.sub(r"(?m)^#\s[^\n]*\n", "", markdown or "", count=1)
+    return body.split("\n#", 1)[0][:800]
+
+
+def page_header(title: str, headings: list[tuple[int, str]] | None = None) -> tuple[str, str | None] | None:
+    """N103: the header written as the page's title or as a heading — '## FUNCTION MEMCPY : UDINT', '## MEMSET
+    FUNCTION: UDINT' — for this page's own symbol: (kind, return type or None)."""
+    syms = page_symbols(title)
+    if not syms:
+        return None
+    for text in [" ".join(title.split())] + [" ".join(h.split()) for _lvl, h in (headings or [])]:
+        m = _HEAD_TEXT.match(text)
+        if m and m.group(2).rsplit(".", 1)[-1].lower() in syms:
+            return _KIND_OF[m.group(1)], (m.group(3) or None)
+        m = _HEAD_TEXT_AFTER.match(text)
+        if m and m.group(1).rsplit(".", 1)[-1].lower() in syms:
+            return _KIND_OF[m.group(2)], (m.group(3) or None)
+    return None
+
+
+def return_from_table(title: str, tables: list[list[list[str]]] | None, titles: list[str] | None) -> str | None:
+    """N103: the return type as Infosys tables it under 'Return value' — a row named like the function / method
+    (LREAL_TO_FMTSTR | STRING(510)), with a Type column."""
+    syms = page_symbols(title)
+    if not syms:
+        return None
+    for i, rows in enumerate(tables or []):
+        ttl = ((titles or [])[i] if i < len(titles or []) else "") or ""
+        if ttl.strip().lower() not in _RETURN_TITLES or len(rows) < 2:
+            continue
+        head = [c.strip().lower() for c in rows[0]]
+        if "name" not in head or not ({"type", "data type", "typ", "datentyp"} & set(head)):
+            continue
+        ni = head.index("name")
+        ti = next(head.index(k) for k in ("type", "data type", "typ", "datentyp") if k in head)
+        for r in rows[1:]:
+            if len(r) > max(ni, ti) and r[ni].strip().lower() in syms and r[ti].strip():
+                return r[ti].strip()
+    return None
+
+
+def _callable_kind(title: str, code_blocks: list[tuple[str, str]], intro: str) -> str | None:
+    """A page with a return value is a function or a method (a function block has none) — which one, from the page:
+    a dotted title (FB_X.Start), the kind its own code declares under another name (a doc error: 'METHOD SendMessageEx'
+    on SendMessageEx2), or what its first sentences call it ('The function converts …', 'Method for adding …')."""
+    if "." in title.split()[0]:
+        return "Method"
     for _lang, code in code_blocks:
         m = _HEAD_RE.search(code)
-        if not m:
-            continue
-        kw, ident = m.group(1).upper(), m.group(2) or ""
-        if kw not in ("TYPE", "VAR_GLOBAL") and ident and name and not _ident_matches(ident, name):
-            continue  # example code about another symbol; keep looking
-        if kw == "TYPE":
-            seg = code[m.start():m.start() + 400].upper()
-            if re.search(r"\bSTRUCT\b", seg):
-                return "Struct"
-            if re.search(r"\bUNION\b", seg):
-                return "Union"
-            if re.search(r":\s*\(", seg):
-                return "Enum"
-            return "Alias"
-        return {"FUNCTION_BLOCK": "FunctionBlock", "FUNCTION": "Function", "PROGRAM": "Program", "METHOD": "Method",
-                "PROPERTY": "Property", "INTERFACE": "Interface", "ACTION": "Action", "VAR_GLOBAL": "GlobalVariable"}[kw]
-    for pre, kind in _PREFIX_KIND:
-        if name.startswith(pre):
-            return kind
-    if any(re.search(r"\bVAR_INPUT\b", c, re.I) for _l, c in code_blocks):
-        return "FunctionBlock"
+        if m and m.group(1) in ("METHOD", "FUNCTION"):
+            return _KIND_OF[m.group(1)]
+    w = re.search(r"\b(method|function)\b", intro or "", re.I)
+    if w:
+        return "Method" if w.group(1).lower() == "method" else "Function"
+    return None
+
+
+def classify(title: str, code_blocks: list[tuple[str, str]], headings: list[tuple[int, str]] | None = None,
+             tables: list[list[list[str]]] | None = None, table_titles: list[str] | None = None,
+             intro: str = "") -> str:
+    """The kind of a page, from the evidence for the page's own symbol, strongest first: its header in the code;
+    its header as the title or a heading (N103); a type or global list on a symbol page; a 'Return value' row named
+    like it (a function); the name prefix (FB_, F_ …); VAR_INPUT blocks on a symbol page. A page that documents no
+    symbol (a sentence as title) is a Page, whatever code it shows (N101)."""
+    name = title.strip()
+    syms = page_symbols(name)
+    if syms:
+        typed: str | None = None
+        for _lang, code in code_blocks:
+            m = _HEAD_RE.search(code)
+            if not m:
+                continue
+            kw, ident = m.group(1), m.group(2) or ""
+            if kw == "VAR_GLOBAL":
+                typed = typed or "GlobalVariable"                 # a GVL page: its name is the title
+            elif ident.lower() in syms:
+                return _kind_of_type(code, m.start()) if kw == "TYPE" else _KIND_OF[kw]
+            elif kw == "TYPE" and typed is None:
+                typed = _kind_of_type(code, m.start())            # the page's type under another name (a doc error)
+        head = page_header(name, headings)
+        if head:
+            return head[0]
+        if typed:
+            return typed
+        if return_from_table(name, tables, table_titles):
+            # a return value: not a function block. Which callable the page does not say: a function (parse_declaration
+            # says so in kind_note) — a method page says 'method' or carries its FB's name
+            return _callable_kind(name, code_blocks, intro) or "Function"
+        for pre, kind in _PREFIX_KIND:
+            if name.startswith(pre):
+                return kind
+        if any(re.search(r"\bVAR_INPUT\b", c) for _l, c in code_blocks):
+            return "FunctionBlock"
     if re.search(r"\bPLC\s+Lib(?:rary)?\b", name, re.I):
         return "Library"
     return "Page"
@@ -759,8 +884,8 @@ def library_from_book(book: str) -> str | None:
 
 
 def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
-    kind = classify(title, doc.code_blocks)
-    decl: dict[str, Any] = {"name": title.strip(), "kind": kind, "declaration": None, "extends": None, "implements": None,
+    kind = classify(title, doc.code_blocks, doc.headings, doc.tables, doc.table_titles, _intro_text(doc.markdown))
+    decl: dict[str, Any] = {"name": symbol_name(title) or title.strip(), "kind": kind, "declaration": None, "extends": None, "implements": None,
                             "return_type": None, "inputs": [], "outputs": [], "in_out": [], "members": [],
                             "enum_values": [], "description": {}}
     desc = _descriptions(doc.tables, doc.table_titles)
@@ -773,9 +898,11 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
             fragments.append(code.strip())
             kw, ident, rest = "", "", ""
         else:
-            kw, ident, rest = m.group(1).upper(), m.group(2) or "", m.group(3) or ""
+            kw, ident, rest = m.group(1), m.group(2) or "", m.group(3) or ""
             if kw not in ("TYPE", "VAR_GLOBAL") and ident and not _ident_matches(ident, decl["name"]):
                 continue
+            if kw in ("TYPE", "VAR_GLOBAL") and not page_symbols(decl["name"]):
+                continue                                  # a manual page's example (N101)
             if decl["declaration"] is None:
                 decl["declaration"] = code.strip()
         if kw in ("FUNCTION", "METHOD", "PROPERTY"):
@@ -817,8 +944,19 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
                     nm, _, val = part.partition(":=")
                     decl["enum_values"].append({"name": nm.strip(), "value": val.strip() or None,
                                                 "description": desc.get(nm.strip())})
+    # N103: the header the page writes as a heading ('## FUNCTION MEMCPY : UDINT') or the 'Return value' table
+    ph = page_header(title, doc.headings)
+    if ph and ph[0] == kind and ph[1] and not decl["return_type"]:
+        decl["return_type"] = ph[1]
+    if kind in ("Function", "Method", "Property") and not decl["return_type"]:
+        decl["return_type"] = return_from_table(title, doc.tables, doc.table_titles)
+        if (decl["return_type"] and kind == "Function" and not ph
+                and _callable_kind(title, doc.code_blocks, _intro_text(doc.markdown)) is None):
+            decl["kind_note"] = ("the page gives a return value and no header: a function, or a method of a function "
+                                 "block — it does not say which")
     if decl["declaration"] is None and fragments:
-        head = {"FunctionBlock": "FUNCTION_BLOCK", "Program": "PROGRAM", "Function": "FUNCTION"}.get(kind)
+        head = {"FunctionBlock": "FUNCTION_BLOCK", "Program": "PROGRAM", "Function": "FUNCTION",
+                "Method": "METHOD"}.get(kind)
         decl["declaration"] = ((f"{head} {decl['name']}  (* header reconstructed *)\n" if head else "")
                                + "\n".join(fragments))
     decl["description"] = desc

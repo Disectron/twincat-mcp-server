@@ -475,3 +475,81 @@ def test_n74_interface_page_methods_by_their_heading():
     assert d["properties"][0]["name"] == "eSeverity" and d["properties"][0]["access"] == "Get"
     _tidy_declaration(d)
     assert "description" not in d, d.get("description")
+
+
+def _page(title, body):
+    from twincat_mcp.infosys import html_to_doc
+    return html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
+
+
+_TBL = ("<table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
+        "<tr><td>{n}</td><td>{t}</td><td>{d}</td></tr></table>")
+
+
+def test_n103_a_function_whose_header_is_a_heading(monkeypatch):
+    """N103 (S2, 0.8.11 retest): Beckhoff writes many function headers as a heading — '## FUNCTION MEMCPY : UDINT',
+    '## MEMSET FUNCTION: UDINT' — or tables the return value only ('Return value: LREAL_TO_FMTSTR | STRING(510)').
+    They were indexed as function blocks with 'FUNCTION_BLOCK MEMCPY (* header reconstructed *)' and no return type:
+    code written from the answer instantiated a function as an FB. (The bodies are those of the real pages.)"""
+    from twincat_mcp.infosys import parse_declaration
+    inputs = "<h2>Inputs</h2><pre>VAR_INPUT\n    destAddr : PVOID;\n    srcAddr  : PVOID;\n    n        : UDINT;\nEND_VAR</pre>"
+    d = parse_declaration("MEMCPY", _page("MEMCPY", "<p>The function MEMCPY can be used to copy …</p>"
+                                                  "<h2>FUNCTION MEMCPY : UDINT</h2>" + inputs))
+    assert (d["kind"], d["return_type"]) == ("Function", "UDINT")
+    assert d["declaration"].startswith("FUNCTION MEMCPY : UDINT  (* header reconstructed *)\nVAR_INPUT"), d["declaration"]
+    d = parse_declaration("MEMSET", _page("MEMSET", "<h2>MEMSET FUNCTION: UDINT</h2>" + inputs))
+    assert (d["kind"], d["return_type"]) == ("Function", "UDINT")
+    d = parse_declaration("SYSTEMTIME_TO_STRING", _page("SYSTEMTIME_TO_STRING",
+                          "<h2>FUNCTION SYSTEMTIME_TO_STRING : STRING(24)</h2>"
+                          "<pre>VAR_INPUT\n    in : TIMESTRUCT;\nEND_VAR</pre>"))
+    assert (d["kind"], d["return_type"]) == ("Function", "STRING(24)")
+    d = parse_declaration("F_ToASC", _page("F_ToASC", "<h2>FUNCTION F_ToASC : BYTE</h2>"
+                                                    "<pre>VAR_INPUT\n    str : STRING;\nEND_VAR</pre>"))
+    assert (d["kind"], d["return_type"]) == ("Function", "BYTE")
+    d = parse_declaration("LREAL_TO_FMTSTR", _page("LREAL_TO_FMTSTR",
+                          "<p>The function converts and formats a floating-point number …</p><h2>Return value</h2>"
+                          + _TBL.format(n="LREAL_TO_FMTSTR", t="STRING(510)", d="")
+                          + "<h2>Inputs</h2><pre>VAR_INPUT\n    in : LREAL;\n    iPrecision : INT;\nEND_VAR</pre>"))
+    assert (d["kind"], d["return_type"]) == ("Function", "STRING(510)") and "kind_note" not in d
+    assert d["declaration"].startswith("FUNCTION LREAL_TO_FMTSTR : STRING(510)")
+    # a return value and nothing that says function or method: a function, and the answer says it is not certain
+    d = parse_declaration("LrealIsFinite", _page("LrealIsFinite", "<h2>Return value</h2>"
+                          + _TBL.format(n="LrealIsFinite", t="BOOL", d="")
+                          + "<h2>Inputs</h2><pre>VAR_INPUT\n    x : REFERENCE TO LREAL;\nEND_VAR</pre>"))
+    assert d["kind"] == "Function" and d["return_type"] == "BOOL" and "does not say which" in d["kind_note"]
+    # a method page that says so, and one whose own code names it differently (a doc error)
+    d = parse_declaration("AddFilter", _page("AddFilter", "<p>Method for adding a filter.</p><h2>Return values</h2>"
+                          + _TBL.format(n="AddFilter", t="HRESULT", d="S_OK")))
+    assert (d["kind"], d["return_type"]) == ("Method", "HRESULT")
+    d = parse_declaration("SendMessageEx2", _page("SendMessageEx2", "<p>This method sends a message.</p>"
+                          "<pre>METHOD SendMessageEx : HRESULT\nVAR_INPUT\n    nTimeStamp : ULINT;\nEND_VAR</pre>"
+                          "<h2>Return value</h2>" + _TBL.format(n="SendMessageEx2", t="HRESULT", d="")))
+    assert d["kind"] == "Method" and d["return_type"] == "HRESULT"
+    # a title with the keyword in it
+    d = parse_declaration("FUNCTION F_GetVersionTcUtilities", _page("FUNCTION F_GetVersionTcUtilities",
+                          "<pre>VAR_INPUT\n    nVersionElement : INT;\nEND_VAR</pre><h2>Return value</h2>"
+                          + _TBL.format(n="F_GetVersionTcUtilities", t="UINT", d="")))
+    assert (d["name"], d["kind"], d["return_type"]) == ("F_GetVersionTcUtilities", "Function", "UINT")
+    # a real function block stays one
+    d = parse_declaration("FB_FileOpen", _page("FB_FileOpen", "<pre>VAR_INPUT\n    sNetId : T_AmsNetId;\nEND_VAR</pre>"))
+    assert d["kind"] == "FunctionBlock" and d["return_type"] is None
+
+
+def test_n101_a_page_about_a_pragma_documents_no_symbol():
+    """N101 (0.8.11 retest): infosys_get_page of "Attribute 'linkalways'" said kind GlobalVariable (its example is a
+    VAR_GLOBAL list); manual pages ('Transmitting structures to the PLC') were Structs, .NET pages Aliases (C#
+    'Type type' read as TYPE). A title that is a sentence documents no IEC symbol; IEC headers are in capitals."""
+    from twincat_mcp.infosys import classify, page_symbols, parse_declaration
+    d = parse_declaration("Attribute 'linkalways'", _page("Attribute 'linkalways'",
+                          "<pre>{attribute 'linkalways'}\nVAR_GLOBAL\n    nVar : INT;\nEND_VAR</pre>"))
+    assert d["kind"] == "Page" and d["members"] == [] and d["declaration"] is None
+    assert classify("Transmitting structures to the PLC", [("st", "TYPE PLCStruct :\nSTRUCT\n  a : INT;\nEND_STRUCT\nEND_TYPE")]) == "Page"
+    assert classify("AdsClient.ReadAny Method (UInt32, Type)", [("csharp", "public object ReadAny(uint indexGroup, Type type)\n{\n}")]) == "Page"
+    assert classify("Global_Constants", [("st", "VAR_GLOBAL CONSTANT\n    nMax : INT := 10;\nEND_VAR")]) == "GlobalVariable"
+    # the type of a type page, also under another name in its code (a doc error: T_DBConfig_Odbc shows TYPE T_DBConfig_NET_MySQL)
+    assert classify("T_DBConfig_Odbc", [("st", "TYPE T_DBConfig_NET_MySQL\nSTRUCT\n  n : UINT;\nEND_STRUCT\nEND_TYPE")]) == "Struct"
+    # IEC code marked cpp by the page is still IEC: the header is in capitals
+    assert classify("Release", [("cpp", "METHOD Release : HRESULT")]) == "Method"
+    assert page_symbols("F_GetCycleTime()") == {"f_getcycletime"} and page_symbols("GetHMI (4.1)") == {"gethmi"}
+    assert page_symbols("Data type __SYSTEM.ExceptionCode") == {"exceptioncode"}
+    assert page_symbols("KL6inData, KL6outData") == {"kl6indata", "kl6outdata"} and page_symbols("Static Analysis Light") == set()

@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (4, "8769f95d966b84f4")
+INFOSYS_FINGERPRINT = (5, "73859714c7745821")
 MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
 ESI_FINGERPRINT = ("1", "95a4f556032d311a")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
 
