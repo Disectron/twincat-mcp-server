@@ -3873,7 +3873,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         description from the page's table), struct members, enum values, return type, EXTENDS /
         IMPLEMENTS, methods (name, definition location, description) and properties (type, access,
         initial value) of an FB, plus the ST declaration text and the page URL. The thing to call
-        before writing code against an FB you have not used before."""
+        before writing code against an FB you have not used before. A name documented by different pages (two
+        libraries, two methods of one name) is refused as ambiguous with the candidates — pass library=; one page in
+        several books is one answer (same_page_in); also_in names the other libraries. The twincat-docs skill's
+        docs_declaration resolves names by the same rule."""
         return await app.docs_call("declaration", symbol, library, timeout=1800)
 
     @mcp.tool(annotations=READ)

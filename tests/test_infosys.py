@@ -553,3 +553,47 @@ def test_n101_a_page_about_a_pragma_documents_no_symbol():
     assert page_symbols("F_GetCycleTime()") == {"f_getcycletime"} and page_symbols("GetHMI (4.1)") == {"gethmi"}
     assert page_symbols("Data type __SYSTEM.ExceptionCode") == {"exceptioncode"}
     assert page_symbols("KL6inData, KL6outData") == {"kl6indata", "kl6outdata"} and page_symbols("Static Analysis Light") == set()
+
+
+def test_n100_one_page_in_two_books_is_one_answer_and_every_reader_agrees(idx):
+    """N100 (0.8.11 retest): the skill's docs_declaration called T_MaxString ambiguous — page 31062795 is in
+    tcplclib_tc2_system and in tf6510_tc3_iec61850 — and ADSREAD ambiguous with the C++ AdsRead page, while the plugin
+    answered both; the plugin in turn took the first of two different pages of one library (two methods IsBase64) and
+    counted Tc2_EtherCAT / Tc2_Ethercat as two libraries. One rule now (infosys.symbol_documents)."""
+    import json as _j
+    from twincat_mcp.infosys import symbol_documents
+    C = "https://infosys.beckhoff.com/content/1033/"
+
+    def put(book, pid, title, kind, lib, declaration):
+        d = {"name": title, "kind": kind, "declaration": declaration, "inputs": [], "outputs": [], "in_out": [],
+             "members": [], "enum_values": [], "description": {}}
+        with idx._db() as con:
+            con.execute("INSERT INTO pages(url, book, page_id, title, kind, library, markdown, text, code, decl, fetched) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (f"{C}{book}/{pid}.html", book, pid, title, kind, lib, "", "",
+                                                         "", _j.dumps(d) if kind != "Page" else None, 1))
+    put("tcplclib_tc2_system", "31062795", "T_MaxString", "Alias", "Tc2_System", "TYPE T_MaxString : STRING(MAX_STRING_LENGTH); END_TYPE")
+    put("tf6510_tc3_iec61850", "31062795", "T_MaxString", "Alias", "Tc2_System", "TYPE T_MaxString : STRING(MAX_STRING_LENGTH); END_TYPE")
+    d = idx.declaration("T_MaxString")
+    assert d["url"] == f"{C}tcplclib_tc2_system/31062795.html" and d["same_page_in"] == ["tf6510_tc3_iec61850"]
+    assert "also_in" not in d
+    # the C++ API's AdsRead documents no IEC symbol: ADSREAD is the FB
+    put("tcplclib_tc2_system", "30866571", "ADSREAD", "FunctionBlock", "Tc2_System", "FUNCTION_BLOCK ADSREAD")
+    put("tc3_c", "743169291", "AdsRead", "Page", None, None)
+    assert idx.declaration("ADSREAD")["url"] == f"{C}tcplclib_tc2_system/30866571.html"
+    assert idx.get_page("ADSREAD")["url"] == f"{C}tcplclib_tc2_system/30866571.html"
+    # one library, spelt two ways by its books, the same declaration: one answer
+    put("tcplclib_tc2_ethercat", "1", "FB_EcGetSlaveState", "FunctionBlock", "Tc2_EtherCAT", "FUNCTION_BLOCK FB_EcGetSlaveState VAR_INPUT sNetId : T_AmsNetId; END_VAR")
+    put("tf6250_tc3_modbus", "2", "FB_EcGetSlaveState", "FunctionBlock", "Tc2_Ethercat", "FUNCTION_BLOCK FB_EcGetSlaveState VAR_INPUT sNetId : T_AmsNetId; END_VAR")
+    d = idx.declaration("FB_EcGetSlaveState")
+    assert d["library"] == "Tc2_EtherCAT" and d["same_page_in"] == ["tf6250_tc3_modbus"] and "also_in" not in d
+    # one library, two different methods of one name (two FBs): nothing chosen, even with library=
+    put("tcplclib_tc3_jsonxml", "4220443531", "IsBase64", "Method", "Tc3_JsonXml", "METHOD IsBase64 : BOOL VAR_INPUT v : SJsonValue; END_VAR")
+    put("tcplclib_tc3_jsonxml", "4220804235", "IsBase64", "Method", "Tc3_JsonXml", "METHOD IsBase64 : BOOL VAR_INPUT n : POINTER TO BYTE; END_VAR")
+    for lib in (None, "Tc3_JsonXml"):
+        with pytest.raises(InfosysError, match=r"ambiguous: IsBase64 is documented by 2 different pages.*infosys_get_page"):
+            idx.declaration("IsBase64", library=lib)
+    # a title that writes the keyword or the call: the same symbol
+    put("tcplclib_tc2_utilities", "99", "FUNCTION F_GetVersionTcUtilities", "Function", "Tc2_Utilities", "FUNCTION F_GetVersionTcUtilities : UINT")
+    assert idx.declaration("F_GetVersionTcUtilities")["url"] == f"{C}tcplclib_tc2_utilities/99.html"
+    with idx._db() as con:
+        assert [[r["book"] for r in g] for g in symbol_documents(con, "t_maxstring")] == [["tcplclib_tc2_system", "tf6510_tc3_iec61850"]]

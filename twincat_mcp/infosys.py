@@ -637,6 +637,132 @@ def symbol_name(title: str) -> str | None:
     return next((x for x in re.findall(r"[A-Za-z_][\w.]*", title or "") if x.rsplit(".", 1)[-1].lower() == want), None)
 
 
+# -- which pages document a symbol: one rule for every reader (N100) ------------------------------------------------
+DOC_COLS = "rowid AS rid, url, book, page_id AS pid, title, kind, library, decl, version, crumb, markdown AS body"
+
+
+def _decl_text(decl: str | None) -> str:
+    try:
+        d = json.loads(decl) if decl else {}
+    except ValueError:
+        d = {}
+    return " ".join(str((d or {}).get("declaration") or "").split())
+
+
+_MD_LINK_TARGET = re.compile(r"\]\([^)\s]*\)")
+
+
+def _body_text(r: Any) -> str:
+    # a page's text without its link targets (a copy in another book links to that book's pages)
+    try:
+        md = r["body"] or ""
+    except (IndexError, KeyError):
+        return ""
+    return " ".join(_MD_LINK_TARGET.sub("]", md).split())
+
+
+def _doc_order(r: Any) -> tuple:
+    # the representative of one document: a page that names its library, a library's own book, then by book, page id
+    return (not r["library"], not str(r["book"]).startswith(("tcplclib_", "tc3plclib_")), len(r["book"] or ""),
+            r["book"] or "", r["pid"] or "")
+
+
+def same_documents(rows: list[Any]) -> list[list[Any]]:
+    """Rows (DOC_COLS) grouped into documents. Two pages are one document when they have the same page id (one
+    Beckhoff page in several books: T_MaxString 31062795 in tcplclib_tc2_system and tf6510_tc3_iec61850), or the
+    same library — compared without case, the books spell it both ways (Tc2_EtherCAT, Tc2_Ethercat) — and the same
+    stored declaration (a page with none: the same text, link targets aside) — the answer is the same whichever is
+    read; a page that names no library, with the declaration of exactly one library's page, is that page's copy.
+    Groups and their rows in _doc_order."""
+    parent = list(range(len(rows)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    seen: dict[tuple, int] = {}
+    libs_of: dict[str, set[str]] = {}
+    for i, r in enumerate(rows):
+        keys = [("pid", r["pid"])] if r["pid"] else []
+        d = _decl_text(r["decl"])
+        if d:
+            keys.append(("decl", (r["library"] or "").lower(), d))
+            if r["library"]:
+                libs_of.setdefault(d, set()).add(r["library"].lower())
+        else:
+            b = _body_text(r)                     # no declaration stored: the same text is the same page
+            if b:
+                keys.append(("text", (r["library"] or "").lower(), b))
+        for k in keys:
+            if k in seen:
+                parent[find(i)] = find(seen[k])
+            else:
+                seen[k] = i
+    # a page that names no library joins the one library whose page shows the same declaration (a product's copy of a
+    # library page: tc3_eventlogger next to tcplclib_tc3_eventlogger); with two such libraries it stays apart
+    for i, r in enumerate(rows):
+        d = _decl_text(r["decl"])
+        if d and not r["library"] and len(libs_of.get(d, ())) == 1:
+            parent[find(i)] = find(seen[("decl", next(iter(libs_of[d])), d)])
+    groups: dict[int, list[Any]] = {}
+    for i, r in enumerate(rows):
+        groups.setdefault(find(i), []).append(r)
+    out = [sorted(g, key=_doc_order) for g in groups.values()]
+    return sorted(out, key=lambda g: _doc_order(g[0]))
+
+
+def names_symbol(title: str, name: str) -> bool:
+    """Does a page with this title document the symbol `name` (IEC: without case)? 'MEMCPY', 'FUNCTION MEMCPY',
+    'MEMCPY()', 'FB_X.Start' for Start; a sentence title documents none (N101)."""
+    n = name.strip().lower()
+    t = " ".join((title or "").split()).lower()
+    if not n:
+        return False
+    if t == n:
+        return True
+    sym = (symbol_name(title) or "").lower()
+    return sym == n or ("." not in n and n in page_symbols(title))
+
+
+def symbol_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = None) -> list[list[Any]]:
+    """N100 (0.8.11 retest): the pages that document the IEC symbol `name`, as documents (same_documents) — the one
+    rule of infosys_declaration, infosys_get_page by name and the twincat-docs skill's docs_declaration / docs_page
+    (they disagreed: the skill called T_MaxString ambiguous — one page in two books — and ADSREAD — the C++ AdsRead
+    page documents no IEC symbol; the plugin took the first page of one library). A page documents it when it is
+    not a 'Page' and its title names it (names_symbol). keep: the caller's filter (library=, book=). More than one
+    document: the name is ambiguous, nothing is chosen (R23)."""
+    s = " ".join(name.split())
+    if not s:
+        return []
+    rows = {r["rid"]: r for r in con.execute(f"SELECT {DOC_COLS} FROM pages WHERE title = ? COLLATE NOCASE "
+                                             "AND kind != 'Page'", (s,))}
+    has_catalog = con.execute("SELECT 1 FROM sqlite_master WHERE name = 'catalog'").fetchone() is not None
+    src = "catalog" if has_catalog else "pages"
+    pat = "%" + _like(s.rsplit(".", 1)[-1]) + "%"
+    more = [r[0] for r in con.execute(f"SELECT rowid, title FROM {src} WHERE kind != 'Page' AND title LIKE ? "
+                                      "ESCAPE '\\' COLLATE NOCASE", (pat,))
+            if r[0] not in rows and names_symbol(r[1], s)]
+    for rid in more:
+        r = con.execute(f"SELECT {DOC_COLS} FROM pages WHERE rowid = ? AND kind != 'Page'", (rid,)).fetchone()
+        if r is not None:
+            rows[r["rid"]] = r
+    cands = [r for r in rows.values() if keep is None or keep(r)]
+    return same_documents(cands)
+
+
+def title_documents(con: Any, title: str, keep: Callable[[Any], bool] | None = None) -> list[list[Any]]:
+    """A page asked for by name: the symbol's documents (symbol_documents); when no page documents a symbol of that
+    name, the pages of exactly that title (a topic: "Attribute 'linkalways'"), one document per page id."""
+    docs = symbol_documents(con, title, keep)
+    if docs:
+        return docs
+    rows = [r for r in con.execute(f"SELECT {DOC_COLS} FROM pages WHERE title = ? COLLATE NOCASE",
+                                   (" ".join(title.split()),)) if keep is None or keep(r)]
+    return same_documents(rows)
+
+
 def _ident_matches(ident: str, title: str) -> bool:
     return bool(ident) and ident.lower() in page_symbols(title)
 
@@ -1832,42 +1958,54 @@ class InfosysIndex:
         return out
 
     def declaration(self, symbol: str, library: str | None = None) -> dict[str, Any]:
-        s = symbol.strip()
-        with self._db() as con:
-            where = "title = ? COLLATE NOCASE AND kind != 'Page'"
-            params: list[Any] = [s]
-            if library:
-                where += " AND (library = ? COLLATE NOCASE OR book = ? COLLATE NOCASE)"
-                params += [library, library]
-            rows = con.execute(f"SELECT url, title, kind, library, decl FROM pages WHERE {where} ORDER BY book", params).fetchall()
-        row = rows[0] if rows else None
-        if row is None:
-            found = self.search_symbols(s, library=library, limit=5)
-            exact = [it for it in found["items"] if it["name"].lower() == s.lower()]
-            if not exact:
-                complete = self.local is not None and self.index_complete()
-                raise InfosysError(f"no symbol page titled {s!r}" + (f" in {library}" if library else "") +
-                                   (f"; near: {[it['name'] for it in found['items']]}" if found["items"] else
-                                    (" in the complete index" if complete else "; " + self._not_indexed_hint())))
+        s = " ".join(symbol.split())
+        lib = (library or "").strip().lower()
+
+        def keep(r: Any) -> bool:
+            return not lib or (r["library"] or "").lower() == lib or (r["book"] or "").lower() == lib
+
+        def documents() -> tuple[list[list[Any]], list[list[Any]]]:
             with self._db() as con:
-                row = con.execute("SELECT url, title, kind, library, decl FROM pages WHERE url = ?", (exact[0]["url"],)).fetchone()
-            rows = [row]
-        libs = sorted({r["library"] for r in rows if r["library"]})
-        if len(libs) > 1 and not library:
+                every = symbol_documents(con, s)          # N100: the one rule of every reader
+            return every, [g for g in ([r for r in g if keep(r)] for g in every) if g]
+
+        every, docs = documents()
+        if not docs:
+            found = self.search_symbols(s, library=library, limit=5)    # indexes the default books first (web cache)
+            if found.get("auto_indexed"):
+                every, docs = documents()
+        if not docs:
+            complete = self.local is not None and self.index_complete()
+            raise InfosysError(f"no symbol page titled {s!r}" + (f" in {library}" if library else "") +
+                               (f"; near: {[it['name'] for it in found['items']]}" if found["items"] else
+                                (" in the complete index" if complete else "; " + self._not_indexed_hint())))
+        if len(docs) > 1:
             # R23 (0.8.8 retest): MC_MoveAbsolute exists in Tc2_MC2 and Tc3_DriveMotionControl with different
-            # parameters — returning the first one let code be written against the wrong FB. Nothing is chosen.
-            cands = [f"{r['library']} ({r['url']})" for r in rows if r["library"]]
-            raise InfosysError(f"ambiguous: {s} is documented in {len(libs)} libraries: {cands} — nothing was chosen. "
-                               "Pass library= with the one the project uses (proj_libraries lists them) and say which "
-                               "one you used.")
+            # parameters — returning the first one let code be written against the wrong FB. Nothing is chosen. One
+            # page in several books, or one library's declaration on several pages, is one document (N100).
+            cands = [f"{g[0]['library'] or g[0]['book']} ({g[0]['url']})" for g in docs]
+            libs = {(g[0]["library"] or "").lower() for g in docs}
+            where = (f"in {len(docs)} libraries" if len(libs) == len(docs) and "" not in libs
+                     else f"by {len(docs)} different pages")
+            raise InfosysError(f"ambiguous: {s} is documented {where}: {cands} — nothing was chosen. Pass library= "
+                               "with the one the project uses (proj_libraries lists them) and say which one you used"
+                               + ("" if len(libs) == len(docs) else "; pages of one library: open the one meant with "
+                                  "infosys_get_page(<url>)") + ".")
+        row = docs[0][0]
         decl = json.loads(row["decl"]) if row["decl"] else {"name": row["title"], "kind": row["kind"], "declaration": None}
         decl.update({"url": row["url"], "library": row["library"]})
-        with self._db() as con:
-            same = con.execute("SELECT DISTINCT library FROM pages WHERE title = ? COLLATE NOCASE AND kind != 'Page' "
-                               "AND library IS NOT NULL AND library != ?", (s, row["library"] or "")).fetchall()
-        others = sorted(r["library"] for r in same if r["library"])
+        chosen = {r["rid"] for r in docs[0]}
+        mine = (row["library"] or "").lower()
+        others: dict[str, str] = {}
+        for g in every:
+            for r in g:
+                if r["rid"] not in chosen and r["library"] and r["library"].lower() != mine:
+                    others.setdefault(r["library"].lower(), r["library"])
         if others:
-            decl["also_in"] = others              # the other libraries with a symbol of this name
+            decl["also_in"] = sorted(others.values())     # the other libraries with a symbol of this name
+        copies = [r["book"] for r in docs[0][1:]]
+        if copies:
+            decl["same_page_in"] = copies                 # the same document in other books (N100)
         if self.local is not None:
             with self._db() as con:
                 v = con.execute("SELECT version FROM pages WHERE url = ?", (row["url"],)).fetchone()
@@ -1969,16 +2107,19 @@ class InfosysIndex:
                 return hits[0]
             raise InfosysError(f"no page id {r} in the " + ("local Help Viewer package" if self.local is not None
                                                              else "Infosys sitemap"))
-        # a symbol name
+        # a symbol name, else a page title — the rule of every reader (N100)
         with self._db() as con:
-            row = con.execute("SELECT url FROM pages WHERE title = ? COLLATE NOCASE AND kind != 'Page' ORDER BY book",
-                              (r,)).fetchone()
-        if row:
-            return row["url"]
+            docs = title_documents(con, r)
+        if not docs and self.search_symbols(r, limit=3).get("auto_indexed"):     # the default books, indexed first
+            with self._db() as con:
+                docs = title_documents(con, r)
+        if len(docs) == 1:
+            return docs[0][0]["url"]
+        if docs:
+            raise InfosysError(f"ambiguous: {len(docs)} different pages are titled {r!r}: "
+                               f"{[g[0]['url'] for g in docs][:20]} — nothing was chosen; pass the URL or 'book/id' of "
+                               "the one meant (for a symbol: the library the project uses, proj_libraries)")
         found = self.search_symbols(r, limit=3)
-        exact = [it for it in found["items"] if it["name"].lower() == r.lower()]
-        if exact:
-            return exact[0]["url"]
         raise InfosysError(f"{ref!r} is neither an Infosys URL, 'book/id', a page id nor an indexed symbol name"
                            + (f"; near: {[it['name'] for it in found['items']]}" if found["items"] else ""))
 

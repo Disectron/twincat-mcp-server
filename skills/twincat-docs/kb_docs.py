@@ -20,8 +20,8 @@ usage:
 Exit code 0 with the answer, 1 with {"error": code, "message": ..., [...]}. Values with spaces go in quotes:
   python kb_docs.py docs_search "query=fbRead( READ := FALSE )" limit=3
 
-Deliberate behaviour: a name that exists in several books is never resolved silently (error 'ambiguous' with the
-candidates), filters are applied before the row limit so 'total' is exact, out-of-range parameters are refused instead
+Deliberate behaviour: a name documented by different pages is never resolved silently (error 'ambiguous' with the
+candidates; one page in several books is one page — the plugin's rule, twincat_mcp.infosys.symbol_documents), filters are applied before the row limit so 'total' is exact, out-of-range parameters are refused instead
 of clamped, an invalid FTS5 query is retried once as a literal phrase, a query of nothing but stop words is refused
 (the rule of the twincat server's kb_search).
 """
@@ -48,7 +48,9 @@ from typing import Any, Callable
 
 VERSION = "5"           # 2: index state in every answer, links as refs, builders shipped beside it; 3: Python 3.12+
                         # 4: the plugin's one Infosys index (index\\infosys-<lcid>.db), the permanent layout (0.8.11)
-                        # 5: hw_* commands on the ESI index (index\\esi.db), its state in status (0.8.12)
+                        # 5: hw_* commands on the ESI index (index\\esi.db), its state in status; a name resolved by the
+                        #    plugin's rule (one page in several books is one page; a symbol is documented by a symbol
+                        #    page), as infosys_declaration does (0.8.12, N100)
 FALLBACK_KB = r"D:\TwinCAT-MCP\knowledge"
 WEB = "https://infosys.beckhoff.com/content/{lcid}/{book}/{pid}.html"
 BUILDERS = Path(__file__).resolve().parent / "builders"
@@ -58,6 +60,7 @@ if "twincat_mcp" not in sys.modules and (_PLUGIN / "twincat_mcp" / "kb_layout.py
     sys.path.insert(0, str(_PLUGIN))
 from twincat_mcp import esi_index as ESI  # noqa: E402 — the ESI index: one implementation (the server's hw_* tools)
 from twincat_mcp import infosys_build as IB  # noqa: E402 — the index's state: one implementation for every reader
+from twincat_mcp import infosys as INF  # noqa: E402 — which pages document a name: the plugin's one rule (N100)
 from twincat_mcp import kb_layout as L  # noqa: E402 — where everything is: one place
 from twincat_mcp import kb_lock as KL  # noqa: E402 — whether a build runs: the OS lock, never a guess
 BUILD_INFOSYS = (f'<Python 3.12+> "{BUILDERS / "infosys_local.py"}" index --kb "<kb>"   (reads the Help Viewer package '
@@ -69,9 +72,11 @@ BUILD_MANUALS = (r"copy the PDF manuals into <kb>\manuals\ (sub-folders allowed)
 RULES = [
     "Documentation questions use this skill; ads_* tools read the running PLC only and never return documentation.",
     "Known symbol -> docs_declaration; unknown -> docs_search -> ref -> docs_page section=...",
-    "A name in several books is never resolved silently: 'ambiguous' + candidates. Pick the library the project "
-    "uses (proj_libraries), call again with book= or ref=, and say which one you used.",
-    "also_in lists the other books that have a page with the same title.",
+    "A name documented by different pages is never resolved silently: 'ambiguous' + candidates. Pick the library "
+    "the project uses (proj_libraries), call again with book= or ref=, and say which one you used. One page in "
+    "several books is one page (same_page_in); a symbol is documented by its symbol page, not by a C++/.NET page of "
+    "that title — the rule of the plugin's infosys_declaration.",
+    "also_in lists the other pages of that title or symbol (same_document: the same page or declaration).",
     "Every item has ref = book/pageid; docs_page accepts that ref, an Infosys URL, a bare page id, an exact title "
     "and ms-xhelp:///?Id=... links.",
     "Cite ref + url in the answer.",
@@ -603,7 +608,8 @@ def run_fts(con: sqlite3.Connection, sql: str, query: str, extra: list[Any]) -> 
 # ---------------------------------------------------------------------------------------------- Infosys
 # the plugin's index: pages(url, book, page_id, title, version, crumb, markdown, kind, library, …), pages_fts
 # (title, text, code — external content), helpids(help_id, url). A page row as the commands use it:
-_PAGE = "SELECT rowid AS rid, url, book, page_id AS pid, title, version, crumb, markdown AS body, kind, library FROM pages"
+_PAGE = ("SELECT rowid AS rid, url, book, page_id AS pid, title, version, crumb, markdown AS body, kind, library, decl "
+         "FROM pages")
 _LINK_MD = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
 
 
@@ -663,19 +669,23 @@ def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref") -> tuple[sq
                 if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())]
         return _pick(ctx, rows, ref, book, "page id", what)
     _check_book_glob(con, book)
-    rows = [r for r in con.execute(f"{_PAGE} WHERE title = ? COLLATE NOCASE", (s,)).fetchall()
-            if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())]
-    return _pick(ctx, rows, ref, book, "title", what)
+    keep = (lambda r: fnmatch.fnmatch(r["book"].lower(), book.lower())) if book else None
+    # N100: the plugin's rule — a symbol is documented by its symbol pages (a C++ 'AdsRead' page is no ADSREAD), one
+    # page in several books is one page; a page asked for by name: the symbol's page, else the pages of that title
+    docs = (INF.symbol_documents if what == "symbol" else INF.title_documents)(con, s, keep)
+    rows = [con.execute(f"{_PAGE} WHERE rowid = ?", (r["rid"],)).fetchone() for g in docs for r in g]
+    return _pick(ctx, [r for r in rows if r is not None], ref, book, "symbol" if what == "symbol" else "title", what)
 
 
 def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: str, what: str) -> tuple[sqlite3.Row, str]:
-    if len(rows) == 1:
-        return rows[0], how
+    docs = INF.same_documents(rows)          # N100: the same page in several books (T_MaxString) is one answer
+    if len(docs) == 1:
+        return docs[0][0], how
     if not rows:
         con = ctx.con("infosys")
         near = []
         word = query_text(ref).strip()
-        if how == "title" and len(word) >= 3 and has_words(word):
+        if how in ("title", "symbol") and len(word) >= 3 and has_words(word):
             # N35: the FTS title column, not a LIKE scan over every page body
             expr = "title : " + " ".join('"' + w.replace('"', '""') + '"*' for w in re.findall(r"[^\W_]+", word))
             try:
@@ -687,16 +697,30 @@ def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: st
                     if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())][:8]
         raise Err("not_found", f"no page for {what} {ref!r}" + (f" in books {book!r}" if book else "") + f" (looked up as {how})",
                   near=near, hint=f"docs_search query={word!r} finds pages by their text")
-    cands = [_cand(ctx, r) for r in _order(rows)]
-    raise Err("ambiguous", f"{len(rows)} pages match {what} {ref!r} ({how}); nothing was chosen — pick the library the "
-              "project uses (proj_libraries) and call again with book=<book> or ref=<ref>, and say which one you used",
-              candidates=cands[:20])
+    cands = []
+    for g in docs:
+        c = _cand(ctx, g[0])
+        if len(g) > 1:
+            c["same_page_in"] = [f"{x['book']}/{x['pid']}" for x in g[1:]]
+        cands.append(c)
+    raise Err("ambiguous", f"{len(docs)} pages match {what} {ref!r} ({how}; one page in several books counts once); "
+              "nothing was chosen — pick the library the project uses (proj_libraries) and call again with book=<book> "
+              "or ref=<ref>, and say which one you used", candidates=cands[:20])
 
 
 def _also_in(con: sqlite3.Connection, r: sqlite3.Row) -> list[dict[str, Any]]:
-    rows = con.execute(f"{_PAGE} WHERE title = ? COLLATE NOCASE AND NOT (book = ? AND page_id = ?)",
-                       (r["title"], r["book"], r["pid"])).fetchall()
-    return [{"ref": f"{x['book']}/{x['pid']}", "book": x["book"], "version": x["version"] or None} for x in _order(rows)]
+    """The other pages of this title or symbol; same_document: the same page (another book) or the same library's same
+    declaration (N100)."""
+    rows = {x["rid"]: x for x in con.execute(f"{_PAGE} WHERE title = ? COLLATE NOCASE", (r["title"],))}
+    for g in INF.symbol_documents(con, INF.symbol_name(r["title"]) or r["title"]):
+        for x in g:
+            rows.setdefault(x["rid"], x)
+    rows.setdefault(r["rid"], r)
+    mine = next(g for g in INF.same_documents(list(rows.values())) if any(x["rid"] == r["rid"] for x in g))
+    same = {x["rid"] for x in mine}
+    return [{"ref": f"{x['book']}/{x['pid']}", "book": x["book"], "version": x["version"] or None,
+             **({"same_document": True} if x["rid"] in same else {})}
+            for x in _order([x for x in rows.values() if x["rid"] != r["rid"]])]
 
 
 def _links(con: sqlite3.Connection, text: str, limit: int = 30) -> list[dict[str, Any]]:

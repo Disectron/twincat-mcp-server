@@ -102,8 +102,11 @@ def test_docs_page_refs_sections_and_paging(kbdir):
     assert r["breadcrumb"] == "PLC Lib: Tc2_System > ADS > ADSREAD"
     rc, r = run(kbdir, "docs_page", "ref=ms-xhelp:///?Id=beckhoff-f599-48a7-92f2-48aa9133ca8a")
     assert rc == 0 and r["ref"] == "tcplclib_tc2_system/31059723" and r["title"] == "T_AmsNetID"
+    # N100: two pages are titled ADSREAD — the Tc2_System FB and the C++ API's AdsRead, which documents no IEC
+    # symbol: the name is the FB's (as infosys_get_page answers), the C++ page is named beside it
     rc, r = run(kbdir, "docs_page", "ref=ADSREAD")
-    assert rc == 1 and r["error"] == "ambiguous" and {c["book"] for c in r["candidates"]} == {"tcplclib_tc2_system", "tc3_c"}
+    assert rc == 0 and r["ref"] == "tcplclib_tc2_system/30866571" and r["resolved_by"] == "title"
+    assert [(a["ref"], a.get("same_document")) for a in r["also_in"]] == [("tc3_c/743169291", None)]
     for ref in ("30866571", "https://infosys.beckhoff.com/content/1033/tcplclib_tc2_system/30866571.html", "ADSREAD"):
         extra = ["book=tcplclib_tc2_system"] if ref == "ADSREAD" else []
         rc, r = run(kbdir, "docs_page", f"ref={ref}", *extra)
@@ -356,3 +359,31 @@ def test_hw_commands_read_the_esi_index_with_its_state(kbdir, tmp_path):
     rc, r = run(kbdir, "hw_lookup", "query=EL3356-0010", "limit=1")
     assert rc == 0 and r["source"]["state"] == "outdated" and "OUTDATED" in r["source"]["state_note"]
     assert {k: v for k, v in _digest(kbdir).items() if "EL34xx" not in k} == before
+
+
+def test_n100_docs_declaration_follows_the_plugins_rule(kbdir):
+    """N100 (0.8.11 retest): docs_declaration T_MaxString was 'ambiguous' — the same page id in two books (a library's
+    page copied into another product's book) — and ADSREAD ambiguous with the C++ AdsRead page, while infosys_declaration
+    answered both. The skill resolves a name with the plugin's rule (infosys.symbol_documents)."""
+    import shutil
+    import sqlite3
+    db = next((kbdir / "index").glob("infosys-*.db"))
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT url, book, page_id, title, kind, library, markdown, text, code, decl, fetched, version, crumb "
+                      "FROM pages WHERE book = 'tcplclib_tc2_system' AND page_id = '30866571'").fetchone()
+    copy = list(row)
+    copy[0] = row[0].replace("tcplclib_tc2_system", "tf6510_tc3_iec61850")
+    copy[1] = "tf6510_tc3_iec61850"
+    con.execute("INSERT INTO pages(url, book, page_id, title, kind, library, markdown, text, code, decl, fetched, version, "
+                "crumb) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", copy)
+    con.commit()
+    con.close()
+    for sym in ("ADSREAD", "adsread"):
+        rc, r = run(kbdir, "docs_declaration", f"symbol={sym}")
+        assert rc == 0 and r["ref"] == "tcplclib_tc2_system/30866571" and r["resolved_by"] == "symbol", r
+        also = {a["ref"]: a.get("same_document") for a in r["also_in"]}
+        assert also == {"tf6510_tc3_iec61850/30866571": True, "tc3_c/743169291": None}, also
+    rc, r = run(kbdir, "docs_page", "ref=30866571")           # a bare page id of a copied page: one page
+    assert rc == 0 and r["ref"] == "tcplclib_tc2_system/30866571"
+    rc, r = run(kbdir, "docs_declaration", "symbol=MC_MoveAbsolute")    # two libraries: still refused
+    assert rc == 1 and r["error"] == "ambiguous" and len(r["candidates"]) == 2

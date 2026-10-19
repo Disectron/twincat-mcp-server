@@ -46,11 +46,14 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 ## Rules
 1. Documentation → this skill. Live PLC values and types → the ads_* tools.
 2. Symbol known → `docs_declaration`. Unknown → `docs_search` → take a `ref` → `docs_page section=`.
-3. `ambiguous` = the name exists in several books (Tc2_MC2 vs Tc3_DriveMotionControl, a PLC library vs the C++
-   docs). Nothing was chosen for you. Find the library the project uses (`proj_libraries` of the twincat server, or
-   ask), call again with `book=` or `ref=`, and say in the answer which library you used. Never write code against
-   the first candidate by guess.
-4. `also_in` lists other books with a page of the same title. Mention it when the library matters.
+3. `ambiguous` = the name is documented by different pages (Tc2_MC2 vs Tc3_DriveMotionControl, or two methods of
+   that name in one library). Nothing was chosen for you. Find the library the project uses (`proj_libraries` of the
+   twincat server, or ask), call again with `book=` or `ref=`, and say in the answer which library you used. Never
+   write code against the first candidate by guess. Not ambiguous — the plugin's `infosys_declaration` rule: one
+   page in several books (`same_page_in`), the same declaration of one library on several pages, and pages that
+   document no IEC symbol (the C++ `AdsRead` beside ADSREAD) when a symbol of that name is asked for.
+4. `also_in` lists the other pages of that title or symbol (`same_document: true` = the same page or declaration).
+   Mention it when the library matters.
 5. Every item has `ref` (book/pageid). Any `ref`, Infosys URL or `ms-xhelp:///?Id=…` link opens with `docs_page`. Follow a
    page's `links` (`text`, `ref`) with `docs_page ref=…`.
 6. Cite `ref` and `url` in the answer.
