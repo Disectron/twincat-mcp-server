@@ -598,11 +598,13 @@ async def test_watch_and_wait_use_notifications_and_let_writes_through(monkeypat
             res["wait"] = payload(await s.call_tool("ads_wait_until", {"name": "MAIN.nCycle", "op": "==", "value": 7, "timeout_ms": 5000}))
 
         async def watch():
-            res["watch"] = payload(await s.call_tool("ads_watch", {"names": ["MAIN.nCycle"], "duration_ms": 1500}))
+            res["watch"] = payload(await s.call_tool("ads_watch", {"names": ["MAIN.nCycle"], "duration_ms": 3000}))
         async with anyio.create_task_group() as tg:
             tg.start_soon(wait)
             tg.start_soon(watch)
-            await anyio.sleep(0.5)
+            # the watch's window opens once its notifications are registered (the first rec start scans the project):
+            # on a slow Windows runner that took longer than the 0.5 s this test waited, and the write landed before it
+            await anyio.sleep(1.5)
             w = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 7})
             assert not w.is_error, text(w)
         assert res["wait"]["met"] and res["wait"]["method"] == "ADS change notification" and res["wait"]["elapsed_ms"] < 4000
