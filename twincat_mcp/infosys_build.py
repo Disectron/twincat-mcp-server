@@ -166,7 +166,7 @@ def state(final: Path, local: Any = None, package: Path | None = None) -> dict[s
                               "pages_done": int(info.get("pages_done") or 0) if running else _count_pages(building),
                               "pages_total": int(info.get("pages_total") or bm.get("pages_total") or 0)}
         if running:
-            rb.update(state="running", phase=info.get("phase") or "pages", pid=info.get("pid"),
+            rb.update(state="running", phase=info.get("phase") or "starting", pid=info.get("pid"),
                       seconds_since_progress=round(time.time() - beat) if beat else None)
         else:
             try:

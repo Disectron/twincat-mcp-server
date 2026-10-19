@@ -74,6 +74,41 @@ def test_a_reader_in_the_same_process_never_releases_the_builders_lock(tmp_path)
     assert not kb_lock.held(lock)
 
 
+def test_n104_two_readers_asking_at_once_never_see_a_build(tmp_path):
+    """N104 (0.8.11 retest): an infosys_declaration answer said "a build is RUNNING (pages, 0 of ? pages)" while none
+    ran — a reader probed the lock by taking it exclusively, so a second reader probing in the same microseconds was
+    refused and took the first for a build (no progress text: '0 of ?'). Readers ask with a shared lock now: only a
+    build's exclusive lock refuses it. A reader's probe in another process is held open here the whole time."""
+    import os
+    import threading
+    lock = tmp_path / "x.db.lock"
+    lock.write_bytes(b"")
+    script = textwrap.dedent(f"""
+        import os, sys
+        sys.path.insert(0, {str(ROOT)!r})
+        from twincat_mcp import kb_lock
+        fd = os.open({str(lock)!r}, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        assert kb_lock._try_shared(fd)
+        print("probing", flush=True)
+        sys.stdin.readline()
+        kb_lock._release_shared(fd)
+    """)
+    proc = subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                            cwd=str(ROOT))
+    try:
+        assert proc.stdout.readline().strip() == "probing"
+        assert not kb_lock.held(lock) and not kb_lock.held(lock)     # the other reader's probe is no build
+    finally:
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        proc.wait(timeout=30)
+    # a build that meets a reader's probe waits for it (a probe lasts microseconds; held here for 0.3 s)
+    fd = os.open(lock, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    assert kb_lock._try_shared(fd)
+    threading.Timer(0.3, lambda: (kb_lock._release_shared(fd), os.close(fd))).start()
+    with kb_lock.IndexLock(lock) as lk:
+        assert kb_lock.held(lock) and lk.info["phase"] == "starting"
+
 # ---------------------------------------------------------------------------------------------- kb_layout move
 def _wal_db(path: Path) -> sqlite3.Connection:
     """A WAL-mode database whose last commit is only in the -wal (the connection stays open, no checkpoint)."""

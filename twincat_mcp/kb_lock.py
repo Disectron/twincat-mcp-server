@@ -7,9 +7,15 @@ two builds that both believe they hold it, no live build that looks dead because
 (LOCK_AT), so reading the progress never meets it (Windows locks are mandatory). The file is never deleted — deleting
 an open lock file lets a second build lock a new file of the same name — and is empty when no build runs.
 
+A build holds the lock exclusively; a reader asks with a SHARED lock (held()), so two readers asking at the same
+moment never see each other as a build (N104, 0.8.11: an answer said "a build is RUNNING (0 of ? pages)" when the
+reader's probe met another reader's probe) — only an exclusive lock refuses a shared one. A build that meets a reader's
+probe (microseconds) retries for about a second.
+
 POSIX: flock (per open file, so a reader in the same process that opens and closes the file never releases the
-build's lock, as fcntl/lockf locks would). Windows: msvcrt.locking. Standard library only: the server, the docs skill
-script and both builders import it.
+build's lock, as fcntl/lockf locks would; LOCK_SH for readers). Windows: msvcrt.locking for the build (LockFile,
+exclusive) and LockFileEx without LOCKFILE_EXCLUSIVE_LOCK for readers, on the same byte. Standard library only: the
+server, the docs skill script and both builders import it.
 """
 from __future__ import annotations
 
@@ -39,6 +45,35 @@ if os.name == "nt":
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         except OSError:
             pass
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t), ("Offset", wintypes.DWORD),
+                    ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                ctypes.POINTER(_OVERLAPPED)]
+    _k32.LockFileEx.restype = wintypes.BOOL
+    _k32.UnlockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.POINTER(_OVERLAPPED)]
+    _k32.UnlockFileEx.restype = wintypes.BOOL
+    _LOCKFILE_FAIL_IMMEDIATELY = 0x1
+
+    def _ov() -> _OVERLAPPED:
+        ov = _OVERLAPPED()
+        ov.Offset, ov.OffsetHigh = LOCK_AT & 0xFFFFFFFF, LOCK_AT >> 32
+        return ov
+
+    def _try_shared(fd: int) -> bool:
+        ov = _ov()
+        return bool(_k32.LockFileEx(msvcrt.get_osfhandle(fd), _LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, ctypes.byref(ov)))
+
+    def _release_shared(fd: int) -> None:
+        ov = _ov()
+        _k32.UnlockFileEx(msvcrt.get_osfhandle(fd), 0, 1, 0, ctypes.byref(ov))
 else:
     import fcntl
 
@@ -54,6 +89,15 @@ else:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass
+
+    def _try_shared(fd: int) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    _release_shared = _release
 
 
 class Held(RuntimeError):
@@ -115,7 +159,8 @@ class IndexLock:
 
 
 def held(path: Path) -> bool:
-    """Is a build holding this lock right now? (A missing file: no.) Takes and drops the lock to find out."""
+    """Is a build holding this lock right now? (A missing file: no.) Takes and drops a shared lock to find out: it is
+    refused only by a build's exclusive lock, never by another reader asking at the same moment."""
     p = Path(path)
     if not p.is_file():
         return False
@@ -124,8 +169,8 @@ def held(path: Path) -> bool:
     except OSError:
         return False
     try:
-        if _try(fd):
-            _release(fd)
+        if _try_shared(fd):
+            _release_shared(fd)
             return False
         return True
     finally:
