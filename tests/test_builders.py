@@ -118,7 +118,7 @@ def test_build_state_up_to_date_rebuild_needed_and_outdated(kb, tmp_path):
     p = build(kb, pkg)
     assert p.returncode == 0, p.stderr
     s = state(kb)
-    assert s["state"] == "complete" and s["pages"] == 8 and "rebuild" not in s, s
+    assert s["state"] == "complete" and s["pages"] == 9 and "rebuild" not in s, s
     assert s["links"] == 2 and s["links_resolved"] == 1          # ms-xhelp links (relative ones: resolved while parsed)
     assert "up to date" in build(kb, pkg).stdout
     # an index of an older format is used as it is and said to need a rebuild — never rebuilt by a reader
@@ -139,7 +139,7 @@ def test_build_state_up_to_date_rebuild_needed_and_outdated(kb, tmp_path):
     s = state(kb)
     assert s["state"] == "outdated" and "package changed" in s["message"]
     assert kbdocs(kb, "docs_books")["source"]["state"] == "outdated"
-    assert "the Help Viewer package changed" in build(kb, pkg).stdout and state(kb)["pages"] == 9
+    assert "the Help Viewer package changed" in build(kb, pkg).stdout and state(kb)["pages"] == 10
 
 
 def _wait_progress(lock: Path, proc: subprocess.Popen, timeout: float = 120) -> dict:
@@ -188,7 +188,7 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
     _hold(proc)                              # its lock stays fresh for 120 s
     running = state(kb)
     assert running["rebuild"]["state"] == "running" and running["state"] == "outdated", running
-    assert "RUNNING" in running["message"] and running["pages"] == 8          # the complete index is still the one in use
+    assert "RUNNING" in running["message"] and running["pages"] == 9          # the complete index is still the one in use
     # a second build while one runs is refused
     second = build(kb, pkg)
     assert second.returncode == 1 and "another build is running" in second.stderr
@@ -200,7 +200,7 @@ def test_interrupted_force_rebuild_keeps_the_complete_index_and_is_reported(kb, 
     if lock.exists():
         os.utime(lock, (time.time() - 600, time.time() - 600))
     st = state(kb)
-    assert st["rebuild"]["state"] == "interrupted" and st["pages"] == 8 and "INTERRUPTED" in st["message"], st
+    assert st["rebuild"]["state"] == "interrupted" and st["pages"] == 9 and "INTERRUPTED" in st["message"], st
     assert kbdocs(kb, "status")["infosys_state"]["rebuild"]["state"] == "interrupted"
     assert kbdocs(kb, "docs_declaration", "symbol=ADSWRITE")["ref"] == "tcplclib_tc2_system/30866572"
     # the next plain `index` builds again — resuming the interrupted build, never "up to date" over a half index
