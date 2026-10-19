@@ -1045,7 +1045,8 @@ class Knowledge:
         except KnowledgeError as exc:
             return {"state": "unknown", "message": str(exc)}
         st = E.state(L.index_file(loc, "esi"), loc, self.esi_dirs)
-        st["sources"] = [{"folder": str(f), "source": s} for f, s in E.source_folders(loc, self.esi_dirs)]
+        st["sources"] = [{"folder": str(f), "source": s} for f, s in
+                         E.source_folders(loc, self.esi_dirs, E.recorded_twincat(L.index_file(loc, "esi")))]
         return st
 
     def esi_build(self, force: bool = False, log: Any = None) -> dict[str, Any]:

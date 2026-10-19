@@ -619,8 +619,8 @@ def parse_device(dev: Any, templates: dict[str, Any], file: Path, vendor: Vendor
     gt = _txt(_kid(dev, "GroupType"))
     dic, dconf = _join([parse_dictionary(_kid(x, "Dictionary")) for x in profs], "index")
     diag, gconf = _join([parse_diag_messages(_kid(x, "DiagMessages")) for x in profs], "text_id")
-    dfiles = [f for f in (_txt(_kid(x, "DictionaryFile")) for x in profs) if f]
-    gfiles = [f for f in (_txt(_kid(x, "DiagFile")) for x in profs) if f]
+    dfiles = list(dict.fromkeys(f for f in (_txt(_kid(x, "DictionaryFile")) for x in profs) if f))  # each once
+    gfiles = list(dict.fromkeys(f for f in (_txt(_kid(x, "DiagFile")) for x in profs) if f))
     rec = {
         "type": typ, "name": _lang(dev, "Name"), "name_de": _lang(dev, "Name", _LCID_DE) or None,
         "product_code": _num(t.get("ProductCode")), "revision": _num(t.get("RevisionNo")),
@@ -1192,7 +1192,9 @@ def build(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = Non
         files = xml_files(folders)
         stamp = sources_stamp(files)
         meta = read_meta(final)
-        current = meta.get("format") == FORMAT and meta.get("state") == "complete"
+        # current: this format, complete, and read with TwinCAT's folders as asked (--twincat / --no-twincat change it)
+        current = (meta.get("format") == FORMAT and meta.get("state") == "complete"
+                   and meta.get("twincat", "1") == ("1" if twincat else "0"))
         if not force and current and meta.get("sources_stamp") == stamp:
             log(f"up to date: {final} ({meta.get('devices')} device revisions from {meta.get('files')} files)")
             out: dict[str, Any] = {"result": "up_to_date", "index": str(final), "devices": _int(meta.get("devices"))}
@@ -1370,7 +1372,7 @@ def state(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = Non
                               "seconds_since_progress": round(time.time() - beat) if beat else None}
         else:
             bm = read_meta(building)
-            if stamp_now is None and final.is_file():
+            if stamp_now is None:              # also with no index yet: a finished first build waits to replace it
                 stamp_now = sources_stamp(xml_files(source_folders(kb, extra, twincat)))
             if out["state"] == "complete":
                 rbs = "stale"                    # build() returns up_to_date and discards it
@@ -1803,6 +1805,9 @@ class EsiIndex:
                 if r["diag_set"]:
                     rec["diag_messages"] = con.execute("SELECT messages FROM diag_sets WHERE id = ?",
                                                        (r["diag_set"],)).fetchone()[0]
+                for k in ("dictionary_conflicts", "diag_conflicts"):     # what the module's profiles give differently
+                    if data.get(k):
+                        rec[k] = data[k]
                 out.append(rec)
         res: dict[str, Any] = {"ident": _hx(mi, 8), "found": len(rows), "modules": out}
         if device:

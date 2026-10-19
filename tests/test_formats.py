@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # (format version, fingerprint of the code that produces it)
 INFOSYS_FINGERPRINT = (5, "dde9d4f83ffa8648")
 MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
-ESI_FINGERPRINT = ("1", "82397878b1ff6a61")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
+ESI_FINGERPRINT = ("1", "12f26f31cd9afc7d")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
 
 EXCLUDE = frozenset({
     "_db", "_Conn", "_file_sig", "_probe", "_writable", "missing_text", "ro_uri", "source", "has_fts", "_bump_gen",

@@ -699,8 +699,16 @@ def same_documents(rows: list[Any]) -> list[list[Any]]:
 
     seen: dict[tuple, list[int]] = {}
     libs_of: dict[str, set[str]] = {}
+    # the page id first, for every row: the same Beckhoff page is one document whatever the order of the rows (a
+    # declaration or text match must not take a book a true copy needs — second review 0.8.12)
     for i, r in enumerate(rows):
-        keys = [("pid", r["pid"])] if r["pid"] else []
+        if r["pid"]:
+            for j in seen.get(("pid", r["pid"]), []):
+                if union(j, i):
+                    break
+            seen.setdefault(("pid", r["pid"]), []).append(i)
+    for i, r in enumerate(rows):
+        keys = []
         d = _decl_text(r["decl"])
         if d:
             keys.append(("decl", (r["library"] or "").lower(), d))

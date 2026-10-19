@@ -18,13 +18,15 @@ from .project_backend import ProjectError
 from .safety import OpClass
 
 
-# the qualifier in front of a name: `fbFill.`, `aFill[i + 1].`, `pFill^.`, `THIS^.` (an index may hold anything but ']')
-_QUAL = r"((?:\w+(?:\s*\[[^\]]*\])*\s*\^?\s*\.\s*)*)"
+# the qualifier in front of a name: `fbFill.`, `aFill[i + 1].`, `aFill[aIdx[i]].`, `pArr^[i].`, `pFill^.`, `THIS^.` —
+# an index holds anything, brackets nested one level
+_IDX = r"(?:\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\])"
+_ONE = rf"\w+\s*\^?{_IDX}*\s*\^?\s*\."
+_QUAL = rf"((?:{_ONE}\s*)*)"
 
 
 def _qual_names(q: str) -> list[str]:
-    import re as _re
-    return [x.lower() for x in _re.findall(r"(\w+)(?:\s*\[[^\]]*\])*\s*\^?\s*\.", q or "")]
+    return [x.lower() for x in _re.findall(rf"(\w+)\s*\^?{_IDX}*\s*\^?\s*\.", q or "")]
 
 
 def _classify_write(line: str, leaf: str, segs: list[str]) -> str | None:

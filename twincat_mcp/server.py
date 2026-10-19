@@ -573,6 +573,18 @@ class App:
             return {"started": False, "already_running": st["rebuild"], "message": st["message"]}
         if st["state"] == "complete" and not force and not st.get("rebuild"):
             return {"started": False, "up_to_date": True, "message": st["message"]}
+        if st["state"] == "complete" and not force and (st.get("rebuild") or {}).get("state") == "stale":
+            # a work file left next to the complete, current index: no rebuild — discarded (rule 7), nothing asked
+            if dry_run:
+                return {"started": False, "up_to_date": True, "stale_work_file": st["rebuild"].get("file"),
+                        "message": st["message"]}
+            try:
+                r = E.build(L.index_file(loc, "esi"), loc, self.kb.esi_dirs, log=lambda m: None,
+                            built_by="twincat-mcp server")
+            except E.EsiError as exc:
+                return {"started": False, "error": str(exc)}
+            return {"started": False, "up_to_date": True, **({"discarded": r["discarded"]} if r.get("discarded") else {}),
+                    "message": self.kb.esi_state()["message"]}
         folders = E.source_folders(loc, self.kb.esi_dirs, E.recorded_twincat(L.index_file(loc, "esi")))
         if not E.has_esi(E.xml_files(folders)):
             return {"started": False, "error": "no ESI files: no .xml whose root is an ESI document (EtherCATInfo, "
@@ -2044,6 +2056,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         pre = await asyncio.to_thread({"infosys": app.spawn_infosys_build, "manuals": app.spawn_manuals_update,
                                        "esi": app.spawn_esi_build}[idx], force, dry_run=True)
         if not pre.get("would_start"):
+            if pre.get("stale_work_file"):          # not a rebuild: the left work file is discarded, the index unchanged
+                pre = await asyncio.to_thread(app.spawn_esi_build, force)
             app.audit("kb_rebuild", {"index": idx, "force": force}, OpClass.CONTROL, "not-started", pre)
             return pre
         await app.permit(ctx, OpClass.CONTROL, "kb_rebuild", idx, confirm_token, mode_gate=False)

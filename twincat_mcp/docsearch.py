@@ -309,8 +309,8 @@ def title_order(rows: list[Any], query: str, title_key: str = "title") -> list[A
 # ------------------------------------------------------------------------------------------- error codes (N99)
 _HEX = re.compile(r"^(?:0x|16#|#x)([0-9a-f_]+)$", re.I)
 # words that make a decimal number of the query an error / return code
-_CODE_WORDS = frozenset("""error errors err errid errorid code codes return returncode result hresult adserr adserror
-fehler fehlercode fehlernummer""".split())
+_CODE_WORDS = frozenset("""error errors err errid nerrid errorid errorcode errcode errno code codes return returncode
+result hresult adserr adserror fehler fehlercode fehlernummer""".split())
 
 
 def code_forms(query: str) -> dict[str, Any] | None:

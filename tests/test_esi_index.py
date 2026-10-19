@@ -602,6 +602,11 @@ async def test_the_server_builds_it_once_by_itself_and_answers_from_it(monkeypat
         assert m["modules"][0]["name"] == "DeviceMain 0106"
         r = payload(await c.call_tool("kb_rebuild", {"index": "esi"}))
         assert r["started"] is False and r["up_to_date"]
+        # a work file left next to the current index: discarded on kb_rebuild without a rebuild or a question
+        building = E.side_files(db)[0]
+        building.write_bytes(db.read_bytes())
+        r = payload(await c.call_tool("kb_rebuild", {"index": "esi"}))
+        assert r["started"] is False and r["discarded"] == str(building) and not building.exists(), r
         r = await c.call_tool("kb_rebuild", {"index": "esi", "force": True})
         assert r.is_error and "tc_request_confirmation" in text(r)
         bad = await c.call_tool("hw_object", {"device": "EL3356-0010", "index": "#x8010"})
@@ -761,3 +766,38 @@ def test_ci_0812_a_reader_leaves_no_connection_open(esi_kb):
         assert open_ == [], open_
     finally:
         gc.enable()
+
+
+def test_second_review_0812_state_and_flags(esi_kb, tmp_path, monkeypatch):
+    """Second review 0.8.12: a finished first build that could not be swapped in was called 'stale' (the index did
+    not exist yet, so its stamp was never compared); --twincat on an index built without TwinCAT's folders kept it
+    up to date when the files had not changed; a file two profiles name was read twice."""
+    kb, tc, db = esi_kb
+    monkeypatch.setattr(E, "_swap", lambda b, f, wait_s=0: f"{f} is open in another program")
+    r = _build(esi_kb)
+    assert r["result"] == "not_replaced" and not db.exists()
+    st = E.state(db, kb, [tc], twincat=False)
+    assert st["state"] == "missing" and st["rebuild"]["state"] == "waiting_to_replace", st
+    monkeypatch.undo()
+    assert _build(esi_kb)["result"] == "replaced"
+    fake_tc = tmp_path / "pd" / "Beckhoff" / "TwinCAT" / "3.1" / "Config" / "Io" / "EtherCAT"
+    fake_tc.mkdir(parents=True)                                     # TwinCAT's folder exists, no file in it yet
+    monkeypatch.setenv("ProgramData", str(tmp_path / "pd"))
+    assert E.recorded_twincat(db) is False
+    r = E.build(db, kb, [tc], twincat=True, log=lambda m: None)
+    assert r["result"] == "built" and E.recorded_twincat(db) is True, r
+    prof = ("<Profile><ChannelNo>{n}</ChannelNo><DictionaryFile>Beckhoff AX5xxx\\Beckhoff AX5206-xxxx-0216 Dict.xml"
+            "</DictionaryFile></Profile>")
+    dev = ('<Device><Type ProductCode="#x2" RevisionNo="#x1">AX9206</Type><Name LcId="1033">AX9206</Name>'
+           + prof.format(n=1) + prof.format(n=2) + "</Device>")
+    _write(kb / "manuals" / "Beckhoff_EtherCAT_XML" / "Beckhoff AX9xxx.xml",
+           f'<?xml version="1.0"?><EtherCATInfo>{VENDOR.format(fv=1)}<Descriptions><Devices>{dev}</Devices>'
+           "</Descriptions></EtherCATInfo>")
+    r = _build(esi_kb)
+    d = E.EsiIndex(db).lookup("AX9206", detail="full")["devices"][0]
+    ax = E.EsiIndex(db).lookup("AX5206-0000-0216", detail="full")["devices"][0]
+    assert "dictionary_files" not in d and d["coe_count"] == ax["coe_count"] > 0, (d, ax)
+    con = sqlite3.connect(db)
+    same = con.execute("SELECT COUNT(DISTINCT dict_id) FROM devices WHERE type IN ('AX9206', 'AX5206-0000-0216')").fetchone()[0]
+    con.close()
+    assert same == 1                                                 # the file's one dictionary, stored once

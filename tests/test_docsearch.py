@@ -135,3 +135,18 @@ def test_review_0812_truncated_counts_documents_not_copies(idx, tmp_path):
     assert r["total"] == 4 and r["count"] == 3 and r["truncated"] is False, r
     r = idx.search("0x745", limit=1)
     assert r["count"] == 1 and r["truncated"] is True, r
+
+
+def test_second_review_0812_the_page_id_wins_whatever_the_order():
+    """Second review 0.8.12: rows B, C, A (B and A two methods of one book with the same declaration, C the copy of
+    A in another book): the declaration match took book Y for B before A's page id could — {B, C} and {A}."""
+    from twincat_mcp.infosys import same_documents
+    decl = json.dumps({"declaration": "METHOD Reset : BOOL"})
+
+    def row(rid, book, pid):
+        return {"rid": rid, "book": book, "pid": pid, "library": "Tc3_X", "decl": decl, "body": "", "title": "Reset"}
+    a, b, c = row(1, "tcplclib_tc3_x", "111"), row(2, "tcplclib_tc3_x", "222"), row(3, "tf9999_y", "111")
+    for order in ([a, b, c], [b, c, a], [c, b, a], [b, a, c]):
+        groups = sorted(sorted(x["rid"] for x in g) for g in same_documents(order))
+        assert groups == [[1, 3], [2]], (order, groups)
+    assert D.code_forms("ErrorCode 1861")["value"] == 1861 and D.code_forms("nErrId 1861")["value"] == 1861
