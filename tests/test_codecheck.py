@@ -122,3 +122,35 @@ def test_d39_scaffold_uses_enum_members_and_names_failing_stubs(idx, project_dir
     assert "fbUut.eCmd := E_Command.None;" in txt and "E_Command.0" not in txt
     assert "fbUut.eOther := 0 (* E_Lib: set a member *);" in txt
     assert r["stubs_fail_until_written"] == ["Test_Start"] and "FAIL on purpose" in r["stub_note"]
+
+
+def test_a_declaration_that_runs_fb_init_is_its_use(tmp_path):
+    """0.8.11 retest (§30, info): proj_lint called the TcUnit suite instance fbCounterModuleTests 'never used' — a
+    suite (EXTENDS FB_TestSuite) registers itself in FB_init, so declaring it is its use. A project FB with an FB_init
+    along its chain is not reported; one that extends a library FB (whose FB_init the project cannot see) is reported
+    as info that says so; an unused instance of an FB without either stays a warning."""
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex
+    d = tmp_path / "p"
+    d.mkdir()
+
+    def pou(name, decl, impl="", methods=""):
+        (d / f"{name}.TcPOU").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n<TcPlcObject Version="1.1.0.1">\n'
+            f'  <POU Name="{name}" Id="{{aaaaaaaa-0000-0000-0000-{sum(map(ord, name)):012d}}}">\n'
+            f"    <Declaration><![CDATA[{decl}]]></Declaration>\n"
+            f"    <Implementation><ST><![CDATA[{impl}]]></ST></Implementation>\n{methods}  </POU>\n</TcPlcObject>\n",
+            encoding="utf-8")
+    pou("FB_CounterModuleTests", "FUNCTION_BLOCK FB_CounterModuleTests EXTENDS TcUnit.FB_TestSuite\nVAR\nEND_VAR")
+    init = ('    <Method Name="FB_init" Id="{aaaaaaaa-0000-0000-0000-000000009999}">\n      <Declaration><![CDATA['
+            "METHOD FB_init : BOOL\nVAR_INPUT\n    bInitRetains : BOOL;\n    bInCopyCode : BOOL;\nEND_VAR]]></Declaration>\n"
+            "      <Implementation><ST><![CDATA[Register(THIS);]]></ST></Implementation>\n    </Method>\n")
+    pou("FB_Registered", "FUNCTION_BLOCK FB_Registered\nVAR\nEND_VAR", methods=init)
+    pou("FB_Child", "FUNCTION_BLOCK FB_Child EXTENDS FB_Registered\nVAR\nEND_VAR")
+    pou("FB_Plain", "FUNCTION_BLOCK FB_Plain\nVAR\nEND_VAR")
+    pou("PRG_Tests", "PROGRAM PRG_Tests\nVAR\n    fbCounterModuleTests : FB_CounterModuleTests;\n    fbChild : FB_Child;\n"
+        "    fbPlain : FB_Plain;\n    fbTimer : TON;\nEND_VAR", "")
+    idx = ProjectIndex(ProjectConfig(root=str(d)))
+    idx.scan()
+    got = {f["message"].split(" ")[0]: f["severity"] for f in cc.lint(idx, "PRG_Tests", rules=["unused"])["items"]}
+    assert got == {"fbCounterModuleTests": "info", "fbPlain": "warning", "fbTimer": "warning"}, got

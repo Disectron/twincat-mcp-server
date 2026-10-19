@@ -168,6 +168,7 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
                         add("abstract_instantiation", u, v.line,
                             f"{v.name} : {v.type} instantiates an ABSTRACT function block", "error")
 
+    fb_inits = _fb_inits(idx)
     for u in units:
         impl = strip_comments(u.implementation)
         decl = strip_comments(u.declaration)
@@ -183,6 +184,16 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
             for v in u.vars:
                 if v.section in ("VAR", "VAR_TEMP", "VAR_STAT", "VAR_INST") and v.name not in idents_impl and v.name not in idents_decl_other \
                         and v.name.lower() != u.name.split(".")[-1].lower():
+                    runs, base = _init_runs(fb_inits, _base_type(v.type))
+                    if runs:
+                        continue        # its FB_init runs when it is instantiated: being declared is its use
+                    if runs is None:
+                        # 0.8.11 retest: a TcUnit suite (EXTENDS FB_TestSuite) registers itself in FB_init
+                        add("unused", u, v.line, f"{v.name} ({v.type}) declared in {v.section}, never referenced in "
+                            f"the code — {_base_type(v.type)} extends {base}, a library function block the project "
+                            "does not define: an FB_init there runs when the instance is created (TcUnit's "
+                            "FB_TestSuite registers the suite that way), so the declaration may be its use", "info")
+                        continue
                     add("unused", u, v.line, f"{v.name} ({v.type}) declared in {v.section} but never used")
         if "naming" in enabled:
             for v in u.vars:
@@ -285,6 +296,33 @@ def lint(idx: ProjectIndex, name: str | None = None, rules: list[str] | None = N
                        + ". proj_scan(root=<folder with the .plcproj>) if this is not the project you meant; the index is "
                          "per server process and starts from project.root / xae.solution_path.")
     return out
+
+
+def _fb_inits(idx: ProjectIndex) -> tuple[dict[str, CodeUnit], set[str]]:
+    """(the project's function blocks by lower-case name, the lower-case names of those with an FB_init method)."""
+    fbs = {x.name.lower(): x for x in idx.units.values() if x.kind == "FUNCTION_BLOCK"}
+    inits = {x.parent.lower() for x in idx.units.values()
+             if x.kind == "METHOD" and x.parent and x.name.rsplit(".", 1)[-1].lower() == "fb_init"}
+    return fbs, inits
+
+
+def _init_runs(fb_inits: tuple[dict[str, CodeUnit], set[str]], type_name: str) -> tuple[bool | None, str | None]:
+    """Does creating an instance of this type run code (an FB_init method along its EXTENDS chain)? -> (True, the FB
+    that has it) / (False, None): a project FB whose whole chain has none, or not a project FB / (None, the library
+    base): a project FB whose chain extends a function block the project does not define (not knowable here)."""
+    fbs, inits = fb_inits
+    name, seen = (type_name or "").strip(), set()
+    if name.lower() not in fbs:
+        return False, None
+    while name and name.lower() not in seen:
+        seen.add(name.lower())
+        fb = fbs.get(name.lower())
+        if fb is None:
+            return None, name
+        if fb.name.lower() in inits:
+            return True, fb.name
+        name = fb.extends[0].strip() if fb.extends else ""
+    return False, None
 
 
 def _base_type(type_str: str) -> str:
