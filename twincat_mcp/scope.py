@@ -86,13 +86,16 @@ def view_log_path(configured: str | None = None) -> Path:
 
 
 def log_mark(path: Path | None) -> dict[str, Any]:
-    """Where the Scope View log ends now ({"path", "size"}; size None: no log yet)."""
+    """Where the Scope View log ends now ({"path", "size"}): size 0 when there is no log yet (all of a log written
+    later is new); "error" when it exists but cannot be read (nothing can be compared then)."""
     if path is None:
         return {"path": None, "size": None}
     try:
         return {"path": str(path), "size": path.stat().st_size}
-    except OSError:
-        return {"path": str(path), "size": None}
+    except FileNotFoundError:
+        return {"path": str(path), "size": 0}
+    except OSError as exc:
+        return {"path": str(path), "size": None, "error": str(exc)}
 
 
 def _decode(raw: bytes) -> str:
@@ -108,6 +111,9 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
     p = mark.get("path")
     if not p:
         return {"log": None, "errors": [], "note": "no Scope View log path"}
+    if mark.get("error"):
+        return {"log": p, "errors": [], "note": f"the log could not be read when the call began ({mark['error']}) — "
+                                                "what is new in it is not known"}
     path = Path(p)
     try:
         size = path.stat().st_size
@@ -130,16 +136,26 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
         return {**out, "errors": [], "note": f"the Scope View log cannot be read: {exc}"}
     entries: list[list[str]] = []
     cur: list[str] | None = None
-    for ln in _decode(raw).splitlines():
+    text = _decode(raw)
+    tagged = False
+    for ln in text.splitlines():
         m = _LEVEL.search(ln)
         if m:
+            tagged = True
             cur = [ln.strip()] if m.group(1).upper() in ("ERROR", "FATAL") else None
             if cur is not None:
                 entries.append(cur)
         elif cur is not None and ln.strip() and len(cur) < 6:
             cur.append(ln.strip())
-    out.update({"new_bytes": size - (mark.get("size") or 0) if size >= (mark.get("size") or 0) else size,
-                "error_count": len(entries), "errors": [" | ".join(e)[:800] for e in entries[-limit:]]})
+    if text.strip() and not tagged:
+        # the level tags this reads ([ERROR], [INFO] …) are not in the new text: the log's format is not the one
+        # expected — its lines that say 'error' are given, and that the format was not recognised
+        entries = [[ln.strip()] for ln in text.splitlines() if re.search(r"error|fehler|exception", ln, re.I)]
+        out["note"] = ((out.get("note") + "; ") if out.get("note") else "") + (
+            "no level tag ([ERROR], [INFO] …) in the new lines: the log's format was not recognised — the lines that "
+            "say 'error' / 'exception' are listed")
+    out.update({"new_bytes": len(raw), "error_count": len(entries),
+                "errors": [" | ".join(e)[:800] for e in entries[-limit:]]})
     return out
 
 
@@ -161,31 +177,43 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
         raise ScopeError("target must be a .csv file (TDMS/DAT need a full Scope licence and are not offered here)")
     if out.exists() and not overwrite:
         raise ScopeError(f"{out} exists; pass overwrite=true or another target")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if out.exists():
-        make_writable(out)
-        out.unlink()
-    ssha, ssize = file_sha256(src)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.exists():
+            make_writable(out)
+            out.unlink()
+    except OSError as exc:
+        raise ScopeError(f"the target {out} cannot be written (open in another program?): {exc} — nothing was exported") from exc
+    try:
+        ssha, ssize = file_sha256(src)
+    except OSError as exc:
+        raise ScopeError(f"{src} cannot be read: {exc} — nothing was exported") from exc
     read_only = is_read_only(src)
     run_on, tmp, copy_note = src, None, None
-    if read_only:
-        tmp = out.parent / f".tcmcp-export-{os.getpid()}-{time.monotonic_ns()}"
-        tmp.mkdir(parents=True)
-        run_on = tmp / src.name
-        shutil.copyfile(src, run_on)                   # copyfile: the copy is writable (no permission bits copied)
-        if file_sha256(run_on)[0] != ssha:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise ScopeError(f"the writable copy of the read-only {src.name} differs from it — nothing was exported")
-        copy_note = {"copy": str(run_on), "sha256_identical": True,
-                     "why": "the source is read-only (rec_stop seals its Scope files like the recording): exported from "
-                            "a byte-identical writable copy, deleted afterwards — the CSV's File line names the copy"}
     mark = log_mark(view_log)
-    cmd = [str(tool), f"svd={run_on}", f"target={out}", "silent"]
+    cmd: list[str] = []
     t0 = time.monotonic()
     try:
+        if read_only:
+            tmp = out.parent / f".tcmcp-export-{os.getpid()}-{time.monotonic_ns()}"
+            try:
+                tmp.mkdir(parents=True)
+                run_on = tmp / src.name
+                shutil.copyfile(src, run_on)           # copyfile: the copy is writable (no permission bits copied)
+                same = file_sha256(run_on)[0] == ssha
+            except OSError as exc:
+                raise ScopeError(f"the read-only {src.name} could not be copied to export it ({exc}) — nothing was "
+                                 "exported") from exc
+            if not same:
+                raise ScopeError(f"the writable copy of the read-only {src.name} differs from it — nothing was exported")
+            copy_note = {"copy": str(run_on), "sha256_identical": True,
+                         "why": "the source is read-only (rec_stop seals its Scope files like the recording): exported "
+                                "from a byte-identical writable copy, deleted afterwards — the CSV's File line names the copy"}
+        cmd = [str(tool), f"svd={run_on}", f"target={out}", "silent"]
+        t0 = time.monotonic()
         try:
-            r = subprocess.run(cmd, cwd=str(tool.parent), capture_output=True, text=True, timeout=timeout_s,
-                               creationflags=_NO_WINDOW)
+            r = subprocess.run(cmd, cwd=str(tool.parent), capture_output=True, text=True, errors="replace",
+                               timeout=timeout_s, creationflags=_NO_WINDOW)
         except subprocess.TimeoutExpired as exc:
             raise ScopeError(f"{TOOL_NAME} did not finish within {timeout_s:.0f} s") from exc
         except OSError as exc:
@@ -193,6 +221,8 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
     finally:
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
+            if tmp.exists():
+                copy_note = {**(copy_note or {}), "left_behind": str(tmp)}   # Windows still held a handle: said, not hidden
     elapsed = round(time.monotonic() - t0, 2)
     log = log_errors_since(mark) if view_log is not None else None
     if not out.is_file() or out.stat().st_size == 0:
@@ -204,11 +234,14 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
                          + (f"; Scope View log, new errors: {log['errors']}" if log and log.get("errors") else
                             f"; Scope View log: no new error ({log.get('note') or log.get('log')})" if log else "")
                          + " — open the file in XAE's Scope View to see whether Beckhoff can read it.")
-    with open(out, "r", encoding="utf-8-sig", errors="replace") as fh:
-        head = [fh.readline().rstrip("\r\n") for _ in range(3)]
-        rows = 3 + sum(1 for _ in fh)
-    esha, esize = file_sha256(out)
-    tsha, _ = file_sha256(tool)
+    try:
+        with open(out, "r", encoding="utf-8-sig", errors="replace") as fh:
+            head = [fh.readline().rstrip("\r\n") for _ in range(3)]
+            rows = 3 + sum(1 for _ in fh)
+        esha, esize = file_sha256(out)
+        tsha, _ = file_sha256(tool)
+    except OSError as exc:
+        raise ScopeError(f"{TOOL_NAME} wrote {out}, but it cannot be read back: {exc}") from exc
     prov: dict[str, Any] = {"_provenance": 1, "kind": "scope_export", "export_file": out.name, "export_sha256": esha,
                             "export_bytes": esize, "source_file": str(src), "source_sha256": ssha, "source_bytes": ssize,
                             "tool": str(tool), "tool_sha256": tsha, "command": cmd, "exit_code": r.returncode,
@@ -228,6 +261,11 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
                  "channels with different sample times follow the export settings saved in the Scope project.")}
     if copy_note:
         res["exported_from_copy"] = copy_note
+    if r.returncode != 0:
+        # review: a tool that fails part-way may leave a partial CSV — it is the tool's output, unchanged, but not
+        # called complete
+        res["warning"] = (f"{TOOL_NAME} exited with code {r.returncode} although it wrote the CSV — it may be "
+                          "incomplete" + (f"; its output: {(r.stderr or r.stdout).strip()[:300]}" if (r.stderr or r.stdout).strip() else ""))
     if log is not None:
         res["scope_view_log"] = log
     return res

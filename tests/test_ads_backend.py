@@ -806,7 +806,7 @@ def test_n50_retest_an_alias_the_table_gives_no_base_is_raw_bytes_or_what_the_so
     r = ads.read("PRG_Test.pAlias4026")
     assert r["value"] == {"raw_hex": (-114343571591392 & (2**64 - 1)).to_bytes(8, "little").hex()}, r
     assert "no base type" in r["type_note"] and "note" not in r
-    ads.alias_hint = lambda name: "POINTER TO FB_AlarmList" if name.lower() == "pt_retestalarm" else None
+    ads.alias_hint = lambda name, port=None: "POINTER TO FB_AlarmList" if name.lower() == "pt_retestalarm" else None
     r = ads.read("PRG_Test.pAlias4026")
     assert r["value"] == "0xFFFF980150086F20" and r["note"] == POINTER_NOTE, r
     assert "project source: TYPE PT_RetestAlarm : POINTER TO FB_AlarmList" in r["type_source"]

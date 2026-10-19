@@ -770,7 +770,8 @@ class Recording:
         parts = []
         if self.stall_list:
             spans = ", ".join(f"{a:.4f}-{b:.4f} ms" for a, b in self.stall_list[:5])     # same text as the native engine
-            parts.append(f"PLC stopped (cycle counter frozen) {spans}")
+            more = f" (+{self.stalls - 5} more)" if self.stalls > 5 else ""
+            parts.append(f"PLC stopped (cycle counter frozen) {spans}{more}")
         if self._stall_open and self._stall_adv_t is not None:
             parts.append(f"PLC stopped (cycle counter frozen) since {self._stall_adv_t:.4f} ms")
         if self.poll_refused:

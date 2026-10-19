@@ -54,7 +54,7 @@ import pyads
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeBackend, XaeError, sta_init, sta_teardown
-from .project_backend import ProjectIndex, ProjectError, not_on_target, parse_tcunit_xml
+from .project_backend import PlcView, ProjectIndex, ProjectError, not_on_target, parse_tcunit_xml, plc_projects_declaring
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
 from . import codecheck
@@ -325,6 +325,34 @@ TOKEN_TARGET_ARGS = {"xae_target": "net_id", "ads_plc_state": "action", "ads_sys
 def _plc_iec_path(path: str) -> str:
     from .xae_backend import _plc_split
     return _plc_split(path)[1]
+
+
+def _merge_checks(outs: list[tuple[str | None, dict[str, Any]]]) -> dict[str, Any]:
+    """N113: the results of one analysis per PLC project as one: numbers added, number tables added per key, lists
+    joined (each dict item tagged with its plc_project), other values kept per PLC project when they differ."""
+    merged: dict[str, Any] = {"plc_projects": [plc for plc, _r in outs]}
+    other: dict[str, dict[str, Any]] = {}
+    for plc, r in outs:
+        for k, v in r.items():
+            if isinstance(v, bool) or v is None or isinstance(v, str):
+                other.setdefault(k, {})[plc or ""] = v
+            elif isinstance(v, (int, float)):
+                merged[k] = merged.get(k, 0) + v
+            elif isinstance(v, list):
+                merged.setdefault(k, []).extend({**x, "plc_project": plc} if isinstance(x, dict) else x for x in v)
+            elif isinstance(v, dict) and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v.values()):
+                tab = merged.setdefault(k, {})
+                for kk, vv in v.items():
+                    tab[kk] = tab.get(kk, 0) + vv
+            else:
+                other.setdefault(k, {})[plc or ""] = v
+    for k, per in other.items():
+        vals = list(per.values())
+        merged[k] = vals[0] if all(x == vals[0] for x in vals) else per
+    sev = {"error": 0, "warning": 1, "info": 2}
+    if isinstance(merged.get("items"), list) and all(isinstance(x, dict) and "severity" in x for x in merged["items"]):
+        merged["items"].sort(key=lambda f: (sev.get(f["severity"], 3), f.get("file") or "", f.get("line") or 0))
+    return merged
 
 
 class TargetArgsError(ToolError):
@@ -855,6 +883,49 @@ class App:
         except ProjectError as exc:
             raise ToolError(K.annotate(str(exc))) from exc
 
+    # -- N113: the source analyses run inside ONE PLC project when names are declared in several ------------------
+    def proj_views(self, name: str | None) -> list[ProjectIndex]:
+        """The index itself when no name is declared twice; else the PLC project that declares `name` (several and no
+        'file@name' pin: refused, nothing is picked), or — no name — each PLC project in turn."""
+        p = self.proj
+        p._ensure()
+        if not p.duplicates:
+            return [p]
+        if name:
+            plcs = plc_projects_declaring(p, name)
+            if len(plcs) > 1:
+                raise ToolError(f"{name!r} is declared in several PLC projects {[x or '(files of no PLC project)' for x in plcs]} "
+                                f"— pin one: '<file-substring>@{name.split('@')[-1]}' (nothing was chosen)")
+            return [PlcView(p, plcs[0])] if plcs else [p]       # not declared: the analysis says so itself
+        return [PlcView(p, plc) for plc in sorted({p._plc_of(f) for f in p._by_file}, key=lambda x: x or "")]
+
+    def proj_for_port(self, port: int | None = None) -> ProjectIndex:
+        """The source of the runtime on ADS `port` (default: the connected one): its PLC project when names are
+        declared in several and the .tsproj maps the port; else the whole index (its lookups refuse ambiguous names)."""
+        p = self.proj
+        if p.root is None:
+            return p
+        p._ensure()
+        if not p.duplicates:
+            return p
+        plc = p.plc_project(port=port or self.ads.port)
+        return PlcView(p, plc) if plc is not None else p
+
+    def proj_view_of_file(self, file: str) -> ProjectIndex:
+        p = self.proj
+        return p if not p.duplicates else PlcView(p, p._plc_of(file))
+
+    async def proj_check(self, fn, name: str | None, *a: Any) -> dict[str, Any]:
+        """A codecheck analysis fn(index, name, *a) on the views of proj_views: one result, or the results of each PLC
+        project merged (counts added, lists joined with plc_project on each item)."""
+        views = await self.proj_call(self.proj_views, name)
+        if len(views) == 1:
+            r = await self.proj_call(fn, views[0], name, *a)
+            if isinstance(views[0], PlcView) and isinstance(r, dict):
+                r["plc_project"] = views[0].plc
+            return r
+        return _merge_checks([(v.plc, await self.proj_call(fn, v, name, *a)) for v in views])
+
     async def kb_call(self, fn, *a, timeout: float = 600, **kw) -> Any:
         try:
             return await asyncio.wait_for(asyncio.to_thread(fn, *a, **kw), timeout)
@@ -1251,28 +1322,29 @@ class App:
         self.pending_edits.clear()
         return out
 
-    def source_alias(self, type_name: str) -> str | None:
-        """N50: the base the project source declares for an alias type (TYPE PT_X : POINTER TO FB_X), or None."""
+    def source_alias(self, type_name: str, port: int | None = None) -> str | None:
+        """N50: the base the project source declares for an alias type (TYPE PT_X : POINTER TO FB_X), or None. port:
+        the runtime's — a name declared in several PLC projects is that port's PLC project's (N113)."""
         if self.proj.root is None:
             return None
         try:
-            return self.proj.type_alias(type_name)
+            return self.proj.type_alias(type_name, port or self.ads.port)
         except Exception:  # noqa: BLE001
             return None
 
-    def is_source_interface(self, type_name: str) -> bool:
-        """The project declares `type_name` (qualified or not) as an INTERFACE."""
+    def is_source_interface(self, type_name: str, port: int | None = None) -> bool:
+        """The project declares `type_name` (qualified or not) as an INTERFACE (in the PLC project of ADS `port`)."""
         if self.proj.root is None:
             return False
         try:
             self.proj._ensure()
         except Exception:  # noqa: BLE001
             return False
-        base = self.proj._base_type_name(type_name or "").split(".")[-1].lower()
-        u = self.proj.units.get(base)
+        base = self.proj._base_type_name(type_name or "").split(".")[-1]
+        u = self.proj.named(base, port or self.ads.port)
         return bool(u is not None and u.kind == "INTERFACE")
 
-    def constant_reason(self, name: str) -> str | None:
+    def constant_reason(self, name: str, port: int | None = None) -> str | None:
         """Source-level write check, installed as AdsBackend.write_guard so every write path runs it.
         Runtime symbol flags do not mark VAR CONSTANT as READONLY on 4026, so the project source decides: a write
         to anything declared in a CONSTANT block is refused. Without a project source the check cannot run: in
@@ -1285,8 +1357,15 @@ class App:
             return None
         try:
             self.proj._ensure()
-            r = self.proj.resolve_symbol(name)
-        except Exception:  # noqa: BLE001 — unknown in source: the runtime check is all we have
+            r = self.proj.resolve_symbol(name, port or self.ads.port)
+        except ProjectError as exc:
+            if "several PLC projects" in str(exc) and self.guard.mode == "guarded":
+                # N113: the name is in the source twice and which one the target runs is not known — the CONSTANT
+                # check cannot be made; guarded mode refuses (as without a project source)
+                return (f"{name!r}: {exc}. A write to a CONSTANT cannot be ruled out — guarded mode refuses it. Name "
+                        "the PLC projects' ADS ports in the .tsproj (AmsPort), or switch to full mode.")
+            return None                                 # unknown in source: the runtime check is all we have
+        except Exception:  # noqa: BLE001
             return None
         for h in r.get("hops", []):
             if h.get("constant"):
@@ -1505,7 +1584,7 @@ class App:
 
 async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str, Any]:
     max_items = max(int(max_items), 1)
-    proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False)
+    proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False, port=app.ads.port)
     src_cut = bool(proj.get("truncated"))
     declared = {it["path"].lower(): it for it in proj["items"] if "[*]" not in it["path"]}
     # source arrays are declared once as x[*].y — the runtime has one leaf per element: match by pattern
@@ -2708,9 +2787,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         except ToolError as exc:
             out["save_svd"] = {"error": str(exc)}
             return out
-        settle = await asyncio.to_thread(_settled, svdx)
-        if settle:
-            out["save_svd"]["settled"] = settle
+        out["save_svd"]["size_watch"] = await asyncio.to_thread(_settled, svdx)
         tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
         failed = None
         if tool is not None:
@@ -2718,7 +2795,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 e = await asyncio.to_thread(S.export, svdx, csv, tool=tool, overwrite=overwrite, key=app.rec.key,
                                             version=__version__)
                 out["export_csv"] = {"path": e["file"], "via": "TC3ScopeExportTool.exe from the saved .svdx",
-                                     "lines": e["lines"], "provenance": e["provenance"]}
+                                     "lines": e["lines"], "provenance": e["provenance"],
+                                     **{k: e[k] for k in ("warning", "exported_from_copy") if k in e}}
                 return out
             except S.ScopeError as exc:
                 failed = str(exc)
@@ -2734,26 +2812,28 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                                       + S.status(app.cfg.scope.export_tool)["note"])
         return out
 
-    def _settled(p: Path, quiet_s: float = 0.5, limit_s: float = 15.0) -> dict[str, Any] | None:
-        """Whether SaveSVD's file is still being written after the call returned (not documented either way): its size
-        watched until unchanged for quiet_s. None when it was final at once; else how long it grew (or still grew)."""
+    def _settled(p: Path, quiet_s: float = 0.5, limit_s: float = 15.0) -> dict[str, Any]:
+        """Whether SaveSVD's file still grew after the call returned (not documented either way): its size watched
+        until it stayed the same for quiet_s — what that shows, no more (an unchanged size is not proof the writer is
+        done)."""
         t0 = time.monotonic()
         try:
             last = p.stat().st_size
-        except OSError:
-            return None
+        except OSError as exc:
+            return {"note": f"the saved file could not be read after SaveSVD returned: {exc}"}
         grew = False
         while True:
             time.sleep(quiet_s)
             try:
                 now = p.stat().st_size
-            except OSError:
-                return {"note": "the saved file disappeared while it was watched"}
+            except OSError as exc:
+                return {"note": f"the saved file disappeared while it was watched: {exc}"}
             if now == last:
-                return {"grew_for_s": round(time.monotonic() - t0 - quiet_s, 2), "bytes": now} if grew else None
+                return {"bytes": now, "grew_after_save": grew, "unchanged_for_s": quiet_s,
+                        **({"grew_for_s": round(time.monotonic() - t0 - quiet_s, 2)} if grew else {})}
             grew, last = True, now
             if time.monotonic() - t0 > limit_s:
-                return {"still_growing_after_s": round(limit_s, 1), "bytes": now,
+                return {"bytes": now, "grew_after_save": True, "still_growing_after_s": round(limit_s, 1),
                         "warning": "the .svdx was still being written — the CSV may lack its end"}
 
     async def _scope_finish(rid: str) -> dict[str, Any] | None:
@@ -2849,7 +2929,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         elif source == "project":
             from .recorder import path_selected, selection_regex
             rx = selection_regex(pattern) if pattern else None
-            pv = await app.proj_call(app.proj.variables, prefix, 64, max_items * 4, False)
+            pv = await app.proj_call(app.proj.variables, prefix, 64, max_items * 4, False, port=app.ads.port)
             leaves = [{"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")}
                       for it in pv["items"] if "[*]" not in it["path"]
                       and (rx is None or path_selected(rx, it["path"]))][:max_items]
@@ -2926,7 +3006,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 raise ToolError(str(exc)) from exc
             src.append("checklist")
         if from_attributes:
-            pv = await app.proj_call(app.proj.variables, scope, 64, 200_000, False)
+            pv = await app.proj_call(app.proj.variables, scope, 64, 200_000, False, port=app.ads.port)
             try:
                 found = capture.items_from_attributes(pv["items"], cycle_ms)
             except capture.ProfileError as exc:
@@ -3172,7 +3252,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Stop a recording, release the ADS notifications, finalize the file; returns status + stats."""
         res = await app.rec_call(app.rec.stop, id, "manual (rec_stop)", timeout=60)
         app.audit("rec_stop", {"id": id, "events": res.get("events")}, OpClass.EDIT, "ok")
-        sc = await _scope_finish(id)
+        try:
+            sc = await _scope_finish(id)
+        except Exception as exc:  # noqa: BLE001 — the ADS recording is stopped and sealed: its result is kept
+            log.exception("Scope finish of %s failed", id)
+            sc = {"error": f"the Scope part failed ({type(exc).__name__}: {exc}) — the ADS recording {id} is stopped and "
+                           "complete; stop / save the Scope configuration in XAE (scope_record)"}
         if sc is not None:
             res["scope"] = sc
         return res
@@ -3413,7 +3498,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def proj_interface(name: str) -> dict[str, Any]:
         """Public interface of an FB/program: inputs/outputs/in-out with types and comments,
         methods (access, signature), properties (get/set), actions, extends/implements."""
-        return await app.proj_call(codecheck.fb_interface, app.proj, name)
+        return await app.proj_check(codecheck.fb_interface, name)
 
     @mcp.tool(annotations=READ)
     async def proj_lint(name: str | None = None, rules: list[str] | None = None,
@@ -3428,13 +3513,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         unsigned counter), new_delete (__NEW without __DELETE, target lacking enable_dynamic_creation).
         Deterministic and offline; the compiler (xae_build + xae_diagnostics) stays the authority.
         rules= subset to run."""
-        return await app.proj_call(codecheck.lint, app.proj, name, rules, prefixes or cfg.project.naming_prefixes or None)
+        return await app.proj_check(codecheck.lint, name, rules, prefixes or cfg.project.naming_prefixes or None)
 
     @mcp.tool(annotations=READ)
     async def proj_call_graph(root: str, depth: int = 4) -> dict[str, Any]:
         """Call graph from a program/FB: FB instances it invokes, functions and methods it calls,
         recursively to `depth` (what runs when this POU runs)."""
-        return await app.proj_call(codecheck.call_graph, app.proj, root, min(depth, 10))
+        return await app.proj_check(codecheck.call_graph, root, min(depth, 10))
 
     @mcp.tool(annotations=EDIT)
     async def tcunit_scaffold(fb_name: str, out_dir: str | None = None, add_to_plcproj: bool = True,
@@ -3448,10 +3533,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # registered (add_to_plcproj=false), and not over a file the project compiles — is no code edit of the
         # PLC project, wherever it is written, so edit_requires_config_mode does not apply to it. (N109: an out_dir
         # under the project root but outside every PLC project was refused in RUN.)
-        dest = await app.proj_call(codecheck.scaffold_dest, app.proj, fb_name, out_dir)
+        view = (await app.proj_call(app.proj_views, fb_name))[0]                    # N113: the FB's own PLC project
+        dest = await app.proj_call(codecheck.scaffold_dest, view, fb_name, out_dir)
         touches_project = add_to_plcproj or (Path(dest).exists() and await app.proj_call(app.proj.is_member, dest))
         await app.permit(None, OpClass.EDIT, "tcunit_scaffold" if touches_project else "tcunit_scaffold_external", fb_name)
-        res = await app.confirmed("tcunit_scaffold", {"fb": fb_name}, OpClass.EDIT, app.proj_call(codecheck.tcunit_scaffold, app.proj, fb_name, out_dir, add_to_plcproj, overwrite))
+        res = await app.confirmed("tcunit_scaffold", {"fb": fb_name}, OpClass.EDIT, app.proj_call(codecheck.tcunit_scaffold, view, fb_name, out_dir, add_to_plcproj, overwrite))
         return res
 
 
@@ -3705,7 +3791,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         declared = None
         if check_source:
             try:
-                pv = await app.proj_call(app.proj.variables, None, 64, 200_000, False)
+                pv = await app.proj_call(app.proj.variables, None, 64, 200_000, False, port=app.ads.port)
                 declared = {it["path"].lower() for it in pv["items"] if "[*]" not in it["path"]}
             except ToolError:
                 declared = None
@@ -4075,7 +4161,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         safe fixes (.bak written); regenerate_lineids rebuilds LineIds blocks."""
         if fix:
             await app.permit(None, OpClass.EDIT, "proj_validate_xml", name or "*")
-        res = await app.proj_call(codecheck.validate_xml, app.proj, name, fix, regenerate_lineids)
+        res = await app.proj_check(codecheck.validate_xml, name, fix, regenerate_lineids)
         if fix and res.get("fixed"):
             app.audit("proj_validate_xml", {"name": name, "fixed": res["fixed"]}, OpClass.EDIT, "ok")
         return res
@@ -4681,8 +4767,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def proj_resolve_symbol(symbol: str) -> dict[str, Any]:
         """Map an ADS symbol path (MAIN.fbFill.fbValve.bOpen) to the file:line where each hop is
         declared, following variable types through FB/STRUCT definitions. Hops inside a library type
-        (Tc2_Standard.CTU.CV) are completed from the runtime's datatype table when the target is reachable."""
-        res = await app.proj_call(app.proj.resolve_symbol, symbol)
+        (Tc2_Standard.CTU.CV) are completed from the runtime's datatype table when the target is reachable. A first
+        name declared in several PLC projects (MAIN in Plc1 and Plc2) is the one of the PLC project on the connected
+        ADS port (AmsPort in the .tsproj)."""
+        res = await app.proj_call(app.proj.resolve_symbol, symbol, app.ads.port)
         if res.get("resolved_to_library_type"):
             try:
                 info = (await app.ads_call(app.ads.symbol_info, symbol, timeout=30)).to_dict()

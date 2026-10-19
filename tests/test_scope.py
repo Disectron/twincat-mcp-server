@@ -131,3 +131,28 @@ def test_scope_view_log_errors_are_reported(tool, tmp_path, monkeypatch):
     assert "does not exist" in S.log_errors_since(S.log_mark(tmp_path / "none.log"))["note"]
     log.write_bytes("\ufeffa [ERROR] wide\r\n".encode("utf-16-le"))
     assert S.log_errors_since({"path": str(log), "size": 0})["errors"] == ["a [ERROR] wide"]
+
+
+def test_review_scope_export_failures_are_said_never_raw(tool, tmp_path, monkeypatch):
+    """Review of 0.8.13: a non-zero exit with a CSV was reported as plain success; a log without level tags gave
+    'no new error'; a missing log at the start made the whole later log 'old'."""
+    import subprocess as sp
+    svd = tmp_path / "a.svdx"
+    svd.write_bytes(b"SCOPEDATA")
+    real = sp.run
+
+    def exit_7(cmd, **kw):
+        r = real(cmd, **kw)
+        return sp.CompletedProcess(r.args, 7, r.stdout, "partial write")
+    monkeypatch.setattr(S.subprocess, "run", exit_7)
+    r = S.export(svd, tmp_path / "a.csv", tool=tool)
+    assert "exited with code 7 although it wrote the CSV" in r["warning"] and "partial write" in r["warning"]
+    monkeypatch.setattr(S.subprocess, "run", real)
+    # a log in another format: its 'error' lines, and that the format was not recognised
+    log = tmp_path / "TcScopeView.log"
+    mark = S.log_mark(log)                                    # no log yet: everything written later is new
+    assert mark["size"] == 0
+    log.write_text("2026-10-19 15:24:25 Scope View: Server error on ordering data\nall fine\n", encoding="utf-8")
+    got = S.log_errors_since(mark)
+    assert got["errors"] == ["2026-10-19 15:24:25 Scope View: Server error on ordering data"]
+    assert "format was not recognised" in got["note"]

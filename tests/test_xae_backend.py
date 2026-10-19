@@ -1110,7 +1110,7 @@ def test_n116_a_closed_solution_is_never_replaced_by_another(monkeypatch):
     st = be.status()
     assert st["solution_mismatch"] and st["bound_solution_open"] is False and be.dte is d1, st
     assert "Project15.sln" in st["refused"] and "DrumFillingMachine" in st["refused"]
-    with pytest.raises(X.XaeError, match="is not open: the attached shell has no solution; open in the other shells: .*Drum.* — nothing was done"):
+    with pytest.raises(X.XaeError, match="is not open: the attached shell has no solution; the XAE shells have: .*Drum.* — nothing was done"):
         be.tree_item("TIPC")
     assert be.dte is d1                                             # never DrumFillingMachine
     d1.Solution.FullName = r"C:\P\Project15.sln"                    # reopened in the same shell
@@ -1149,3 +1149,24 @@ def test_n116_a_dead_proxy_reattaches_to_the_bound_solution_only(monkeypatch):
     be.dte = None                                                   # (what _retry does on RPC_E_DISCONNECTED)
     with pytest.raises(X.XaeError, match=r"DrumFillingMachine.sln is not open in any XAE shell"):
         be._need()
+
+
+def test_n116_review_a_runtime_bound_solution_is_kept_by_status_and_attach(monkeypatch):
+    """Review of N116: with no xae.solution_path, the solution bound at runtime (the only one open) was ignored by
+    xae_status' own attach (and xae_attach() without a path) once the shell had gone: they attached to whatever was open
+    then. The bound solution counts there too; an empty shell is never taken for the one that has the solution."""
+    be, d1, d2, shells = _two_shells(monkeypatch, XaeConfig(com_retry_s=0.3))
+    both = list(shells)
+    shells[:] = [both[0]]                                           # only Project15 open: bound at runtime
+    be.attach()
+    assert be.bound_solution == r"C:\P\Project15.sln"
+    shells[:] = [both[1]]                                           # Project15's shell gone, DrumFillingMachine open
+    be.dte = None
+    with pytest.raises(X.XaeError, match=r"Project15.sln is not open in any XAE shell .*nothing was attached"):
+        be.attach()                                                 # what xae_status does when not attached
+    assert be.dte is None and be.bound_solution == r"C:\P\Project15.sln"
+    # an empty shell listed first is not taken for the one with the (only) solution
+    be2, e1, e2, shells2 = _two_shells(monkeypatch, XaeConfig(com_retry_s=0.3))
+    e1.Solution.FullName = ""
+    be2.attach()
+    assert be2.dte is e2 and be2.bound_solution == r"C:\D\DrumFillingMachine.sln"

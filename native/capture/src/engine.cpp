@@ -1094,6 +1094,7 @@ void Engine::finish() {
         std::string st = "PLC stopped (cycle counter frozen) ";
         for (size_t k = 0; k < stall_list_.size() && k < 5; ++k)
             st += (k ? ", " : "") + ms(stall_list_[k].first) + "-" + ms(stall_list_[k].second) + " ms";
+        if (stalls_ > 5) st += " (+" + std::to_string(stalls_ - 5) + " more)";
         why.push_back(st);
     }
     if (samples_ == 0) why.push_back("no sample recorded");

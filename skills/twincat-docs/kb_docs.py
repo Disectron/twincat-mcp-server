@@ -688,6 +688,8 @@ def _parsed_declaration(r: sqlite3.Row) -> dict[str, Any]:
     out: dict[str, Any] = {"kind": d.get("kind") or r["kind"]}
     if out["kind"] in ("Function", "Method", "Property"):
         out["return_type"] = d.get("return_type")
+        if out["return_type"] is None:
+            out["return_type_note"] = "the page names no return type (no header, no return-value table) — not known"
     for k in ("kind_note", "extends", "implements", "declaration"):
         if d.get(k):
             out[k] = d[k]

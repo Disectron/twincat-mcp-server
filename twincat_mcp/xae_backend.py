@@ -130,6 +130,8 @@ def _norm_sol(p: str | None) -> str:
     only, so the rule does not depend on the platform the tests run on); '' for none."""
     import ntpath
     p = str(p or "").strip()
+    if p and os.name == "nt":
+        p = os.path.abspath(p)              # a relative xae.solution_path: as the server's folder resolves it
     return ntpath.normcase(ntpath.normpath(p)) if p else ""
 
 
@@ -233,8 +235,14 @@ class XaeBackend:
         if not want or self.dte is None:
             return None
         try:
-            cur = str(self.dte.Solution.FullName or "")
-        except Exception:  # noqa: BLE001 — a dead proxy: the call itself reports it (and re-attaches, _retry)
+            # through _retry: a busy shell (call rejected) is asked again, a dead proxy re-attaches to the bound one —
+            # never skipped (review: any COM error passed the check, a solution switch in progress among them)
+            cur = str(self._retry(lambda: self.dte.Solution.FullName, "Solution.FullName") or "")
+        except XaeError:
+            if raise_:
+                raise
+            return None
+        if self.dte is None:
             return None
         if _norm_sol(cur) == want:
             return None
@@ -252,8 +260,7 @@ class XaeBackend:
         why = (f"the solution this server works on, {self.bound_solution}"
                + (" (xae.solution_path)" if _norm_sol(self.cfg.solution_path) == want else "")
                + f", is not open: the attached shell has {cur or 'no solution'}"
-               + (f"; open in the other shells: {others}" if (others := [c.get('solution') or '(none)' for c in cands
-                                                                         if c.get('dte') is not self.dte]) else "")
+               + (f"; the XAE shells have: {[c.get('solution') or '(no solution)' for c in cands]}" if cands else "")
                + " — nothing was done. Open it in XAE again (the tools find it by themselves), or "
                  "xae_attach(solution_path=…) to work on another solution")
         if raise_:
@@ -342,7 +349,11 @@ class XaeBackend:
         a shell launched with it, launch=true); several shells with different solutions and none named: refused."""
         self._require_win()
         explicit = bool(solution_path)
-        want_sol = solution_path or (self.bound_solution if _internal else None) or self.cfg.solution_path or ""
+        # review: xae_status / xae_attach() without a path attached to whatever was open when the solution bound at
+        # runtime (none configured) had been closed — the bound solution counts there too; xae_attach() without a path
+        # goes back to xae.solution_path when one is configured
+        want_sol = (solution_path or (self.bound_solution if _internal else None) or self.cfg.solution_path
+                    or self.bound_solution or "")
         want_sol_norm = _norm_sol(want_sol)
         cands = [c for c in self._rot_candidates() if not progid or c["progid"] == progid]
         order = {p: i for i, p in enumerate(self.cfg.progids)}
@@ -364,11 +375,17 @@ class XaeBackend:
                                "nothing was chosen. xae_attach(solution_path=…) with the one to work on, or set "
                                "xae.solution_path in twincat_mcp.toml")
             if cands:
-                pick = cands[0]
+                pick = next((c for c in cands if c["solution"]), cands[0])    # the shell that has it, not an empty one
         launched = False
         if pick is None:
             do_launch = (not self.cfg.attach_only) if launch is None else launch
             if not do_launch:
+                if want_sol_norm and cands and _for_open:
+                    raise XaeError(
+                        f"no XAE shell is free to open {want_sol}: the open shells have "
+                        f"{[c['solution'] or '(no solution)' for c in cands]}, and opening it there would close that "
+                        "solution — nothing was done. Open it in XAE yourself, close a solution first, or "
+                        "xae_attach(launch=true) to start a shell for it.")
                 if want_sol_norm and cands:
                     raise XaeError(
                         f"the solution {want_sol} is not open in any XAE shell (open: "
@@ -453,6 +470,8 @@ class XaeBackend:
             d.pop("solution_error", None)
             d["note"] = "no solution open in the shell — xae_open_solution(path) or open one in XAE"
             return d
+        if not_open:
+            return d                                     # the other solution's TwinCAT project is not this server's
         try:
             sm = self._sm()
             d["twincat_project"] = self._sysman_project_name

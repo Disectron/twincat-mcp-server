@@ -478,3 +478,60 @@ def test_n114_unknown_tsproj_contents_keep_every_plc_project(tmp_path):
     (tmp_path / "Machine.tsproj").write_text("<TcSmProject><Plc>", encoding="utf-8")       # unreadable
     r = p.scan()
     assert len(p.plcproj) == 1 and "cannot be read" in r["plc_projects_note"]
+
+
+def _plc_with_action(root, name, impl, cycle_us, var_type="INT"):
+    d = _plc(root, name, impl, cycle_us)
+    main = d / "POUs" / "MAIN.TcPOU"
+    main.write_text(main.read_text(encoding="utf-8").replace(
+        "  n : INT;", f"  n : INT;\n  x : {var_type};").replace(
+        "</POU>", f'<Action Name="Act"><Implementation><ST><![CDATA[n := 0; // {name}]]></ST></Implementation></Action></POU>'),
+        encoding="utf-8")
+    return d
+
+
+def test_n113_review_readers_never_pick_one_of_two_silently(tmp_path):
+    """Review of N113: lookups were per PLC project, but lists, searches, symbol resolution and sub-items still read the
+    name -> unit view, where MAIN of one PLC project hides the other's. Lists and searches show both; resolution is
+    done in the PLC project of the ADS port; an ambiguous name (MAIN.Act, 'Act') is refused, for writes too."""
+    for n, port in (("Plc1", 851), ("Plc2", 852)):
+        d = _plc_with_action(tmp_path, n, "n := n + 1;", 10000, var_type=f"ST_{n}")
+        (d / "DUTs").mkdir()
+        (d / "DUTs" / f"ST_{n}.TcDUT").write_text(
+            f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><DUT Name="ST_{n}"><Declaration><![CDATA[TYPE ST_{n} :\n'
+            f'STRUCT\n  v{n} : INT;\nEND_STRUCT\nEND_TYPE]]></Declaration></DUT></TcPlcObject>', encoding="utf-8")
+        register_sources(d / f"{n}.plcproj")
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert "main.act" in p.duplicates
+    assert len(p.list_units("PROGRAM")["units"]) == 2
+    assert {h["file"] for h in p.search(r"// Plc")["hits"]} == {str(tmp_path / n / "POUs" / "MAIN.TcPOU") for n in ("Plc1", "Plc2")}
+    with pytest.raises(ProjectError, match="exists in several files"):
+        p.get_unit("MAIN.Act")
+    with pytest.raises(ProjectError, match="matches 2 objects"):
+        p.get_unit("Act")
+    assert "Plc2" in p.get_unit("Plc2@MAIN.Act").implementation
+    # resolution in the PLC project of the ADS port
+    r = p.resolve_symbol("MAIN.x.vPlc2", 852)
+    assert r["resolved"] and r["hops"][1]["type"] == "ST_Plc2" and r["hops"][2]["declared_in"] == "ST_Plc2", r
+    assert p.resolve_symbol("MAIN.x.vPlc1", 851)["resolved"]
+    with pytest.raises(ProjectError, match="several PLC projects .* no ADS port was given"):
+        p.resolve_symbol("MAIN.x")
+    v = p.variables(port=852)
+    assert {it["path"] for it in v["items"]} == {"MAIN.n", "MAIN.x.vPlc2"} and "note" not in v
+    v = p.variables()
+    assert {"MAIN.x.vPlc1", "MAIN.x.vPlc2"} <= {it["path"] for it in v["items"]} and "several PLC projects" in v["note"]
+
+
+def test_n113_review_an_unresolved_tsproj_reference_keeps_every_plc_project(tmp_path):
+    """Review: Plc1 resolved and Plc2's .xti missing — Plc2.plcproj on disk may be the one the .tsproj names; it was
+    dropped as 'removed from the tree'. Every .plcproj counts, and the scan says which reference was not found."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _tsproj(tmp_path, ("Plc1", 851))
+    ts = (tmp_path / "Machine.tsproj").read_text(encoding="utf-8").replace("</Plc>", '<Project File="Plc2.xti"/></Plc>')
+    (tmp_path / "Machine.tsproj").write_text(ts, encoding="utf-8")
+    p = idx(tmp_path)
+    r = p.scan()
+    assert len(p.plcproj) == 2 and p.plcproj_not_in_project == []
+    assert "could not be found" in r["plc_projects_note"] and r["plc_projects_not_found"][0]["unresolved"] is True

@@ -1048,6 +1048,29 @@ async def test_n113_save_check_compares_each_plc_projects_own_main(monkeypatch, 
         await app.save_verified("xae_build")
 
 
+
+@pytest.mark.anyio
+async def test_n113_review_analyses_run_inside_one_plc_project(monkeypatch, tmp_path):
+    """Review of N113: proj_lint / proj_call_graph / proj_interface read the name -> unit view, where MAIN of one PLC
+    project stands for both. Each analysis runs inside one PLC project: a name in two is refused unless pinned, the
+    whole-project lint is the lint of each PLC project, its findings tagged."""
+    from tests.fake_ads import install
+    from tests.test_project import _plc, _tsproj
+    install(monkeypatch)
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2; // TODO Plc2 only", 2000)
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    async with client_for(build_server(mk_cfg(tmp_path))) as s:
+        r = await s.call_tool("proj_call_graph", {"root": "MAIN"})
+        assert r.is_error and "several PLC projects" in text(r) and "@MAIN" in text(r)
+        g = payload(await s.call_tool("proj_call_graph", {"root": "Plc2@MAIN"}))
+        assert g["plc_project"].endswith("Plc2.plcproj") and g["root"] == "MAIN"
+        li = payload(await s.call_tool("proj_lint", {}))
+        assert len(li["plc_projects"]) == 2 and li["units"] == 2
+        todo = [f for f in li["items"] if f["rule"] == "todo"]
+        assert todo and all(f["plc_project"].endswith("Plc2.plcproj") for f in todo)
+
+
 async def _noop():
     return None
 
