@@ -734,3 +734,30 @@ def test_review_0812_xml_that_is_no_esi_starts_no_first_build(tmp_path):
     files.append((_write(tmp_path / "manuals" / "a.xml", f"<?xml version='1.0'?><EtherCATInfo>{VENDOR.format(fv=1)}"
                          "</EtherCATInfo>"), "knowledge"))
     assert E.has_esi(files)
+
+
+def test_ci_0812_a_reader_leaves_no_connection_open(esi_kb):
+    """0.8.12 Windows CI: a build waited 60 s and could not replace esi.db — a reader's connection was still open.
+    sqlite3 connections sit in a reference cycle with their statement cache (an lru_cache that holds the
+    connection), so the garbage collector closes them late, not when the read returns; on Windows an open file cannot
+    be replaced. Every read closes its connection."""
+    import gc
+    kb, tc, db = esi_kb
+    _build(esi_kb)
+    x = E.EsiIndex(db)
+    gc.disable()
+    try:
+        x.lookup("EL3356-0010", detail="full")
+        x.search("RMB")
+        x.object("EL3356-0010", "#x8000")
+        open_ = []
+        for o in gc.get_objects():
+            if isinstance(o, sqlite3.Connection):
+                try:
+                    names = [r[2] for r in o.execute("PRAGMA database_list")]
+                except sqlite3.ProgrammingError:
+                    continue                                   # closed
+                open_ += [n for n in names if n and Path(n).name == "esi.db"]
+        assert open_ == [], open_
+    finally:
+        gc.enable()

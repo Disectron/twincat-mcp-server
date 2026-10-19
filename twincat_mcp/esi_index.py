@@ -41,6 +41,7 @@ Standard library only: the server, the builder (skills/twincat-docs/builders/esi
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -1419,10 +1420,17 @@ class EsiIndex:
     def __init__(self, db: Path):
         self.db = Path(db)
 
-    def _con(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _con(self) -> Iterator[sqlite3.Connection]:
+        """A read-only connection, closed when the read is done — not left to the garbage collector: on Windows an
+        open file cannot be replaced, and a build waited 60 s for a reader's forgotten connection (0.8.12 CI)."""
         if not self.db.is_file():
             raise EsiError(f"no ESI index yet ({self.db})", "no_index")
-        return connect_ro(self.db)
+        con = connect_ro(self.db)
+        try:
+            yield con
+        finally:
+            con.close()
 
     @staticmethod
     def _range(n: int, what: str, bits: int, given: Any) -> int:
