@@ -1322,7 +1322,7 @@ async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, proje
     cfg.knowledge.location = str(kb)
     srv = build_server(cfg)
     ins = srv._lowlevel_server.instructions
-    assert "Offline documentation, state at this connection" in ins and "Infosys index: complete (8 pages" in ins
+    assert "Offline documentation, state at this connection" in ins and "Infosys index: complete (9 pages" in ins
     db = kb / "index" / "infosys-1033.db"
     building = db.with_name(db.name + ".building")
     building.write_bytes(db.read_bytes())
@@ -1336,7 +1336,7 @@ async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, proje
     c.close()
     srv = build_server(cfg)                                          # a reconnection = a new server process
     ins = srv._lowlevel_server.instructions
-    assert "a build was INTERRUPTED at 8 of 51656 pages" in ins and "infosys_local.py" in ins
+    assert "a build was INTERRUPTED at 9 of 51656 pages" in ins and "infosys_local.py" in ins
     assert "rebuilt only when the user approves it" in ins and "kb_rebuild(index='infosys')" in ins
     async with client_for(srv) as s:
         d = payload(await s.call_tool("tc_doctor", {}))

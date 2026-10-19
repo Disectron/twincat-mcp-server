@@ -305,7 +305,7 @@ def test_status_reports_the_offline_documentation_layout(kb, kb_fixture):
     k.set_location(str(loc))
     d = k.status()["docs"]
     assert d["skill"] == "twincat-docs" and str(K.docs_skill_path()) in d["call"] and str(loc) in d["call"]
-    assert d["infosys"]["exists"] and d["infosys"]["pages"] == 8 and d["infosys"]["books"] == 6
+    assert d["infosys"]["exists"] and d["infosys"]["pages"] == 9 and d["infosys"]["books"] == 6
     assert Path(d["infosys"]["package"]).name == "BKINFOSYS3_FIXTURE_EN-US.mshc" and d["infosys"]["lcid"] == "1033"
     assert d["infosys"]["state"] == "complete" and d["infosys"]["format"] == d["infosys"]["format_expected"]
     assert d["infosys"]["links"] == 2 and d["infosys"]["links_resolved"] == 1 and "command" not in d["infosys"]

@@ -673,6 +673,27 @@ def _intro(body: str) -> str:
     return t[:600] + ("…" if len(t) > 600 else "")
 
 
+def _parsed_declaration(r: sqlite3.Row) -> dict[str, Any]:
+    """N103b: what the index stored for the page when it was built (the plugin's parse_declaration — the same answer
+    infosys_declaration gives): the kind, the return type of a function / method / property, and the declaration
+    with its header ('FUNCTION MEMCPY : UDINT' — Beckhoff often writes the header as a heading, so the page's code
+    blocks alone never show the return type)."""
+    try:
+        d = json.loads(r["decl"]) if r["decl"] else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return {"kind": r["kind"], "declaration_note": "the index holds no parsed declaration for this page — the "
+                                                       "kind is the page's, the return type is not known"}
+    out: dict[str, Any] = {"kind": d.get("kind") or r["kind"]}
+    if out["kind"] in ("Function", "Method", "Property"):
+        out["return_type"] = d.get("return_type")
+    for k in ("kind_note", "extends", "implements", "declaration"):
+        if d.get(k):
+            out[k] = d[k]
+    return out
+
+
 def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
     r, how = resolve(ctx, a["symbol"], a["book"], what="symbol")
@@ -687,7 +708,7 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         used += len(b)
     req = re.search(r"(?ms)^#{1,4} (?:Requirements|Prerequisites|Voraussetzungen)\s*\n(.*?)(?=^#{1,4} |\Z)", body)
     out: dict[str, Any] = _page_head(ctx, r)
-    out.update({"resolved_by": how, "intro": _intro(body), "declaration_blocks": shown,
+    out.update({"resolved_by": how, **_parsed_declaration(r), "intro": _intro(body), "declaration_blocks": shown,
                 "requirements": req.group(1).strip() if req else None, "also_in": _also_in(con, r)})
     lk = _links(con, body)
     if lk:
