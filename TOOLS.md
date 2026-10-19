@@ -1,4 +1,4 @@
-# twincat-mcp 0.8.12 — tool reference
+# twincat-mcp 0.8.13 — tool reference
 
 160 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
@@ -104,8 +104,8 @@
 - `xae_dialog_resolve` [C/D] — Click a button on an open XAE dialog ('OK', 'Yes', 'No', 'Cancel'…). remember=true adds an auto-answer rule for that title (never for machine-affecting prompts). Control-class; machine-affecting prompts (activate/run/download/login/delete/safety) are destructive-class.
 - `xae_io_disable` [E] — Set/clear the Disabled flag on I/O devices under TIID (all, or the named ones) so a configuration activates without the hardware present — TcUnit on a PC, dry runs.
 - `xae_links` [R] — Variable links of the PLC instance: every AT %I*/%Q* variable with its link target; lists the unlinked ones (the usual reason an output never moves).
-- `xae_attach` [E] — Attach to the running XAE shell / Visual Studio (Running Object Table). Picks the instance holding solution_path when given. launch=true starts a new shell (slow).
-- `xae_status` [R] — Shell version, open solution, projects, TwinCAT project name, target NetId, started flag. Attaches to the shell first if not attached yet (as every xae_* tool does).
+- `xae_attach` [E] — Attach to the running XAE shell / Visual Studio (Running Object Table) that has the solution: solution_path when given (from then on every xae_* tool works on it — flagged solution_mismatch when it is not xae.solution_path), else xae.solution_path. A solution no shell has open is never replaced by another one…
+- `xae_status` [R] — Shell version, open solution, projects, TwinCAT project name, target NetId, started flag. Attaches to the shell first if not attached yet (as every xae_* tool does). solution_bound: the solution the xae_* tools work on; solution_mismatch / refused: it is not open (they refuse); reattached: it was found in a shell…
 - `xae_open_solution` [E] — Open a .sln in the attached shell.
 - `xae_build` [E] — Build the solution. save_first (default) runs File.SaveAll, saves whatever the shell still reports unsaved, and checks that every xae_pou_set / xae_pou_create edit of this session is in the source files — it refuses to build otherwise (an external reload would discard the edits). Returns success, error/warning items…
 - `xae_diagnostics` [R] — Current XAE Error List (errors/warnings/messages with file:line — TwinCAT's own entries too, read from the list view when the automation interface reports none; this focuses the Error List window) merged with the Build output pane, plus the pane's tail, without rebuilding. `source` names where each part came from.
@@ -157,7 +157,7 @@
 - `proj_changed` [R] — Units whose source differs from a git revision (default: uncommitted work) plus untracked files — 'what did I change?'; pair with proj_vs_runtime for 'is it deployed?'.
 - `proj_list` [R] — List indexed objects. kind: PROGRAM | FUNCTION_BLOCK | FUNCTION | STRUCT | ENUM | UNION | ALIAS | GVL | INTERFACE | METHOD | PROPERTY | ACTION (case-insensitive).
 - `proj_get_code` [R] — Source of an object ('FB_Valve', 'FB_Valve.Open', 'MAIN'): declaration/implementation with file line numbers, parsed VAR declarations, sub-items.
-- `proj_resolve_symbol` [R] — Map an ADS symbol path (MAIN.fbFill.fbValve.bOpen) to the file:line where each hop is declared, following variable types through FB/STRUCT definitions. Hops inside a library type (Tc2_Standard.CTU.CV) are completed from the runtime's datatype table when the target is reachable.
+- `proj_resolve_symbol` [R] — Map an ADS symbol path (MAIN.fbFill.fbValve.bOpen) to the file:line where each hop is declared, following variable types through FB/STRUCT definitions. Hops inside a library type (Tc2_Standard.CTU.CV) are completed from the runtime's datatype table when the target is reachable. A first name declared in several PLC…
 - `proj_search` [R] — Regex search over all declarations/implementations → unit, file, line, text.
 - `proj_references` [R] — Where a type/object is instantiated (variables of that type) and mentioned.
 - `proj_read_file` [R] — Raw text of a project file (relative to project root or absolute).
@@ -202,7 +202,7 @@
 - `scope_status` [R] — TwinCAT Scope on this PC: where TC3ScopeExportTool.exe is (TE130x Scope View / TF3300 Scope Server) and the default export folder.
 - `scope_export` [E] — Export a saved TwinCAT Scope recording (.svdx / .svd) to CSV with Beckhoff's TC3ScopeExportTool.exe (command line `"svd=<file>" target=<csv> silent`; CSV needs no extra licence). Default target: <recordings>/scope/<name>.csv ([scope] export_dir). The CSV is Beckhoff's output, unchanged — channels, time column and…
 - `scope_list` [R] — TwinCAT Scope configurations in the solution open in XAE (TwinCAT Measurement projects). Their channels, sample time and record time are what scope_record / rec_start(also_scope=true) record.
-- `scope_record` [E] — Drive a Scope configuration open in XAE (Automation Interface IMeasurementScope): action = start | stop | save (SaveSVD + ExportCSV → <recordings>/scope/<scope>-<time>.svdx/.csv, or path=<file>.svdx). scope = its name when several are open. Affects only the Scope recording, not the PLC.
+- `scope_record` [E] — Drive a Scope configuration open in XAE (Automation Interface IMeasurementScope): action = start | stop | save (SaveSVD → <recordings>/scope/<scope>-<time>.svdx, or path=<file>.svdx; the .csv exported from that file with Beckhoff's export tool — XAE's ExportCSV only without it, flagged; the Scope View log's new ERROR…
 
 ## Prompts (5)
 
