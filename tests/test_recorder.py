@@ -1208,7 +1208,8 @@ def test_n62_cycle_compared_with_the_task_that_runs_the_program(rec, monkeypatch
                             {"index": 2, "name": "FastTask", "cycle_time_ms": 1.0}]}
     monkeypatch.setattr(rec, "_manifest", lambda port=None: man)
     owners = {"MAIN": [{"name": "PlcTask", "cycle_ms": 10.0, "plc_project": None}]}
-    rec.task_of = lambda name: owners.get(name, [])
+    ports = []
+    rec.task_of = lambda name, port=None: (ports.append(port), owners.get(name, []))[1]
     st = rec.start(symbols=["MAIN.nCycle", "GVL_Machine.nDrumsFilled"], prefix=None, pattern=None, mode="cycle",
                    cycle_ms=1, duration_s=None, max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0,
                    name="n62", max_symbols=50, cycle_counter=None)
@@ -1218,6 +1219,7 @@ def test_n62_cycle_compared_with_the_task_that_runs_the_program(rec, monkeypatch
                                         "basis": "its task in the project, cycle from the runtime"}
     assert st["task_check"]["GVL_Machine"]["task"] is None and "GVL" in st["task_check"]["GVL_Machine"]["basis"]
     assert "GVL_Machine" not in st["warning"]               # 1 ms = the fastest task: not below
+    assert ports and set(ports) == {rec.ads.port}             # N114: the port read picks the PLC project
 
 
 def test_n62_project_task_config_maps_programs_to_tasks(tmp_path):
@@ -1282,7 +1284,8 @@ def test_n62_tasks_of_two_plc_projects_with_the_same_task_name_are_both_kept(tmp
     assert [(t["name"], t["cycle_ms"]) for t in a] == [("PlcTask", 10.0)] and a[0]["plc_project"].endswith("PlcA.plcproj")
     assert [(t["name"], t["cycle_ms"]) for t in b] == [("PlcTask", 2.0)], b
     assert idx.tasks_of("MAIN") is None                      # in both projects: not known which one is recorded
-    # review: PRG_C reached only through MAIN — whose MAIN the index holds is one of the two: cannot tell, not []
+    # PRG_C (only in PlcA) reached only through MAIN: the review's 'cannot tell' came from the name-only index holding
+    # one of the two MAINs; N113 keeps both, so PlcA's own MAIN is followed — PlcA's task runs PRG_C
     for d in ("PlcA", "PlcB"):
         (tmp_path / d / "POUs" / "PRG_C.TcPOU").write_text(
             '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="PRG_C"><Declaration><![CDATA[PROGRAM PRG_C\n'
@@ -1292,7 +1295,8 @@ def test_n62_tasks_of_two_plc_projects_with_the_same_task_name_are_both_kept(tmp
         main.write_text(main.read_text(encoding="utf-8").replace("<![CDATA[;]]>", "<![CDATA[PRG_C();]]>"), encoding="utf-8")
         register_sources(tmp_path / d / f"{d}.plcproj")
     idx = ProjectIndex(ProjectConfig(root=str(tmp_path)))
-    assert idx.tasks_of("PRG_C") is None, idx.tasks_of("PRG_C")
+    got = idx.tasks_of("PRG_C")
+    assert [(t["name"], t["cycle_ms"]) for t in got] == [("PlcTask", 10.0)] and got[0]["plc_project"].endswith("PlcA.plcproj")
 
 
 # ------------------------------------------------------------------ R43: a program change during a recording

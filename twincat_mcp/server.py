@@ -361,8 +361,8 @@ class App:
         self.rec.rcfg = cfg.recorder
 
         # N62: the recorder compares cycle_ms with the task that runs each recorded program (project task config)
-        def _task_of(name: str) -> list[dict[str, Any]] | None:
-            return self.proj.tasks_of(name)
+        def _task_of(name: str, port: int | None = None) -> list[dict[str, Any]] | None:
+            return self.proj.tasks_of(name, port)
         self.rec.task_of = _task_of
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
@@ -1201,14 +1201,13 @@ class App:
         def norm(t: str | None) -> str:
             return re.sub(r"\s+", " ", (t or "").replace("\r", "")).strip()
         self.proj.ensure_fresh()
-        units = self.proj.units
         bad: list[dict[str, Any]] = []
         for path, e in self.pending_edits.items():
-            segs = [x for x in path.split("^") if x]
-            keys = ([f"{segs[-2]}.{segs[-1]}".lower()] if len(segs) >= 2 else []) + ([segs[-1].lower()] if segs else [])
-            u = next((units[k] for k in keys if k in units), None)
+            # N113: looked up in the PLC project the tree path names — by name alone, MAIN of Plc2 was compared with
+            # MAIN of Plc1 and every build refused 'declaration on disk differs'
+            u, why = self.proj.unit_at_tree_path(path)
             if u is None:
-                bad.append({"path": path, "edited_at": e["at"], "why": "not in any source file under the project root"})
+                bad.append({"path": path, "edited_at": e["at"], "why": why})
                 continue
             for part in ("declaration", "implementation"):
                 if part in e and norm(e[part]) != norm(getattr(u, part)):

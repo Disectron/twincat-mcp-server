@@ -1023,6 +1023,31 @@ async def test_d44_build_refuses_until_shell_edits_are_on_disk(monkeypatch, proj
     assert (await app.save_verified("xae_deploy"))["edits_checked"] == 1
 
 
+
+@pytest.mark.anyio
+async def test_n113_save_check_compares_each_plc_projects_own_main(monkeypatch, tmp_path):
+    """N113: with MAIN in Plc1 and Plc2, every xae_build(save_first) refused 'declaration on disk differs' — the edit of
+    TIPC^Plc2^…^MAIN was compared with whichever MAIN the name-only index held. The tree path's PLC project decides."""
+    from tests.test_project import _plc, _tsproj
+    from twincat_mcp.server import App, ToolError
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    app = App(mk_cfg(tmp_path))
+
+    async def xae_call(fn, *a, **kw):
+        return {"saved": True, "dirty_before": [], "dirty_after": []}
+    monkeypatch.setattr(app, "xae_call", xae_call)
+    monkeypatch.setattr("twincat_mcp.server.asyncio.sleep", lambda d: _noop())
+    app.note_edit("TIPC^Plc1^Plc1 Project^POUs^MAIN", None, "n := n + 1;")
+    app.note_edit("TIPC^Plc2^Plc2 Project^POUs^MAIN", None, "n := n + 2;")
+    r = await app.save_verified("xae_build")
+    assert r["edits_on_disk"] == ["TIPC^Plc1^Plc1 Project^POUs^MAIN", "TIPC^Plc2^Plc2 Project^POUs^MAIN"]
+    app.note_edit("TIPC^Plc2^Plc2 Project^POUs^MAIN", None, "n := n + 1;")   # Plc1's text: not what Plc2's file holds
+    with pytest.raises(ToolError, match=r"Plc2 Project\^POUs\^MAIN: implementation on disk differs"):
+        await app.save_verified("xae_build")
+
+
 async def _noop():
     return None
 

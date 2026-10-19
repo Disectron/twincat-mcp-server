@@ -40,32 +40,136 @@ def _norm(p: Path) -> str:
         return os.path.normcase(str(p))
 
 
-def _compiled_files(plcproj: list[dict[str, Any]]) -> set[str] | None:
+def _compiled_files(plcproj: list[dict[str, Any]]) -> dict[str, str] | None:
     """N106: the files the PLC projects compile (<Compile Include="POUs\\MAIN.TcPOU"/>, relative to the .plcproj,
-    MSBuild-escaped) — None when there is no .plcproj (a folder of loose sources: every file is a unit). A .plcproj
-    that cannot be read contributes every source file below its folder (what it compiles is not known)."""
+    MSBuild-escaped), each with the .plcproj that compiles it — None when there is no .plcproj (a folder of loose
+    sources: every file is a unit). A .plcproj that cannot be read contributes every source file below its folder
+    (what it compiles is not known)."""
     if not plcproj:
         return None
     from urllib.parse import unquote
-    out: set[str] = set()
+    out: dict[str, str] = {}
     for pp in plcproj:
         base = Path(pp["file"]).parent
         if pp.get("error"):
-            out.update(_norm(f) for f in base.rglob("*") if f.suffix.lower() in SRC_EXT)
+            out.update({_norm(f): pp["file"] for f in base.rglob("*") if f.suffix.lower() in SRC_EXT})
             continue
         for inc in pp.get("compile") or []:
-            out.add(_norm(base.joinpath(*[x for x in unquote(inc).replace("\\", "/").split("/") if x])))
+            out[_norm(base.joinpath(*[x for x in unquote(inc).replace("\\", "/").split("/") if x]))] = pp["file"]
     return out
 
 
 def _plcproj_stamp(root: Path) -> dict[str, float]:
+    """What decides which files are the project: the .plcproj files, and the .tsproj / .xti files that name the PLC
+    projects (N114: a PLC project removed from the tree changes the .tsproj, not its .plcproj)."""
     out: dict[str, float] = {}
-    for pp in root.rglob("*.plcproj"):
-        try:
-            out[str(pp)] = pp.stat().st_mtime
-        except OSError:
-            pass
+    for pat in ("*.plcproj", "*.tsproj", "*.xti"):
+        for pp in root.rglob(pat):
+            try:
+                out[str(pp)] = pp.stat().st_mtime
+            except OSError:
+                pass
     return out
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find_xti(base: Path, name: str) -> tuple[Path | None, str | None]:
+    """The independent project file a .tsproj names (<Project File="Plc2.xti"/>): XAE keeps it in _Config\\PLC\\;
+    anywhere else below the .tsproj's folder only when exactly one file has that name."""
+    first = base / "_Config" / "PLC" / name
+    if first.is_file():
+        return first, None
+    hits = [p for p in base.rglob(name) if p.is_file() and "_Boot" not in p.parts]
+    if len(hits) == 1:
+        return hits[0], None
+    return None, (f"its file {name!r} was not found below {str(base)!r}" if not hits else
+                  f"{len(hits)} files named {name!r} below {str(base)!r} — which one is meant is not known")
+
+
+def _parse_tsproj(p: Path) -> dict[str, Any]:
+    """N113/N114: the PLC projects a TwinCAT project consists of — each <Plc><Project Name= PrjFilePath= AmsPort=> of
+    the .tsproj, inline or in an independent file (<Project File="Plc2.xti"/>). {"file", "error", "plc": [{"name" (the
+    PLC project's name in the XAE tree: TIPC^<name>), "plcproj" (the file, None when not found), "ams_port",
+    "path_in_file", "why"?}]}. PrjFilePath is relative to the file that holds it; the .tsproj's folder is tried too."""
+    d: dict[str, Any] = {"file": str(p), "plc": [], "error": None}
+    try:
+        root = ET.fromstring(p.read_text(encoding="utf-8-sig", errors="replace"))
+    except (ET.ParseError, OSError) as exc:
+        d["error"] = f"{type(exc).__name__}: {exc}"
+        return d
+    for plc in (e for e in root.iter() if _local(e.tag) == "Plc"):
+        for el in plc:
+            if _local(el.tag) != "Project":
+                continue
+            src, holder = el, p
+            if el.get("File") and not el.get("PrjFilePath"):
+                xti, why = _find_xti(p.parent, el.get("File") or "")
+                if xti is None:
+                    d["plc"].append({"name": el.get("Name"), "plcproj": None, "ams_port": None, "why": why})
+                    continue
+                try:
+                    xr = ET.fromstring(xti.read_text(encoding="utf-8-sig", errors="replace"))
+                except (ET.ParseError, OSError) as exc:
+                    d["plc"].append({"name": el.get("Name"), "plcproj": None, "ams_port": None,
+                                     "why": f"{str(xti)!r} cannot be read: {exc}"})
+                    continue
+                found = next((e for e in xr.iter() if _local(e.tag) == "Project" and e.get("PrjFilePath")), None)
+                if found is None:
+                    d["plc"].append({"name": el.get("Name"), "plcproj": None, "ams_port": None,
+                                     "why": f"{str(xti)!r} names no PrjFilePath"})
+                    continue
+                src, holder = found, xti
+            port = (src.get("AmsPort") or "").strip()
+            row: dict[str, Any] = {"name": src.get("Name") or el.get("Name"), "plcproj": None,
+                                   "ams_port": int(port) if port.isdigit() else None}
+            rel = src.get("PrjFilePath")
+            if not rel:
+                row["why"] = "no PrjFilePath (a PLC project without sources in this project)"
+                d["plc"].append(row)
+                continue
+            row["path_in_file"] = rel
+            parts = [x for x in rel.replace("\\", "/").split("/") if x]
+            cands = [holder.parent.joinpath(*parts)] + ([p.parent.joinpath(*parts)] if holder != p else [])
+            hit = next((c for c in cands if c.is_file()), None)
+            if hit is None:
+                row["why"] = f"{rel!r} (relative to {str(holder.parent)!r}) does not exist"
+            else:
+                row["plcproj"] = str(hit)
+            d["plc"].append(row)
+    return d
+
+
+def _in_project(ts: list[dict[str, Any]], plcproj: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
+                                                                                   list[dict[str, Any]], str | None]:
+    """N114: which .plcproj files are the TwinCAT project's PLC projects — those a .tsproj under the root names. A
+    .plcproj no .tsproj names (the folder of a PLC project removed from the tree stays on disk) is not part of the
+    project. When that cannot be told — no .tsproj, one that cannot be read, or none naming a .plcproj that exists —
+    every .plcproj counts, and the reason is returned. Each kept .plcproj gets "tree_name" and "ams_port"."""
+    if not ts:
+        return plcproj, [], None
+    bad = [t["file"] for t in ts if t.get("error")]
+    named: dict[str, dict[str, Any]] = {}
+    for t in ts:
+        for r in t["plc"]:
+            if r.get("plcproj"):
+                named.setdefault(_norm(Path(r["plcproj"])), {**r, "tsproj": t["file"]})
+    if bad:
+        return plcproj, [], f"{bad} cannot be read: which PLC projects belong to the project is not known — every .plcproj counts"
+    if not named:
+        return plcproj, [], ("no .tsproj names a .plcproj that exists: which PLC projects belong to the project is not "
+                             "known — every .plcproj counts")
+    keep, left = [], []
+    for pp in plcproj:
+        r = named.get(_norm(Path(pp["file"])))
+        if r is None:
+            left.append({"file": pp["file"], "why": "no .tsproj under the root names this PLC project (removed from "
+                                                    "the tree? its folder stays on disk) — not part of the project"})
+        else:
+            keep.append({**pp, "tree_name": r.get("name"), "ams_port": r.get("ams_port"), "tsproj": r["tsproj"]})
+    return keep, left, None
 
 # N92: the variables of a PROGRAM / GVL that become symbols of the runtime (VAR_TEMP never does; CONSTANT is replaced)
 _SYMBOL_SECTIONS = {"PROGRAM": {"VAR", "VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_STAT", "VAR_INST"},
@@ -220,9 +324,24 @@ class ProjectError(RuntimeError):
 class _Index:
     """What a scan or refresh builds before it is published (N88: copy-on-write — readers outside the lock iterate
     the published dicts, which are never changed in place; a scan swaps in complete new ones)."""
-    units: dict[str, CodeUnit]
+    by_file: dict[str, dict[str, CodeUnit]]   # file -> its units by lower-case name: every file's units are kept
     files: dict[str, float]
-    duplicates: dict[str, list[str]]
+
+    def copy(self) -> "_Index":
+        return _Index(dict(self.by_file), dict(self.files))
+
+    def merged(self) -> tuple[dict[str, CodeUnit], dict[str, list[str]]]:
+        """The name -> unit view (a name declared in two files: the file indexed last) and the names declared in
+        several files. N113: the per-file units stay complete — MAIN of Plc2 does not replace MAIN of Plc1 there."""
+        units: dict[str, CodeUnit] = {}
+        dup: dict[str, list[str]] = {}
+        for f, us in self.by_file.items():
+            for k, u in us.items():
+                prev = units.get(k)
+                if prev is not None and prev.file != f and u.parent is None:
+                    dup.setdefault(k, [prev.file]).append(f)
+                units[k] = u
+        return units, dup
 
 
 class ProjectIndex:
@@ -231,14 +350,20 @@ class ProjectIndex:
         self.root: Path | None = Path(cfg.root) if cfg.root else None
         self.units: dict[str, CodeUnit] = {}      # lower-case name -> unit
         self.duplicates: dict[str, list[str]] = {}  # lower-case name -> files when the same name exists twice
+        self._by_file: dict[str, dict[str, CodeUnit]] = {}   # N113: file -> its units (names in two files both kept)
         self.files: dict[str, float] = {}         # path -> mtime
         self.solutions: list[str] = []
         self.tsproj: list[str] = []
+        # N114: the PLC projects of the TwinCAT project — the .plcproj files a .tsproj names (with "tree_name",
+        # "ams_port"); every .plcproj under the root when that cannot be told (plc_projects_note says why)
         self.plcproj: list[dict[str, Any]] = []
+        self.plcproj_not_in_project: list[dict[str, Any]] = []   # .plcproj files no .tsproj names
+        self.plc_refs: list[dict[str, Any]] = []                 # what the .tsproj files name, found or not
+        self.plc_projects_note: str | None = None
         # N106: the project is what its .plcproj files compile — a .Tc* file under the root that no .plcproj lists (a
         # backup copy, an export, a test leftover) is not part of it: not a unit, listed here
         self.not_in_project: list[str] = []
-        self._members: set[str] | None = None     # normcase paths of the compiled files; None: no .plcproj (loose sources)
+        self._members: dict[str, str] | None = None   # normcase path of each compiled file -> its .plcproj; None: no .plcproj
         self._plcproj_stamp: dict[str, float] = {}
         self.scanned_at: float | None = None
         # N26: tools run in worker threads; parallel first calls must not scan concurrently (each scan clears
@@ -259,10 +384,12 @@ class ProjectIndex:
             raise ProjectError(f"project root not set or not a directory: {self.root}. "
                                "Pass root= or set TCMCP_PROJECT_ROOT / TCMCP_SOLUTION.")
         t0 = time.time()
-        ix = _Index({}, {}, {})
+        ix = _Index({}, {})
+        stamp = _plcproj_stamp(self.root)            # before reading: a change made during the scan rescans next time
         solutions = [str(p) for p in self.root.rglob("*.sln")]
-        tsproj = [str(p) for p in self.root.rglob("*.tsproj")]
-        plcproj = [self._parse_plcproj(pp) for pp in self.root.rglob("*.plcproj")]
+        tsproj_files = list(self.root.rglob("*.tsproj"))
+        ts = [_parse_tsproj(p) for p in tsproj_files]
+        plcproj, left_out, plc_note = _in_project(ts, [self._parse_plcproj(pp) for pp in self.root.rglob("*.plcproj")])
         members = _compiled_files(plcproj)
         n_files = 0
         outside: list[str] = []
@@ -277,13 +404,15 @@ class ProjectIndex:
                     self._index_file(p, ix)
                     n_files += 1
                 except ET.ParseError as exc:
-                    ix.files[str(p)] = -1
-                    ix.units[f"__parse_error__{p.name}".lower()] = CodeUnit(p.name, "PARSE_ERROR", str(p), "", str(exc))
+                    self._parse_error(p, exc, ix)
         # published whole (N88): the units first, so a reader that sees the new plcproj never pairs it with old units
-        self.units, self.files, self.duplicates = ix.units, ix.files, ix.duplicates
-        self.solutions, self.tsproj, self.plcproj = solutions, tsproj, plcproj
+        self._publish(ix)
+        self.solutions, self.tsproj, self.plcproj = solutions, [str(p) for p in tsproj_files], plcproj
+        self.plcproj_not_in_project, self.plc_projects_note = left_out, plc_note
+        self.plc_refs = [{**r, "tsproj": t["file"]} for t in ts for r in t["plc"]] + \
+                        [{"tsproj": t["file"], "error": t["error"]} for t in ts if t.get("error")]
         self._members, self.not_in_project = members, sorted(outside)
-        self._plcproj_stamp = _plcproj_stamp(self.root)
+        self._plcproj_stamp = stamp
         self.scanned_at = time.time()
         kinds: dict[str, int] = {}
         for u in self.units.values():
@@ -292,20 +421,40 @@ class ProjectIndex:
                "duplicate_names": self.duplicates,
                "solutions": self.solutions, "tsproj": self.tsproj,
                "plcproj": [{"file": p["file"], "name": p["name"], "compile_items": len(p["compile"]),
+                            **({"tree_name": p["tree_name"], "ams_port": p["ams_port"]} if "tree_name" in p else {}),
                             **({"error": p["error"]} if p.get("error") else {})} for p in self.plcproj],
                "duration_s": round(time.time() - t0, 2)}
+        missing = [r for r in self.plc_refs if not r.get("plcproj")]
+        if missing:
+            out["plc_projects_not_found"] = missing
+        if self.plc_projects_note:
+            out["plc_projects_note"] = self.plc_projects_note
         out.update(self.outside_note())
         return out
 
+    def _publish(self, ix: _Index) -> None:
+        units, dup = ix.merged()
+        self.units, self.duplicates, self._by_file, self.files = units, dup, ix.by_file, ix.files
+
+    @staticmethod
+    def _parse_error(p: Path, exc: Exception, ix: _Index) -> None:
+        ix.files[str(p)] = -1
+        ix.by_file[str(p)] = {f"__parse_error__{p.name}".lower(): CodeUnit(p.name, "PARSE_ERROR", str(p), "", str(exc))}
+
     def outside_note(self) -> dict[str, Any]:
-        """N106: the source files under the root that no .plcproj compiles — not part of the project, so not units."""
-        if not self.not_in_project:
-            return {}
-        return {"not_in_project": {"count": len(self.not_in_project), "files": self.not_in_project[:20],
-                                   "why": "no .plcproj under the root compiles these files (a backup copy, an export, "
-                                          "a leftover?): they are not part of the PLC project and not indexed as units "
-                                          "— proj_read_file reads them; add them to the project in XAE to have them "
-                                          "indexed"}}
+        """N106: the source files under the root that no .plcproj compiles — not part of the project, so not units.
+        N114: and the .plcproj files no .tsproj names (their files are among them)."""
+        out: dict[str, Any] = {}
+        if self.not_in_project:
+            out["not_in_project"] = {
+                "count": len(self.not_in_project), "files": self.not_in_project[:20],
+                "why": "no PLC project of the TwinCAT project compiles these files (a backup copy, an export, the folder "
+                       "of a PLC project removed from the tree, a leftover?): they are not part of the project and not "
+                       "indexed as units — proj_read_file reads them; add them to the project in XAE to have them "
+                       "indexed"}
+        if self.plcproj_not_in_project:
+            out["plcproj_not_in_project"] = self.plcproj_not_in_project
+        return out
 
     REFRESH_MIN_S = 2.0   # index-based tools re-check file mtimes at most this often
 
@@ -421,10 +570,10 @@ class ProjectIndex:
             return {"changed": sorted(f for f in after if f in before and after[f] != before[f]),
                     "added": sorted(f for f in after if f not in before),
                     "removed": sorted(f for f in before if f not in after), "units": r["units"],
-                    "rescanned": "a .plcproj changed"}
+                    "rescanned": "a .plcproj, .tsproj or .xti changed"}
         changed, added, removed = [], [], []
         seen: set[str] = set()
-        ix = _Index(dict(self.units), dict(self.files), {k: list(v) for k, v in self.duplicates.items()})
+        ix = _Index(dict(self._by_file), dict(self.files))
         for p in self.root.rglob("*"):
             if p.suffix.lower() in SRC_EXT and p.is_file():
                 if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
@@ -441,34 +590,26 @@ class ProjectIndex:
                 else:
                     continue
                 try:
-                    self._drop_file(sp, ix)
-                    self._index_file(p, ix)
+                    self._index_file(p, ix)           # replaces the file's units (its place in the order kept)
                 except ET.ParseError as exc:
-                    ix.files[sp] = -1
-                    ix.units[f"__parse_error__{p.name}".lower()] = CodeUnit(p.name, "PARSE_ERROR", sp, "", str(exc))
+                    self._parse_error(p, exc, ix)
         for sp in list(ix.files):
             if sp not in seen:
                 removed.append(sp)
-                self._drop_file(sp, ix)
+                ix.by_file.pop(sp, None)
                 ix.files.pop(sp, None)
         if changed or added or removed:
-            self.units, self.files, self.duplicates = ix.units, ix.files, ix.duplicates     # published whole (N88)
+            self._publish(ix)                         # published whole (N88)
         self.scanned_at = time.time()
         return {"changed": changed, "added": added, "removed": removed, "units": len(self.units)}
 
     def reindex_file(self, p: Path) -> None:
-        """Re-index one file now (after an edit): its old units dropped, the new ones published whole (N88). Raises
+        """Re-index one file now (after an edit): its units replaced, the index published whole (N88). Raises
         ET.ParseError — and publishes nothing — when the file does not parse."""
         with self._scan_lock:
-            ix = _Index(dict(self.units), dict(self.files), {k: list(v) for k, v in self.duplicates.items()})
-            self._drop_file(str(p), ix)
+            ix = _Index(dict(self._by_file), dict(self.files))
             self._index_file(p, ix)
-            self.units, self.files, self.duplicates = ix.units, ix.files, ix.duplicates
-
-    @staticmethod
-    def _drop_file(path: str, ix: _Index) -> None:
-        for k in [k for k, u in ix.units.items() if u.file == path]:
-            ix.units.pop(k, None)
+            self._publish(ix)
 
     def changed_units(self, since: str = "HEAD") -> dict[str, Any]:
         """Units whose files differ from a git revision (default: uncommitted changes), plus
@@ -533,9 +674,14 @@ class ProjectIndex:
         return d
 
     def _index_file(self, p: Path, ix: _Index) -> None:
+        """Index one file into ix.by_file[file] (replacing what the file held). Raises ET.ParseError before anything
+        of ix is changed."""
         text = p.read_text(encoding="utf-8-sig", errors="replace")
-        ix.files[str(p)] = p.stat().st_mtime
+        mtime = p.stat().st_mtime
         root = ET.fromstring(text)
+        mine: dict[str, CodeUnit] = {}
+        ix.files[str(p)] = mtime
+        ix.by_file[str(p)] = mine
         kind_tag = SRC_EXT[p.suffix.lower()]
         obj = root.find(kind_tag)
         if obj is None:
@@ -549,10 +695,7 @@ class ProjectIndex:
         unit = CodeUnit(name, kind, str(p), kind_tag, decl, impl, dl, il)
         self._fill_header(unit)
         unit.vars = parse_vars(decl, unit.decl_line0)
-        prev = ix.units.get(name.lower())
-        if prev is not None and prev.file != str(p):
-            ix.duplicates.setdefault(name.lower(), [prev.file]).append(str(p))
-        ix.units[name.lower()] = unit
+        mine[name.lower()] = unit
         # sub-items
         for tag, k in (("Method", "METHOD"), ("Property", "PROPERTY"), ("Action", "ACTION"), ("Transition", "TRANSITION")):
             for i, sub in enumerate(obj.findall(tag)):
@@ -565,7 +708,7 @@ class ProjectIndex:
                               sdl, sil, parent=name)
                 self._fill_header(su)
                 su.vars = parse_vars(sdecl, su.decl_line0)
-                ix.units[full.lower()] = su
+                mine[full.lower()] = su
                 if tag == "Property":
                     for acc in ("Get", "Set"):
                         a = sub.find(acc)
@@ -575,7 +718,7 @@ class ProjectIndex:
                             au = CodeUnit(f"{full}.{acc}", acc.upper(), str(p),
                                           f"{kind_tag}/{tag}[@Name='{sname}']/{acc}",
                                           _cdata(a, "Declaration"), _cdata_impl(a), adl, ail, parent=full)
-                            ix.units[au.name.lower()] = au
+                            mine[au.name.lower()] = au
 
     def _fill_header(self, u: CodeUnit) -> None:
         m = _RE_HEADER.search(u.declaration or "")
@@ -612,13 +755,8 @@ class ProjectIndex:
             raise ProjectError(f"{name!r} exists in several files {self.duplicates[key]}; "
                                f"qualify it as '<file-substring>@{name}'")
         if pin is not None:
-            cands = [x for x in self.units.values() if x.name.lower() == key and pin.lower() in x.file.lower()]
-            # duplicates overwrite each other in self.units; re-index the pinned file on demand
-            if not cands and key in self.duplicates:
-                for f in self.duplicates[key]:
-                    if pin.lower() in f.lower():
-                        self.reindex_file(Path(f))
-                        cands = [x for x in self.units.values() if x.name.lower() == key and pin.lower() in x.file.lower()]
+            # N113: every file's units are kept, so the unit of the pinned file is there even when the name exists twice
+            cands = [x for f, us in self._by_file.items() if pin.lower() in f.lower() for k, x in us.items() if k == key]
             if len(cands) != 1:
                 raise ProjectError(f"'{pin}@{name}' matches {len(cands)} units")
             return cands[0]
@@ -949,8 +1087,16 @@ class ProjectIndex:
 
     # -- tasks (N62) ------------------------------------------------------------------------------------------
     def _plc_of(self, path: str | Path) -> str | None:
-        """The PLC project (its .plcproj file) a file belongs to: the nearest folder above it holding a .plcproj."""
-        dirs = {Path(pp["file"]).parent.resolve(): pp["file"] for pp in self.plcproj if pp.get("file")}
+        """The PLC project (its .plcproj file) a file belongs to: the .plcproj that compiles it; for a file no
+        .plcproj lists (a .TcTTO, a visualisation), the nearest folder above it holding one of the project's .plcproj."""
+        owner = (self._members or {}).get(_norm(Path(path)))
+        if owner is not None:
+            return owner
+        return self._nearest(path, self.plcproj)
+
+    @staticmethod
+    def _nearest(path: str | Path, plcproj: list[dict[str, Any]]) -> str | None:
+        dirs = {Path(pp["file"]).parent.resolve(): pp["file"] for pp in plcproj if pp.get("file")}
         try:
             here = Path(path).resolve()
         except OSError:
@@ -959,6 +1105,58 @@ class ProjectIndex:
             if d in dirs:
                 return dirs[d]
         return None
+
+    def plc_project(self, *, name: str | None = None, port: int | None = None) -> str | None:
+        """N113/N114: the .plcproj of the PLC project the .tsproj names `name` (TIPC^<name> in the XAE tree) or gives
+        ADS port `port` — None when no .tsproj says so, or more than one project matches."""
+        hits = [pp["file"] for pp in self.plcproj
+                if (name is not None and str(pp.get("tree_name") or "").lower() == name.lower())
+                or (port is not None and pp.get("ams_port") == port)]
+        return hits[0] if len(hits) == 1 else None
+
+    def plc_units(self, plc: str | None) -> tuple[dict[str, CodeUnit], set[str]]:
+        """N113: the units of ONE PLC project (its .plcproj file; None: the files of no PLC project), complete even when
+        another PLC project declares the same names — and the names declared twice within it."""
+        units: dict[str, CodeUnit] = {}
+        dup: set[str] = set()
+        for f, us in self._by_file.items():           # a published snapshot (N88)
+            if self._plc_of(f) != plc:
+                continue
+            for k, u in us.items():
+                prev = units.get(k)
+                if prev is not None and prev.file != f and u.parent is None:
+                    dup.add(k)
+                units[k] = u
+        return units, dup
+
+    def unit_at_tree_path(self, path: str) -> tuple[CodeUnit | None, str | None]:
+        """N113: the source unit an XAE tree path names (TIPC^Plc2^Plc2 Project^POUs^MAIN, …^FB_X^M_Start) — looked up
+        in the PLC project the path names (TIPC^<name>, from the .tsproj), so MAIN of Plc2 is never taken for MAIN of
+        Plc1. (unit, None), or (None, why)."""
+        segs = [x for x in path.split("^") if x]
+        if not segs:
+            return None, "empty tree path"
+        keys = ([f"{segs[-2]}.{segs[-1]}".lower()] if len(segs) >= 2 else []) + [segs[-1].lower()]
+        plc = self.plc_project(name=segs[1]) if len(segs) >= 3 and segs[0].upper() == "TIPC" else None
+        if plc is not None:
+            units, dup = self.plc_units(plc)
+            where = f"PLC project {segs[1]!r} ({plc})"
+        else:
+            units, dup = self.units, set(self.duplicates)
+            where = "the project"
+        k = next((k for k in keys if k in units), None)
+        if k is None:
+            return None, f"not in any source file of {where}"
+        if k in dup:
+            if plc is not None:
+                files = sorted({u.file for f, us in self._by_file.items() if self._plc_of(f) == plc
+                                for kk, u in us.items() if kk == k})
+                return None, f"{units[k].name!r} is declared in several files of {where}: {files}"
+            named = (f"its PLC project {segs[1]!r} is not one a .tsproj under the root names"
+                     if len(segs) >= 3 and segs[0].upper() == "TIPC" else "the path names no PLC project (TIPC^<name>^…)")
+            return None, (f"{units[k].name!r} is declared in several files {self.duplicates.get(k)} and {named} — "
+                          "which file holds this object is not known")
+        return units[k], None
 
     def task_config(self) -> dict[str, dict[str, Any]]:
         """The PLC tasks of the project from its *.TcTTO files: {file: {"name", "cycle_ms": float | None,
@@ -969,9 +1167,12 @@ class ProjectIndex:
         out: dict[str, dict[str, Any]] = {}
         if self.root is None:
             return out
+        left = self.plcproj_not_in_project
         for f in sorted(self.root.rglob("*.TcTTO")) + sorted(self.root.rglob("*.tctto")):
             if "_Boot" in f.parts or str(f) in out:
                 continue
+            if left and self._nearest(f, self.plcproj + left) in {pp["file"] for pp in left}:
+                continue                      # N114: a task of a PLC project no .tsproj names is no task of the project
             try:
                 task = ET.fromstring(f.read_text(encoding="utf-8-sig", errors="replace")).find("Task")
             except (ET.ParseError, OSError):
@@ -984,26 +1185,35 @@ class ProjectIndex:
                            "programs": [p for p in progs if p], "plc_project": self._plc_of(f), "file": str(f)}
         return out
 
-    def tasks_of(self, unit_name: str) -> list[dict[str, Any]] | None:
+    def tasks_of(self, unit_name: str, port: int | None = None) -> list[dict[str, Any]] | None:
         """The tasks that run a PROGRAM: it is in a task's PouCall, or a program of that task calls it (transitively,
         from its body, actions and methods) — only tasks and programs of the program's own PLC project. Each task:
-        {"name", "cycle_ms", "plc_project"}. [] when the name is no program (a GVL, an FB type: no owner of its own);
-        None when the project cannot tell: no task configuration, or the name exists in several files (MAIN in two
-        PLC projects — which one the recording reads is not known here)."""
+        {"name", "cycle_ms", "plc_project"}. port: the ADS port the program is read from — N114: the PLC project the
+        .tsproj gives that port is the one meant (MAIN of Plc2 on 852, not MAIN of Plc1). [] when the name is no
+        program (a GVL, an FB type: no owner of its own); None when the project cannot tell: no task configuration, or
+        the name exists in several PLC projects and no .tsproj maps the port to one of them."""
         tasks = self.task_config()
         if not tasks:
             return None
         key = unit_name.lower()
-        if key in self.duplicates:
+        plc = self.plc_project(port=port) if port is not None else None
+        if plc is None:
+            if key in self.duplicates:
+                return None
+            u = self.units.get(key)
+            if u is None or u.kind != "PROGRAM":
+                return []
+            plc = self._plc_of(u.file)
+        units, dup = self.plc_units(plc)            # this PLC project's units, complete (N113)
+        if key in dup:
             return None
-        u = self.units.get(key)
+        u = units.get(key)
         if u is None or u.kind != "PROGRAM":
             return []
-        plc = self._plc_of(u.file)
-        progs = {k: v for k, v in self.units.items() if v.kind == "PROGRAM" and self._plc_of(v.file) == plc}
+        progs = {k: v for k, v in units.items() if v.kind == "PROGRAM"}
         calls: dict[str, set[str]] = {}       # program → programs it calls
         for k in progs:
-            body = " ".join(x.implementation for x in self.units.values()
+            body = " ".join(x.implementation for x in units.values()
                             if x.name.lower() == k or (x.parent or "").lower() == k)
             code = "\n".join(_strip_comments_line(ln) for ln in body.splitlines())
             calls[k] = {o for o in progs if o != k and re.search(r"\b" + re.escape(progs[o].name) + r"\s*[(.]", code, re.I)}
@@ -1020,9 +1230,9 @@ class ProjectIndex:
                 if p in seen:
                     continue
                 seen.add(p)
-                if p in self.duplicates:
-                    # a program of this name exists in several files and the index holds only one of them: what it
-                    # calls in THIS project is not known — not followed
+                if p in dup:
+                    # a program of this name is declared twice in this PLC project: which one runs is not known —
+                    # not followed
                     dup_on_way = True
                     continue
                 todo.extend(calls.get(p, ()))

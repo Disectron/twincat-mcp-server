@@ -2357,9 +2357,9 @@ class Recorder:
             st["warning"] = " | ".join(warns)
         return st
 
-    # set by the server from the project index: name of a program → the tasks that run it ([] = no program, e.g. a
-    # GVL; None = the project has no task configuration). N62.
-    task_of: Callable[[str], list[dict[str, Any]] | None] | None = None
+    # set by the server from the project index: (name of a program, ADS port it is read from) → the tasks that run it
+    # ([] = no program, e.g. a GVL; None = the project cannot tell). N62; N114: the port picks the PLC project.
+    task_of: Callable[[str, int | None], list[dict[str, Any]] | None] | None = None
 
     def _task_check(self, rec: Any, syms: list[SymbolEntry], cycle_ms: float) -> dict[str, Any]:
         man = (getattr(rec, "meta", None) or {}).get("manifest") or {}
@@ -2367,6 +2367,7 @@ class Recorder:
               for t in (man.get("tasks") if isinstance(man.get("tasks"), list) else [])
               if isinstance(t, dict) and isinstance(t.get("cycle_time_ms"), (int, float)) and t["cycle_time_ms"] > 0}
         fastest = min(rt.values()) if rt else None
+        port = (getattr(rec, "meta", None) or {}).get("port")
         checked: dict[str, Any] = {}
         below: list[dict[str, Any]] = []
         roots = sorted({x.name.split(".", 1)[0] for x in syms if not _is_system_root(x.name)})
@@ -2374,7 +2375,7 @@ class Recorder:
             owners = None
             if self.task_of is not None:
                 try:
-                    owners = self.task_of(r)
+                    owners = self.task_of(r, port if isinstance(port, int) else None)
                 except Exception:  # noqa: BLE001 — no project: the fastest task is the comparison
                     owners = None
             if owners:
