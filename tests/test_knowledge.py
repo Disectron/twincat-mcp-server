@@ -657,3 +657,71 @@ def test_a_stub_of_0811_becomes_the_current_one(kb, monkeypatch):
     assert st["manuals_db.py"]["state"] == "replaced"
     assert K.builder_kind(loc / "tools" / "manuals_db.py", "manuals_db.py") == ("stub", "2")
     assert "esi_db.py" in (loc / "tools" / "manuals_db.py").read_text(encoding="utf-8")
+
+
+def _pou(folder: Path, name: str, decl: str, impl: str = "") -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.TcPOU").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">\n'
+        f'  <POU Name="{name}" Id="{{aaaaaaaa-0000-0000-0000-0000000000{len(name):02d}}}" SpecialFunc="None">\n'
+        f"    <Declaration><![CDATA[{decl}]]></Declaration>\n"
+        f"    <Implementation><ST><![CDATA[{impl}]]></ST></Implementation>\n  </POU>\n</TcPlcObject>\n",
+        encoding="utf-8")
+
+
+def test_n102_identifier_words_and_code_before_comments(kb, tmp_path):
+    """N102 (0.8.11 retest): kb_search 'alarm text' found only GVL_Machine (a comment word), not FB_AlarmList — the
+    tokenizer keeps FB_AlarmList / sAlarmText whole; 'EXTENDS FB_ModuleBase' ranked a unit with the words in a
+    comment above the real subclass. The search table holds the words of names and identifiers; a unit whose code
+    holds every word comes before one that has some of them only in comments."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "alarms"
+    _pou(src, "FB_AlarmList", "FUNCTION_BLOCK FB_AlarmList\nVAR\n    aAlarmTexts : ARRAY[1..10] OF STRING;\nEND_VAR",
+         "aAlarmTexts[1] := 'Overpressure';")
+    _pou(src, "PRG_Main", "PROGRAM PRG_Main\nVAR\n    nCycle : UDINT;\nEND_VAR",
+         "// the alarm text is shown by the HMI\nnCycle := nCycle + 1;")
+    _pou(src, "FB_ModuleBase", "FUNCTION_BLOCK FB_ModuleBase\nVAR\n    bBusy : BOOL;\nEND_VAR")
+    _pou(src, "FB_CounterModule", "FUNCTION_BLOCK FB_CounterModule EXTENDS FB_ModuleBase\nVAR\n    nCount : INT;\nEND_VAR")
+    _pou(src, "FB_Notes", "FUNCTION_BLOCK FB_Notes\nVAR\n    bDummy : BOOL; (* later: EXTENDS FB_ModuleBase *)\nEND_VAR")
+    k.add_project(str(src), "alarms")
+    r = k.search("alarm text")
+    units = [h["unit"] for h in r["hits"]]
+    assert units[0] == "FB_AlarmList" and "match_in" not in r["hits"][0], r
+    assert dict((h["unit"], h.get("match_in")) for h in r["hits"]).get("PRG_Main") == "comments", r
+    r = k.search("EXTENDS FB_ModuleBase")
+    assert [h["unit"] for h in r["hits"]][0] == "FB_CounterModule", r
+    assert {h["unit"]: h.get("match_in") for h in r["hits"]}["FB_Notes"] == "comments", r
+    assert "search_table_note" not in r
+
+
+def test_n102_a_search_table_of_0811_is_rebuilt_on_the_next_reindex(kb, tmp_path):
+    """The search table of 0.8.11 has no identifier words: kb_search says so and uses it as it is; the next
+    kb_reindex (the user's call) rebuilds it from the stored units in one transaction — no file is read again."""
+    import sqlite3
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "alarms"
+    _pou(src, "FB_AlarmList", "FUNCTION_BLOCK FB_AlarmList\nVAR\n    aAlarmTexts : ARRAY[1..10] OF STRING;\nEND_VAR")
+    k.add_project(str(src), "alarms")
+    db = tmp / "kbdata" / "index" / "knowledge.db"
+    con = sqlite3.connect(db)
+    con.execute("DROP TABLE units_fts")             # the table as 0.8.11 made it, filled from the units
+    con.execute("CREATE VIRTUAL TABLE units_fts USING fts5(project UNINDEXED, name, kind UNINDEXED, file UNINDEXED, "
+                "declaration, implementation, comments, tokenize='unicode61')")
+    con.execute("INSERT INTO units_fts SELECT project, name, kind, file, declaration, implementation, comments FROM units")
+    con.execute("PRAGMA user_version = 0")
+    con.commit()
+    con.close()
+    k2 = K.Knowledge(tmp / "home", str(tmp / "kbdata"))
+    r = k2.search("alarm text")                     # 'text' is in no token of the 0.8.11 table
+    assert r["words_ignored"]["text"] == "on no unit" and "kb_reindex() rebuilds it" in r["search_table_note"], r
+    (src / "FB_AlarmList.TcPOU").unlink()                       # the rebuild reads no file
+    res = k2.reindex(str(src))
+    assert res["search_table"]["units"] == 1, res
+    r = k2.search("alarm list")
+    # the unit is gone from the folder, so the folder's re-index removed it — but the table was rebuilt first
+    assert "search_table_note" not in r
+    _pou(src, "FB_AlarmList", "FUNCTION_BLOCK FB_AlarmList\nVAR\n    aAlarmTexts : ARRAY[1..10] OF STRING;\nEND_VAR")
+    k2.reindex(str(src))
+    assert [h["unit"] for h in k2.search("alarm text")["hits"]] == ["FB_AlarmList"]

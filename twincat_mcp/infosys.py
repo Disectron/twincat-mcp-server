@@ -47,6 +47,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
+from .docsearch import title_words
+
 # Bump when the code that turns a page into stored rows changes (html_to_doc / _MdWalker, parse_declaration, classify,
 # _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
 # re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
@@ -763,6 +765,88 @@ def title_documents(con: Any, title: str, keep: Callable[[Any], bool] | None = N
     return same_documents(rows)
 
 
+# -- searching the index: one search for every reader (N99, N105) ---------------------------------------------------
+def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[Any] | None = None,
+                 snippet_tokens: int = 18) -> dict[str, Any]:
+    """The Infosys search of infosys_search and of the twincat-docs skill's docs_search (they ranked differently):
+    docsearch.search_tiers over pages_fts with the column weights of docsearch.infosys_rank, then
+      - an error code (docsearch.code_forms): the pages whose table defines it (hex and decimal in one row) first;
+      - the hits ordered by their titles (docsearch.title_order);
+      - one page in several books once (same_documents): its copies are named in `copies` — the ADS return-code
+        table is in some 30 books.
+    where / extra: a filter on the pages (alias p) and its parameters. Raises docsearch.SearchError.
+    -> {rows (rid, url, book, pid, title, version, kind, library, s = excerpt, r = bm25), total, mode, expr, info,
+        code (code_forms or None), copies {rid: [(book, page id), …]}}"""
+    from . import docsearch as DS
+    extra = list(extra or [])
+    DS.vocab(con, "pages_fts")
+    cols = ("pages_fts.rowid AS rid, p.url, p.book, p.page_id AS pid, p.title, p.version, p.kind, p.library, "
+            f"snippet(pages_fts, 2, '[', ']', '…', {int(snippet_tokens)}) AS s, {DS.infosys_rank(con)} AS r")
+    w = "pages_fts MATCH ?" + (f" AND ({where})" if where else "")
+    sql = f"SELECT {cols} FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {w} ORDER BY r LIMIT ?"
+    count_sql = f"SELECT COUNT(*) FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {w}"
+
+    def body(r: Any) -> str:
+        x = con.execute("SELECT markdown FROM pages WHERE rowid = ?", (r["rid"],)).fetchone()
+        return (x[0] if x else "") or ""
+
+    forms, defined = DS.code_definitions(con, query, sql, extra, body)
+    copies: dict[int, list[tuple[str, str]]] = {}
+
+    def arrange(rows: list[Any]) -> list[Any]:
+        ordered = DS.title_order(rows, query, "title")
+        if defined:
+            ids = {r["rid"] for r in defined}
+            ordered = defined + [r for r in ordered if r["rid"] not in ids]
+        return _one_per_document(con, ordered, copies)
+
+    rows, total, mode, expr, info = DS.search_tiers(con, sql, count_sql, query, extra, limit, fts="pages_fts",
+                                                    arrange=arrange)
+    if not rows and defined:                    # the code's table, though no tier found the query's other words
+        rows, total, mode = arrange([])[:limit], len(defined), "the code's table (no page has the other words)"
+    ids = {r["rid"] for r in defined}
+    return {"rows": rows, "total": total, "mode": mode, "expr": expr, "info": info, "code": forms,
+            "defined": sum(1 for r in rows if r["rid"] in ids),
+            "copies": {r["rid"]: copies[r["rid"]] for r in rows if r["rid"] in copies}}
+
+
+def code_note(res: dict[str, Any]) -> str | None:
+    """What an answer to a code query says about where the code is defined (N99)."""
+    if not res.get("code"):
+        return None
+    c = res["code"]
+    if res.get("defined"):
+        return (f"{res['defined']} of these pages define {c['hex'][0]} / {c['dec']} in a table (hex and decimal in one "
+                "row) — they are listed first")
+    return f"no indexed table holds {c['hex'][0]} and {c['dec']} in one row: these pages mention the code"
+
+
+def _one_per_document(con: Any, rows: list[Any], copies: dict[int, list[tuple[str, str]]]) -> list[Any]:
+    """The hits with each document once, at the place of its best hit (same_documents: the same page id, or the same
+    library and declaration / text), shown as the document's representative (a page that names its library, the
+    library's own book — as infosys_declaration answers); the others in copies[rid of the one shown]. Only hits that
+    share a title are compared (a copy has its page's title)."""
+    by_title: dict[str, list[Any]] = {}
+    for r in rows:
+        by_title.setdefault(" ".join(str(r["title"] or "").lower().split()), []).append(r)
+    pos = {r["rid"]: i for i, r in enumerate(rows)}
+    place: dict[int, Any] = {}                 # index in rows -> the row shown there
+    drop: set[int] = set()
+    for same in by_title.values():
+        if len(same) < 2:
+            continue
+        full = [con.execute(f"SELECT {DOC_COLS} FROM pages WHERE rowid = ?", (r["rid"],)).fetchone() for r in same]
+        for g in same_documents([f for f in full if f is not None]):
+            if len(g) < 2:
+                continue
+            best = min(pos[x["rid"]] for x in g)
+            rep = g[0]["rid"]                  # same_documents puts the representative first
+            place[best] = rows[pos[rep]]
+            copies[rep] = [(x["book"], x["pid"]) for x in g[1:]]
+            drop.update(pos[x["rid"]] for x in g if pos[x["rid"]] != best)
+    return [place.get(i, r) for i, r in enumerate(rows) if i not in drop]
+
+
 def _ident_matches(ident: str, title: str) -> bool:
     return bool(ident) and ident.lower() in page_symbols(title)
 
@@ -1385,19 +1469,22 @@ class InfosysIndex:
                 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             """)
             cols = {r["name"] for r in con.execute("PRAGMA table_info(pages)")}
-            for c in ("version", "crumb"):          # added with the Help Viewer source
+            for c in ("version", "crumb", "words"):  # version, crumb: the Help Viewer source; words: format 5 (N105)
                 if c not in cols:
                     con.execute(f"ALTER TABLE pages ADD COLUMN {c} TEXT")
+            if "words" not in cols:
+                con.executemany("UPDATE pages SET words = ? WHERE rowid = ?",
+                                [(title_words(r[1]), r[0]) for r in con.execute("SELECT rowid, title FROM pages")])
             # external-content FTS: the index points at pages' own columns instead of keeping a second copy of every
             # page's text (≈ a third of the database). An older self-contained FTS table is replaced and rebuilt
             # from pages — no page has to be parsed again for that.
             try:
                 row = con.execute("SELECT sql FROM sqlite_master WHERE name = 'pages_fts'").fetchone()
-                if row is not None and "content='pages'" not in (row[0] or ""):
-                    con.execute("DROP TABLE pages_fts")
+                if row is not None and ("content='pages'" not in (row[0] or "") or " words" not in (row[0] or "")):
+                    con.execute("DROP TABLE pages_fts")     # self-contained, or without the words column (format 5)
                     row = None
                 con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url UNINDEXED, title, text, code, "
-                            "content='pages', content_rowid='rowid', tokenize='unicode61')")
+                            "words, content='pages', content_rowid='rowid', tokenize='unicode61')")
                 self._fts = True
                 if row is None:
                     con.execute("INSERT INTO pages_fts(pages_fts) VALUES ('rebuild')")
@@ -1518,19 +1605,21 @@ class InfosysIndex:
         code = CODE_SEP.join(f"{lang}\n{c}" for lang, c in doc.code_blocks)
         has_decl = kind != "Page" and decl["declaration"] is not None
         version = _doc_version(doc.meta.get("Microsoft.Help.DisplayVersion"))
-        old = con.execute("SELECT rowid, url, title, text, code FROM pages WHERE url = ?", (url,)).fetchone()
+        words = title_words(title)              # the title's identifiers as words (format 5, N105)
+        old = con.execute("SELECT rowid, url, title, text, code, words FROM pages WHERE url = ?", (url,)).fetchone()
         if old is not None:
             if self._fts:   # external content: the index entry is removed with the values it was built from
-                con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code) VALUES ('delete', ?, ?, ?, ?, ?)",
-                            (old[0], old[1], old[2], old[3], old[4]))
+                con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code, words) "
+                            "VALUES ('delete', ?, ?, ?, ?, ?, ?)", (old[0], old[1], old[2], old[3], old[4], old[5]))
             con.execute("DELETE FROM pages WHERE rowid = ?", (old[0],))
         cur = con.execute("INSERT INTO pages(url, book, page_id, lastmod, title, kind, library, markdown, text, code, "
-                          "decl, fetched, version, crumb) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          "decl, fetched, version, crumb, words) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                           (url, bk[0], bk[1], lastmod, title, kind, library, doc.markdown, text, code,
-                           json.dumps(decl) if has_decl or kind != "Page" else None, time.time(), version, doc.crumb or None))
+                           json.dumps(decl) if has_decl or kind != "Page" else None, time.time(), version,
+                           doc.crumb or None, words))
         if self._fts:
-            con.execute("INSERT INTO pages_fts(rowid, url, title, text, code) VALUES (?,?,?,?,?)",
-                        (cur.lastrowid, url, title, text, code))
+            con.execute("INSERT INTO pages_fts(rowid, url, title, text, code, words) VALUES (?,?,?,?,?,?)",
+                        (cur.lastrowid, url, title, text, code, words))
         return {"url": url, "title": title, "kind": kind, "library": library}
 
     def _fetch_doc(self, url: str) -> HtmlDoc:
@@ -1686,8 +1775,8 @@ class InfosysIndex:
                 _bump_gen(con)
             for bk in gone:
                 if self._fts:
-                    con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code) "
-                                "SELECT 'delete', rowid, url, title, text, code FROM pages WHERE book = ?", (bk,))
+                    con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code, words) "
+                                "SELECT 'delete', rowid, url, title, text, code, words FROM pages WHERE book = ?", (bk,))
                 con.execute("DELETE FROM pages WHERE book = ?", (bk,))
                 con.execute("DELETE FROM books WHERE book = ?", (bk,))
             if self._fts and fetched:
@@ -1816,7 +1905,11 @@ class InfosysIndex:
         if not q:
             raise InfosysError("empty query")
         _check_limit(limit)
-        items = self._fts_search(q, library, limit) if self._fts else self._like_search(q, library, limit)
+        last: dict[str, Any] | None = None
+        if self._fts:
+            items, last = self._fts_run(q, library, limit)
+        else:
+            items = self._like_search(q, library, limit)
         backend = "local-fts5" if self._fts else "local-like"
         if not items and self.local is None and (self.web_fallback if web_fallback is None else web_fallback):
             items = self._ddg(q, limit)
@@ -1824,6 +1917,14 @@ class InfosysIndex:
         if self.local is not None:
             backend += "+helpviewer"
         res = {"query": q, "backend": backend, "count": len(items), "items": items, **self._answer_meta()}
+        if last:
+            res["query_mode"] = last["mode"]
+            res["total"] = last["total"]
+            for k in ("words_used", "words_ignored", "words_too_common"):
+                if last["info"].get(k):
+                    res[k] = last["info"][k]
+            if last.get("code"):
+                res["code_note"] = code_note(last)
         if web_fallback and self.local is not None:
             res["note"] = "web_fallback is ignored with the local Help Viewer package (no network lookups)"   # R30
         if not items and library:
@@ -2034,7 +2135,7 @@ class InfosysIndex:
                     return m.group(0)
                 resolved += 1
                 return u
-            rows = con.execute("SELECT rowid, url, title, markdown, text, code, decl FROM pages WHERE "
+            rows = con.execute("SELECT rowid, url, title, markdown, text, code, decl, words FROM pages WHERE "
                                "markdown LIKE '%ms-xhelp%' OR decl LIKE '%ms-xhelp%'").fetchall()
             for r in rows:
                 md = _XHELP.sub(sub, r["markdown"] or "")
@@ -2043,13 +2144,14 @@ class InfosysIndex:
                     continue
                 text = _text_of(md)
                 if self._fts:
-                    con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code) VALUES "
-                                "('delete', ?, ?, ?, ?, ?)", (r["rowid"], r["url"], r["title"], r["text"], r["code"]))
+                    con.execute("INSERT INTO pages_fts(pages_fts, rowid, url, title, text, code, words) VALUES "
+                                "('delete', ?, ?, ?, ?, ?, ?)", (r["rowid"], r["url"], r["title"], r["text"], r["code"],
+                                                                 r["words"]))
                 con.execute("UPDATE pages SET markdown = ?, text = ?, decl = ? WHERE rowid = ?",
                             (md, text, decl, r["rowid"]))
                 if self._fts:
-                    con.execute("INSERT INTO pages_fts(rowid, url, title, text, code) VALUES (?,?,?,?,?)",
-                                (r["rowid"], r["url"], r["title"], text, r["code"]))
+                    con.execute("INSERT INTO pages_fts(rowid, url, title, text, code, words) VALUES (?,?,?,?,?,?)",
+                                (r["rowid"], r["url"], r["title"], text, r["code"], r["words"]))
                 pages += 1
             con.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)",
                             [("links", str(found)), ("links_resolved", str(resolved))])
@@ -2125,36 +2227,30 @@ class InfosysIndex:
 
     # -- internals -------------------------------------------------------------------
     def _fts_search(self, q: str, library: str | None, limit: int) -> list[dict[str, Any]]:
-        # R29: a quoted phrase stays one FTS phrase ("ADS error code" 1861 matched pages with 'error code' alone)
-        terms: list[str] = []
-        for phrase, bare in re.findall(r'"([^"]*)"|([^\s"]+)', q):
-            words = re.findall(r"[\w\.]+", phrase if phrase else bare)
-            if words:
-                terms.append('"' + " ".join(w.replace('"', '""') for w in words) + '"')
-        toks = terms
-        if not toks:
-            return []
-        for joiner in (" AND ", " OR "):
-            match = joiner.join(toks)
-            sql = (f"SELECT p.url, p.title, p.kind, p.library, p.book, p.version, "
-                   f"snippet(pages_fts, 2, '[', ']', '…', 24) AS snip, bm25(pages_fts, 0.0, 10.0, 1.0, 0.5) AS score "
-                   f"FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE pages_fts MATCH ?")
-            params: list[Any] = [match]
-            if library:
-                sql += " AND (p.library = ? COLLATE NOCASE OR p.book = ? COLLATE NOCASE)"
-                params += [library, library]
-            sql += " ORDER BY score LIMIT ?"
-            params.append(limit)
-            try:
-                with self._db() as con:
-                    rows = con.execute(sql, params).fetchall()
-            except sqlite3.OperationalError as exc:
-                raise InfosysError(f"search syntax: {exc}") from exc
-            if rows:
-                return [{"url": r["url"], "title": r["title"], "kind": r["kind"], "library": r["library"], "book": r["book"],
-                         **({"version": r["version"]} if r["version"] else {}),
-                         "excerpt": r["snip"], "score": round(-r["score"], 3)} for r in rows]
-        return []
+        return self._fts_run(q, library, limit)[0]
+
+    def _fts_run(self, q: str, library: str | None, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """The index's one search (search_index — the twincat-docs skill's docs_search is the same): tiers for a
+        question in words, "quoted phrases" kept (R29), identifiers as words, titles first, an error code's table
+        first, a page in several books once. -> (items, search_index's answer)."""
+        from . import docsearch as DS
+        try:
+            with self._db() as con:
+                res = search_index(con, q, limit, where="p.library = ? COLLATE NOCASE OR p.book = ? COLLATE NOCASE"
+                                   if library else "", extra=[library, library] if library else [], snippet_tokens=24)
+        except DS.SearchError as exc:
+            if exc.code == "empty_query":
+                raise InfosysError(exc.message) from None
+            raise InfosysError(f"search syntax: {exc.message}") from None
+        out = []
+        for r in res["rows"]:
+            it = {"url": r["url"], "title": r["title"], "kind": r["kind"], "library": r["library"], "book": r["book"],
+                  **({"version": r["version"]} if r["version"] else {}),
+                  "excerpt": r["s"], "score": round(-r["r"], 3)}
+            if r["rid"] in res["copies"]:
+                it["same_page_in"] = [b for b, _pid in res["copies"][r["rid"]]]
+            out.append(it)
+        return out, res
 
     def _like_search(self, q: str, library: str | None, limit: int) -> list[dict[str, Any]]:
         toks = [t.lower() for t in re.findall(r"[\w\.]+", q)]

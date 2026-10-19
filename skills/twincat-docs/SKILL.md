@@ -30,7 +30,7 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 | Question | Command |
 |---|---|
 | Inputs/outputs/members of a known FB, function, struct or enum | `docs_declaration symbol=ADSREAD book=tcplclib_tc2_system` |
-| Concept, how-to, error text, anything else in Infosys | `docs_search query=… [book=glob] [limit=1-50]` → `ref` → `docs_page ref=… section=…` |
+| Concept, how-to, error text, error code, anything else in Infosys | `docs_search query=… [book=glob] [limit=1-50]` → `ref` → `docs_page ref=… section=…` (the plugin's infosys_search: identifiers count as their words, titles that name the query first, an error code's defining table first — `code_note` —, one page in several books once — `same_page_in`) |
 | A page or a link from an answer | `docs_page ref=<book/pageid, Infosys URL, page id, exact title, ms-xhelp link> [section=] [offset=] [max_chars=200-20000]` |
 | Which books exist | `docs_books filter=tcplclib_tc2_*` |
 | Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so) |

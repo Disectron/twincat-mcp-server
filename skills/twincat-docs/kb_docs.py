@@ -50,7 +50,9 @@ VERSION = "5"           # 2: index state in every answer, links as refs, builder
                         # 4: the plugin's one Infosys index (index\\infosys-<lcid>.db), the permanent layout (0.8.11)
                         # 5: hw_* commands on the ESI index (index\\esi.db), its state in status; a name resolved by the
                         #    plugin's rule (one page in several books is one page; a symbol is documented by a symbol
-                        #    page), as infosys_declaration does (0.8.12, N100)
+                        #    page), as infosys_declaration does (0.8.12, N100); docs_search is the plugin's search
+                        #    (twincat_mcp.infosys.search_index: identifier words, titles first, a code's table first,
+                        #    copies once — N99, N105)
 FALLBACK_KB = r"D:\TwinCAT-MCP\knowledge"
 WEB = "https://infosys.beckhoff.com/content/{lcid}/{book}/{pid}.html"
 BUILDERS = Path(__file__).resolve().parent / "builders"
@@ -61,6 +63,7 @@ if "twincat_mcp" not in sys.modules and (_PLUGIN / "twincat_mcp" / "kb_layout.py
 from twincat_mcp import esi_index as ESI  # noqa: E402 — the ESI index: one implementation (the server's hw_* tools)
 from twincat_mcp import infosys_build as IB  # noqa: E402 — the index's state: one implementation for every reader
 from twincat_mcp import infosys as INF  # noqa: E402 — which pages document a name: the plugin's one rule (N100)
+from twincat_mcp import docsearch as DS  # noqa: E402 — searching: the plugin's one ranking (N105)
 from twincat_mcp import kb_layout as L  # noqa: E402 — where everything is: one place
 from twincat_mcp import kb_lock as KL  # noqa: E402 — whether a build runs: the OS lock, never a guess
 BUILD_INFOSYS = (f'<Python 3.12+> "{BUILDERS / "infosys_local.py"}" index --kb "<kb>"   (reads the Help Viewer package '
@@ -432,177 +435,38 @@ def one_line(s: str | None) -> str:
     return _WS.sub(" ", s or "").strip()
 
 
-def query_text(s: str | None) -> str:
-    """A query as typed or pasted: a non-breaking space in it is a space (the indexes hold none)."""
-    return (s or "").replace("\xa0", " ")
+query_text = DS.query_text
+has_words = DS.has_words
+natural = DS.natural
 
 
 def like_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def has_words(q: str) -> bool:
-    return bool(re.search(r"[^\W_]", q))
+# searching: the plugin's one implementation (twincat_mcp.docsearch — the server's infosys_search ranks with it too)
+_fold = DS.fold
+STOP_WORDS = DS.STOP_WORDS
+COMMON_SHARE = DS.COMMON_SHARE
+matched_words = DS.matched_words
 
 
-_FTS_SYNTAX = re.compile(r'["*:()^]|\b(?:AND|OR|NOT|NEAR)\b')
+def _err(exc: "DS.SearchError") -> Err:
+    return Err(exc.code, exc.message, **exc.extra)
 
 
-def natural(q: str) -> bool:
-    """Words only (no FTS5 operators, quotes, prefixes, column filters, code punctuation): a question in words."""
-    return not _FTS_SYNTAX.search(q) and bool(re.fullmatch(r"[\w\s\-./,?!']+", q))
-
-
-# words that say nothing about a page: never searched alone, never a prefix (N65)
-def _fold(w: str) -> str:
-    import unicodedata
-    return "".join(c for c in unicodedata.normalize("NFKD", w.lower()) if not unicodedata.combining(c))
-
-
-# compared with _fold(word), so stored folded: 'für' was never matched (the query word folds to 'fur')
-STOP_WORDS = frozenset(_fold(w) for w in """
-a an and are as at be but by can do does for from has have how i if in into is it its no not of on or so such that
-the their then there these this to was were what when where which while who why will with without you your
-der die das den dem des ein eine einer eines einem und oder ist sind wie was wann wo warum mit von zu zum zur im in
-am an auf aus bei für nicht kein keine ich es er sie wir ihr
-""".split())
-COMMON_SHARE = 0.2          # a word on more than this share of the pages does not pick a page in the some-words tier
-
-
-def _term_df(con: sqlite3.Connection, word: str, prefix: bool) -> int | None:
-    """Pages holding the word (all its tokens: 'T_AmsNetId' is 't' + 'amsnetid'), from the index's own vocabulary;
-    prefix: whether any term starts with it. None when the vocabulary is not available."""
-    toks = [t for t in re.split(r"[^\w]|_", _fold(word)) if t]
-    if not toks:
-        return 0
+def search_tiers(*a: Any, **kw: Any) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
     try:
-        dfs = []
-        for i, t in enumerate(toks):
-            if prefix and i == len(toks) - 1:
-                r = con.execute("SELECT MAX(doc) FROM temp.fts_vocab WHERE term >= ? AND term < ?",
-                                (t, t + "\U0010ffff")).fetchone()
-            else:
-                r = con.execute("SELECT doc FROM temp.fts_vocab WHERE term = ?", (t,)).fetchone()
-            dfs.append(int(r[0] or 0) if r else 0)
-        return min(dfs)
-    except sqlite3.Error:
-        return None
-
-
-def _page_count(con: sqlite3.Connection, fts: str = "fts") -> int:
-    try:
-        # the Infosys index's pages_fts reads its text from pages: count the pages themselves
-        return int(con.execute("SELECT COUNT(*) FROM " + ("pages" if fts == "pages_fts" else fts)).fetchone()[0])
-    except sqlite3.Error:
-        return 0
-
-
-def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, extra: list[Any],
-                 limit: int, title_key: str | None = None, fts: str = "fts"
-                 ) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
-    """N36/N65: a question in words falls back in steps, and only on words that can pick a page:
-      1. every word as written (stop words included: a precise query stays precise);
-      2. every informative word that occurs in the index — stop words, 1-2 letter words and words on no page dropped;
-      3. those words as prefixes (a word is kept when some term starts with it: 'Diagnos' -> diagnostics);
-      4. some of them (OR) — without words that are on more than 20 % of the pages.
-    Nothing informative left: no hits (never 49,096 'some words' hits for 'how to zzqxv a the'). N79: a query of
-    nothing but stop words ('how to a the') is refused, as the twincat server's kb_search refuses it — one word alone
-    ('the') is searched as written. A page whose title is one of the query words ranks first ('ADSREAD xyzqq' ->
-    ADSREAD before AdsReadDeviceInfo). FTS5 syntax or code punctuation runs as written (run_fts, with the phrase retry).
-    -> (rows, total, mode, expression, info: words used / ignored with the reason)."""
-    q = query_text(query).strip()
-    if not natural(q):
-        rows, mode, expr = run_fts(con, sql, query, extra + [limit])
-        return rows, con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr, {}
-    words = [w for w in re.findall(r"[^\W_]+(?:_[^\W_]+)*", q)]
-    if not words:
-        raise Err("empty_query", f"the query {query!r} has no searchable word (punctuation is not indexed)")
-    if len(words) > 1 and all(_fold(w) in STOP_WORDS for w in words):
-        raise Err("empty_query", f"the query {query!r} has only stop words ({', '.join(words)}): they are on almost "
-                  "every page and pick none — give a name, a product code or specific words")
-
-    def ph(w: str) -> str:
-        return '"' + w.replace('"', '""') + '"'
-    ignored: dict[str, str] = {}
-    informative = []
-    for w in words:
-        if _fold(w) in STOP_WORDS:
-            ignored[w] = "stop word"
-        elif len(w) < 3 and not w.isdigit():
-            ignored[w] = "shorter than 3 letters"
-        else:
-            informative.append(w)
-    pref = []                                  # informative words some term of the index starts with
-    for w in informative:
-        df = _term_df(con, w, True)
-        if df is None or df > 0:
-            pref.append(w)
-        else:
-            ignored[w] = "on no page"
-    n_pages = _page_count(con, fts)
-    common = {w for w in pref if n_pages and (_term_df(con, w, False) or 0) > COMMON_SHARE * n_pages}
-    tiers = [("all words", " ".join(ph(w) for w in words), words)]
-    if pref and pref != words:                 # without the stop words / words on no page, exactly as written
-        tiers.append(("all words found in the index", " ".join(ph(w) for w in pref), pref))
-    if pref:
-        tiers.append(("all words (as prefixes)", " ".join(ph(w) + "*" for w in pref), pref))
-    if len(pref) > 1:
-        some = [w for w in pref if w not in common] or pref     # a word on most pages picks nothing — unless all are
-        tiers.append(("some words (no page has all of them)", " OR ".join(ph(w) + "*" for w in some), some))
-    lw = {w.lower() for w in words}
-    for label, expr, used in tiers:
-        fetch = min(max(limit * 3, limit), 150) if title_key else limit
-        rows = con.execute(sql, [expr, *extra, fetch]).fetchall()
-        if rows:
-            if title_key:     # a page titled exactly like a query word first, bm25 order otherwise
-                rows = sorted(rows, key=lambda r: 0 if str(r[title_key] or "").lower() in lw else 1)
-            info: dict[str, Any] = {"words_used": used}
-            if ignored:
-                info["words_ignored"] = ignored
-            if label.startswith("some words") and common and set(used) != set(pref):
-                info["words_too_common"] = sorted(common)
-            return rows[:limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], label, expr, info
-    info = {"words_used": []}
-    if ignored:
-        info["words_ignored"] = ignored
-    return [], 0, tiers[-1][0], tiers[-1][1], info
-
-
-def matched_words(con: sqlite3.Connection, rowid: int, words: list[str], fts: str = "fts") -> list[str]:
-    """Which of the words (as prefixes) the page with this fts rowid holds — shown per hit in the some-words tier."""
-    out = []
-    for w in words:
-        try:
-            if con.execute(f"SELECT 1 FROM {fts} WHERE rowid = ? AND {fts} MATCH ?",
-                           (rowid, '"' + w.replace('"', '""') + '"*')).fetchone():
-                out.append(w)
-        except sqlite3.Error:
-            pass
-    return out
+        return DS.search_tiers(*a, **kw)
+    except DS.SearchError as exc:
+        raise _err(exc) from None
 
 
 def run_fts(con: sqlite3.Connection, sql: str, query: str, extra: list[Any]) -> tuple[list[sqlite3.Row], str, str]:
-    """Run an FTS5 statement whose first parameter is the MATCH expression. -> (rows, mode, expression used).
-    Invalid FTS5 syntax is retried once as a literal phrase (rule 7)."""
-    q = query_text(query).strip()
-    if not q:
-        raise Err("empty_query", "the query is empty")
-    if not has_words(q):
-        raise Err("empty_query", f"the query {query!r} has no searchable word (punctuation is not indexed)")
     try:
-        return con.execute(sql, [q, *extra]).fetchall(), "fts5", q
-    except sqlite3.OperationalError as exc:
-        msg = str(exc)
-        if "no such module" in msg:
-            raise Err("internal", f"this Python's SQLite has no FTS5 ({msg}); use the python.org Python") from None
-        if "locked" in msg or "disk i/o" in msg.lower():
-            raise Err("internal", f"database busy ({msg}) — is the index being rebuilt right now?") from None
-    phrase = '"' + q.replace('"', '""') + '"'
-    try:
-        return con.execute(sql, [phrase, *extra]).fetchall(), "phrase (input was not valid FTS5 syntax)", phrase
-    except sqlite3.OperationalError as exc:
-        raise Err("bad_query", f"query not usable even as a phrase: {exc}",
-                  hint="FTS5 syntax: words, \"exact phrase\", OR, NOT, prefix*") from None
+        return DS.run_fts(con, sql, query, extra)
+    except DS.SearchError as exc:
+        raise _err(exc) from None
 
 
 # ---------------------------------------------------------------------------------------------- Infosys
@@ -751,24 +615,27 @@ def _page_head(ctx: Ctx, r: sqlite3.Row) -> dict[str, Any]:
 def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
     _check_book_glob(con, a["book"])
-    where = "pages_fts MATCH ?" + (" AND fnm(p.book, ?)" if a["book"] else "")
-    extra = [a["book"]] if a["book"] else []
-    rows, total, mode, expr, info = search_tiers(
-        con, "SELECT pages_fts.rowid AS rid, p.book, p.page_id AS pid, p.title, p.version, "
-             "snippet(pages_fts, 2, '[', ']', '…', 18) AS s, bm25(pages_fts, 0.0, 8.0, 1.0, 1.0) AS r "
-             f"FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {where} ORDER BY r LIMIT ?",
-        f"SELECT COUNT(*) FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {where}", a["query"], extra,
-        a["limit"], title_key="title", fts="pages_fts")
+    try:   # the plugin's one search of this index (infosys_search answers with it too): N99, N105
+        res = INF.search_index(con, a["query"], a["limit"], where="fnm(p.book, ?)" if a["book"] else "",
+                               extra=[a["book"]] if a["book"] else [])
+    except DS.SearchError as exc:
+        raise _err(exc) from None
+    rows, total, mode, info = res["rows"], res["total"], res["mode"], res["info"]
     items = []
     for r in rows:
         it = {"ref": f"{r['book']}/{r['pid']}", "title": r["title"], "book": r["book"],
               "version": r["version"] or None, "excerpt": one_line(r["s"]),
               "url": WEB.format(lcid=ctx.lcid(), book=r["book"], pid=r["pid"]), "score": float(f"{-r['r']:.4g}")}
+        if r["rid"] in res["copies"]:
+            it["same_page_in"] = [f"{b}/{pid}" for b, pid in res["copies"][r["rid"]]]
         if mode.startswith("some words"):
             it["matched"] = matched_words(con, r["rid"], info.get("words_used") or [], fts="pages_fts")
         items.append(it)
     out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info, "count": len(items), "total": total,
                            "truncated": total > len(items), "items": items, "source": ctx.source("infosys")}
+    if res["code"]:
+        out["code"] = {k: res["code"][k] for k in ("value", "hex", "dec")}
+        out["code_note"] = INF.code_note(res)
     if not items:
         out["hint"] = ("no page contains these words" + (f" in books {a['book']!r}" if a["book"] else "")
                        + " — try fewer or other words, OR, prefix*")

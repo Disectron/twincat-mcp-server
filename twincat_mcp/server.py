@@ -2092,8 +2092,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def kb_search(query: str, kinds: list[str] | None = None, project: str | None = None, limit: int = 20) -> dict[str, Any]:
         """Search the code of the project folders the user added ("alarm handler", "FB_Valve", "CONCAT"): unit, kind,
-        file and the matching declaration/code excerpts, best first. Units with EVERY word first, then every word as a
-        prefix ('CounterMod' finds FB_CounterModule); only when none has them all, units with some words
+        file and the matching declaration/code excerpts, best first. Names and identifiers count as their words
+        (FB_AlarmList: alarm, list). Units with EVERY word first, then every word as a prefix ('CounterMod' finds
+        FB_CounterModule); a unit whose code holds the words before one that has them only in comments
+        (match_in='comments'); only when none has them all, units with some words
         (match='some words', with the words each unit holds; words on no unit or on most units are not used and
         are listed). Stop words ('how', 'to', 'the') are not searched; a query of stop words only is refused. A copy
         name (PRG_X_9) that no unit has falls back to the name it was copied from. "quoted text" is a phrase. kinds
@@ -3883,7 +3885,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def infosys_search(query: str, library: str | None = None, limit: int = 10,
                              web_fallback: bool | None = None) -> dict[str, Any]:
         """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]); "quoted phrases"
-        stay together, limit 1..50. Local Help Viewer package (default): no network (web_fallback is ignored and said
+        stay together, limit 1..50. A question in words falls back in tiers (query_mode, words_used); identifiers
+        count as their words (FB_SocketConnect: socket, connect); titles that name the query come first; an error
+        code (0x745, 1861) lists the pages whose table defines it first (code_note); one page in several books is
+        listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
         so), results carry the page's doc version and the package date. docs.source='web': when the index has nothing,
         a DuckDuckGo site: query verified against the sitemap; the 'backend' field says which path answered."""
         return await app.docs_call("search", query, library, limit, web_fallback, timeout=300)

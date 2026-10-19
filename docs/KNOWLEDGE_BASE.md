@@ -3,8 +3,10 @@
 Agreed with Ryan on 2026-10-18 (0.8.11). Permanent: a change to any rule below needs his approval and is recorded
 here. Changes: 2026-10-19 (0.8.12, Ryan asked for an index of the ESI files he put in `manuals\Beckhoff_EtherCAT_XML`)
 — the ESI devices have their own index, `index\esi.db`, built from the ESI files in `manuals\` and TwinCAT's ESI
-folders; `knowledge.db` keeps the project folders only (rules 1, 2, 5, 6). Code that touches the knowledge folder follows these rules; `twincat_mcp/kb_layout.py` is the one place that
-names its paths.
+folders; `knowledge.db` keeps the project folders only (rules 1, 2, 5, 6). 2026-10-19 (0.8.12, the 0.8.11 retest
+N102) — `knowledge.db`'s search table is derived from its stored units; a new layout of it is rebuilt from them at the
+next `kb_reindex` / `kb_add_project` (rule 6). Code that touches the knowledge folder follows these rules;
+`twincat_mcp/kb_layout.py` is the one place that names its paths.
 
 ## 1. Layout and ownership
 
@@ -79,8 +81,11 @@ resolved to page addresses. Readers never repair stored data; a fix to what is s
     the next manuals update starts again from the index in use (PDFs already in it are not read again), the next
     ESI build starts over (minutes).
   - `knowledge.db` holds the project folders, so it is never swapped as a file: it changes in one transaction per
-    folder (the database is WAL — readers keep the rows of before until the commit). The ESI table it held up to
-    0.8.11 is no longer read; `kb_status` lists it, the plugin never drops it.
+    folder (the database is WAL — readers keep the rows of before until the commit). Its search table (`units_fts`)
+    is derived from the stored units: a new layout of it (0.8.12: the words of names and identifiers, the code
+    without comments) is rebuilt from them in one transaction at the next `kb_reindex` / `kb_add_project` — no
+    project file is read for it; until then `kb_search` uses the table as it is and says so. The ESI table it held
+    up to 0.8.11 is no longer read; `kb_status` lists it, the plugin never drops it.
 - At most one format change per index per release, and only when stored content changes.
 
 ## 7. Nothing is deleted by the plugin

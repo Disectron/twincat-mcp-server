@@ -43,6 +43,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from . import docsearch as DS
 from . import esi_index as E
 from . import kb_layout as L
 
@@ -156,13 +157,8 @@ KNOWN_ERRORS_COVERED = ("ADS errors 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in 
                         "ADS error 1861, ADS-Error: 1861, 0x745, 0x00000745); license; XAE busy / modal dialog / "
                         "disconnected; logged in; compiler: identifier not defined (C0046), cannot convert type "
                         "(C0032), unknown type")
-# N71: the words of a sentence around the names (folded: compared with _fold(word)); the same list as the docs skill
-STOP_WORDS = frozenset(unicodedata.normalize("NFKD", w).encode("ascii", "ignore").decode() for w in """
-a an and are as at be but by can cannot do does for from has have how i if in into is it its no not of on or so such
-that the their then there these this to was were what when where which while who why will with without you your
-der die das den dem des ein eine einer eines einem und oder ist sind wie was wann wo warum mit von zu zum zur im in
-am an auf aus bei für nicht kein keine ich es er sie wir ihr
-""".split())
+# N71: the words of a sentence around the names: the one list of every search (docsearch)
+STOP_WORDS = DS.STOP_WORDS
 COMMON_SHARE = 0.2          # some-words tier: a word in more than this share of the units (≥ 25 units) is not used
 IEC_WORDS = frozenset("""
 BOOL BYTE WORD DWORD LWORD SINT USINT INT UINT DINT UDINT LINT ULINT REAL LREAL TIME LTIME DATE TOD TIME_OF_DAY DT
@@ -173,8 +169,24 @@ FUNCTION_BLOCK METHOD PROPERTY INTERFACE EXTENDS IMPLEMENTS THIS SUPER
 """.split())
 
 
-def _fold(w: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", w.lower()) if not unicodedata.combining(c))
+_fold = DS.fold
+
+# units_fts: what kb_search matches. name_words / idents / code (0.8.12, N102): the words of the unit's name and of
+# the identifiers of its code ('FB_AlarmList' → alarm, list; 'aAlarmTexts' → alarm, texts) — the tokenizer keeps an
+# identifier whole, so 'alarm text' never found FB_AlarmList —, and the code without its comments and strings (to tell
+# a unit whose code holds the words from one that has them in a comment; not ranked: weight 0)
+UNITS_FTS = ("CREATE VIRTUAL TABLE IF NOT EXISTS units_fts USING fts5(project UNINDEXED, name, kind UNINDEXED, "
+             "file UNINDEXED, declaration, implementation, comments, name_words, idents, code, tokenize='unicode61')")
+UNITS_FTS_COLS = "project, name, kind, file, declaration, implementation, comments, name_words, idents, code"
+_COMMENT_OR_STRING = re.compile(r"\(\*.*?\*\)|//[^\n]*|'(?:\$.|[^'$])*'|\"(?:\$.|[^\"$])*\"", re.S)
+
+
+def unit_words(name: str, declaration: str, implementation: str) -> tuple[str, str, str]:
+    """(name_words, idents, code) of a unit for units_fts: the words of its name, the words of its code's identifiers
+    made of several words (IEC keywords such as VAR_INPUT are none), its code without comments and strings."""
+    code = _COMMENT_OR_STRING.sub(" ", (declaration or "") + "\n" + (implementation or ""))
+    idents = re.sub(r"\b[A-Za-z_]\w*\b", lambda m: "" if m.group(0).upper() in IEC_WORDS else m.group(0), code)
+    return " ".join(DS.ident_words(name)), " ".join(DS.ident_words(idents)), code
 
 
 _ADS_CODE = re.compile(r"\bads[\s_-]*(?:error|fehler|err)\b[\s:#=-]*(?:code[\s:#=-]*)?(0x[0-9a-f]+|\d+)"
@@ -388,6 +400,7 @@ class Knowledge:
         self.last_layout: dict[str, Any] | None = None
         self.library_dirs = library_dirs or []
         self._fts: bool | None = None
+        self._fts_words = True              # units_fts has name_words / idents (set when it is opened)
         self.last_upkeep: dict[str, Any] | None = None
 
     # -- location -------------------------------------------------------------------------
@@ -463,6 +476,7 @@ class Knowledge:
         self.home.mkdir(parents=True, exist_ok=True)
         self._pointer().write_text(json.dumps({"path": str(p), "chosen": time.strftime("%Y-%m-%dT%H:%M:%S")}), encoding="utf-8")
         self._fts = None
+        self._fts_words = True
         self.layout(p)                               # the permanent layout in the new folder (docs/KNOWLEDGE_BASE.md)
         out: dict[str, Any] = {"location": str(p), "database": str(L.locate(p, "knowledge"))}
         if old is not None and old != p and L.locate(old, "knowledge").exists():
@@ -519,9 +533,10 @@ class Knowledge:
         con.execute("CREATE INDEX IF NOT EXISTS units_project ON units(project)")
         if self._fts is None:
             try:
-                con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS units_fts USING fts5(project UNINDEXED, name, kind UNINDEXED, "
-                            "file UNINDEXED, declaration, implementation, comments, tokenize='unicode61')")
+                con.execute(UNITS_FTS)
                 self._fts = True
+                row = con.execute("SELECT sql FROM sqlite_master WHERE name = 'units_fts'").fetchone()
+                self._fts_words = bool(row and " code," in (row[0] or ""))     # False: the search table of 0.8.11
             except sqlite3.OperationalError:
                 self._fts = False
 
@@ -695,6 +710,7 @@ class Knowledge:
         from .config import ProjectConfig
         from .project_backend import ProjectIndex
         out = []
+        upgraded = self._upgrade_search_table()
         for r in rows:
             root = Path(r["path"])
             if not root.is_dir():
@@ -721,13 +737,39 @@ class Knowledge:
                     row = (r["path"], u.name, u.kind, u.file, u.decl_line0, u.declaration or "", (u.implementation or "")[:20000], comments[:5000])
                     con.execute("INSERT INTO units VALUES (?,?,?,?,?,?,?,?)", row)
                     if self._fts:
-                        con.execute("INSERT INTO units_fts(project, name, kind, file, declaration, implementation, comments) VALUES (?,?,?,?,?,?,?)",
-                                    (row[0], row[1], row[2], row[3], row[5], row[6], row[7]))
+                        con.execute(f"INSERT INTO units_fts({UNITS_FTS_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                    (row[0], row[1], row[2], row[3], row[5], row[6], row[7], *unit_words(row[1], row[5], row[6])))
                 con.execute("UPDATE projects SET indexed=?, units=?, files=? WHERE path=?",
                             (time.strftime("%Y-%m-%dT%H:%M:%S"), len(units), stamp, r["path"]))
             out.append({"project": r["path"], "units": len(units), "files": scan.get("files"),
                         "parse_errors": sum(1 for u in idx.units.values() if u.kind == "PARSE_ERROR")})
-        return {"reindexed": out}
+        res: dict[str, Any] = {"reindexed": out}
+        if upgraded is not None:
+            res["search_table"] = upgraded
+        return res
+
+    def _upgrade_search_table(self) -> dict[str, Any] | None:
+        """N102: the search table of 0.8.11 has no identifier words. Replaced on the next kb_reindex / kb_add_project
+        (the user's call): rebuilt from the stored units in one transaction — no file is read again, the units are
+        unchanged; a reader sees the old table or the new one. -> what was done, None when nothing was to do."""
+        with self._db() as con:
+            if not self._fts or getattr(self, "_fts_words", True):
+                return None
+            t0 = time.time()
+            if con.in_transaction:
+                con.commit()
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DROP TABLE units_fts")
+            con.execute(UNITS_FTS)
+            n = 0
+            for u in con.execute("SELECT project, name, kind, file, declaration, implementation, comments FROM units").fetchall():
+                con.execute(f"INSERT INTO units_fts({UNITS_FTS_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            (*tuple(u), *unit_words(u["name"], u["declaration"], u["implementation"])))
+                n += 1
+        self._fts_words = True
+        return {"rebuilt": True, "units": n, "seconds": round(time.time() - t0, 2),
+                "why": "identifier words (FB_AlarmList → alarm, list) for kb_search — from the stored units, no file "
+                       "read again"}
 
     def search(self, query: str, kinds: list[str] | None = None, project: str | None = None, limit: int = 20) -> dict[str, Any]:
         q = (query or "").strip()
@@ -829,13 +871,19 @@ class Knowledge:
             out["known_errors_covered"] = KNOWN_ERRORS_COVERED
         if not nproj:
             out["note"] = "no project folders in the knowledge base yet — kb_add_project(path) with a folder the user names"
+        elif self._fts and not self._fts_words:
+            out["search_table_note"] = ("the search table is of 0.8.11: identifiers are not split into words "
+                                        "('alarm' does not find FB_AlarmList) — kb_reindex() rebuilds it from the stored "
+                                        "units (seconds; no file is read again)")
         return out
 
     def _search_tiers(self, con: sqlite3.Connection, phrases: list[str], words: list[str], kinds: list[str],
                       scope: list[str], limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """R36: every word first (exact, then as word prefixes: 'CounterMod' → CounterModule); only when no unit has
-        them all, units with some of them, marked match='some words' with the words each one holds. N71: in that tier
-        a word on no unit, or on most units ('TYPE', 'BOOL', 'VAR' in a big project), picks nothing and is not used."""
+        """R36: every word first (exact, then as word prefixes: 'CounterMod' → CounterModule — both lists, the exact
+        ones first); only when no unit has them all, units with some of them, marked match='some words' with the words
+        each one holds. N71: in that tier a word on no unit, or on most units ('TYPE', 'BOOL', 'VAR' in a big project),
+        picks nothing and is not used. N102: within that, a unit whose code (not only a comment) holds the words
+        first, then the name that names most of the query (docsearch.title_order), then bm25."""
         def ph(t: str) -> str:
             return '"' + t.replace('"', '""') + '"'
         where_extra, params_extra = "", []
@@ -873,15 +921,18 @@ class Knowledge:
                 tiers.append(("some words", " OR ".join(ph(t) if t in phrases else ph(t) + "*" for t in used), used))
         hits: list[dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
-        for label, expr, terms in tiers:
-            if hits:
-                break
-            info["tier"] = label
+        words_cols = self._fts and self._fts_words
+        # N102: a word of the name (and of a name's words) weighs most, then the declaration, the comments, the code
+        rank = "bm25(units_fts, 0, 10, 0, 0, 3, 1, 2" + (", 10, 1, 0)" if words_cols else ")")
+        code_cols = "{name name_words idents code}" if words_cols else None
+        fetch = min(max(limit * 3, 60), 600)
+
+        def run(label: str, expr: str, terms: list[str]) -> list[sqlite3.Row]:
             if self._fts:
                 sql = ("SELECT rowid AS rid, project, name, kind, file, snippet(units_fts, 4, '«', '»', ' … ', 12) AS decl, "
-                       "snippet(units_fts, 5, '«', '»', ' … ', 12) AS impl, bm25(units_fts, 0, 10, 0, 0, 3, 1, 2) AS score "
+                       f"snippet(units_fts, 5, '«', '»', ' … ', 12) AS impl, {rank} AS score "
                        f"FROM units_fts WHERE units_fts MATCH ?{where_extra} ORDER BY score LIMIT ?")
-                params: list[Any] = [expr, *params_extra, limit]
+                params: list[Any] = [expr, *params_extra, fetch]
             else:
                 conds = " AND " if label != "some words" else " OR "
                 sql = ("SELECT rowid AS rid, project, name, kind, file, substr(declaration,1,200) AS decl, "
@@ -890,23 +941,56 @@ class Knowledge:
                 params = []
                 for t in terms:
                     params += [self._like(t)] * 4
-                params += [*params_extra, limit]
+                params += [*params_extra, fetch]
             try:
-                rows = con.execute(sql, params).fetchall()
+                return con.execute(sql, params).fetchall()
             except sqlite3.OperationalError as exc:
                 raise KnowledgeError(f"search failed for {expr!r}: {exc}") from exc
-            for r in rows:
-                key = (r["project"], r["name"], r["file"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                h = {"project": r["project"], "unit": r["name"], "kind": r["kind"], "file": r["file"],
-                     "declaration": r["decl"], "code": r["impl"], "match": label}
-                if label == "some words":
-                    h["matched"] = [t for t in terms if self._row_has(con, r["rid"], t, t in phrases)]
-                hits.append(h)
-                if len(hits) >= limit:
-                    break
+
+        # R36: units with every word (as written, or as word prefixes) — both, the exact ones first; only when no unit
+        # has them all, units with some of them
+        rows: list[sqlite3.Row] = []
+        tier_of: dict[int, int] = {}
+        used_expr = ""
+        for ti, (label, expr, terms) in enumerate(tiers):
+            if ti >= 2 and rows:                   # 'some words' only when no unit has every word
+                break
+            got = run(label, expr, terms)
+            for r in got:
+                if r["rid"] not in tier_of:
+                    tier_of[r["rid"]] = ti
+                    rows.append(r)
+            if got:
+                used_expr = expr                   # the widest expression that matched: the code check uses it
+        if not rows:
+            info["tier"] = tiers[-1][0]
+            return hits, info
+        info["tier"] = tiers[min(tier_of.values())][0]
+        in_code: set[int] | None = None
+        if code_cols:
+            # N102: a unit whose code holds the words before one that has them only in its comments
+            try:
+                in_code = {x[0] for x in con.execute(f"SELECT rowid FROM units_fts WHERE units_fts MATCH ?{where_extra}",
+                                                     [f"{code_cols} : ({used_expr})", *params_extra])}
+            except sqlite3.OperationalError:
+                in_code = None
+        order = {id(r): k for k, r in enumerate(DS.title_order(rows, " ".join(phrases + words), "name"))}
+        rows = sorted(rows, key=lambda r: (in_code is not None and r["rid"] not in in_code, tier_of[r["rid"]], order[id(r)]))
+        for r in rows:
+            key = (r["project"], r["name"], r["file"])
+            if key in seen:
+                continue
+            seen.add(key)
+            label, _expr, terms = tiers[tier_of[r["rid"]]]
+            h = {"project": r["project"], "unit": r["name"], "kind": r["kind"], "file": r["file"],
+                 "declaration": r["decl"], "code": r["impl"], "match": label}
+            if in_code is not None and r["rid"] not in in_code:
+                h["match_in"] = "comments"         # the words are there, not every one in the code
+            if label == "some words":
+                h["matched"] = [t for t in terms if self._row_has(con, r["rid"], t, t in phrases)]
+            hits.append(h)
+            if len(hits) >= limit:
+                break
         return hits, info
 
     _LIKE_ONE = ("(name LIKE ? ESCAPE '\\' OR declaration LIKE ? ESCAPE '\\' OR implementation LIKE ? ESCAPE '\\' "

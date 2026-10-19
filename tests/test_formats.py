@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (5, "73859714c7745821")
+INFOSYS_FINGERPRINT = (5, "dde9d4f83ffa8648")
 MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
 ESI_FINGERPRINT = ("1", "95a4f556032d311a")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
 
@@ -103,12 +103,14 @@ def _manuals_module():
 
 def infosys_code() -> dict[str, str]:
     """What a page of the local package becomes in index\\infosys-<lcid>.db: the package reader, the books chosen,
-    the HTML walker, links, cells, declarations, the help-link pass and the lookup tables."""
+    the HTML walker, links, cells, declarations, the title words (docsearch.ident_words), the schema, the help-link
+    pass and the lookup tables."""
+    from twincat_mcp import docsearch as ds
     from twincat_mcp import helpviewer as hv
     from twincat_mcp import infosys as inf
     return _closure([inf.InfosysIndex.index_all, inf.InfosysIndex._store, inf.InfosysIndex.resolve_help_links,
-                     inf.InfosysIndex.sync_derived, inf.html_to_doc, inf.parse_declaration, inf.classify,
-                     hv.HelpViewerSource], [inf, hv])
+                     inf.InfosysIndex.sync_derived, inf.InfosysIndex._init_db, inf.html_to_doc, inf.parse_declaration,
+                     inf.classify, hv.HelpViewerSource], [inf, hv, ds])
 
 
 def test_infosys_format_tracks_the_extraction_code():
