@@ -598,11 +598,13 @@ async def test_watch_and_wait_use_notifications_and_let_writes_through(monkeypat
             res["wait"] = payload(await s.call_tool("ads_wait_until", {"name": "MAIN.nCycle", "op": "==", "value": 7, "timeout_ms": 5000}))
 
         async def watch():
-            res["watch"] = payload(await s.call_tool("ads_watch", {"names": ["MAIN.nCycle"], "duration_ms": 1500}))
+            res["watch"] = payload(await s.call_tool("ads_watch", {"names": ["MAIN.nCycle"], "duration_ms": 3000}))
         async with anyio.create_task_group() as tg:
             tg.start_soon(wait)
             tg.start_soon(watch)
-            await anyio.sleep(0.5)
+            # the watch's window opens once its notifications are registered (the first rec start scans the project):
+            # on a slow Windows runner that took longer than the 0.5 s this test waited, and the write landed before it
+            await anyio.sleep(1.5)
             w = await s.call_tool("ads_write", {"name": "MAIN.nCycle", "value": 7})
             assert not w.is_error, text(w)
         assert res["wait"]["met"] and res["wait"]["method"] == "ADS change notification" and res["wait"]["elapsed_ms"] < 4000
@@ -1023,6 +1025,54 @@ async def test_d44_build_refuses_until_shell_edits_are_on_disk(monkeypatch, proj
     assert (await app.save_verified("xae_deploy"))["edits_checked"] == 1
 
 
+
+@pytest.mark.anyio
+async def test_n113_save_check_compares_each_plc_projects_own_main(monkeypatch, tmp_path):
+    """N113: with MAIN in Plc1 and Plc2, every xae_build(save_first) refused 'declaration on disk differs' — the edit of
+    TIPC^Plc2^…^MAIN was compared with whichever MAIN the name-only index held. The tree path's PLC project decides."""
+    from tests.test_project import _plc, _tsproj
+    from twincat_mcp.server import App, ToolError
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    app = App(mk_cfg(tmp_path))
+
+    async def xae_call(fn, *a, **kw):
+        return {"saved": True, "dirty_before": [], "dirty_after": []}
+    monkeypatch.setattr(app, "xae_call", xae_call)
+    monkeypatch.setattr("twincat_mcp.server.asyncio.sleep", lambda d: _noop())
+    app.note_edit("TIPC^Plc1^Plc1 Project^POUs^MAIN", None, "n := n + 1;")
+    app.note_edit("TIPC^Plc2^Plc2 Project^POUs^MAIN", None, "n := n + 2;")
+    r = await app.save_verified("xae_build")
+    assert r["edits_on_disk"] == ["TIPC^Plc1^Plc1 Project^POUs^MAIN", "TIPC^Plc2^Plc2 Project^POUs^MAIN"]
+    app.note_edit("TIPC^Plc2^Plc2 Project^POUs^MAIN", None, "n := n + 1;")   # Plc1's text: not what Plc2's file holds
+    with pytest.raises(ToolError, match=r"Plc2 Project\^POUs\^MAIN: implementation on disk differs"):
+        await app.save_verified("xae_build")
+
+
+
+@pytest.mark.anyio
+async def test_n113_review_analyses_run_inside_one_plc_project(monkeypatch, tmp_path):
+    """Review of N113: proj_lint / proj_call_graph / proj_interface read the name -> unit view, where MAIN of one PLC
+    project stands for both. Each analysis runs inside one PLC project: a name in two is refused unless pinned, the
+    whole-project lint is the lint of each PLC project, its findings tagged."""
+    from tests.fake_ads import install
+    from tests.test_project import _plc, _tsproj
+    install(monkeypatch)
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2; // TODO Plc2 only", 2000)
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    async with client_for(build_server(mk_cfg(tmp_path))) as s:
+        r = await s.call_tool("proj_call_graph", {"root": "MAIN"})
+        assert r.is_error and "several PLC projects" in text(r) and "@MAIN" in text(r)
+        g = payload(await s.call_tool("proj_call_graph", {"root": "Plc2@MAIN"}))
+        assert g["plc_project"].endswith("Plc2.plcproj") and g["root"] == "MAIN"
+        li = payload(await s.call_tool("proj_lint", {}))
+        assert len(li["plc_projects"]) == 2 and li["units"] == 2
+        todo = [f for f in li["items"] if f["rule"] == "todo"]
+        assert todo and all(f["plc_project"].endswith("Plc2.plcproj") for f in todo)
+
+
 async def _noop():
     return None
 
@@ -1120,6 +1170,10 @@ async def test_n40_n42_token_targets_are_computed_by_the_server(monkeypatch, pro
         # two projects and only the action given: the error says what is missing, before any token exists
         r = await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "target": "login"})
         assert r.is_error and "2 PLC projects" in text(r) and "plc_project_path" in text(r)
+        # the tool itself: the missing PLC project is said first, the guard's refusal after it (N41/N42 polish)
+        r = await s.call_tool("xae_plc", {"action": "login"})
+        assert r.is_error and "xae_plc: 2 PLC projects" in text(r) and done[-1:] == [("download", "TIPC^PlcB")]
+        assert "target=''" not in text(r) and "needs a confirm_token too" in text(r)
         # a partial hand-written target is completed (one project): no retry needed
         projects[:] = ["TIPC^PlcA^PlcA Project"]
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "target": "login"}))
@@ -1297,7 +1351,7 @@ async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, proje
     cfg.knowledge.location = str(kb)
     srv = build_server(cfg)
     ins = srv._lowlevel_server.instructions
-    assert "Offline documentation, state at this connection" in ins and "Infosys index: complete (8 pages" in ins
+    assert "Offline documentation, state at this connection" in ins and "Infosys index: complete (9 pages" in ins
     db = kb / "index" / "infosys-1033.db"
     building = db.with_name(db.name + ".building")
     building.write_bytes(db.read_bytes())
@@ -1311,7 +1365,7 @@ async def test_offline_docs_state_at_connection_and_in_doctor(monkeypatch, proje
     c.close()
     srv = build_server(cfg)                                          # a reconnection = a new server process
     ins = srv._lowlevel_server.instructions
-    assert "a build was INTERRUPTED at 8 of 51656 pages" in ins and "infosys_local.py" in ins
+    assert "a build was INTERRUPTED at 9 of 51656 pages" in ins and "infosys_local.py" in ins
     assert "rebuilt only when the user approves it" in ins and "kb_rebuild(index='infosys')" in ins
     async with client_for(srv) as s:
         d = payload(await s.call_tool("tc_doctor", {}))

@@ -424,7 +424,7 @@ class AdsBackend:
         dtver = self.__dict__.setdefault("_dtver", {})
         if hit and not refresh:
             if hit[1] is not None:
-                hit[1].declared = self.alias_hint     # the project's aliases (N50) — set again: the project may change
+                hit[1].declared = self._alias_hook(c.ams_net_port)   # the project's aliases (N50) — set again: it may change
             if ver is not None and dtver.get(key) == ver:
                 return hit[1]
             if ver is None and time.time() - hit[0] < self.cfg.symbol_cache_ttl_s:
@@ -437,8 +437,14 @@ class AdsBackend:
             ts, err = None, _fmt_exc(exc)
         self._dtcache[key] = (time.time(), ts, err)
         if ts is not None:
-            ts.declared = self.alias_hint
+            ts.declared = self._alias_hook(c.ams_net_port)
         return ts
+
+    def _alias_hook(self, port: int) -> Callable[[str], str | None] | None:
+        """The project's alias lookup for the runtime on this ADS port (N113: an alias declared in two PLC projects is
+        the one of the PLC project on this port)."""
+        hint = self.alias_hint
+        return None if hint is None else (lambda name: hint(name, port))
 
     def type_info(self, type_name: str, port: int | None = None) -> dict[str, Any]:
         ts = self.typesystem(False, port)
@@ -1265,10 +1271,10 @@ class AdsBackend:
 
     # set by the server: True when the project source declares this name as an INTERFACE — the runtime's datatype
     # table does not always mark interface types recognisably (field retest #52/#64)
-    interface_hint: Callable[[str], bool] | None = None
+    interface_hint: Callable[[str, int | None], bool] | None = None
     # set by the server: the base the project source declares for an alias type ('PT_X' -> 'POINTER TO FB_X') — the
     # 4026 datatype table gives an alias of a pointer no base type (N50)
-    alias_hint: Callable[[str], str | None] | None = None
+    alias_hint: Callable[[str, int | None], str | None] | None = None
 
     def is_interface_type(self, type_name: str, port: int | None = None) -> bool:
         try:
@@ -1279,7 +1285,7 @@ class AdsBackend:
             return True
         if self.interface_hint is not None:
             try:
-                return bool(self.interface_hint(type_name))
+                return bool(self.interface_hint(type_name, port or self.port))
             except Exception:  # noqa: BLE001
                 return False
         return False
@@ -1293,7 +1299,7 @@ class AdsBackend:
         if tt.kind == "pointer":
             return f"{type_name} is a POINTER/REFERENCE — writing an address is refused; write the variable it points to"
         base = tt.elem.name if tt.kind == "array" and tt.elem else type_name
-        if self.interface_hint is not None and self.interface_hint(base):
+        if self.interface_hint is not None and self.interface_hint(base, port or self.port):
             return (f"{base} is an INTERFACE (declared in the project source) — writing it would make the PLC call a wild "
                     "pointer; assign interfaces in PLC code, not over ADS")
         try:
@@ -1352,13 +1358,13 @@ class AdsBackend:
 
     # set by the server: source-level checks (CONSTANT declarations, no project in guarded mode) that every
     # write path must pass — ads_write, ads_write_many, snap_apply, test_*, exp_* all end in check_write
-    write_guard: Callable[[str], str | None] | None = None
+    write_guard: Callable[[str, int | None], str | None] | None = None
 
     def check_write(self, name: str, value: Any, port: int | None = None) -> dict[str, Any]:
         """Everything write() would refuse, without writing: READONLY flag, pointer/reference/interface types,
         source-level CONSTANT, enum names, array length, string length, integer range. Returns the encoded value."""
         if self.write_guard is not None:
-            why = self.write_guard(name)
+            why = self.write_guard(name, port or self.port)
             if why:
                 raise AdsError(why)
         s = self.symbol_info(name, port)

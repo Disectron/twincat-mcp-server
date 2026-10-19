@@ -287,10 +287,12 @@ def _title_terms(title: str) -> tuple[set[str], int]:
     return own | set(words), len(set(words)) or 1
 
 
-def title_order(rows: list[Any], query: str, title_key: str = "title") -> list[Any]:
+def title_order(rows: list[Any], query: str, title_key: str = "title", library_key: str | None = None) -> list[Any]:
     """N105: the page whose title names most of the query's informative words first ('tcp client connect socket' →
-    FB_SocketConnect: socket, connect), then the title that is exactly one of the query's words ('ADSREAD xyzqq' →
-    ADSREAD before AdsReadDeviceInfo), then the title the query names most completely; the index's own order (bm25)
+    FB_SocketConnect: socket, connect), then — library_key — the page whose title and library together name most
+    (the library is part of a symbol's name: 'EtherCAT slave state' → the slave-state symbols of Tc2_EtherCAT before
+    'State Machine Slave Settings'), then the title that is exactly one of the query's words ('ADSREAD xyzqq' → ADSREAD
+    before AdsReadDeviceInfo), then the title the query names most completely; the index's own order (bm25)
     otherwise. A title's words: its own and its identifiers' (ident_words)."""
     q = query_text(query)
     want = informative_words(q)
@@ -300,8 +302,10 @@ def title_order(rows: list[Any], query: str, title_key: str = "title") -> list[A
         title = str(r[title_key] or "")
         terms, size = _title_terms(title)
         cov = sum(1 for w in want if any(_same_word(t, w) for t in terms))
+        lib = _title_terms(str(r[library_key] or ""))[0] if library_key else set()
+        with_lib = sum(1 for w in want if any(_same_word(t, w) for t in terms | lib)) if lib else cov
         exact = fold(title.strip()) in raw
-        keyed.append(((-cov, not exact, -cov / size, i), r))
+        keyed.append(((-cov, -with_lib, not exact, -cov / size, i), r))
     keyed.sort(key=lambda x: x[0])
     return [r for _, r in keyed]
 

@@ -84,21 +84,21 @@ def mention_kind(line: str, leaf: str, segs: list[str]) -> str | None:
 _QUALIFIED_ONLY = _re.compile(r"\{\s*attribute\s+'qualified_only'\s*\}", _re.I)
 
 
-def _declares(app, unit_name: str, leaf: str) -> bool:
+def _declares(proj, unit_name: str, leaf: str) -> bool:
     """Does this unit — a POU, or a method / action / property of one — or a function block it extends declare a
-    variable `leaf` (which a bare `leaf` there then means)?"""
-    units = app.proj.units
+    variable `leaf` (which a bare `leaf` there then means)? proj: the source of the symbol's PLC project (N113)."""
+    units = proj.units
     names = [unit_name.lower()]
     if "." in unit_name:
         names.append(unit_name.split(".")[0].lower())
     for n in list(names):
         u = units.get(n)
         if u is not None:
-            names += [a.name.lower() for a in codecheck._ancestors(app.proj, u)]
+            names += [a.name.lower() for a in codecheck._ancestors(proj, u)]
     return any(v.name.lower() == leaf.lower() for n in names if (u := units.get(n)) is not None for v in u.vars)
 
 
-def _in_scope(app, unit_name: str, declared_in: str | None, leaf: str | None = None) -> bool:
+def _in_scope(proj, unit_name: str, declared_in: str | None, leaf: str | None = None) -> bool:
     """Does a bare `leaf` in unit_name mean the symbol declared in `declared_in`? Declared in a POU: in that POU, its
     methods / actions and the function blocks that extend it. Declared in a GVL without {attribute 'qualified_only'}:
     in every unit that does not declare a `leaf` of its own (review 0.8.12 — MAIN's bare nCount of GVL.nCount was
@@ -109,11 +109,11 @@ def _in_scope(app, unit_name: str, declared_in: str | None, leaf: str | None = N
     if owner == declared_in.split(".")[0].lower():
         return True
     try:
-        d = app.proj.units.get(declared_in.split(".")[0].lower())
+        d = proj.units.get(declared_in.split(".")[0].lower())
         if d is not None and d.kind == "GVL":
-            return not _QUALIFIED_ONLY.search(d.declaration or "") and not (leaf and _declares(app, unit_name, leaf))
-        u = app.proj.units.get(owner)
-        return bool(u is not None and any(a.name.lower() == declared_in.lower() for a in codecheck._ancestors(app.proj, u)))
+            return not _QUALIFIED_ONLY.search(d.declaration or "") and not (leaf and _declares(proj, unit_name, leaf))
+        u = proj.units.get(owner)
+        return bool(u is not None and any(a.name.lower() == declared_in.lower() for a in codecheck._ancestors(proj, u)))
     except Exception:  # noqa: BLE001
         return False
 
@@ -126,12 +126,13 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
     except Exception as exc:  # noqa: BLE001
         rep["live"] = {"error": str(exc)}
     try:
-        res = await app.proj_call(app.proj.resolve_symbol, symbol)
+        proj = await app.proj_call(app.proj_for_port)      # N113: the source of the PLC project this symbol is read from
+        res = await app.proj_call(proj.resolve_symbol, symbol, app.ads.port)
         rep["resolution"] = res
         leaf = symbol.split(".")[-1].split("[")[0]
         # a write is `x :=`, an output binding `Q => x` in an FB call, or `x` passed as VAR_IN_OUT (approximated by
         # a bare `, x)` / `(x,` inside a call — reported separately as possible writes)
-        writers = await app.proj_call(app.proj.search, rf"(\b{leaf}\b\s*:=|=>\s*{leaf}\b)", None, 50, True)
+        writers = await app.proj_call(proj.search, rf"(\b{leaf}\b\s*:=|=>\s*{leaf}\b)", None, 50, True)
         segs = [x.split("[")[0] for x in symbol.split(".")]
         hops = res.get("hops") or []
         declared_in = next((h.get("declared_in") for h in reversed(hops) if h.get("declared_in")), None)
@@ -143,7 +144,7 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
             if kind in ("assignment_unqualified", "output_binding_unqualified"):
                 # N3: a bare `x :=` (or `Q => x`) writes the x in scope of that unit — only a writer if that unit (or
                 # one derived from it) declares this symbol's x; FB_Counter.OnReset's nCount is not MAIN.nCount
-                if not _in_scope(app, h.get("unit", ""), declared_in, leaf):
+                if not _in_scope(proj, h.get("unit", ""), declared_in, leaf):
                     continue
                 kind = kind.replace("_unqualified", "")
             h["kind"] = kind
@@ -162,12 +163,12 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
                 rep["hmi_writers"] = hw[:20]
         except Exception:  # noqa: BLE001 — no HMI/visu in this project
             pass
-        mentions = await app.proj_call(app.proj.search, rf"\b{leaf}\b", ["PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "ACTION", "GET", "SET"], 200, True)
+        mentions = await app.proj_call(proj.search, rf"\b{leaf}\b", ["PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "ACTION", "GET", "SET"], 200, True)
 
         def names_it(unit: str, text: str) -> bool:
             # N111: FB_CounterModule's own nCount is not MAIN.nCount — a bare name counts only in the symbol's scope
             k = mention_kind(text, leaf, segs)
-            return k == "qualified" or (k == "unqualified" and _in_scope(app, unit, declared_in, leaf))
+            return k == "qualified" or (k == "unqualified" and _in_scope(proj, unit, declared_in, leaf))
         impl_mentions = [h for h in mentions["hits"] if h["part"] == "implementation"
                          and names_it(h.get("unit", ""), h.get("text", ""))]
         rep["writers"] = writers["hits"][:30]
@@ -179,11 +180,11 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
                 continue
             seen_units.append(h["unit"])
             try:
-                code = await app.proj_call(app.proj.get_code, h["unit"], "implementation", False)
+                code = await app.proj_call(proj.get_code, h["unit"], "implementation", False)
             except Exception:  # noqa: BLE001
                 continue
             lines = (code.get("implementation") or "").splitlines()
-            u = app.proj.get_unit(h["unit"])
+            u = proj.get_unit(h["unit"])
             idxs = [i for i, ln in enumerate(lines) if names_it(h["unit"], ln)][:3]
             for i in idxs:
                 lo, hi = max(0, i - context_lines // 2), min(len(lines), i + context_lines // 2 + 1)
@@ -279,7 +280,7 @@ async def release_check(app, plc_project_path: str | None = None, run_build: boo
             c["build"] = {"skipped": str(exc)}
             rep["warnings"].append("build not run (XAE unavailable)")
     try:
-        li = await app.proj_call(codecheck.lint, app.proj, None, lint_rules, None)
+        li = await app.proj_check(codecheck.lint, None, lint_rules, None)
         c["lint"] = {"findings": li["findings"], "by_rule": li["by_rule"], "warnings": [f for f in li["items"] if f["severity"] == "warning"][:30]}
         if any(f["severity"] == "warning" for f in li["items"]):
             rep["warnings"].append("lint warnings present")
@@ -331,10 +332,11 @@ async def project_overview(app) -> dict[str, Any]:
     scan = await app.proj_call(app.proj.scan)
     rep: dict[str, Any] = {"index": {k: scan[k] for k in ("root", "files", "units", "by_kind", "plcproj", "duplicate_names")}}
     progs = await app.proj_call(app.proj.list_units, "PROGRAM", None, 50)
+    view_of = await app.proj_call(app.proj_view_map)          # N113: one view per PLC project, built off the event loop
     rep["programs"] = []
     for pr in progs["units"]:
         try:
-            g = await app.proj_call(codecheck.call_graph, app.proj, pr["name"], 3)
+            g = await app.proj_call(codecheck.call_graph, view_of(pr["file"]), pr["name"], 3)
             rep["programs"].append({"name": pr["name"], "file": pr["file"], "calls": [n["name"] for n in g["nodes"][1:] if not n.get("repeat")][:40]})
         except Exception:  # noqa: BLE001
             rep["programs"].append({"name": pr["name"], "file": pr["file"]})
@@ -342,7 +344,7 @@ async def project_overview(app) -> dict[str, Any]:
     rep["function_blocks"] = []
     for fb in fbs["units"][:60]:
         try:
-            i = await app.proj_call(codecheck.fb_interface, app.proj, fb["name"])
+            i = await app.proj_call(codecheck.fb_interface, view_of(fb["file"]), fb["name"])
             rep["function_blocks"].append({"name": fb["name"], "extends": i["extends"], "implements": i["implements"],
                                            "inputs": [v["name"] for v in i["inputs"]], "outputs": [v["name"] for v in i["outputs"]],
                                            "methods": [m["name"] for m in i["methods"]], "file": fb["file"]})
@@ -352,7 +354,7 @@ async def project_overview(app) -> dict[str, Any]:
     rep["duts"] = [u["name"] for u in (await app.proj_call(app.proj.list_units, "STRUCT", None, 200))["units"]] + \
                   [u["name"] for u in (await app.proj_call(app.proj.list_units, "ENUM", None, 200))["units"]]
     try:
-        li = await app.proj_call(codecheck.lint, app.proj, None, None, None)
+        li = await app.proj_check(codecheck.lint, None, None, None)
         rep["lint"] = {"findings": li["findings"], "by_rule": li["by_rule"]}
     except Exception as exc:  # noqa: BLE001
         rep["lint"] = {"skipped": str(exc)}

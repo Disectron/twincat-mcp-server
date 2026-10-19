@@ -819,7 +819,7 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
 
     def arrange(rows: list[Any]) -> list[Any]:
         seen["read"] = len(rows)
-        ordered = DS.title_order(rows, query, "title")
+        ordered = DS.title_order(rows, query, "title", "library")
         if defined:
             ids = {r["rid"] for r in defined}
             ordered = defined + [r for r in ordered if r["rid"] not in ids]

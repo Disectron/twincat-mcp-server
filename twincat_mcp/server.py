@@ -54,7 +54,7 @@ import pyads
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeBackend, XaeError, sta_init, sta_teardown
-from .project_backend import ProjectIndex, ProjectError, not_on_target, parse_tcunit_xml
+from .project_backend import PlcView, ProjectIndex, ProjectError, not_on_target, parse_tcunit_xml, plc_projects_declaring
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
 from . import codecheck
@@ -327,6 +327,41 @@ def _plc_iec_path(path: str) -> str:
     return _plc_split(path)[1]
 
 
+def _merge_checks(outs: list[tuple[str | None, dict[str, Any]]]) -> dict[str, Any]:
+    """N113: the results of one analysis per PLC project as one: numbers added, number tables added per key, lists
+    joined (each dict item tagged with its plc_project), other values kept per PLC project when they differ."""
+    merged: dict[str, Any] = {"plc_projects": [plc for plc, _r in outs]}
+    other: dict[str, dict[str, Any]] = {}
+    for plc, r in outs:
+        for k, v in r.items():
+            if isinstance(v, bool) or v is None or isinstance(v, str):
+                other.setdefault(k, {})[plc or ""] = v
+            elif isinstance(v, (int, float)):
+                merged[k] = merged.get(k, 0) + v
+            elif isinstance(v, list):
+                merged.setdefault(k, []).extend({**x, "plc_project": plc} if isinstance(x, dict) else x for x in v)
+            elif isinstance(v, dict) and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v.values()):
+                tab = merged.setdefault(k, {})
+                for kk, vv in v.items():
+                    tab[kk] = tab.get(kk, 0) + vv
+            else:
+                other.setdefault(k, {})[plc or ""] = v
+    for k, per in other.items():
+        vals = list(per.values())
+        merged[k] = vals[0] if all(x == vals[0] for x in vals) else per
+    sev = {"error": 0, "warning": 1, "info": 2}
+    if isinstance(merged.get("items"), list) and all(isinstance(x, dict) and "severity" in x for x in merged["items"]):
+        merged["items"].sort(key=lambda f: (sev.get(f["severity"], 3), f.get("file") or "", f.get("line") or 0))
+    if isinstance(merged.get("items"), list) and len(merged["items"]) > 1000:
+        merged["items_shown"] = f"1000 of {len(merged['items'])} (the most severe first)"
+        merged["items"] = merged["items"][:1000]
+    return merged
+
+
+class TargetArgsError(ToolError):
+    """token_target: the shell answered, but the arguments name no target (N41/N42: which PLC project)."""
+
+
 class App:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -361,8 +396,8 @@ class App:
         self.rec.rcfg = cfg.recorder
 
         # N62: the recorder compares cycle_ms with the task that runs each recorded program (project task config)
-        def _task_of(name: str) -> list[dict[str, Any]] | None:
-            return self.proj.tasks_of(name)
+        def _task_of(name: str, port: int | None = None) -> list[dict[str, Any]] | None:
+            return self.proj.tasks_of(name, port)
         self.rec.task_of = _task_of
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
@@ -851,6 +886,62 @@ class App:
         except ProjectError as exc:
             raise ToolError(K.annotate(str(exc))) from exc
 
+    # -- N113: the source analyses run inside ONE PLC project when names are declared in several ------------------
+    def proj_views(self, name: str | None) -> list[ProjectIndex]:
+        """The index itself when no name is declared twice; else the PLC project that declares `name` (several and no
+        'file@name' pin: refused, nothing is picked), or — no name — each PLC project in turn."""
+        p = self.proj
+        p._ensure()
+        if not p.duplicates:
+            return [p]
+        if name:
+            plcs = plc_projects_declaring(p, name)
+            if len(plcs) > 1:
+                raise ToolError(f"{name!r} is declared in several PLC projects {[x or '(files of no PLC project)' for x in plcs]} "
+                                f"— pin one: '<file-substring>@{name.split('@')[-1]}' (nothing was chosen)")
+            return [PlcView(p, plcs[0])] if plcs else [p]       # not declared: the analysis says so itself
+        return [PlcView(p, plc) for plc in sorted({p._plc_of(f) for f in p._by_file}, key=lambda x: x or "")]
+
+    def proj_for_port(self, port: int | None = None) -> ProjectIndex:
+        """The source of the runtime on ADS `port` (default: the connected one): its PLC project when names are
+        declared in several and the .tsproj maps the port; else the whole index (its lookups refuse ambiguous names)."""
+        p = self.proj
+        if p.root is None:
+            return p
+        p._ensure()
+        if not p.duplicates:
+            return p
+        plc = p.plc_project(port=port or self.ads.port)
+        return PlcView(p, plc) if plc is not None else p
+
+    def proj_view_map(self) -> Any:
+        """A function file -> the view of its PLC project, the views built once (in the worker thread that calls this)."""
+        p = self.proj
+        p._ensure()
+        if not p.duplicates:
+            return lambda _f: p
+        views: dict[str | None, ProjectIndex] = {}
+
+        def of(f: str) -> ProjectIndex:
+            plc = p.plc_of_file(f)
+            if plc not in views:
+                views[plc] = PlcView(p, plc)
+            return views[plc]
+        for f in list(p._by_file):
+            of(f)
+        return of
+
+    async def proj_check(self, fn, name: str | None, *a: Any) -> dict[str, Any]:
+        """A codecheck analysis fn(index, name, *a) on the views of proj_views: one result, or the results of each PLC
+        project merged (counts added, lists joined with plc_project on each item)."""
+        views = await self.proj_call(self.proj_views, name)
+        if len(views) == 1:
+            r = await self.proj_call(fn, views[0], name, *a)
+            if isinstance(views[0], PlcView) and isinstance(r, dict):
+                r["plc_project"] = views[0].plc
+            return r
+        return _merge_checks([(v.plc, await self.proj_call(fn, v, name, *a)) for v in views])
+
     async def kb_call(self, fn, *a, timeout: float = 600, **kw) -> Any:
         try:
             return await asyncio.wait_for(asyncio.to_thread(fn, *a, **kw), timeout)
@@ -1201,14 +1292,13 @@ class App:
         def norm(t: str | None) -> str:
             return re.sub(r"\s+", " ", (t or "").replace("\r", "")).strip()
         self.proj.ensure_fresh()
-        units = self.proj.units
         bad: list[dict[str, Any]] = []
         for path, e in self.pending_edits.items():
-            segs = [x for x in path.split("^") if x]
-            keys = ([f"{segs[-2]}.{segs[-1]}".lower()] if len(segs) >= 2 else []) + ([segs[-1].lower()] if segs else [])
-            u = next((units[k] for k in keys if k in units), None)
+            # N113: looked up in the PLC project the tree path names — by name alone, MAIN of Plc2 was compared with
+            # MAIN of Plc1 and every build refused 'declaration on disk differs'
+            u, why = self.proj.unit_at_tree_path(path)
             if u is None:
-                bad.append({"path": path, "edited_at": e["at"], "why": "not in any source file under the project root"})
+                bad.append({"path": path, "edited_at": e["at"], "why": why})
                 continue
             for part in ("declaration", "implementation"):
                 if part in e and norm(e[part]) != norm(getattr(u, part)):
@@ -1248,28 +1338,29 @@ class App:
         self.pending_edits.clear()
         return out
 
-    def source_alias(self, type_name: str) -> str | None:
-        """N50: the base the project source declares for an alias type (TYPE PT_X : POINTER TO FB_X), or None."""
+    def source_alias(self, type_name: str, port: int | None = None) -> str | None:
+        """N50: the base the project source declares for an alias type (TYPE PT_X : POINTER TO FB_X), or None. port:
+        the runtime's — a name declared in several PLC projects is that port's PLC project's (N113)."""
         if self.proj.root is None:
             return None
         try:
-            return self.proj.type_alias(type_name)
+            return self.proj.type_alias(type_name, port or self.ads.port)
         except Exception:  # noqa: BLE001
             return None
 
-    def is_source_interface(self, type_name: str) -> bool:
-        """The project declares `type_name` (qualified or not) as an INTERFACE."""
+    def is_source_interface(self, type_name: str, port: int | None = None) -> bool:
+        """The project declares `type_name` (qualified or not) as an INTERFACE (in the PLC project of ADS `port`)."""
         if self.proj.root is None:
             return False
         try:
             self.proj._ensure()
         except Exception:  # noqa: BLE001
             return False
-        base = self.proj._base_type_name(type_name or "").split(".")[-1].lower()
-        u = self.proj.units.get(base)
+        base = self.proj._base_type_name(type_name or "").split(".")[-1]
+        u = self.proj.named(base, port or self.ads.port)
         return bool(u is not None and u.kind == "INTERFACE")
 
-    def constant_reason(self, name: str) -> str | None:
+    def constant_reason(self, name: str, port: int | None = None) -> str | None:
         """Source-level write check, installed as AdsBackend.write_guard so every write path runs it.
         Runtime symbol flags do not mark VAR CONSTANT as READONLY on 4026, so the project source decides: a write
         to anything declared in a CONSTANT block is refused. Without a project source the check cannot run: in
@@ -1282,8 +1373,15 @@ class App:
             return None
         try:
             self.proj._ensure()
-            r = self.proj.resolve_symbol(name)
-        except Exception:  # noqa: BLE001 — unknown in source: the runtime check is all we have
+            r = self.proj.resolve_symbol(name, port or self.ads.port)
+        except ProjectError as exc:
+            if "several PLC projects" in str(exc) and self.guard.mode == "guarded":
+                # N113: the name is in the source twice and which one the target runs is not known — the CONSTANT
+                # check cannot be made; guarded mode refuses (as without a project source)
+                return (f"{name!r}: {exc}. A write to a CONSTANT cannot be ruled out — guarded mode refuses it. Name "
+                        "the PLC projects' ADS ports in the .tsproj (AmsPort), or switch to full mode.")
+            return None                                 # unknown in source: the runtime check is all we have
+        except Exception:  # noqa: BLE001
             return None
         for h in r.get("hops", []):
             if h.get("constant"):
@@ -1320,6 +1418,12 @@ class App:
                 self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope())
             except SafetyError as exc:
                 self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
+                if isinstance(xae_exc, TargetArgsError) and "needs a confirm_token" in str(exc):
+                    # N41/N42 polish: the shell answered, the arguments do not name a target — that reason first; the
+                    # guard's "needs a confirm_token … target ''" suggested a token for '', which can never be right
+                    raise ToolError(f"{xae_exc} — nothing was done. It needs a confirm_token too, issued for its "
+                                    f"target once the arguments name one: tc_request_confirmation(action={action!r}, "
+                                    "args={…the same arguments…})") from exc
                 raise ToolError(f"{exc} (target not known: {str(xae_exc)[:200]})") from exc
             raise
 
@@ -1351,7 +1455,7 @@ class App:
         if action == "xae_plc":
             act = str(a.get("action") or "")
             if not act:
-                raise ToolError("xae_plc's token names the action: pass args={'action': 'login', 'plc_project_path': …}")
+                raise TargetArgsError("xae_plc's token names the action: pass args={'action': 'login', 'plc_project_path': …}")
             path = a.get("plc_project_path")
             # N78: the token names a PLC project of the open solution — one that does not exist gets no token (and
             # the tool, which computes its target the same way, refuses it before anything is done)
@@ -1360,12 +1464,12 @@ class App:
                 want = _plc_iec_path(str(path))
                 hit = [p for p in projs if p.lower() == want.lower()]
                 if not hit:
-                    raise ToolError(f"no PLC project {str(path)!r} in the open solution — its PLC projects: {projs} "
+                    raise TargetArgsError(f"no PLC project {str(path)!r} in the open solution — its PLC projects: {projs} "
                                     "(xae_plc_projects lists them)")
                 proj = hit[0]
             else:
                 if len(projs) != 1:
-                    raise ToolError(f"{len(projs)} PLC projects — xae_plc needs plc_project_path, and its token names it: "
+                    raise TargetArgsError(f"{len(projs)} PLC projects — xae_plc needs plc_project_path, and its token names it: "
                                     f"{projs}")
                 proj = projs[0]
             return f"{act}:{proj}@{await self._xae_netid()}"
@@ -1496,8 +1600,11 @@ class App:
 
 async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str, Any]:
     max_items = max(int(max_items), 1)
-    proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False)
+    proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False, port=app.ads.port)
     src_cut = bool(proj.get("truncated"))
+    # review of N113: roots declared in several PLC projects whose port maps to none — both sources are walked, so a
+    # variable of the other PLC project would read as 'missing online': those roots are not judged
+    ambiguous = {r.lower() for r in proj.get("ambiguous_roots") or []}
     declared = {it["path"].lower(): it for it in proj["items"] if "[*]" not in it["path"]}
     # source arrays are declared once as x[*].y — the runtime has one leaf per element: match by pattern
     templates = {it["path"].lower(): it for it in proj["items"] if "[*]" in it["path"]}
@@ -1550,7 +1657,7 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
     missing_final += [templates[k] for k in tmpl_keys if k not in tmpl_hit]
     # D23: a verdict needs both sides complete. A declared item under a root whose online list was cut (or could not
     # be read) is not "missing", and with the source list cut no online leaf can be called "extra".
-    blind = online_cut | {u.lower() for u in unreadable}
+    blind = online_cut | {u.lower() for u in unreadable} | ambiguous
     not_judged_missing = [it for it in missing_final if it["path"].split(".")[0].lower() in blind]
     missing_final = [it for it in missing_final if it["path"].split(".")[0].lower() not in blind]
     extra_raw = []
@@ -1588,6 +1695,8 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
                        f"{len(not_judged_missing)} declared items under them not judged")
         if unreadable:
             why.append(f"online symbols of {unreadable} could not be read: their declared items are not judged")
+        if ambiguous:
+            why.append(f"{proj.get('note')} — their declared items are not judged")
         out["not_judged"] = {"missing_candidates": len(not_judged_missing), "extra_candidates": not_judged_extra,
                              "reason": "; ".join(why) + ". Raise max_items or narrow with scope= for a full verdict."}
     if len(missing_final) > cap or len(extra) > cap:
@@ -2612,8 +2721,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         file, no Python on the data path), 'python' = the in-process recorder, None = recorder.engine from the config
         (default 'auto': native when installed). The response says which engine ran and why. After stopping: rec_verify.
         also_scope: also run the TwinCAT Scope configuration open in XAE (scope = its name when several are open) —
-        StartRecord now; at rec_stop StopRecord, SaveSVD and ExportCSV into <recordings>/scope/<id>.svdx / .scope.csv
-        with a signed link file. What Scope records (channels, sample time) is set in that configuration. With
+        StartRecord now; at rec_stop StopRecord and SaveSVD into <recordings>/scope/<id>.svdx, the CSV <id>.scope.csv
+        exported from that file with Beckhoff's export tool (XAE's ExportCSV only without it, flagged), a signed link
+        file, and the Scope View log's new ERROR lines (scope_view_log). What Scope records (channels, sample time) is set in that configuration. With
         recorder.also_scope = 'ask' (default) and a Scope configuration open, leaving also_scope unset asks the user
         (prompt, or an error that tells you to ask and call again with true/false)."""
         # R6: arguments that can never work are refused here, before the call queues behind a long job on the worker
@@ -2669,46 +2779,105 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         f"(scope=<name> if several) or also_scope=false. Nothing was started. "
                         f"([recorder] also_scope = 'always' / 'never' makes this permanent.)")
 
+    def _view_log() -> Path:
+        from . import scope as S
+        return S.view_log_path(app.cfg.scope.view_log)
+
     async def _scope_start(rid: str, name: str) -> dict[str, Any]:
+        from . import scope as S
+        mark = await asyncio.to_thread(S.log_mark, _view_log())
         try:
             r = await app.xae_call(app.xae.scope_action, "start", name or None, timeout=60)
         except ToolError as exc:
             return {"error": f"Scope recording NOT started: {exc}. The ADS recording {rid} runs regardless."}
         app.scope_runs[rid] = {"scope": r["scope"], "name": name or None, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
-                               "start_result": r.get("result_code")}
+                               "start_result": r.get("result_code"), "log_mark": mark}
         app.audit("scope_start", {"id": rid, "scope": r["scope"]}, OpClass.EDIT, "ok")
         return {"started": True, **r, "note": "Scope records independently (its own ADS acquisition and timestamps); "
                                               "it is stopped, saved and exported at rec_stop"}
 
+    async def _scope_save(name: str | None, svdx: Path, csv: Path, overwrite: bool = False) -> dict[str, Any]:
+        """SaveSVD, then the CSV FROM THE SAVED FILE with Beckhoff's export tool (N117: XAE's ExportCSV right after
+        SaveSVD wrote a CSV that lacked the end of the .svdx — 600 ms, and 3 rows of a 58 s recording; exported from the
+        .svdx, the CSV holds what the file holds). XAE's ExportCSV only when the tool is missing or fails, flagged."""
+        from . import scope as S
+        out: dict[str, Any] = {}
+        try:
+            r = await app.xae_call(app.xae.scope_action, "save_svd", name, str(svdx), timeout=600)
+            out["save_svd"] = {k: r[k] for k in ("result_code", "path", "warning", "result_note") if k in r}
+        except ToolError as exc:
+            out["save_svd"] = {"error": str(exc)}
+            return out
+        out["save_svd"]["size_watch"] = await asyncio.to_thread(_settled, svdx)
+        tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
+        failed = None
+        if tool is not None:
+            try:
+                e = await asyncio.to_thread(S.export, svdx, csv, tool=tool, overwrite=overwrite, key=app.rec.key,
+                                            version=__version__)
+                out["export_csv"] = {"path": e["file"], "via": "TC3ScopeExportTool.exe from the saved .svdx",
+                                     "lines": e["lines"], "provenance": e["provenance"],
+                                     **{k: e[k] for k in ("warning", "exported_from_copy") if k in e}}
+                return out
+            except S.ScopeError as exc:
+                failed = str(exc)
+        try:
+            r = await app.xae_call(app.xae.scope_action, "export_csv", name, str(csv), timeout=600)
+            out["export_csv"] = {**{k: r[k] for k in ("result_code", "path", "warning", "result_note") if k in r},
+                                 "via": "XAE ExportCSV",
+                                 "check": ("XAE's ExportCSV wrote a CSV shorter than the .svdx in the 0.8.12 retest "
+                                           "(N117) — compare with scope_export of the .svdx")}
+        except ToolError as exc:
+            out["export_csv"] = {"error": str(exc)}
+        out["export_csv"]["export_tool"] = failed or ("TC3ScopeExportTool.exe not found — "
+                                                      + S.status(app.cfg.scope.export_tool)["note"])
+        return out
+
+    def _settled(p: Path, quiet_s: float = 0.5, limit_s: float = 15.0) -> dict[str, Any]:
+        """Whether SaveSVD's file still grew after the call returned (not documented either way): its size watched
+        until it stayed the same for quiet_s — what that shows, no more (an unchanged size is not proof the writer is
+        done)."""
+        t0 = time.monotonic()
+        try:
+            last = p.stat().st_size
+        except OSError as exc:
+            return {"note": f"the saved file could not be read after SaveSVD returned: {exc}"}
+        grew = False
+        while True:
+            time.sleep(quiet_s)
+            try:
+                now = p.stat().st_size
+            except OSError as exc:
+                return {"note": f"the saved file disappeared while it was watched: {exc}"}
+            if now == last:
+                return {"bytes": now, "grew_after_save": grew, "unchanged_for_s": quiet_s,
+                        **({"grew_for_s": round(time.monotonic() - t0 - quiet_s, 2)} if grew else {})}
+            grew, last = True, now
+            if time.monotonic() - t0 > limit_s:
+                return {"bytes": now, "grew_after_save": True, "still_growing_after_s": round(limit_s, 1),
+                        "warning": "the .svdx was still being written — the CSV may lack its end"}
+
     async def _scope_finish(rid: str) -> dict[str, Any] | None:
+        from . import scope as S
         run = app.scope_runs.pop(rid, None)
         if run is None:
             return None
         d = _scope_dir()
         svdx, csv = d / f"{rid}.svdx", d / f"{rid}.scope.csv"
         out: dict[str, Any] = {"scope": run["scope"]}
-        steps = (("stop", None), ("save_svd", str(svdx)), ("export_csv", str(csv)))
-        for action, path in steps:
-            try:
-                r = await app.xae_call(app.xae.scope_action, action, run["name"], path, timeout=600)
-                out[action] = {k: r[k] for k in ("result_code", "path", "warning") if k in r}
-            except ToolError as exc:
-                out[action] = {"error": str(exc)}
-                if action == "stop":
-                    out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
-                    return out
-        if svdx.is_file() and not csv.is_file():
-            # the export tool from the saved file instead (same CSV writer, no XAE needed)
-            from . import scope as S
-            tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
-            if tool is not None:
-                try:
-                    await asyncio.to_thread(S.export, svdx, csv, tool=tool, key=app.rec.key, version=__version__)
-                    out["export_csv"] = {"path": str(csv), "via": "TC3ScopeExportTool.exe"}
-                except S.ScopeError as exc:
-                    out["export_csv"] = {"error": str(exc)}
-        out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv)
-        app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")}, OpClass.EDIT, "ok")
+        try:
+            r = await app.xae_call(app.xae.scope_action, "stop", run["name"], None, timeout=600)
+            out["stop"] = {k: r[k] for k in ("result_code", "warning", "result_note") if k in r}
+        except ToolError as exc:
+            out["stop"] = {"error": str(exc)}
+            out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
+        else:
+            out.update(await _scope_save(run["name"], svdx, csv))
+            out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv)
+            app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
+                      OpClass.EDIT, "ok")
+        if run.get("log_mark"):
+            out["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, run["log_mark"])
         return out
 
     def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path) -> dict[str, Any]:
@@ -2776,15 +2945,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         cycle_ms, a suggested mode per leaf, and — when checklist='<name>' — writes
         ~/.twincat_mcp/profiles/<name>.checklist.csv with a 'select' column to mark (preselect =
         patterns already marked). Then rec_profile_save(name, from_checklist=name)."""
+        src_note: str | None = None
         if source == "runtime":
             leaves = await app.ads_call(_scan_runtime, prefix, pattern, max_items, timeout=300, slow=True)
         elif source == "project":
             from .recorder import path_selected, selection_regex
             rx = selection_regex(pattern) if pattern else None
-            pv = await app.proj_call(app.proj.variables, prefix, 64, max_items * 4, False)
+            pv = await app.proj_call(app.proj.variables, prefix, 64, max_items * 4, False, port=app.ads.port)
             leaves = [{"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")}
                       for it in pv["items"] if "[*]" not in it["path"]
                       and (rx is None or path_selected(rx, it["path"]))][:max_items]
+            src_note = pv.get("note")
         else:
             raise ToolError("source must be runtime | project")
         if not leaves:
@@ -2810,6 +2981,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                "items": [{"path": lf["path"], "type": lf["type"], "size": lf.get("size"), "suggested_mode": capture.suggest_mode(lf["type"]),
                                           **({"attrs": lf["attrs"]} if lf.get("attrs") else {})} for lf in leaves[:show]],
                                "truncated_items": len(leaves) > show}
+        if src_note:
+            res["source_note"] = src_note
         if checklist:
             path = app.profiles.checklist_path(checklist)
             await asyncio.to_thread(path.write_text, capture.build_checklist(leaves, cycle_ms, preselect), "utf-8")
@@ -2858,7 +3031,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 raise ToolError(str(exc)) from exc
             src.append("checklist")
         if from_attributes:
-            pv = await app.proj_call(app.proj.variables, scope, 64, 200_000, False)
+            pv = await app.proj_call(app.proj.variables, scope, 64, 200_000, False, port=app.ads.port)
+            if pv.get("note"):
+                raise ToolError(f"from_attributes: {pv['note']} — which PLC project's attributes to take is not known; "
+                                "connect to the PLC project's ADS port (ads_connect) or pass scope='<file-substring>@<name>'")
             try:
                 found = capture.items_from_attributes(pv["items"], cycle_ms)
             except capture.ProfileError as exc:
@@ -3104,7 +3280,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Stop a recording, release the ADS notifications, finalize the file; returns status + stats."""
         res = await app.rec_call(app.rec.stop, id, "manual (rec_stop)", timeout=60)
         app.audit("rec_stop", {"id": id, "events": res.get("events")}, OpClass.EDIT, "ok")
-        sc = await _scope_finish(id)
+        try:
+            sc = await _scope_finish(id)
+        except Exception as exc:  # noqa: BLE001 — the ADS recording is stopped and sealed: its result is kept
+            log.exception("Scope finish of %s failed", id)
+            sc = {"error": f"the Scope part failed ({type(exc).__name__}: {exc}) — the ADS recording {id} is stopped and "
+                           "complete; stop / save the Scope configuration in XAE (scope_record)"}
         if sc is not None:
             res["scope"] = sc
         return res
@@ -3127,7 +3308,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (command line `"svd=<file>" target=<csv> silent`; CSV needs no extra licence). Default target:
         <recordings>/scope/<name>.csv ([scope] export_dir). The CSV is Beckhoff's output, unchanged — channels, time
         column and alignment of channels with different sample times follow the Scope project's export settings. A
-        signed <csv>.provenance.json records the source file and SHA-256, the tool and its SHA-256, and the command."""
+        signed <csv>.provenance.json records the source file and SHA-256, the tool and its SHA-256, and the command.
+        A read-only source (rec_stop seals its .svdx) is exported from a byte-identical writable copy. scope_view_log:
+        the ERROR lines the Scope View log (TcScopeView.log) got during the export."""
         from . import scope as S
         tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
         if tool is None:
@@ -3136,7 +3319,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         out = app.out_path(target, overwrite, "scope export") if target else _scope_dir() / (src.stem + ".csv")
         try:
             res = await asyncio.to_thread(S.export, src, out, tool=tool, overwrite=overwrite, key=app.rec.key,
-                                          version=__version__)
+                                          version=__version__, view_log=_view_log())
         except S.ScopeError as exc:
             raise ToolError(str(exc)) from exc
         app.audit("scope_export", {"svd": str(src), "target": str(out), "sha256": res["export_sha256"]}, OpClass.EDIT, "ok")
@@ -3151,18 +3334,20 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def scope_record(action: str, scope: str | None = None, path: str | None = None) -> dict[str, Any]:
         """Drive a Scope configuration open in XAE (Automation Interface IMeasurementScope): action = start | stop |
-        save (SaveSVD + ExportCSV → <recordings>/scope/<scope>-<time>.svdx/.csv, or path=<file>.svdx). scope = its
-        name when several are open. Affects only the Scope recording, not the PLC."""
+        save (SaveSVD → <recordings>/scope/<scope>-<time>.svdx, or path=<file>.svdx; the .csv exported from that file
+        with Beckhoff's export tool — XAE's ExportCSV only without it, flagged; the Scope View log's new ERROR lines).
+        scope = its name when several are open. Affects only the Scope recording, not the PLC."""
         if action in ("start", "stop"):
             r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
         elif action == "save":
+            from . import scope as S
             base = app.out_path(str(Path(path).with_suffix(".svdx")), False, "scope file").with_suffix("") if path else _scope_dir() / (
                 re.sub(r"[^\w.-]+", "_", scope or "scope") + "-" + time.strftime("%Y%m%d-%H%M%S"))
-            r = {"save_svd": await app.xae_call(app.xae.scope_action, "save_svd", scope, str(base) + ".svdx", timeout=600)}
-            try:
-                r["export_csv"] = await app.xae_call(app.xae.scope_action, "export_csv", scope, str(base) + ".csv", timeout=600)
-            except ToolError as exc:
-                r["export_csv"] = {"error": str(exc), "hint": "scope_export(svd=…) runs Beckhoff's export tool on the saved file"}
+            mark = await asyncio.to_thread(S.log_mark, _view_log())
+            r = await _scope_save(scope, Path(str(base) + ".svdx"), Path(str(base) + ".csv"))
+            if "error" in r["save_svd"]:
+                raise ToolError(f"Scope save: {r['save_svd']['error']}")
+            r["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, mark)
         else:
             raise ToolError("action must be start | stop | save")
         app.audit("scope_record", {"action": action, "scope": scope, "path": path}, OpClass.EDIT, "ok")
@@ -3341,7 +3526,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def proj_interface(name: str) -> dict[str, Any]:
         """Public interface of an FB/program: inputs/outputs/in-out with types and comments,
         methods (access, signature), properties (get/set), actions, extends/implements."""
-        return await app.proj_call(codecheck.fb_interface, app.proj, name)
+        return await app.proj_check(codecheck.fb_interface, name)
 
     @mcp.tool(annotations=READ)
     async def proj_lint(name: str | None = None, rules: list[str] | None = None,
@@ -3356,13 +3541,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         unsigned counter), new_delete (__NEW without __DELETE, target lacking enable_dynamic_creation).
         Deterministic and offline; the compiler (xae_build + xae_diagnostics) stays the authority.
         rules= subset to run."""
-        return await app.proj_call(codecheck.lint, app.proj, name, rules, prefixes or cfg.project.naming_prefixes or None)
+        return await app.proj_check(codecheck.lint, name, rules, prefixes or cfg.project.naming_prefixes or None)
 
     @mcp.tool(annotations=READ)
     async def proj_call_graph(root: str, depth: int = 4) -> dict[str, Any]:
         """Call graph from a program/FB: FB instances it invokes, functions and methods it calls,
         recursively to `depth` (what runs when this POU runs)."""
-        return await app.proj_call(codecheck.call_graph, app.proj, root, min(depth, 10))
+        return await app.proj_check(codecheck.call_graph, root, min(depth, 10))
 
     @mcp.tool(annotations=EDIT)
     async def tcunit_scaffold(fb_name: str, out_dir: str | None = None, add_to_plcproj: bool = True,
@@ -3376,10 +3561,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # registered (add_to_plcproj=false), and not over a file the project compiles — is no code edit of the
         # PLC project, wherever it is written, so edit_requires_config_mode does not apply to it. (N109: an out_dir
         # under the project root but outside every PLC project was refused in RUN.)
-        dest = await app.proj_call(codecheck.scaffold_dest, app.proj, fb_name, out_dir)
+        view = (await app.proj_call(app.proj_views, fb_name))[0]                    # N113: the FB's own PLC project
+        dest = await app.proj_call(codecheck.scaffold_dest, view, fb_name, out_dir)
         touches_project = add_to_plcproj or (Path(dest).exists() and await app.proj_call(app.proj.is_member, dest))
         await app.permit(None, OpClass.EDIT, "tcunit_scaffold" if touches_project else "tcunit_scaffold_external", fb_name)
-        res = await app.confirmed("tcunit_scaffold", {"fb": fb_name}, OpClass.EDIT, app.proj_call(codecheck.tcunit_scaffold, app.proj, fb_name, out_dir, add_to_plcproj, overwrite))
+        res = await app.confirmed("tcunit_scaffold", {"fb": fb_name}, OpClass.EDIT, app.proj_call(codecheck.tcunit_scaffold, view, fb_name, out_dir, add_to_plcproj, overwrite))
         return res
 
 
@@ -3631,13 +3817,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             except ToolError:
                 continue
         declared = None
+        src_note = None
         if check_source:
             try:
-                pv = await app.proj_call(app.proj.variables, None, 64, 200_000, False)
-                declared = {it["path"].lower() for it in pv["items"] if "[*]" not in it["path"]}
+                pv = await app.proj_call(app.proj.variables, None, 64, 200_000, False, port=app.ads.port)
+                src_note = pv.get("note")
+                declared = None if src_note else {it["path"].lower() for it in pv["items"] if "[*]" not in it["path"]}
             except ToolError:
                 declared = None
-        return await asyncio.to_thread(app.hmi.compare, online, declared)
+        res = await asyncio.to_thread(app.hmi.compare, online, declared)
+        if src_note and isinstance(res, dict):
+            res["source_not_checked"] = f"{src_note} — the source was not compared"
+        return res
 
 
 
@@ -4003,7 +4194,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         safe fixes (.bak written); regenerate_lineids rebuilds LineIds blocks."""
         if fix:
             await app.permit(None, OpClass.EDIT, "proj_validate_xml", name or "*")
-        res = await app.proj_call(codecheck.validate_xml, app.proj, name, fix, regenerate_lineids)
+        res = await app.proj_check(codecheck.validate_xml, name, fix, regenerate_lineids)
         if fix and res.get("fixed"):
             app.audit("proj_validate_xml", {"name": name, "fixed": res["fixed"]}, OpClass.EDIT, "ok")
         return res
@@ -4183,18 +4374,24 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def xae_attach(progid: str | None = None, solution_path: str | None = None,
                          launch: bool | None = None) -> dict[str, Any]:
-        """Attach to the running XAE shell / Visual Studio (Running Object Table). Picks the
-        instance holding solution_path when given. launch=true starts a new shell (slow)."""
+        """Attach to the running XAE shell / Visual Studio (Running Object Table) that has the solution: solution_path
+        when given (from then on every xae_* tool works on it — flagged solution_mismatch when it is not
+        xae.solution_path), else xae.solution_path. A solution no shell has open is never replaced by another one
+        (refused, or launch=true starts a shell with it); several shells with different solutions and none named or
+        configured: refused. If the solution is closed later, every xae_* tool refuses until it is open again (in any
+        shell — they find it by themselves)."""
         return await app.xae_call(app.xae.attach, progid, solution_path, launch, timeout=180)
 
     @mcp.tool(annotations=READ)
     async def xae_status() -> dict[str, Any]:
         """Shell version, open solution, projects, TwinCAT project name, target NetId, started flag.
-        Attaches to the shell first if not attached yet (as every xae_* tool does)."""
+        Attaches to the shell first if not attached yet (as every xae_* tool does). solution_bound: the solution the
+        xae_* tools work on; solution_mismatch / refused: it is not open (they refuse); reattached: it was found in
+        a shell again."""
         def _st():
             if app.xae.dte is None:
                 try:
-                    app.xae.attach()
+                    app.xae.attach(_internal=True)      # the bound solution first, as every other xae_* call (_need)
                 except XaeError as exc:
                     return {"attached": False, "reason": str(exc)}
             return app.xae.status()
@@ -4603,8 +4800,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def proj_resolve_symbol(symbol: str) -> dict[str, Any]:
         """Map an ADS symbol path (MAIN.fbFill.fbValve.bOpen) to the file:line where each hop is
         declared, following variable types through FB/STRUCT definitions. Hops inside a library type
-        (Tc2_Standard.CTU.CV) are completed from the runtime's datatype table when the target is reachable."""
-        res = await app.proj_call(app.proj.resolve_symbol, symbol)
+        (Tc2_Standard.CTU.CV) are completed from the runtime's datatype table when the target is reachable. A first
+        name declared in several PLC projects (MAIN in Plc1 and Plc2) is the one of the PLC project on the connected
+        ADS port (AmsPort in the .tsproj)."""
+        res = await app.proj_call(app.proj.resolve_symbol, symbol, app.ads.port)
         if res.get("resolved_to_library_type"):
             try:
                 info = (await app.ads_call(app.ads.symbol_info, symbol, timeout=30)).to_dict()

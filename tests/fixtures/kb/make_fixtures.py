@@ -79,6 +79,12 @@ PAGES = {
         "<a href='https://www.beckhoff.com/'>Beckhoff</a>, <a href='#top'>top</a>, "
         "<a href='ms-xhelp:///?Id=beckhoff-not-in-package'>gone</a>.</p>"
         + pre("VAR_INPUT\n    WRITE : BOOL;\nEND_VAR")),
+    # N103b: the function header is written as a heading, the code block has the inputs only (as Beckhoff does)
+    "tcplclib_tc2_system/1033/30868043.html": page(
+        "MEMCPY", "beckhoff-memcpy", "Tc2_System (TwinCAT v3.1.0)", ["PLC Lib: Tc2_System", "Memory", "MEMCPY"],
+        "<h1>MEMCPY</h1><p>The function MEMCPY can be used to copy the values of PLC variables from one memory area "
+        "to another.</p><h2>FUNCTION MEMCPY : UDINT</h2>"
+        + pre("VAR_INPUT\n    destAddr : PVOID;\n    srcAddr  : PVOID;\n    n        : UDINT;\nEND_VAR")),
     "tcplclib_tc2_system_ex/1033/40000001.html": page(
         "ADS return codes", "beckhoff-ads-codes", "Tc2_System (TwinCAT v3.1.0)", ["PLC Lib: Tc2_System", "ADS return codes"],
         "<h1>ADS return codes</h1><p>ADSREAD and ADSWRITE report ERRID. 1861 means timeout elapsed.</p>"

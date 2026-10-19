@@ -95,6 +95,18 @@ def test_docs_declaration_never_resolves_an_ambiguous_name(kbdir):
     assert rc == 1 and {n["ref"] for n in r["near"]} == {"tcplclib_tc2_mc2/70094731", "tcplclib_tc3_drivemotioncontrol/8280601227"}
 
 
+def test_n103b_docs_declaration_gives_kind_and_return_type(kbdir):
+    """N103b (0.8.12 retest): docs_declaration had no kind or return type — MEMCPY's page writes 'FUNCTION MEMCPY :
+    UDINT' as a heading, its code block holds the inputs only, so a reader of the skill never saw ': UDINT'. The skill
+    answers with what the index stored for the page (the same as infosys_declaration)."""
+    rc, r = run(kbdir, "docs_declaration", "symbol=MEMCPY")
+    assert rc == 0 and r["kind"] == "Function" and r["return_type"] == "UDINT", r
+    assert r["declaration"].startswith("FUNCTION MEMCPY : UDINT"), r["declaration"]
+    assert r["declaration_blocks"][0].startswith("VAR_INPUT")          # the page's own code blocks, as before
+    rc, r = run(kbdir, "docs_declaration", "symbol=ADSREAD", "book=tcplclib_tc2_system")
+    assert rc == 0 and r["kind"] == "FunctionBlock" and "return_type" not in r
+
+
 def test_docs_page_refs_sections_and_paging(kbdir):
     rc, r = run(kbdir, "docs_page", "ref=tcplclib_tc2_system/30866571", "section=Outputs")
     assert rc == 0 and r["outline"] == ["ADSREAD", "Inputs", "Outputs", "Prerequisites"]
@@ -128,7 +140,7 @@ def test_docs_page_refs_sections_and_paging(kbdir):
 
 def test_docs_books(kbdir):
     rc, r = run(kbdir, "docs_books", "filter=tcplclib_tc2_sys*")
-    assert rc == 0 and r["books"] == [{"book": "tcplclib_tc2_system", "pages": 3}, {"book": "tcplclib_tc2_system_ex", "pages": 1}]
+    assert rc == 0 and r["books"] == [{"book": "tcplclib_tc2_system", "pages": 4}, {"book": "tcplclib_tc2_system_ex", "pages": 1}]
 
 
 def test_manual_commands(kbdir):
@@ -173,7 +185,7 @@ def test_commands_status_help_and_location(kbdir, tmp_path):
     rc, r = run(kbdir, "help")
     assert rc == 0 and set(r["commands"]) >= {"docs_search", "manual_page", "status"} and r["rules"]
     rc, r = run(kbdir, "status")
-    assert rc == 0 and r["infosys"]["pages"] == 8 and r["infosys"]["books"] == 6 and r["manuals"]["manuals"] == 1
+    assert rc == 0 and r["infosys"]["pages"] == 9 and r["infosys"]["books"] == 6 and r["manuals"]["manuals"] == 1
     # no database → no_index naming the build command, in the folder it looked at
     empty = tmp_path / "empty"
     empty.mkdir()

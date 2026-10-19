@@ -46,6 +46,9 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 ## Rules
 1. Documentation → this skill. Live PLC values and types → the ads_* tools.
 2. Symbol known → `docs_declaration`. Unknown → `docs_search` → take a `ref` → `docs_page section=`.
+   `docs_declaration` gives `kind`, `return_type` (function, method, property) and `declaration` with its header
+   as the index parsed them — the same answer as `infosys_declaration`; `declaration_blocks` are the page's own
+   code blocks, which often lack the header (`FUNCTION MEMCPY : UDINT` is a heading on the page).
 3. `ambiguous` = the name is documented by different pages (Tc2_MC2 vs Tc3_DriveMotionControl, or two methods of
    that name in one library). Nothing was chosen for you. Find the library the project uses (`proj_libraries` of the
    twincat server, or ask), call again with `book=` or `ref=`, and say in the answer which library you used. Never

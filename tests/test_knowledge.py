@@ -305,7 +305,7 @@ def test_status_reports_the_offline_documentation_layout(kb, kb_fixture):
     k.set_location(str(loc))
     d = k.status()["docs"]
     assert d["skill"] == "twincat-docs" and str(K.docs_skill_path()) in d["call"] and str(loc) in d["call"]
-    assert d["infosys"]["exists"] and d["infosys"]["pages"] == 8 and d["infosys"]["books"] == 6
+    assert d["infosys"]["exists"] and d["infosys"]["pages"] == 9 and d["infosys"]["books"] == 6
     assert Path(d["infosys"]["package"]).name == "BKINFOSYS3_FIXTURE_EN-US.mshc" and d["infosys"]["lcid"] == "1033"
     assert d["infosys"]["state"] == "complete" and d["infosys"]["format"] == d["infosys"]["format_expected"]
     assert d["infosys"]["links"] == 2 and d["infosys"]["links_resolved"] == 1 and "command" not in d["infosys"]
@@ -478,6 +478,14 @@ def test_builder_copies_become_stubs_once_and_are_reported(kb, tmp_path, monkeyp
     assert "left alone" in d["builders"]["infosys_local.py"]["note"]
     # the user's own script is never offered as the command — the plugin's builder is
     assert str(K.builders_dir() / "infosys_local.py") in d["infosys"]["command"]
+    # N64 polish: the start's upkeep is reported as such, with what it did — an unchanged stub is no action
+    u = d["builder_upkeep"]
+    assert u["at_server_start"] and "state of the files now" in u["note"]
+    assert "manuals_db.py" not in u["tools"] and u["tools"]["infosys_local.py"]["state"] == "left alone"
+    (loc / "tools" / "manuals_db.py").write_text((loc / "tools" / "manuals_db.py").read_text(encoding="utf-8") + "\n# edit\n",
+                                                encoding="utf-8")
+    d = k.docs_layout(loc)                                   # edited after the start: `builders` says so, upkeep unchanged
+    assert d["builders"]["manuals_db.py"]["copy_kind"] == "other" and "manuals_db.py" not in d["builder_upkeep"]["tools"]
 
 
 def test_content_sha_reads_crlf_as_lf_and_nothing_else(tmp_path):

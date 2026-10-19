@@ -359,3 +359,184 @@ def test_n106_the_project_is_what_its_plcproj_compiles(project_dir):
     (loose / "FB_X.TcPOU").write_text(backup.read_text().replace("FB_ValveOld", "FB_X"))
     q = ProjectIndex(ProjectConfig(root=str(loose)))
     assert q.scan()["units"] >= 1 and q.get_unit("FB_X") and "not_in_project" not in q.scan()
+
+
+# ------------------------------------------------------------------ N113 / N114: PLC projects named by the .tsproj
+def _plc(root, name, impl, cycle_us, prog="MAIN"):
+    d = root / name
+    (d / "POUs").mkdir(parents=True)
+    (d / f"{name}.plcproj").write_text('<?xml version="1.0" encoding="utf-8"?><Project><PropertyGroup><Name>'
+                                       f'{name}</Name></PropertyGroup><ItemGroup /></Project>', encoding="utf-8")
+    (d / "POUs" / f"{prog}.TcPOU").write_text(
+        f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="{prog}"><Declaration><![CDATA[PROGRAM {prog}\n'
+        f'VAR\n  n : INT;\nEND_VAR]]></Declaration><Implementation><ST><![CDATA[{impl}]]></ST></Implementation></POU>'
+        '</TcPlcObject>', encoding="utf-8")
+    (d / "PlcTask.TcTTO").write_text(
+        f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><Task Name="PlcTask"><CycleTime>{cycle_us}</CycleTime>'
+        f'<PouCall><Name>{prog}</Name></PouCall></Task></TcPlcObject>', encoding="utf-8")
+    register_sources(d / f"{name}.plcproj")
+    return d
+
+
+def _tsproj(root, *plcs, xti=()):
+    """plcs: (name, port) named inline; xti: (name, port) in _Config\\PLC\\<name>.xti (independent project files)."""
+    inline = "".join(f'<Project GUID="{{0000000{i}-0000-0000-0000-000000000000}}" Name="{n}" '
+                     f'PrjFilePath="{n}\\{n}.plcproj" TmcFilePath="{n}\\{n}.tmc" AmsPort="{port}"/>'
+                     for i, (n, port) in enumerate(plcs))
+    files = "".join(f'<Project File="{n}.xti"/>' for n, _ in xti)
+    for n, port in xti:
+        (root / "_Config" / "PLC").mkdir(parents=True, exist_ok=True)
+        (root / "_Config" / "PLC" / f"{n}.xti").write_text(
+            '<?xml version="1.0"?><TcSmItem ClassName="CNestedPlcProjDef"><Project GUID="{1}" '
+            f'Name="{n}" PrjFilePath="..\\..\\{n}\\{n}.plcproj" AmsPort="{port}"/></TcSmItem>', encoding="utf-8")
+    (root / "Machine.tsproj").write_text(
+        '<?xml version="1.0"?><TcSmProject TcVersion="3.1.4026.14"><Project><System/>'
+        f'<Plc>{inline}{files}</Plc></Project></TcSmProject>', encoding="utf-8")
+
+
+def test_n113_two_plc_projects_with_main_each_keep_their_own_unit(tmp_path):
+    """N113: units were keyed by name only — MAIN of Plc2 replaced MAIN of Plc1, so an edit of one was compared with the
+    other's file. Every file's units are kept; a tree path is looked up in the PLC project it names (the .tsproj)."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    r = p.scan()
+    assert sorted((x["tree_name"], x["ams_port"]) for x in r["plcproj"]) == [("Plc1", 851), ("Plc2", 852)]
+    assert "main" in p.duplicates
+    u1, why1 = p.unit_at_tree_path("TIPC^Plc1^Plc1 Project^POUs^MAIN")
+    u2, why2 = p.unit_at_tree_path("TIPC^Plc2^Plc2 Project^POUs^MAIN")
+    assert why1 is None and why2 is None
+    assert "Plc1" in u1.file and "n + 1" in u1.implementation
+    assert "Plc2" in u2.file and "n + 2" in u2.implementation
+    u, why = p.unit_at_tree_path("TIPC^Plc9^Plc9 Project^POUs^MAIN")
+    assert u is None and "declared in several files" in why and "'Plc9' is not one a .tsproj" in why, why
+    # the pinned lookup finds the pinned file's unit without re-indexing (the name -> unit view holds one of them)
+    assert "n + 1" in p.get_unit("Plc1@MAIN").implementation and "n + 2" in p.get_unit("Plc2@MAIN").implementation
+    with pytest.raises(ProjectError, match="exists in several files"):
+        p.get_unit("MAIN")
+
+
+def test_n114_task_of_main_follows_the_port_to_its_plc_project(tmp_path):
+    """N114: with MAIN in two PLC projects the task check said 'task configuration not available'. The ADS port the
+    recording reads names the PLC project (AmsPort in the .tsproj)."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert [(t["name"], t["cycle_ms"]) for t in p.tasks_of("MAIN", 852)] == [("PlcTask", 2.0)]
+    assert [(t["name"], t["cycle_ms"]) for t in p.tasks_of("MAIN", 851)] == [("PlcTask", 10.0)]
+    assert p.tasks_of("MAIN") is None                       # no port: which MAIN is not known
+    assert p.tasks_of("MAIN", 853) is None                  # a port no .tsproj names: not known either
+
+
+def test_n114_a_plc_project_removed_from_the_tree_is_not_part_of_the_project(tmp_path):
+    """N114 (corrected): after Plc2 was removed from the tree its folder stayed on disk with MAIN.TcPOU; MAIN counted
+    twice and the task check of the ONE remaining PLC said 'task configuration not available'."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert p.tasks_of("MAIN") is None
+    _tsproj(tmp_path, ("Plc1", 851))                        # Plc2 removed from the tree: only the .tsproj changes
+    p.REFRESH_MIN_S = 0
+    p.refresh()
+    assert p.duplicates == {}, p.duplicates
+    assert [x["file"] for x in p.plcproj] == [str(tmp_path / "Plc1" / "Plc1.plcproj")]
+    assert [x["file"] for x in p.plcproj_not_in_project] == [str(tmp_path / "Plc2" / "Plc2.plcproj")]
+    assert str(tmp_path / "Plc2" / "POUs" / "MAIN.TcPOU") in p.not_in_project
+    assert [(t["name"], t["cycle_ms"]) for t in p.tasks_of("MAIN")] == [("PlcTask", 10.0)]
+    assert [t["cycle_ms"] for t in p.task_config().values()] == [10.0]    # Plc2's task is no task of the project
+    note = p.outside_note()
+    assert note["plcproj_not_in_project"][0]["why"].startswith("no .tsproj under the root names this PLC project")
+
+
+def test_n114_independent_project_files_name_the_plc_projects(tmp_path):
+    """The .tsproj may keep a PLC project in an independent file (<Project File="Plc1.xti"/>, _Config\\PLC\\Plc1.xti,
+    PrjFilePath relative to the .xti)."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Old", "n := n + 2;", 2000)
+    _tsproj(tmp_path, xti=[("Plc1", 851)])
+    p = idx(tmp_path)
+    assert [(x["tree_name"], x["ams_port"]) for x in p.plcproj] == [("Plc1", 851)]
+    assert p.plc_project(port=851) == str(tmp_path / "Plc1" / "Plc1.plcproj")
+    assert [x["file"] for x in p.plcproj_not_in_project] == [str(tmp_path / "Old" / "Old.plcproj")]
+
+
+def test_n114_unknown_tsproj_contents_keep_every_plc_project(tmp_path):
+    """A .tsproj that names no .plcproj that exists (another format, a broken path) cannot tell which PLC projects
+    belong to the project: every .plcproj counts and the scan says why — nothing is dropped on a guess."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    (tmp_path / "Machine.tsproj").write_text('<?xml version="1.0"?><TcSmProject><Project><Plc><Project Name="X" '
+                                             'PrjFilePath="Gone\\Gone.plcproj" AmsPort="851"/></Plc></Project>'
+                                             '</TcSmProject>', encoding="utf-8")
+    p = idx(tmp_path)
+    r = p.scan()
+    assert len(p.plcproj) == 1 and p.plcproj_not_in_project == []
+    assert "every .plcproj counts" in r["plc_projects_note"]
+    assert r["plc_projects_not_found"][0]["name"] == "X" and "does not exist" in r["plc_projects_not_found"][0]["why"]
+    (tmp_path / "Machine.tsproj").write_text("<TcSmProject><Plc>", encoding="utf-8")       # unreadable
+    r = p.scan()
+    assert len(p.plcproj) == 1 and "cannot be read" in r["plc_projects_note"]
+
+
+def _plc_with_action(root, name, impl, cycle_us, var_type="INT"):
+    d = _plc(root, name, impl, cycle_us)
+    main = d / "POUs" / "MAIN.TcPOU"
+    main.write_text(main.read_text(encoding="utf-8").replace(
+        "  n : INT;", f"  n : INT;\n  x : {var_type};").replace(
+        "</POU>", f'<Action Name="Act"><Implementation><ST><![CDATA[n := 0; // {name}]]></ST></Implementation></Action></POU>'),
+        encoding="utf-8")
+    return d
+
+
+def test_n113_review_readers_never_pick_one_of_two_silently(tmp_path):
+    """Review of N113: lookups were per PLC project, but lists, searches, symbol resolution and sub-items still read the
+    name -> unit view, where MAIN of one PLC project hides the other's. Lists and searches show both; resolution is
+    done in the PLC project of the ADS port; an ambiguous name (MAIN.Act, 'Act') is refused, for writes too."""
+    for n, port in (("Plc1", 851), ("Plc2", 852)):
+        d = _plc_with_action(tmp_path, n, "n := n + 1;", 10000, var_type=f"ST_{n}")
+        (d / "DUTs").mkdir()
+        (d / "DUTs" / f"ST_{n}.TcDUT").write_text(
+            f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><DUT Name="ST_{n}"><Declaration><![CDATA[TYPE ST_{n} :\n'
+            f'STRUCT\n  v{n} : INT;\nEND_STRUCT\nEND_TYPE]]></Declaration></DUT></TcPlcObject>', encoding="utf-8")
+        register_sources(d / f"{n}.plcproj")
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert "main.act" in p.duplicates
+    assert len(p.list_units("PROGRAM")["units"]) == 2
+    assert {h["file"] for h in p.search(r"// Plc")["hits"]} == {str(tmp_path / n / "POUs" / "MAIN.TcPOU") for n in ("Plc1", "Plc2")}
+    with pytest.raises(ProjectError, match="exists in several files"):
+        p.get_unit("MAIN.Act")
+    with pytest.raises(ProjectError, match="matches 2 objects"):
+        p.get_unit("Act")
+    assert "Plc2" in p.get_unit("Plc2@MAIN.Act").implementation
+    # resolution in the PLC project of the ADS port
+    r = p.resolve_symbol("MAIN.x.vPlc2", 852)
+    assert r["resolved"] and r["hops"][1]["type"] == "ST_Plc2" and r["hops"][2]["declared_in"] == "ST_Plc2", r
+    assert p.resolve_symbol("MAIN.x.vPlc1", 851)["resolved"]
+    with pytest.raises(ProjectError, match="several PLC projects .* no ADS port was given"):
+        p.resolve_symbol("MAIN.x")
+    v = p.variables(port=852)
+    assert {it["path"] for it in v["items"]} == {"MAIN.n", "MAIN.x.vPlc2"} and "note" not in v
+    v = p.variables()
+    assert {"MAIN.x.vPlc1", "MAIN.x.vPlc2"} <= {it["path"] for it in v["items"]} and "several PLC projects" in v["note"]
+    assert v["ambiguous_roots"] == ["MAIN"]
+    # the file -> PLC project memo is dropped with a new published index
+    c1 = p._cache()
+    p.scan()
+    assert p._cache() is not c1
+
+
+def test_n113_review_an_unresolved_tsproj_reference_keeps_every_plc_project(tmp_path):
+    """Review: Plc1 resolved and Plc2's .xti missing — Plc2.plcproj on disk may be the one the .tsproj names; it was
+    dropped as 'removed from the tree'. Every .plcproj counts, and the scan says which reference was not found."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _tsproj(tmp_path, ("Plc1", 851))
+    ts = (tmp_path / "Machine.tsproj").read_text(encoding="utf-8").replace("</Plc>", '<Project File="Plc2.xti"/></Plc>')
+    (tmp_path / "Machine.tsproj").write_text(ts, encoding="utf-8")
+    p = idx(tmp_path)
+    r = p.scan()
+    assert len(p.plcproj) == 2 and p.plcproj_not_in_project == []
+    assert "could not be found" in r["plc_projects_note"] and r["plc_projects_not_found"][0]["unresolved"] is True

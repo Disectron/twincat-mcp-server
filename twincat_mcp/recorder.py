@@ -764,14 +764,34 @@ class Recording:
     def stalled_now(self) -> int:
         return self.stalled_samples + (self._stall_rep if self._stall_open else 0)
 
-    def label_reason(self) -> str | None:
+    def label_reason(self, miss: int | None = None) -> str | None:
+        """Every cause of an INCOMPLETE label, in the conditions of label() (D11/D13 polish: only the STOP was named —
+        a RUN→CONFIG→RUN gap counted against the label but was said only in `errors`)."""
         parts = []
         if self.stall_list:
             spans = ", ".join(f"{a:.4f}-{b:.4f} ms" for a, b in self.stall_list[:5])     # same text as the native engine
-            parts.append(f"PLC stopped (cycle counter frozen) {spans}")
+            more = f" (+{self.stalls - 5} more)" if self.stalls > 5 else ""
+            parts.append(f"PLC stopped (cycle counter frozen) {spans}{more}")
+        if self._stall_open and self._stall_adv_t is not None:
+            parts.append(f"PLC stopped (cycle counter frozen) since {self._stall_adv_t:.4f} ms")
         if self.poll_refused:
             parts.append("reads refused by the runtime, those samples are missing: " + ", ".join(
                 f"{n} ×{v['count']} ({v['first_error']})" for n, v in list(self.poll_refused.items())[:5]))
+        if self.mode == "cycle":
+            miss = self.missing_samples() if miss is None else miss
+            if self.samples == 0:
+                parts.append("no sample recorded")
+            if miss and not self.poll_refused:
+                parts.append(f"{miss} sample(s) missing from the PLC timeline (gap markers in the file)")
+            if self.dropped or self.dropped_on_stop:
+                parts.append(f"{self.dropped + self.dropped_on_stop} sample(s) dropped (queue overflow / at the stop)")
+            if self.unsubscribed:
+                parts.append(f"{len(self.unsubscribed)} variable(s) not subscribed")
+            if self.start_when is not None and self.triggered_at is None:
+                parts.append("start_when never fired")
+            ub = unprovable_blocks(self.timeline_blocks(), self.fallback_period()) if self.samples else []
+            if ub:
+                parts.append(f"block(s) {ub[:10]} cannot be proven complete (no sample, or one without a period)")
         return "; ".join(parts) or None
 
     def silent_missing_estimate(self) -> float:
@@ -1445,8 +1465,9 @@ class Recording:
                           "max_delay_ms": self.max_delay_ms,
                           "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "lines": self._lines,
                           "sha256": digest}
-                if self.label_reason():
-                    footer["label_reason"] = self.label_reason()
+                why = self.label_reason(miss)
+                if why and footer["label"] != "COMPLETE":
+                    footer["label_reason"] = why
                 late = sum(b.late for b in self.blocks)
                 if late:
                     footer["late_samples"] = late          # written after a later stamp of another block (see _horizon)
@@ -1622,8 +1643,9 @@ class Recording:
             st["completeness_estimated"] = True
         if self._stall_open and self._stall_adv_t is not None:
             st["stalled_since_ms"] = round(self._stall_adv_t, 4)
-        if self.label_reason():
-            st["label_reason"] = self.label_reason()
+        why = self.label_reason()
+        if why and not st["label"].startswith("COMPLETE"):
+            st["label_reason"] = why
         st.update(self.stop_and_trigger_notes())
         if self.unsubscribed:
             st["unsubscribed_symbols"] = self.unsubscribed[:50]
@@ -2357,9 +2379,9 @@ class Recorder:
             st["warning"] = " | ".join(warns)
         return st
 
-    # set by the server from the project index: name of a program → the tasks that run it ([] = no program, e.g. a
-    # GVL; None = the project has no task configuration). N62.
-    task_of: Callable[[str], list[dict[str, Any]] | None] | None = None
+    # set by the server from the project index: (name of a program, ADS port it is read from) → the tasks that run it
+    # ([] = no program, e.g. a GVL; None = the project cannot tell). N62; N114: the port picks the PLC project.
+    task_of: Callable[[str, int | None], list[dict[str, Any]] | None] | None = None
 
     def _task_check(self, rec: Any, syms: list[SymbolEntry], cycle_ms: float) -> dict[str, Any]:
         man = (getattr(rec, "meta", None) or {}).get("manifest") or {}
@@ -2367,6 +2389,7 @@ class Recorder:
               for t in (man.get("tasks") if isinstance(man.get("tasks"), list) else [])
               if isinstance(t, dict) and isinstance(t.get("cycle_time_ms"), (int, float)) and t["cycle_time_ms"] > 0}
         fastest = min(rt.values()) if rt else None
+        port = (getattr(rec, "meta", None) or {}).get("port")
         checked: dict[str, Any] = {}
         below: list[dict[str, Any]] = []
         roots = sorted({x.name.split(".", 1)[0] for x in syms if not _is_system_root(x.name)})
@@ -2374,7 +2397,7 @@ class Recorder:
             owners = None
             if self.task_of is not None:
                 try:
-                    owners = self.task_of(r)
+                    owners = self.task_of(r, port if isinstance(port, int) else None)
                 except Exception:  # noqa: BLE001 — no project: the fastest task is the comparison
                     owners = None
             if owners:

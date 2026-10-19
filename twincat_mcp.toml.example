@@ -39,6 +39,7 @@ also_scope = "ask"                 # rec_start + a TwinCAT Scope configuration o
 # export_tool = 'C:\Program Files (x86)\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\TC3ScopeExportTool.exe'
 # export_dir = 'D:\Recordings\scope'   # default: <recordings>\scope
 # project = "Scope_Counter"          # the Scope configuration rec_start(also_scope=true) records; default: the only one open
+# view_log = 'C:\ProgramData\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\TcScopeView.log'   # (the default) new ERROR lines are reported
 
 [server]
 tool_groups = ["ads", "rec", "snap", "test", "proj", "xae", "infosys", "wf", "scope"]   # only these groups (tc_* always); remove the line for all

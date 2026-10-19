@@ -578,7 +578,7 @@ def call_graph(idx: ProjectIndex, root: str, depth: int = 4) -> dict[str, Any]:
         # FB instances (by declared type) that are actually invoked
         scalar = set(DEFAULT_PREFIXES) | {"BOOL", "STRING", "WSTRING", "TIME", "LTIME", "DATE", "DT", "TOD"}
         for v in u.vars:
-            tu = idx._unit_for_type(v.type)
+            tu = idx._unit_for_type(v.type, near=u)
             called = re.search(rf"\b{re.escape(v.name)}\s*\(", impl) is not None
             if tu and tu.kind in ("FUNCTION_BLOCK", "PROGRAM") and re.search(rf"\b{re.escape(v.name)}\b", impl):
                 visit(tu, lvl + 1, f"{u.name}.{v.name}")
