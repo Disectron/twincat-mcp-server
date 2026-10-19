@@ -2611,8 +2611,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         file, no Python on the data path), 'python' = the in-process recorder, None = recorder.engine from the config
         (default 'auto': native when installed). The response says which engine ran and why. After stopping: rec_verify.
         also_scope: also run the TwinCAT Scope configuration open in XAE (scope = its name when several are open) —
-        StartRecord now; at rec_stop StopRecord, SaveSVD and ExportCSV into <recordings>/scope/<id>.svdx / .scope.csv
-        with a signed link file. What Scope records (channels, sample time) is set in that configuration. With
+        StartRecord now; at rec_stop StopRecord and SaveSVD into <recordings>/scope/<id>.svdx, the CSV <id>.scope.csv
+        exported from that file with Beckhoff's export tool (XAE's ExportCSV only without it, flagged), a signed link
+        file, and the Scope View log's new ERROR lines (scope_view_log). What Scope records (channels, sample time) is set in that configuration. With
         recorder.also_scope = 'ask' (default) and a Scope configuration open, leaving also_scope unset asks the user
         (prompt, or an error that tells you to ask and call again with true/false)."""
         # R6: arguments that can never work are refused here, before the call queues behind a long job on the worker
@@ -2668,46 +2669,104 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                         f"(scope=<name> if several) or also_scope=false. Nothing was started. "
                         f"([recorder] also_scope = 'always' / 'never' makes this permanent.)")
 
+    def _view_log() -> Path:
+        from . import scope as S
+        return S.view_log_path(app.cfg.scope.view_log)
+
     async def _scope_start(rid: str, name: str) -> dict[str, Any]:
+        from . import scope as S
+        mark = await asyncio.to_thread(S.log_mark, _view_log())
         try:
             r = await app.xae_call(app.xae.scope_action, "start", name or None, timeout=60)
         except ToolError as exc:
             return {"error": f"Scope recording NOT started: {exc}. The ADS recording {rid} runs regardless."}
         app.scope_runs[rid] = {"scope": r["scope"], "name": name or None, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
-                               "start_result": r.get("result_code")}
+                               "start_result": r.get("result_code"), "log_mark": mark}
         app.audit("scope_start", {"id": rid, "scope": r["scope"]}, OpClass.EDIT, "ok")
         return {"started": True, **r, "note": "Scope records independently (its own ADS acquisition and timestamps); "
                                               "it is stopped, saved and exported at rec_stop"}
 
+    async def _scope_save(name: str | None, svdx: Path, csv: Path, overwrite: bool = False) -> dict[str, Any]:
+        """SaveSVD, then the CSV FROM THE SAVED FILE with Beckhoff's export tool (N117: XAE's ExportCSV right after
+        SaveSVD wrote a CSV that lacked the end of the .svdx — 600 ms, and 3 rows of a 58 s recording; exported from the
+        .svdx, the CSV holds what the file holds). XAE's ExportCSV only when the tool is missing or fails, flagged."""
+        from . import scope as S
+        out: dict[str, Any] = {}
+        try:
+            r = await app.xae_call(app.xae.scope_action, "save_svd", name, str(svdx), timeout=600)
+            out["save_svd"] = {k: r[k] for k in ("result_code", "path", "warning", "result_note") if k in r}
+        except ToolError as exc:
+            out["save_svd"] = {"error": str(exc)}
+            return out
+        settle = await asyncio.to_thread(_settled, svdx)
+        if settle:
+            out["save_svd"]["settled"] = settle
+        tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
+        failed = None
+        if tool is not None:
+            try:
+                e = await asyncio.to_thread(S.export, svdx, csv, tool=tool, overwrite=overwrite, key=app.rec.key,
+                                            version=__version__)
+                out["export_csv"] = {"path": e["file"], "via": "TC3ScopeExportTool.exe from the saved .svdx",
+                                     "lines": e["lines"], "provenance": e["provenance"]}
+                return out
+            except S.ScopeError as exc:
+                failed = str(exc)
+        try:
+            r = await app.xae_call(app.xae.scope_action, "export_csv", name, str(csv), timeout=600)
+            out["export_csv"] = {**{k: r[k] for k in ("result_code", "path", "warning", "result_note") if k in r},
+                                 "via": "XAE ExportCSV",
+                                 "check": ("XAE's ExportCSV wrote a CSV shorter than the .svdx in the 0.8.12 retest "
+                                           "(N117) — compare with scope_export of the .svdx")}
+        except ToolError as exc:
+            out["export_csv"] = {"error": str(exc)}
+        out["export_csv"]["export_tool"] = failed or ("TC3ScopeExportTool.exe not found — "
+                                                      + S.status(app.cfg.scope.export_tool)["note"])
+        return out
+
+    def _settled(p: Path, quiet_s: float = 0.5, limit_s: float = 15.0) -> dict[str, Any] | None:
+        """Whether SaveSVD's file is still being written after the call returned (not documented either way): its size
+        watched until unchanged for quiet_s. None when it was final at once; else how long it grew (or still grew)."""
+        t0 = time.monotonic()
+        try:
+            last = p.stat().st_size
+        except OSError:
+            return None
+        grew = False
+        while True:
+            time.sleep(quiet_s)
+            try:
+                now = p.stat().st_size
+            except OSError:
+                return {"note": "the saved file disappeared while it was watched"}
+            if now == last:
+                return {"grew_for_s": round(time.monotonic() - t0 - quiet_s, 2), "bytes": now} if grew else None
+            grew, last = True, now
+            if time.monotonic() - t0 > limit_s:
+                return {"still_growing_after_s": round(limit_s, 1), "bytes": now,
+                        "warning": "the .svdx was still being written — the CSV may lack its end"}
+
     async def _scope_finish(rid: str) -> dict[str, Any] | None:
+        from . import scope as S
         run = app.scope_runs.pop(rid, None)
         if run is None:
             return None
         d = _scope_dir()
         svdx, csv = d / f"{rid}.svdx", d / f"{rid}.scope.csv"
         out: dict[str, Any] = {"scope": run["scope"]}
-        steps = (("stop", None), ("save_svd", str(svdx)), ("export_csv", str(csv)))
-        for action, path in steps:
-            try:
-                r = await app.xae_call(app.xae.scope_action, action, run["name"], path, timeout=600)
-                out[action] = {k: r[k] for k in ("result_code", "path", "warning") if k in r}
-            except ToolError as exc:
-                out[action] = {"error": str(exc)}
-                if action == "stop":
-                    out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
-                    return out
-        if svdx.is_file() and not csv.is_file():
-            # the export tool from the saved file instead (same CSV writer, no XAE needed)
-            from . import scope as S
-            tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
-            if tool is not None:
-                try:
-                    await asyncio.to_thread(S.export, svdx, csv, tool=tool, key=app.rec.key, version=__version__)
-                    out["export_csv"] = {"path": str(csv), "via": "TC3ScopeExportTool.exe"}
-                except S.ScopeError as exc:
-                    out["export_csv"] = {"error": str(exc)}
-        out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv)
-        app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")}, OpClass.EDIT, "ok")
+        try:
+            r = await app.xae_call(app.xae.scope_action, "stop", run["name"], None, timeout=600)
+            out["stop"] = {k: r[k] for k in ("result_code", "warning", "result_note") if k in r}
+        except ToolError as exc:
+            out["stop"] = {"error": str(exc)}
+            out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
+        else:
+            out.update(await _scope_save(run["name"], svdx, csv))
+            out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv)
+            app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
+                      OpClass.EDIT, "ok")
+        if run.get("log_mark"):
+            out["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, run["log_mark"])
         return out
 
     def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path) -> dict[str, Any]:
@@ -3126,7 +3185,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (command line `"svd=<file>" target=<csv> silent`; CSV needs no extra licence). Default target:
         <recordings>/scope/<name>.csv ([scope] export_dir). The CSV is Beckhoff's output, unchanged — channels, time
         column and alignment of channels with different sample times follow the Scope project's export settings. A
-        signed <csv>.provenance.json records the source file and SHA-256, the tool and its SHA-256, and the command."""
+        signed <csv>.provenance.json records the source file and SHA-256, the tool and its SHA-256, and the command.
+        A read-only source (rec_stop seals its .svdx) is exported from a byte-identical writable copy. scope_view_log:
+        the ERROR lines the Scope View log (TcScopeView.log) got during the export."""
         from . import scope as S
         tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
         if tool is None:
@@ -3135,7 +3196,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         out = app.out_path(target, overwrite, "scope export") if target else _scope_dir() / (src.stem + ".csv")
         try:
             res = await asyncio.to_thread(S.export, src, out, tool=tool, overwrite=overwrite, key=app.rec.key,
-                                          version=__version__)
+                                          version=__version__, view_log=_view_log())
         except S.ScopeError as exc:
             raise ToolError(str(exc)) from exc
         app.audit("scope_export", {"svd": str(src), "target": str(out), "sha256": res["export_sha256"]}, OpClass.EDIT, "ok")
@@ -3150,18 +3211,20 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def scope_record(action: str, scope: str | None = None, path: str | None = None) -> dict[str, Any]:
         """Drive a Scope configuration open in XAE (Automation Interface IMeasurementScope): action = start | stop |
-        save (SaveSVD + ExportCSV → <recordings>/scope/<scope>-<time>.svdx/.csv, or path=<file>.svdx). scope = its
-        name when several are open. Affects only the Scope recording, not the PLC."""
+        save (SaveSVD → <recordings>/scope/<scope>-<time>.svdx, or path=<file>.svdx; the .csv exported from that file
+        with Beckhoff's export tool — XAE's ExportCSV only without it, flagged; the Scope View log's new ERROR lines).
+        scope = its name when several are open. Affects only the Scope recording, not the PLC."""
         if action in ("start", "stop"):
             r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
         elif action == "save":
+            from . import scope as S
             base = app.out_path(str(Path(path).with_suffix(".svdx")), False, "scope file").with_suffix("") if path else _scope_dir() / (
                 re.sub(r"[^\w.-]+", "_", scope or "scope") + "-" + time.strftime("%Y%m%d-%H%M%S"))
-            r = {"save_svd": await app.xae_call(app.xae.scope_action, "save_svd", scope, str(base) + ".svdx", timeout=600)}
-            try:
-                r["export_csv"] = await app.xae_call(app.xae.scope_action, "export_csv", scope, str(base) + ".csv", timeout=600)
-            except ToolError as exc:
-                r["export_csv"] = {"error": str(exc), "hint": "scope_export(svd=…) runs Beckhoff's export tool on the saved file"}
+            mark = await asyncio.to_thread(S.log_mark, _view_log())
+            r = await _scope_save(scope, Path(str(base) + ".svdx"), Path(str(base) + ".csv"))
+            if "error" in r["save_svd"]:
+                raise ToolError(f"Scope save: {r['save_svd']['error']}")
+            r["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, mark)
         else:
             raise ToolError("action must be start | stop | save")
         app.audit("scope_record", {"action": action, "scope": scope, "path": path}, OpClass.EDIT, "ok")

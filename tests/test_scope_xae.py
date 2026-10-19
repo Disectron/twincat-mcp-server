@@ -104,6 +104,42 @@ async def test_also_scope_records_saves_exports_and_links(monkeypatch, project_d
 
 
 @pytest.mark.anyio
+async def test_n117_rec_stop_exports_the_csv_from_the_saved_svdx(monkeypatch, project_dir, fake_xae, tmp_path):
+    """N117 (0.8.12 retest): the CSV XAE's ExportCSV wrote right after SaveSVD lacked the end of the .svdx (the last
+    600 ms; 3 rows of 58 s). With the export tool installed the CSV is exported from the saved .svdx — it holds what
+    the file holds — and XAE's ExportCSV is not called. The Scope View log's new errors come with the result."""
+    from tests.test_scope import FAKE
+    import sys
+    d = tmp_path / "TE130X-Scope-View"
+    d.mkdir()
+    (d / "fake_export.py").write_text(FAKE)
+    exe = d / ("TC3ScopeExportTool.cmd" if os.name == "nt" else "TC3ScopeExportTool.exe")
+    exe.write_text(f'@"{sys.executable}" "{d / "fake_export.py"}" %*\r\n' if os.name == "nt" else
+                   f'#!/bin/sh\nexec "{sys.executable}" "{d / "fake_export.py"}" "$@"\n')
+    exe.chmod(0o755)
+    log = tmp_path / "TcScopeView.log"
+    log.write_text("2026-10-18 06:18:00 [ERROR] old\n", encoding="utf-8")
+    monkeypatch.setenv("TCMCP_FAKE_SCOPE_LOG", str(log))
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    cfg.scope.export_tool, cfg.scope.view_log = str(exe), str(log)
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+        assert fake_xae.calls == ["start", "stop", "save"]                      # no ExportCSV in XAE
+        sc = out["scope"]
+        assert sc["export_csv"]["via"] == "TC3ScopeExportTool.exe from the saved .svdx" and sc["export_csv"]["lines"] == 5
+        assert Path(sc["export_csv"]["path"]).name == f"{r['id']}.scope.csv"
+        assert [e.endswith("Ads-Error 0xA2 (162)") for e in sc["scope_view_log"]["errors"]] == [True]   # not the old one
+        # without the tool: XAE's ExportCSV, flagged
+        cfg.scope.export_tool = str(tmp_path / "missing.exe")
+        sv = payload(await s.call_tool("scope_record", {"action": "save"}))
+        assert sv["export_csv"]["via"] == "XAE ExportCSV" and "N117" in sv["export_csv"]["check"]
+        assert "not found" in sv["export_csv"]["export_tool"] and fake_xae.calls[-2:] == ["save", "csv"]
+
+
+@pytest.mark.anyio
 async def test_never_policy_refuses_and_record_tool(monkeypatch, project_dir, fake_xae):
     install(monkeypatch)
     cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)

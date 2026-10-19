@@ -163,6 +163,9 @@ class ScopeConfig:
     export_dir: str | None = None
     # the Scope configuration rec_start records alongside (name in the XAE solution); None = the only one open
     project: str | None = None
+    # the Scope View's log, read for new errors by rec_stop(also_scope) / scope_record / scope_export; None =
+    # %ProgramData%\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\TcScopeView.log
+    view_log: str | None = None
 
 
 @dataclass
