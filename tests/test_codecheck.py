@@ -112,6 +112,8 @@ def test_d39_scaffold_uses_enum_members_and_names_failing_stubs(idx, project_dir
         "    <Declaration><![CDATA[{attribute 'qualified_only'}\n{attribute 'strict'}\nTYPE E_Command :\n(\n"
         "\tNone := 0,   // nothing\n\tStart,\n\tStop\n) UINT;\nEND_TYPE\n]]></Declaration>\n  </DUT>\n</TcPlcObject>\n",
         encoding="utf-8")
+    from tests.conftest import register_sources
+    register_sources(project_dir / "Plc" / "Plc.plcproj")
     pou = Path(idx.get_unit("FB_Fill").file)
     pou.write_text(pou.read_text().replace("\tbEnable", "\teCmd      : E_Command;\n\teOther    : E_Lib;\n\tbEnable", 1))
     idx.refresh()

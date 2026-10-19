@@ -758,19 +758,25 @@ _METHOD_TMPL = """    <Method Name="{name}" Id="{{{guid}}}">
 """
 
 
+def scaffold_dest(idx: ProjectIndex, fb_name: str, out_dir: str | None = None) -> Path:
+    """The file tcunit_scaffold writes: <out_dir or the FB's folder\\Tests>\\<FB>_Tests.TcPOU."""
+    iface = fb_interface(idx, fb_name)
+    if iface["kind"] != "FUNCTION_BLOCK":
+        raise ProjectError(f"{fb_name} is a {iface['kind']}, scaffold targets function blocks")
+    dest_dir = Path(out_dir) if out_dir else Path(iface["file"]).parent / "Tests"
+    return dest_dir / f"{iface['name']}_Tests.TcPOU"
+
+
 def tcunit_scaffold(idx: ProjectIndex, fb_name: str, out_dir: str | None = None,
                     add_to_plcproj: bool = True, overwrite: bool = False) -> dict[str, Any]:
     """Generate FB_<fb>_Tests.TcPOU (TcUnit.FB_TestSuite) with one test method per
     public method plus an initial-state test, and register it in the .plcproj."""
     iface = fb_interface(idx, fb_name)
-    if iface["kind"] != "FUNCTION_BLOCK":
-        raise ProjectError(f"{fb_name} is a {iface['kind']}, scaffold targets function blocks")
     fb = iface["name"]
     suite = f"{fb}_Tests"
     src = Path(iface["file"])
-    dest_dir = Path(out_dir) if out_dir else src.parent / "Tests"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{suite}.TcPOU"
+    dest = scaffold_dest(idx, fb_name, out_dir)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and not overwrite:
         raise ProjectError(f"{dest} exists; pass overwrite=true")
     tests: list[tuple[str, str, str]] = []

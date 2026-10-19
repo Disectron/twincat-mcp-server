@@ -3342,15 +3342,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         .plcproj. Assertions are left as TODO stubs."""
         if out_dir:
             out_dir = str(app.out_path(out_dir, what="scaffold folder", is_dir=True))       # R4
-        touches_project = add_to_plcproj or out_dir is None
-        if not touches_project and app.proj.root is not None:
-            try:
-                touches_project = Path(app.proj.root).resolve() in Path(out_dir).resolve().parents or \
-                    Path(out_dir).resolve() == Path(app.proj.root).resolve()
-            except OSError:
-                touches_project = True
-        # N12: a scaffold written outside the project (and not registered in the .plcproj) is not a code edit of the
-        # PLC project, so edit_requires_config_mode does not apply to it
+        # N12 / N109: the PLC project is what its .plcproj compiles (N106). A scaffold it does not compile — not
+        # registered (add_to_plcproj=false), and not over a file the project compiles — is no code edit of the
+        # PLC project, wherever it is written, so edit_requires_config_mode does not apply to it. (N109: an out_dir
+        # under the project root but outside every PLC project was refused in RUN.)
+        dest = await app.proj_call(codecheck.scaffold_dest, app.proj, fb_name, out_dir)
+        touches_project = add_to_plcproj or (Path(dest).exists() and await app.proj_call(app.proj.is_member, dest))
         await app.permit(None, OpClass.EDIT, "tcunit_scaffold" if touches_project else "tcunit_scaffold_external", fb_name)
         res = await app.confirmed("tcunit_scaffold", {"fb": fb_name}, OpClass.EDIT, app.proj_call(codecheck.tcunit_scaffold, app.proj, fb_name, out_dir, add_to_plcproj, overwrite))
         return res

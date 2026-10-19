@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import register_sources
+
 from twincat_mcp.config import ProjectConfig
 from twincat_mcp.project_backend import ProjectIndex
 from twincat_mcp import codecheck
@@ -120,6 +122,7 @@ def oop_dir(tmp_path: Path) -> Path:
     (d / "MAIN.TcPOU").write_text(_pou(
         "MAIN", "PROGRAM MAIN", "fbGood();",
         decl_vars="VAR\n\tfbBase : FB_Base;\n\tpBase : POINTER TO FB_Base;\n\tfbGood : FB_Good;\n\taBases : ARRAY[0..1] OF FB_Base;\nEND_VAR"))
+    register_sources(tmp_path / "oop" / "Plc" / "Plc.plcproj")         # N106: the project is what the .plcproj compiles
     return tmp_path / "oop"
 
 
@@ -212,6 +215,7 @@ def test_round2_interface_dispatch_inheritance_scaffold(oop_dir):
         "FB_Counter", "FUNCTION_BLOCK FB_Counter EXTENDS FB_Hooked", ";",
         decl_vars="VAR_OUTPUT\n\tnCount : INT;\nEND_VAR",
         members=_method("OnRunning", "METHOD PROTECTED OnRunning", "nCount := nCount + 1;")).replace("3.1.4024.12", "3.1.4026.12"))
+    register_sources(oop_dir / "Plc" / "Plc.plcproj")
     idx = ProjectIndex(ProjectConfig(root=str(oop_dir)))
     idx.scan()
     g = codecheck.call_graph(idx, "FB_Machine", 4)

@@ -1115,7 +1115,8 @@ def _tree_stamp(root: Path) -> str:
     import hashlib
     h = hashlib.sha256()
     for f in sorted(root.rglob("*")):
-        if f.suffix.lower() in (".tcpou", ".tcdut", ".tcgvl", ".tcio") and f.is_file():
+        # N106: a .plcproj decides which source files are units — a change of it changes the index
+        if f.suffix.lower() in (".tcpou", ".tcdut", ".tcgvl", ".tcio", ".plcproj") and f.is_file():
             st = f.stat()
             h.update(f"{f}:{st.st_size}:{st.st_mtime_ns}\n".encode())
     return h.hexdigest()

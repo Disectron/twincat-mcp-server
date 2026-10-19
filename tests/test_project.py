@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import register_sources
+
 from twincat_mcp.config import ProjectConfig
 from twincat_mcp.project_backend import ProjectIndex, ProjectError, parse_tcunit_xml, parse_vars
 
@@ -174,6 +176,7 @@ def test_incremental_refresh_and_git_changes(project_dir):
     f.write_text(f.read_text().replace("tOpened : TIME;", "tOpened : TIME;\n\ttClosed : TIME;"))
     new = project_dir / "Plc" / "POUs" / "FB_New.TcPOU"
     new.write_text((project_dir / "Plc" / "POUs" / "FB_Valve.TcPOU").read_text().replace('Name="FB_Valve"', 'Name="FB_New"').replace("FUNCTION_BLOCK FB_Valve", "FUNCTION_BLOCK FB_New"))
+    register_sources(project_dir / "Plc" / "Plc.plcproj")              # N106: added to the project, as XAE does
     (project_dir / "Plc" / "DUTs" / "ST_Recipe.TcDUT").unlink()
     r = p.refresh()
     assert f.as_posix() in [Path(x).as_posix() for x in r["changed"]] and len(r["added"]) == 1 and len(r["removed"]) == 1
@@ -188,6 +191,7 @@ def test_incremental_refresh_and_git_changes(project_dir):
     assert p.changed_units()["units"] == []
     (project_dir / "Plc" / "POUs" / "MAIN.TcPOU").write_text((project_dir / "Plc" / "POUs" / "MAIN.TcPOU").read_text().replace("nCycle + 1", "nCycle + 2"))
     (project_dir / "Plc" / "POUs" / "FB_Extra.TcPOU").write_text(new.read_text().replace("FB_New", "FB_Extra"))
+    register_sources(project_dir / "Plc" / "Plc.plcproj")
     p.refresh()
     ch = p.changed_units()
     st = {u["name"]: u["status"] for u in ch["units"]}
@@ -301,6 +305,8 @@ def test_n92_review_strings_projects_and_duplicates(tmp_path, project_dir):
     (two / "Plc2.plcproj").write_text((plc / "Plc.plcproj").read_text(encoding="utf-8"), encoding="utf-8")
     _obj(two / "POUs" / "MAIN2.TcPOU", "POU", "MAIN2", "PROGRAM MAIN2\nVAR\n\tn : INT;\nEND_VAR\n", "n := n + 1;")
     _obj(two / "GVLs" / "GVL_Two.TcGVL", "GVL", "GVL_Two", "VAR_GLOBAL\n\tnX : INT;\nEND_VAR\n")
+    register_sources(plc / "Plc.plcproj")
+    register_sources(two / "Plc2.plcproj")
     idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
     assert st_strip("a := '//x'; // c\nb := '(*'; (* ' *) c") == "a := '//x';  \nb := '(*';   c"
     assert st_strip("s := 'it''s'; t := '$'x'", blank_strings=True) == "s := ''''; t := ''"
@@ -318,6 +324,38 @@ def test_n92_review_strings_projects_and_duplicates(tmp_path, project_dir):
     assert [m["root"] for m in r3["roots"]] == ["GVL_Two"] and r3["plc_project"].endswith("Plc2.plcproj")
     # a duplicate name (two files) is never called missing
     _obj(two / "GVLs" / "GVL_Machine.TcGVL", "GVL", "GVL_Machine", "VAR_GLOBAL\n\tnY : INT;\nEND_VAR\n")
+    register_sources(two / "Plc2.plcproj")
     idx.refresh()
     r4 = not_on_target(idx.declared_roots(), {"main2"})
     assert "GVL_Machine" not in [m["root"] for m in r4["roots"]], r4
+
+
+
+def test_n106_the_project_is_what_its_plcproj_compiles(project_dir):
+    """N106 (0.8.11 retest): a backup copy of a POU under the root (retest_plcopen\\before_FB_RetestX.TcPOU) was a
+    unit — the call graph, the overview and lint showed it beside the real one. Only the .plcproj's compile items are
+    units; the others are named (not_in_project). Added to the project (the .plcproj saved), a file is a unit."""
+    backup = project_dir / "retest_plcopen" / "before_FB_Valve.TcPOU"
+    backup.parent.mkdir()
+    backup.write_text((project_dir / "Plc" / "POUs" / "FB_Valve.TcPOU").read_text().replace('Name="FB_Valve"', 'Name="FB_ValveOld"')
+                      .replace("FUNCTION_BLOCK FB_Valve", "FUNCTION_BLOCK FB_ValveOld"))
+    stray = project_dir / "Plc" / "POUs" / "Copy of MAIN.TcPOU"
+    stray.write_text((project_dir / "Plc" / "POUs" / "MAIN.TcPOU").read_text())
+    p = ProjectIndex(ProjectConfig(root=str(project_dir)))
+    r = p.scan()
+    assert "fb_valveold" not in p.units and p.duplicates == {}, (p.duplicates, list(p.units))
+    assert r["not_in_project"]["count"] == 2 and str(backup) in r["not_in_project"]["files"]
+    assert not p.is_member(backup) and p.is_member(project_dir / "Plc" / "POUs" / "MAIN.TcPOU")
+    # added to the PLC project in XAE (the .plcproj lists it): a unit, found by the next refresh
+    pp = project_dir / "Plc" / "Plc.plcproj"
+    pp.write_text(pp.read_text().replace("</ItemGroup>", '<Compile Include="..\\retest_plcopen\\before_FB_Valve.TcPOU"/>'
+                                         "</ItemGroup>", 1))
+    d = p.refresh()
+    assert d["rescanned"] and str(backup) in d["added"] and p.get_unit("FB_ValveOld").kind == "FUNCTION_BLOCK"
+    assert [str(stray)] == p.not_in_project
+    # a folder of loose sources (no .plcproj at all): every file is a unit
+    loose = project_dir.parent / "loose"
+    loose.mkdir()
+    (loose / "FB_X.TcPOU").write_text(backup.read_text().replace("FB_ValveOld", "FB_X"))
+    q = ProjectIndex(ProjectConfig(root=str(loose)))
+    assert q.scan()["units"] >= 1 and q.get_unit("FB_X") and "not_in_project" not in q.scan()

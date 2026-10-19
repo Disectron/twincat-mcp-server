@@ -822,6 +822,8 @@ def test_n50_retest_the_project_source_names_an_alias(tmp_path, project_dir):
         'Id="{aaaaaaaa-0000-0000-0000-000000000077}"><Declaration><![CDATA[(* alarm list *)\n'
         "TYPE PT_RetestAlarm : POINTER TO FB_AlarmList; // the list\nEND_TYPE\n]]></Declaration></DUT>\n</TcPlcObject>\n",
         encoding="utf-8")
+    from tests.conftest import register_sources
+    register_sources(project_dir / "Plc" / "Plc.plcproj")
     idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
     assert idx.type_alias("PT_RetestAlarm") == "POINTER TO FB_AlarmList"
     assert idx.type_alias("ST_Recipe") is None and idx.type_alias("Nope") is None

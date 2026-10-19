@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import register_sources
+
 from twincat_mcp.config import AdsConfig
 from twincat_mcp.ads_backend import AdsBackend, AdsError
 from twincat_mcp import recorder as R
@@ -1270,6 +1272,7 @@ def test_n62_tasks_of_two_plc_projects_with_the_same_task_name_are_both_kept(tmp
             f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><Task Name="PlcTask"><CycleTime>{cyc}</CycleTime>'
             f'<PouCall><Name>{prog}</Name></PouCall><PouCall><Name>MAIN</Name></PouCall></Task></TcPlcObject>',
             encoding="utf-8")
+        register_sources(d / f"{name}.plcproj")                       # N106: what the PLC project compiles
     plc("PlcA", "PRG_A", 10000)
     plc("PlcB", "PRG_B", 2000)
     idx = ProjectIndex(ProjectConfig(root=str(tmp_path)))
@@ -1287,6 +1290,7 @@ def test_n62_tasks_of_two_plc_projects_with_the_same_task_name_are_both_kept(tmp
             encoding="utf-8") if d == "PlcA" else None
         main = tmp_path / d / "POUs" / "MAIN.TcPOU"
         main.write_text(main.read_text(encoding="utf-8").replace("<![CDATA[;]]>", "<![CDATA[PRG_C();]]>"), encoding="utf-8")
+        register_sources(tmp_path / d / f"{d}.plcproj")
     idx = ProjectIndex(ProjectConfig(root=str(tmp_path)))
     assert idx.tasks_of("PRG_C") is None, idx.tasks_of("PRG_C")
 
@@ -1413,3 +1417,27 @@ def test_n50_pointers_are_not_recorded_as_numbers(rec):
     pointer member) were recorded and decoded as signed integers."""
     s = rec.expand_symbols(["PRG_Test.pAlias", "PRG_Test.pData", "MAIN.nCycle", "MAIN.fbFill.eState"], None, None, 50)
     assert sorted(x.name for x in s) == ["MAIN.fbFill.eState", "MAIN.nCycle"]
+
+
+def test_n111_a_counter_the_program_resets_is_not_called_a_twincat_restart(rec):
+    """N111 (0.8.11 retest): rec_verify explained MAIN.nCount going back to 0 (MAIN.bReset) as 'TwinCAT restart' and
+    a repeated value as 'PLC stopped'. With the task's cycle counter recorded with the data, the cause is said from
+    it: it kept counting → the program set the counter back / left it alone; it restarted → a TwinCAT restart."""
+    st = _two_blocks(rec, cycle_counter=CC)
+    c = _conn()
+    user = 0
+    for i in range(60):
+        c.fire(CC, 1000 + i, ft(i * 10))
+        user = 0 if i == 30 else user + (0 if i in (40, 41) else 1)           # reset at 30, two cycles left alone
+        c.fire("MAIN.nCycle", user, ft(i * 10))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] >= 120)
+    rec.stop(st["id"], "manual (rec_stop)")
+    v = rec.verify(st["id"], counter="MAIN.nCycle")
+    cn = v["counter"]
+    assert cn["backwards"] == 1 and "TwinCAT restart" not in cn["resets"][0]["task_cycle_counter"]
+    assert cn["resets"][0]["task_cycle_counter"] == "kept counting: the program set it back", cn
+    assert "0 with a TwinCAT restart" in cn["reset_note"] and cn["duplicates"] == 2
+    assert "in 2 of them the task ran" in cn["note"], cn["note"]
+    # the task's own counter: going back is a restart, repeating is a stopped task
+    v2 = rec.verify(st["id"], counter=CC)
+    assert v2["counter"]["lossless"] and "reset_note" not in v2["counter"]

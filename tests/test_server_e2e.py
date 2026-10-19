@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 
 import anyio
 import pytest
+
+from tests.conftest import register_sources
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.shared.memory import create_client_server_memory_streams
@@ -698,6 +700,7 @@ async def test_interfaces_known_from_source(monkeypatch, project_dir):
     (project_dir / "Plc" / "POUs" / "I_Thing.TcIO").write_text(
         '<?xml version="1.0" encoding="utf-8"?><TcPlcObject Version="1.1.0.1"><Itf Name="I_Thing" Id="{00000000-0000-0000-0003-000000000001}">'
         '<Declaration><![CDATA[INTERFACE I_Thing\n]]></Declaration></Itf></TcPlcObject>')
+    register_sources(project_dir / "Plc" / "Plc.plcproj")
     srv = build_server(mk_cfg(project_dir, mode="full", confirm_destructive=False))
     async with client_for(srv) as s:
         r = payload(await s.call_tool("ads_read", {"name": "PRG_Test.ipThing"}))
@@ -717,6 +720,7 @@ async def test_debug_symbol_writers_respect_scope(monkeypatch, project_dir):
         '<?xml version="1.0" encoding="utf-8"?><TcPlcObject Version="1.1.0.1"><POU Name="FB_Other" Id="{00000000-0000-0000-0000-000000000077}">'
         '<Declaration><![CDATA[FUNCTION_BLOCK FB_Other\nVAR\n\tnCycle : UDINT;\nEND_VAR\n]]></Declaration>'
         '<Implementation><ST><![CDATA[nCycle := 0;]]></ST></Implementation></POU></TcPlcObject>')
+    register_sources(project_dir / "Plc" / "Plc.plcproj")
     srv = build_server(mk_cfg(project_dir, mode="readonly"))
     async with client_for(srv) as s:
         d = payload(await s.call_tool("wf_debug_symbol", {"symbol": "MAIN.nCycle", "watch_ms": 0}))
@@ -1296,6 +1300,7 @@ def _gvl(project_dir, name: str, decl: str) -> None:
         '<?xml version="1.0" encoding="utf-8"?>\n<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">\n'
         f'  <GVL Name="{name}" Id="{{aaaaaaaa-0000-0000-0000-0000000000{len(name):02d}}}">\n'
         f"    <Declaration><![CDATA[{decl}]]></Declaration>\n  </GVL>\n</TcPlcObject>\n", encoding="utf-8")
+    register_sources(project_dir / "Plc" / "Plc.plcproj")              # N106: part of the PLC project
 
 
 @pytest.mark.anyio
@@ -1363,3 +1368,32 @@ async def test_n98_an_export_into_a_folder_that_does_not_exist_yet(monkeypatch, 
         (project_dir / "exports" / "afile").write_text("x")
         bad = await s.call_tool("rec_export", {"id": rid, "out_path": str(project_dir / "exports" / "afile" / "x.csv")})
         assert bad.is_error and "is a file, not a folder" in text(bad)
+
+
+@pytest.mark.anyio
+async def test_n109_a_scaffold_the_project_does_not_compile_is_not_gated_by_config_mode(monkeypatch, project_dir):
+    """N109 (0.8.11 retest): tcunit_scaffold with add_to_plcproj=false was refused in RUN (edit_requires_config_mode)
+    when its out_dir was under the project root. What the PLC project compiles is its .plcproj (N106): a scaffold
+    not registered and not over a compiled file is no edit of it, wherever it is written."""
+    install(monkeypatch)
+    from twincat_mcp import ads_backend as AB
+    monkeypatch.setattr(AB.AdsBackend, "system_state", lambda self: {"twincat_mode": "RUN"})
+    srv = build_server(mk_cfg(project_dir, mode="full", edit_requires_config_mode=True))
+    async with client_for(srv) as s:
+        scratch = project_dir / "scratch" / "tests"                       # under the root, in no PLC project
+        r = payload(await s.call_tool("tcunit_scaffold", {"fb_name": "FB_Valve", "out_dir": str(scratch),
+                                                          "add_to_plcproj": False}))
+        assert Path(r["file"]).parent == scratch.resolve() and "FB_Valve_Tests" not in \
+            (project_dir / "Plc" / "Plc.plcproj").read_text()
+        # registered in the .plcproj: a code edit — refused in RUN
+        res = await s.call_tool("tcunit_scaffold", {"fb_name": "FB_Valve", "add_to_plcproj": True})
+        assert res.is_error and "is in RUN — switch to CONFIG first" in text(res), text(res)
+        # over a file the project compiles (even with add_to_plcproj=false): a code edit — refused in RUN
+        pou = project_dir / "Plc" / "POUs" / "Tests" / "FB_Valve_Tests.TcPOU"
+        pou.parent.mkdir(parents=True)
+        pou.write_text((project_dir / "Plc" / "POUs" / "FB_Valve.TcPOU").read_text()
+                       .replace('Name="FB_Valve"', 'Name="FB_Valve_Tests"').replace("FUNCTION_BLOCK FB_Valve",
+                                                                                "FUNCTION_BLOCK FB_Valve_Tests"))
+        register_sources(project_dir / "Plc" / "Plc.plcproj")
+        res = await s.call_tool("tcunit_scaffold", {"fb_name": "FB_Valve", "add_to_plcproj": False, "overwrite": True})
+        assert res.is_error and "is in RUN — switch to CONFIG first" in text(res), text(res)

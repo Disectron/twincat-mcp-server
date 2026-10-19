@@ -19,6 +19,7 @@ discipline. (Semantic search à la twincat-index-mcp is a different tool.)
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -30,6 +31,41 @@ from typing import Any, Iterable
 from .config import ProjectConfig
 
 SRC_EXT = {".tcpou": "POU", ".tcdut": "DUT", ".tcgvl": "GVL", ".tcio": "Itf"}
+
+
+def _norm(p: Path) -> str:
+    try:
+        return os.path.normcase(str(Path(p).resolve()))
+    except OSError:
+        return os.path.normcase(str(p))
+
+
+def _compiled_files(plcproj: list[dict[str, Any]]) -> set[str] | None:
+    """N106: the files the PLC projects compile (<Compile Include="POUs\\MAIN.TcPOU"/>, relative to the .plcproj,
+    MSBuild-escaped) — None when there is no .plcproj (a folder of loose sources: every file is a unit). A .plcproj
+    that cannot be read contributes every source file below its folder (what it compiles is not known)."""
+    if not plcproj:
+        return None
+    from urllib.parse import unquote
+    out: set[str] = set()
+    for pp in plcproj:
+        base = Path(pp["file"]).parent
+        if pp.get("error"):
+            out.update(_norm(f) for f in base.rglob("*") if f.suffix.lower() in SRC_EXT)
+            continue
+        for inc in pp.get("compile") or []:
+            out.add(_norm(base.joinpath(*[x for x in unquote(inc).replace("\\", "/").split("/") if x])))
+    return out
+
+
+def _plcproj_stamp(root: Path) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for pp in root.rglob("*.plcproj"):
+        try:
+            out[str(pp)] = pp.stat().st_mtime
+        except OSError:
+            pass
+    return out
 
 # N92: the variables of a PROGRAM / GVL that become symbols of the runtime (VAR_TEMP never does; CONSTANT is replaced)
 _SYMBOL_SECTIONS = {"PROGRAM": {"VAR", "VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_STAT", "VAR_INST"},
@@ -199,6 +235,11 @@ class ProjectIndex:
         self.solutions: list[str] = []
         self.tsproj: list[str] = []
         self.plcproj: list[dict[str, Any]] = []
+        # N106: the project is what its .plcproj files compile — a .Tc* file under the root that no .plcproj lists (a
+        # backup copy, an export, a test leftover) is not part of it: not a unit, listed here
+        self.not_in_project: list[str] = []
+        self._members: set[str] | None = None     # normcase paths of the compiled files; None: no .plcproj (loose sources)
+        self._plcproj_stamp: dict[str, float] = {}
         self.scanned_at: float | None = None
         # N26: tools run in worker threads; parallel first calls must not scan concurrently (each scan clears
         # and re-appends → duplicated plcproj/units). Re-entrant: refresh() may fall back to scan(). N88: scans and
@@ -222,10 +263,15 @@ class ProjectIndex:
         solutions = [str(p) for p in self.root.rglob("*.sln")]
         tsproj = [str(p) for p in self.root.rglob("*.tsproj")]
         plcproj = [self._parse_plcproj(pp) for pp in self.root.rglob("*.plcproj")]
+        members = _compiled_files(plcproj)
         n_files = 0
+        outside: list[str] = []
         for p in self.root.rglob("*"):
             if p.suffix.lower() in SRC_EXT and p.is_file():
                 if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
+                    continue
+                if members is not None and _norm(p) not in members:
+                    outside.append(str(p))
                     continue
                 try:
                     self._index_file(p, ix)
@@ -236,15 +282,30 @@ class ProjectIndex:
         # published whole (N88): the units first, so a reader that sees the new plcproj never pairs it with old units
         self.units, self.files, self.duplicates = ix.units, ix.files, ix.duplicates
         self.solutions, self.tsproj, self.plcproj = solutions, tsproj, plcproj
+        self._members, self.not_in_project = members, sorted(outside)
+        self._plcproj_stamp = _plcproj_stamp(self.root)
         self.scanned_at = time.time()
         kinds: dict[str, int] = {}
         for u in self.units.values():
             kinds[u.kind] = kinds.get(u.kind, 0) + 1
-        return {"root": str(self.root), "files": n_files, "units": len(self.units), "by_kind": kinds,
-                "duplicate_names": self.duplicates,
-                "solutions": self.solutions, "tsproj": self.tsproj,
-                "plcproj": [{"file": p["file"], "name": p["name"], "compile_items": len(p["compile"])} for p in self.plcproj],
-                "duration_s": round(time.time() - t0, 2)}
+        out = {"root": str(self.root), "files": n_files, "units": len(self.units), "by_kind": kinds,
+               "duplicate_names": self.duplicates,
+               "solutions": self.solutions, "tsproj": self.tsproj,
+               "plcproj": [{"file": p["file"], "name": p["name"], "compile_items": len(p["compile"]),
+                            **({"error": p["error"]} if p.get("error") else {})} for p in self.plcproj],
+               "duration_s": round(time.time() - t0, 2)}
+        out.update(self.outside_note())
+        return out
+
+    def outside_note(self) -> dict[str, Any]:
+        """N106: the source files under the root that no .plcproj compiles — not part of the project, so not units."""
+        if not self.not_in_project:
+            return {}
+        return {"not_in_project": {"count": len(self.not_in_project), "files": self.not_in_project[:20],
+                                   "why": "no .plcproj under the root compiles these files (a backup copy, an export, "
+                                          "a leftover?): they are not part of the PLC project and not indexed as units "
+                                          "— proj_read_file reads them; add them to the project in XAE to have them "
+                                          "indexed"}}
 
     REFRESH_MIN_S = 2.0   # index-based tools re-check file mtimes at most this often
 
@@ -351,6 +412,16 @@ class ProjectIndex:
     def _refresh(self) -> dict[str, Any]:
         if self.scanned_at is None or self.root is None:
             return self.scan()
+        if _plcproj_stamp(self.root) != self._plcproj_stamp:
+            # a .plcproj added, removed or saved (XAE added or removed an object): what the project is changed —
+            # scanned again, the delta reported as for any refresh
+            before = dict(self.files)
+            r = self._scan(None)
+            after = self.files
+            return {"changed": sorted(f for f in after if f in before and after[f] != before[f]),
+                    "added": sorted(f for f in after if f not in before),
+                    "removed": sorted(f for f in before if f not in after), "units": r["units"],
+                    "rescanned": "a .plcproj changed"}
         changed, added, removed = [], [], []
         seen: set[str] = set()
         ix = _Index(dict(self.units), dict(self.files), {k: list(v) for k, v in self.duplicates.items()})
@@ -358,6 +429,8 @@ class ProjectIndex:
             if p.suffix.lower() in SRC_EXT and p.is_file():
                 if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
                     continue
+                if self._members is not None and _norm(p) not in self._members:
+                    continue                          # N106: not compiled by any .plcproj (not_in_project)
                 sp = str(p)
                 seen.add(sp)
                 mt = p.stat().st_mtime
@@ -430,6 +503,12 @@ class ProjectIndex:
                 units.append({"name": u.name, "kind": u.kind, "file": u.file, "status": {"M": "modified", "A": "added", "D": "deleted", "?": "untracked", "R": "renamed"}.get(st, st)})
         other = [f for f in files if f.lower().endswith((".tsproj", ".plcproj", ".xti", ".tmc", ".sln"))]
         return {"since": since, "repo": str(repo), "units": units, "project_files": other, "all_changed_files": len(files)}
+
+    def is_member(self, path: str | Path) -> bool:
+        """Is this file compiled by a .plcproj under the root (True as well when the root has no .plcproj)? Read
+        fresh (no refresh throttle): it decides whether an edit is an edit of the PLC project (N109)."""
+        self.ensure_fresh()
+        return self._members is None or _norm(Path(path)) in self._members
 
     @staticmethod
     def _parse_plcproj(p: Path) -> dict[str, Any]:
