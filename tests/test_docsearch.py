@@ -34,8 +34,10 @@ def test_identifiers_are_words(text, words):
 def test_code_forms_and_where_a_code_is_defined():
     f = D.code_forms("ADS return codes 0x745")
     assert (f["value"], f["dec"], f["hex"]) == (1861, "1861", ["0x745", "0x0745", "0x00000745"])
-    assert D.code_forms("1861")["hex"][0] == "0x745" and D.code_forms("16#745")["value"] == 1861
+    assert D.code_forms("ADS error 1861")["hex"][0] == "0x745" and D.code_forms("16#745")["value"] == 1861
     assert D.code_forms("error 7") is None and D.code_forms("0x745 1861") is None and D.code_forms("ADSREAD") is None
+    # a decimal number is a code only when a word says so (review 0.8.12): a port or a build is none
+    assert D.code_forms("1861") is None and D.code_forms("ADS port 851") is None and D.code_forms("build 4024") is None
     table = "| Hex | Dec | Name |\n|---|---|---|\n| 0x745 | 1861 | ADSERR_CLIENT_SYNCTIMEOUT |"
     assert D.definition_score(table, 1861) == 2
     assert D.definition_score("| Code |\n| 0x00000745 |", 1861) == 1
@@ -92,7 +94,7 @@ def test_n105_n99_one_search_for_both_readers(idx, tmp_path):
     first = r["items"][0]
     assert first["url"] == f"{C}tcplclib_tc2_system/374277003.html" and first["same_page_in"] == ["tc3_c"]
     assert "define 0x745 / 1861 in a table" in r["code_note"]
-    r = idx.search("1861")                                                     # the decimal form: the same table
+    r = idx.search("ADS error 1861")                                           # the decimal form: the same table
     assert r["items"][0]["title"] == "ADS Return Codes"
     # the skill reads the same file with the same code
     kb = tmp_path / "kb"
@@ -106,3 +108,30 @@ def test_n105_n99_one_search_for_both_readers(idx, tmp_path):
         plugin = [i["title"] for i in idx.search(q)["items"]]
         assert p.returncode == 0 and [i["title"] for i in out["items"]] == plugin and plugin[0] == top, (out, plugin)
     assert out["items"][0]["same_page_in"] == ["tc3_c/374277003"] and out["code"]["dec"] == "1861"
+
+
+def test_review_0812_two_pages_of_one_book_are_never_one_document(idx):
+    """Review 0.8.12: two FBs' methods of one name and signature (Beckhoff titles a method page with the bare name)
+    were one 'document' — infosys_declaration answered one of them, the search dropped the other as a copy. A copy is
+    in another book; two pages of one book are two documents."""
+    from twincat_mcp.infosys import InfosysError
+    body = "<pre>METHOD Reset : BOOL\nVAR_INPUT\n    bForce : BOOL;\nEND_VAR</pre>"
+    with idx._db() as con:
+        for ref in ("tcplclib_tc3_x/111", "tcplclib_tc3_x/222", "tf9999_other/111"):
+            idx._store(con, f"{C}{ref}.html", "", _page("Reset", "<p>Resets the block.</p>" + body))
+        con.execute("UPDATE pages SET library = 'Tc3_X' WHERE book = 'tcplclib_tc3_x'")
+    with pytest.raises(InfosysError, match="ambiguous: Reset is documented by 2 different pages"):
+        idx.declaration("Reset")
+    r = idx.search("Resets the block")
+    urls = sorted(i["url"] for i in r["items"])
+    assert urls == [f"{C}tcplclib_tc3_x/111.html", f"{C}tcplclib_tc3_x/222.html"], r["items"]
+    assert [i.get("same_page_in") for i in r["items"] if i["url"].endswith("/111.html")] == [["tf9999_other"]]
+
+
+def test_review_0812_truncated_counts_documents_not_copies(idx, tmp_path):
+    """Review 0.8.12: 'total' counts pages (a copy once per book) and 'truncated' was total > items — true when
+    nothing was cut, only copies listed once."""
+    r = idx.search("0x745", limit=10)
+    assert r["total"] == 4 and r["count"] == 3 and r["truncated"] is False, r
+    r = idx.search("0x745", limit=1)
+    assert r["count"] == 1 and r["truncated"] is True, r

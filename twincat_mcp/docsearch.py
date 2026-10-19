@@ -308,17 +308,24 @@ def title_order(rows: list[Any], query: str, title_key: str = "title") -> list[A
 
 # ------------------------------------------------------------------------------------------- error codes (N99)
 _HEX = re.compile(r"^(?:0x|16#|#x)([0-9a-f_]+)$", re.I)
+# words that make a decimal number of the query an error / return code
+_CODE_WORDS = frozenset("""error errors err errid errorid code codes return returncode result hresult adserr adserror
+fehler fehlercode fehlernummer""".split())
 
 
 def code_forms(query: str) -> dict[str, Any] | None:
     """An error / return code in the query, in the forms the code tables write it (N99): '0x745' → value 1861, hex
-    0x745 / 0x0745 / 0x00000745, decimal 1861. One code token in the query (hex: 0x…, 16#…, #x…; decimal: two digits
-    or more, with a hex form that differs from it); else None."""
-    toks = re.findall(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", query_text(query))
+    0x745 / 0x0745 / 0x00000745, decimal 1861. One code token in the query: hex (0x…, 16#…, #x…), or a decimal number
+    of two digits or more next to a word that says it is a code ('error 1861', 'ADS return code 1861' — 'ADS port
+    851' or 'build 4024' is no code, review 0.8.12); else None."""
+    q = query_text(query)
+    toks = re.findall(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", q)
     if len(toks) != 1:
         return None
     t = toks[0]
     m = _HEX.match(t)
+    if not m and not _CODE_WORDS & {fold(w) for w in re.findall(r"[^\W\d_]+", q)}:
+        return None
     try:
         value = int(m.group(1).replace("_", ""), 16) if m else int(t)
     except ValueError:

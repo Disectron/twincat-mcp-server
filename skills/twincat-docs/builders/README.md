@@ -254,7 +254,7 @@ A version-1 database has no `meta` table; the next `update` creates it.
 ### Commands
 
 ```
-python esi_db.py [--kb PATH | --db PATH] update [--force] [--esi-dir DIR ... | --no-esi-dirs] [--no-twincat]
+python esi_db.py [--kb PATH | --db PATH] update [--force] [--esi-dir DIR ... | --no-esi-dirs] [--no-twincat | --twincat]
 python esi_db.py stats   [--json]
 python esi_db.py lookup  QUERY [--revision REV] [--detail newest|summary|full] [--limit 5]
 python esi_db.py search  QUERY [--kinds device,object,diag,module] [--limit 20]
@@ -265,7 +265,9 @@ python esi_db.py module  IDENT [--device DEVICE]
 
 The server runs `update` itself (the first build at its start, later `kb_rebuild(index='esi')` once approved) with its
 `knowledge.esi_dirs` as `--esi-dir` (or `--no-esi-dirs`); without either, `update` uses the folders the index in use
-was built with. Standard library only; the queries print the JSON of the server's `hw_*` tools.
+was built with. `--no-twincat` leaves TwinCAT's own ESI folders out and is recorded in the index (its state and later
+updates keep it); `--twincat` reads them again. A work file (`esi.db.building`) left next to a complete, current index
+is discarded by the next `update`. Standard library only; the queries print the JSON of the server's `hw_*` tools.
 
 ### What is read (`twincat_mcp/esi_index.py`, format 1)
 
@@ -283,7 +285,13 @@ and skipped:
   resolved per channel — `ChnFac` adds `n × ChnFac` to an index or sub-index, a name's `#1` becomes `1 + n × ChnFac`.
   A template the file does not hold is kept as `unresolved` with the reason. Such a file is read twice (templates
   first); every other file once, element by element, each device dropped once read (memory stays bounded — the
-  88 MB `ELM310x.xml` included).
+  88 MB `ELM310x.xml` included). A dictionary or diagnosis file of its own is read whole (the AX5000 dictionaries:
+  1.6 MB each).
+- **Several profiles** of one device (the schema allows one per channel; Beckhoff's files have one): their
+  dictionaries, diagnosis messages and the files they name are joined; an object or message two of them give
+  differently is listed in `dictionary_conflicts` / `diag_conflicts` (the first one's is kept).
+- **A description replaced** by a newer one (another folder, higher FileVersion) leaves nothing behind: objects and
+  messages only it used are dropped before the index is complete, so the counts and `hw_search` are of what is kept.
 - **Dictionary**: objects with type, bit size, access, PDO mapping, backup / setting flags, comment; sub-indices from
   the object's data type (bit offset, type, access); an array type's elements one by one (`SubIndex 001` …, base
   type, own bit offset); `Info\SubItem` defaults matched by name; `DefaultData` decoded little-endian for elementary

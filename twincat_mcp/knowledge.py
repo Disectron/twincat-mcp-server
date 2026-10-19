@@ -762,7 +762,8 @@ class Knowledge:
             con.execute("DROP TABLE units_fts")
             con.execute(UNITS_FTS)
             n = 0
-            for u in con.execute("SELECT project, name, kind, file, declaration, implementation, comments FROM units").fetchall():
+            for u in con.cursor().execute("SELECT project, name, kind, file, declaration, implementation, comments "
+                                          "FROM units"):              # one unit at a time, not all in memory
                 con.execute(f"INSERT INTO units_fts({UNITS_FTS_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?)",
                             (*tuple(u), *unit_words(u["name"], u["declaration"], u["implementation"])))
                 n += 1
@@ -927,12 +928,14 @@ class Knowledge:
         code_cols = "{name name_words idents code}" if words_cols else None
         fetch = min(max(limit * 3, 60), 600)
 
-        def run(label: str, expr: str, terms: list[str]) -> list[sqlite3.Row]:
+        def run(label: str, expr: str, terms: list[str], in_code_only: bool = False) -> list[sqlite3.Row]:
             if self._fts:
                 sql = ("SELECT rowid AS rid, project, name, kind, file, snippet(units_fts, 4, '«', '»', ' … ', 12) AS decl, "
                        f"snippet(units_fts, 5, '«', '»', ' … ', 12) AS impl, {rank} AS score "
                        f"FROM units_fts WHERE units_fts MATCH ?{where_extra} ORDER BY score LIMIT ?")
-                params: list[Any] = [expr, *params_extra, fetch]
+                # in_code_only: the units whose code (not only a comment) holds the words — read first, so that a
+                # window of `fetch` rows ranked by bm25 (comments weigh more than code) cannot leave them out
+                params: list[Any] = [f"{code_cols} : ({expr})" if in_code_only else expr, *params_extra, fetch]
             else:
                 conds = " AND " if label != "some words" else " OR "
                 sql = ("SELECT rowid AS rid, project, name, kind, file, substr(declaration,1,200) AS decl, "
@@ -953,9 +956,15 @@ class Knowledge:
         tier_of: dict[int, int] = {}
         used_expr = ""
         for ti, (label, expr, terms) in enumerate(tiers):
-            if ti >= 2 and rows:                   # 'some words' only when no unit has every word
+            if label == "some words" and rows:     # 'some words' only when no unit has every word
                 break
-            got = run(label, expr, terms)
+            got = []
+            if code_cols:
+                try:
+                    got = run(label, expr, terms, in_code_only=True)
+                except KnowledgeError:
+                    got = []
+            got += run(label, expr, terms)
             for r in got:
                 if r["rid"] not in tier_of:
                     tier_of[r["rid"]] = ti
@@ -1057,11 +1066,18 @@ class Knowledge:
         st = self.esi_state()
         if st["state"] == "missing":
             rb = st.get("rebuild") or {}
-            return {"esi_index": st, "note": (
-                f"the ESI index is being built (its first build: {rb.get('phase') or 'starting'}) — ask again in a "
-                "minute; kb_status shows the progress" if rb.get("state") == "running" else
-                "no ESI index yet: its first build starts by itself (server start, or this call through the server); "
-                "or approve kb_rebuild(index='esi')")}
+            loc = self.require()
+            if rb.get("state") == "running":
+                note = (f"the ESI index is being built (its first build: {rb.get('phase') or 'starting'}) — ask again "
+                        "in a minute; kb_status shows the progress")
+            elif not E.has_esi(E.xml_files(E.source_folders(loc, self.esi_dirs))):
+                note = ("no ESI index: no ESI file (an .xml whose root is EtherCATInfo, EtherCATModule, EtherCATDict "
+                        "or EtherCATDiag) in the knowledge folder's manuals\\ or TwinCAT's ESI folders — copy the "
+                        "vendor's ESI files into manuals\\ (any sub-folder); the first build then starts by itself")
+            else:
+                note = ("no ESI index yet: its first build starts by itself (server start, or this call through the "
+                        "server); or approve kb_rebuild(index='esi')")
+            return {"esi_index": st, "note": note}
         try:
             res = getattr(E.EsiIndex(L.index_file(self.require(), "esi")), fn)(*a)
         except E.EsiError as exc:

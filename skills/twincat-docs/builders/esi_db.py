@@ -8,7 +8,7 @@ tools and the twincat-docs skill read the same file).
 
 usage:
   python esi_db.py [--kb PATH | --db PATH] <command> ...
-  python esi_db.py update  [--force] [--esi-dir DIR ... | --no-esi-dirs] [--no-twincat]   build (or rebuild)
+  python esi_db.py update  [--force] [--esi-dir DIR ... | --no-esi-dirs] [--no-twincat | --twincat]   build
   python esi_db.py stats   [--json]                                      the state: complete / outdated / building …
   python esi_db.py lookup  QUERY [--revision REV] [--detail newest|summary|full] [--limit 5]
   python esi_db.py search  QUERY [--kinds device,object,diag,module] [--limit 20]
@@ -22,7 +22,8 @@ not FTS5 syntax is searched as one phrase.
 `update` writes <db>.building and replaces the index only when it is complete (the index in use stays until then; an
 interrupted build replaces nothing). Without --force an index built from exactly these files is left as it is.
 --esi-dir: extra ESI folders (the server passes its knowledge.esi_dirs); without it, the extra folders the index in
-use was built with. Standard library only; needs Python 3.12 or newer (checked at start).
+use was built with; TwinCAT's own ESI folders as the index in use (--no-twincat / --twincat change it). Standard
+library only; needs Python 3.12 or newer (checked at start).
 
 The knowledge folder (<kb>) is --kb, else TCMCP_KNOWLEDGE_DIR, else the folder chosen with the twincat plugin's
 kb_set_location, else the folder above this script when it is a knowledge folder, else D:\\TwinCAT-MCP\\knowledge.
@@ -93,7 +94,8 @@ def cmd_update(args) -> int:
     print(f"knowledge folder: {kb} ({how}); index: {db}")
     try:
         extra = [] if args.no_esi_dirs else (args.esi_dir or None)      # None: the folders the index was built with
-        res = E.build(db, kb, extra=extra, twincat=not args.no_twincat,
+        twincat = False if args.no_twincat else True if args.twincat else None     # None: as the index in use
+        res = E.build(db, kb, extra=extra, twincat=twincat,
                       force=args.force, built_by=f"{BUILDER} {BUILDER_VERSION} (twincat-mcp {PLUGIN_VERSION})")
     except E.EsiError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -139,7 +141,10 @@ def main() -> int:
     s.add_argument("--esi-dir", action="append", default=[], help="an extra ESI folder (repeatable)")
     s.add_argument("--no-esi-dirs", action="store_true", help="no extra ESI folders (not even those the index in use "
                    "was built with)")
-    s.add_argument("--no-twincat", action="store_true", help="leave TwinCAT's own ESI folders out")
+    s.add_argument("--no-twincat", action="store_true", help="leave TwinCAT's own ESI folders out (recorded: later "
+                   "updates keep it)")
+    s.add_argument("--twincat", action="store_true", help="read TwinCAT's own ESI folders again (the default for a new "
+                   "index)")
     s = sub.add_parser("stats")
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("lookup")

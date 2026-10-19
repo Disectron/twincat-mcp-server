@@ -725,3 +725,25 @@ def test_n102_a_search_table_of_0811_is_rebuilt_on_the_next_reindex(kb, tmp_path
     _pou(src, "FB_AlarmList", "FUNCTION_BLOCK FB_AlarmList\nVAR\n    aAlarmTexts : ARRAY[1..10] OF STRING;\nEND_VAR")
     k2.reindex(str(src))
     assert [h["unit"] for h in k2.search("alarm text")["hits"]] == ["FB_AlarmList"]
+
+
+def test_review_0812_phrases_only_and_code_hits_beyond_the_window(kb, tmp_path):
+    """Review 0.8.12: with quoted phrases only, units with one phrase were added to those with both (the 'some words'
+    tier is the second one there); with many comment matches, code matches ranked below the bm25 window were lost."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "p"
+    _pou(src, "FB_Both", "FUNCTION_BLOCK FB_Both\nVAR\n    bAlarmList : BOOL; bResetValve : BOOL;\nEND_VAR",
+         "// alarm list and reset valve\nbAlarmList := bResetValve;")
+    _pou(src, "FB_One", "FUNCTION_BLOCK FB_One\nVAR\n    nX : INT;\nEND_VAR", "// alarm list only\nnX := 1;")
+    for i in range(70):                                            # comment-only matches outrank code in bm25
+        _pou(src, f"FB_Note{i:02d}", f"FUNCTION_BLOCK FB_Note{i:02d}\nVAR\n    nY : INT;\nEND_VAR",
+             "// valve valve valve\nnY := 1;")
+    _pou(src, "FB_Valve", "FUNCTION_BLOCK FB_Valve\nVAR\n    bOpen : BOOL;\nEND_VAR", "bOpen := TRUE;")
+    k.add_project(str(src), "p")
+    r = k.search('"alarm list" "reset valve"')
+    assert [h["unit"] for h in r["hits"]] == ["FB_Both"], r
+    r = k.search("valve", limit=5)
+    assert {h["unit"] for h in r["hits"][:2]} == {"FB_Valve", "FB_Both"}, r      # name / identifier bResetValve
+    assert r["hits"][0]["unit"] == "FB_Valve"                                   # the name names it
+    assert all(h.get("match_in") == "comments" for h in r["hits"][2:]) and len(r["hits"]) == 5, r

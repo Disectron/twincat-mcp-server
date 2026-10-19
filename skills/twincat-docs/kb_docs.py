@@ -21,9 +21,11 @@ Exit code 0 with the answer, 1 with {"error": code, "message": ..., [...]}. Valu
   python kb_docs.py docs_search "query=fbRead( READ := FALSE )" limit=3
 
 Deliberate behaviour: a name documented by different pages is never resolved silently (error 'ambiguous' with the
-candidates; one page in several books is one page — the plugin's rule, twincat_mcp.infosys.symbol_documents), filters are applied before the row limit so 'total' is exact, out-of-range parameters are refused instead
-of clamped, an invalid FTS5 query is retried once as a literal phrase, a query of nothing but stop words is refused
-(the rule of the twincat server's kb_search).
+candidates; one page in several books is one page — the plugin's rule, twincat_mcp.infosys.symbol_documents),
+filters are applied before the row limit so 'total' is exact ('total' counts pages: a page in several books once per
+book; docs_search lists it once, with same_page_in, and 'truncated' says whether hits were not shown), out-of-range
+parameters are refused instead of clamped, an invalid FTS5 query is retried once as a literal phrase, a query of
+nothing but stop words is refused (the rule of the twincat server's kb_search).
 """
 from __future__ import annotations
 
@@ -631,8 +633,9 @@ def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         if mode.startswith("some words"):
             it["matched"] = matched_words(con, r["rid"], info.get("words_used") or [], fts="pages_fts")
         items.append(it)
+    # total: the pages that match (a page in several books once per book; copies are one item, same_page_in)
     out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info, "count": len(items), "total": total,
-                           "truncated": total > len(items), "items": items, "source": ctx.source("infosys")}
+                           "truncated": res["more"], "items": items, "source": ctx.source("infosys")}
     if res["code"]:
         out["code"] = {k: res["code"][k] for k in ("value", "hex", "dec")}
         out["code_note"] = INF.code_note(res)

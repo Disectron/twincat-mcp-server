@@ -16,17 +16,23 @@ What is read — four document kinds, told apart by their root element:
                  <TxPdo Ref=… Chn=…> resolved per channel), the predefined PDO assignments (AlternativeSmMapping, with
                  their init commands), slots of modular devices, the CoE object dictionary (objects, sub-indices with
                  type, bit offset, access, PDO mapping, defaults decoded, limits, unit code, enumeration texts; array
-                 elements one by one), inline diagnosis messages, and the DictionaryFile / DiagFile it names; the
+                 elements one by one), inline diagnosis messages, and the DictionaryFile / DiagFile it names — of
+                 every Profile of the device (several are joined; an object or message the profiles or files give
+                 differently is named in dictionary_conflicts / diag_conflicts, the first one's is kept); the
                  modules of Descriptions\\Modules;
   EtherCATModule modules of modular devices (ModuleIdent, PDOs, dictionary, diagnosis messages);
   EtherCATDict   dictionaries in their own file (AX5000: the drive parameters);
   EtherCATDiag   diagnosis message catalogues (text id, message, description, causes and remedies, reaction, reset).
-Identical objects, dictionaries and diagnosis messages (most revisions share them) are stored once. Devices, objects,
-diagnosis messages and modules are full-text searchable.
+Identical objects, dictionaries and diagnosis messages (most revisions share them) are stored once; those only a
+replaced description used are dropped before the index is complete (the counts are of what is kept). Devices,
+objects, diagnosis messages and modules are full-text searchable. EtherCATInfo / EtherCATModule files are read
+element by element (each device dropped once read); a dictionary or diagnosis file is read whole (the AX5000
+dictionaries: 1.6 MB).
 
 Build discipline (as the other indexes): one build at a time (an OS lock on <db>.lock with the progress), written as
 <db>.building and swapped in when complete — the index in use stays as it is until then; an interrupted build
-replaces nothing; a finished build that could not replace the index (it was open) replaces it at the next build.
+replaces nothing; a finished build that could not replace the index (it was open) replaces it at the next build;
+a work file left next to a complete, current index (stale) is discarded by the next build.
 Readers open the file read-only. FORMAT is the stored layout and the reading rules: an index of another format stays
 in use and is reported rebuild_needed until the user approves the rebuild. tests/test_formats.py fingerprints the
 code behind it.
@@ -109,6 +115,12 @@ def xml_files(folders: list[tuple[Path, str]]) -> list[tuple[Path, str]]:
                     seen.add(k)
                     out.append((p, src))
     return out
+
+
+def has_esi(files: list[tuple[Path, str]]) -> bool:
+    """Is one of the files an ESI document (its root element; only the start of a file is read)? An .xml that is
+    not (a project export, a config file) starts no first build (review 0.8.12)."""
+    return any(root_kind(p) is not None for p, _s in files)
 
 
 def sources_stamp(files: list[tuple[Path, str]]) -> str:
@@ -601,9 +613,14 @@ def parse_device(dev: Any, templates: dict[str, Any], file: Path, vendor: Vendor
     typ = _txt(t)
     if not typ:
         return None
-    prof = _kid(dev, "Profile")
+    profs = _kids(dev, "Profile")
+    prof = profs[0] if profs else None
     gt = _txt(_kid(dev, "GroupType"))
-    return {
+    dic, dconf = _join([parse_dictionary(_kid(x, "Dictionary")) for x in profs], "index")
+    diag, gconf = _join([parse_diag_messages(_kid(x, "DiagMessages")) for x in profs], "text_id")
+    dfiles = [f for f in (_txt(_kid(x, "DictionaryFile")) for x in profs) if f]
+    gfiles = [f for f in (_txt(_kid(x, "DiagFile")) for x in profs) if f]
+    rec = {
         "type": typ, "name": _lang(dev, "Name"), "name_de": _lang(dev, "Name", _LCID_DE) or None,
         "product_code": _num(t.get("ProductCode")), "revision": _num(t.get("RevisionNo")),
         "vendor": vendor[0], "vendor_id": vendor[1], "file_version": vendor[2],
@@ -627,22 +644,64 @@ def parse_device(dev: Any, templates: dict[str, Any], file: Path, vendor: Vendor
                                      ("revision", h.get("RevisionNo"))) if v}
                   for h in _kids(dev, "HideType")] or None,      # the older descriptions this one replaces in XAE
         "profile_no": _num(_txt(_kid(prof, "ProfileNo"))), "channels": _num(_txt(_kid(prof, "ChannelCount"))),
-        "dictionary": parse_dictionary(_kid(prof, "Dictionary")),
-        "dictionary_file": _txt(_kid(prof, "DictionaryFile")) or None,
-        "diag_file": _txt(_kid(prof, "DiagFile")) or None,
-        "diag": parse_diag_messages(_kid(prof, "DiagMessages")) or None,
+        "dictionary": dic,
+        "dictionary_file": dfiles[0] if dfiles else None,
+        "diag_file": gfiles[0] if gfiles else None,
+        "diag": diag or None,
     }
+    if len(profs) > 1:          # the schema allows several (a channel each); Beckhoff's files have one
+        rec["profiles"] = [{"profile_no": _num(_txt(_kid(x, "ProfileNo"))), "channel_no": _num(_txt(_kid(x, "ChannelNo"))),
+                            "channels": _num(_txt(_kid(x, "ChannelCount")))} for x in profs]
+    if len(dfiles) > 1:
+        rec["dictionary_files"] = dfiles
+    if len(gfiles) > 1:
+        rec["diag_files"] = gfiles
+    if dconf:
+        rec["dictionary_conflicts"] = [_hx(i) for i in dconf]
+    if gconf:
+        rec["diag_conflicts"] = [_hx(i) for i in gconf]
+    return rec
+
+
+def _join(parts: list[list[dict[str, Any]] | None], key: str) -> tuple[list[dict[str, Any]] | None, list[int]]:
+    """Objects (key 'index') or diagnosis messages (key 'text_id') of several profiles or files as one list: each key
+    once, in the order given; a key two parts give differently is returned in conflicts (the first part's is kept)."""
+    parts = [x for x in parts if x]
+    if not parts:
+        return None, []
+    if len(parts) == 1:
+        return parts[0], []
+    out: list[dict[str, Any]] = []
+    seen: dict[Any, str] = {}
+    conflicts: list[int] = []
+    for part in parts:
+        for o in part:
+            h = _hash(o)
+            if o[key] in seen:
+                if seen[o[key]] != h and o[key] not in conflicts:
+                    conflicts.append(o[key])
+                continue
+            seen[o[key]] = h
+            out.append(o)
+    return out, conflicts
 
 
 def parse_module(mod: Any, file: Path, vendor: Vendor, templates: dict[str, Any] | None = None) -> dict[str, Any] | None:
     t = _kid(mod, "Type")
     if t is None:
         return None
-    prof = _kid(mod, "Profile")
-    return {"type": _txt(t), "ident": _num(t.get("ModuleIdent")), "name": _lang(mod, "Name"), "vendor": vendor[0],
-            "file_version": vendor[2], "profile_no": _num(_txt(_kid(prof, "ProfileNo"))),
-            "pdos": _pdos(mod, templates or {}, file.name), "dictionary": parse_dictionary(_kid(prof, "Dictionary")),
-            "diag": parse_diag_messages(_kid(prof, "DiagMessages")) or None}
+    profs = _kids(mod, "Profile")
+    prof = profs[0] if profs else None
+    dic, dconf = _join([parse_dictionary(_kid(x, "Dictionary")) for x in profs], "index")
+    diag, gconf = _join([parse_diag_messages(_kid(x, "DiagMessages")) for x in profs], "text_id")
+    rec = {"type": _txt(t), "ident": _num(t.get("ModuleIdent")), "name": _lang(mod, "Name"), "vendor": vendor[0],
+           "file_version": vendor[2], "profile_no": _num(_txt(_kid(prof, "ProfileNo"))),
+           "pdos": _pdos(mod, templates or {}, file.name), "dictionary": dic, "diag": diag or None}
+    if dconf:
+        rec["dictionary_conflicts"] = [_hx(i) for i in dconf]
+    if gconf:
+        rec["diag_conflicts"] = [_hx(i) for i in gconf]
+    return rec
 
 
 def _templates(path: Path) -> dict[str, Any]:
@@ -848,6 +907,11 @@ class _Writer:
         return h
 
 
+def _like(s: str) -> str:
+    """A LIKE pattern part that matches `s` literally (ESCAPE '\\')."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _title(typ: str, name: str) -> str:
     """'EL3356-0010 1Ch. Ana. Input …' — the name, with the type in front when the name does not begin with it."""
     return name if (name or "").lower().startswith((typ or "").lower()) else f"{typ} {name}".strip()
@@ -884,6 +948,8 @@ class _Build:
         self.n_modules = 0
         self.file_keys: dict[int, list[tuple]] = {}
         self.ref_files: dict[str, int | None] = {}
+        self.ref_dicts: set[int] = set()            # dictionaries / catalogues of a file of their own: always kept
+        self.ref_sets: set[int] = set()
 
     def file(self, p: Path, src: str) -> None:
         try:
@@ -939,10 +1005,51 @@ class _Build:
                 self.errors.append(f"{p.name}: {exc}")
                 return None
             if kind == "dict":
-                self.ref_files[k] = self.w.dict_id(parse_dictionary(_kid(root, "Dictionary")), str(p))
+                self.ref_files[k] = x = self.w.dict_id(parse_dictionary(_kid(root, "Dictionary")), str(p))
+                if x is not None:
+                    self.ref_dicts.add(x)
             else:
-                self.ref_files[k] = self.w.diag_set(parse_diag_messages(_kid(root, "DiagMessages")), str(p))
+                self.ref_files[k] = x = self.w.diag_set(parse_diag_messages(_kid(root, "DiagMessages")), str(p))
+                if x is not None:
+                    self.ref_sets.add(x)
         return self.ref_files[k]
+
+    def _stored(self, kind: str, ref: int) -> list[dict[str, Any]]:
+        if kind == "dict":
+            q = "SELECT o.data FROM dict_obj d JOIN obj o ON o.id = d.obj_id WHERE d.dict_id = ? ORDER BY d.idx"
+        else:
+            q = "SELECT m.data FROM diag_msg d JOIN msg m ON m.id = d.msg_id WHERE d.set_id = ? ORDER BY d.text_id"
+        return [_unpack(r[0]) for r in self.con.execute(q, (ref,))]
+
+    def _content(self, rec: dict[str, Any], p: Path, kind: str) -> int | None:
+        """The device's dictionary (kind 'dict') or diagnosis catalogue ('diag'): inline in its profiles, in the
+        files they name, or both (joined; what they give differently in rec[…_conflicts]) -> its id."""
+        inline = rec.pop("dictionary" if kind == "dict" else "diag", None)
+        one = rec.get("dictionary_file" if kind == "dict" else "diag_file")
+        names = rec.get("dictionary_files" if kind == "dict" else "diag_files") or ([one] if one else [])
+        ids = []
+        for name in names:
+            ref = _resolve_ref(name, p, self.by_name)
+            if ref is None:
+                self.missing.append(f"{rec['type']}: {name}")
+                note = "dictionary_note" if kind == "dict" else "diag_note"
+                what = "dictionary" if kind == "dict" else "diagnosis"
+                rec[note] = (rec[note] + "; " if rec.get(note) else "") + \
+                    f"the {what} file {name!r} is not in the ESI folders"
+                continue
+            x = self._ref_file(ref, kind)
+            if x is not None:
+                ids.append(x)
+        if not inline and len(ids) == 1:
+            return ids[0]                              # the file's own dictionary / catalogue, stored once
+        parts = ([inline] if inline else []) + [self._stored(kind, x) for x in ids]
+        joined, conflicts = _join(parts, "index" if kind == "dict" else "text_id")
+        if conflicts:
+            key = "dictionary_conflicts" if kind == "dict" else "diag_conflicts"
+            rec[key] = sorted(set(rec.get(key) or []) | {_hx(i) for i in conflicts})
+        if kind == "dict":
+            return self.w.dict_id(joined, str(p))
+        return self.w.diag_set(joined, str(p))
 
     def device(self, rec: dict[str, Any], fid: int, p: Path, mtime: float) -> None:
         key = (rec["type"].lower(), rec["product_code"], rec["revision"])
@@ -956,22 +1063,8 @@ class _Build:
             if ver <= old["ver"]:
                 old["differs_in"].append({"file": str(p), "file_version": rec.get("file_version")})
                 return
-        did = self.w.dict_id(rec.pop("dictionary", None), str(p))
-        if did is None and rec.get("dictionary_file"):
-            ref = _resolve_ref(rec["dictionary_file"], p, self.by_name)
-            if ref is None:
-                self.missing.append(f"{rec['type']}: {rec['dictionary_file']}")
-                rec["dictionary_note"] = f"the dictionary file {rec['dictionary_file']!r} is not in the ESI folders"
-            else:
-                did = self._ref_file(ref, "dict")
-        sid = self.w.diag_set(rec.pop("diag", None), str(p))
-        if sid is None and rec.get("diag_file"):
-            ref = _resolve_ref(rec["diag_file"], p, self.by_name)
-            if ref is None:
-                self.missing.append(f"{rec['type']}: {rec['diag_file']}")
-                rec["diag_note"] = f"the diagnosis file {rec['diag_file']!r} is not in the ESI folders"
-            else:
-                sid = self._ref_file(ref, "diag")
+        did = self._content(rec, p, "dict")
+        sid = self._content(rec, p, "diag")
         n_obj = self.con.execute("SELECT objects FROM dicts WHERE id = ?", (did,)).fetchone()[0] if did else 0
         data = {k: v for k, v in rec.items() if k not in ("type", "name", "product_code", "revision", "vendor",
                                                           "group_type")}
@@ -999,14 +1092,42 @@ class _Build:
         module files per firmware revision); a device's slots are resolved against them when read (EsiIndex)."""
         did = self.w.dict_id(rec.pop("dictionary", None), str(p))
         sid = self.w.diag_set(rec.pop("diag", None), str(p))
-        data = {"pdos": rec["pdos"], "profile_no": rec.get("profile_no"), "file_version": rec.get("file_version")}
+        data = {"pdos": rec["pdos"], "profile_no": rec.get("profile_no"), "file_version": rec.get("file_version"),
+                **{k: rec[k] for k in ("dictionary_conflicts", "diag_conflicts") if rec.get(k)}}
         self.con.execute("INSERT INTO modules (ident, type, name, vendor, file_id, dict_id, diag_set, data) "
                          "VALUES (?,?,?,?,?,?,?,?)",
                          (rec["ident"], rec["type"], rec["name"], rec["vendor"], fid, did, sid, _pack(data)))
         self.n_modules += 1
 
+    def _prune(self) -> None:
+        """Review 0.8.12: a description replaced by a newer one (another file, higher FileVersion) left its
+        dictionary, catalogue, objects and messages behind — found by hw_search, counted as stored. Kept: what a
+        device or module uses, and the content of a dictionary / diagnosis file of its own."""
+        con = self.con
+        con.execute("CREATE TEMP TABLE keep_d (id INTEGER PRIMARY KEY)")
+        con.execute("CREATE TEMP TABLE keep_s (id INTEGER PRIMARY KEY)")
+        con.execute("INSERT OR IGNORE INTO keep_d SELECT dict_id FROM devices WHERE dict_id IS NOT NULL "
+                    "UNION SELECT dict_id FROM modules WHERE dict_id IS NOT NULL")
+        con.executemany("INSERT OR IGNORE INTO keep_d VALUES (?)", [(x,) for x in self.ref_dicts])
+        con.execute("INSERT OR IGNORE INTO keep_s SELECT diag_set FROM devices WHERE diag_set IS NOT NULL "
+                    "UNION SELECT diag_set FROM modules WHERE diag_set IS NOT NULL")
+        con.executemany("INSERT OR IGNORE INTO keep_s VALUES (?)", [(x,) for x in self.ref_sets])
+        con.execute("DELETE FROM dicts WHERE id NOT IN (SELECT id FROM keep_d)")
+        con.execute("DELETE FROM dict_obj WHERE dict_id NOT IN (SELECT id FROM keep_d)")
+        con.execute("DELETE FROM obj WHERE id NOT IN (SELECT obj_id FROM dict_obj)")
+        con.execute("DELETE FROM diag_sets WHERE id NOT IN (SELECT id FROM keep_s)")
+        con.execute("DELETE FROM diag_msg WHERE set_id NOT IN (SELECT id FROM keep_s)")
+        con.execute("DELETE FROM msg WHERE id NOT IN (SELECT msg_id FROM diag_msg)")
+        con.execute("DROP TABLE keep_d")
+        con.execute("DROP TABLE keep_s")
+        objs = {r[0] for r in con.execute("SELECT id FROM obj")}
+        msgs = {r[0] for r in con.execute("SELECT id FROM msg")}
+        self.w.search = [r for r in self.w.search if (int(r[1]) in objs if r[0] == "object" else
+                                                      int(r[1]) in msgs if r[0] == "diag" else True)]
+
     def finish(self) -> dict[str, Any]:
         con = self.con
+        self._prune()
         for d in self.devs.values():
             if d["also_in"] or d["differs_in"]:
                 con.execute("UPDATE devices SET also_in = ?, differs_in = ? WHERE id = ?",
@@ -1026,9 +1147,10 @@ class _Build:
                              " ".join(f"{x['name']} " + " ".join(e["name"] for e in x["entries"]) for x in data["pdos"])))
             con.executemany("INSERT INTO search (kind, ref, title, body) VALUES (?, ?, ?, ?)", rows)
             con.execute("INSERT INTO search(search) VALUES ('optimize')")
+        n = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("dicts", "obj", "msg")}
         return {"devices": len(self.devs), "types": len({k[0] for k in self.devs}), "modules": self.n_modules,
-                "dictionaries": len(self.w.dicts), "objects": len(self.w.objs),
-                "diag_messages": len(self.w.msgs), "files_read": len(self.seen_hash), "kinds": self.kinds}
+                "dictionaries": n["dicts"], "objects": n["obj"], "diag_messages": n["msg"],
+                "files_read": len(self.seen_hash), "kinds": self.kinds}
 
 
 def recorded_extra(final: Path) -> list[str]:
@@ -1039,15 +1161,22 @@ def recorded_extra(final: Path) -> list[str]:
         return []
 
 
-def build(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = None, twincat: bool = True,
+def recorded_twincat(final: Path) -> bool:
+    """Whether the index in use read TwinCAT's own ESI folders (esi_db.py update --no-twincat: not); True for none."""
+    return read_meta(final).get("twincat", "1") != "0"
+
+
+def build(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = None, twincat: bool | None = None,
           force: bool = False, built_by: str = "", log: Callable[[str], None] = print) -> dict[str, Any]:
     """Build <final> from every ESI file of the sources, into <final>.building, swapped in when complete. Without
     force an index built from exactly these files (same paths, sizes, times) in this format is left as it is.
-    extra=None: the extra folders the index in use was built with (a rebuild from the command line keeps them)."""
+    extra=None / twincat=None: the extra folders, and whether TwinCAT's folders were read, as for the index in use
+    (a rebuild from the command line or through the server keeps them)."""
     final = Path(final)
     building, lock = side_files(final)
     final.parent.mkdir(parents=True, exist_ok=True)
     extra = [str(x) for x in (recorded_extra(final) if extra is None else extra)]
+    twincat = recorded_twincat(final) if twincat is None else bool(twincat)
     folders = source_folders(kb, extra, twincat)
     if not folders:
         raise EsiError("no ESI source: neither <kb>\\manuals nor a TwinCAT ESI folder (Config\\Io\\EtherCAT) exists "
@@ -1065,7 +1194,12 @@ def build(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = Non
         current = meta.get("format") == FORMAT and meta.get("state") == "complete"
         if not force and current and meta.get("sources_stamp") == stamp:
             log(f"up to date: {final} ({meta.get('devices')} device revisions from {meta.get('files')} files)")
-            return {"result": "up_to_date", "index": str(final), "devices": _int(meta.get("devices"))}
+            out: dict[str, Any] = {"result": "up_to_date", "index": str(final), "devices": _int(meta.get("devices"))}
+            if building.is_file():               # left by an interrupted or redundant build: the index is current
+                _discard(building)
+                log(f"discarded {building} (a build left next to the complete, current index)")
+                out["discarded"] = str(building)
+            return out
         bm = read_meta(building) if building.is_file() else {}
         if (not force and bm.get("state") == "complete" and bm.get("format") == FORMAT
                 and bm.get("sources_stamp") == stamp):
@@ -1084,7 +1218,7 @@ def build(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = Non
         log(f"building {final} ({why}) from {len(files)} XML files in {[str(f) for f, _s in folders]}"
             + ("; the current index stays in use until the new one is complete" if final.is_file() else ""))
         t0 = time.time()
-        res = _build_into(building, files, folders, stamp, built_by, lk, extra)
+        res = _build_into(building, files, folders, stamp, built_by, lk, extra, twincat)
         lk.update(phase="replacing the index in use")
         why_not = _swap(building, final)
         took = round(time.time() - t0)
@@ -1106,7 +1240,7 @@ def build(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = Non
 
 
 def _build_into(db: Path, files: list[tuple[Path, str]], folders: list[tuple[Path, str]], stamp: str,
-                built_by: str, lk: kb_lock.IndexLock, extra: list[str]) -> dict[str, Any]:
+                built_by: str, lk: kb_lock.IndexLock, extra: list[str], twincat: bool = True) -> dict[str, Any]:
     con = sqlite3.connect(str(db))
     try:
         con.execute("PRAGMA journal_mode=OFF")       # the work file: nothing reads it before it is complete
@@ -1120,7 +1254,8 @@ def _build_into(db: Path, files: list[tuple[Path, str]], folders: list[tuple[Pat
         con.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [
             ("format", FORMAT), ("state", "building"), ("started", time.strftime("%Y-%m-%d %H:%M:%S")),
             ("built_by", built_by or "twincat-mcp"), ("python", sys.version.split()[0]), ("fts", str(int(fts))),
-            ("sources", json.dumps([[str(f), s] for f, s in folders])), ("extra_dirs", json.dumps(extra))])
+            ("sources", json.dumps([[str(f), s] for f, s in folders])), ("extra_dirs", json.dumps(extra)),
+            ("twincat", "1" if twincat else "0")])
         b = _Build(con, fts, files)
         total = len(files)
         for i, (p, src) in enumerate(files):
@@ -1142,13 +1277,22 @@ def _build_into(db: Path, files: list[tuple[Path, str]], folders: list[tuple[Pat
     return {**res, "files": total, "errors": b.errors[:20], "missing_refs": b.missing, "not_esi": b.not_esi[:20]}
 
 
-def _discard(building: Path) -> None:
-    """The build's own work file and its SQLite side files — the only thing a build deletes."""
+def _discard(building: Path, wait_s: float = SWAP_WAIT_S) -> None:
+    """The build's own work file and its SQLite side files — the only thing a build deletes. A file another program
+    holds open (a reader, a virus scan) is retried as _swap does, then the build stops with the reason."""
     for p in [building] + [building.with_name(building.name + x) for x in SIDE]:
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
+        t0 = time.time()
+        while True:
+            try:
+                p.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError:
+                if time.time() - t0 > wait_s:
+                    raise EsiError(f"{p} is open in another program — it cannot be discarded; close it and build "
+                                   "again", "busy") from None
+                time.sleep(1.0)
 
 
 def _swap(building: Path, final: Path, wait_s: float = SWAP_WAIT_S) -> str | None:
@@ -1166,12 +1310,16 @@ def _swap(building: Path, final: Path, wait_s: float = SWAP_WAIT_S) -> str | Non
 
 
 # --------------------------------------------------------------------------------------------- state
-def state(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = None, twincat: bool = True) -> dict[str, Any]:
+def state(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = None,
+          twincat: bool | None = None) -> dict[str, Any]:
     """missing | complete | rebuild_needed (another format, or never finished) | outdated (ESI files added, changed or
-    removed since, or other ESI folders), plus a build running / interrupted / waiting to replace it. An index that
-    exists is in use as it is until the user approves the rebuild. extra=None: the folders it was built with."""
+    removed since, or other ESI folders), plus a build running / interrupted / waiting to replace it / stale (a work
+    file left next to the complete, current index: the next build discards it). An index that exists is in use as it
+    is until the user approves the rebuild. extra=None / twincat=None: the folders it was built with."""
     final = Path(final)
     extra = [str(x) for x in (recorded_extra(final) if extra is None else extra)]
+    twincat = recorded_twincat(final) if twincat is None else bool(twincat)
+    stamp_now: str | None = None
     building, lock = side_files(final)
     meta = read_meta(final)
     out: dict[str, Any] = {"database": str(final), "format_expected": FORMAT}
@@ -1186,7 +1334,8 @@ def state(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = Non
     else:
         folders = source_folders(kb, extra, twincat)
         files = xml_files(folders)
-        out["state"] = "complete" if sources_stamp(files) == meta.get("sources_stamp") else "outdated"
+        stamp_now = sources_stamp(files)
+        out["state"] = "complete" if stamp_now == meta.get("sources_stamp") else "outdated"
         if out["state"] == "outdated":
             try:
                 was = [f for f, _s in json.loads(meta.get("sources") or "[]")]
@@ -1220,8 +1369,17 @@ def state(final: Path, kb: Path | None, extra: Iterable[str | Path] | None = Non
                               "seconds_since_progress": round(time.time() - beat) if beat else None}
         else:
             bm = read_meta(building)
-            out["rebuild"] = {"state": "waiting_to_replace" if bm.get("state") == "complete" else "interrupted",
-                              "file": str(building)}
+            if stamp_now is None and final.is_file():
+                stamp_now = sources_stamp(xml_files(source_folders(kb, extra, twincat)))
+            if out["state"] == "complete":
+                rbs = "stale"                    # build() returns up_to_date and discards it
+            elif bm.get("state") == "complete" and bm.get("format") == FORMAT and bm.get("sources_stamp") == stamp_now:
+                rbs = "waiting_to_replace"       # build() swaps it in
+            elif bm.get("state") == "complete":
+                rbs = "stale"                    # built from other files or another format: build() starts over
+            else:
+                rbs = "interrupted"
+            out["rebuild"] = {"state": rbs, "file": str(building)}
     out["message"] = message(out)
     return out
 
@@ -1236,6 +1394,8 @@ def message(s: dict[str, Any]) -> str:
         tail = "; a finished build replaces it at the next build"
     elif rb.get("state") == "interrupted":
         tail = "; a build was interrupted — the next one starts over"
+    elif rb.get("state") == "stale":
+        tail = f"; a work file was left ({rb.get('file')}) — the next build discards it"
     else:
         tail = ""
     if st == "missing":
@@ -1265,23 +1425,31 @@ class EsiIndex:
         return connect_ro(self.db)
 
     @staticmethod
-    def _rev(revision: int | str | None) -> int | None:
-        if revision is None or isinstance(revision, int):
-            return revision
-        n = _num(str(revision).replace("0x", "#x").replace("0X", "#x"))
-        if n is None:
-            raise EsiError(f"revision must be a number or '#x…' as hw_lookup shows it (got {revision!r})")
+    def _range(n: int, what: str, bits: int, given: Any) -> int:
+        # an ESI number is a UDINT (product code, revision, ModuleIdent, text id) or a UINT (object index)
+        if not 0 <= n < (1 << bits):
+            raise EsiError(f"{what} {given!r} is out of range (0 … 0x{(1 << bits) - 1:X})")
         return n
+
+    @staticmethod
+    def _rev(revision: int | str | None) -> int | None:
+        if revision is None:
+            return None
+        n = revision if isinstance(revision, int) else _num(str(revision).replace("0x", "#x").replace("0X", "#x"))
+        if n is None or isinstance(n, bool):
+            raise EsiError(f"revision must be a number or '#x…' as hw_lookup shows it (got {revision!r})")
+        return EsiIndex._range(n, "revision", 32, revision)
 
     @staticmethod
     def _index(v: str | int, what: str = "index") -> int:
         if isinstance(v, int):
-            return v
-        s = str(v).strip().split(":")[0]
-        n = _num(s if s[:2].lower() in ("#x", "0x") else ("#x" + s if re.fullmatch(r"[0-9A-Fa-f]{4}", s) else s))
+            n: int | None = v
+        else:
+            s = str(v).strip().split(":")[0]
+            n = _num(s if s[:2].lower() in ("#x", "0x") else ("#x" + s if re.fullmatch(r"[0-9A-Fa-f]{4}", s) else s))
         if n is None:
             raise EsiError(f"{what} must be like '#x8000' or 0x8000 (got {v!r})")
-        return n
+        return EsiIndex._range(n, what, 16 if what == "index" else 32, v)
 
     def lookup(self, query: str, limit: int = 5, revision: int | str | None = None,
                detail: str = "newest") -> dict[str, Any]:
@@ -1301,13 +1469,20 @@ class EsiIndex:
         with self._con() as con:
             pc = _num(q.replace("0x", "#x")) if q[:2].lower() in ("#x", "0x") else None
             if pc is not None:
-                rows = con.execute(sel + f"d.product_code = ?{rs} ORDER BY d.revision DESC LIMIT 200", [pc, *rp]).fetchall()
+                self._range(pc, "product code", 32, q)
+                where, params, order = f"d.product_code = ?{rs}", [pc, *rp], "d.revision DESC"
             else:
-                rows = con.execute(sel + f"d.type = ? COLLATE NOCASE{rs} ORDER BY d.revision DESC LIMIT 200",
-                                   [q, *rp]).fetchall()
-                if not rows:
-                    rows = con.execute(sel + f"(d.type LIKE ? OR d.name LIKE ?){rs} ORDER BY d.type, d.revision DESC "
-                                       "LIMIT 200", [f"%{q}%", f"%{q}%", *rp]).fetchall()
+                where, params, order = f"d.type = ? COLLATE NOCASE{rs}", [q, *rp], "d.revision DESC"
+                if not con.execute(f"SELECT 1 FROM devices d WHERE {where} LIMIT 1", params).fetchone():
+                    pat = "%" + _like(q) + "%"           # the text as typed: '%' and '_' match only themselves
+                    where = f"(d.type LIKE ? ESCAPE '\\' OR d.name LIKE ? ESCAPE '\\'){rs}"
+                    params, order = [pat, pat, *rp], "d.type, d.revision DESC"
+            rows = con.execute(sel + f"{where} ORDER BY {order} LIMIT 200", params).fetchall()
+            # the counts are of every match (the rows read are the first 200 in that order)
+            n_all, n_types = con.execute(f"SELECT COUNT(*), COUNT(DISTINCT lower(d.type)) FROM devices d WHERE {where}",
+                                         params).fetchone()
+            types = [x[0] for x in con.execute(f"SELECT MIN(d.type) FROM devices d WHERE {where} GROUP BY lower(d.type) "
+                                               "ORDER BY lower(d.type) LIMIT 40", params)]
             # the newest revision of every type first, then the older ones (the older revisions of the first type
             # used to fill the limit before the other types showed)
             firsts, rest, seen = [], [], set()
@@ -1322,10 +1497,11 @@ class EsiIndex:
                 full = detail == "full" or (detail == "newest" and (first or rev is not None))
                 out_rows.append(self._device(con, r, full))
                 trimmed += 0 if full else 1
-        res: dict[str, Any] = {"query": q, "matches": len(rows), "types": sorted({r["type"] for r in rows})[:40],
-                               "detail": detail, "devices": out_rows}
-        if len(rows) > int(limit):
-            res["more"] = f"{len(rows) - int(limit)} more revision(s) match: limit=…, revision=…, or a longer query"
+        res: dict[str, Any] = {"query": q, "matches": n_all, "types": types, "detail": detail, "devices": out_rows}
+        if n_types > len(types):
+            res["types_count"] = n_types              # 'types' lists the first 40 by name
+        if n_all > int(limit):
+            res["more"] = f"{n_all - len(out_rows)} more revision(s) match: limit=…, revision=…, or a longer query"
         if trimmed:
             res["detail_note"] = (f"{trimmed} device row(s) as one line (detail={detail!r}): detail='full', or "
                                   "revision='#x…' (as shown), gives them in full")
@@ -1359,7 +1535,8 @@ class EsiIndex:
         if not full:
             return d
         for k in ("name_de", "physics", "file_version", "mailbox", "dc", "sm", "fmmu", "slots", "profile_no",
-                  "channels", "dictionary_file", "diag_file", "hides"):
+                  "channels", "profiles", "dictionary_file", "dictionary_files", "diag_file", "diag_files", "hides",
+                  "dictionary_conflicts", "diag_conflicts"):
             if data.get(k) not in (None, [], {}):
                 d[k] = data[k]
         if data.get("slots"):
@@ -1442,8 +1619,8 @@ class EsiIndex:
         rows = con.execute(q + (" AND d.revision = ?" if rev is not None else "") + " ORDER BY d.revision DESC LIMIT 1",
                            [device.strip()] + ([rev] if rev is not None else [])).fetchall()
         if not rows:
-            near = [x[0] for x in con.execute("SELECT DISTINCT type FROM devices WHERE type LIKE ? ORDER BY type "
-                                              "LIMIT 8", (f"%{device.strip()}%",))]
+            near = [x[0] for x in con.execute("SELECT DISTINCT type FROM devices WHERE type LIKE ? ESCAPE '\\' "
+                                              "ORDER BY type LIMIT 8", ("%" + _like(device.strip()) + "%",))]
             raise EsiError(f"{device!r}{f' revision {_hx(rev, 8)}' if rev is not None else ''} is not in the ESI index"
                            + (f" — types with that text: {near}" if near else " (hw_lookup lists types and revisions)"),
                            "not_found")
@@ -1549,10 +1726,7 @@ class EsiIndex:
             groups: dict[tuple, dict[str, Any]] = {}
             for r in rows:
                 key = (r["kind"], r["title"])
-                if key in groups:
-                    groups[key]["variants"] = groups[key].get("variants", 1) + 1
-                    continue
-                if len(items) >= int(limit):
+                if key in groups or len(items) >= int(limit):
                     continue
                 ref = int(r["ref"])
                 it: dict[str, Any] = {"kind": r["kind"], "title": r["title"]}
@@ -1573,6 +1747,13 @@ class EsiIndex:
                     m = con.execute("SELECT ident, type FROM modules WHERE id = ?", (ref,)).fetchone()
                     it.update(module=m["type"], ident=_hx(m["ident"], 8))
                 items.append(it)
+            # variants: every hit with that title, counted over the whole index (not only the rows read)
+            expr = q if how == "fts" else '"' + q.replace('"', '""') + '"'
+            for (kind, title), it in groups.items():
+                n = con.execute("SELECT COUNT(*) FROM search WHERE search MATCH ? AND kind = ? AND title = ?",
+                                (expr, kind, title)).fetchone()[0]
+                if n > 1:
+                    it["variants"] = n
         out: dict[str, Any] = {"query": q, "kinds": want, "count": len(items), "items": items}
         if any(i.get("variants") for i in items):
             out["variants_note"] = ("variants: that many hits with the same title (revisions of one device type, or the "

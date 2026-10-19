@@ -728,6 +728,31 @@ async def test_debug_symbol_writers_respect_scope(monkeypatch, project_dir):
         assert "MAIN" in units and "FB_Other" not in units, d["writers"]
 
 
+@pytest.mark.anyio
+async def test_review_0812_a_bare_name_of_a_global_variable_is_in_scope_everywhere(monkeypatch, project_dir):
+    """Review 0.8.12: a variable of a GVL without {attribute 'qualified_only'} is reached by its bare name from every
+    unit that has no variable of that name — wf_debug_symbol dropped those writers and mentions (N111 had narrowed
+    a bare name to the declaring POU); an index expression in the qualifier (aFill[i + 1].x) is a qualifier."""
+    install(monkeypatch)
+    plc = project_dir / "Plc"
+    (plc / "GVLs" / "GVL_Free.TcGVL").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject Version="1.1.0.1"><GVL Name="GVL_Free" '
+        'Id="{00000000-0000-0000-0000-000000000081}"><Declaration><![CDATA[VAR_GLOBAL\n\tnShared : INT;\nEND_VAR\n]]>'
+        '</Declaration></GVL></TcPlcObject>')
+    for name, decl, impl in (("PRG_User", "PROGRAM PRG_User\nVAR\nEND_VAR\n", "nShared := nShared + 1;\nIF nShared > 5 THEN nShared := 0; END_IF"),
+                             ("FB_Own", "FUNCTION_BLOCK FB_Own\nVAR\n\tnShared : INT;\nEND_VAR\n", "nShared := 3;")):
+        (plc / "POUs" / f"{name}.TcPOU").write_text(
+            '<?xml version="1.0" encoding="utf-8"?><TcPlcObject Version="1.1.0.1"><POU Name="' + name + '" '
+            'Id="{00000000-0000-0000-0000-0000000000' + str(82 + len(name)) + '}"><Declaration><![CDATA[' + decl + ']]>'
+            '</Declaration><Implementation><ST><![CDATA[' + impl + ']]></ST></Implementation></POU></TcPlcObject>')
+    register_sources(plc / "Plc.plcproj")
+    srv = build_server(mk_cfg(project_dir, mode="readonly"))
+    async with client_for(srv) as s:
+        d = payload(await s.call_tool("wf_debug_symbol", {"symbol": "GVL_Free.nShared", "watch_ms": 0}))
+        assert {w["unit"] for w in d["writers"]} == {"PRG_User"}, d["writers"]
+        assert {m["unit"] for m in d["mentions"]} == {"PRG_User"}, d["mentions"]
+
+
 def test_env_override_of_toml_is_reported(tmp_path, monkeypatch):
     """N10: mode = "full" in the TOML silently lost to TCMCP_MODE from the plugin settings."""
     from twincat_mcp.config import load

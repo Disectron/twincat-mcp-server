@@ -571,11 +571,12 @@ class App:
         st = self.kb.esi_state()
         if (st.get("rebuild") or {}).get("state") == "running":
             return {"started": False, "already_running": st["rebuild"], "message": st["message"]}
-        if st["state"] == "complete" and not force:
+        if st["state"] == "complete" and not force and not st.get("rebuild"):
             return {"started": False, "up_to_date": True, "message": st["message"]}
-        folders = E.source_folders(loc, self.kb.esi_dirs)
-        if not E.xml_files(folders):
-            return {"started": False, "error": "no ESI files: no .xml in " + (", ".join(str(f) for f, _s in folders)
+        folders = E.source_folders(loc, self.kb.esi_dirs, E.recorded_twincat(L.index_file(loc, "esi")))
+        if not E.has_esi(E.xml_files(folders)):
+            return {"started": False, "error": "no ESI files: no .xml whose root is an ESI document (EtherCATInfo, "
+                    "EtherCATModule, EtherCATDict, EtherCATDiag) in " + (", ".join(str(f) for f, _s in folders)
                     or "the knowledge folder's manuals\\, and no TwinCAT ESI folder (Config\\Io\\EtherCAT) on this PC")
                     + " — copy the ESI files into manuals\\ or set knowledge.esi_dirs"}
         if dry_run:
@@ -602,7 +603,8 @@ class App:
         from . import esi_index as E
         from . import kb_layout as L
         loc = self.kb.location()[0]
-        if loc is None or L.index_file(loc, "esi").exists() or not E.xml_files(E.source_folders(loc, self.kb.esi_dirs)):
+        if loc is None or L.index_file(loc, "esi").exists() or \
+                not E.has_esi(E.xml_files(E.source_folders(loc, self.kb.esi_dirs))):
             return None
         st = self.kb.esi_state()
         if st["state"] != "missing" or (st.get("rebuild") or {}).get("state") == "running":
@@ -2145,14 +2147,22 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         size and offset, access, PDO mapping, backup/setting flags, the default (decoded from DefaultData, enum text
         when there is one), min/max, unit code, enumeration texts; array elements one by one. index: '#x8000' or
         '0x8000' (4 hex digits alone are read as hex). device: the exact type ('EL3356-0010')."""
-        return await app.kb_call(app.kb.hw_object, device, index, revision, timeout=60)
+        first = await asyncio.to_thread(app.esi_first_build)
+        res = await app.kb_call(app.kb.hw_object, device, index, revision, timeout=60)
+        if first:
+            res["esi_first_build"] = first
+        return res
 
     @mcp.tool(annotations=READ)
     async def hw_diag(code: str, device: str | None = None, revision: int | str | None = None) -> dict[str, Any]:
         """A diagnosis message by its text id as the diagnosis history shows it (object 0x10F3; '#x4101', '0x4101'):
         message text, description, causes and remedies, class, reaction, reset — from the device's own catalogue when
         `device` is given, else every distinct message with that id and the device types / modules that use it."""
-        return await app.kb_call(app.kb.hw_diag, code, device, revision, timeout=60)
+        first = await asyncio.to_thread(app.esi_first_build)
+        res = await app.kb_call(app.kb.hw_diag, code, device, revision, timeout=60)
+        if first:
+            res["esi_first_build"] = first
+        return res
 
     @mcp.tool(annotations=READ)
     async def hw_module(ident: str, device: str | None = None, revision: int | str | None = None) -> dict[str, Any]:
@@ -2160,7 +2170,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         it: PDOs, CoE objects, diagnosis messages. With `device`, the module that device's slot means (hw_lookup's
         rule: the device's own file, then the module file paired with it by name, then the only one), else every
         module with that ident."""
-        return await app.kb_call(app.kb.hw_module, ident, device, revision, timeout=60)
+        first = await asyncio.to_thread(app.esi_first_build)
+        res = await app.kb_call(app.kb.hw_module, ident, device, revision, timeout=60)
+        if first:
+            res["esi_first_build"] = first
+        return res
 
     async def tc_request_confirmation(action: str, target: str = "", args: dict[str, Any] | None = None) -> dict[str, Any]:
         act = (action or "").strip()

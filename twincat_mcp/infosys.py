@@ -674,9 +674,10 @@ def same_documents(rows: list[Any]) -> list[list[Any]]:
     Beckhoff page in several books: T_MaxString 31062795 in tcplclib_tc2_system and tf6510_tc3_iec61850), or the
     same library — compared without case, the books spell it both ways (Tc2_EtherCAT, Tc2_Ethercat) — and the same
     stored declaration (a page with none: the same text, link targets aside) — the answer is the same whichever is
-    read; a page that names no library, with the declaration of exactly one library's page, is that page's copy.
-    Groups and their rows in _doc_order."""
+    read; a page that names no library, with the declaration of exactly one library's page, is that page's copy. A
+    document has at most one page per book (a copy is in another book). Groups and their rows in _doc_order."""
     parent = list(range(len(rows)))
+    books = [{str(r["book"] or "").lower()} for r in rows]       # per group: the books it has a page of
 
     def find(i: int) -> int:
         while parent[i] != i:
@@ -684,7 +685,19 @@ def same_documents(rows: list[Any]) -> list[list[Any]]:
             i = parent[i]
         return i
 
-    seen: dict[tuple, int] = {}
+    def union(i: int, j: int) -> bool:
+        # a copy is in another book: two pages of one book are never one document (review 0.8.12 — two FBs'
+        # methods of one name and signature, both titled 'Reset', are two answers, not a page and its copy)
+        a, b = find(i), find(j)
+        if a == b:
+            return True
+        if books[a] & books[b]:
+            return False
+        parent[b] = a
+        books[a] |= books[b]
+        return True
+
+    seen: dict[tuple, list[int]] = {}
     libs_of: dict[str, set[str]] = {}
     for i, r in enumerate(rows):
         keys = [("pid", r["pid"])] if r["pid"] else []
@@ -698,16 +711,18 @@ def same_documents(rows: list[Any]) -> list[list[Any]]:
             if b:
                 keys.append(("text", (r["library"] or "").lower(), b))
         for k in keys:
-            if k in seen:
-                parent[find(i)] = find(seen[k])
-            else:
-                seen[k] = i
+            for j in seen.get(k, []):
+                if union(j, i):
+                    break
+            seen.setdefault(k, []).append(i)
     # a page that names no library joins the one library whose page shows the same declaration (a product's copy of a
     # library page: tc3_eventlogger next to tcplclib_tc3_eventlogger); with two such libraries it stays apart
     for i, r in enumerate(rows):
         d = _decl_text(r["decl"])
         if d and not r["library"] and len(libs_of.get(d, ())) == 1:
-            parent[find(i)] = find(seen[("decl", next(iter(libs_of[d])), d)])
+            for j in seen.get(("decl", next(iter(libs_of[d])), d), []):
+                if union(j, i):
+                    break
     groups: dict[int, list[Any]] = {}
     for i, r in enumerate(rows):
         groups.setdefault(find(i), []).append(r)
@@ -792,20 +807,37 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
 
     forms, defined = DS.code_definitions(con, query, sql, extra, body)
     copies: dict[int, list[tuple[str, str]]] = {}
+    seen = {"read": 0, "documents": 0}
 
     def arrange(rows: list[Any]) -> list[Any]:
+        seen["read"] = len(rows)
         ordered = DS.title_order(rows, query, "title")
         if defined:
             ids = {r["rid"] for r in defined}
             ordered = defined + [r for r in ordered if r["rid"] not in ids]
-        return _one_per_document(con, ordered, copies)
+        out = _one_per_document(con, ordered, copies)
+        seen["documents"] = len(out)
+        return out
 
     rows, total, mode, expr, info = DS.search_tiers(con, sql, count_sql, query, extra, limit, fts="pages_fts",
                                                     arrange=arrange)
+    outside = 0                                 # defining pages without the tier's words: listed, so counted
     if not rows and defined:                    # the code's table, though no tier found the query's other words
-        rows, total, mode = arrange([])[:limit], len(defined), "the code's table (no page has the other words)"
+        rows, total, mode = arrange([])[:limit], 0, "the code's table (no page has the other words)"
+        outside = len(defined)
+    elif defined and expr:
+        for r in defined:
+            try:
+                hit = con.execute("SELECT 1 FROM pages_fts WHERE rowid = ? AND pages_fts MATCH ?", (r["rid"], expr)).fetchone()
+            except sqlite3.Error:
+                hit = True
+            outside += 0 if hit else 1
+    total += outside
     ids = {r["rid"] for r in defined}
-    return {"rows": rows, "total": total, "mode": mode, "expr": expr, "info": info, "code": forms,
+    # more: hits not shown — more documents than `limit` among those read, or pages that were not read. `total`
+    # counts pages: a page in several books once per book (copies are listed once, with same_page_in)
+    more = seen["documents"] > len(rows) or total > seen["read"] + outside
+    return {"rows": rows, "total": total, "more": more, "mode": mode, "expr": expr, "info": info, "code": forms,
             "defined": sum(1 for r in rows if r["rid"] in ids),
             "copies": {r["rid"]: copies[r["rid"]] for r in rows if r["rid"] in copies}}
 
@@ -1917,9 +1949,10 @@ class InfosysIndex:
         if self.local is not None:
             backend += "+helpviewer"
         res = {"query": q, "backend": backend, "count": len(items), "items": items, **self._answer_meta()}
-        if last:
+        if last and backend.startswith("local"):     # (the web fallback's items are not of this search)
             res["query_mode"] = last["mode"]
-            res["total"] = last["total"]
+            res["total"] = last["total"]              # pages; a page in several books once per book
+            res["truncated"] = last["more"]
             for k in ("words_used", "words_ignored", "words_too_common"):
                 if last["info"].get(k):
                     res[k] = last["info"][k]

@@ -3241,15 +3241,19 @@ class Recorder:
                     if task:
                         why = "the task's cycle counter restarted (TwinCAT restart / RUN after CONFIG)"
                     elif ref is not None:
-                        restarts = 0
+                        restarts = kept = 0
                         for r in resets:
-                            k = _ref_delta(ref[1], r["t_ms"] - r["gap_ms"], r["t_ms"])
+                            k = _ref_delta(ref[1], ref[2], r["t_ms"] - r["gap_ms"], r["t_ms"])
                             r["task_cycle_counter"] = ("restarted too: a TwinCAT restart" if k is not None and k < 0 else
                                                        "kept counting: the program set it back" if k is not None and k > 0
                                                        else "no sample of it around this time")
                             restarts += 1 if k is not None and k < 0 else 0
+                            kept += 1 if k is not None and k > 0 else 0
                         why = (f"{restarts} with a TwinCAT restart (the task's cycle counter {ref[0]} restarted too), "
-                               f"{back - restarts} without (the program set it back, or not decidable — see resets)")
+                               f"{kept} set back by the program (the task's cycle counter went on), "
+                               f"{len(resets) - restarts - kept} not decidable (no sample of it around them)"
+                               + (f"; {back - len(resets)} more beyond the {len(resets)} listed were not assessed"
+                                  if back > len(resets) else ""))
                     else:
                         why = ("set back by the program, or by a TwinCAT restart — a program variable does not tell "
                                "which (record in cycle mode: the task's cycle counter is recorded with the data and "
@@ -3261,7 +3265,7 @@ class Recorder:
                         out["counter"]["note"] = (f"{dups} samples repeat the previous counter value: the task did not "
                                                   "run between them (PLC stopped / breakpoint) — frozen values, not new data")
                     elif ref is not None:
-                        ran = sum(1 for ta, tb in dup_pairs if (_ref_delta(ref[1], ta, tb) or 0) > 0)
+                        ran = sum(1 for ta, tb in dup_pairs if (_ref_delta(ref[1], ref[2], ta, tb) or 0) > 0)
                         out["counter"]["note"] = (
                             f"{dups} samples repeat the previous counter value: in {ran} of them the task ran (its cycle "
                             f"counter {ref[0]} went on — the program did not change this counter in that cycle), in "
@@ -3503,14 +3507,15 @@ class Recorder:
         return res
 
     @staticmethod
-    def _task_counter_series(path: Path, header: dict[str, Any]) -> tuple[str, list[tuple[float, int]]] | None:
-        """The task's own cycle counter recorded with the data (cycle mode, cycle_counter auto) as (name, [(t, v)])."""
+    def _task_counter_series(path: Path, header: dict[str, Any]) -> tuple[str, list[tuple[float, int]], list[float]] | None:
+        """The task's own cycle counter recorded with the data (cycle mode, cycle_counter auto) as (name, [(t, v)],
+        [t] — the times once, for _ref_delta)."""
         name = header.get("cycle_counter")
         if not name or not _TASK_COUNTER.search(name):
             return None
         series = [(t, int(rv)) for t, _n, v in iter_events(path, {name.lower()})
                   if isinstance(rv := _raw_val(v), (int, float)) and not isinstance(rv, bool)]
-        return (name, series) if len(series) >= 2 else None
+        return (name, series, [t for t, _v in series]) if len(series) >= 2 else None
 
     def _path_for(self, rid: str) -> Path:
         rec = self.recs.get(rid)
@@ -3528,11 +3533,10 @@ class Recorder:
 _TASK_COUNTER = re.compile(r"_TaskInfo\[\d+\]\.CycleCount$", re.I)
 
 
-def _ref_delta(series: list[tuple[float, int]], ta: float, tb: float) -> int | None:
+def _ref_delta(series: list[tuple[float, int]], ts: list[float], ta: float, tb: float) -> int | None:
     """How a reference counter changed from the last sample at or before ta to the first at or after tb (None: no
-    sample there)."""
+    sample there). ts: the series' times (built once by the caller: one call per duplicate, O(log n) each)."""
     import bisect
-    ts = [t for t, _v in series]
     i = bisect.bisect_right(ts, ta) - 1
     j = bisect.bisect_left(ts, tb)
     if i < 0 or j >= len(series):

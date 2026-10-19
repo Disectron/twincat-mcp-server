@@ -628,3 +628,109 @@ async def test_no_esi_files_no_build_and_said_before_asking(monkeypatch, project
         h = payload(await c.call_tool("hw_lookup", {"query": "EL2008"}))
         assert h["esi_index"]["state"] == "missing" and "esi_first_build" not in h
     assert not (kb / "index" / "esi.db").exists()
+
+
+def test_review_0812_a_replaced_description_leaves_nothing_behind(esi_kb):
+    """Review 0.8.12: a revision described by an older file and then replaced by a newer one (higher FileVersion,
+    read later) left the older description's objects in the index — hw_search found objects no device has, and the
+    counts included them."""
+    kb, tc, db = esi_kb
+    newer = EL33.format(vendor=VENDOR.format(fv=11)).replace("RMB Settings", "Bridge Settings")
+    _write(tc / "Beckhoff EL33xx.xml", newer)                       # read after manuals\: it replaces the fv-10 one
+    r = _build(esi_kb)
+    x = E.EsiIndex(db)
+    assert x.search("RMB", kinds=["object"])["items"] == []         # the replaced description's object is gone
+    hit = x.search("Bridge Settings", kinds=["object"])["items"]
+    assert hit and hit[0]["devices"]["count"] >= 1, hit
+    con = sqlite3.connect(db)
+    n_obj = con.execute("SELECT COUNT(*) FROM obj").fetchone()[0]
+    unused = con.execute("SELECT COUNT(*) FROM obj WHERE id NOT IN (SELECT obj_id FROM dict_obj)").fetchone()[0]
+    no_user = con.execute("SELECT COUNT(*) FROM dicts WHERE id NOT IN (SELECT dict_id FROM devices WHERE dict_id IS "
+                          "NOT NULL UNION SELECT dict_id FROM modules WHERE dict_id IS NOT NULL) AND origin NOT LIKE "
+                          "'%Dict.xml'").fetchone()[0]
+    con.close()
+    assert r["objects"] == n_obj and unused == 0 and no_user == 0, (r, n_obj, unused, no_user)
+
+
+def test_review_0812_a_work_file_next_to_a_current_index_is_discarded(esi_kb):
+    """Review 0.8.12: a .building left next to a complete, current index was reported 'interrupted — the next one
+    starts over' but no build ever removed it (the build returned up_to_date first)."""
+    kb, tc, db = esi_kb
+    _build(esi_kb)
+    building = E.side_files(db)[0]
+    building.write_bytes(db.read_bytes())                           # a finished, redundant build of the same files
+    st = E.state(db, kb, [tc], twincat=False)
+    assert st["state"] == "complete" and st["rebuild"]["state"] == "stale" and "discards it" in st["message"], st
+    r = _build(esi_kb)
+    assert r["result"] == "up_to_date" and r["discarded"] == str(building) and not building.exists()
+
+
+def test_review_0812_a_build_without_twincat_folders_stays_so(esi_kb, tmp_path, monkeypatch):
+    """Review 0.8.12: an index built with --no-twincat was reported OUTDATED on every PC with TwinCAT's ESI folders
+    (state() always counted them), and the next rebuild would have added them."""
+    kb, tc, db = esi_kb
+    fake_tc = tmp_path / "pd" / "Beckhoff" / "TwinCAT" / "3.1" / "Config" / "Io" / "EtherCAT"
+    _write(fake_tc / "Beckhoff EL1xxx.xml", TERMINALS.format(vendor=VENDOR.format(fv=1)).replace("EL1002", "EL1012"))
+    monkeypatch.setenv("ProgramData", str(tmp_path / "pd"))
+    assert fake_tc in E.twincat_esi_folders()
+    E.build(db, kb, [tc], twincat=False, log=lambda m: None)
+    assert E.recorded_twincat(db) is False
+    assert E.state(db, kb, [tc])["state"] == "complete"             # as built: TwinCAT's folders are not counted
+    assert E.build(db, kb, [tc], log=lambda m: None)["result"] == "up_to_date"
+    assert E.EsiIndex(db).lookup("EL1012")["matches"] == 0
+    E.build(db, kb, [tc], twincat=True, log=lambda m: None)         # asked for: read again
+    assert E.recorded_twincat(db) is True and E.EsiIndex(db).lookup("EL1012")["matches"] == 1
+
+
+def test_review_0812_counts_are_exact_and_input_is_literal(tmp_path):
+    """Review 0.8.12: hw_lookup's matches / more were of the first 200 rows; hw_search's variants of the rows read;
+    '%' and '_' in a query were LIKE wildcards; a hex number past 32 bits failed with an unmapped OverflowError."""
+    devs = "".join(f'<Device><Type ProductCode="#x00001234" RevisionNo="#x{r:08x}">EL9{r % 3}00</Type>'
+                   f'<Name LcId="1033">EL9{r % 3}00 Test terminal</Name></Device>' for r in range(1, 251))
+    m = tmp_path / "kb" / "manuals"
+    _write(m / "Beckhoff EL9xxx.xml", f'<?xml version="1.0"?><EtherCATInfo>{VENDOR.format(fv=1)}<Descriptions>'
+           f'<Devices>{devs}</Devices></Descriptions></EtherCATInfo>')
+    db = tmp_path / "kb" / "index" / "esi.db"
+    E.build(db, tmp_path / "kb", [], twincat=False, log=lambda m: None)
+    x = E.EsiIndex(db)
+    r = x.lookup("Test terminal", limit=5)
+    assert r["matches"] == 250 and r["types"] == ["EL9000", "EL9100", "EL9200"], r
+    assert r["more"].startswith("245 more")
+    assert x.lookup("#x00001234", limit=5)["matches"] == 250
+    assert x.lookup("EL9_00")["matches"] == 0                       # '_' is the character, not any character
+    s = x.search("Test terminal", kinds=["device"], limit=2)
+    assert {i["variants"] for i in s["items"]} == {84, 83}, s        # 250 revisions over 3 types, all counted
+    for bad in (lambda: x.lookup("#xFFFFFFFFFFFFFFFFFFF"), lambda: x.lookup("EL9000", revision="#x1FFFFFFFF"),
+                lambda: x.object("EL9000", "#x123456")):
+        with pytest.raises(E.EsiError, match="out of range"):
+            bad()
+
+
+def test_review_0812_every_profile_of_a_device_is_read(tmp_path):
+    """Review 0.8.12: the ESI schema allows several Profile elements (one per channel); only the first was read.
+    Their dictionaries are joined; an object two profiles give differently is named, the first one's kept."""
+    def prof(ch, objs):
+        o = "".join(f'<Object><Index>#x{i:04x}</Index><Name>{n}</Name><Type>UINT</Type><BitSize>16</BitSize>'
+                    f'<Flags><Access>rw</Access></Flags></Object>' for i, n in objs)
+        return (f"<Profile><ProfileNo>402</ProfileNo><ChannelNo>{ch}</ChannelNo><Dictionary><Objects>{o}</Objects>"
+                "</Dictionary></Profile>")
+    dev = ('<Device><Type ProductCode="#x1" RevisionNo="#x1">AX9002</Type><Name LcId="1033">AX9002 two axes</Name>'
+           + prof(1, [(0x1018, "Identity"), (0x6040, "Controlword")])
+           + prof(2, [(0x1018, "Identity"), (0x6840, "Controlword axis 2"), (0x6040, "Other")]) + "</Device>")
+    m = tmp_path / "kb" / "manuals"
+    _write(m / "Beckhoff AX9xxx.xml", f'<?xml version="1.0"?><EtherCATInfo>{VENDOR.format(fv=1)}<Descriptions>'
+           f'<Devices>{dev}</Devices></Descriptions></EtherCATInfo>')
+    db = tmp_path / "kb" / "index" / "esi.db"
+    E.build(db, tmp_path / "kb", [], twincat=False, log=lambda m: None)
+    d = E.EsiIndex(db).lookup("AX9002", detail="full")["devices"][0]
+    assert d["coe_count"] == 3 and d["dictionary_conflicts"] == ["#x6040"], d
+    assert [p["channel_no"] for p in d["profiles"]] == [1, 2]
+    assert E.EsiIndex(db).object("AX9002", "#x6840")["name"] == "Controlword axis 2"
+
+
+def test_review_0812_xml_that_is_no_esi_starts_no_first_build(tmp_path):
+    files = [(_write(tmp_path / "manuals" / "export.xml", "<?xml version='1.0'?><PlcProjectExport/>"), "knowledge")]
+    assert not E.has_esi(files)
+    files.append((_write(tmp_path / "manuals" / "a.xml", f"<?xml version='1.0'?><EtherCATInfo>{VENDOR.format(fv=1)}"
+                         "</EtherCATInfo>"), "knowledge"))
+    assert E.has_esi(files)

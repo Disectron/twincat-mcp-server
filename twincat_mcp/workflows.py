@@ -7,6 +7,7 @@ other backends; gating of writes/destructive steps stays in the server.
 from __future__ import annotations
 
 import asyncio
+import re as _re
 import time
 from typing import Any
 
@@ -17,30 +18,37 @@ from .project_backend import ProjectError
 from .safety import OpClass
 
 
+# the qualifier in front of a name: `fbFill.`, `aFill[i + 1].`, `pFill^.`, `THIS^.` (an index may hold anything but ']')
+_QUAL = r"((?:\w+(?:\s*\[[^\]]*\])*\s*\^?\s*\.\s*)*)"
+
+
+def _qual_names(q: str) -> list[str]:
+    import re as _re
+    return [x.lower() for x in _re.findall(r"(\w+)(?:\s*\[[^\]]*\])*\s*\^?\s*\.", q or "")]
+
+
 def _classify_write(line: str, leaf: str, segs: list[str]) -> str | None:
     """'assignment' / 'output_binding' / 'named_input_parameter' (fb(x := y) — a read of y) / None (a different
     variable with the same leaf name, e.g. other.x := … when the symbol is MAIN.fb.x)."""
     import re as _re
     code = _re.sub(r"//.*$|\(\*.*?\*\)", "", line)
-    for m in _re.finditer(rf"=>\s*((?:[\w\[\]^]+\.)*){_re.escape(leaf)}\b", code, _re.I):
+    for m in _re.finditer(rf"=>\s*{_QUAL}{_re.escape(leaf)}\b", code, _re.I):
         # N111: `Q => x` binds this symbol only when unqualified in its scope, or qualified by a suffix of its path
-        quals = [x.split("[")[0].rstrip("^").lower() for x in m.group(1).split(".") if x]
+        quals = _qual_names(m.group(1))
         if not quals:
             return "output_binding_unqualified"
         if _qualifier_matches(quals + [leaf.lower()], segs):
             return "output_binding"
-    for m in _re.finditer(rf"([\w\[\]^]+\.)*\b{_re.escape(leaf)}\b(\[[^\]]*\])?\s*:=", code, _re.I):
-        start = m.start()
-        qual = code[start:m.start() + len(m.group(0))].split(":=")[0].strip()
-        parts = [x.split("[")[0].rstrip("^") for x in qual.split(".")]
-        before = code[:start].rstrip()
+    for m in _re.finditer(rf"{_QUAL}\b{_re.escape(leaf)}\b(?:\s*\[[^\]]*\])*\s*:=", code, _re.I):
+        parts = _qual_names(m.group(1)) + [leaf.lower()]
+        before = code[:m.start()].rstrip()
         if len(parts) == 1 and before.endswith(("(", ",")):
             return "named_input_parameter"
         if len(parts) > 1:
             # qualified: the qualifier must be a suffix of the symbol's own path (fbFill.bDone for MAIN.fbFill.bDone)
-            if not _qualifier_matches([x.lower() for x in parts], segs):
+            if not _qualifier_matches(parts, segs):
                 continue
-            return "assignment_unqualified" if parts[0].lower() in ("this", "super") else "assignment"
+            return "assignment_unqualified" if parts[0] in ("this", "super") else "assignment"
         return "assignment_unqualified"
     return None
 
@@ -59,8 +67,8 @@ def mention_kind(line: str, leaf: str, segs: list[str]) -> str | None:
     import re as _re
     code = _re.sub(r"//.*$|\(\*.*?\*\)|'[^']*'|\"[^\"]*\"", "", line)
     found = None
-    for m in _re.finditer(rf"((?:[\w\[\]^]+\.)*)\b{_re.escape(leaf)}\b", code, _re.I):
-        quals = [x.split("[")[0].rstrip("^").lower() for x in m.group(1).split(".") if x]
+    for m in _re.finditer(rf"{_QUAL}\b{_re.escape(leaf)}\b", code, _re.I):
+        quals = _qual_names(m.group(1))
         if not quals:
             found = found or "unqualified"
         elif _qualifier_matches(quals + [leaf.lower()], segs):
@@ -71,13 +79,37 @@ def mention_kind(line: str, leaf: str, segs: list[str]) -> str | None:
     return found
 
 
-def _in_scope(app, unit_name: str, declared_in: str | None) -> bool:
+_QUALIFIED_ONLY = _re.compile(r"\{\s*attribute\s+'qualified_only'\s*\}", _re.I)
+
+
+def _declares(app, unit_name: str, leaf: str) -> bool:
+    """Does this unit — a POU, or a method / action / property of one — or a function block it extends declare a
+    variable `leaf` (which a bare `leaf` there then means)?"""
+    units = app.proj.units
+    names = [unit_name.lower()]
+    if "." in unit_name:
+        names.append(unit_name.split(".")[0].lower())
+    for n in list(names):
+        u = units.get(n)
+        if u is not None:
+            names += [a.name.lower() for a in codecheck._ancestors(app.proj, u)]
+    return any(v.name.lower() == leaf.lower() for n in names if (u := units.get(n)) is not None for v in u.vars)
+
+
+def _in_scope(app, unit_name: str, declared_in: str | None, leaf: str | None = None) -> bool:
+    """Does a bare `leaf` in unit_name mean the symbol declared in `declared_in`? Declared in a POU: in that POU, its
+    methods / actions and the function blocks that extend it. Declared in a GVL without {attribute 'qualified_only'}:
+    in every unit that does not declare a `leaf` of its own (review 0.8.12 — MAIN's bare nCount of GVL.nCount was
+    dropped); with qualified_only: nowhere (a bare name cannot reach it)."""
     if not declared_in or not unit_name:
         return True
     owner = unit_name.split(".")[0].lower()
     if owner == declared_in.split(".")[0].lower():
         return True
     try:
+        d = app.proj.units.get(declared_in.split(".")[0].lower())
+        if d is not None and d.kind == "GVL":
+            return not _QUALIFIED_ONLY.search(d.declaration or "") and not (leaf and _declares(app, unit_name, leaf))
         u = app.proj.units.get(owner)
         return bool(u is not None and any(a.name.lower() == declared_in.lower() for a in codecheck._ancestors(app.proj, u)))
     except Exception:  # noqa: BLE001
@@ -109,7 +141,7 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
             if kind in ("assignment_unqualified", "output_binding_unqualified"):
                 # N3: a bare `x :=` (or `Q => x`) writes the x in scope of that unit — only a writer if that unit (or
                 # one derived from it) declares this symbol's x; FB_Counter.OnReset's nCount is not MAIN.nCount
-                if not _in_scope(app, h.get("unit", ""), declared_in):
+                if not _in_scope(app, h.get("unit", ""), declared_in, leaf):
                     continue
                 kind = kind.replace("_unqualified", "")
             h["kind"] = kind
@@ -133,7 +165,7 @@ async def debug_symbol(app, symbol: str, watch_ms: int = 1500, context_lines: in
         def names_it(unit: str, text: str) -> bool:
             # N111: FB_CounterModule's own nCount is not MAIN.nCount — a bare name counts only in the symbol's scope
             k = mention_kind(text, leaf, segs)
-            return k == "qualified" or (k == "unqualified" and _in_scope(app, unit, declared_in))
+            return k == "qualified" or (k == "unqualified" and _in_scope(app, unit, declared_in, leaf))
         impl_mentions = [h for h in mentions["hits"] if h["part"] == "implementation"
                          and names_it(h.get("unit", ""), h.get("text", ""))]
         rep["writers"] = writers["hits"][:30]

@@ -597,3 +597,9 @@ def test_n100_one_page_in_two_books_is_one_answer_and_every_reader_agrees(idx):
     assert idx.declaration("F_GetVersionTcUtilities")["url"] == f"{C}tcplclib_tc2_utilities/99.html"
     with idx._db() as con:
         assert [[r["book"] for r in g] for g in symbol_documents(con, "t_maxstring")] == [["tcplclib_tc2_system", "tf6510_tc3_iec61850"]]
+
+
+def test_review_0812_a_web_answer_carries_no_fts_counts(idx, monkeypatch):
+    """Review 0.8.12: when the web fallback answered, total / query_mode described the empty local search."""
+    r = idx.search("technology data SAF")
+    assert r["backend"] == "duckduckgo+sitemap" and "total" not in r and "query_mode" not in r, r
