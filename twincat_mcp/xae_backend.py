@@ -121,6 +121,14 @@ def sta_teardown() -> None:  # pragma: no cover
         pythoncom.CoUninitialize()
 
 
+def _norm_sol(p: str | None) -> str:
+    """A solution path as compared — as Windows treats it (case and separators do not matter; XAE runs on Windows
+    only, so the rule does not depend on the platform the tests run on); '' for none."""
+    import ntpath
+    p = str(p or "").strip()
+    return ntpath.normcase(ntpath.normpath(p)) if p else ""
+
+
 class XaeBackend:
     def __init__(self, cfg: XaeConfig):
         self.cfg = cfg
@@ -131,6 +139,11 @@ class XaeBackend:
         self._sysman_project_name: str | None = None
         self.pid: int | None = None
         self.watchdog = DialogWatchdog(cfg.dialog_rules)
+        # N116 (0.8.12 retest, S1): the solution this server works on — xae.solution_path, else the one named in
+        # xae_attach(solution_path=…) / xae_open_solution, else the one open when it attached. Every call checks that
+        # the shell still has it: closed → refused (never another solution), reopened → found again in the ROT.
+        self.bound_solution: str | None = cfg.solution_path or None
+        self.reattach_note: str | None = None
 
     # ------------------------------------------------------------ helpers
     def _require_win(self) -> None:
@@ -168,7 +181,7 @@ class XaeBackend:
                         # the solution was closed and reopened (or the shell restarted): find the live shell and retry once
                         self._reattaching = True
                         try:
-                            self.attach()
+                            self.attach(_internal=True)
                             log.warning("%s: DTE proxy was dead (0x%08X); re-attached to the running shell and retrying", what, hr & 0xFFFFFFFF)
                             return fn()
                         except Exception as exc2:  # noqa: BLE001
@@ -204,8 +217,67 @@ class XaeBackend:
 
     def _need(self) -> Any:
         if self.dte is None:
-            self.attach()
+            self.attach(_internal=True)
+        else:
+            self._check_bound()
         return self.dte
+
+    def _check_bound(self, raise_: bool = True) -> str | None:
+        """N116: is the bound solution the one open in the attached shell? If not, the shell that has it now (the
+        ROT) is attached instead; none has it → XaeError (raise_) / the reason — nothing acts on another solution."""
+        want = _norm_sol(self.bound_solution)
+        if not want or self.dte is None:
+            return None
+        try:
+            cur = str(self.dte.Solution.FullName or "")
+        except Exception:  # noqa: BLE001 — a dead proxy: the call itself reports it (and re-attaches, _retry)
+            return None
+        if _norm_sol(cur) == want:
+            return None
+        try:
+            cands = self._rot_candidates()
+        except Exception:  # noqa: BLE001
+            cands = []
+        match = [c for c in cands if c.get("solution") and _norm_sol(c["solution"]) == want]
+        if match:
+            self._take(match[0])
+            self.reattach_note = (f"{self.bound_solution} is open in another XAE shell now (or was reopened) — "
+                                  f"re-attached to it ({match[0].get('moniker') or match[0].get('progid')})")
+            log.warning("N116: %s", self.reattach_note)
+            return None
+        why = (f"the solution this server works on, {self.bound_solution}"
+               + (" (xae.solution_path)" if _norm_sol(self.cfg.solution_path) == want else "")
+               + f", is not open: the attached shell has {cur or 'no solution'}"
+               + (f"; open in the other shells: {others}" if (others := [c.get('solution') or '(none)' for c in cands
+                                                                         if c.get('dte') is not self.dte]) else "")
+               + " — nothing was done. Open it in XAE again (the tools find it by themselves), or "
+                 "xae_attach(solution_path=…) to work on another solution")
+        if raise_:
+            raise XaeError(why)
+        return why
+
+    def _take(self, pick: dict[str, Any]) -> None:
+        """Attach to one ROT candidate (or a launched shell): DTE, progid, pid for the dialog watchdog."""
+        self.dte, self.progid = pick["dte"], pick["progid"]
+        self.sysman = None
+        self.attached_at = time.time()
+        self.pid = None
+        if pick.get("moniker") and ":" in pick["moniker"]:
+            try:
+                self.pid = int(pick["moniker"].rsplit(":", 1)[1])
+            except ValueError:
+                self.pid = None
+        if self.pid is None and sys.platform == "win32":
+            # launched via Dispatch (no ROT moniker): take the pid from the shell's main window, so the
+            # dialog watchdog has a process scope — without one it deliberately watches nothing
+            try:
+                import win32process  # type: ignore
+                hwnd = int(self.dte.MainWindow.HWnd)
+                self.pid = int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
+            except Exception as exc:  # noqa: BLE001
+                log.warning("XAE pid unknown (%s); dialog watchdog disabled until re-attach", exc)
+        if self.cfg.dialog_watchdog:
+            self.watchdog.start(self.pid)
 
     @staticmethod
     def _stale_sysman(exc: BaseException) -> bool:
@@ -215,8 +287,8 @@ class XaeBackend:
         return hr == E_POINTER or (hr == DISP_E_EXCEPTION and (scode == E_POINTER or "pointer" in str(info).lower()))
 
     def _sm(self) -> Any:
+        self._need()                       # N116: the bound solution, checked on every call
         if self.sysman is None:
-            self._need()
             self._find_sysman()
         else:
             # N9: a solution closed and reopened behind us leaves the cached System Manager stale — compare the
@@ -259,26 +331,46 @@ class XaeBackend:
         return out
 
     def attach(self, progid: str | None = None, solution_path: str | None = None,
-               launch: bool | None = None) -> dict[str, Any]:
+               launch: bool | None = None, _internal: bool = False, _for_open: bool = False) -> dict[str, Any]:
+        """Attach to the shell that has the solution: solution_path (explicit — it becomes the solution this server
+        works on), else xae.solution_path, else (an internal re-attach) the bound one, else the one open in the only
+        shell. N116: a named or configured solution that no shell has is never replaced by another one — refused (or
+        a shell launched with it, launch=true); several shells with different solutions and none named: refused."""
         self._require_win()
-        want_sol = (solution_path or self.cfg.solution_path or "")
-        want_sol_norm = os.path.normcase(os.path.abspath(want_sol)) if want_sol else ""
+        explicit = bool(solution_path)
+        want_sol = solution_path or (self.bound_solution if _internal else None) or self.cfg.solution_path or ""
+        want_sol_norm = _norm_sol(want_sol)
         cands = [c for c in self._rot_candidates() if not progid or c["progid"] == progid]
+        order = {p: i for i, p in enumerate(self.cfg.progids)}
+        cands.sort(key=lambda c: order.get(c["progid"], 99))
         pick = None
         if want_sol_norm:
             for c in cands:
-                if c["solution"] and os.path.normcase(os.path.abspath(c["solution"])) == want_sol_norm:
+                if c["solution"] and _norm_sol(c["solution"]) == want_sol_norm:
                     pick = c
                     break
-        if pick is None and cands:
-            # prefer the configured progid order
-            order = {p: i for i, p in enumerate(self.cfg.progids)}
-            cands.sort(key=lambda c: order.get(c["progid"], 99))
-            pick = cands[0]
+            if pick is None and _for_open:
+                # xae_open_solution: a shell with no solution open takes it (the solution is opened into it next)
+                pick = next((c for c in cands if not str(c["solution"] or "").strip()), None)
+        else:
+            sols = {_norm_sol(c["solution"]) for c in cands if c["solution"]}
+            if len(sols) > 1:
+                raise XaeError(f"{len(cands)} XAE shells with different solutions are open "
+                               f"({[c['solution'] or '(none)' for c in cands]}) and xae.solution_path is not set — "
+                               "nothing was chosen. xae_attach(solution_path=…) with the one to work on, or set "
+                               "xae.solution_path in twincat_mcp.toml")
+            if cands:
+                pick = cands[0]
         launched = False
         if pick is None:
             do_launch = (not self.cfg.attach_only) if launch is None else launch
             if not do_launch:
+                if want_sol_norm and cands:
+                    raise XaeError(
+                        f"the solution {want_sol} is not open in any XAE shell (open: "
+                        f"{[c['solution'] or '(no solution)' for c in cands]}) — nothing was attached: the tools would act "
+                        "on another project and target. Open it in XAE, or xae_attach(launch=true) to start a shell with it, "
+                        "or xae_attach(solution_path=…) to work on another solution.")
                 raise XaeError(
                     "No running XAE shell / Visual Studio with TwinCAT found in the ROT "
                     f"(looked for {list(self.cfg.progids)}). Open the solution in XAE, or call "
@@ -295,26 +387,7 @@ class XaeBackend:
                     last = exc
             if pick is None:
                 raise XaeError(f"could not launch any of {list(self.cfg.progids)}: {last}")
-        self.dte, self.progid = pick["dte"], pick["progid"]
-        self.sysman = None
-        self.attached_at = time.time()
-        self.pid = None
-        if pick.get("moniker") and ":" in pick["moniker"]:
-            try:
-                self.pid = int(pick["moniker"].rsplit(":", 1)[1])
-            except ValueError:
-                self.pid = None
-        if self.pid is None and sys.platform == "win32":
-            # launched via Dispatch (no ROT moniker): take the pid from the shell's main window, so the
-            # dialog watchdog has a process scope — without one it deliberately watches nothing
-            try:
-                import win32process  # type: ignore
-                hwnd = int(self.dte.MainWindow.HWnd)
-                self.pid = int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
-            except Exception as exc:  # noqa: BLE001
-                log.warning("XAE pid unknown (%s); dialog watchdog disabled until re-attach", exc)
-        if self.cfg.dialog_watchdog:
-            self.watchdog.start(self.pid)
+        self._take(pick)
         if launched:
             try:
                 self.dte.SuppressUI = False
@@ -322,19 +395,36 @@ class XaeBackend:
                 self.dte.UserControl = True  # keep alive when we release
             except Exception:  # noqa: BLE001
                 pass
-            if want_sol:
+        if want_sol:
+            self.bound_solution = want_sol
+            if launched and not _for_open:
                 self.open_solution(want_sol)
-        elif want_sol and pick["solution"] and os.path.normcase(os.path.abspath(pick["solution"])) != want_sol_norm:
-            pass  # attached to a shell with a different solution; status() will show it
+        elif str(pick.get("solution") or "").strip():
+            self.bound_solution = pick["solution"]       # the only one open: from now on this one, no other
         info = self.status()
         info["launched"] = launched
         info["candidates"] = [{"progid": c["progid"], "solution": c["solution"], "moniker": c["moniker"]} for c in cands]
+        if explicit and self.cfg.solution_path and _norm_sol(solution_path) != _norm_sol(self.cfg.solution_path):
+            info["solution_mismatch"] = True
+            info["solution_note"] = (f"attached to {solution_path}, not the configured xae.solution_path "
+                                     f"({self.cfg.solution_path}) — every xae_* tool works on {solution_path} until "
+                                     "xae_attach() without a path")
         return info
 
     def status(self) -> dict[str, Any]:
         if self.dte is None:
             return {"attached": False, "platform": sys.platform, "progids": list(self.cfg.progids)}
+        not_open = self._check_bound(raise_=False)        # N116: re-attaches when it is open in a shell again
         d: dict[str, Any] = {"attached": True, "progid": self.progid}
+        if self.bound_solution:
+            d["solution_bound"] = self.bound_solution
+        if self.reattach_note:
+            d["reattached"] = self.reattach_note
+            self.reattach_note = None
+        if not_open:
+            d["solution_mismatch"] = True
+            d["bound_solution_open"] = False
+            d["refused"] = not_open
         try:
             d["dte_version"] = self._retry(lambda: self.dte.Version, "DTE.Version")
             d["edition"] = self._retry(lambda: self.dte.Edition, "DTE.Edition")
@@ -396,10 +486,14 @@ class XaeBackend:
 
     # ------------------------------------------------------------ solution
     def open_solution(self, path: str) -> dict[str, Any]:
-        dte = self._need()
         if not os.path.isfile(path):
             raise XaeError(f"solution not found: {path}")
-        self._retry(lambda: dte.Solution.Open(path), "Solution.Open")
+        if self.dte is None:
+            self.attach(solution_path=path, _for_open=True)
+        dte = self.dte
+        if _norm_sol(str(dte.Solution.FullName or "")) != _norm_sol(path):
+            self._retry(lambda: dte.Solution.Open(path), "Solution.Open")
+        self.bound_solution = path                        # N116: the solution asked for is the one worked on
         self.sysman = None
         # wait for projects to load
         for _ in range(120):

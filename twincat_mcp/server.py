@@ -4183,14 +4183,20 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def xae_attach(progid: str | None = None, solution_path: str | None = None,
                          launch: bool | None = None) -> dict[str, Any]:
-        """Attach to the running XAE shell / Visual Studio (Running Object Table). Picks the
-        instance holding solution_path when given. launch=true starts a new shell (slow)."""
+        """Attach to the running XAE shell / Visual Studio (Running Object Table) that has the solution: solution_path
+        when given (from then on every xae_* tool works on it — flagged solution_mismatch when it is not
+        xae.solution_path), else xae.solution_path. A solution no shell has open is never replaced by another one
+        (refused, or launch=true starts a shell with it); several shells with different solutions and none named or
+        configured: refused. If the solution is closed later, every xae_* tool refuses until it is open again (in any
+        shell — they find it by themselves)."""
         return await app.xae_call(app.xae.attach, progid, solution_path, launch, timeout=180)
 
     @mcp.tool(annotations=READ)
     async def xae_status() -> dict[str, Any]:
         """Shell version, open solution, projects, TwinCAT project name, target NetId, started flag.
-        Attaches to the shell first if not attached yet (as every xae_* tool does)."""
+        Attaches to the shell first if not attached yet (as every xae_* tool does). solution_bound: the solution the
+        xae_* tools work on; solution_mismatch / refused: it is not open (they refuse); reattached: it was found in
+        a shell again."""
         def _st():
             if app.xae.dte is None:
                 try:

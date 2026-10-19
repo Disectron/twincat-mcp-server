@@ -1074,3 +1074,69 @@ def test_n97_replace_is_done_in_place_and_a_removed_object_is_never_silent(xae, 
                               dup("PRG_TcUnitRunner"))
     with pytest.raises(X.XaeError, match=r"removed 2 existing object\(s\) from their place.*re-created elsewhere"):
         be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+
+
+def _two_shells(monkeypatch, cfg):
+    """Two XAE shells: Project15.sln (pid 1) and DrumFillingMachine.sln (pid 2), as in the 0.8.12 retest."""
+    be = X.XaeBackend(cfg)
+    monkeypatch.setattr(be, "_require_win", lambda: None)
+    monkeypatch.setattr(be, "_dte2", lambda: None)
+    sm1, sm2 = FakeSysMan(), FakeSysMan()
+    sm2.net = "5.166.17.133.1.1"
+    d1, d2 = FakeDTE(sm1), FakeDTE(sm2)
+    d1.Solution.FullName, d2.Solution.FullName = r"C:\P\Project15.sln", r"C:\D\DrumFillingMachine.sln"
+    shells = [("!TcXaeShell.DTE.17.0:1", d1), ("!TcXaeShell.DTE.17.0:2", d2)]
+    monkeypatch.setattr(be, "_rot_candidates", lambda: [
+        {"progid": "TcXaeShell.DTE.17.0", "moniker": m, "dte": d, "solution": d.Solution.FullName} for m, d in shells])
+    return be, d1, d2, shells
+
+
+def test_n116_a_closed_solution_is_never_replaced_by_another(monkeypatch):
+    """N116 (0.8.12 retest, S1): two shells; the configured Project15.sln was closed — the next xae_status answered
+    for DrumFillingMachine.sln and another target, without a word, and stayed there after Project15 was reopened.
+    Now: closed → every call refused, status says so; reopened (in the same or another shell) → found again."""
+    be, d1, d2, shells = _two_shells(monkeypatch, XaeConfig(com_retry_s=0.3, solution_path=r"C:\P\Project15.sln"))
+    assert be.attach()["target_net_id"] == "5.1.2.3.1.1" and be.dte is d1
+    d1.Solution.FullName = ""                                       # File → Close Solution in shell 1
+    st = be.status()
+    assert st["solution_mismatch"] and st["bound_solution_open"] is False and be.dte is d1, st
+    assert "Project15.sln" in st["refused"] and "DrumFillingMachine" in st["refused"]
+    with pytest.raises(X.XaeError, match="is not open: the attached shell has no solution; open in the other shells: .*Drum.* — nothing was done"):
+        be.tree_item("TIPC")
+    assert be.dte is d1                                             # never DrumFillingMachine
+    d1.Solution.FullName = r"C:\P\Project15.sln"                    # reopened in the same shell
+    assert be.tree_item("TIPC") and be.status().get("solution_mismatch") is None
+    d1.Solution.FullName = ""                                       # closed, then opened in a third shell
+    sm3 = FakeSysMan()
+    sm3.net = "5.1.2.3.1.1"
+    d3 = FakeDTE(sm3)
+    d3.Solution.FullName = r"c:\p\PROJECT15.sln"                    # Windows: case does not matter
+    shells.append(("!TcXaeShell.DTE.17.0:3", d3))
+    st = be.status()
+    assert be.dte is d3 and "re-attached" in st["reattached"] and st["target_net_id"] == "5.1.2.3.1.1", st
+
+
+def test_n116_attach_never_falls_back_and_unconfigured_never_guesses(monkeypatch):
+    be, d1, d2, shells = _two_shells(monkeypatch, XaeConfig(com_retry_s=0.3, solution_path=r"C:\P\Elsewhere.sln"))
+    with pytest.raises(X.XaeError, match=r"Elsewhere.sln is not open in any XAE shell .*nothing was attached"):
+        be.attach()
+    assert be.dte is None
+    # explicitly another solution: allowed, flagged, and from then on that one
+    info = be.attach(solution_path=r"C:\D\DrumFillingMachine.sln")
+    assert be.dte is d2 and info["solution_mismatch"] and "not the configured" in info["solution_note"]
+    assert be.bound_solution == r"C:\D\DrumFillingMachine.sln"
+    # nothing configured, two solutions open: nothing chosen
+    be2, *_ = _two_shells(monkeypatch, XaeConfig(com_retry_s=0.3))
+    with pytest.raises(X.XaeError, match="2 XAE shells with different solutions are open .*nothing was chosen"):
+        be2.attach()
+    be2.attach(solution_path=r"C:\P\Project15.sln")
+    assert be2.bound_solution == r"C:\P\Project15.sln"
+
+
+def test_n116_a_dead_proxy_reattaches_to_the_bound_solution_only(monkeypatch):
+    be, d1, d2, shells = _two_shells(monkeypatch, XaeConfig(com_retry_s=0.3))
+    be.attach(solution_path=r"C:\D\DrumFillingMachine.sln")
+    shells[:] = [shells[0]]                                         # shell 2 exits: only Project15 is left
+    be.dte = None                                                   # (what _retry does on RPC_E_DISCONNECTED)
+    with pytest.raises(X.XaeError, match=r"DrumFillingMachine.sln is not open in any XAE shell"):
+        be._need()
