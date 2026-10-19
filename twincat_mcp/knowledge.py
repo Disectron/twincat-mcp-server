@@ -1295,11 +1295,15 @@ SHIPPED_BUILDERS: dict[str, dict[str, str]] = {
         "057677fad71344f574eaa97104d1e47ec8e556db5aa9341333abeab3e8990ebe": "3",   # 1200fee (TCMCP_STUB_DIR)
         "7f65bb454e0e57975ca5227fafce3b8db444dbcc334c990ab1da8359272fa341": "4",   # release 0.8.10
         "cb18f84dd247bd5451cabb10055879c5210702a739cb1719d90fe42e85de66f8": "5",   # release 0.8.11
+        "fda439492e2533cbc075ea8451aa135deaf04342ef5782c703b3c203a8de3808": "6",   # release 0.8.12
     },
-    "esi_db.py": {},                                                                # new in 0.8.12
+    "esi_db.py": {
+        "724ab1d168c1ebcf8551b873335327b501153003d55ff12bfadc4f3287bbd49e": "1",   # release 0.8.12 (new)
+    },
 }
 SHIPPED_STUBS: dict[str, str] = {
     "6eb88af57099b2610da38becf909609829ed9c69d015cb98800e0740a86c9adf": "1",       # 1200fee … release 0.8.11
+    "220e8968ce5e629771024c610214d1849d1e1ee4d99543227c96089bff7bf511": "2",       # release 0.8.12
 }
 
 

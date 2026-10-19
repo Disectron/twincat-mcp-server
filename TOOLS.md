@@ -1,4 +1,4 @@
-# twincat-mcp 0.8.11 — tool reference
+# twincat-mcp 0.8.12 — tool reference
 
 160 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 

@@ -28,6 +28,10 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| 0.8.12 | ESI index first build on the real knowledge folder (`manuals\Beckhoff_EtherCAT_XML`, ≈ 230 AX5000 dictionaries, and TwinCAT's `Config\Io\EtherCAT`) | starts by itself at server start; `kb_status` → esi complete, devices / files / `missing_refs` count 0 (all Dict files present); time and size of `index\esi.db`; `hw_lookup EL3356-0010` (PDOs, assignments, DC), `hw_object AX5206-0000-0216 #x…` (a drive parameter from the Dict file), `hw_diag #x4101 device=…`, `hw_module` of an AX8000 slot |
+| 0.8.12 | Infosys format 5 / manuals format 5: approve `kb_rebuild(index='infosys')` and `kb_rebuild(index='manuals')` | `infosys_declaration MEMCPY` → Function, return UDINT; `LREAL_TO_FMTSTR` → STRING(510); `Attribute 'linkalways'` → Page; `docs_declaration T_MaxString` and `ADSREAD` answer directly (same as `infosys_declaration`); `docs_search "tcp client connect socket"` → FB_SocketConnect first; `docs_search 0x745` → the ADS return-code table first, `same_page_in` lists its copies |
+| 0.8.12 | `kb_search` on the retest project after `kb_reindex()` (the search table is rebuilt from the stored units) | `search_table` in the answer once; "alarm text" → FB_AlarmList; "EXTENDS FB_ModuleBase" → FB_CounterModule first, comment-only matches marked `match_in: comments` |
+| 0.8.12 | N107 / N110 / N106 live: `rec_compare` of two native recordings, `ipc_eventlog`, `proj_*` on the project with `retest_plcopen\` backups | rec_compare answers; the event log is read (boot folder resolved); the backups are in `not_in_project`, not units |
 | 0.8.11 | layout move on the real knowledge folder (first server start after the update) | `index\` holds `knowledge.db`, `manuals.db`, `infosys-1033.db` (renamed from `knowledge.db`, `manualsdb\`, `infosys\helpviewer-1033\index.sqlite`), `index\README.md`; `kb_status` → `layout.obsolete_files` lists `helpviewer\infosys_en.db` (≈ 288 MB), nothing deleted; your `manuals\`, `sop\`, `tools\*OLD.py` untouched |
 | 0.8.11 | Infosys format 4: the moved index reads `rebuild_needed`, answers as it is; `kb_rebuild(index='infosys')` approved | before approval no build starts (also across a restart); after: `tc_doctor` → rebuild running with pages done, the old index answers meanwhile, then `complete`, format 4; time and size of the build; on Windows the swap while the server reads (`replaced`, or `waiting_to_replace` → swapped at the next start) |
 | 0.8.11 | N77 / N79 on the real index: `infosys_declaration FB_WG_ComboFilter`, a property with a linked type; `docs_search "how to a the"` | property `type` plain text + `type_ref`; the stop-word query refused like `kb_search` |
@@ -71,11 +75,10 @@ tool wishlist (2026-10-18).
 - `D:\TwinCAT-MCP\knowledge\sop\scope\ScopeAI.cs` — the real property names, before `scope_add_channel` /
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
-- Retest of 0.8.11 (the 0.8.11 rows above; approve the Infosys and manuals rebuilds to format 4; delete
+- Retest of 0.8.12 (the 0.8.12 rows above; approve the Infosys and manuals rebuilds to format 5).
+- Retest of 0.8.11 (the 0.8.11 rows above; the format-4 rebuilds are superseded by format 5; delete
   `helpviewer\infosys_en.db` when you like).
 - Retest of 0.8.10 (N38, R40, N41, N42/N40/N69, R24, N37/N66, N64/N68, N65, N67, N46, N39/N47–N55, N56–N63, and the review fixes: recorder blocks with < 2 samples, Python stop_when end, dump names, restart proof without a counter reset = "cannot tell"; the hardware rows above).
-- D19 (ESI PDOs read empty): the PDOs are template references (`Ref="TxEL3xxNComplex10-10V"`, `Chn`); the template
-  definition's format is unknown here — the ESI file that holds it (e.g. `C:\TwinCAT\3.1\Config\Io\EtherCAT\Beckhoff EL31xx.xml`).
 
 ## Decided (wishlist 2026-10-18)
 
@@ -104,7 +107,6 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 | #45 | Check all objects did not run — 0.8.7 calls `ITcPlcIECProject2.CheckAllObjects` first (unverified, above) |
 | SOP indexing | `sop\*.md` listed by `kb_status`, not searchable yet (decided: index them; wishlist above) |
 | R32 (part) | Infosys "T_Ams NetId" table split — joined when the index is built since 0.8.11 (format 4; 0.8.9 joined it when a page was read), verified in the 0.8.9 retest; the cause in the raw HTML is still not seen |
-| D19 | ESI PDOs that are template references (`Ref=…`, `Chn`) are not resolved — waiting on the ESI file |
 | #49 / N9 | stale System Manager after solution reopen (partly fixed) |
 | #79 | modal dialog raised by the command itself |
 | launcher POSIX | on Linux / macOS a directory rename succeeds while a server runs from it, so a replaced venv (`.old-*`) can be removed under another window's server; on Windows the rename fails and the venv stays (N46). Windows is the target platform |
@@ -112,7 +114,7 @@ Not built yet: everything marked "build" / "fold" / "index" / "reads" below, and
 
 ### From the 0.8.3 deep test
 
-All items fixed up to 0.8.7 except D5 and D19 (waiting on Ryan, above).
+All items fixed: up to 0.8.7, D5 in 0.8.11, D19 (ESI PDO templates) in 0.8.12.
 
 ## On hold
 
