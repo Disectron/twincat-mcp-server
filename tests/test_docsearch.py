@@ -52,6 +52,22 @@ def test_titles_that_name_the_query_come_first():
     assert D.title_order(rows, "ADSREAD xyzqq")[0]["title"] == "ADSREAD"      # exactly a query word, before a prefix
 
 
+
+def test_n105_the_library_names_query_words_too():
+    """N105 (0.8.12 retest): 'EtherCAT slave state' — every candidate's title names 'slave state' only; 'EtherCAT' is
+    the library's (Tc2_EtherCAT.FB_EcGetSlaveState). Title words first, then title and library together: the
+    Tc2_EtherCAT symbols come before a manual page that only says 'slave' and 'state'."""
+    rows = [{"title": "State Machine Slave Settings", "library": None},
+            {"title": "FB_EcSetSlaveState", "library": "Tc2_EtherCAT"},
+            {"title": "FB_EcGetSlaveState", "library": "Tc2_EtherCAT"}]
+    got = [r["title"] for r in D.title_order(rows, "EtherCAT slave state", "title", "library")]
+    assert got[-1] == "State Machine Slave Settings", got
+    assert [r["title"] for r in D.title_order(rows, "EtherCAT slave state")][0] == "State Machine Slave Settings"
+    # the title still counts first: a title with more of the words beats a library match
+    rows.append({"title": "EtherCAT slave state machine", "library": None})
+    assert D.title_order(rows, "EtherCAT slave state", "title", "library")[0]["title"] == "EtherCAT slave state machine"
+
+
 def _page(title, body):
     return html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
 
