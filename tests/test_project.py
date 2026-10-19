@@ -521,6 +521,11 @@ def test_n113_review_readers_never_pick_one_of_two_silently(tmp_path):
     assert {it["path"] for it in v["items"]} == {"MAIN.n", "MAIN.x.vPlc2"} and "note" not in v
     v = p.variables()
     assert {"MAIN.x.vPlc1", "MAIN.x.vPlc2"} <= {it["path"] for it in v["items"]} and "several PLC projects" in v["note"]
+    assert v["ambiguous_roots"] == ["MAIN"]
+    # the file -> PLC project memo is dropped with a new published index
+    c1 = p._cache()
+    p.scan()
+    assert p._cache() is not c1
 
 
 def test_n113_review_an_unresolved_tsproj_reference_keeps_every_plc_project(tmp_path):

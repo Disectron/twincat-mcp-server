@@ -352,6 +352,9 @@ def _merge_checks(outs: list[tuple[str | None, dict[str, Any]]]) -> dict[str, An
     sev = {"error": 0, "warning": 1, "info": 2}
     if isinstance(merged.get("items"), list) and all(isinstance(x, dict) and "severity" in x for x in merged["items"]):
         merged["items"].sort(key=lambda f: (sev.get(f["severity"], 3), f.get("file") or "", f.get("line") or 0))
+    if isinstance(merged.get("items"), list) and len(merged["items"]) > 1000:
+        merged["items_shown"] = f"1000 of {len(merged['items'])} (the most severe first)"
+        merged["items"] = merged["items"][:1000]
     return merged
 
 
@@ -911,9 +914,22 @@ class App:
         plc = p.plc_project(port=port or self.ads.port)
         return PlcView(p, plc) if plc is not None else p
 
-    def proj_view_of_file(self, file: str) -> ProjectIndex:
+    def proj_view_map(self) -> Any:
+        """A function file -> the view of its PLC project, the views built once (in the worker thread that calls this)."""
         p = self.proj
-        return p if not p.duplicates else PlcView(p, p._plc_of(file))
+        p._ensure()
+        if not p.duplicates:
+            return lambda _f: p
+        views: dict[str | None, ProjectIndex] = {}
+
+        def of(f: str) -> ProjectIndex:
+            plc = p.plc_of_file(f)
+            if plc not in views:
+                views[plc] = PlcView(p, plc)
+            return views[plc]
+        for f in list(p._by_file):
+            of(f)
+        return of
 
     async def proj_check(self, fn, name: str | None, *a: Any) -> dict[str, Any]:
         """A codecheck analysis fn(index, name, *a) on the views of proj_views: one result, or the results of each PLC
@@ -1586,6 +1602,9 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
     max_items = max(int(max_items), 1)
     proj = await app.proj_call(app.proj.variables, scope, 64, max_items, False, port=app.ads.port)
     src_cut = bool(proj.get("truncated"))
+    # review of N113: roots declared in several PLC projects whose port maps to none — both sources are walked, so a
+    # variable of the other PLC project would read as 'missing online': those roots are not judged
+    ambiguous = {r.lower() for r in proj.get("ambiguous_roots") or []}
     declared = {it["path"].lower(): it for it in proj["items"] if "[*]" not in it["path"]}
     # source arrays are declared once as x[*].y — the runtime has one leaf per element: match by pattern
     templates = {it["path"].lower(): it for it in proj["items"] if "[*]" in it["path"]}
@@ -1638,7 +1657,7 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
     missing_final += [templates[k] for k in tmpl_keys if k not in tmpl_hit]
     # D23: a verdict needs both sides complete. A declared item under a root whose online list was cut (or could not
     # be read) is not "missing", and with the source list cut no online leaf can be called "extra".
-    blind = online_cut | {u.lower() for u in unreadable}
+    blind = online_cut | {u.lower() for u in unreadable} | ambiguous
     not_judged_missing = [it for it in missing_final if it["path"].split(".")[0].lower() in blind]
     missing_final = [it for it in missing_final if it["path"].split(".")[0].lower() not in blind]
     extra_raw = []
@@ -1676,6 +1695,8 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
                        f"{len(not_judged_missing)} declared items under them not judged")
         if unreadable:
             why.append(f"online symbols of {unreadable} could not be read: their declared items are not judged")
+        if ambiguous:
+            why.append(f"{proj.get('note')} — their declared items are not judged")
         out["not_judged"] = {"missing_candidates": len(not_judged_missing), "extra_candidates": not_judged_extra,
                              "reason": "; ".join(why) + ". Raise max_items or narrow with scope= for a full verdict."}
     if len(missing_final) > cap or len(extra) > cap:
@@ -2924,6 +2945,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         cycle_ms, a suggested mode per leaf, and — when checklist='<name>' — writes
         ~/.twincat_mcp/profiles/<name>.checklist.csv with a 'select' column to mark (preselect =
         patterns already marked). Then rec_profile_save(name, from_checklist=name)."""
+        src_note: str | None = None
         if source == "runtime":
             leaves = await app.ads_call(_scan_runtime, prefix, pattern, max_items, timeout=300, slow=True)
         elif source == "project":
@@ -2933,6 +2955,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             leaves = [{"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")}
                       for it in pv["items"] if "[*]" not in it["path"]
                       and (rx is None or path_selected(rx, it["path"]))][:max_items]
+            src_note = pv.get("note")
         else:
             raise ToolError("source must be runtime | project")
         if not leaves:
@@ -2958,6 +2981,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                "items": [{"path": lf["path"], "type": lf["type"], "size": lf.get("size"), "suggested_mode": capture.suggest_mode(lf["type"]),
                                           **({"attrs": lf["attrs"]} if lf.get("attrs") else {})} for lf in leaves[:show]],
                                "truncated_items": len(leaves) > show}
+        if src_note:
+            res["source_note"] = src_note
         if checklist:
             path = app.profiles.checklist_path(checklist)
             await asyncio.to_thread(path.write_text, capture.build_checklist(leaves, cycle_ms, preselect), "utf-8")
@@ -3007,6 +3032,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             src.append("checklist")
         if from_attributes:
             pv = await app.proj_call(app.proj.variables, scope, 64, 200_000, False, port=app.ads.port)
+            if pv.get("note"):
+                raise ToolError(f"from_attributes: {pv['note']} — which PLC project's attributes to take is not known; "
+                                "connect to the PLC project's ADS port (ads_connect) or pass scope='<file-substring>@<name>'")
             try:
                 found = capture.items_from_attributes(pv["items"], cycle_ms)
             except capture.ProfileError as exc:
@@ -3789,13 +3817,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             except ToolError:
                 continue
         declared = None
+        src_note = None
         if check_source:
             try:
                 pv = await app.proj_call(app.proj.variables, None, 64, 200_000, False, port=app.ads.port)
-                declared = {it["path"].lower() for it in pv["items"] if "[*]" not in it["path"]}
+                src_note = pv.get("note")
+                declared = None if src_note else {it["path"].lower() for it in pv["items"] if "[*]" not in it["path"]}
             except ToolError:
                 declared = None
-        return await asyncio.to_thread(app.hmi.compare, online, declared)
+        res = await asyncio.to_thread(app.hmi.compare, online, declared)
+        if src_note and isinstance(res, dict):
+            res["source_not_checked"] = f"{src_note} — the source was not compared"
+        return res
 
 
 
@@ -4358,7 +4391,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         def _st():
             if app.xae.dte is None:
                 try:
-                    app.xae.attach()
+                    app.xae.attach(_internal=True)      # the bound solution first, as every other xae_* call (_need)
                 except XaeError as exc:
                     return {"attached": False, "reason": str(exc)}
             return app.xae.status()

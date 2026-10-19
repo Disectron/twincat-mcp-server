@@ -739,7 +739,7 @@ class Knowledge:
             except Exception as exc:  # noqa: BLE001
                 out.append({"project": r["path"], "error": str(exc)})
                 continue
-            units = [u for u in idx.units.values() if u.kind != "PARSE_ERROR"]
+            units = [u for u in idx.all_units() if u.kind != "PARSE_ERROR"]     # both MAINs of two PLC projects
             with self._db() as con:
                 con.execute("DELETE FROM units WHERE project=?", (r["path"],))
                 if self._fts:

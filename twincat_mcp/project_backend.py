@@ -367,7 +367,7 @@ class ProjectIndex:
         self.units: dict[str, CodeUnit] = {}      # lower-case name -> unit
         self.duplicates: dict[str, list[str]] = {}  # lower-case name -> files when the same name exists twice
         self._by_file: dict[str, dict[str, CodeUnit]] = {}   # N113: file -> its units (names in two files both kept)
-        self._plc_cache: tuple[Any, dict[Any, tuple[dict[str, CodeUnit], set[str]]]] | None = None
+        self._plc_cache: tuple[Any, Any, dict[Any, tuple[dict[str, CodeUnit], set[str]]], dict[str, str | None]] | None = None
         self.files: dict[str, float] = {}         # path -> mtime
         self.solutions: list[str] = []
         self.tsproj: list[str] = []
@@ -622,7 +622,7 @@ class ProjectIndex:
         if changed or added or removed:
             self._publish(ix)                         # published whole (N88)
         self.scanned_at = time.time()
-        return {"changed": changed, "added": added, "removed": removed, "units": len(self.units)}
+        return {"changed": changed, "added": added, "removed": removed, "units": len(self.all_units())}
 
     def reindex_file(self, p: Path) -> None:
         """Re-index one file now (after an edit): its units replaced, the index published whole (N88). Raises
@@ -999,6 +999,7 @@ class ProjectIndex:
         self._ensure()
         roots: list[CodeUnit]
         note = None
+        twice: list[str] = []
         if scope:
             u0 = self.named(scope, port) if scope.strip().lower() in self.duplicates else None
             roots = [u0 if u0 is not None else self.get_unit(scope)]
@@ -1039,6 +1040,7 @@ class ProjectIndex:
                "roots": [r.name for r in roots], "items": items}
         if note:
             out["note"] = note
+            out["ambiguous_roots"] = twice
         return out
 
     def _emit(self, path: str, type_str: str, u: CodeUnit, v: VarDecl, depth: int, seen: tuple[str, ...],
@@ -1178,24 +1180,39 @@ class ProjectIndex:
         another PLC project declares the same names — and the names declared twice within it. Cached per published
         index (N88: a scan or refresh publishes a new _by_file, which drops the cache)."""
         by_file = self._by_file                       # a published snapshot (N88)
-        cache = self._plc_cache
-        if cache is None or cache[0] is not by_file:
-            cache = self._plc_cache = (by_file, {})
-        hit = cache[1].get(plc)
+        cache = self._cache()
+        hit = cache[2].get(plc)
         if hit is not None:
             return hit
         units: dict[str, CodeUnit] = {}
         dup: set[str] = set()
         for f, us in by_file.items():
-            if self._plc_of(f) != plc:
+            if self.plc_of_file(f) != plc:
                 continue
             for k, u in us.items():
                 prev = units.get(k)
                 if prev is not None and prev.file != f and u.kind != "PARSE_ERROR":
                     dup.add(k)
                 units[k] = u
-        cache[1][plc] = (units, dup)
+        cache[2][plc] = (units, dup)
         return units, dup
+
+    def _cache(self) -> tuple[Any, Any, dict[Any, tuple[dict[str, CodeUnit], set[str]]], dict[str, str | None]]:
+        """Memo of this published index (review: _plc_of resolves the path on every call — a variables() walk with
+        names in two PLC projects made tens of thousands of resolve() calls). Keyed on the published _by_file and
+        _members objects, so a scan's new index or new compile lists drop it."""
+        by_file, members = self._by_file, self._members
+        c = self._plc_cache
+        if c is None or c[0] is not by_file or c[1] is not members:
+            c = self._plc_cache = (by_file, members, {}, {})
+        return c
+
+    def plc_of_file(self, f: str) -> str | None:
+        """_plc_of for an indexed file, memoised per published index."""
+        memo = self._cache()[3]
+        if f not in memo:
+            memo[f] = self._plc_of(f)
+        return memo[f]
 
     def all_units(self) -> list[CodeUnit]:
         """Every unit of every file — a name declared in two PLC projects is listed twice (the name -> unit view holds
@@ -1208,7 +1225,7 @@ class ProjectIndex:
         if not self.duplicates or near is None:
             return self.units
         f = near.file if isinstance(near, CodeUnit) else str(near)
-        return self.plc_units(self._plc_of(f))[0]
+        return self.plc_units(self.plc_of_file(f))[0]
 
     def named(self, name: str, port: int | None = None) -> CodeUnit | None:
         """The unit of this name as the runtime on ADS `port` has it: the PLC project the .tsproj gives that port, when
@@ -1390,7 +1407,7 @@ class PlcView(ProjectIndex):
         self.__dict__.update(idx.__dict__)
         self._parent = idx
         self.plc = plc
-        by_file = {f: us for f, us in idx._by_file.items() if idx._plc_of(f) == plc}
+        by_file = {f: us for f, us in idx._by_file.items() if idx.plc_of_file(f) == plc}
         ix = _Index(by_file, {f: m for f, m in idx.files.items() if f in by_file})
         self.units, self.duplicates = ix.merged()
         self._by_file, self.files = by_file, ix.files
@@ -1421,7 +1438,7 @@ def plc_projects_declaring(idx: ProjectIndex, name: str) -> list[str | None]:
     out: list[str | None] = []
     for f, us in idx._by_file.items():
         if key in us and (pin is None or pin.lower() in f.lower()):
-            plc = idx._plc_of(f)
+            plc = idx.plc_of_file(f)
             if plc not in out:
                 out.append(plc)
     return out

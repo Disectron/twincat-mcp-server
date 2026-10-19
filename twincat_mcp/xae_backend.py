@@ -150,6 +150,7 @@ class XaeBackend:
         # the shell still has it: closed → refused (never another solution), reopened → found again in the ROT.
         self.bound_solution: str | None = cfg.solution_path or None
         self.reattach_note: str | None = None
+        self.bound_check_failed: str | None = None
 
     # ------------------------------------------------------------ helpers
     def _require_win(self) -> None:
@@ -231,6 +232,7 @@ class XaeBackend:
     def _check_bound(self, raise_: bool = True) -> str | None:
         """N116: is the bound solution the one open in the attached shell? If not, the shell that has it now (the
         ROT) is attached instead; none has it → XaeError (raise_) / the reason — nothing acts on another solution."""
+        self.bound_check_failed = None
         want = _norm_sol(self.bound_solution)
         if not want or self.dte is None:
             return None
@@ -238,9 +240,10 @@ class XaeBackend:
             # through _retry: a busy shell (call rejected) is asked again, a dead proxy re-attaches to the bound one —
             # never skipped (review: any COM error passed the check, a solution switch in progress among them)
             cur = str(self._retry(lambda: self.dte.Solution.FullName, "Solution.FullName") or "")
-        except XaeError:
+        except XaeError as exc:
             if raise_:
                 raise
+            self.bound_check_failed = str(exc)           # review: a dead / busy shell is said, not read as 'open'
             return None
         if self.dte is None:
             return None
@@ -436,7 +439,14 @@ class XaeBackend:
         if self.dte is None:
             return {"attached": False, "platform": sys.platform, "progids": list(self.cfg.progids)}
         not_open = self._check_bound(raise_=False)        # N116: re-attaches when it is open in a shell again
+        failed = getattr(self, "bound_check_failed", None)
+        if self.dte is None:                              # the shell went away and no re-attach was possible
+            return {"attached": False, "platform": sys.platform, "progids": list(self.cfg.progids),
+                    **({"solution_bound": self.bound_solution} if self.bound_solution else {}),
+                    "reason": failed or "the XAE shell is not reachable"}
         d: dict[str, Any] = {"attached": True, "progid": self.progid}
+        if failed:
+            d["solution_check_error"] = failed           # which solution the shell has could not be read
         if self.bound_solution:
             d["solution_bound"] = self.bound_solution
         if self.reattach_note:

@@ -1170,3 +1170,16 @@ def test_n116_review_a_runtime_bound_solution_is_kept_by_status_and_attach(monke
     e1.Solution.FullName = ""
     be2.attach()
     assert be2.dte is e2 and be2.bound_solution == r"C:\D\DrumFillingMachine.sln"
+
+
+def test_n116_second_review_status_keeps_an_explicit_solution_over_the_configured_one(monkeypatch):
+    """Second review: xae_status attached without the bound solution's precedence — configured A, xae_attach(B), B's
+    shell gone, A open: xae_status silently rebound to A. Its attach is internal now: B is refused, nothing rebound."""
+    be, d1, d2, shells = _two_shells(monkeypatch, XaeConfig(com_retry_s=0.3, solution_path=r"C:\P\Project15.sln"))
+    be.attach(solution_path=r"C:\D\DrumFillingMachine.sln")
+    shells[:] = [shells[0]]                                         # DrumFillingMachine's shell gone, Project15 open
+    be.dte = None
+    with pytest.raises(X.XaeError, match=r"DrumFillingMachine.sln is not open in any XAE shell"):
+        be.attach(_internal=True)                                   # what xae_status does now
+    assert be.bound_solution == r"C:\D\DrumFillingMachine.sln"
+    assert be.attach()["solution_bound"] == r"C:\P\Project15.sln"  # xae_attach() without a path: back to the config

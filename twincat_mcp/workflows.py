@@ -332,10 +332,11 @@ async def project_overview(app) -> dict[str, Any]:
     scan = await app.proj_call(app.proj.scan)
     rep: dict[str, Any] = {"index": {k: scan[k] for k in ("root", "files", "units", "by_kind", "plcproj", "duplicate_names")}}
     progs = await app.proj_call(app.proj.list_units, "PROGRAM", None, 50)
+    view_of = await app.proj_call(app.proj_view_map)          # N113: one view per PLC project, built off the event loop
     rep["programs"] = []
     for pr in progs["units"]:
         try:
-            g = await app.proj_call(codecheck.call_graph, app.proj_view_of_file(pr["file"]), pr["name"], 3)
+            g = await app.proj_call(codecheck.call_graph, view_of(pr["file"]), pr["name"], 3)
             rep["programs"].append({"name": pr["name"], "file": pr["file"], "calls": [n["name"] for n in g["nodes"][1:] if not n.get("repeat")][:40]})
         except Exception:  # noqa: BLE001
             rep["programs"].append({"name": pr["name"], "file": pr["file"]})
@@ -343,7 +344,7 @@ async def project_overview(app) -> dict[str, Any]:
     rep["function_blocks"] = []
     for fb in fbs["units"][:60]:
         try:
-            i = await app.proj_call(codecheck.fb_interface, app.proj_view_of_file(fb["file"]), fb["name"])
+            i = await app.proj_call(codecheck.fb_interface, view_of(fb["file"]), fb["name"])
             rep["function_blocks"].append({"name": fb["name"], "extends": i["extends"], "implements": i["implements"],
                                            "inputs": [v["name"] for v in i["inputs"]], "outputs": [v["name"] for v in i["outputs"]],
                                            "methods": [m["name"] for m in i["methods"]], "file": fb["file"]})
