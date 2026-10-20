@@ -107,11 +107,16 @@ class XaeError(RuntimeError):
     pass
 
 
-class _ActedUnconfirmed(XaeError):
+class XaeExplained(XaeError):
+    """An error the plugin composed with its own cause and what to do — not annotated with a known-error note (review
+    of 0.8.14: '… the project is logged in, application …' got 'XAE is logged in … log out first' appended)."""
+
+
+class _ActedUnconfirmed(XaeExplained):
     """A PLC online command was accepted but its state was not read back: it may have acted — never retried elsewhere."""
 
 
-class _NeedsLogin(XaeError):
+class _NeedsLogin(XaeExplained):
     """Start / Stop / Reset asked of a project that is not logged in: refused before any route runs it."""
 
 
@@ -214,7 +219,7 @@ class XaeBackend:
                     finally:
                         self._refreshing_sm = False
                 msg = _com_msg(exc)
-                if "logged into" in msg.lower() or "logged in" in msg.lower():
+                if re.search(r"(?<!not )(?<!n't )logged in(?:to)?\b", msg, re.I):     # not 'is not logged in'
                     msg += " — XAE is logged in to the PLC; the project cannot be changed online. Log out first: xae_plc('logout')."
                 raise XaeError(f"{what}: {msg}") from exc
 

@@ -104,7 +104,7 @@ def _convert_fix(a: str, b: str) -> str:
 KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [(re.compile(p, re.I), c, f) for p, c, f in [
     # N70: the TwinCAT compiler's messages, by their text (the C-numbers differ between builds; the text does not).
     # First: their quoted names may contain anything the broader patterns below look for ('bLicenseOk')
-    (r"identifier '([^']+)' (?:is )?not defined|identifier ([A-Za-z_][\w.]*) (?:is )?not defined",
+    (r"identifier '([^']+)' (?:is )?not defined|identifier (?!(?:is|was|not)\b)([A-Za-z_][\w.]*) (?:is )?not defined",
      "'{1}' is not declared where it is used: a typo, a variable declared in another POU or GVL without the "
      "qualifier, a library that is not referenced, or a namespace / qualified_only GVL ('GVL.{1}')",
      "proj_search {1} (this project) / kb_search {1} (added folders) show where it is declared; declare it, qualify "
@@ -112,7 +112,7 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [(re.compile(p, re.I), c,
     (r"cannot convert type '([^']+)' to type '([^']+)'",
      "IEC 61131-3 has no implicit conversion from {1} to {2} here",
      _convert_fix),
-    (r"unknown type:? '([^']+)'|unknown type:? ([A-Za-z_][\w.]*)",
+    (r"unknown type:? '([^']+)'|unknown type: ([A-Za-z_][\w.]*)",
      "the type '{1}' is not known to the compiler: a typo, a DUT not in the project, or a library not referenced",
      "kb_search {1} / infosys_declaration {1} shows where it comes from; add the DUT or the library"),
     (r"0x98110724|2551252772|\blicen[cs]es?\b",
@@ -124,7 +124,7 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [(re.compile(p, re.I), c,
     (r"0x800706ba|-2147023174|rpc server is unavailable|disconnected \(closed",
      "the XAE shell was closed/reopened or crashed; the COM proxy is dead",
      "the next xae_* call re-attaches by itself; if not, xae_attach"),
-    (r"logged into|logged in",
+    (r"(?<!not )(?<!n't )logged in(?:to)?\b",
      "XAE is logged in to the PLC; the project cannot be changed online",
      "xae_plc('logout'), make the change, build, log in again"),
 ]]
@@ -203,22 +203,31 @@ def unit_words(name: str, declaration: str, implementation: str) -> tuple[str, s
     return " ".join(DS.ident_words(name)), " ".join(DS.ident_words(idents)), code
 
 
+# a code word right before the number: 'error 1861', 'error code 7', 'nErrId := 1808', 'error number 1861'
+_CODE_WORD = r"(?:error|fehler|err|errid|nerrid|errorid|nerrorid|errorcode|nerrorcode)(?:[\s_-]*(?:code|number|id|no\.?))?"
 _ADS_CODE = re.compile(r"\bads[\s_-]*(?:error|fehler|err)\b[\s:#=-]*(?:code[\s:#=-]*)?(0x[0-9a-f]+|\d+)"
-                       r"|\berror[\s_-]*code[\s:#=-]*(0x[0-9a-f]+|\d+)", re.I)
+                       r"|\b" + _CODE_WORD + r"\b[\s:#=-]*(0x[0-9a-f]+|\d+)\b"
+                       r"|\badserror\b\s*:[^\n()]{0,160}\((\d+)\)", re.I)          # pyads: 'ADSError: … (1808).' 
 _HEX = re.compile(r"\b0x([0-9a-f]{1,8})\b", re.I)
 _ADS_WORD = re.compile(r"\bads(?:\b|error|err\b|fehler)", re.I)      # 'ADS', 'ADSError' — not 'ads_write_raw'
 _ADS_HRESULT = re.compile(r"\b0x9811([0-9a-f]{4})\b", re.I)            # the ADS facility of an HRESULT
-_SYMBOL = re.compile(r"\b(?:ADSERR|ERR)_[A-Z0-9_]+\b")
+_SYMBOL = re.compile(r"\bADSERR_[A-Z0-9_]+\b|\bERR_[A-Z]+NOTFOUND\b")    # case as Beckhoff writes them
 _NUMBER = r"(?:0x[0-9a-f]+|16#[0-9a-f_]+|\d+)"
 # N129 / N130: what makes a query an error message — a code in a notation that says so, a code word right next to a
 # number, an HRESULT, an ADS symbol, a compiler message (its number or its text), or a number that is the whole query.
 # Not the word 'error' alone ('error handler' is a search in code), not a bare hex number anywhere ('nCycleCount 0x705')
+# Not the word 'error' alone ('error handler' is a search in code), not a bare hex number anywhere ('nCycleCount
+# 0x705'), not a decimal or 16# number alone ('851', '16#FF' are literals of the code), not an identifier that begins
+# with err_ / ERR_ (review: 'ERR_TIMEOUT' of an enum, 'err_count'), not a Beckhoff model number ('C6015': compiler
+# messages are C0xxx)
 _ERROR_MESSAGE = re.compile(
     r"\bads[\s_-]*(?:error|err|fehler)\b[\s:#=-]*" + _NUMBER +
-    r"|\b(?:error|fehler|err|errid|nerrid|errorid|errorcode|code)\b[\s:#=-]*" + _NUMBER + r"\b"
-    r"|\b0x[89a-f][0-9a-f]{7}\b|\b(?:ADSERR|ERR)_[A-Z0-9_]+\b|\bC\d{4}\b"
-    r"|identifier\s+'?[A-Za-z_][\w.]*'?\s+(?:is\s+)?not\s+defined|cannot convert type|unknown type"
-    r"|^\s*" + _NUMBER + r"\s*$", re.I)
+    r"|\b(?:" + _CODE_WORD + r"|code)\b[\s:#=-]*" + _NUMBER + r"\b"
+    r"|\badserror\b\s*:[^\n()]{0,160}\(\d+\)"
+    r"|\b0x[89a-f][0-9a-f]{7}\b|\bC0\d{3}\b"
+    r"|identifier\s+'[^']+'\s+(?:is\s+)?not\s+defined|identifier\s+(?!(?:is|was|not)\b)[A-Za-z_][\w.]*\s+(?:is\s+)?not\s+defined"
+    r"|cannot convert type\s+'|unknown type:?\s*'|unknown type:\s*[A-Za-z_]"
+    r"|^\s*0x[0-9a-f]+\s*$", re.I)
 
 
 def message_names(q: str) -> list[str]:
@@ -229,7 +238,7 @@ def message_names(q: str) -> list[str]:
     out = [t for t in re.findall(r"'([A-Za-z_][\w.]*)'", q) if t.upper() not in IEC_WORDS]
     rest = re.sub(r"'[^']*'", " ", q)
     for t in re.findall(r"(?<![\w#.])[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", rest):
-        if t.upper() in IEC_WORDS or _SYMBOL.fullmatch(t) or re.fullmatch(r"C\d{4}|0x[0-9a-f]+", t, re.I):
+        if t.upper() in IEC_WORDS or _SYMBOL.fullmatch(t) or re.fullmatch(r"C0\d{3}|0x[0-9a-f]+", t, re.I):
             continue
         if ("." in t or re.match(r"[a-z]+[A-Z0-9]", t) or re.search(r"[A-Za-z0-9]_[A-Za-z0-9]", t)
                 or (re.search(r"\d", t) and re.search(r"[A-Za-z]{2}", t))):
@@ -240,7 +249,7 @@ def message_names(q: str) -> list[str]:
 def is_error_message(q: str) -> bool:
     """kb_search: is the query an error message (its cause / fix in known_error, only its names searched in the code)
     rather than words of the code?"""
-    return bool(_ERROR_MESSAGE.search(q or "")) or _hresult_dec(q or "") is not None
+    return bool(_ERROR_MESSAGE.search(q or "") or _SYMBOL.search(q or "")) or _hresult_dec(q or "") is not None
 
 
 def _hresult_dec(msg: str) -> int | None:
@@ -271,15 +280,16 @@ def ads6_context(port: int | None, mode: str | None) -> dict[str, str]:
 
 def _ads_codes(msg: str) -> list[int]:
     """The ADS return codes a message names, the most explicit first: 'ADSError 1861' (pyads), 'ADS error 1861',
-    'ADS-Error: 0x745', 'error code 1861' (about ADS, or an ADS device error 0x700–0x7FF), an ADS HRESULT
-    (0x98110745, or in decimal), an ADS symbol (ADSERR_CLIENT_SYNCTIMEOUT), a number that is the whole message; then
+    'ADS-Error: 0x745', pyads' 'ADSError: symbol not found (1808)', 'error 1861' / 'error code 1861' / 'nErrId :=
+    1861' (about ADS, or an ADS device error 0x700–0x7FF), an ADS HRESULT (0x98110745, or in decimal), an ADS symbol
+    (ADSERR_CLIENT_SYNCTIMEOUT), a 0x number that is the whole message; then
     — only in a message about ADS — Beckhoff's text of the code ('symbol not found') and bare hex numbers.
     N129: a bare hex number of 0x700–0x7FF in any text was an ADS code ('nCycleCount 0x705' → 1797)."""
     ads = _ADS_WORD.search(msg) is not None or _ADS_HRESULT.search(msg) is not None or \
         any(t in _ADS_SYMBOLS for t in _SYMBOL.findall(msg))
     codes: list[int] = []
     for m in _ADS_CODE.finditer(msg):
-        v = m.group(1) or m.group(2)
+        v = m.group(1) or m.group(2) or m.group(3)
         n = int(v, 16) if v.lower().startswith("0x") else int(v)
         if m.group(2) is not None and not ads and not 0x700 <= n <= 0x7FF:
             continue                                  # 'exited with error code 7' is not an ADS error; 1861 is
@@ -289,10 +299,9 @@ def _ads_codes(msg: str) -> list[int]:
     if dec is not None:
         codes.append(dec)
     codes += [_ADS_SYMBOLS[t] for t in _SYMBOL.findall(msg) if t in _ADS_SYMBOLS]
-    whole = re.fullmatch(r"\s*(0x[0-9a-f]+|16#[0-9a-f_]+|\d+)\s*", msg, re.I)
+    whole = re.fullmatch(r"\s*0x([0-9a-f]+)\s*", msg, re.I)          # 0x… alone (no ST literal is written so)
     if whole:
-        v = whole.group(1).lower().replace("_", "")
-        codes.append(int(v[2:], 16) if v.startswith("0x") else int(v[3:], 16) if v.startswith("16#") else int(v))
+        codes.append(int(whole.group(1), 16))
     if ads:
         low = msg.lower()
         codes += [c for c, (_sym, text, *_r) in ADS_NOTES.items() if re.search(text, low)]
@@ -396,8 +405,9 @@ def _sync_folder(part: str) -> bool:
 
 def check_location(path: str | Path, plugin_dirs_: list[Path] | None = None, probe: bool = True,
                    space: bool = True) -> list[str]:
-    """Every condition the folder fails, as plain sentences (empty list = usable). probe=False skips the write test
-    (R34: read-only calls must not write; parallel calls raced on one probe file), space=False the free-space test."""
+    """Every condition the folder fails, as plain sentences (empty list = usable). probe=True: the folder is being
+    chosen — the write test and the drive-root rule; probe=False (R34: read-only calls must not write; parallel calls
+    raced on one probe file) checks only what makes a folder in use unusable. space=False skips the free-space test."""
     problems: list[str] = []
     p = Path(strip_long_prefix(str(path))).expanduser()
     if not p.is_absolute():
@@ -422,7 +432,7 @@ def check_location(path: str | Path, plugin_dirs_: list[Path] | None = None, pro
         fs = _posix_fstype(p)
         if fs and any(x in fs for x in ("nfs", "cifs", "smb", "sshfs", "fuse.s3", "9p")):
             problems.append(f"it is on a network file system ({fs})")
-    if p.parent == p:
+    if probe and p.parent == p:            # choosing only — a folder in use keeps working (R34: reads check less)
         problems.append(f"{p} is a drive root: the knowledge folder gets index\\, manuals\\, sop\\ and tools\\ of its "
                         f"own — give a folder on it (e.g. {Path(p, 'TwinCAT-MCP', 'knowledge')})")
     if any(_sync_folder(part) for part in p.parts):
@@ -469,21 +479,21 @@ def check_location(path: str | Path, plugin_dirs_: list[Path] | None = None, pro
 def norm_path(path: str | Path) -> str:
     """R35: one spelling per folder — resolved, no trailing separator, and case-folded where the file system is
     case-insensitive (Windows), so 'C:\\P15\\' and 'c:\\p15' are the same project."""
-    p = Path(path).expanduser()
+    p = Path(strip_long_prefix(str(path))).expanduser()          # review: '\\\\?\\C:\\P15' is 'C:\\P15' too
     try:
         p = p.resolve()
     except OSError:
         pass
-    return os.path.normcase(os.path.normpath(str(p)))
+    return os.path.normcase(os.path.normpath(strip_long_prefix(str(p))))
 
 
 def display_path(path: str | Path) -> str:
-    p = Path(path).expanduser()
+    p = Path(strip_long_prefix(str(path))).expanduser()
     try:
         p = p.resolve()            # Windows: the on-disk spelling of an existing folder
     except OSError:
         pass
-    return os.path.normpath(str(p))
+    return os.path.normpath(strip_long_prefix(str(p)))
 
 
 def _posix_fstype(p: Path) -> str | None:
@@ -591,10 +601,15 @@ class Knowledge:
             raise KnowledgeError(f"{p} cannot hold the knowledge base: {'; '.join(problems)}. Conditions: "
                                  + "; ".join(LOCATION_CONDITIONS))
         old, _ = self.location()
+        if old is not None and L.index_dir(old).is_dir() and \
+                kb_lock.held(L.index_dir(old) / "knowledge.db.lock"):
+            # review: a change still running (a kb_call that timed out) would go on writing into the folder it
+            # began in — the location is not switched under it
+            info = kb_lock.read(L.index_dir(old) / "knowledge.db.lock")[0] or {}
+            raise KnowledgeError(f"a change of the knowledge base in {old} is still running ({info.get('phase')}, pid "
+                                 f"{info.get('pid')}) — wait until it is finished, then choose the new folder")
         self.home.mkdir(parents=True, exist_ok=True)
         self._pointer().write_text(json.dumps({"path": str(p), "chosen": time.strftime("%Y-%m-%dT%H:%M:%S")}), encoding="utf-8")
-        self._fts = None
-        self._fts_words = True
         self.layout(p)                               # the permanent layout in the new folder (docs/KNOWLEDGE_BASE.md)
         out: dict[str, Any] = {"location": str(p), "database": str(L.locate(p, "knowledge"))}
         if old is not None and old != p and L.locate(old, "knowledge").exists():
@@ -639,37 +654,42 @@ class Knowledge:
         return out
 
     # -- database -------------------------------------------------------------------------
-    def _db(self) -> "_Conn":
-        p = L.locate(self.require(), "knowledge")
+    def _db_path(self) -> Path:
+        return L.locate(self.require(), "knowledge")
+
+    def _db(self, path: Path | None = None) -> "_Conn":
+        """A writer's connection — to `path`, the database an operation took when it began (review: a write after a
+        kb_call timeout looked the location up again and could land in a folder chosen meanwhile)."""
+        p = path or self._db_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         return _Conn(p, self)
 
-    def _db_if_any(self) -> "_Conn | None":
+    def _db_if_any(self, path: Path | None = None) -> "_Conn | None":
         """For reads: the database if it exists — a read never creates index\\ or knowledge.db (agent finding of the
         0.8.13 retest: kb_status / kb_search made both). None: no project folder was ever added here."""
-        p = L.locate(self.require(), "knowledge")
+        p = path or self._db_path()
         return _Conn(p, self, write=False) if p.is_file() else None
 
     def _db_read(self) -> "_Conn":
         """For a read that lists or searches: the database, or — when there is none yet — an empty one in memory with
-        the same tables (nothing is created on disk)."""
-        return self._db_if_any() or _Conn(Path(":memory:"), self)
+        the tables a read uses (nothing is created on disk, and nothing of it is taken for the real database's state:
+        review — its search table set the shared flag and the first real add then had none)."""
+        return self._db_if_any() or _Conn(Path(":memory:"), self, write=False, scratch=True)
 
     def _write_lock(self, what: str) -> "_WriteLock":
         """One change of knowledge.db at a time (kb_lock on index\\knowledge.db.lock, as the builds): a second
         kb_add_project / kb_reindex / kb_remove_project — another thread of this server after a kb_call timeout, or
         another server — is refused with what is running, instead of racing (two adds of one new folder ended in an
         IntegrityError)."""
-        return _WriteLock(L.index_dir(self.require()) / "knowledge.db.lock", what)
+        loc = self.require()
+        return _WriteLock(L.index_dir(loc) / "knowledge.db.lock", what, L.locate(loc, "knowledge"))
 
     def _init(self, con: sqlite3.Connection, write: bool = True) -> None:
         """A writer creates what is missing (tables, the problems column of 0.8.14, the search table); a reader only
-        looks what is there — it never changes the database (agent finding of the 0.8.13 retest)."""
+        looks what is there — it never changes the database (agent finding of the 0.8.13 retest). Either one takes the
+        search table's state from the database it opened, every time — never from an earlier connection's guess."""
         if not write:
-            if self._fts is None:
-                row = con.execute("SELECT sql FROM sqlite_master WHERE name = 'units_fts'").fetchone()
-                self._fts = row is not None
-                self._fts_words = bool(row and " code," in (row[0] or ""))
+            self._fts_state(con)
             return
         con.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         con.execute("CREATE TABLE IF NOT EXISTS projects (path TEXT PRIMARY KEY, label TEXT, added TEXT, indexed TEXT, units INTEGER, files TEXT)")
@@ -679,14 +699,16 @@ class Knowledge:
         cols = {r[1] for r in con.execute("PRAGMA table_info(projects)")}
         if "problems" not in cols:               # N132 (0.8.14): what could not be read, kept for kb_status
             con.execute("ALTER TABLE projects ADD COLUMN problems TEXT")
-        if self._fts is None:
-            try:
-                con.execute(UNITS_FTS)
-                self._fts = True
-                row = con.execute("SELECT sql FROM sqlite_master WHERE name = 'units_fts'").fetchone()
-                self._fts_words = bool(row and " code," in (row[0] or ""))     # False: the search table of 0.8.11
-            except sqlite3.OperationalError:
-                self._fts = False
+        try:
+            con.execute(UNITS_FTS)
+        except sqlite3.OperationalError:
+            pass                                 # no FTS5 in this SQLite: kb_search uses LIKE
+        self._fts_state(con)
+
+    def _fts_state(self, con: sqlite3.Connection) -> None:
+        row = con.execute("SELECT sql FROM sqlite_master WHERE name = 'units_fts'").fetchone()
+        self._fts = row is not None
+        self._fts_words = bool(row and " code," in (row[0] or ""))           # False: the search table of 0.8.11
 
     def status(self) -> dict[str, Any]:
         loc, src = self.location()
@@ -863,14 +885,15 @@ class Knowledge:
                                      f"there twice — kb_remove_project {r['path']!r} first, then add {p}")
 
     def add_project(self, path: str, label: str | None = None) -> dict[str, Any]:
+        path = strip_long_prefix(path) if path else path          # one spelling of the folder (review: '\\\\?\\C:\\…')
         if not path or not Path(path).expanduser().is_absolute():
             raise KnowledgeError(f"{path!r} is not an existing absolute folder")
         p = Path(display_path(path))
         if not p.is_dir():
             raise KnowledgeError(f"{path!r} is not an existing absolute folder")
         self._refuse_project_folder(p)
-        with self._write_lock(f"kb_add_project {p}"):
-            db = self._db_if_any()
+        with self._write_lock(f"kb_add_project {p}") as wl:
+            db = self._db_if_any(wl.db)
             same: list[dict[str, Any]] = []
             if db is not None:
                 with db as con:
@@ -881,7 +904,7 @@ class Knowledge:
             # list with 0 units. Now it is registered in the transaction that stores its units, or not at all
             res = self._reindex_rows([{"path": keep, "files": None,
                                        "register": {"label": label or p.name, "relabel": label,
-                                                    "merge": [d["path"] for d in same[1:]]}}], force=True)
+                                                    "merge": [d["path"] for d in same[1:]]}}], force=True, db=wl.db)
         r0 = res["reindexed"][0]
         if r0.get("error"):
             r0["registered"] = bool(same)
@@ -894,8 +917,8 @@ class Knowledge:
         return res
 
     def remove_project(self, path: str) -> dict[str, Any]:
-        with self._write_lock(f"kb_remove_project {path}"):
-            db = self._db_if_any()
+        with self._write_lock(f"kb_remove_project {path}") as wl:
+            db = self._db_if_any(wl.db)
             if db is None:
                 raise KnowledgeError(f"{path!r} is not in the knowledge base; indexed: none")
             with db as con:
@@ -906,14 +929,14 @@ class Knowledge:
                 if len(by_folder) > 1:
                     raise KnowledgeError(f"the label {path!r} names {len(by_folder)} different folders: "
                                          f"{[r['path'] for r in hit]} — nothing was removed; pass the folder path")
-            with self._db() as con:
+            with self._db(wl.db) as con:
                 n = sum(self._drop_project(con, r["path"]) for r in hit)
         return {"removed": [r["path"] for r in hit], "units_removed": n,
                 "note": "only the index entries were removed; your files are untouched"}
 
     def reindex(self, path: str | None = None) -> dict[str, Any]:
-        with self._write_lock(f"kb_reindex {path or '(every changed folder)'}"):
-            db = self._db_if_any()
+        with self._write_lock(f"kb_reindex {path or '(every changed folder)'}") as wl:
+            db = self._db_if_any(wl.db)
             if db is None:
                 if path:
                     raise KnowledgeError(f"{path!r} is not in the knowledge base (indexed: none); kb_add_project first")
@@ -926,9 +949,9 @@ class Knowledge:
                                              f"{self._project_list(con) or 'none'}); kb_add_project first")
                 else:
                     rows = [dict(r) for r in con.execute("SELECT path, files FROM projects")]
-            return self._reindex_rows(rows, force=bool(path))
+            return self._reindex_rows(rows, force=bool(path), db=wl.db)
 
-    def _reindex_rows(self, rows: list[dict[str, Any]], force: bool) -> dict[str, Any]:
+    def _reindex_rows(self, rows: list[dict[str, Any]], force: bool, db: Path) -> dict[str, Any]:
         """Read each folder, then store its units — and, for a folder being added (`register`), its entry — in one
         transaction. N132: the files that could not be read, the files no PLC project compiles and the files read
         in another encoding than they claim are named in the answer and kept with the entry (kb_status); the whole
@@ -936,7 +959,7 @@ class Knowledge:
         from .config import ProjectConfig
         from .project_backend import ProjectIndex
         out = []
-        upgraded = self._upgrade_search_table()
+        upgraded = self._upgrade_search_table(db)
         for r in rows:
             root = Path(r["path"])
             if not root.is_dir():
@@ -955,7 +978,7 @@ class Knowledge:
             units = [u for u in idx.all_units() if u.kind != "PARSE_ERROR"]     # both MAINs of two PLC projects
             problems = _problems(idx)
             reg = r.get("register")
-            with self._db() as con:
+            with self._db(db) as con:
                 if reg is not None:
                     for d in reg["merge"]:
                         self._drop_project(con, d)
@@ -986,12 +1009,16 @@ class Knowledge:
             res["search_table"] = upgraded
         return res
 
-    def _upgrade_search_table(self) -> dict[str, Any] | None:
+    def _upgrade_search_table(self, db: Path) -> dict[str, Any] | None:
         """N102: the search table of 0.8.11 has no identifier words. Replaced on the next kb_reindex / kb_add_project
         (the user's call): rebuilt from the stored units in one transaction — no file is read again, the units are
-        unchanged; a reader sees the old table or the new one. -> what was done, None when nothing was to do."""
-        with self._db() as con:
-            if not self._fts or getattr(self, "_fts_words", True):
+        unchanged; a reader sees the old table or the new one. Also when the search table does not hold the stored
+        units (one made after them). -> what was done, None when nothing was to do."""
+        with self._db(db) as con:
+            if not self._fts:
+                return None
+            if self._fts_words and con.execute("SELECT COUNT(*) FROM units").fetchone()[0] == \
+                    con.execute("SELECT COUNT(*) FROM units_fts").fetchone()[0]:
                 return None
             t0 = time.time()
             if con.in_transaction:
@@ -1511,6 +1538,21 @@ _STAMP_EXT = (".tcpou", ".tcdut", ".tcgvl", ".tcio", ".plcproj", ".tsproj", ".xt
 _STAMP_SKIP = {".git", ".vs", ".svn", "_boot", "_compileinfo", "_libraries"}
 
 
+_STAMP_V = "2:"                          # 0.8.14: .tsproj / .xti / .sln in the stamp — older stamps compare as before
+
+
+def _legacy_tree_stamp(root: Path) -> str:
+    """The stamp 0.8.13 and before stored (sources and .plcproj only) — compared with a folder indexed by them, so an
+    unchanged folder is not called changed after the update (review)."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in sorted(root.rglob("*")):
+        if f.suffix.lower() in (".tcpou", ".tcdut", ".tcgvl", ".tcio", ".plcproj") and f.is_file():
+            st = f.stat()
+            h.update(f"{f}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+    return h.hexdigest()
+
+
 def _tree_stamp(root: Path) -> str:
     """What the index of a folder depends on: its sources, and what decides which of them are units — the .plcproj
     files (N106), the .tsproj / .xti files that name the PLC projects and the .sln that names the .tsproj (N133: an
@@ -1530,7 +1572,7 @@ def _tree_stamp(root: Path) -> str:
                 found.append((f, st.st_size, st.st_mtime_ns))
     for f, size, mt in sorted(found):
         h.update(f"{f}:{size}:{mt}\n".encode())
-    return h.hexdigest()
+    return _STAMP_V + h.hexdigest()
 
 
 def folder_state(path: str, stamp: str | None) -> str:
@@ -1538,7 +1580,10 @@ def folder_state(path: str, stamp: str | None) -> str:
     last indexing) and what to do."""
     if not Path(path).is_dir():
         return "folder not found (moved, renamed or deleted?) — its units are those of the last indexing: kb_remove_project, or kb_add_project the new place"
-    if stamp != _tree_stamp(Path(path)):
+    # one walk of the folder (stat of its sources; .git, _Boot … not walked) — no cache: an answer about the files
+    # now must not be seconds old
+    cur = _tree_stamp(Path(path)) if (stamp or "").startswith(_STAMP_V) else _legacy_tree_stamp(Path(path))
+    if stamp != cur:
         return "files changed since it was indexed — its units are those of the last indexing: kb_reindex"
     return "current"
 
@@ -1549,7 +1594,7 @@ def _problems(idx: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     errs = idx.parse_errors()
     if errs:
-        out["parse_errors"] = errs
+        out["parse_error_files"] = errs
     if idx.read_notes:
         out["read_notes"] = dict(sorted(idx.read_notes.items()))
     if idx.not_in_project:
@@ -1559,7 +1604,7 @@ def _problems(idx: Any) -> dict[str, Any]:
 
 
 def _problem_counts(problems: dict[str, Any]) -> dict[str, int]:
-    return {"parse_errors": len(problems.get("parse_errors", [])),
+    return {"parse_errors": len(problems.get("parse_error_files", [])),
             "not_in_project_count": (problems.get("not_in_project") or {}).get("count", 0)}
 
 
@@ -1881,9 +1926,10 @@ class _WriteLock:
     """with kb._write_lock(what): … — kb_lock's operating-system lock on index\\knowledge.db.lock; KnowledgeError
     naming the running change when another holds it."""
 
-    def __init__(self, path: Path, what: str):
+    def __init__(self, path: Path, what: str, db: Path):
         self.lk = kb_lock.IndexLock(path)
         self.what = what
+        self.db = db                       # the database this change writes, whatever the location becomes
 
     def __enter__(self) -> "_WriteLock":
         try:
@@ -1901,8 +1947,8 @@ class _WriteLock:
 
 
 class _Conn:
-    def __init__(self, path: Path, kb: Knowledge, write: bool = True):
-        self.path, self.kb, self.write = path, kb, write
+    def __init__(self, path: Path, kb: Knowledge, write: bool = True, scratch: bool = False):
+        self.path, self.kb, self.write, self.scratch = path, kb, write, scratch
         self.con: sqlite3.Connection | None = None
 
     def __enter__(self) -> sqlite3.Connection:
@@ -1914,6 +1960,12 @@ class _Conn:
                 self.con.execute("PRAGMA synchronous=NORMAL")
             except sqlite3.DatabaseError:
                 pass
+        if self.scratch:                   # an empty stand-in: the tables a read lists, no state taken from it
+            self.con.execute("CREATE TABLE projects (path TEXT PRIMARY KEY, label TEXT, added TEXT, indexed TEXT, "
+                             "units INTEGER, files TEXT, problems TEXT)")
+            self.con.execute("CREATE TABLE units (project TEXT, name TEXT, kind TEXT, file TEXT, line INTEGER, "
+                             "declaration TEXT, implementation TEXT, comments TEXT)")
+            return self.con
         self.kb._init(self.con, self.write)
         return self.con
 

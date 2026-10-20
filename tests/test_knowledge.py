@@ -778,6 +778,8 @@ def test_n128_project_folders_that_are_not_projects_or_overlap_are_refused(kb, p
     k.add_project(str(project_dir), "p")
     with pytest.raises(K.KnowledgeError, match=r"inside the indexed folder .*kb_reindex 'p'"):
         k.add_project(str(project_dir / "Plc"))
+    with pytest.raises(K.KnowledgeError, match=r"inside the indexed folder"):         # review: '\\?\' spelling
+        k.add_project("\\\\?\\" + str(project_dir / "Plc"))
     with pytest.raises(K.KnowledgeError, match="contains the indexed folder .*kb_remove_project"):
         k.add_project(str(project_dir.parent))
     assert [p["path"] for p in k.status()["projects"]] == [str(project_dir)]
@@ -818,6 +820,18 @@ def test_agent_findings_registration_write_lock_and_reads_that_create_nothing(kb
     assert not (kbf / "index" / "knowledge.db").exists()
     with pytest.raises(K.KnowledgeError, match="not in the knowledge base"):
         k2.remove_project(str(project_dir))
+    # review of 0.8.14: the empty stand-in of those reads must not be taken for the database — the first add then had
+    # no search table ('no such table: units_fts') and the folder stayed on the LIKE fallback
+    other = tmp_path / "other_proj"
+    import shutil as _sh
+    _sh.copytree(project_dir, other)
+    assert k2.add_project(str(other), "o")["reindexed"][0]["units"] >= 8
+    import sqlite3 as _sq
+    assert _sq.connect(kbf / "index" / "knowledge.db").execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'units_fts'").fetchone()
+    assert K.Knowledge(tmp_path / "home_ro", str(kbf)).search("Valve")["hits"][0]["unit"].startswith("FB_Valve")
+    # a knowledge folder in use at a drive root keeps working (only choosing one is refused)
+    assert not any("drive root" in x for x in K.check_location(Path(tmp_path.anchor), probe=False, space=False))
     # a folder whose scan fails is not registered
     k.set_location(str(tmp / "kbdata"))
     from twincat_mcp import project_backend as PB
@@ -837,6 +851,8 @@ def test_agent_findings_registration_write_lock_and_reads_that_create_nothing(kb
             with pytest.raises(K.KnowledgeError, match=r"another change of the knowledge base is running \(kb_reindex"):
                 call()
         assert k.search("FB_Valve")["projects_indexed"] == 0               # reads are not blocked
+        with pytest.raises(K.KnowledgeError, match="still running"):       # nor is the location switched under it
+            k.set_location(str(tmp_path / "kb_elsewhere"))
     assert k.add_project(str(project_dir), "p")["reindexed"][0]["units"] >= 8
 
 
@@ -859,7 +875,7 @@ def test_n132_unreadable_files_are_named_utf16_read_and_no_text_cut(kb, project_
     register_sources(project_dir / "Plc" / "Plc.plcproj")
     _pou(project_dir / "Plc" / "Backup", "FB_KbDup", "FUNCTION_BLOCK FB_KbDup\nVAR\nEND_VAR")   # not compiled
     r = k.add_project(str(project_dir), "p")["reindexed"][0]
-    assert [e["file"] for e in r["parse_errors"]] == [str(pous / "FB_Broken.TcPOU")] and r["parse_errors"][0]["error"]
+    assert r["parse_errors"] == 1 and [e["file"] for e in r["parse_error_files"]] == [str(pous / "FB_Broken.TcPOU")]
     assert list(r["read_notes"]) == [str(fa)] and "Windows-1252" in r["read_notes"][str(fa)], r
     assert r["not_in_project"]["count"] == 1 and r["not_in_project"]["files"][0].endswith("FB_KbDup.TcPOU"), r
     assert k.search("nDurchfluss")["hits"][0]["unit"] == "FB_Utf16"
@@ -878,6 +894,19 @@ def test_n132_unreadable_files_are_named_utf16_read_and_no_text_cut(kb, project_
     assert f16.read_bytes()[:2] == b"\xff\xfe" and "nDurchfluss := 1; // ß" in f16.read_text(encoding="utf-16")
     with pytest.raises(ProjectError, match="not valid UTF-8 .*not edited"):
         idx.set_code("FB_Ansi", None, "nMenge := 1;")
+    # review of 0.8.14: proj_validate_xml reads and writes the files as the index does
+    from twincat_mcp import codecheck
+    v = codecheck.validate_xml(idx)
+    rules = {(Path(i["file"]).name, i["rule"]) for i in v["items"]}
+    assert ("FB_Utf16.TcPOU", "xml") not in rules and ("FB_Ansi.TcPOU", "encoding") in rules, v["items"]
+    # a UTF-8 file with a BOM and one bad byte stays UTF-8 (its good umlauts are kept); bytes alone decide otherwise
+    from twincat_mcp.project_backend import decode_source
+    t, enc, bom, note = decode_source(b"\xef\xbb\xbf<a>Gr\xc3\xb6\xc3\x9fe \x96</a>")
+    assert t == "<a>Größe \ufffd</a>" and enc == "utf-8" and "U+FFFD" in note
+    t, enc, bom, note = decode_source(b"<a>Gr\xc3\xb6\xc3\x9fe \x96</a>")
+    assert t.startswith("<a>Größe") and enc == "utf-8"
+    t, enc, bom, note = decode_source(b"<a>Gr\xf6\xdfe \x96</a>")
+    assert t == "<a>Größe –</a>" and enc == "cp1252" and "Windows-1252" in note
 
 
 def test_n133_a_changed_renamed_or_deleted_folder_is_reported(kb, project_dir, tmp_path):
@@ -888,6 +917,16 @@ def test_n133_a_changed_renamed_or_deleted_folder_is_reported(kb, project_dir, t
     k.set_location(str(tmp / "kbdata"))
     k.add_project(str(project_dir), "p")
     assert "stale" not in k.search("FB_Valve") and k.status()["projects"][0]["state"] == "current"
+    # review of 0.8.14: a folder indexed by 0.8.13 (its stamp of sources only) is not 'changed' after the update
+    import sqlite3 as _sq
+    db = _sq.connect(tmp / "kbdata" / "index" / "knowledge.db")
+    db.execute("UPDATE projects SET files=?", (K._legacy_tree_stamp(project_dir),))
+    db.commit()
+    assert k.status()["projects"][0]["state"] == "current" and "stale" not in k.search("FB_Valve")
+    (project_dir / "Plc" / "POUs" / "MAIN.TcPOU").write_text(
+        (project_dir / "Plc" / "POUs" / "MAIN.TcPOU").read_text() + "\n")
+    assert k.status()["projects"][0]["state"].startswith("files changed")
+    k.reindex("p")
     ts = project_dir / "Machine.tsproj"
     os.utime(ts, ns=(ts.stat().st_atime_ns, ts.stat().st_mtime_ns + 10**9))
     st = k.status()["projects"][0]["state"]
@@ -980,9 +1019,18 @@ def test_n129_n130_error_messages_keep_their_names_and_known_errors_need_their_c
     assert K.annotate("PermissionError: [Errno 1] Operation not permitted") == \
         "PermissionError: [Errno 1] Operation not permitted"
     # the code in every notation the local ADS return-code table gives — and pyads' text, in a message about ADS
-    for q in ("ADSERR_CLIENT_SYNCTIMEOUT", "0x98110745", "ADS-Error: 0x745", "ADSError 1861", "1861", "0x745",
-              "ADSError: timeout elapsed"):
+    for q in ("ADSERR_CLIENT_SYNCTIMEOUT", "0x98110745", "ADS-Error: 0x745", "ADSError 1861", "0x745", "error 1861",
+              "nErrId := 1861", "ADSError: timeout elapsed", "ADSError: Timeout elapsed (1861). "):
         assert K.known_error(q)["code"].startswith("ADS return code 0x745 (1861)"), q
+        assert K.is_error_message(q) or q == "ADSError: timeout elapsed", q
+    # review of 0.8.14: pyads' own text is an error message for kb_search (it was searched as words)
+    r = k.search("ADSError: symbol not found (1808). ")
+    assert r["known_error"]["code"].endswith("ADSERR_DEVICE_SYMBOLNOTFOUND") and r["hits"] == [], r
+    # … and words of the code are not: identifiers beginning with ERR_ / err_, numbers, model numbers, sentences
+    for q in ("ERR_TIMEOUT", "err_count reset", "851", "16#FF", "C6015", "the unknown type of data", "1861"):
+        assert not K.is_error_message(q), q
+    assert K.known_error("the unknown type of data") is None and K.known_error("identifier is not defined") is None
+    assert K.known_error("TIPC^Plc1^Plc1 Project is not logged in — start acts on the online session") is None
     assert K.known_error("ADSError 1796: reading or writing not permitted")["code"].endswith("ADSERR_DEVICE_INVALIDACCESS")
     assert K.known_error("Target port not found – ADS server is not started (ADS)")["code"].endswith("ERR_TARGETPORTNOTFOUND")
     assert "'nFoo' is not declared" in K.known_error("identifier nFoo not defined")["cause"]

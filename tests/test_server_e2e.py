@@ -1566,3 +1566,27 @@ async def test_n127_kb_changes_are_gated_by_the_mode_and_audited(monkeypatch, pr
         assert res.is_error
         audit = payload(await s.call_tool("tc_audit_tail", {"n": 3}))
         assert audit[-1]["tool"] == "kb_reindex" and audit[-1]["outcome"] == "error", audit
+
+
+@pytest.mark.anyio
+async def test_review_0814_plugin_composed_xae_errors_get_no_known_error_note(tmp_path):
+    """Review of 0.8.14: the plugin's own '… 5 s later the project is logged in, application Run …' (an online command
+    that may have acted) got 'XAE is logged in to the PLC … log out first' appended, and 'is not logged in' matched
+    the logged-in note. A message the plugin composed carries its own cause; a negated phrase is not the state."""
+    from twincat_mcp import xae_backend as XB
+    from twincat_mcp.server import App, ToolError
+    app = App(mk_cfg(tmp_path))
+    app.dialogs_now = lambda: []                                      # no shell on this machine
+
+    def acted():
+        raise XB._ActedUnconfirmed("ITcPlcOnline.Login on TIPC^P^P Project returned, but 5 s later the project is "
+                                   "logged in, application Stop — the command may have acted; check xae_status")
+    with pytest.raises(ToolError) as ei:
+        await app.xae_call(acted)
+    assert "known cause" not in str(ei.value) and "may have acted" in str(ei.value)
+
+    def raw():
+        raise XB.XaeError("ExecuteCommand: the project is not logged in")
+    with pytest.raises(ToolError) as ei:
+        await app.xae_call(raw)
+    assert "known cause" not in str(ei.value), str(ei.value)

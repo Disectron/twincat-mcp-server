@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .project_backend import ProjectIndex, CodeUnit, ProjectError, st_strip
+from .project_backend import ProjectIndex, CodeUnit, ProjectError, decode_source, read_source, st_strip
 
 # Default Hungarian-style prefixes (Beckhoff / common TwinCAT practice). Override
 # via ProjectConfig.naming_prefixes if the house style differs.
@@ -661,7 +661,7 @@ def validate_xml(idx: ProjectIndex, name: str | None = None, fix: bool = False,
     guids: dict[str, list[str]] = {}
     for f in sorted({u.file for u in idx.units.values()}):
         try:
-            txt = Path(f).read_text(encoding="utf-8-sig", errors="replace")
+            txt = read_source(Path(f))
         except OSError:
             continue
         for g in re.findall(r'Id="(\{[^"]+\})"', txt):
@@ -671,8 +671,10 @@ def validate_xml(idx: ProjectIndex, name: str | None = None, fix: bool = False,
     for f in files:
         p = Path(f)
         raw = p.read_bytes()
-        bom = raw.startswith(b"\xef\xbb\xbf")
-        txt = raw[3:].decode("utf-8", "replace") if bom else raw.decode("utf-8", "replace")
+        # review of 0.8.14: read as the project index reads it (UTF-16 files were 'not well-formed' here)
+        txt, enc, bom_bytes, note = decode_source(raw)
+        if note:
+            findings.append({"file": f, "rule": "encoding", "severity": "warning", "message": note})
         new = txt
         try:
             root = ET.fromstring(txt)
@@ -758,9 +760,12 @@ def validate_xml(idx: ProjectIndex, name: str | None = None, fix: bool = False,
                 new = new.replace(close, blocks + close, 1)
                 fixed.append({"file": f, "fix": "added LineIds", "for": missing_lineids})
         # (no eof_newline rule: XAE writes its files without a trailing newline — flagging that flagged every file)
-        if fix and new != txt:
+        if fix and new != txt and note:
+            # written back, the bytes it could not read would change (as proj_set_code refuses)
+            fixed.append({"file": f, "fix": "NOT APPLIED — " + note.split(" — ")[0] + "; fix its encoding first"})
+        elif fix and new != txt:
             p.with_suffix(p.suffix + ".bak").write_bytes(raw)
-            p.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
+            p.write_bytes(bom_bytes + new.encode(enc))              # its own encoding (UTF-16 stays UTF-16)
             try:
                 idx.reindex_file(p)
             except Exception:  # noqa: BLE001

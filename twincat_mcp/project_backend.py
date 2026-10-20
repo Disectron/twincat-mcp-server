@@ -78,9 +78,12 @@ def decode_source(raw: bytes) -> tuple[str, str, bytes, str | None]:
         return body.decode(enc), enc, bom, None
     except UnicodeDecodeError as exc:
         where = f"byte 0x{body[exc.start]:02X} at offset {exc.start + len(bom)}"
-        if enc == "utf-8":
+        # review of 0.8.14: a UTF-8 file with one bad byte was read whole as Windows-1252 (its good umlauts became
+        # 'Ã¶'). Windows-1252 only when nothing says UTF-8: no BOM and not one valid multi-byte UTF-8 sequence
+        utf8_seq = re.search(rb"[\xc2-\xdf][\x80-\xbf]|[\xe0-\xef][\x80-\xbf]{2}|[\xf0-\xf4][\x80-\xbf]{3}", body)
+        if enc == "utf-8" and not bom and utf8_seq is None:
             return (body.decode("cp1252", "replace"), "cp1252", bom,
-                    f"not valid UTF-8 ({where}) — read as Windows-1252; check its umlauts")
+                    f"not valid UTF-8 ({where}) and no UTF-8 sequence in it — read as Windows-1252; check its umlauts")
         return body.decode(enc, "replace"), enc, bom, f"not valid {enc} ({where}) — such bytes read as U+FFFD"
 
 

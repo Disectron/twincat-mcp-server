@@ -53,7 +53,7 @@ import pyads
 
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
-from .xae_backend import XaeBackend, XaeError, sta_init, sta_teardown
+from .xae_backend import XaeBackend, XaeError, XaeExplained, sta_init, sta_teardown
 from .project_backend import PlcView, ProjectIndex, ProjectError, not_on_target, parse_tcunit_xml, plc_projects_declaring
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
@@ -854,6 +854,8 @@ class App:
             elif ("0x80010001" in low or "0x8001010a" in low or "-2147418111" in low or "-2147417846" in low
                     or "call was rejected" in low or "retry later" in low):
                 msg += " — XAE refused the COM call: it is busy or a modal dialog has the shell." + await asyncio.to_thread(self._dialog_hint)
+            if isinstance(exc, XaeExplained):
+                raise ToolError(msg) from exc          # it carries its own cause and what to do
             lic = _license_hint(msg)
             if lic:
                 msg += " " + lic
@@ -2306,8 +2308,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         POU (= those three), METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …;
         project = the folder (any spelling) or its label; limit 1–200. `stale`: folders changed, renamed or deleted
         since they were indexed — their hits are those of the last indexing (kb_reindex). An error message — a code in
-        a notation that says so (ADSError 1861, ADS error 1861, error 1861, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT), a
-        compiler message, or a number alone; not the word 'error' or a hex number anywhere — gets the plugin's note
+        a notation that says so (ADSError 1861, pyads' 'ADSError: … (1861)', ADS error 1861, error 1861, nErrId :=
+        1861, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT), a compiler message (C0046: …), or a 0x number alone; not the
+        word 'error', a decimal / 16# literal alone, a hex number anywhere or an ERR_… identifier of the code — gets the plugin's note
         in known_error (ADS return codes 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 with code and symbol, license, XAE
         busy / dialog / disconnected, logged in, compiler: identifier not defined, cannot convert type, unknown type;
         null + known_errors_covered when it has none) and is searched only for the names of the code it holds
