@@ -647,12 +647,13 @@ _RE_LINEID = re.compile(r"<LineId Id=\"(\d+)\" Count=\"(\d+)\"\s*/>")
 
 
 def validate_xml(idx: ProjectIndex, name: str | None = None, fix: bool = False,
-                 regenerate_lineids: bool = False) -> dict[str, Any]:
+                 regenerate_lineids: bool = False, backed_up: set[str] | None = None) -> dict[str, Any]:
     """Structural checks of TwinCAT source files: well-formed XML, root/Name/Id, GUID format and
     project-wide uniqueness, Declaration/Implementation presence, property accessor VAR blocks,
     LineIds ↔ implementation line counts, file ending. fix=true applies safe fixes (missing final
     newline, GUID case, duplicate GUID → new GUID, and — only with regenerate_lineids — rebuilt
-    LineIds); writes a .bak first."""
+    LineIds); writes a .bak first. backed_up: the files one call already backed up — a file two PLC projects compile
+    is checked in each; its .bak keeps the bytes from before the call (review: the second pass overwrote it)."""
     import xml.etree.ElementTree as ET
     idx._ensure()
     files = sorted({u.file for u in idx.units.values() if u.kind != "PARSE_ERROR" and (not name or u.name.lower() == name.lower() or (u.parent or "").lower() == name.lower())})
@@ -764,7 +765,10 @@ def validate_xml(idx: ProjectIndex, name: str | None = None, fix: bool = False,
             # written back, the bytes it could not read would change (as proj_set_code refuses)
             fixed.append({"file": f, "fix": "NOT APPLIED — " + note.split(" — ")[0] + "; fix its encoding first"})
         elif fix and new != txt:
-            p.with_suffix(p.suffix + ".bak").write_bytes(raw)
+            if backed_up is None or f not in backed_up:
+                p.with_suffix(p.suffix + ".bak").write_bytes(raw)
+                if backed_up is not None:
+                    backed_up.add(f)
             p.write_bytes(bom_bytes + new.encode(enc))              # its own encoding (UTF-16 stays UTF-16)
             try:
                 idx.reindex_file(p)

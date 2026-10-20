@@ -105,14 +105,27 @@ def _content_end(path: Path, size: int) -> int:
     return 0
 
 
+_HEAD = 4096
+
+
+def _head(path: Path, n: int) -> str:
+    """A fingerprint of the log's first n bytes — a new log (rotated) begins otherwise."""
+    import hashlib
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read(n)).hexdigest()[:16]
+
+
 def log_mark(path: Path | None) -> dict[str, Any]:
-    """Where the Scope View log's text ends now ({"path", "size"}; trailing NUL padding not counted, N140): size 0 when
-    there is no log yet (all of a log written later is new); "error" when it exists but cannot be read (nothing can be
-    compared then)."""
+    """Where the Scope View log's text ends now ({"path", "size", "head"}; trailing NUL padding not counted, N140):
+    size 0 when there is no log yet (all of a log written later is new); "error" when it exists but cannot be read
+    (nothing can be compared then). head: the fingerprint of its beginning — a log rotated to one that has grown past
+    the mark is told by it (review of N140: a padded log's text end is below its file size)."""
     if path is None:
         return {"path": None, "size": None}
     try:
-        return {"path": str(path), "size": _content_end(path, path.stat().st_size)}
+        end = _content_end(path, path.stat().st_size)
+        n = min(_HEAD, end)
+        return {"path": str(path), "size": end, **({"head": _head(path, n), "head_bytes": n} if n else {})}
     except FileNotFoundError:
         return {"path": str(path), "size": 0}
     except OSError as exc:
@@ -179,6 +192,13 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
     if size < start:
         out["note"] = "the log is shorter than when the call began (rotated?) — read from its start"
         start = 0
+    elif mark.get("head"):
+        try:
+            if _head(path, int(mark.get("head_bytes") or 0)) != mark["head"]:
+                out["note"] = "the log begins otherwise than when the call began (a new log) — read from its start"
+                start = 0
+        except OSError as exc:
+            return {**out, "errors": [], "note": f"the Scope View log cannot be read: {exc}"}
     entries: list[list[str]] = []
     said: list[str] = []                  # untagged lines that say error — used only when no line is tagged at all
     cur: list[str] | None = None
@@ -204,7 +224,11 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
         out["note"] = ((out.get("note") + "; ") if out.get("note") else "") + (
             "no level tag ([ERROR], [INFO] …) in the new lines: the log's format was not recognised — the lines that "
             "say 'error' / 'exception' are listed")
-    out.update({"new_bytes": size - start, "error_count": len(entries),
+    try:
+        new = max(0, _content_end(path, size) - start)          # the text written, not the padding (review of N140)
+    except OSError:
+        new = size - start
+    out.update({"new_bytes": new, "error_count": len(entries),
                 "errors": [" | ".join(e)[:800] for e in entries[-limit:]]})
     return out
 

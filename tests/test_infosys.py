@@ -754,6 +754,33 @@ def test_kbv_i13_methods_of_two_fbs_are_never_one_document(idx):
     assert sorted(d["same_page_in"]) == ["tf6701_tc3_iot_communication_mqtt", "tf6760_tc3_iot_https_rest"]
 
 
+def test_review_0815_a_members_owner_above_a_topic_page_and_by_its_own_name(idx):
+    """Review: a member below a topic page ('Methods') had no owner and joined the first group of its declaration —
+    FB_B's copy taken for FB_A's; an owner titled 'Tc3_Foo.FB_A' was another owner than 'FB_A' (copies split). The
+    owner is the first symbol page above topic pages, by its own name; FB_B.Run finds the page below 'Methods'."""
+    run = "<pre>METHOD Run : BOOL\nVAR_INPUT\n    bGo : BOOL;\nEND_VAR</pre>"
+    _store_with(idx, "tf1000_book_one/100", "FB_A", "<pre>FUNCTION_BLOCK FB_A\nVAR_INPUT\n    a : INT;\nEND_VAR</pre>", "a1")
+    _store_with(idx, "tf1000_book_one/101", "Run", run, "a1-run", parent="a1")
+    _store_with(idx, "tf3000_book_three/300", "FB_B", "<pre>FUNCTION_BLOCK FB_B\nVAR_INPUT\n    b : INT;\nEND_VAR</pre>", "b3")
+    _store_with(idx, "tf3000_book_three/301", "Run", run, "b3-run", parent="b3")
+    _store_with(idx, "tf2000_book_two/200", "FB_B", "<pre>FUNCTION_BLOCK FB_B\nVAR_INPUT\n    b : INT;\nEND_VAR</pre>", "b2")
+    _store_with(idx, "tf2000_book_two/201", "Methods", "<p>The methods of FB_B.</p>", "b2-methods", parent="b2")
+    _store_with(idx, "tf2000_book_two/202", "Run", run, "b2-run", parent="b2-methods")
+    _store_with(idx, "tf4000_book_four/400", "Tc3_Foo.FB_A", "<pre>FUNCTION_BLOCK FB_A\nVAR_INPUT\n    a : INT;\nEND_VAR</pre>",
+                "a4")
+    _store_with(idx, "tf4000_book_four/101", "Run", run, "a4-run", parent="a4")
+    idx.resolve_help_links()
+    with idx._db() as con:
+        docs = inf.symbol_documents(con, "Run")
+    got = sorted(sorted(f"{r['book']}/{r['pid']}" for r in g) for g in docs)
+    assert got == [["tf1000_book_one/101", "tf4000_book_four/101"],
+                   ["tf2000_book_two/202", "tf3000_book_three/301"]], got
+    C = "https://infosys.beckhoff.com/content/1033/"
+    d = idx.declaration("FB_B.Run")
+    assert d["url"] in (f"{C}tf2000_book_two/202.html", f"{C}tf3000_book_three/301.html") and len(d["same_page_in"]) == 1
+    assert idx.declaration("FB_A.Run")["url"] in (f"{C}tf1000_book_one/101.html", f"{C}tf4000_book_four/101.html")
+
+
 def test_n138_a_page_that_is_not_utf8_keeps_its_characters():
     """N138 (0.8.13 retest): the stored text of 4 tf5200 pages had U+FFFD for Beckhoff's curly quotes — the package
     page was Windows-1252, read as UTF-8 with errors replaced. (The ADS return-code table itself stores its dashes:

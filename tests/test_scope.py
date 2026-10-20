@@ -214,6 +214,14 @@ def test_n140_the_logs_nul_padding_is_no_text(tmp_path):
     log.write_bytes(wide + b"\x00" * 64)
     assert S.log_errors_since({"path": str(log), "size": 2})["errors"] == ["t [ ERROR ] wide"]
     assert S.log_mark(log)["size"] == len(wide) - 1          # after the '\n' byte, the last that is not NUL
+    # review of N140: the mark is below the padded file's size — a log rotated to a new one that grew past the mark is
+    # told by its beginning (else its first entries were skipped); new_bytes counts text, not padding
+    log.write_text("2026-10-20 t [ INFO  ] old\n" + pad, encoding="utf-8")
+    mark = S.log_mark(log)
+    assert S.log_errors_since(mark)["new_bytes"] == 0
+    log.write_text("2026-10-21 t [ ERROR ] in the new log\n" + "t [ INFO  ] filler\n" * 3, encoding="utf-8")
+    got = S.log_errors_since(mark)
+    assert got["errors"] == ["2026-10-21 t [ ERROR ] in the new log"] and "a new log" in got["note"], got
 
 
 def test_review_0813_a_long_log_window_is_read_whole(tmp_path, monkeypatch):

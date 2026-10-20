@@ -4403,7 +4403,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         safe fixes (.bak written); regenerate_lineids rebuilds LineIds blocks."""
         if fix:
             await app.permit(None, OpClass.EDIT, "proj_validate_xml", name or "*")
-        res = await app.proj_check(codecheck.validate_xml, name, fix, regenerate_lineids)
+        res = await app.proj_check(codecheck.validate_xml, name, fix, regenerate_lineids, set())   # one .bak per file
         if fix and res.get("fixed"):
             app.audit("proj_validate_xml", {"name": name, "fixed": res["fixed"]}, OpClass.EDIT, "ok")
         return res

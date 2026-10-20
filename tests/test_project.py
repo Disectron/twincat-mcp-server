@@ -785,10 +785,69 @@ def test_s4_0814_a_shared_file_is_walked_with_the_types_of_its_plc_project(tmp_p
         assert [i["path"] for i in v["items"]] == [path] and Path(v["plc_project"]).stem == plc, (port, v)
     v = p.variables("Plc2@GVL_Common", port=851)
     assert [i["path"] for i in v["items"]] == ["GVL_Common.stData.bTwo"] and Path(v["plc_project"]).stem == "Plc2"
-    v = p.variables("GVL_Common")                                   # no port: both PLC projects compile it, said so
+    v = p.variables("GVL_Common")                                   # no port: walked in each PLC project, items tagged
     assert [Path(x).stem for x in v["plc_projects"]] == ["Plc1", "Plc2"], v
+    assert [(i["path"], Path(i["plc_project"]).stem) for i in v["items"]] == [
+        ("GVL_Common.stData.nOne", "Plc1"), ("GVL_Common.stData.bTwo", "Plc2")], v["items"]
+    v = p.variables()                                               # every root, in its own PLC project
+    got = {(i["path"], Path(i["plc_project"]).stem) for i in v["items"]}
+    assert {("GVL_Common.stData.nOne", "Plc1"), ("GVL_Common.stData.bTwo", "Plc2"), ("MAIN.n", "Plc1"),
+            ("MAIN.n", "Plc2")} <= got, got
+    assert "plc_project" not in p.variables(port=852)["items"][0]  # one PLC project walked: named once, on the result
     for port, member in ((851, "nOne"), (852, "bTwo")):             # the symbol resolved with that PLC project's types
         r = p.resolve_symbol(f"GVL_Common.stData.{member}", port)
         assert r["resolved"] and r["hops"][-1]["declared_in"] == "ST_Data", (port, r)
         assert Path(r["hops"][-1]["file"]).parts[-3] == ("Plc1" if port == 851 else "Plc2")
     assert not p.resolve_symbol("GVL_Common.stData.bTwo", 851)["resolved"]
+
+
+def test_review_0815_n141_with_three_plc_projects(tmp_path):
+    """Review: PRG_B in Plc2 and Plc3, read on Plc1's port 851 — 'declared in several PLC projects … no single PLC
+    project ADS port 851' (false: 851 is Plc1's). Not declared in Plc1, and where it is."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000, prog="PRG_B")
+    _plc(tmp_path, "Plc3", "n := n + 3;", 2000, prog="PRG_B")
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852), ("Plc3", 853))
+    p = idx(tmp_path)
+    with pytest.raises(ProjectError) as e:
+        p.resolve_symbol("PRG_B.n", 851)
+    assert "not declared in PLC project Plc1 (ADS port 851)" in str(e.value) and "['Plc2', 'Plc3']" in str(e.value)
+    assert "several PLC projects" not in str(e.value)
+    assert p.resolve_symbol("PRG_B.n", 853)["resolved"]
+
+
+def test_review_0815_a_shared_files_backup_is_the_file_before_the_call(tmp_path):
+    """Review: proj_validate_xml(fix=true) checks a file two PLC projects compile once per PLC project — a GUID it
+    shares with a Plc1 file is fixed in Plc1's pass, one it shares with a Plc2 file in Plc2's; the second pass wrote
+    the .bak again, over the original bytes. One .bak per file per call."""
+    from twincat_mcp import codecheck
+    from twincat_mcp.project_backend import PlcView
+    g1, g2 = "{11111111-1111-1111-1111-111111111111}", "{22222222-2222-2222-2222-222222222222}"
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+
+    def pou(path, name, ids, method=None):
+        m = (f'<Method Name="{method}" Id="{ids[1]}"><Declaration><![CDATA[METHOD {method} : BOOL]]></Declaration>'
+             f'<Implementation><ST><![CDATA[]]></ST></Implementation></Method>') if method else ""
+        path.write_text(f'<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="{name}" Id="{ids[0]}">'
+                        f'<Declaration><![CDATA[FUNCTION_BLOCK {name}]]></Declaration><Implementation><ST><![CDATA[]]>'
+                        f'</ST></Implementation>{m}</POU></TcPlcObject>', encoding="utf-8")
+    (tmp_path / "Common").mkdir()
+    shared = tmp_path / "Common" / "FB_Shared.TcPOU"
+    pou(shared, "FB_Shared", (g1, g2), method="M_Run")
+    pou(tmp_path / "Plc1" / "POUs" / "FB_One.TcPOU", "FB_One", (g1,))
+    pou(tmp_path / "Plc2" / "POUs" / "FB_Two.TcPOU", "FB_Two", (g2,))
+    for plc in ("Plc1", "Plc2"):
+        register_sources(tmp_path / plc / f"{plc}.plcproj")
+        pp = tmp_path / plc / f"{plc}.plcproj"
+        pp.write_text(pp.read_text().replace("</Project>", '<ItemGroup><Compile Include="..\\Common\\FB_Shared.TcPOU">'
+                                              "<SubType>Code</SubType></Compile></ItemGroup></Project>"))
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    before = shared.read_bytes()
+    done: set[str] = set()
+    views = [PlcView(p, p.plc_project(name=n)) for n in ("Plc1", "Plc2")]
+    fixed = [codecheck.validate_xml(v, None, True, False, done)["fixed"] for v in views]
+    assert all(any(f["file"] == str(shared) for f in fx) for fx in fixed), fixed      # fixed in both passes
+    assert (tmp_path / "Common" / "FB_Shared.TcPOU.bak").read_bytes() == before
+    assert g1 not in shared.read_text() and g2 not in shared.read_text()

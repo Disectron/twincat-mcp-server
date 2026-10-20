@@ -688,11 +688,28 @@ def member_owners(con: Any, rows: list[Any]) -> dict[int, str]:
     out: dict[int, str] = {}
     for r in rows:
         if r["kind"] in _MEMBER_KINDS:
-            p = con.execute("SELECT q.title, q.kind FROM pages p JOIN pages q ON q.url = p.parent WHERE p.rowid = ?",
-                            (r["rid"],)).fetchone()
-            name = symbol_name(p[0]) if p is not None and p[1] != "Page" else None
+            up = _ancestors(con, r["rid"])
+            name = symbol_name(up[-1][0]) if up and up[-1][1] != "Page" else None
             if name:
-                out[r["rid"]] = name.lower()
+                # review: the symbol's own name — 'Tc3_Foo.FB_X' and 'FB_X' are one owner, as _owned_by reads them
+                out[r["rid"]] = name.rsplit(".", 1)[-1].lower()
+    return out
+
+
+def _ancestors(con: Any, rid: int, depth: int = 3) -> list[tuple[str, str]]:
+    """(title, kind) of a page's parents in the Help Viewer contents, nearest first: through topic pages ('Methods')
+    up to the first symbol page, at most `depth` (format 6)."""
+    out: list[tuple[str, str]] = []
+    r = con.execute("SELECT parent FROM pages WHERE rowid = ?", (rid,)).fetchone()
+    url = r[0] if r is not None else None
+    while url and len(out) < depth:
+        q = con.execute("SELECT title, kind, parent FROM pages WHERE url = ?", (url,)).fetchone()
+        if q is None:
+            break
+        out.append((q[0], q[1]))
+        if q[1] != "Page":
+            break
+        url = q[2]
     return out
 
 
@@ -837,7 +854,9 @@ def symbol_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = N
         # N126 (format 6): 'FB_X.Call' — Beckhoff titles a method page with its bare name; the pages below FB_X's page
         # in the contents are FB_X's members (a page titled 'FB_X.Call' itself stays a candidate). kb_verify I13
         # (0.8.14): the bare name as a title writes it — 'LookUp()', 'GetHMI (4.1)' (names_symbol), not only 'LookUp'
-        owned = _owned_by(con, [r for r in fetch(bare) if keep is None or keep(r)], owner)
+        # owner first, by rowid: a member name like 'Reset' has hundreds of pages; only the owner's are read (review)
+        owned = [r for r in fetch([x["rid"] for x in _owned_by(con, [{"rid": rid} for rid in bare], owner)])
+                 if keep is None or keep(r)]
         ids = {r["rid"] for r in cands}
         cands += [r for r in owned if r["rid"] not in ids]
     return same_documents(cands, con)
@@ -882,13 +901,13 @@ def page_family(con: Any, url: str, limit: int = 60) -> dict[str, Any]:
 
 
 def _owned_by(con: Any, rows: list[Any], owner: str) -> list[Any]:
-    """The candidate pages whose parent in the contents documents `owner` (FB_WG_ComboFilter.Call → the 'Call' page
-    below FB_WG_ComboFilter's page)."""
+    """The candidate pages (each with "rid") whose parent in the contents documents `owner` (FB_WG_ComboFilter.Call →
+    the 'Call' page below FB_WG_ComboFilter's page) — the parent itself, or the first symbol page above topic pages
+    ('Methods'), as member_owners reads it."""
     out = []
     for r in rows:
-        p = con.execute("SELECT q.title FROM pages p JOIN pages q ON q.url = p.parent WHERE p.rowid = ?",
-                        (r["rid"],)).fetchone()
-        if p is not None and names_symbol(p[0], owner):
+        up = _ancestors(con, r["rid"])
+        if up and (names_symbol(up[0][0], owner) or (up[-1][1] != "Page" and names_symbol(up[-1][0], owner))):
             out.append(r)
     return out
 
