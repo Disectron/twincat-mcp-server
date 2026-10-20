@@ -67,6 +67,8 @@ UNIT_KINDS = ("PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "PROPERTY", "GE
 # N134: 'POU' — the IEC program organisation units; the kind POU itself is only a POU file whose header did not parse
 KIND_ALIASES = {"FB": ("FUNCTION_BLOCK",), "DUT": ("DUT", "STRUCT", "UNION", "ENUM", "ALIAS"), "ITF": ("INTERFACE",),
                 "POU": ("PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "POU")}
+# a unit that is part of another (FB_X.Execute, I_Module.Execute, FB_X.Value.Get) — N144
+_MEMBER_KINDS = ("METHOD", "PROPERTY", "GET", "SET", "ACTION", "TRANSITION")
 # N135: what a search engine's query language would read as operators — kb_search has none
 _OPERATOR_WORDS = frozenset({"OR", "AND", "NOT", "NEAR"})
 _OPERATOR_SYNTAX = re.compile(r"(?:^|\s)[-+^](?=\w)|(?<=\w)\*|\bNEAR\s*\(|(?<![\w])(?:OR|AND|NOT)(?![\w])")
@@ -699,6 +701,8 @@ class Knowledge:
         con.execute("CREATE TABLE IF NOT EXISTS units (project TEXT, name TEXT, kind TEXT, file TEXT, line INTEGER, "
                     "declaration TEXT, implementation TEXT, comments TEXT)")
         con.execute("CREATE INDEX IF NOT EXISTS units_project ON units(project)")
+        con.execute("CREATE TABLE IF NOT EXISTS project_files (project TEXT, path TEXT, size INTEGER, mtime INTEGER)")
+        con.execute("CREATE INDEX IF NOT EXISTS project_files_project ON project_files(project)")
         cols = {r[1] for r in con.execute("PRAGMA table_info(projects)")}
         if "problems" not in cols:               # N132 (0.8.14): what could not be read, kept for kb_status
             con.execute("ALTER TABLE projects ADD COLUMN problems TEXT")
@@ -833,6 +837,7 @@ class Knowledge:
 
     def _drop_project(self, con: sqlite3.Connection, stored: str) -> int:
         n = con.execute("DELETE FROM units WHERE project=?", (stored,)).rowcount
+        con.execute("DELETE FROM project_files WHERE project=?", (stored,))
         if self._fts:
             con.execute("DELETE FROM units_fts WHERE project=?", (stored,))
         con.execute("DELETE FROM projects WHERE path=?", (stored,))
@@ -848,6 +853,8 @@ class Knowledge:
         for r in con.execute(f"SELECT {sel} FROM projects ORDER BY path"):
             pr = dict(r)
             pr["state"] = folder_state(pr["path"], pr.pop("files"))
+            if pr["state"].startswith("files changed"):
+                pr.update(folder_changes(con, pr["path"]))                     # N147
             probs = json.loads(pr.pop("problems", None) or "null")
             if probs:
                 pr.update(_problem_counts(probs))
@@ -968,7 +975,8 @@ class Knowledge:
             if not root.is_dir():
                 out.append({"project": r["path"], "error": "folder not found (moved or deleted?) — kb_remove_project or re-add"})
                 continue
-            stamp = _tree_stamp(root)
+            found = _tree_files(root)
+            stamp = _stamp_of(found)
             if r.get("files") == stamp and not force:
                 out.append({"project": r["path"], "unchanged": True})
                 continue
@@ -1005,6 +1013,10 @@ class Knowledge:
                 con.execute("UPDATE projects SET indexed=?, units=?, files=?, problems=? WHERE path=?",
                             (time.strftime("%Y-%m-%dT%H:%M:%S"), len(units), stamp,
                              json.dumps(problems) if problems else None, r["path"]))
+                # N147: the files the stamp is made of, so that a changed folder can name what changed
+                con.execute("DELETE FROM project_files WHERE project=?", (r["path"],))
+                con.executemany("INSERT INTO project_files(project, path, size, mtime) VALUES (?,?,?,?)",
+                                [(r["path"], f, size, mt) for f, size, mt in found])
             out.append({"project": r["path"], "units": len(units), "files": scan.get("files"), **_problem_counts(problems),
                         **problems})
         res: dict[str, Any] = {"reindexed": out}
@@ -1046,7 +1058,21 @@ class Knowledge:
             raise KnowledgeError("empty query — give words from the code, a unit name or an error message")
         phrases = [x for x in re.findall(r'"([^"]+)"', q) if re.search(r"[^\W_]", x)]
         bare = re.sub(r'"[^"]*"', " ", q)
-        words = [w for w in re.findall(r"\w+", bare) if re.search(r"[^\W_]", w)]     # N135: '_' alone is no word
+        # N146 (0.8.14 retest): tokens joined by punctuation ('STRING(40)', 'fbTimer(IN:=') are one sequence of the
+        # code — searched as adjacent words (an FTS phrase), not as words anywhere in the unit ('STRING(40)' matched
+        # E_State: {attribute 'to_string'} and Running := 40). A qualified name ('GVL_Param.MAX_ALARMS', joined by '.'
+        # only) stays its names: the GVL declares the second
+        sequences: list[str] = []
+        loose: list[str] = []
+        for chunk in bare.split():
+            toks = [w for w in re.findall(r"\w+", chunk) if re.search(r"[^\W_]", w)]
+            joins = re.findall(r"(?<=\w)[^\w\s]+(?=\w)", chunk)
+            if len(toks) > 1 and any(j != "." for j in joins):
+                sequences.append(" ".join(toks))
+            else:
+                loose.append(chunk)
+        phrases += sequences
+        words = [w for w in re.findall(r"\w+", " ".join(loose)) if re.search(r"[^\W_]", w)]   # N135: '_' is no word
         if not phrases and not words:
             # R37: ':=' used to reach FTS as MATCH '' and fail with an empty message
             raise KnowledgeError(f"the query {q!r} has no searchable word: kb_search matches whole words and word "
@@ -1094,9 +1120,16 @@ class Knowledge:
             for w in informative:
                 ignored.setdefault(w, "error message text (not a name of the code)")
             informative = list(dict.fromkeys(w for t in names for w in re.findall(r"\w+", t) if re.search(r"[^\W_]", w)))
+            # N171 (0.8.14 retest): "C0046: Identifier 'X' not defined" searched the message's placeholder X — three
+            # noise hits. A single character is no name to look for in the code (as with the words of a query)
+            for w in [w for w in informative if len(w) == 1]:
+                informative.remove(w)
+                ignored[w] = ("a single character (a placeholder of the message?) — not searched: as a name it is in "
+                              "nearly every unit")
             for w in informative:
                 ignored.pop(w, None)
             phrases = []
+            sequences = []
         if not phrases and not informative and not error_msg:
             raise KnowledgeError(f"the query {q!r} has only stop words ({', '.join(ignored)}): kb_search looks for the "
                                  "names and words of the code — give a unit or variable name, or specific words")
@@ -1112,7 +1145,8 @@ class Knowledge:
                                          f"{self._project_list(con) or 'none'}")                    # R35 / R39
                 scope = [r["path"] for r in m]
             # N133: a folder edited, renamed or deleted after indexing was answered from its old units, silently
-            stale = [{"project": r["path"], "label": r["label"], "state": st}
+            stale = [{"project": r["path"], "label": r["label"], "state": st,
+                      **(folder_changes(con, r["path"]) if st.startswith("files changed") else {})}
                      for r in con.execute("SELECT path, label, files FROM projects ORDER BY path")
                      if (not scope or r["path"] in scope) and (st := folder_state(r["path"], r["files"])) != "current"]
             base_note = None
@@ -1136,6 +1170,8 @@ class Knowledge:
             out["operators_note"] = ("kb_search has no query operators: OR / AND / NOT / NEAR(…), '-', '+', '^' and "
                                      "'*' are not read as such — every other word is searched, as a word and as a word "
                                      "prefix, and a unit must hold all of them (\"quoted text\" is a phrase)")
+        if sequences:
+            out["searched_as_sequence"] = sequences
         if stale:
             out["stale"] = stale
         if ignored or info.get("ignored"):
@@ -1150,8 +1186,24 @@ class Knowledge:
             out["note"] = ("no unit contains every word of the query; these contain some of them (best first, "
                            "'matched' names them) — fewer or more specific words help")
         elif nproj and not hits and (phrases or informative):
-            out["note"] = (f"no unit contains {', '.join(phrases + informative)} (name, declaration, code, comments of "
-                           f"the {nproj} indexed folder(s))")
+            what = ", ".join(phrases + informative)
+            if want_kinds:
+                # N143 (0.8.14 retest): 'nCount kinds=[DUT]' said "no unit contains nCount" — units of other kinds do
+                with self._db_read() as con:
+                    other, _i = self._search_tiers(con, phrases, informative, [], scope, 200)
+                n_kind: dict[str, int] = {}
+                for h in other:
+                    n_kind[h["kind"]] = n_kind.get(h["kind"], 0) + 1
+                given = "/".join(str(x).strip().upper() for x in kinds or [])
+                out["note"] = (f"no {given} unit contains {what}" + (
+                    f"; {len(other)}{'+' if len(other) >= 200 else ''} unit(s) of other kinds do ("
+                    + ", ".join(f"{kk} {nn}" for kk, nn in sorted(n_kind.items(), key=lambda x: -x[1]))
+                    + ") — leave kinds out to see them" if other else
+                    f" — nor does a unit of another kind (name, declaration, code, comments of the {nproj} indexed "
+                    "folder(s))"))
+            else:
+                out["note"] = (f"no unit contains {what} (name, declaration, code, comments of the {nproj} indexed "
+                               "folder(s))")
         elif error_msg and not informative and not phrases:
             out["note"] = ("an error message without a name to look for in the code: known_error has its cause and fix"
                            if err else "an error message without a name to look for in the code, and not one the "
@@ -1182,8 +1234,12 @@ class Knowledge:
             where_extra += f" AND project IN ({','.join('?' * len(scope))})"
             params_extra += scope
         if kinds:
-            where_extra += f" AND kind IN ({','.join('?' * len(kinds))})"
-            params_extra += kinds
+            # N144 (0.8.14 retest): a member is part of its POU / interface — 'Execute kinds=[INTERFACE]' found nothing
+            # though I_Module declares the method Execute (unit I_Module.Execute, kind METHOD). Members are searched too
+            # and answered as their owner, when the owner is of the kinds asked
+            sql_kinds = list(dict.fromkeys([*kinds, *(k for k in _MEMBER_KINDS if k not in kinds)]))
+            where_extra += f" AND kind IN ({','.join('?' * len(sql_kinds))})"
+            params_extra += sql_kinds
         def pre(w: str) -> str:            # N135: a one-character prefix is in nearly every unit — that word exact
             return ph(w) + ("*" if len(w) > 1 else "")
         info: dict[str, Any] = {}
@@ -1280,27 +1336,69 @@ class Knowledge:
                 in_code = None
         declares = self._declaring(con, rows, words)
         order = {id(r): k for k, r in enumerate(DS.title_order(rows, " ".join(phrases + words), "name"))}
+        qw = [_fold(t) for w in words for t in re.findall(r"[^\W_]+", w)]
+
+        def own(r: sqlite3.Row) -> tuple[bool, int]:
+            # N145 (0.8.14 retest): 'CounterMod' listed FB_CounterModule's methods before FB_CounterModule — the unit
+            # whose OWN name (not its owner's part of it) holds the words comes first, the one with the fewest other
+            # words in its name first among those
+            toks = [_fold(t) for t in re.findall(r"[^\W_]+", (r["name"] or "").rsplit(".", 1)[-1])]
+            hit = {t for t in toks for w in qw if t.startswith(w)}
+            return (not hit, len([t for t in toks if t not in hit]))
         rows = sorted(rows, key=lambda r: (in_code is not None and r["rid"] not in in_code, -declares.get(r["rid"], 0),
-                                           tier_of[r["rid"]], order[id(r)]))
+                                           own(r), tier_of[r["rid"]], order[id(r)]))
+        owners: dict[tuple[str, str, str], tuple[str, str] | None] = {}
+        by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
         for r in rows:
-            key = (r["project"], r["name"], r["file"])
+            name, kind, member = r["name"], r["kind"], None
+            if kinds and kind not in kinds:
+                # N144: a member found — answered as its owner, when the owner is of the kinds asked
+                ok = (r["project"], r["file"], name)
+                if ok not in owners:
+                    owners[ok] = self._owner_of(con, r["project"], r["file"], name)
+                o = owners[ok]
+                if o is None or o[1] not in kinds:
+                    continue
+                name, kind, member = o[0], o[1], r["name"]
+            key = (r["project"], name, r["file"])
             if key in seen:
+                if member and key in by_key:
+                    by_key[key].setdefault("via_members", []).append(member)
                 continue
             seen.add(key)
             label, _expr, terms = tiers[tier_of[r["rid"]]]
-            h = {"project": r["project"], "unit": r["name"], "kind": r["kind"], "file": r["file"],
+            h = {"project": r["project"], "unit": name, "kind": kind, "file": r["file"],
                  "declaration": r["decl"], "code": r["impl"], "match": label}
+            if member:
+                h["via_member"] = member
             if in_code is not None and r["rid"] not in in_code:
                 # the words are there, not every one in the code — N135: in a string literal is not 'comments'
                 h["match_in"] = "comments" if r["rid"] in in_comments else "string literals or comments"
+                # N146 (0.8.14 retest): which ones — 'STRING(40)' was labelled so though '40' was in E_State's code
+                h["words_not_in_code"] = [t for t in terms if not self._row_has(con, r["rid"], t, t in phrases, code_cols)]
             if declares.get(r["rid"]):
                 h["declares"] = True
             if label == "some words":
                 h["matched"] = [t for t in terms if self._row_has(con, r["rid"], t, t in phrases)]
             hits.append(h)
+            by_key[key] = h
             if len(hits) >= limit:
                 break
         return hits, info
+
+    @staticmethod
+    def _owner_of(con: sqlite3.Connection, project: str, file: str, name: str) -> tuple[str, str] | None:
+        """(name, kind) of the POU / interface / data type a member belongs to — FB_X.Value.Get → FB_X (through the
+        property); None when it is not stored."""
+        while "." in name:
+            name = name.rsplit(".", 1)[0]
+            r = con.execute("SELECT kind FROM units WHERE project = ? AND file = ? AND name = ?",
+                            (project, file, name)).fetchone()
+            if r is None:
+                return None
+            if r[0] not in _MEMBER_KINDS:
+                return name, r[0]
+        return None
 
     def _declaring(self, con: sqlite3.Connection, rows: list[sqlite3.Row], words: list[str]) -> dict[int, int]:
         """N131: how many of the query's identifiers each unit declares — its name, a variable / constant / member /
@@ -1346,9 +1444,11 @@ class Knowledge:
         return con.execute(f"SELECT COUNT(*) FROM units WHERE {self._LIKE_ONE}{where_extra}",
                            [self._like(term or "")] * 4 + params_extra).fetchone()[0]
 
-    def _row_has(self, con: sqlite3.Connection, rid: int, term: str, phrase: bool) -> bool:
+    def _row_has(self, con: sqlite3.Connection, rid: int, term: str, phrase: bool, cols: str | None = None) -> bool:
         if self._fts:
-            e = '"' + term.replace('"', '""') + '"' + ("" if phrase else "*")
+            e = '"' + term.replace('"', '""') + '"' + ("" if phrase or len(term) == 1 else "*")
+            if cols:
+                e = f"{cols} : ({e})"
             return con.execute("SELECT 1 FROM units_fts WHERE rowid = ? AND units_fts MATCH ?", (rid, e)).fetchone() is not None
         return con.execute(f"SELECT 1 FROM units WHERE rowid = ? AND {self._LIKE_ONE}",
                            [rid] + [self._like(term)] * 4).fetchone() is not None
@@ -1556,12 +1656,10 @@ def _legacy_tree_stamp(root: Path) -> str:
     return h.hexdigest()
 
 
-def _tree_stamp(root: Path) -> str:
-    """What the index of a folder depends on: its sources, and what decides which of them are units — the .plcproj
-    files (N106), the .tsproj / .xti files that name the PLC projects and the .sln that names the .tsproj (N133: an
-    edit of those changed the units without changing the stamp). Folders the scan never reads are not walked."""
-    import hashlib
-    h = hashlib.sha256()
+def _tree_files(root: Path) -> list[tuple[str, int, int]]:
+    """(path, size, mtime_ns) of what the index of a folder depends on: its sources, and what decides which of them
+    are units — the .plcproj files (N106), the .tsproj / .xti files that name the PLC projects and the .sln that names
+    the .tsproj (N133). Folders the scan never reads are not walked. Sorted by path."""
     found: list[tuple[str, int, int]] = []
     for dirpath, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d.lower() not in _STAMP_SKIP]
@@ -1573,9 +1671,45 @@ def _tree_stamp(root: Path) -> str:
                 except OSError:
                     continue
                 found.append((f, st.st_size, st.st_mtime_ns))
-    for f, size, mt in sorted(found):
+    return sorted(found)
+
+
+def _stamp_of(found: list[tuple[str, int, int]]) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for f, size, mt in found:
         h.update(f"{f}:{size}:{mt}\n".encode())
     return _STAMP_V + h.hexdigest()
+
+
+def _tree_stamp(root: Path) -> str:
+    """The stamp of a folder (_tree_files): changes with any file the index of the folder depends on (N133)."""
+    return _stamp_of(_tree_files(root))
+
+
+def folder_changes(con: sqlite3.Connection, path: str) -> dict[str, Any]:
+    """N147 (0.8.14 retest): 'stale: files changed since it was indexed' named no file — which files changed, came or
+    went since the folder was indexed (the files recorded then, table project_files), at most 20 of each, with their
+    counts. A folder indexed before 0.8.15 has no record: said so."""
+    try:
+        rec = {r[0]: (r[1], r[2]) for r in con.execute("SELECT path, size, mtime FROM project_files WHERE project = ?",
+                                                        (path,))}
+    except sqlite3.OperationalError:
+        rec = {}
+    if not rec:
+        return {"changed_files_note": "which files changed is not known: the folder was indexed before 0.8.15, when "
+                                      "its files were not recorded — kb_reindex records them"}
+    now = {f: (size, mt) for f, size, mt in _tree_files(Path(path))} if Path(path).is_dir() else {}
+    changed = sorted(f for f in now.keys() & rec.keys() if now[f] != rec[f])
+    added = sorted(now.keys() - rec.keys())
+    removed = sorted(rec.keys() - now.keys())
+    out: dict[str, Any] = {}
+    for key, lst in (("changed_files", changed), ("added_files", added), ("removed_files", removed)):
+        if lst:
+            out[key] = lst[:20]
+            if len(lst) > 20:
+                out[key.replace("_files", "_count")] = len(lst)
+    return out
 
 
 def folder_state(path: str, stamp: str | None) -> str:

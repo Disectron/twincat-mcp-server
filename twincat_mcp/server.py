@@ -2368,10 +2368,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (`declares`). Stop words ('how', 'to', 'the') and, in a query of several words, single characters are not
         searched; a query of stop words only is refused. There are no query operators: OR / AND / NOT / NEAR, '-',
         '^', '*' are not read as such (`operators_note`). A copy name (PRG_X_9) that no unit has falls back to the
-        name it was copied from. "quoted text" is a phrase. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
-        POU (= those three), METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …;
-        project = the folder (any spelling) or its label; limit 1–200. `stale`: folders changed, renamed or deleted
-        since they were indexed — their hits are those of the last indexing (kb_reindex). An error message — a code in
+        name it was copied from. "quoted text" is a phrase; tokens joined by punctuation ('STRING(40)', 'fbTimer(IN:=')
+        are searched as one sequence (`searched_as_sequence`), a qualified name ('GVL_X.nY') as its names. A unit whose
+        own name holds the words comes before its members. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
+        POU (= those three), METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …; with
+        kinds, a member is answered as its owner of those kinds (`via_member`: 'Execute' kinds=[INTERFACE] → I_Module);
+        no hit names the units of other kinds that have the words. `words_not_in_code`: the words a hit has only in
+        comments / string literals. project = the folder (any spelling) or its label; limit 1–200. `stale`: folders
+        changed, renamed or deleted since they were indexed — their hits are those of the last indexing (kb_reindex);
+        `changed_files` / `added_files` / `removed_files` name them. An error message — a code in
         a notation that says so (ADSError 1861, pyads' 'ADSError: … (1861)', ADS error 1861, error 1861, nErrId :=
         1861, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT), a compiler message (C0046: …), or a 0x number alone; not the
         word 'error', a decimal / 16# literal alone, a hex number anywhere or an ERR_… identifier of the code — gets the plugin's note

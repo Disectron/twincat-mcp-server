@@ -1046,3 +1046,94 @@ def test_n129_n130_error_messages_keep_their_names_and_known_errors_need_their_c
     assert r["known_error"] and r["hits"][0]["unit"] == "PRG_Machine", r
     r = k.search("C0046")
     assert r["known_error"] is None and "C-number alone is not documented locally" in r["known_errors_covered"], r
+
+
+def _pou_m(folder: Path, name: str, decl: str, impl: str = "", methods=()) -> Path:
+    """A POU with methods ((name, declaration, implementation), …)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    ms = "".join(f'<Method Name="{m}" Id="{{bbbbbbbb-0000-0000-0000-0000000000{i:02d}}}"><Declaration><![CDATA[{d}]]>'
+                 f'</Declaration><Implementation><ST><![CDATA[{b}]]></ST></Implementation></Method>'
+                 for i, (m, d, b) in enumerate(methods))
+    f = folder / f"{name}.TcPOU"
+    f.write_text('<?xml version="1.0" encoding="utf-8"?>\n<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">\n'
+                 f'  <POU Name="{name}" Id="{{aaaaaaaa-0000-0000-0000-0000000000{len(name):02d}}}" SpecialFunc="None">\n'
+                 f"    <Declaration><![CDATA[{decl}]]></Declaration>\n"
+                 f"    <Implementation><ST><![CDATA[{impl}]]></ST></Implementation>{ms}\n  </POU>\n</TcPlcObject>\n",
+                 encoding="utf-8")
+    return f
+
+
+def _p15_like(src: Path) -> None:
+    _pou_m(src, "FB_ModuleBase", "FUNCTION_BLOCK ABSTRACT FB_ModuleBase IMPLEMENTS I_Module\nVAR\n    bBusy : BOOL;\nEND_VAR",
+           "", [("Execute", "METHOD Execute : BOOL", "Execute := TRUE;")])
+    _pou_m(src, "FB_CounterModule", "FUNCTION_BLOCK FB_CounterModule EXTENDS FB_ModuleBase\nVAR\n    nCount : INT;\n"
+           "    sName : STRING(40);\nEND_VAR", "",
+           [("OnReset", "METHOD OnReset : BOOL", "nCount := 0;"), ("OnRunning", "METHOD OnRunning : BOOL", "nCount := nCount + 1;")])
+    _pou_m(src, "FB_CounterModule_Tests", "FUNCTION_BLOCK FB_CounterModule_Tests\nVAR\n    fbUut : FB_CounterModule;\n"
+           "END_VAR", "fbUut();")
+    (src / "I_Module.TcIO").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><Itf Name="I_Module" Id="{cccccccc-0000-0000-0000-000000000001}">'
+        "<Declaration><![CDATA[INTERFACE I_Module]]></Declaration><Method Name=\"Execute\" "
+        'Id="{cccccccc-0000-0000-0000-000000000002}"><Declaration><![CDATA[METHOD Execute : BOOL]]></Declaration></Method>'
+        "</Itf></TcPlcObject>", encoding="utf-8")
+    (src / "E_State.TcDUT").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><DUT Name="E_State"><Declaration><![CDATA['
+        "{attribute 'to_string'}\nTYPE E_State :\n(\n    Idle := 0,\n    Running := 40\n);\nEND_TYPE]]></Declaration>"
+        "</DUT></TcPlcObject>", encoding="utf-8")
+
+
+def test_n143_n144_n145_n146_kinds_members_own_name_and_sequences(kb, tmp_path):
+    """0.8.14 retest §34c. N143: with kinds, the empty answer said 'no unit contains nCount' — units of other kinds
+    do. N144: kinds did not see members: 'Execute kinds=[INTERFACE]' found nothing though I_Module declares the method
+    Execute (unit I_Module.Execute, kind METHOD); kinds=[FB] found FB_ModuleBase only through a comment. N145:
+    'CounterMod' listed FB_CounterModule's methods before FB_CounterModule. N146: 'STRING(40)' matched E_State
+    ({attribute 'to_string'} + Running := 40) — tokens joined by punctuation are one sequence of the code."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "p15"
+    _p15_like(src)
+    k.add_project(str(src), "p15")
+    r = k.search("nCount", ["DUT"])
+    assert r["hits"] == [] and "no DUT unit contains nCount" in r["note"], r.get("note")
+    assert "of other kinds" in r["note"] and "FUNCTION_BLOCK" in r["note"] and "METHOD" in r["note"], r["note"]
+    r = k.search("Execute", ["INTERFACE"])
+    assert [(h["unit"], h["kind"], h.get("via_member"), h.get("declares")) for h in r["hits"]] == [
+        ("I_Module", "INTERFACE", "I_Module.Execute", True)], r["hits"]
+    r = k.search("Execute", ["FB"])
+    assert [(h["unit"], h.get("via_member")) for h in r["hits"]] == [("FB_ModuleBase", "FB_ModuleBase.Execute")], r
+    r = k.search("CounterMod")
+    assert [h["unit"] for h in r["hits"]][:2] == ["FB_CounterModule", "FB_CounterModule_Tests"], [h["unit"] for h in r["hits"]]
+    r = k.search("STRING(40)")
+    assert [h["unit"] for h in r["hits"]] == ["FB_CounterModule"] and r["searched_as_sequence"] == ["STRING 40"], r
+    r = k.search("FB_CounterModule.nCount")          # a qualified name stays two names: the FB declares the second
+    assert r["hits"][0]["unit"] == "FB_CounterModule", r["hits"]
+
+
+def test_n146_n147_n171_label_changed_files_and_placeholders(kb, tmp_path):
+    """N146: the label said 'string literals or comments' for a unit whose code held one of the words — the words not
+    in its code are named. N147: 'stale: files changed since it was indexed' named no file. N171: the placeholder 'X' of
+    'C0046: Identifier 'X' not defined' was searched as a name (noise)."""
+    import os
+    import time as _t
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "p15"
+    _p15_like(src)
+    _pou_m(src, "FB_Note", "FUNCTION_BLOCK FB_Note\nVAR\n    nLimit : INT := 40;\nEND_VAR", "// alarm text\n;")
+    k.add_project(str(src), "p15")
+    r = k.search("alarm nLimit")
+    h = next(h for h in r["hits"] if h["unit"] == "FB_Note")
+    assert h["words_not_in_code"] == ["alarm"], h
+    f = src / "FB_Note.TcPOU"
+    _t.sleep(0.01)
+    f.write_text(f.read_text().replace("40", "41"), encoding="utf-8")
+    os.utime(f, (f.stat().st_atime, f.stat().st_mtime + 5))
+    (src / "FB_New.TcPOU").write_text((src / "FB_Note.TcPOU").read_text().replace("FB_Note", "FB_New"), encoding="utf-8")
+    (src / "E_State.TcDUT").unlink()
+    r = k.search("nCount")
+    st = r["stale"][0]
+    assert st["changed_files"] == [str(f)] and st["added_files"] == [str(src / "FB_New.TcPOU")], st
+    assert st["removed_files"] == [str(src / "E_State.TcDUT")], st
+    r = k.search("C0046: Identifier 'X' not defined")
+    assert r["hits"] == [] and "X" in r["words_ignored"] and "single character" in r["words_ignored"]["X"], r
+    assert r["known_error"], r
