@@ -179,8 +179,8 @@ def infosys_rank(con: sqlite3.Connection) -> str:
 
 def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, extra: list[Any],
                  limit: int, title_key: str | None = None, fts: str = "fts",
-                 arrange: Callable[[list[Any]], list[Any]] | None = None, title_col: str | None = None
-                 ) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
+                 arrange: Callable[[list[Any]], list[Any]] | None = None, title_col: str | None = None,
+                 title_sql: str | None = None) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
     """N36/N65: a question in words falls back in steps, and only on words that can pick a page:
       1. every word as written (stop words included: a precise query stays precise);
       2. every informative word that occurs in the index — stop words, 1-2 letter words and words on no page dropped;
@@ -188,9 +188,10 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
       4. some of them (OR) — without words that are on more than 20 % of the pages.
     Nothing informative left: no hits. N79: a query of nothing but stop words is refused; one word alone ('the') is
     searched as written. title_key: the hits of a tier are ordered by title_order (N105); arrange: instead, a function
-    that orders the hits read (more than `limit`). title_col (with title_key or arrange): the FTS column of the titles —
-    the hits of the tier whose title holds its informative words are read as well (title_hits), not only the best by
-    bm25: a page titled as the query is ordered by its title wherever bm25 ranks it. FTS5 syntax or code punctuation
+    that orders the hits read (more than `limit`). title_col, title_sql (with title_key or arrange): the FTS column of
+    the titles and `sql` ordered by the title's length — the hits of the tier that begin with the query or hold its words in
+    the title are read as well (title_hits), not only the best by bm25: a page titled as the query is ordered by its
+    title wherever bm25 ranks it. FTS5 syntax or code punctuation
     runs as written (run_fts, with the phrase retry). Needs vocab(con, fts) for the term statistics.
     -> (rows, total, mode, expression, info: words used / ignored with the reason)."""
     q = query_text(query).strip()
@@ -235,9 +236,10 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
         tiers.append(("some words (no page has all of them)", " OR ".join(ph(w) + "*" for w in some), some))
     for label, expr, used in tiers:
         rows = con.execute(sql, [expr, *extra, _fetch(limit, title_key or arrange)]).fetchall()
-        if rows and title_col and (title_key or arrange):
-            rows = rows + title_hits(con, sql, expr, used, label.endswith("(as prefixes)") or label.startswith("some"),
-                                     extra, title_col, {r[0] for r in rows})
+        if rows and title_col and title_sql and (title_key or arrange):
+            rows = rows + title_hits(con, title_sql, expr, used,
+                                     label.endswith("(as prefixes)") or label.startswith("some"), extra, title_col,
+                                     {r[0] for r in rows}, q)
         if rows:
             rows = _arranged(rows, q, title_key, arrange)
             info: dict[str, Any] = {"words_used": used}
@@ -253,21 +255,37 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
 
 
 def title_hits(con: sqlite3.Connection, sql: str, expr: str, used: list[str], prefix: bool, extra: list[Any],
-               title_col: str, have: set[Any]) -> list[sqlite3.Row]:
-    """The hits of a tier (expr) whose title holds every informative word it used — read besides the best by bm25,
-    which the title order sees alone otherwise: 'Data type' did not find the page titled 'Data type' (bm25 rank 685,
-    behind 300 'Data types' pages full of 'data type'). They are hits of the tier, so its count is unchanged. Rows
-    already read (`have`, by the first column) are left out; at most _TITLE_HITS, the best by bm25."""
+               title_col: str, have: set[Any], query: str = "") -> list[sqlite3.Row]:
+    """The hits of a tier (expr) that the title order must see, read besides the best by bm25, which it sees alone
+    otherwise ('Data type' did not find the page titled 'Data type': bm25 rank 685, behind 300 'Data types' pages full
+    of 'data type'): the hits whose title begins with the query's words in their order — the page titled as the query
+    is one of them however common its words are ('TwinCAT', 'MC', 'Object Method') — then those whose title holds
+    every informative word the tier used. They are hits of the tier, so its count is unchanged. sql orders them by
+    the title's length — the shortest title that begins with the query is the query ('TwinCAT' before 300
+    'TwinCAT …' pages whose text says TwinCAT more often; bm25 cannot tell when every title holds the word). Rows
+    already read (`have`, by the first column) are left out; at most _TITLE_HITS of each."""
+    def q_(w: str) -> str:
+        return w.replace('"', '""')
+    conds = []
+    toks = re.findall(r"[^\W_]+", query_text(query))
+    if toks:
+        conds.append(f'{title_col} : ^"{q_(" ".join(toks))}"')
     words = [w for w in used if fold(w) not in STOP_WORDS and (len(w) >= 3 or w.isdigit())]
-    if not words:
-        return []
-    star = "*" if prefix else ""
-    cond = " AND ".join(f'{title_col} : "{w.replace(chr(34), chr(34) * 2)}"{star}' for w in words)
-    try:
-        rows = con.execute(sql, [f"({expr}) AND ({cond})", *extra, _TITLE_HITS]).fetchall()
-    except sqlite3.OperationalError:
-        return []
-    return [r for r in rows if r[0] not in have]
+    if words:
+        star = "*" if prefix else ""
+        conds.append(" AND ".join(f'{title_col} : "{q_(w)}"{star}' for w in words))
+    out: list[sqlite3.Row] = []
+    seen = set(have)
+    for cond in conds:
+        try:
+            rows = con.execute(sql, [f"({expr}) AND ({cond})", *extra, _TITLE_HITS]).fetchall()
+        except sqlite3.OperationalError:
+            continue
+        for r in rows:
+            if r[0] not in seen:
+                seen.add(r[0])
+                out.append(r)
+    return out
 
 
 _TITLE_HITS = 300
@@ -357,12 +375,12 @@ def code_forms(query: str) -> dict[str, Any] | None:
     of two digits or more next to a word that says it is a code ('error 1861', 'ADS return code 1861' — 'ADS port
     851' or 'build 4024' is no code, review 0.8.12); else None."""
     q = query_text(query)
-    toks = re.findall(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", q)
+    toks = list(re.finditer(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", q))
     if len(toks) != 1:
         return None
-    t = toks[0]
+    t = toks[0].group(0)
     m = _HEX.match(t)
-    if not m and not _CODE_WORDS & {fold(w) for w in re.findall(r"[^\W\d_]+", q)}:
+    if not m and not _next_to_code_word(q, toks[0].start(), toks[0].end()):
         return None
     try:
         value = int(m.group(1).replace("_", ""), 16) if m else int(t)
@@ -373,6 +391,16 @@ def code_forms(query: str) -> dict[str, Any] | None:
     h = f"{value:x}"
     hexes = sorted({f"0x{h}", f"0x{h.zfill(4)}", f"0x{h.zfill(8)}"}, key=len)
     return {"token": t, "value": value, "hex": hexes, "dec": str(value)}
+
+
+def _next_to_code_word(q: str, start: int, end: int) -> bool:
+    """The decimal number q[start:end] stands alone (not part of a name: 'P-CHAN-00020', 'EL3102_1') and the word
+    right before or after it says it is a code ('error 1861', 'nErrId = 1861', '1861 error')."""
+    if re.search(r"[\w-]$", q[:start]) or re.match(r"[\w-]", q[end:]):
+        return False
+    before = re.search(r"([^\W\d_]+)[\s:=#(]{1,3}$", q[:start])
+    after = re.match(r"[\s:)]{1,3}([^\W\d_]+)", q[end:])
+    return any(x is not None and fold(x.group(1)) in _CODE_WORDS for x in (before, after))
 
 
 def _cell_value(cell: str) -> tuple[str, int] | None:

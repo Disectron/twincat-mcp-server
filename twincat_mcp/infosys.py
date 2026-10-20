@@ -808,6 +808,8 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
     w = "pages_fts MATCH ?" + (f" AND ({where})" if where else "")
     sql = f"SELECT {cols} FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {w} ORDER BY r LIMIT ?"
     count_sql = f"SELECT COUNT(*) FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {w}"
+    title_sql = (f"SELECT {cols} FROM pages_fts JOIN pages p ON p.rowid = pages_fts.rowid WHERE {w} "
+                 "ORDER BY length(p.title), r LIMIT ?")
 
     def body(r: Any) -> str:
         x = con.execute("SELECT markdown FROM pages WHERE rowid = ?", (r["rid"],)).fetchone()
@@ -828,7 +830,7 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
         return out
 
     rows, total, mode, expr, info = DS.search_tiers(con, sql, count_sql, query, extra, limit, fts="pages_fts",
-                                                    arrange=arrange, title_col="title")
+                                                    arrange=arrange, title_col="title", title_sql=title_sql)
     outside = 0                                 # defining pages without the tier's words: listed, so counted
     if not rows and defined:                    # the code's table, though no tier found the query's other words
         rows, total, mode = arrange([])[:limit], 0, "the code's table (no page has the other words)"

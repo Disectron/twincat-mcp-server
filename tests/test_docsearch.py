@@ -179,6 +179,17 @@ def test_second_review_0812_the_page_id_wins_whatever_the_order():
     assert D.code_forms("ErrorCode 1861")["value"] == 1861 and D.code_forms("nErrId 1861")["value"] == 1861
 
 
+def test_kbv_a_number_is_a_code_only_next_to_a_code_word():
+    """kb_verify full run on the real index (0.8.13): 'Number of errors per row (P-CHAN-00020)' listed the pages that
+    define error code 20 before the page of that title — 'errors' anywhere in the query made 00020 a code, though the
+    rule (review 0.8.12) is a number NEXT TO a word that says it is a code, and 00020 is part of a parameter name."""
+    assert D.code_forms("Number of errors per row (P-CHAN-00020)") is None
+    assert D.code_forms("errors in P-CHAN-00020") is None and D.code_forms("error in row 25 of the table") is None
+    assert D.code_forms("ADS error 1861")["value"] == 1861 and D.code_forms("error code 1861")["value"] == 1861
+    assert D.code_forms("nErrId = 1861")["value"] == 1861 and D.code_forms("1861 error")["value"] == 1861
+    assert D.code_forms("ADS return codes 0x745")["value"] == 1861          # hex needs no word
+
+
 def test_kbv_a_page_titled_as_the_query_is_found(idx):
     """kb_verify on the real index (0.8.13): 'Data type' did not find the page titled 'Data type' in the top 50 — the
     hits are ordered by their titles, but only the 150–300 best by bm25 were read, and 300 'Data types' pages full of
@@ -194,9 +205,20 @@ def test_kbv_a_page_titled_as_the_query_is_found(idx):
         for n in range(12):
             idx._store(con, f"{C}tf52{n:02d}_cyc/{5000 + n}.html", "", _page(
                 "Process (internal cycle)", f"<p>Cycle {n}: internal cycle process, internal cycle process.</p>"))
-    for q in ("Data type", "Internal cycle process"):
+        # full run on the real index: a title of one common word ('TwinCAT': thousands of titles hold it) or of a
+        # word shorter than 3 letters ('MC', no informative word at all)
+        for n in range(320):
+            idx._store(con, f"{C}tc3_x{n:03d}/{7000 + n}.html", "", _page(
+                f"TwinCAT component {n}", f"<p>TwinCAT {n}: " + "TwinCAT runtime. " * 4 + "</p>"))
+            idx._store(con, f"{C}tcplclib_tc2_mc2_{n:03d}/{8000 + n}.html", "", _page(
+                f"MC_Function{n}", f"<p>MC function {n}: MC MC MC.</p>"))
+        idx._store(con, f"{C}tc3_c/6778770443.html", "", _page(
+            "TwinCAT", "<p>" + " ".join(f"word{k}" for k in range(400)) + " TwinCAT.</p>"))
+        idx._store(con, f"{C}tc3_io_intro/1999768587.html", "", _page(
+            "MC", "<p>" + " ".join(f"word{k}" for k in range(400)) + " MC.</p>"))
+    for q in ("Data type", "Internal cycle process", "TwinCAT", "MC"):
         r = idx.search(q, limit=10)
-        assert r["items"][0]["title"] == q, [i["title"] for i in r["items"]]
+        assert r["items"][0]["title"] == q, (q, [i["title"] for i in r["items"]])
     r = idx.search("Data type", limit=10)
     assert r["total"] == 321 and r["query_mode"] == "all words"          # the count is the tier's, unchanged
 
