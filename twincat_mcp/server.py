@@ -4298,7 +4298,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def infosys_search_symbols(query: str, kind: str | None = None, library: str | None = None,
                                      limit: int = 10) -> dict[str, Any]:
         """Find library symbols (function blocks, functions, structs, enums, aliases, interfaces,
-        GVLs) by name fragment in the indexed books; exact > prefix > contains. kind: FunctionBlock |
+        GVLs) by name fragment in the indexed books; exact > prefix > contains; with * or ? a glob on the name
+        ('FB_EcCoE*', 'FB_Ec*Write'). kind: FunctionBlock |
         Function | Program | Method | Property | Action | Enum | Struct | Union | Alias | Interface |
         GlobalVariable | Library. library: 'Tc2_System' or the book slug. Indexes the default
         libraries on first use if nothing is indexed."""
@@ -4323,7 +4324,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                              web_fallback: bool | None = None) -> dict[str, Any]:
         """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]); "quoted phrases"
         stay together, limit 1..50. A question in words falls back in tiers (query_mode, words_used); identifiers
-        count as their words (FB_SocketConnect: socket, connect); titles that name the query come first; an error
+        count as their words (FB_SocketConnect: socket, connect); a word in capitals is a keyword or acronym and always
+        searched (FOR, BY, THIS, ST, AL — in lower case 'for', 'this' are English stop words), and a title that has it
+        comes first ('ST instruction FOR'); code punctuation that finds nothing as written is searched as its words
+        ('THIS^ SUPER^', 'S= R='); titles that name the query come first; an error
         code (0x745, 1861 alone, 'error 1861') lists the pages whose table defines it first, code tables before other
         pages (code_note); one page in several books — or placed twice in one — is listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
         so), results carry the page's doc version and the package date. docs.source='web': when the index has nothing,

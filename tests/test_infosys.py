@@ -781,6 +781,64 @@ def test_review_0815_a_members_owner_above_a_topic_page_and_by_its_own_name(idx)
     assert idx.declaration("FB_A.Run")["url"] in (f"{C}tf1000_book_one/101.html", f"{C}tf4000_book_four/101.html")
 
 
+def _store_pages(idx, pages):
+    with idx._db() as con:
+        for ref, title, body in pages:
+            idx._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", _page(title, body))
+
+
+def test_n148_n149_iec_keywords_and_operators_are_searchable(idx):
+    """0.8.14 retest §34d. N148: IEC keywords were dropped as English stop words — 'THIS pointer' ignored THIS (the
+    page THIS unreachable by search), 'FOR loop BY step' ranked the CNC '$FOR' page first. A word written in capitals
+    is a keyword or an acronym of the documentation (FOR, BY, THIS, ST, AL), never a stop word or a too-short word.
+    N149: 'THIS^ SUPER^' (a phrase) found nothing and nothing else was tried; 'REF=' found AXIS_REF … instead of the
+    page of the operator REF=. A page whose title holds the operator comes first; a query whose punctuation finds
+    nothing is searched as its words."""
+    P = "tc3_plc_intro"
+    _store_pages(idx, [
+        (f"{P}/2528843147", "THIS", "<p>THIS is a special variable: a pointer to the own function block instance. "
+                                    "Use THIS^ to dereference it.</p>"),
+        (f"{P}/2528837771", "SUPER", "<p>SUPER is a pointer to the function block instance of the basic function block "
+                                     "(SUPER^).</p>"),
+        (f"{P}/1000000001", "POINTER TO", "<p>A pointer holds the address of a variable; this pointer type …</p>"),
+        (f"{P}/2528897931", "ST instruction FOR", "<p>The FOR loop: FOR nCounter := 1 TO 10 BY 2 DO … END_FOR. The step "
+                                                  "size is given BY the increment.</p>"),
+        ("tf5200_cnc/1000000002", "Counting loop ($FOR)", "<p>The counting loop $FOR repeats a block; the loop counter "
+                                                         "runs step by step up to the end value. FOR loop of the CNC.</p>"),
+        (f"{P}/4978163979", "Assignment operator REF=", "<p>REF= assigns a reference to a variable.</p>"),
+        ("tcplclib_tc2_mc2/1000000003", "AXIS_REF", "<p>AXIS_REF is the axis reference (REF) of every motion FB.</p>"),
+        (f"{P}/1000000004", "Set operator S=", "<p>S= sets a BOOL variable: set and reset assignment.</p>"),
+        (f"{P}/1000000005", "Reset operator R=", "<p>R= resets a BOOL variable: set and reset assignment.</p>"),
+    ])
+    idx.sync_derived()
+    first = lambda q: [i["title"] for i in idx.search(q, limit=5)["items"]]           # noqa: E731
+    assert first("THIS pointer")[0] == "THIS", first("THIS pointer")
+    assert first("FOR loop BY step")[0] == "ST instruction FOR", first("FOR loop BY step")
+    assert first("REF=")[0] == "Assignment operator REF=", first("REF=")
+    got = first("THIS^ SUPER^")
+    assert {"THIS", "SUPER"} <= set(got[:2]), got
+    got = first("set reset S= R=")
+    assert set(got[:2]) == {"Set operator S=", "Reset operator R="}, got
+    # lower case is English: 'this' is a stop word once the words as written find nothing — said so, with the way out
+    r = idx.search("this pointer xyzzyq", limit=5)
+    assert "in capitals (THIS)" in r["words_ignored"]["this"] and "this" not in r["words_used"], r
+    r = idx.search("THIS pointer", limit=5)                      # N166: a word the search used is not 'ignored'
+    assert "words_ignored" not in r and r["words_used"] == ["THIS", "pointer"], r
+
+
+def test_n161_symbol_search_takes_globs(idx):
+    """N161 (0.8.14 retest): infosys_search_symbols 'FB_EcCoE*' → 0, the '*' taken literally (infosys_books takes
+    globs); 'FB_EcCoE' → 7."""
+    _store_pages(idx, [(f"tcplclib_tc2_ethercat/{i}", t, f"<pre>FUNCTION_BLOCK {t}\nVAR_INPUT\n    sNetId : STRING;\n"
+                                                         "END_VAR</pre>")
+                       for i, t in enumerate(["FB_EcCoESdoRead", "FB_EcCoESdoWrite", "FB_EcCoeReadBIC", "FB_EcGetSlaveState"])])
+    r = idx.search_symbols("FB_EcCoE*", limit=10, auto_index=False)
+    assert sorted(i["name"] for i in r["items"]) == ["FB_EcCoESdoRead", "FB_EcCoESdoWrite", "FB_EcCoeReadBIC"], r
+    r = idx.search_symbols("FB_Ec*Write", limit=10, auto_index=False)
+    assert [i["name"] for i in r["items"]] == ["FB_EcCoESdoWrite"], r
+    assert idx.search_symbols("FB_EcCoE", limit=10, auto_index=False)["count"] == 3
+
+
 def test_n138_a_page_that_is_not_utf8_keeps_its_characters():
     """N138 (0.8.13 retest): the stored text of 4 tf5200 pages had U+FFFD for Beckhoff's curly quotes — the package
     page was Windows-1252, read as UTF-8 with errors replaced. (The ADS return-code table itself stores its dashes:

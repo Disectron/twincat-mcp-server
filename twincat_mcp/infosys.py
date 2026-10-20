@@ -32,6 +32,7 @@ from __future__ import annotations
 import gzip
 import html
 import io
+import fnmatch
 import json
 import re
 import sqlite3
@@ -2050,13 +2051,20 @@ class InfosysIndex:
             where.append("(library = ? COLLATE NOCASE OR book = ? COLLATE NOCASE)")
             params += [library, library]
         _check_limit(limit)
+        # N161 (0.8.14 retest): 'FB_EcCoE*' found nothing — the '*' was a character of the name. A query with * or ?
+        # is a glob on the symbol's name (as infosys_books takes them); without, a part of the name as before
+        glob = bool(re.search(r"[*?]", q))
+        like = "".join("%" if ch == "*" else "_" if ch == "?" else _like(ch) for ch in q) if glob else _like(q)
         where.append("(title LIKE ? ESCAPE '\\' COLLATE NOCASE)")
-        params.append(f"%{_like(q)}%")
+        params.append(f"%{like}%")
         # R18: the catalog (a few MB) instead of the page store (hundreds of MB, cold: 16.9 s); markdown only for the hits
         self.sync_derived()
         with self._db() as con:
             rows = con.execute(f"SELECT url, title, kind, library, book FROM catalog WHERE {' AND '.join(where)}",
                                params).fetchall()
+            if glob:
+                rows = [r for r in rows if fnmatch.fnmatchcase((symbol_name(r["title"]) or r["title"] or "").lower(),
+                                                               q.lower())]
             ql = q.lower()
 
             def rank(r):
