@@ -1344,7 +1344,9 @@ class Knowledge:
             # words in its name first among those
             toks = [_fold(t) for t in re.findall(r"[^\W_]+", (r["name"] or "").rsplit(".", 1)[-1])]
             hit = {t for t in toks for w in qw if t.startswith(w)}
-            return (not hit, len([t for t in toks if t not in hit]))
+            # review of 0.8.15: a name that holds none of the words says nothing — its length put FB_Aux ('pulser', a
+            # prefix hit) before FB_Valve_Dose_Control ('IF pulse', the word itself): the tiers decide then
+            return (not hit, len([t for t in toks if t not in hit]) if hit else 0)
         rows = sorted(rows, key=lambda r: (in_code is not None and r["rid"] not in in_code, -declares.get(r["rid"], 0),
                                            own(r), tier_of[r["rid"]], order[id(r)]))
         owners: dict[tuple[str, str, str], tuple[str, str] | None] = {}
@@ -2010,22 +2012,6 @@ _PRODUCT = re.compile(r"^[A-Za-z]{1,4}\d{3,5}(?:-\d{4})?$")
 _PRODUCT_IN = re.compile(r"\b([A-Z]{1,4}\d{3,5}(?:-\d{4})?)\b")
 
 
-def _product_rows(con: sqlite3.Connection, code: str, limit: int) -> tuple[list[sqlite3.Row], str | None]:
-    """N67: a product is its base order code plus an optional variant (CX9020-0130 is a CX9020; EL3102-0010 an
-    EL3102). Look for the code itself (or its variants); a variant no manual names falls back to the base code — a
-    manual is written for the base product — labelled 'base product CX9020'. -> (rows, label or None)."""
-    def q(c: str) -> list[sqlite3.Row]:
-        like = c.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "-%"
-        return con.execute("SELECT d.name, d.id, GROUP_CONCAT(p.page) AS pages, SUM(p.n) AS hits FROM product p "
-                           "JOIN doc d ON d.id = p.doc WHERE p.code = ? OR p.code LIKE ? ESCAPE '\\' "
-                           "GROUP BY p.doc ORDER BY hits DESC LIMIT ?", (c, like, limit)).fetchall()
-    rows = q(code)
-    m = re.fullmatch(r"([A-Z]{1,4}\d{3,5})-\d{4}", code)
-    if rows or not m:
-        return rows, None
-    return q(m.group(1)), f"base product {m.group(1)} (no manual names the variant {code})"
-
-
 def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
     """Which indexed PDF manuals mention these product codes (manuals_db.py's product table: exact code or CODE-xxxx)."""
     if loc is None or not codes:
@@ -2039,23 +2025,19 @@ def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
     # N163 (0.8.14 retest): manual_product's rule (kb_docs.product_manuals: the product table, else the page text) —
     # this said 'copy its PDF' for a code whose manual is indexed but missing from an older builder's product table
     kd = kb_docs_module()
+    if kd is None:            # review of 0.8.15: no second copy of the rule here — as for manuals_state
+        return {"manuals_note": "the twincat-docs skill is not installed next to the server: which manuals name a "
+                                "product is not looked up"}
     try:
         con = _ro(db)
         try:
             for code in codes[:3]:
                 c = code.strip().upper()
-                if kd is not None:
-                    got = kd.product_manuals(con, c, 5)
-                    via = got.get("matched_as")
-                    items = [{**it, "pages": it["pages"][:20], **({"matched_as": via} if via else {})}
-                             for it in got["items"]]
-                    if got.get("note"):
-                        notes.append(got["note"])
-                else:
-                    rows, via = _product_rows(con, c, 5)
-                    items = [{"doc": r["name"], "doc_id": r["id"], "mentions": r["hits"],
-                              "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})[:20],
-                              **({"matched_as": via} if via else {})} for r in rows]
+                got = kd.product_manuals(con, c, 5)
+                via = got.get("matched_as")
+                items = [{**it, "pages": it["pages"][:20], **({"matched_as": via} if via else {})} for it in got["items"]]
+                if got.get("note"):
+                    notes.append(got["note"])
                 if items:
                     found[c] = items
         finally:

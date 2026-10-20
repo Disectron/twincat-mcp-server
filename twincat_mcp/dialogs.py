@@ -250,7 +250,13 @@ def _modal_windows(pid: int, tops: list[int], listed: set[int]) -> list[Dialog]:
     trigger: while it is enabled, a floating tool window, a torn-off Error List or a splash is no dialog."""
     in_pid = set(tops)
     main = _MAIN_WINDOWS.get(pid)
-    roots = [main] if main in in_pid else [h for h in tops if _owner(h) not in in_pid]
+    # review of 0.8.15: with xae.visible=false the main window is hidden — not among the visible windows it was never
+    # checked, and a modal window it owns went unseen. The recorded main window decides while it is a window of the
+    # process, visible or not
+    known = main is not None and (main in in_pid or (
+        _safe(win32gui.IsWindow, main, default=False)
+        and (_safe(win32process.GetWindowThreadProcessId, main, default=(0, 0)) or (0, 0))[1] == pid))
+    roots = [main] if known else [h for h in tops if _owner(h) not in in_pid]
     held = [r for r in roots if not _safe(win32gui.IsWindowEnabled, r, default=True)]
     if not held:
         return []

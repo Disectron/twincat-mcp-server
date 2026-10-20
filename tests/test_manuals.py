@@ -163,6 +163,11 @@ def test_n164_a_hex_index_is_searched_in_all_its_notations(mkb):
     for q in ("0x8000", "#x8000", "16#8000"):
         rc, r = kbdocs(mkb, "manual_search", f"query={q}")
         assert rc == 0 and pages_of(r) == [4, 5, 6, 7], (q, r)                 # not 'Motor speed 8000 rpm' (p8)
+    # review of 0.8.15: the builder's CLI search was a second, raw FTS search ('8000:11' an FTS syntax error) — it
+    # prints the skill's manual_search now
+    p = builder("search", "8000:11", "--kb", str(mkb))
+    hits = [ln for ln in p.stdout.splitlines() if " | p" in ln]
+    assert p.returncode == 0 and [int(ln.split(" | p")[1].split(" ")[0].split("|")[0]) for ln in hits] == [4, 5], p.stdout + p.stderr
     rc, r = kbdocs(mkb, "manual_search", "query=0x8000 filter")               # with words: the index is one of them
     assert rc == 0 and pages_of(r) == [4, 5] and r["words_used"] == ["filter"]
     # FTS5 syntax written by the user runs as written
@@ -276,10 +281,11 @@ def test_n169_ranges_and_defaults_are_in_the_help_and_refusals_name_the_way_on(m
     default — the ranges were invisible until a call was refused, and the refusal did not say how to read on. The
     help gives range and default; a refusal names the paging route. The skill's help and refusals do the same for
     the manual_* commands."""
-    for cmd, texts in (("search", ["--limit N", "1 or more", "default 10", "--offset N", "default 0"]),
+    # review of 0.8.15: search / product / toc read through the skill's commands — their ranges are the skill's
+    for cmd, texts in (("search", ["--limit N", "1-50", "used as 50", "default 10", "--offset N", "default 0"]),
                        ("show", ["--max N", "1 or more", "default 4000", "--offset N", "default 0"]),
-                       ("toc", ["--depth N", "1 or more", "default 2"]),
-                       ("product", ["--limit N", "1 or more", "default 20"])):
+                       ("toc", ["--depth N", "1-6", "default 2"]),
+                       ("product", ["--limit N", "1-50", "default 20"])):
         p = builder(cmd, "-h")
         assert p.returncode == 0 and all(t in " ".join(p.stdout.split()) for t in texts), (cmd, p.stdout)
     p = builder("show", "ED2008", "13", "--max", "0", "--kb", str(mkb))

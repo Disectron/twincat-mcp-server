@@ -24,7 +24,8 @@ Deliberate behaviour: a name documented by different pages is never resolved sil
 candidates; one page in several books is one page — the plugin's rule, twincat_mcp.infosys.symbol_documents),
 filters are applied before the row limit so 'total' is exact ('total' counts pages: a page in several books once per
 book; docs_search lists it once, with same_page_in, and 'truncated' says whether hits were not shown), out-of-range
-parameters are refused instead of clamped, an invalid FTS5 query is retried once as a literal phrase, a query of
+parameters are refused (a search's limit above its maximum is used as the maximum, clamped: true — N167), an invalid
+FTS5 query is retried once as a literal phrase, a query of
 nothing but stop words is refused (the rule of the twincat server's kb_search).
 """
 from __future__ import annotations
@@ -216,7 +217,7 @@ def bind(spec: dict[str, P], kv: dict[str, str]) -> dict[str, Any]:
                 v = p.hi
             if (p.lo is not None and v < p.lo) or (p.hi is not None and v > p.hi):
                 rng = f"{p.lo}-{p.hi}" if p.hi is not None else f">= {p.lo}"
-                raise Err("bad_param", f"{name} must be {rng} (got {v}) — out-of-range values are refused, not clamped"
+                raise Err("bad_param", f"{name} must be {rng} (got {v}) — refused"
                           + (f"; {p.route}" if p.route else ""))
             out[name] = v
         else:
@@ -369,15 +370,18 @@ def overview(kb: Path) -> dict[str, Any]:
 
 
 class Ctx:
-    def __init__(self, kb: Path, kb_source: str, infosys_db: Path | None = None):
+    def __init__(self, kb: Path, kb_source: str, infosys_db: Path | None = None, manuals_db: Path | None = None):
         self.kb, self.kb_source = kb, kb_source
         self.infosys_db = infosys_db               # an explicit index file (the builder's --db)
+        self.manuals_db = manuals_db               # an explicit manuals database (manuals_db.py --db)
         self._con: dict[str, sqlite3.Connection] = {}
         self._src: dict[str, dict[str, Any]] = {}
 
     def path(self, which: str) -> Path:
         if which == "infosys" and self.infosys_db is not None:
             return self.infosys_db
+        if which == "manuals" and self.manuals_db is not None:
+            return self.manuals_db
         return L.locate(self.kb, "infosys" if which == "infosys" else "manuals")
 
     def con(self, which: str) -> sqlite3.Connection:
@@ -606,8 +610,9 @@ def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: st
             # N35: the FTS title column, not a LIKE scan over every page body; N159 (0.8.14 retest): the plugin's one
             # near list — the title filter on every word (it applied to the first only), the owner of 'FB.Method'
             near = [_cand(ctx, r) for r in INF.near_symbols(con, word, keep)]
+        onote = INF.owner_note(con, word, keep) if how == "symbol" else None       # review of 0.8.15
         raise Err("not_found", f"no page for {what} {ref!r}" + (f" in books {book!r}" if book else "") + f" (looked up as {how})",
-                  near=near, hint=f"docs_search query={word!r} finds pages by their text")
+                  near=near, hint=onote or f"docs_search query={word!r} finds pages by their text")
     cands = []
     for g in docs:
         c = _cand(ctx, g[0])
@@ -797,10 +802,9 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         # N170: documented in a section or table of a page (it has no page of its own)
         out.update({"title": r["title"], "page_title": r["page_title"], "section": r["section"]})
     elif how == "title word":
-        # N170: no page and no section documents the symbol; this page has the name in its title
-        out.update({"kind": "Page", "match": "title", "outline": [h for h, _ in _sections(body) if h],
-                    "declaration_note": f"no page or section documents a symbol named {a['symbol']}; this page has the "
-                                        "name in its title — docs_page ref=<ref> for its text"})
+        # N170: no page and no section documents the symbol; this page has the name in its title (the plugin's fields)
+        tw = INF.title_word_answer(query_text(a["symbol"]).strip(), body, f"docs_page ref={out['ref']}")
+        out.update({"kind": tw["kind"], "match": tw["match"], "outline": tw["outline"], "declaration_note": tw["note"]})
     fam = _family(con, r)
     if fam.get("parent"):
         out["parent"] = fam["parent"]

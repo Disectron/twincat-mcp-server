@@ -415,8 +415,8 @@ def parse_dictionary(dic: Any) -> list[dict[str, Any]] | None:
             obj["subitems"] = rows
         first = seen.get(idx)
         if first is not None:
-            # kb_verify E2 (0.8.14 full run): Beckhoff's EL66xx.xml defines #x1C32 / #x1C33 of EL6653-0010 twice, the
-            # same bytes — the device listed 17 objects and counted 19. An index defined again is one object: the
+            # kb_verify E2 (0.8.14 full run): Beckhoff's EL66xx.xml defines #x1C32 / #x1C33 of EL6653 and EL6653-0010
+            # twice, the same bytes — the devices listed 17 objects and counted 19. An index defined again is one object: the
             # same definition is dropped, another one leaves the first in place and is said (never silently lost)
             if obj != {k: v for k, v in first.items() if k != "defined_again_differs"}:
                 first["defined_again_differs"] = first.get("defined_again_differs", 0) + 1
@@ -1893,24 +1893,26 @@ class EsiIndex:
             raise EsiError("this index was built by an SQLite without FTS5: no full-text search (hw_lookup works)",
                            "no_index")
         with self._con() as con:
-            sql = (f"SELECT kind, ref, title, snippet(search, 3, '[', ']', '…', 12) AS snip FROM search WHERE search "
-                   f"MATCH ? AND kind IN ({','.join('?' * len(want))}) ORDER BY rank LIMIT ?")
-            fetch = (int(offset) + int(limit)) * 8     # hits of one device type / one text are shown as one
+            kinds = ",".join("?" * len(want))
+            # N167 (0.8.14 retest; review of 0.8.15): one item per title at its best hit, cut in SQL — a window of
+            # (offset + limit) * 8 rows held 3 titles of 33 for 'Device type' (hundreds of revisions share a title),
+            # and the next page said 'past the last hit'
+            group_sql = (f"SELECT kind, title, MIN(rank) AS r FROM search WHERE search MATCH ? AND kind IN ({kinds}) "
+                         "GROUP BY kind, title ORDER BY r, kind, title LIMIT ? OFFSET ?")
             try:
-                rows = con.execute(sql, [q, *want, fetch]).fetchall()
+                heads = con.execute(group_sql, [q, *want, int(limit), int(offset)]).fetchall()
                 how = "fts"
             except sqlite3.OperationalError:
                 # not FTS5 syntax (an order code with '-', a '#x…'): the words as one phrase
-                rows = con.execute(sql, ['"' + q.replace('"', '""') + '"', *want, fetch]).fetchall()
+                heads = con.execute(group_sql, ['"' + q.replace('"', '""') + '"', *want, int(limit), int(offset)]).fetchall()
                 how = "phrase"
             expr = q if how == "fts" else '"' + q.replace('"', '""') + '"'
-            # N167: the items in rank order (one per title, at its best hit), counted over the whole index
             total = con.execute(f"SELECT COUNT(*) FROM (SELECT DISTINCT kind, title FROM search WHERE search MATCH ? "
-                                f"AND kind IN ({','.join('?' * len(want))}))", [expr, *want]).fetchone()[0]
-            firsts: dict[tuple, Any] = {}
-            for r in rows:
-                firsts.setdefault((r["kind"], r["title"]), r)
-            page = list(firsts.values())[int(offset):int(offset) + int(limit)]
+                                f"AND kind IN ({kinds}))", [expr, *want]).fetchone()[0]
+            best = ("SELECT kind, ref, title, snippet(search, 3, '[', ']', '…', 12) AS snip FROM search WHERE search "
+                    "MATCH ? AND kind = ? AND title = ? ORDER BY rank LIMIT 1")
+            page = [con.execute(best, (expr, h["kind"], h["title"])).fetchone() for h in heads]
+            page = [r for r in page if r is not None]
             if not page and int(offset) and total:
                 raise EsiError(f"offset {offset} is past the last hit ({total} items) — offset=0 for the first ones")
             items: list[dict[str, Any]] = []

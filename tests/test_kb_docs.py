@@ -62,7 +62,7 @@ def test_docs_search_ranking_total_and_phrase_retry(kbdir):
 
 @pytest.mark.parametrize("args, code, text", [
     (["query=x", "limit=0"], "bad_param", "limit must be 1-50 (got 0)"),
-    (["query=x", "offset=-1"], "bad_param", "refused, not clamped"),       # N167: limit=51 is clamped now
+    (["query=x", "offset=-1"], "bad_param", "offset must be >= 0 (got -1) — refused"),   # N167: limit=51 is clamped now
     (["query=  "], "empty_query", "empty"),
     (["query=:="], "empty_query", "no searchable word"),
     (["query=ADSREAD", "bogus=1"], "bad_param", "allowed: query, book, library, limit, offset"),

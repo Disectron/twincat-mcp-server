@@ -947,8 +947,9 @@ def test_n167_hw_search_pages_through_every_item_once(esi_kb):
 
 
 def test_an_object_defined_twice_in_one_dictionary_is_one_object(esi_kb):
-    """kb_verify E2 on the user's ESI set (0.8.14 full run): EL6653-0010 rev #x0010000A — '17 CoE objects listed,
-    counted 19'. Beckhoff's EL66xx.xml defines #x1C32 and #x1C33 twice in that device's dictionary, byte-identical.
+    """kb_verify E2 on the user's ESI set (0.8.14 full run): EL6653 (Scanner, rev #x00100000) and EL6653-0010 (Adapter,
+    rev #x0010000A) — '17 CoE objects listed, counted 19'. Beckhoff's EL66xx.xml defines #x1C32 and #x1C33 twice in
+    the dictionary both devices share, byte-identical.
     The list kept one per index, the count took both. An index defined again identically is the same object, kept
     once and counted once; defined again differently, the first definition is the object and it says so
     (defined_again_differs) — nothing is dropped silently."""
@@ -969,3 +970,27 @@ def test_an_object_defined_twice_in_one_dictionary_is_one_object(esi_kb):
     o = x.object("EL3356-0010", "#x1c12")
     assert o["name"] == "RxPDO assign" and o["defined_again_differs"] == 1, o
     assert "defined_again_differs" not in x.object("EL3356-0010", "#x1018")
+
+
+def test_review_0815_hw_search_pages_when_one_title_has_hundreds_of_hits(esi_kb):
+    """Review of 0.8.15 (N167 for ESI): each page read (offset + limit) * 8 rows and kept one per title — on the real
+    index 'Device type' (kinds=object) showed 3 of 33 items, then 'offset 3 is past the last hit (33 items)': hundreds
+    of revisions share one title and filled the window. The items are cut per title in SQL: every item reachable."""
+    import sqlite3
+    _build(esi_kb)
+    db = esi_kb[2]
+    con = sqlite3.connect(db)
+    oid = con.execute("SELECT id FROM obj LIMIT 1").fetchone()[0]
+    con.executemany("INSERT INTO search (kind, ref, title, body) VALUES ('object', ?, ?, ?)",
+                    [(str(oid), "#x9999 Filler", "zzfill zzfill zzfill")] * 400
+                    + [(str(oid), f"#x999{k} Other {k}", "zzfill") for k in range(5)])
+    con.commit()
+    con.close()
+    x = E.EsiIndex(db)
+    got, off = [], 0
+    while off is not None:
+        r = x.search("zzfill", kinds=["object"], limit=2, offset=off)
+        got += [i["title"] for i in r["items"]]
+        off = r["next_offset"]
+    assert r["total"] == 6 and len(got) == 6 and len(set(got)) == 6 and got[0] == "#x9999 Filler", got
+    assert next(i for i in x.search("zzfill", kinds=["object"], limit=1)["items"])["variants"] == 400

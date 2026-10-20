@@ -422,7 +422,13 @@ def title_order(rows: list[Any], query: str, title_key: str = "title", library_k
     want = informative_words(q)
     raw = {fold(w) for w in re.findall(r"\S+", q)}
     seq = _word_seq(q)
-    caps = {w for w in _CAPS_TOKEN.findall(q) if keyword(w)}
+    # review of 0.8.15: an IEC keyword, not every word in capitals — 'PLC persistent variables' put 'Resetting the PLC
+    # project' above 'Remanent Variables - PERSISTENT, RETAIN', 'CX9020 LED' lost 'Diagnostic LEDs': an acronym of
+    # the query is a word like any other (it is searched, keyword()); only a keyword names the page it titles
+    caps = {w for w in _CAPS_TOKEN.findall(q) if w in IEC_KEYWORDS}
+    # N149: an operator of the query as written — a word with its punctuation ('REF=', 'S=', 'THIS^') — that a title
+    # holds as one of its tokens: the page of that operator ('Assignment operator REF=', not AXIS_REF)
+    ops = {t for t in q.split() if re.search(r"\w", t) and re.search(r"[^\w\s]", t)}
     keyed = []
     for i, r in enumerate(rows):
         title = str(r[title_key] or "")
@@ -434,7 +440,7 @@ def title_order(rows: list[Any], query: str, title_key: str = "title", library_k
         whole = bool(seq) and _word_seq(title) == seq
         # N148: a keyword of the query written in capitals that the title has as a word of its own, in capitals —
         # 'ST instruction FOR' for 'FOR loop BY step' (not the CNC's '$FOR'), 'THIS' for 'THIS pointer'
-        kw = len(caps & set(_CAPS_TOKEN.findall(title))) if caps else 0
+        kw = (len(caps & set(_CAPS_TOKEN.findall(title))) if caps else 0) + (len(ops & set(title.split())) if ops else 0)
         keyed.append(((not whole, -kw, -cov, -with_lib, not exact, -cov / size, i), r))
     keyed.sort(key=lambda x: x[0])
     return [r for _, r in keyed]

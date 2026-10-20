@@ -1139,3 +1139,18 @@ def test_n146_n147_n171_label_changed_files_and_placeholders(kb, tmp_path):
     r = k.search("C0046: Identifier 'X' not defined")
     assert r["hits"] == [] and "X" in r["words_ignored"] and "single character" in r["words_ignored"]["X"], r
     assert r["known_error"], r
+
+
+def test_review_0815_a_name_without_the_word_does_not_rank_by_its_length(kb, tmp_path):
+    """Review of 0.8.15 (N145's sort key): 'pulse' put FB_Aux (code 'pulser', a prefix hit) before
+    FB_Valve_Dose_Control (code 'IF pulse', the word itself) — the number of words in a name that holds none of the
+    query's words decided, ahead of 'the word itself before a prefix of it'. A name without the words says nothing."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "proj"
+    _pou_m(src, "FB_Valve_Dose_Control", "FUNCTION_BLOCK FB_Valve_Dose_Control\nVAR\n    bOpen : BOOL;\nEND_VAR",
+           "IF pulse THEN\n    bOpen := TRUE;\nEND_IF")
+    _pou_m(src, "FB_Aux", "FUNCTION_BLOCK FB_Aux\nVAR\n    bOn : BOOL;\nEND_VAR", "bOn := pulser;")
+    k.add_project(str(src), "proj")
+    r = k.search("pulse")
+    assert [h["unit"] for h in r["hits"]][:2] == ["FB_Valve_Dose_Control", "FB_Aux"], [h["unit"] for h in r["hits"]]

@@ -1069,3 +1069,88 @@ def test_n160_get_page_reads_a_part_as_the_skill_does_and_not_found_says_how_on(
         idx.declaration("NoSuchSymbolXyz")
     with pytest.raises(InfosysError, match=r"infosys_search\(query='NoSuchSymbolXyz'\)"):
         idx.get_page("NoSuchSymbolXyz")
+
+
+def test_review_0815_an_acronym_in_capitals_does_not_outrank_the_words_of_the_query(idx):
+    """Review of 0.8.15 (N148's title key): every word in capitals counted as a keyword the title should hold —
+    'PLC persistent variables' ranked 'Resetting the PLC project' above 'Remanent Variables - PERSISTENT, RETAIN',
+    'CX9020 LED' dropped 'Diagnostic LEDs'. An acronym is a word of the query like any other; only an IEC keyword
+    (THIS, FOR) puts the page it titles first."""
+    P = "tc3_plc_intro"
+    _store_pages(idx, [
+        (f"{P}/1000000101", "Remanent Variables - PERSISTENT, RETAIN", "<p>Persistent variables keep their values. "
+                                                                       "PLC data.</p>"),
+        (f"{P}/1000000102", "Resetting the PLC project", "<p>Reset the PLC project: persistent variables stay, other "
+                                                         "variables are reset.</p>"),
+        (f"{P}/1000000103", "THIS", "<p>THIS is a pointer to the own instance.</p>"),
+        (f"{P}/1000000104", "Pointer", "<p>A pointer and THIS pointer: an address.</p>"),
+    ])
+    idx.sync_derived()
+    first = lambda q: [i["title"] for i in idx.search(q, limit=5)["items"]]           # noqa: E731
+    assert first("PLC persistent variables")[0] == "Remanent Variables - PERSISTENT, RETAIN", first("PLC persistent variables")
+    assert first("THIS pointer")[0] == "THIS", first("THIS pointer")
+
+
+def test_review_0815_a_member_through_an_owner_of_two_pages_is_not_guessed(idx):
+    """Review of 0.8.15 (N158): FB_BA_SeqCtrl is documented by Tc3_BaCommon (no EXTENDS) and by tf8040 (EXTENDS
+    FB_BA_Loop) — 'FB_BA_SeqCtrl.Calc' answered FB_BA_Loop.Calc ('it is FB_BA_Loop's') as if the owner were known,
+    while 'FB_BA_SeqCtrl' alone is ambiguous. The sources of an owner of several pages that differ are not merged:
+    not found, saying why, and library= picks the owner."""
+    B, C = "tf8040_tc3_buildingautomation", "tcplclib_tc3_bacommon"
+    _store_with(idx, f"{C}/1001", "FB_BA_SeqCtrl", "<pre>FUNCTION_BLOCK FB_BA_SeqCtrl\nVAR_INPUT\n    bA : BOOL;\nEND_VAR"
+                "</pre>", "c-seq")
+    _store_with(idx, f"{B}/2001", "FB_BA_SeqCtrl", "<pre>FUNCTION_BLOCK FB_BA_SeqCtrl EXTENDS FB_BA_Loop\nVAR_INPUT\n"
+                "    bB : BOOL;\nEND_VAR</pre>", "b-seq")
+    _store_with(idx, f"{B}/2002", "FB_BA_Loop", "<pre>FUNCTION_BLOCK FB_BA_Loop\nVAR_INPUT\n    bC : BOOL;\nEND_VAR</pre>",
+                "b-loop")
+    _store_with(idx, f"{B}/2003", "Calc", "<pre>METHOD Calc : BOOL\nVAR_INPUT\n    fIn : LREAL;\nEND_VAR</pre>", "b-calc",
+                "b-loop")
+    idx.resolve_help_links()
+    idx.sync_derived()
+    with pytest.raises(InfosysError, match="ambiguous"):
+        idx.declaration("FB_BA_SeqCtrl")
+    with pytest.raises(InfosysError, match=r"FB_BA_SeqCtrl is documented by 2 pages .* pass library=") as e:
+        idx.declaration("FB_BA_SeqCtrl.Calc")
+    assert "FB_BA_Loop's" not in str(e.value)
+    d = idx.declaration("FB_BA_SeqCtrl.Calc", library=B)
+    assert d["url"].endswith(f"{B}/2003.html") and d["defined_in"] == "FB_BA_Loop", d
+
+
+def test_review_0815_syntax_sections_operator_names_and_the_page_own_header():
+    """Review of 0.8.15 (N150 / N157 rules). An operator's syntax is what its 'Syntax' label gives — not the first
+    code block within 2000 characters (CAL got its Example, __VARINFO 'in the declaration:'); an operator is named
+    in capitals or as TwinCAT's __ ones (MathOperation's 'The operator can be selected' is a setting). The header in
+    a page's Syntax section is its declaration, also under another name (FB_ExternalHydAxisLibRef on
+    ExternalHydAxisLibRef, the copy-paste METHOD SendEqualMessage on SendHresult()); 'the Subscription method' names
+    the page's kind as 'the method Subscription' does; 'FUNCTION BLOCK X' (44 pages write the space) is a header."""
+    def page(title, body):
+        return html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
+
+    def kind(title, body):
+        return parse_declaration(title, page(title, body))
+    cal = kind("CAL", "<p>The CAL operator is used to call a function block.</p><p><b>Syntax:</b></p>"
+                      "<p>CAL &lt;function block&gt; (&lt;input&gt; := &lt;value&gt;)</p><p><b>Example:</b></p>"
+                      "<pre>CAL fbInst(nVar1 := 0)</pre>")
+    assert cal["kind"] == "Operator" and cal["declaration"] == "CAL <function block> (<input> := <value>)", cal
+    vi = kind("__VARINFO", "<p>The operator __VARINFO returns information.</p><p><b>Syntax in the declaration:</b></p>"
+                           "<pre>&lt;info&gt; : __SYSTEM.VAR_INFO;</pre><p><b>Syntax for the call:</b></p>"
+                           "<pre>&lt;info&gt; := __VARINFO( &lt;variable&gt; );</pre><p><b>Sample:</b></p><pre>x := 1;</pre>")
+    assert vi["declaration"] == "<info> : __SYSTEM.VAR_INFO;\n<info> := __VARINFO( <variable> );", vi
+    mx = kind("MAX", "<p>The MAX operator returns the largest value.</p><p><b>Syntax:</b> <code>OUT := MAX(IN0, IN1)</code></p>")
+    assert mx["declaration"] == "OUT := MAX(IN0, IN1)", mx
+    assert kind("MathOperation", "<p>Symbols are calculated with the MathOperation block. The operator can be "
+                                 "selected under MathOperator.</p>")["kind"] == "Page"
+    hyd = kind("ExternalHydAxisLibRef", "<p>This class represents a standard hydraulic axis.</p><h2>Syntax:</h2>"
+                                        "<pre>FUNCTION_BLOCK FB_ExternalHydAxisLibRef\nVAR_INPUT\n    stAxisRef : AXIS_REF;"
+                                        "\nEND_VAR</pre><h2>Sample</h2><pre>METHOD Other</pre>")
+    assert hyd["kind"] == "FunctionBlock", hyd
+    sh = kind("SendHresult()", "<p>Logs a message in the EventLogger.</p><h2>Syntax:</h2><pre>METHOD SendEqualMessage : "
+                               "HRESULT\nVAR_INPUT\n    hr : HRESULT;\nEND_VAR</pre>")
+    assert sh["kind"] == "Method", sh
+    sub = kind("Subscription", "<p>You can use the Subscription method to request OCA objects.</p><h2>Syntax</h2>"
+                               "<pre>VAR_INPUT\n    bExecute : BOOL;\nEND_VAR</pre>")
+    assert sub["kind"] == "Method", sub
+    oc = kind("FB_OCPP1_Client", "<p>This function block represents an OCPP client.</p><h2>Syntax</h2>"
+                                 "<pre>FUNCTION BLOCK FB_OCPP1_Client EXTENDS FB_Base\nVAR_OUTPUT\n    bValid : BOOL;\nEND_VAR</pre>")
+    assert oc["kind"] == "FunctionBlock" and oc["declaration"].startswith("FUNCTION BLOCK FB_OCPP1_Client"), oc
+    assert oc["extends"] == "FB_Base" and [x["name"] for x in oc["outputs"]] == ["bValid"], oc

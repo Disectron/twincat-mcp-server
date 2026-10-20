@@ -130,6 +130,7 @@ HwLimit = Annotated[int, Field(json_schema_extra={"minimum": 1}, description="it
                                "used as 100 (clamped: true)")]
 Offset = Annotated[int, Field(json_schema_extra={"minimum": 0}, description="skipped first: the next page is "
                               "offset=<next_offset>")]
+Limit50 = Annotated[int, Field(json_schema_extra={"minimum": 1, "maximum": 50}, description="results shown, 1-50")]
 PageChars = Annotated[int, Field(json_schema_extra={"minimum": 200, "maximum": 60000},
                                  description="characters shown, 200-60000; read on with section= or offset=")]
 
@@ -4454,7 +4455,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def infosys_search_symbols(query: str, kind: str | None = None, library: str | None = None,
-                                     limit: int = 10) -> dict[str, Any]:
+                                     limit: Limit50 = 10) -> dict[str, Any]:
         """Find library symbols (function blocks, functions, structs, enums, aliases, interfaces,
         GVLs) by name fragment in the indexed books; exact > prefix > contains; with * or ? a glob on the name
         ('FB_EcCoE*', 'FB_Ec*Write'). kind: FunctionBlock |
@@ -4494,7 +4495,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await app.docs_call("search", query, library, limit, web_fallback, offset, timeout=300)
 
     @mcp.tool(annotations=READ)
-    async def infosys_search_code(query: str, language: str | None = None, limit: int = 10,
+    async def infosys_search_code(query: str, language: str | None = None, limit: Limit50 = 10,
                                   ignore_spacing: bool = False) -> dict[str, Any]:
         """Search the code examples of the indexed pages for a fragment — a call pattern, an attribute, a constant
         (case-insensitive substring of the code as written; non-breaking spaces count as spaces). language: one

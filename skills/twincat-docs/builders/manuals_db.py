@@ -13,6 +13,9 @@ usage:
   python manuals_db.py show    DOC PAGE[-PAGE] [--max 4000] [--offset 0]     page text (DOC: file name, glob or doc id)
   python manuals_db.py toc     DOC [--depth 2]                    bookmarks with page numbers
   python manuals_db.py docs    [--filter GLOB]                    indexed manuals: id, pages, title
+
+search / product / toc / docs are the twincat-docs skill's manual_* commands (kb_docs.py) printed as text — the same
+answers, notations (0x8000:11, °C, mV/V) and ranges; show prints the pages' text, read on with --offset.
   python manuals_db.py stats   [--json]                         the real state: manuals, PDFs not indexed, a running update
 
 QUERY is FTS5 syntax: words are ANDed, "exact phrase", OR, NOT, prefix*.
@@ -764,55 +767,64 @@ def _docs(con, pattern: str | None) -> list[sqlite3.Row]:
     return [r for r in rows if fnmatch.fnmatch(r["name"].lower(), pat) or fnmatch.fnmatch((r["title"] or "").lower(), pat)]
 
 
-def cmd_search(args) -> None:
-    con = connect(_db(args))
-    names = {r["id"]: r["name"] for r in con.execute("SELECT id, name FROM doc")}
-    where, params = "fts MATCH ?", [args.query]
-    if args.doc:
-        # the manual filter runs inside the query, before LIMIT (version 1 filtered the first limit × 10 hits only)
-        ids = [r["id"] for r in _docs(con, args.doc)]
-        if not ids:
-            sys.exit(f"no indexed manual matches '{args.doc}' (docs lists them)")
-        where += f" AND doc IN ({','.join('?' * len(ids))})"
-        params += ids
+def _skill():
+    """The twincat-docs skill's kb_docs.py beside this folder — its manual_* commands are the one implementation of
+    reading this database (review of 0.8.15: `search` here was a second, raw FTS search without the N164 / N165
+    notations, `product` one without the page-text answer of N163)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tcmcp_kb_docs_manuals_cli", HERE.parent / "kb_docs.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _run(args, cmd: str, params: dict) -> dict:
+    """One skill command on this database (--db / --kb as given); a refusal is printed as the skill words it."""
+    kd = _skill()
+    root, how = kb_root(args.kb)
+    ctx = kd.Ctx(root, how, manuals_db=Path(args.db) if args.db else None)
+    fn, spec, _doc = kd.COMMANDS[cmd]
     try:
-        # N167 (0.8.14 retest): --offset pages through the hits (the rowid makes the order of equal scores fixed)
-        rows = con.execute("SELECT doc, page, section, snippet(fts, 0, '[', ']', '…', 16) AS s, bm25(fts, 1.0, 4.0) AS r "
-                           f"FROM fts WHERE {where} ORDER BY r, fts.rowid LIMIT ? OFFSET ?",
-                           params + [args.limit, args.offset]).fetchall()
-        total = con.execute(f"SELECT COUNT(*) FROM fts WHERE {where}", params).fetchone()[0]
-    except sqlite3.OperationalError as exc:
-        sys.exit(f"bad query ({exc}); FTS5 syntax: words, \"phrase\", OR, NOT, prefix*")
-    for r in rows:
-        sec = f" | {r['section']}" if r["section"] else ""
-        snip = re.sub(r"\s+", " ", r["s"])
-        print(f"{names.get(r['doc'], r['doc'])} | p{r['page']}{sec} | {snip}")
-    if not rows:
-        print(f"no hits after --offset {args.offset} ({total} hits)" if total and args.offset else "no hits")
-    elif total > args.offset + len(rows):
-        print(f"({len(rows)} of {total} hits; --offset {args.offset + len(rows)} for the next ones)")
+        return fn(ctx, kd.bind(spec, {k: str(v) for k, v in params.items() if v is not None}))
+    except kd.Err as exc:
+        sys.exit(exc.message + (f" — {exc.extra['hint']}" if exc.extra.get("hint") else ""))
+
+
+def cmd_search(args) -> None:
+    out = _run(args, "manual_search", {"query": args.query, "doc": args.doc, "limit": args.limit, "offset": args.offset})
+    for t in out.get("terms") or []:
+        print(f"({t['term']}: {t['searched_as']})")
+    for it in out["items"]:
+        sec = f" | {it['section']}" if it.get("section") else ""
+        print(f"{it['doc']} | p{it['page']}{sec} | {it['excerpt']}")
+    if out.get("clamped_note"):
+        print(f"({out['clamped_note']})")
+    if not out["items"]:
+        print("no hits" + (f" — {out['hint']}" if out.get("hint") else ""))
+    elif out.get("next_offset") is not None:
+        print(f"({len(out['items'])} of {out['total']} hits; --offset {out['next_offset']} for the next ones)")
 
 
 def cmd_product(args) -> None:
-    con = connect(_db(args))
-    code = args.code.upper()
-    rows = con.execute("SELECT d.name, p.doc, GROUP_CONCAT(p.page) pages, SUM(p.n) hits FROM product p JOIN doc d ON d.id=p.doc "
-                       "WHERE p.code=? OR p.code LIKE ? GROUP BY p.doc ORDER BY hits DESC LIMIT ?",
-                       (code, code + "-%", args.limit)).fetchall()
-    if not rows:
-        print(f"{code}: not in any indexed manual")
-    for r in rows:
-        pages = sorted({int(x) for x in r["pages"].split(",")})
+    out = _run(args, "manual_product", {"code": args.code, "limit": args.limit})
+    if out.get("matched_as"):
+        print(f"({out['code']}: {out['matched_as']}" + (f" — {out['note']}" if out.get("note") else "") + ")")
+    if not out["items"]:
+        print(f"{out['code']}: not in any indexed manual" + (f" — {out['hint']}" if out.get("hint") else ""))
+    for it in out["items"]:
+        pages = it["pages"]
         txt = ",".join(map(str, pages[:15])) + (" …" if len(pages) > 15 else "")
-        print(f"{r['name']} | {r['hits']} mentions | pages {txt}")
+        print(f"{it['doc']} | {it['mentions']} mentions | pages {txt}")
 
 
 def cmd_show(args) -> None:
     con = connect(_db(args))
-    docs = _docs(con, args.doc)
-    if len(docs) != 1:
-        sys.exit(f"'{args.doc}' matches {len(docs)} manuals" + (": " + ", ".join(d["name"] for d in docs[:8]) if docs else ""))
-    d = docs[0]
+    kd = _skill()
+    try:
+        d = kd._one_doc(con, args.doc)                 # the skill's rule for naming a manual (manual_page / manual_toc)
+    except kd.Err as exc:
+        sys.exit(exc.message)
     a, _, b = args.pages.partition("-")
     lo, hi = int(a), int(b or a)
     head = f"{d['name']} | {d['title']} | {d['pages']} pages | {d['path']}"
@@ -830,21 +842,18 @@ def cmd_show(args) -> None:
 
 
 def cmd_toc(args) -> None:
-    con = connect(_db(args))
-    docs = _docs(con, args.doc)
-    if len(docs) != 1:
-        sys.exit(f"'{args.doc}' matches {len(docs)} manuals")
-    d = docs[0]
-    print(f"{d['name']} | {d['pages']} pages")
-    for r in con.execute("SELECT level, title, page FROM toc WHERE doc=? AND level<=? ORDER BY rowid", (d["id"], args.depth)):
+    out = _run(args, "manual_toc", {"doc": args.doc, "depth": args.depth})
+    print(f"{out['doc']} | {out['pages']} pages")
+    for r in out["toc"]:
         print(f"{'  ' * (r['level'] - 1)}{r['title']}  p{r['page']}")
+    if out.get("note"):
+        print(f"({out['note']})")
 
 
 def cmd_docs(args) -> None:
-    con = connect(_db(args))
-    for r in _docs(con, args.filter):
+    for r in _run(args, "manual_docs", {"filter": args.filter})["manuals"]:
         scan = "  (no text)" if not r["text_pages"] else ""
-        print(f"{r['id']:>4} | {r['name']} | {r['pages']} p | {r['title']}{scan}")
+        print(f"{r['id']:>4} | {r['doc']} | {r['pages']} p | {r['title']}{scan}")
 
 
 def ro_uri(db: Path) -> str:
@@ -891,17 +900,18 @@ def main() -> None:
     # says how to read on
     s = sub.add_parser("update"); s.add_argument("--dir"); s.add_argument("--force", action="store_true")
     s = sub.add_parser("search"); s.add_argument("query"); s.add_argument("--doc", help="manual: file name, glob or id")
-    s.add_argument("--limit", type=int, default=10, metavar="N", help="hits shown, 1 or more (default 10)")
+    s.add_argument("--limit", type=int, default=10, metavar="N", help="hits shown, 1-50; a larger one is used as 50 "
+                                                                      "(default 10)")
     s.add_argument("--offset", type=int, default=0, metavar="N",
                    help="hits skipped, 0 or more (default 0): the next ones after --limit")
     s = sub.add_parser("product"); s.add_argument("code")
-    s.add_argument("--limit", type=int, default=20, metavar="N", help="manuals shown, 1 or more (default 20)")
+    s.add_argument("--limit", type=int, default=20, metavar="N", help="manuals shown, 1-50 (default 20)")
     s = sub.add_parser("show"); s.add_argument("doc"); s.add_argument("pages", help="N or N-M")
     s.add_argument("--max", type=int, default=4000, metavar="N", help="characters shown, 1 or more (default 4000)")
     s.add_argument("--offset", type=int, default=0, metavar="N",
                    help="characters skipped, 0 or more (default 0): the rest of a text cut at --max")
     s = sub.add_parser("toc"); s.add_argument("doc")
-    s.add_argument("--depth", type=int, default=2, metavar="N", help="bookmark levels, 1 or more (default 2)")
+    s.add_argument("--depth", type=int, default=2, metavar="N", help="bookmark levels, 1-6 (default 2)")
     s = sub.add_parser("docs"); s.add_argument("--filter")
     s = sub.add_parser("stats"); s.add_argument("--json", action="store_true"); s.add_argument("--dir")
     args = ap.parse_args()

@@ -72,8 +72,9 @@ INDEXER_VERSION = 7          # 3: code without non-breaking spaces; the return v
                              #    not UTF-8 decoded in its own charset (N138: Windows-1252 pages kept U+FFFD)
                              # 7: a page's kind from its own evidence, never from its samples (0.8.14 retest N150 N151
                              #    N157 N172: an FB whose sample declares a STRUCT is an FB, an operator page an Operator,
-                             #    a method page a Method; a function's 'returns TRUE/FALSE' is its BOOL return); the
-                             #    symbols documented inside pages (N170, the derived table `symbols`)
+                             #    a method page a Method; a function's 'returns TRUE/FALSE' is its BOOL return; the
+                             #    header in a page's Syntax section, 'FUNCTION BLOCK X' read as a header; an operator's
+                             #    syntax only under its label); the symbols documented inside pages (N170, `symbols`)
 
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
@@ -605,8 +606,10 @@ def html_to_doc(raw: bytes | str, base_url: str | None = None, package: bool = F
 # N103 / N101: an IEC header is written in capitals (Beckhoff's code, whatever language label the page gives it —
 # 'METHOD Release : HRESULT' is marked cpp); a case-insensitive match read C# 'Type type' as TYPE and JavaScript
 # 'function' as FUNCTION
+# review of 0.8.15: 44 pages write the header 'FUNCTION BLOCK FB_OCPP1_Client' (a space) — read as FUNCTION 'BLOCK',
+# their header was skipped (the declaration made of fragments) and a Syntax-section rule would have made them Functions
 _HEAD_RE = re.compile(
-    r"^\s*(?:\{[^}]*\}\s*)*(FUNCTION_BLOCK|FUNCTION|PROGRAM|METHOD|PROPERTY|INTERFACE|TYPE|VAR_GLOBAL|ACTION)\b\s*"
+    r"^\s*(?:\{[^}]*\}\s*)*(FUNCTION_BLOCK|FUNCTION BLOCK|FUNCTION|PROGRAM|METHOD|PROPERTY|INTERFACE|TYPE|VAR_GLOBAL|ACTION)\b\s*"
     r"(?:(?:ABSTRACT|FINAL|INTERNAL|PUBLIC|PRIVATE|PROTECTED)\s+)*([A-Za-z_][\w]*)?(.*)$", re.M)
 _POU_KW = r"FUNCTION_BLOCK|FUNCTION|PROGRAM|METHOD|PROPERTY|INTERFACE|ACTION"
 # the header as a heading or a title: 'FUNCTION MEMCPY : UDINT', 'FUNCTION DCTIME_TO_DCTIME64: T_DCTIME64' …
@@ -615,7 +618,7 @@ _HEAD_TEXT = re.compile(rf"^({_POU_KW})\s+(?:(?:ABSTRACT|FINAL|INTERNAL|PUBLIC|P
 # … and with the name first: 'MEMSET FUNCTION: UDINT', 'MEMCMP FUNCTION: DINT'
 _HEAD_TEXT_AFTER = re.compile(r"^([A-Za-z_][\w.]*)\s+(FUNCTION_BLOCK|FUNCTION)\s*(?::\s*(\S.*?))?\s*$")
 _RETURN_TITLES = ("return value", "return values", "rückgabewert", "return parameter")
-_KIND_OF = {"FUNCTION_BLOCK": "FunctionBlock", "FUNCTION": "Function", "PROGRAM": "Program", "METHOD": "Method",
+_KIND_OF = {"FUNCTION_BLOCK": "FunctionBlock", "FUNCTION BLOCK": "FunctionBlock", "FUNCTION": "Function", "PROGRAM": "Program", "METHOD": "Method",
             "PROPERTY": "Property", "INTERFACE": "Interface", "ACTION": "Action", "VAR_GLOBAL": "GlobalVariable"}
 _SECTION_RE = re.compile(r"^\s*(VAR_INPUT|VAR_OUTPUT|VAR_IN_OUT|VAR_GLOBAL|VAR)\b[^\n]*\n(.*?)^\s*END_VAR", re.I | re.M | re.S)
 _STRUCT_RE = re.compile(r"STRUCT\b(.*?)END_STRUCT", re.I | re.S)
@@ -1016,22 +1019,48 @@ def defined_in(asked: str, parent_title: str | None) -> dict[str, str] | None:
 def member_sources(con: Any, owner: str, member: str, keep: Callable[[Any], bool] | None = None) -> list[str]:
     """N158: where a member of `owner` is defined when owner's pages do not document it — the definition location the
     owner's methods / properties table gives it ('I_TcMessage', 'Inherited from FB_TcEventBase'; 'Local' names
-    none), else the types the owner EXTENDS, then those it IMPLEMENTS — read from the owner's stored declarations."""
-    out: list[str] = []
-    later: list[str] = []
+    none), else the types the owner EXTENDS, then those it IMPLEMENTS — read from the owner's stored declaration.
+    Review of 0.8.15: an owner documented by several pages that say different things (FB_BA_SeqCtrl of Tc3_BaCommon,
+    no EXTENDS, and of tf8040, EXTENDS FB_BA_Loop) names no source: which one is meant is not known (owner_sources
+    says why; library= picks one)."""
+    per = owner_sources(con, owner, member, keep)
+    return per[0] if len(per) == 1 else []
+
+
+def owner_sources(con: Any, owner: str, member: str, keep: Callable[[Any], bool] | None = None) -> list[list[str]]:
+    """The sources of `member` (member_sources) per document of `owner` — the same list once."""
+    out: list[list[str]] = []
     for g in symbol_documents(con, owner, keep, frozenset({owner.lower()})):
-        for r in g[:1]:
-            try:
-                d = json.loads(r["decl"]) if r["decl"] else {}
-            except ValueError:
-                d = {}
-            for m in (d.get("methods") or []) + (d.get("properties") or []):
-                if str(m.get("name") or "").lower() == member.lower():
-                    loc = re.sub(r"^(?:inherited\s+from|defined\s+in|from)\s+", "", str(m.get("definition_location") or "").strip(), flags=re.I)
-                    if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", loc) and loc.lower() not in ("local", owner.lower()):
-                        out.append(loc)
-            later += [x for x in [d.get("extends")] + list(d.get("implements") or []) if isinstance(x, str) and x]
-    return list(dict.fromkeys(out + later))
+        r = g[0]
+        try:
+            d = json.loads(r["decl"]) if r["decl"] else {}
+        except ValueError:
+            d = {}
+        here: list[str] = []
+        for m in (d.get("methods") or []) + (d.get("properties") or []):
+            if str(m.get("name") or "").lower() == member.lower():
+                loc = re.sub(r"^(?:inherited\s+from|defined\s+in|from)\s+", "", str(m.get("definition_location") or "").strip(), flags=re.I)
+                if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", loc) and loc.lower() not in ("local", owner.lower()):
+                    here.append(loc)
+        here += [x for x in [d.get("extends")] + list(d.get("implements") or []) if isinstance(x, str) and x]
+        here = list(dict.fromkeys(here))
+        if here not in out:
+            out.append(here)
+    return out
+
+
+def owner_note(con: Any, name: str, keep: Callable[[Any], bool] | None = None) -> str | None:
+    """Why 'Owner.Member' found nothing when Owner is documented by several pages that differ in where its members
+    come from (review of 0.8.15) — None otherwise."""
+    if "." not in name:
+        return None
+    owner, member = name.rsplit(".", 1)
+    docs = symbol_documents(con, owner, keep, frozenset({owner.lower()}))
+    if len(docs) < 2 or len(owner_sources(con, owner, member, keep)) < 2:
+        return None
+    where = ", ".join(f"{g[0]['library'] or g[0]['book']}" for g in docs[:6])
+    return (f"{owner} is documented by {len(docs)} pages ({where}) that differ in what it extends or implements, so "
+            f"where its {member} is defined is not known — pass library= with the one the project uses")
 
 
 def title_documents(con: Any, title: str, keep: Callable[[Any], bool] | None = None) -> list[list[Any]]:
@@ -1107,6 +1136,15 @@ def part_ranges(offset: Any, max_chars: Any) -> None:
                                      "section=<a heading of the outline> or offset=<next_offset>")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise PageError("bad_param", f"offset must be >= 0 (got {offset!r}) — 0 is the start, next_offset the next part")
+
+
+def title_word_answer(name: str, body: str, read_with: str) -> dict[str, Any]:
+    """N170: what answers a name no symbol page and no section documents, when one page has it as a word of its title —
+    the fields every reader gives (review of 0.8.15: infosys_declaration and docs_declaration built them apart, with
+    two outline rules): kind Page, match 'title', the page's outline (page_sections), and the note."""
+    return {"kind": "Page", "match": "title", "outline": [h for h, _ in page_sections(body or "") if h],
+            "note": f"no page or section documents a symbol named {name}; this page has the name in its title — "
+                    f"{read_with} for its text"}
 
 
 def page_part(body: str, section: str | None = None, offset: int = 0, max_chars: int = 4000) -> dict[str, Any]:
@@ -1370,6 +1408,11 @@ def _operator_page(title: str, intro: str) -> bool:
     page's 'The operator can acknowledge …' means a person)."""
     if any(title.startswith(pre) for pre, _k in _PREFIX_KIND):
         return False
+    # review of 0.8.15: an operator is named in capitals (ADR, SEL, MAX) or as TwinCAT's own ones (__NEW) — the
+    # MathOperation block's 'The operator can be selected under MathOperator' is about its setting
+    sym = symbol_name(title) or ""
+    if not re.fullmatch(r"__[A-Z][A-Z0-9_]*|[A-Z][A-Z0-9_]*", sym):
+        return False
     return bool(_OPERATOR_INTRO.search(_prose(intro)))
 
 
@@ -1388,10 +1431,12 @@ def _param_kind(title: str, code_blocks: list[tuple[str, str]], tables: list[lis
     VAR_INPUT blocks without a header: what the page calls itself, a function block else (as before 0.8.15);
     VAR_IN_OUT / VAR_OUTPUT blocks or Inputs / Outputs tables (Name | Type): only what the page calls itself (N157:
     TestAndSet, 'You can use this function …' with a VAR_IN_OUT block) — none: not told."""
-    if not (_identifier_title(title) or re.search(r"\b(?:function\s+block|FB|function|method)\s+" + re.escape(title)
-                                                  + r"\b", _prose(intro))):
-        return None
     said = _callable_of_intro(intro, title)
+    nm = re.escape(symbol_name(title) or title.strip())
+    # review of 0.8.15: 'You can use the Subscription method …' names it as well as 'the method Subscription' does
+    if not (_identifier_title(title) or re.search(rf"\b(?:{_CALL})\s+{nm}\b|\b{nm}\s+(?:{_CALL})\b", _prose(intro),
+                                                re.I)):
+        return None
     if any(not _HEAD_RE.search(c) and re.search(r"\bVAR_INPUT\b", c) for _l, c in code_blocks):
         return said or "FunctionBlock"
     if any(not _HEAD_RE.search(c) and re.search(r"\bVAR_(?:IN_OUT|OUTPUT)\b", c) for _l, c in code_blocks):
@@ -1444,7 +1489,7 @@ def _identifier_title(title: str) -> bool:
 
 def classify(title: str, code_blocks: list[tuple[str, str]], headings: list[tuple[int, str]] | None = None,
              tables: list[list[list[str]]] | None = None, table_titles: list[str] | None = None,
-             intro: str = "") -> str:
+             intro: str = "", syntax_code: list[str] | None = None) -> str:
     """The kind of a page, from the evidence for the page's own symbol, strongest first: its header in the code;
     its header as the title or a heading (N103); an operator page (N150); a 'Return value' row named like it (a
     function); the name prefix (FB_, F_ …); a doc error — a header under another name of the kind the page's
@@ -1479,6 +1524,14 @@ def classify(title: str, code_blocks: list[tuple[str, str]], headings: list[tupl
         for kw, code in other:
             if kw == "TYPE" and all(_code_only(c, _TYPE_BLOCK) for _l, c in code_blocks):
                 return _kind_of_type(code, 0)     # the page's type under another name on a page of types (a doc error)
+        if _identifier_title(name):
+            # review of 0.8.15: the header in the page's Syntax section is its declaration, also under another name —
+            # 'FUNCTION_BLOCK FB_ExternalHydAxisLibRef' on ExternalHydAxisLibRef, Beckhoff's copy-paste 'METHOD
+            # SendEqualMessage' on SendHresult() (both had become Pages); a sample is under 'Sample', not 'Syntax'
+            for code in syntax_code or []:
+                hm = _HEAD_RE.search(code)
+                if hm and hm.group(1) not in ("TYPE", "VAR_GLOBAL"):
+                    return _KIND_OF[hm.group(1)]
         for pre, kind in _PREFIX_KIND:
             if name.startswith(pre):
                 return kind
@@ -1631,17 +1684,49 @@ def library_from_book(book: str) -> str | None:
     return gen.capitalize() + "_" + "".join(p.capitalize() for p in rest.split("_"))
 
 
+_SYNTAX_LABEL = re.compile(r"^[#*\t ]*Syntax\b([^:*\n]*)[*\t ]*:?[*\t ]*:?[\t ]*(.*)$", re.I)
+_LABEL_LINE = re.compile(r"^\s*(?:#{1,6}\s|\*\*[^*]+\*\*\s*:?\s*$)")
+
+
+def _syntax_parts(markdown: str) -> list[tuple[str, bool]]:
+    """(text, is code) of what each 'Syntax' label of a page gives: the text on its line ('**Syntax:** `OUT := MAX(IN0,
+    IN1, ...)`'), else the code blocks right below it, else the one line of text below it ('CAL <function block>
+    (…)'); 'Syntax in the declaration:' / 'Syntax for the call:' are both read. Below the next label or heading nothing
+    belongs to the syntax (review of 0.8.15: the first code block within 2000 characters was the sample under
+    'Example' / 'Samples' — CAL, SEL — and 'in the declaration:' was read as __VARINFO's syntax)."""
+    lines = (markdown or "").split("\n")
+    out: list[tuple[str, bool]] = []
+    i = 0
+    while i < len(lines):
+        m = _SYNTAX_LABEL.match(lines[i])
+        i += 1
+        if not m:
+            continue
+        inline = m.group(2).strip().strip("*").strip().strip("`").strip()
+        if inline:
+            out.append((inline, False))
+            continue
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        if i < len(lines) and lines[i].startswith("```"):
+            while i < len(lines) and lines[i].startswith("```"):          # the code blocks right below the label
+                j = i + 1
+                while j < len(lines) and not lines[j].startswith("```"):
+                    j += 1
+                block = "\n".join(lines[i + 1:j]).strip()
+                if block:
+                    out.append((block, True))
+                i = j + 1
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+        elif i < len(lines) and not _LABEL_LINE.match(lines[i]) and not _SYNTAX_LABEL.match(lines[i]):
+            out.append((lines[i].strip().strip("`").strip(), False))      # one line of text: the syntax as prose
+    return out
+
+
 def _operator_syntax(markdown: str) -> str | None:
-    """N150: an operator page's syntax — the code block under its 'Syntax' label, or the text on that line
-    ('**Syntax:** __DELETE (<Pointer>)')."""
-    m = re.search(r"(?im)^[#*\t ]*Syntax[\t ]*[*:]*[\t ]*[*:]*[\t ]*(.*)$", markdown or "")
-    if not m:
-        return None
-    inline = m.group(1).strip().strip("*").strip()
-    if inline:
-        return inline
-    code = re.search(r"```[^\n`]*\n(.*?)\n```", markdown[m.end():m.end() + 2000], re.S)
-    return code.group(1).strip() if code else None
+    """N150: an operator page's syntax — every part its 'Syntax' labels give (_syntax_parts)."""
+    return "\n".join(t for t, _code in _syntax_parts(markdown)) or None
 
 
 _TYPE_KINDS = ("Struct", "Union", "Enum", "Alias")
@@ -1649,7 +1734,8 @@ _TYPE_KINDS = ("Struct", "Union", "Enum", "Alias")
 
 def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
     intro = _intro_text(doc.markdown)
-    kind = classify(title, doc.code_blocks, doc.headings, doc.tables, doc.table_titles, intro)
+    kind = classify(title, doc.code_blocks, doc.headings, doc.tables, doc.table_titles, intro,
+                    [t for t, code in _syntax_parts(doc.markdown) if code])
     decl: dict[str, Any] = {"name": symbol_name(title) or title.strip(), "kind": kind, "declaration": None, "extends": None, "implements": None,
                             "return_type": None, "inputs": [], "outputs": [], "in_out": [], "members": [],
                             "enum_values": [], "description": {}}
@@ -2946,7 +3032,11 @@ class InfosysIndex:
         def documents() -> tuple[list[list[Any]], list[list[Any]]]:
             with self._db() as con:
                 every = symbol_documents(con, s)          # N100: the one rule of every reader
-            return every, [g for g in ([r for r in g if keep(r)] for g in every) if g]
+                docs = [g for g in ([r for r in g if keep(r)] for g in every) if g]
+                if not docs and lib:
+                    # review of 0.8.15: the library names the owner of a member it inherits (FB_BA_SeqCtrl.Calc of tf8040)
+                    docs = symbol_documents(con, s, keep)
+            return every, docs
 
         every, docs = documents()
         if not docs:
@@ -2959,6 +3049,7 @@ class InfosysIndex:
             with self._db() as con:
                 titled = title_word_documents(con, s, keep)
                 close = near_symbols(con, s, keep) if len(titled) != 1 else []
+                onote = owner_note(con, s, keep)
             if len(titled) == 1:
                 return self._title_answer(s, titled[0])
             complete = self.local is not None and self.index_complete()
@@ -2968,7 +3059,7 @@ class InfosysIndex:
                                (f"; near: {near}" if near else
                                 (" in the complete index" if complete else "; " + self._not_indexed_hint()))
                                # N160 (0.8.14 retest): the way on, as the skill's not_found gives it
-                               + f" — infosys_search(query={s!r}) finds pages by their text")
+                               + (f" — {onote}" if onote else f" — infosys_search(query={s!r}) finds pages by their text"))
         if len(docs) > 1:
             # R23 (0.8.8 retest): MC_MoveAbsolute exists in Tc2_MC2 and Tc3_DriveMotionControl with different
             # parameters — returning the first one let code be written against the wrong FB. Nothing is chosen. One
@@ -3022,11 +3113,9 @@ class InfosysIndex:
         """N170: the answer for a name no symbol page and no section documents, when one page has it as a word of its
         title: that page, kind Page, match 'title', its outline."""
         row = group[0]
-        out: dict[str, Any] = {"name": name, "kind": "Page", "match": "title", "title": row["title"], "url": row["url"],
-                               "library": row["library"], "declaration": None,
-                               "outline": [h for _lvl, h, _t in _md_sections(row["body"] or "")],
-                               "note": f"no page or section documents a symbol named {name}; this page has the name in "
-                                       "its title — infosys_get_page(<url>) for its text"}
+        out: dict[str, Any] = {"name": name, "title": row["title"], "url": row["url"], "library": row["library"],
+                               "declaration": None,
+                               **title_word_answer(name, row["body"] or "", "infosys_get_page(<url>)")}
         if len(group) > 1:
             out["same_page_in"] = list(dict.fromkeys(r["book"] for r in group[1:]))
         if self.local is not None:

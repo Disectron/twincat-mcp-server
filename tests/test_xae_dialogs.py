@@ -204,6 +204,7 @@ class _Desk:
             return w[h]["ex"] if idx == -20 else w[h]["style"]
         g = types.SimpleNamespace(
             EnumWindows=enum_windows, EnumChildWindows=enum_children, IsWindowVisible=lambda h: w[h]["visible"],
+            IsWindow=lambda h: h in w,
             IsWindowEnabled=lambda h: w[h]["enabled"], GetClassName=lambda h: w[h]["cls"],
             GetWindowText=lambda h: w[h]["title"], GetWindow=lambda h, cmd: w[h]["owner"] if cmd == 4 else 0,
             GetWindowLong=get_long, PostMessage=lambda h, msg, a, b: self.posted.append((h, msg)))
@@ -322,6 +323,22 @@ def test_n173_the_main_window_the_shell_names_is_the_one_watched(monkeypatch):
     assert [(d.hwnd, d.captions()) for d in D.list_dialogs(100)] == [(40, ["OK"])]
     D.set_main_window(100, None)
     assert D._MAIN_WINDOWS == {}
+
+
+def test_review_0815_a_hidden_main_window_still_decides(monkeypatch):
+    """Review of 0.8.15 (N173): with xae.visible=false the shell's main window is hidden — only the visible windows
+    were looked at, so the main window was never checked and a modal window it owns (a WPF box) went unseen. The
+    recorded main window decides while it is a window of the process, visible or not."""
+    desk = _Desk()
+    main = desk.top(10, WPF, "Project15 - TcXaeShell", enabled=False, visible=False)
+    desk.top(40, WPF, "Options", owner=main)
+    desk.install(monkeypatch, uia={40: (["OK", "Cancel"], [])})
+    monkeypatch.setattr(D, "_MAIN_WINDOWS", {}, raising=False)
+    D.set_main_window(100, main)
+    assert [(d.hwnd, d.captions()) for d in D.list_dialogs(100)] == [(40, ["OK", "Cancel"])]
+    desk.w[main]["enabled"] = True                                     # nothing modal: the visible window is no dialog
+    assert D.list_dialogs(100) == []
+    D.set_main_window(100, None)
 
 
 def test_n173_resolve_presses_ui_automation_buttons_and_refuses_unknown_ones(monkeypatch):
