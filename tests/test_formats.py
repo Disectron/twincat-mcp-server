@@ -24,7 +24,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (6, "be63695fc32e063d")   # 0.8.14: TOC parents (N126), page charset (N138)
+INFOSYS_FINGERPRINT = (7, "b37714b81cc534b9")   # 0.8.15: kinds from the page's own evidence (N150 N151 N157 N172),
+#                                                    symbols inside pages (N170)
 MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
 ESI_FINGERPRINT = ("1", "12f26f31cd9afc7d")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
 

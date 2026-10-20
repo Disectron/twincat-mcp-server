@@ -195,9 +195,21 @@ def cmd_decl(args) -> int:
         return 1
     _kd, out = got
     parts = [_head(out)]
+    if out.get("section"):
+        # N170: documented in a section or table of a page
+        parts.append(f"{out.get('kind')} — section {out['section']!r} of {out.get('page_title') or out['title']}")
+    if out.get("match") == "title":
+        parts.append(out.get("declaration_note") or "")
+        parts.append("Outline: " + "; ".join(out.get("outline") or []))
     if out.get("intro"):
         parts.append(out["intro"])
-    parts += ["```\n" + b + "\n```" for b in out.get("declaration_blocks") or []]
+    blocks = out.get("declaration_blocks") or []
+    parts += ["```\n" + b + "\n```" for b in blocks]
+    if not blocks and out.get("declaration"):
+        parts.append("```\n" + out["declaration"] + "\n```")          # reconstructed by the index (N170)
+    if out.get("value") is not None:
+        parts.append(f"Value: {out['value']}" + (f" (GVL {out['gvl']})" if out.get("gvl") else "")
+                     + (f" — {out['description']}" if isinstance(out.get("description"), str) else ""))
     if out.get("requirements"):
         parts.append("Requirements:\n" + out["requirements"])
     if out.get("also_in"):

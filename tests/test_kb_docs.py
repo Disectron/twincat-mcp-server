@@ -436,6 +436,36 @@ def test_kbv_i13_the_skill_ties_a_member_to_its_fb(kbdir):
     assert r["parent"]["title"] == "FB_CammingLookUp"
 
 
+def test_n158_n159_the_skill_follows_a_member_to_where_it_is_defined(kbdir):
+    """N158 (0.8.14 retest): docs_declaration FB_TcMessage.Send → not_found (Send is I_TcMessage's; FB_TcMessage's
+    methods table says so). N159: its near list was 8 Tc3_DALI FBs — the title filter held for the first word only;
+    FB_TcMessage, I_TcMessage were not offered."""
+    from tests.test_infosys import store_eventlogger
+    from twincat_mcp.infosys import InfosysIndex, html_to_doc, _bump_gen
+    ix = InfosysIndex(db_file=kbdir / "index" / "infosys-1033.db")
+
+    def store(ref, title, body, hid, parent=None):
+        d = html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
+        d.meta = {"Microsoft.Help.Id": hid, **({"Microsoft.Help.TOCParent": parent} if parent else {})}
+        with ix._db() as con:
+            ix._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", d)
+    store_eventlogger(store)
+    ix.resolve_help_links()
+    with ix._db() as con:
+        _bump_gen(con)
+    ix.sync_derived()
+    del ix
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_TcMessage.Send")
+    assert rc == 0 and r["ref"] == "tcplclib_tc3_eventlogger/5051076107", r
+    assert r["parent"]["title"] == "I_TcMessage" and r["defined_in"] == "I_TcMessage" and r["return_type"] == "HRESULT"
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_Derived.RequestEventText")
+    assert rc == 0 and r["ref"] == "tcplclib_tc3_eventlogger/5002603531" and r["defined_in"] == "FB_TcEventBase", r
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_TcMessage.Sendx")
+    assert rc == 1 and r["error"] == "not_found", r
+    near = [c["title"] for c in r["near"]]
+    assert near[:3] == ["FB_TcMessage", "FB_TcEventBase", "I_TcMessage"] and not any("DALI" in t for t in near), near
+
+
 def test_kbv_pages_whose_id_is_not_a_number(kbdir):
     """kb_verify on the real index (0.8.13): docs_page with the Infosys URL of a book's index page ('…/el6851/
     index.html') or of a page id like '6778772363_30967009' — 1169 of the 51,655 pages — said not_found (looked up as

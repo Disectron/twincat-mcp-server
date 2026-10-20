@@ -541,8 +541,17 @@ def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref") -> tuple[sq
     # N100: the plugin's rule — a symbol is documented by its symbol pages (a C++ 'AdsRead' page is no ADSREAD), one
     # page in several books is one page; a page asked for by name: the symbol's page, else the pages of that title
     docs = (INF.symbol_documents if what == "symbol" else INF.title_documents)(con, s, keep)
-    rows = [con.execute(f"{_PAGE} WHERE rowid = ?", (r["rid"],)).fetchone() for g in docs for r in g]
-    return _pick(ctx, [r for r in rows if r is not None], ref, book, "symbol" if what == "symbol" else "title", what)
+    # N170: a symbol documented in a section or table of a page is its own row (no page row of its own)
+    rows = [r if INF.is_symbol_row(r) else con.execute(f"{_PAGE} WHERE rowid = ?", (r["rid"],)).fetchone()
+            for g in docs for r in g]
+    rows = [r for r in rows if r is not None]
+    if not rows and what == "symbol":
+        # N170 (0.8.14 retest): no page and no section documents it — a page with the name as a word of its title
+        # ('Library Recipe Management - RecipeManCommands') answers as a page; several are offered in near
+        titled = INF.title_word_documents(con, s, keep)
+        if len(titled) == 1:
+            return con.execute(f"{_PAGE} WHERE rowid = ?", (titled[0][0]["rid"],)).fetchone(), "title word"
+    return _pick(ctx, rows, ref, book, "symbol" if what == "symbol" else "title", what)
 
 
 def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: str, what: str) -> tuple[sqlite3.Row, str]:
@@ -555,15 +564,10 @@ def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: st
         near = []
         word = query_text(ref).strip()
         if how in ("title", "symbol") and len(word) >= 3 and has_words(word):
-            # N35: the FTS title column, not a LIKE scan over every page body
-            expr = "title : " + " ".join('"' + w.replace('"', '""') + '"*' for w in re.findall(r"[^\W_]+", word))
-            try:
-                hits = [r[0] for r in con.execute("SELECT rowid FROM pages_fts WHERE pages_fts MATCH ? LIMIT 200", (expr,))]
-            except sqlite3.OperationalError:
-                hits = []
-            rows_near = [con.execute(f"{_PAGE} WHERE rowid = ?", (h,)).fetchone() for h in hits]
-            near = [_cand(ctx, r) for r in _order([r for r in rows_near if r is not None])
-                    if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())][:8]
+            # N35: the FTS title column, not a LIKE scan over every page body; N159 (0.8.14 retest): the plugin's one
+            # near list — the title filter on every word (it applied to the first only), the owner of 'FB.Method'
+            keep = (lambda r: fnmatch.fnmatch(r["book"].lower(), book.lower())) if book else None
+            near = [_cand(ctx, r) for r in INF.near_symbols(con, word, keep)]
         raise Err("not_found", f"no page for {what} {ref!r}" + (f" in books {book!r}" if book else "") + f" (looked up as {how})",
                   near=near, hint=f"docs_search query={word!r} finds pages by their text")
     cands = []
@@ -699,17 +703,26 @@ def _parsed_declaration(r: sqlite3.Row) -> dict[str, Any]:
               "enum_values", "methods", "properties", "description"):
         if d.get(k):
             out[k] = d[k]
+    if INF.is_symbol_row(r):
+        # N170: a symbol documented in a section or table of a page — its value, GVL, section, how it was read
+        for k in ("value", "type", "gvl", "return_description", "summary", "reconstructed"):
+            if d.get(k):
+                out[k] = d[k]
     return out
 
 
 def _family(con: sqlite3.Connection, r: sqlite3.Row) -> dict[str, Any]:
     """N126: the page's parent and child pages in the Help Viewer contents (Infosys format 6), as refs docs_page
     opens — an FB's page lists its method and property pages, a method page names its FB."""
-    fam = INF.page_family(con, r["url"])
-
     def ref(u: str) -> str:
         b = INF.book_of(u)
         return f"{b[0]}/{b[1]}" if b else u
+    if INF.is_symbol_row(r):
+        # N170: a method documented in a section of its FB's page — the FB is that page
+        if r["owner"] and r["kind"] != "Constant":
+            return {"parent": {"title": r["owner"], "ref": ref(r["url"])}}
+        return {}
+    fam = INF.page_family(con, r["url"])
     out: dict[str, Any] = {}
     if fam.get("parent"):
         out["parent"] = {"title": fam["parent"]["title"], "ref": ref(fam["parent"]["url"])}
@@ -725,6 +738,10 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     r, how = resolve(ctx, a["symbol"], a["book"], what="symbol")
     body = r["body"] or ""
     blocks = [b.strip("\n") for b in re.findall(r"```[^\n`]*\n(.*?)\n```", body, re.S)]
+    samples = 0
+    if INF.is_symbol_row(r):
+        # N170: the declaration is reconstructed from the page's tables — its code blocks are examples, not it
+        samples, blocks = len(blocks), []
     shown, used, rest = [], 0, 0
     for b in blocks:
         if used + len(b) > 12000 and shown:
@@ -736,15 +753,28 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = _page_head(ctx, r)
     out.update({"resolved_by": how, **_parsed_declaration(r), "intro": _intro(body), "declaration_blocks": shown,
                 "requirements": req.group(1).strip() if req else None, "also_in": _also_in(con, r)})
+    if INF.is_symbol_row(r):
+        # N170: documented in a section or table of a page (it has no page of its own)
+        out.update({"title": r["title"], "page_title": r["page_title"], "section": r["section"]})
+    elif how == "title word":
+        # N170: no page and no section documents the symbol; this page has the name in its title
+        out.update({"kind": "Page", "match": "title", "outline": [h for h, _ in _sections(body) if h],
+                    "declaration_note": f"no page or section documents a symbol named {a['symbol']}; this page has the "
+                                        "name in its title — docs_page ref=<ref> for its text"})
     fam = _family(con, r)
     if fam.get("parent"):
         out["parent"] = fam["parent"]
+        out.update(INF.defined_in(query_text(a["symbol"]).strip(), fam["parent"]["title"]) or {})   # N158
     lk = _links(con, body)
     if lk:
         out["links"] = lk
     if rest:
         out["blocks_not_shown"] = f"{rest} more code block(s) — docs_page ref={out['ref']} for the whole page"
-    if not blocks:
+    if INF.is_symbol_row(r):
+        where = f"docs_page ref={out['ref']}" + (f" section={r['section']!r}" if r["section"] else "")
+        out["note"] = ("no code declares it: the declaration is reconstructed from the page's tables"
+                       + (f"; the {samples} code block(s) there are examples" if samples else "") + f" — {where} for the text")
+    elif not blocks:
         out["note"] = f"the page has no code block — docs_page ref={out['ref']} for its text"
     out["source"] = ctx.source("infosys")
     return out
@@ -753,16 +783,23 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 def cmd_docs_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
     r, how = resolve(ctx, a["ref"], a["book"])
+    if INF.is_symbol_row(r):
+        # N170: a symbol documented in a section of a page — the page, at that section unless one is asked for
+        if not a["section"] and r["section"]:
+            a = {**a, "section": r["section"]}
+        r = con.execute(f"{_PAGE} WHERE url = ?", (r["url"],)).fetchone()
     body = r["body"] or ""
     secs = _sections(body)
     outline = [h for h, _ in secs if h]
     text, section = body, None
     if a["section"]:
         want = a["section"].lower()
+        # N170: a heading that IS the one asked for wins — 'Method CreateRecipe' is not also 'Method CreateRecipeNoSave'
+        exact = any(h.lower() == want for h, _ in secs)
         on, keep = False, []
         for h, block in secs:
             if h:
-                on = want in h.lower()
+                on = h.lower() == want if exact else want in h.lower()
             if on:
                 keep.append(block)
         if not keep:

@@ -55,7 +55,7 @@ from .docsearch import title_words
 # _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
 # re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
 # changes without a bump.
-INDEXER_VERSION = 6          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
+INDEXER_VERSION = 7          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
                              #    Methods / Properties tables as their own lists (N74)
                              # 4: everything a reader used to repair is stored repaired (docs/KNOWLEDGE_BASE.md rule 4):
                              #    no invisible marks, image placeholders or empty links; links resolved to page URLs
@@ -70,6 +70,10 @@ INDEXER_VERSION = 6          # 3: code without non-breaking spaces; the return v
                              # 6: each page's place in the Help Viewer contents (Microsoft.Help.TOCParent → parent URL,
                              #    N126: an FB's method pages titled 'Call' could not be tied to their FB); a page that is
                              #    not UTF-8 decoded in its own charset (N138: Windows-1252 pages kept U+FFFD)
+                             # 7: a page's kind from its own evidence, never from its samples (0.8.14 retest N150 N151
+                             #    N157 N172: an FB whose sample declares a STRUCT is an FB, an operator page an Operator,
+                             #    a method page a Method; a function's 'returns TRUE/FALSE' is its BOOL return); the
+                             #    symbols documented inside pages (N170, the derived table `symbols`)
 
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
@@ -78,7 +82,8 @@ ALLOWED_HOSTS = {"infosys.beckhoff.com"}
 DDG_HOSTS = {"html.duckduckgo.com", "duckduckgo.com"}
 USER_AGENT = "twincat-mcp/0.6 (+https://github.com/; documentation lookup for an engineering tool)"
 CODE_SEP = "\n\x1e\n"
-DERIVED_VERSION = 1          # catalog / code_blocks layout; a bump rebuilds them from the stored pages (no re-parse)
+DERIVED_VERSION = 2          # catalog / code_blocks / symbols layout; a bump brings them in step from the stored pages
+                             # (no re-parse). 2: symbols — the methods and constants documented inside pages (N170)
 
 
 BOOK_CATEGORIES = ("plc-library", "function-tf", "engineering-te", "twincat-system", "hardware", "other")
@@ -652,6 +657,67 @@ def symbol_name(title: str) -> str | None:
 DOC_COLS = "rowid AS rid, url, book, page_id AS pid, title, kind, library, decl, version, crumb, markdown AS body"
 
 
+# N170: a symbol documented inside a page (the derived table `symbols`: a '## Method X' section with its tables, a row
+# of a constants table) is a row with the DOC_COLS keys too — rid negative (-symbols.id), title its name
+# ('RecipeManCommands.CreateRecipe', 'ERR_RECIPE_NOT_FOUND'), body its section of the page, url / book / pid the page's
+# — plus section (the heading), owner (the FB of a method, the GVL of a constant) and page_title.
+def is_symbol_row(r: Any) -> bool:
+    return int(r["rid"] or 0) < 0
+
+
+def has_symbols(con: Any) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE name = 'symbols'").fetchone() is not None
+
+
+def _section_text(markdown: str, heading: str | None) -> str:
+    """The section of a page under this heading, the heading line included; the whole page without one."""
+    if not heading:
+        return markdown
+    for lvl, head, text in _md_sections(markdown):
+        if head == heading:
+            return f"{'#' * lvl} {head}{text}"
+    return markdown
+
+
+def symbol_rows(con: Any, name: str, keep: Callable[[Any], bool] | None = None) -> list[dict[str, Any]]:
+    """N170: the symbols documented inside pages with this name — 'Owner.Name' by owner and name, a bare name by name;
+    without case, but an exact-case match wins (a 'createRecipe' never hides a 'CreateRecipe' of the same case as
+    asked). [] for an index without the table (built before 0.8.15)."""
+    s = " ".join(name.split())
+    if not s or not has_symbols(con):
+        return []
+    owner, member = s.rsplit(".", 1) if "." in s else ("", s)
+    sql = ("SELECT s.id, s.name, s.owner, s.kind, s.section, s.decl, p.url, p.book, p.page_id, p.title, p.library, "
+           "p.version, p.crumb, p.markdown FROM symbols s JOIN pages p ON p.rowid = s.page_rowid "
+           "WHERE s.name = ? COLLATE NOCASE" + (" AND s.owner = ? COLLATE NOCASE" if owner else ""))
+    got = con.execute(sql, (member, owner) if owner else (member,)).fetchall()
+    exact = [r for r in got if r[1] == member and (not owner or r[2] == owner)]
+    out = []
+    for r in exact or got:
+        title = f"{r[2]}.{r[1]}" if r[2] and r[3] != "Constant" else r[1]
+        row = {"rid": -int(r[0]), "url": r[6], "book": r[7], "pid": r[8], "title": title, "kind": r[3],
+               "library": r[10], "decl": r[5], "version": r[11], "crumb": r[12],
+               "body": _section_text(r[13] or "", r[4]), "section": r[4], "owner": r[2], "page_title": r[9]}
+        if keep is None or keep(row):
+            out.append(row)
+    return out
+
+
+def title_word_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = None,
+                         limit: int = 50) -> list[list[Any]]:
+    """N170: the pages whose title has the name as a word ('Library Recipe Management - RecipeManCommands' for
+    RecipeManCommands) — what answers a symbol no page and no section documents, as documents (same_documents)."""
+    s = " ".join(name.split())
+    if len(s) < 3 or not re.fullmatch(r"[A-Za-z_][\w.]*", s):
+        return []
+    src = "catalog" if con.execute("SELECT 1 FROM sqlite_master WHERE name = 'catalog'").fetchone() else "pages"
+    word = re.compile(rf"(?<![\w.]){re.escape(s)}(?![\w])", re.I)
+    rids = [rid for rid, title in con.execute(f"SELECT rowid, title FROM {src} WHERE title LIKE ? ESCAPE '\\' "
+                                              "COLLATE NOCASE", ("%" + _like(s) + "%",)) if word.search(title or "")]
+    rows = [con.execute(f"SELECT {DOC_COLS} FROM pages WHERE rowid = ?", (rid,)).fetchone() for rid in rids[:limit]]
+    return same_documents([r for r in rows if r is not None and (keep is None or keep(r))], con)
+
+
 def _decl_text(decl: str | None) -> str:
     try:
         d = json.loads(decl) if decl else {}
@@ -685,11 +751,14 @@ def member_owners(con: Any, rows: list[Any]) -> dict[int, str]:
     """{rid: the symbol its parent page documents (lower case)} of the member pages (method, property, action,
     transition) among rows (DOC_COLS) whose parent in the Help Viewer contents is a symbol page — format 6 stores the
     parent; a member below a topic page ('Methods') or with no parent has no owner here."""
-    if con is None or not has_parents(con):
+    if con is None or not (has_parents(con) or any(is_symbol_row(r) for r in rows)):
         return {}
     out: dict[int, str] = {}
     for r in rows:
-        if r["kind"] in _MEMBER_KINDS:
+        if r["kind"] in _MEMBER_KINDS and is_symbol_row(r):
+            if r["owner"]:
+                out[r["rid"]] = str(r["owner"]).lower()      # N170: a method section of its FB's page
+        elif r["kind"] in _MEMBER_KINDS:
             up = _ancestors(con, r["rid"])
             name = symbol_name(up[-1][0]) if up and up[-1][1] != "Page" else None
             if name:
@@ -756,7 +825,7 @@ def same_documents(rows: list[Any], con: Any = None) -> list[list[Any]]:
     # the page id first, for every row: the same Beckhoff page is one document whatever the order of the rows (a
     # declaration or text match must not take a book a true copy needs — second review 0.8.12)
     for i, r in enumerate(rows):
-        if r["pid"]:
+        if r["pid"] and not is_symbol_row(r):          # a symbol in a page shares its page id with the page
             # N99b (0.8.13 retest): '374277003_30131813' and '374277003_2750866' are Beckhoff's page 374277003 placed
             # twice in one book (the 4 'ADS Return Codes' of tf6500, byte-identical) — one page, merged like its copies.
             # Review of 0.8.14: a shared id prefix alone is not that — two FBs' 'EqualsTo' (5002755467_60885635 /
@@ -779,7 +848,11 @@ def same_documents(rows: list[Any], con: Any = None) -> list[list[Any]]:
     for i, r in enumerate(rows):
         keys = []
         d = _decl_text(r["decl"])
-        if d:
+        if is_symbol_row(r):
+            # N170: one symbol in sections of several pages — the PLCPRJ_ERROR_* constants of the four TCP/IP samples
+            # of one book — is one answer when name and declaration are the same
+            keys.append(("sym", str(r["title"]).lower(), d))
+        elif d:
             keys.append(("decl", (r["library"] or "").lower(), d))
             if r["library"]:
                 libs_of.setdefault(d, set()).add(r["library"].lower())
@@ -789,14 +862,14 @@ def same_documents(rows: list[Any], con: Any = None) -> list[list[Any]]:
                 keys.append(("text", (r["library"] or "").lower(), b))
         for k in keys:
             for j in seen.get(k, []):
-                if union(j, i):
+                if union(j, i, same_source=k[0] == "sym"):
                     break
             seen.setdefault(k, []).append(i)
     # a page that names no library joins the one library whose page shows the same declaration (a product's copy of a
     # library page: tc3_eventlogger next to tcplclib_tc3_eventlogger); with two such libraries it stays apart
     for i, r in enumerate(rows):
         d = _decl_text(r["decl"])
-        if d and not r["library"] and len(libs_of.get(d, ())) == 1:
+        if d and not r["library"] and not is_symbol_row(r) and len(libs_of.get(d, ())) == 1:
             for j in seen.get(("decl", next(iter(libs_of[d])), d), []):
                 if union(j, i):
                     break
@@ -820,7 +893,8 @@ def names_symbol(title: str, name: str) -> bool:
     return sym == n or ("." not in n and n in page_symbols(title))
 
 
-def symbol_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = None) -> list[list[Any]]:
+def symbol_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = None,
+                     _seen: frozenset[str] = frozenset()) -> list[list[Any]]:
     """N100 (0.8.11 retest): the pages that document the IEC symbol `name`, as documents (same_documents) — the one
     rule of infosys_declaration, infosys_get_page by name and the twincat-docs skill's docs_declaration / docs_page
     (they disagreed: the skill called T_MaxString ambiguous — one page in two books — and ADSREAD — the C++ AdsRead
@@ -861,7 +935,100 @@ def symbol_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = N
                  if keep is None or keep(r)]
         ids = {r["rid"] for r in cands}
         cands += [r for r in owned if r["rid"] not in ids]
-    return same_documents(cands, con)
+    # N170 (0.8.14 retest): a symbol documented in a section or table of a page (RecipeManCommands' 22 methods, the
+    # ERR_ codes of its GVL) — unless a page of the same library / book documents it (its own page is the answer)
+    libs = {str(r["library"]).lower() for r in cands if r["library"]}
+    books = {str(r["book"]).lower() for r in cands}
+    cands += [r for r in symbol_rows(con, s, keep)
+              if not ((r["library"] and r["library"].lower() in libs) or str(r["book"]).lower() in books)]
+    docs = same_documents(cands, con)
+    if not docs and "." in s and len(_seen) < 4:
+        # N158 (0.8.14 retest): FB_TcMessage.Send was not found — Send is I_TcMessage's (FB_TcMessage's methods table
+        # says so: definition location I_TcMessage), and I_TcMessage.Send resolves. A member its owner does not
+        # document itself is looked up where the owner's page says it is defined, then up EXTENDS and IMPLEMENTS
+        for via in member_sources(con, owner, member, keep):
+            if via.lower() not in _seen:
+                docs = symbol_documents(con, f"{via}.{member}", keep, _seen | {owner.lower(), via.lower()})
+                if docs:
+                    break
+    return docs
+
+
+def near_symbols(con: Any, name: str, keep: Callable[[Any], bool] | None = None, limit: int = 8) -> list[Any]:
+    """N159 (0.8.14 retest): what a symbol that is not found is offered instead (each document once, DOC_COLS rows):
+    the pages with the name as a word of their title; for 'Owner.Member' the owner's page, then the types the owner
+    says the member comes from (member_sources) and their member; then the pages whose TITLE has all the name's words,
+    then any of them (prefixes, words of three letters and more). The near list for FB_TcMessage.Send was eight DALI
+    FBs: the title filter 'title : "FB"* "TcMessage"* "Send"*' applies to the first word only — the others matched
+    the page text."""
+    s = " ".join(name.split())
+    out: list[Any] = []
+    seen: set[int] = set()
+
+    def add(groups: list[list[Any]]) -> None:
+        for g in groups:
+            if len(out) >= limit:
+                return
+            if not any(r["rid"] in seen for r in g):
+                out.append(g[0])
+            seen.update(r["rid"] for r in g)
+    add(title_word_documents(con, s, keep))
+    if "." in s:
+        owner, member = s.rsplit(".", 1)
+        add(symbol_documents(con, owner, keep))
+        for via in member_sources(con, owner, member, keep):
+            add(symbol_documents(con, via, keep))
+            add(symbol_documents(con, f"{via}.{member}", keep))
+    words = re.findall(r"[^\W_]+", s)
+    words = [w for w in words if len(w) >= 3] or words
+    if words and len(out) < limit and con.execute("SELECT 1 FROM sqlite_master WHERE name = 'pages_fts'").fetchone():
+        terms = ['"' + w.replace('"', '""') + '"*' for w in words]
+        for op in (" AND ", " OR "):
+            try:
+                rids = [r[0] for r in con.execute("SELECT rowid FROM pages_fts WHERE pages_fts MATCH ? ORDER BY rank "
+                                                  "LIMIT 200", (f"title : ({op.join(terms)})",))]
+            except sqlite3.Error:
+                rids = []
+            rows = [con.execute(f"SELECT {DOC_COLS} FROM pages WHERE rowid = ?", (rid,)).fetchone() for rid in rids]
+            add(same_documents([r for r in rows if r is not None and (keep is None or keep(r))], con))
+            if len(out) >= limit or len(words) == 1:
+                break
+    return out[:limit]
+
+
+def defined_in(asked: str, parent_title: str | None) -> dict[str, str] | None:
+    """N158: {"asked_as", "defined_in", "note"} when 'Owner.Member' was answered by a member of another symbol (an
+    interface it implements, a base it extends) — None when the answer is Owner's own member or nothing says whose."""
+    if "." not in asked or not parent_title:
+        return None
+    owner, member = asked.rsplit(".", 1)
+    p = symbol_name(parent_title) or ""
+    if not p or p.rsplit(".", 1)[-1].lower() == owner.rsplit(".", 1)[-1].lower():
+        return None
+    return {"asked_as": asked, "defined_in": p,
+            "note": f"{owner} documents no {member} of its own; it is {p}'s (where {owner}'s page, EXTENDS or "
+                    f"IMPLEMENTS says it is defined)"}
+
+
+def member_sources(con: Any, owner: str, member: str, keep: Callable[[Any], bool] | None = None) -> list[str]:
+    """N158: where a member of `owner` is defined when owner's pages do not document it — the definition location the
+    owner's methods / properties table gives it ('I_TcMessage', 'Inherited from FB_TcEventBase'; 'Local' names
+    none), else the types the owner EXTENDS, then those it IMPLEMENTS — read from the owner's stored declarations."""
+    out: list[str] = []
+    later: list[str] = []
+    for g in symbol_documents(con, owner, keep, frozenset({owner.lower()})):
+        for r in g[:1]:
+            try:
+                d = json.loads(r["decl"]) if r["decl"] else {}
+            except ValueError:
+                d = {}
+            for m in (d.get("methods") or []) + (d.get("properties") or []):
+                if str(m.get("name") or "").lower() == member.lower():
+                    loc = re.sub(r"^(?:inherited\s+from|defined\s+in|from)\s+", "", str(m.get("definition_location") or "").strip(), flags=re.I)
+                    if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", loc) and loc.lower() not in ("local", owner.lower()):
+                        out.append(loc)
+            later += [x for x in [d.get("extends")] + list(d.get("implements") or []) if isinstance(x, str) and x]
+    return list(dict.fromkeys(out + later))
 
 
 def title_documents(con: Any, title: str, keep: Callable[[Any], bool] | None = None) -> list[list[Any]]:
@@ -1533,6 +1700,239 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
     return decl
 
 
+# -- symbols documented inside a page (N170) -------------------------------------------------------------------------
+# 0.8.14 retest: 'RecipeManCommands', 'CreateRecipe' … were 'no page for symbol' — the 22 methods of RecipeManCommands
+# are '## Method X' sections of ONE page (tc3_plc_intro/2525821323) with Inputs / Return value tables and no code, and
+# its ERR_ codes a table. Such sections and tables are symbols of their own (derived table `symbols`), looked up when
+# no page documents the name (symbol_documents).
+_MEMBER_HEAD = re.compile(r"^(Method|Property|Function|Action)\s+([A-Za-z_]\w*)\s*(?:\(\s*\))?\s*$"
+                          r"|^([A-Za-z_]\w*)\s*(?:\(\s*\))?\s*\((Method|Property|Function|Action)\)\s*$", re.I)
+_CONST_NAME = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+_IEC_VALUE = re.compile(r"^(?:16#[0-9A-Fa-f_]+|8#[0-7_]+|2#[01_]+|[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|TRUE|FALSE)$")
+_IEC_BASED = re.compile(r"^(?:16|8|2)#")
+_C_VALUE = re.compile(r"^[+-]?0[xX][0-9A-Fa-f]+[uUlL]*$")
+_VALUE_HEAD = re.compile(r"\bvalue\b|\binitiali[sz]ation\b|\binitial\b", re.I)
+_PLC_CONTEXT = re.compile(r"\bPLC\b|\bGVL\b|\bglobal\s+(?:variable\s+list|constants?)\b|\bVAR_GLOBAL\b", re.I)
+_OWNER_KINDS = (("function block", "FunctionBlock"), ("interface", "Interface"), ("program", "Program"))
+
+
+def _md_cell(c: str) -> str:
+    c = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", c)
+    return " ".join(c.replace("**", "").replace("`", "").split())
+
+
+def _md_sections(md: str) -> list[tuple[int, str, str]]:
+    """(level, heading, text up to the next heading of that level or higher) of a page's Markdown; a '#' line in a
+    code block is code."""
+    heads = []
+    fence = False
+    for m in re.finditer(r"(?m)^(```.*|(#{1,6})\s+(.*))$", md):
+        if m.group(1).startswith("```"):
+            fence = not fence
+        elif not fence:
+            heads.append((m.start(), m.end(), len(m.group(2)), m.group(3).strip()))
+    out = []
+    for i, (_s, e, lvl, head) in enumerate(heads):
+        end = next((s2 for s2, _e2, l2, _h2 in heads[i + 1:] if l2 <= lvl), len(md))
+        out.append((lvl, head, md[e:end]))
+    return out
+
+
+def _md_tables(text: str) -> list[tuple[str, list[list[str]]]]:
+    """(label, rows) of the pipe tables in a text: the label is the line above the table ('**Inputs (VAR_INPUT)**');
+    rows[0] is the header row."""
+    out: list[tuple[str, list[list[str]]]] = []
+    lines = text.split("\n")
+    label = ""
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("|"):
+            rows: list[list[str]] = []
+            while i < len(lines) and lines[i].startswith("|"):
+                if not re.fullmatch(r"\|[\s\-|:]*\|?", lines[i].strip()):
+                    rows.append([_md_cell(c) for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+            out.append((label, rows))
+            label = ""
+            continue
+        if ln.strip():
+            label = _md_cell(ln).strip(" :")
+        i += 1
+    return out
+
+
+def _vars_of(rows: list[list[str]]) -> list[dict[str, Any]]:
+    """Name | (Data) type | Description rows → variables; [] when the table has no Name column."""
+    if len(rows) < 2:
+        return []
+    hdr = [c.lower() for c in rows[0]]
+    ni = next((k for k, h in enumerate(hdr) if "name" in h), None)
+    ti = next((k for k, h in enumerate(hdr) if "type" in h), None)
+    di = next((k for k, h in enumerate(hdr) if "description" in h or "comment" in h or "meaning" in h), None)
+    if ni is None:
+        return []
+    out = []
+    for r in rows[1:]:
+        if ni < len(r) and re.fullmatch(r"[A-Za-z_]\w*", r[ni]):
+            out.append({"name": r[ni], "type": (r[ti] if ti is not None and ti < len(r) else "") or None,
+                        "default": None, "description": (r[di] if di is not None and di < len(r) else "") or None})
+    return out
+
+
+def _page_owner(title: str) -> str | None:
+    """The symbol whose members a page documents in sections: 'Library Recipe Management - RecipeManCommands' →
+    RecipeManCommands (the name after ' - '), else the page's own symbol."""
+    m = re.search(r"\s[-–]\s*([A-Za-z_]\w*)\s*$", title or "")
+    return m.group(1) if m else symbol_name(title or "")
+
+
+def _var_lines(items: list[dict[str, Any]]) -> list[str]:
+    w = max((len(x["name"]) for x in items), default=0)
+    return [f"    {x['name'].ljust(w)} : {x['type'] or '(* type not given on the page *)'};"
+            + (f"   // {x['description']}" if x.get("description") else "") for x in items]
+
+
+def _prose_of(body: str) -> str:
+    return " ".join(re.sub(r"(?m)^\|.*$|```.*?```", " ", body, flags=re.S).split())
+
+
+def _constant_tables(markdown: str) -> list[tuple[str, str, list[list[str]]]]:
+    """(heading, section text, rows) of the tables of IEC constants on a page: a header whose second column is a
+    value ('Name | Initialization value | Comment', 'Port numbers | Value | Description'), at least 80 % of the rows
+    NAME_X | IEC literal, and evidence that they are IEC — a value written 16# / 2# / 8# in such a table of the page,
+    or the text naming the PLC / a GVL / global constants. Not a table in C notation (0x…: the ADS DLL, the CNC
+    interfaces), not one the text calls an enumeration (the values of an enum type, not constants). The deepest
+    section first: the nearest heading names the table."""
+    found: list[tuple[str, str, list[list[str]], bool]] = []
+    seen: set[tuple[str, ...]] = set()
+    secs = sorted(_md_sections(markdown), key=lambda x: -x[0]) + [(0, "", markdown)]
+    for _lvl, head, body in secs:
+        part = body if head else re.split(r"(?m)^#{1,6}\s", markdown, maxsplit=1)[0]
+        for label, rows in _md_tables(part):
+            if len(rows) < 3 or len(rows[0]) < 2 or _CONST_NAME.match(rows[0][0]) or not _VALUE_HEAD.search(rows[0][1]):
+                continue
+            key = tuple(r[0] for r in rows)
+            if key in seen:
+                continue
+            seen.add(key)
+            data = rows[1:]
+            if any(len(r) >= 2 and _C_VALUE.match(r[1]) for r in data):
+                continue
+            hits = [r for r in data if len(r) >= 2 and _CONST_NAME.match(r[0]) and _IEC_VALUE.match(r[1])]
+            if len(hits) < 2 or len(hits) < 0.8 * len(data):
+                continue
+            text = _prose_of(body) + " " + label
+            if re.search(r"\benumeration\b", text, re.I):
+                continue
+            found.append((head, text, hits, bool(_PLC_CONTEXT.search(text + " " + " ".join(rows[0])))))
+    based = any(_IEC_BASED.match(r[1]) for _h, _t, hits, _c in found for r in hits)
+    return [(h, t, hits) for h, t, hits, ctx in found if based or ctx]
+
+
+def heading_symbols(title: str, markdown: str, kind: str | None = None) -> list[dict[str, Any]]:
+    """N170: the symbols a page documents in its sections and tables, each {name, owner, kind, section, decl}:
+      - a heading 'Method X' / 'Property X' / 'Function X' / 'Action X' / 'X (Method)' whose section tables its
+        parameters (a table labelled VAR_INPUT / VAR_OUTPUT / VAR_IN_OUT / Inputs / Outputs) or its return value
+        (a 'Return value' table): kind from the heading, the declaration reconstructed from the tables, owner the
+        page's symbol (_page_owner). The owner itself when the page is not its page and its text says what it is
+        ('the function block RecipeManCommands'): its methods, no VAR blocks (the page shows none);
+      - a table of IEC constants (_constant_tables): kind Constant with its value, the type and the GVL when the
+        text names them ('… in the GVL ReturnValues', '… of the data type UDINT'). Not on a type's page (kind Enum /
+        Struct / Union / Alias: the rows are the type's values or components).
+    Nothing is assumed: a type the table leaves empty stays unknown, an owner the text does not name a function
+    block / interface / program gets no entry of its own."""
+    md = markdown or ""
+    if "|" not in md:
+        return []
+    own = (symbol_name(title or "") or "").lower()
+    owner = _page_owner(title)
+    out: list[dict[str, Any]] = []
+    members: list[dict[str, Any]] = []
+    for _lvl, head, body in _md_sections(md):
+        m = _MEMBER_HEAD.match(head)
+        if not m:
+            continue
+        kw = (m.group(1) or m.group(4)).capitalize()
+        name = m.group(2) or m.group(3)
+        if name.lower() == own:
+            continue                                   # the page's own symbol ('FUNCTION F_GetVersionTcUtilities')
+        ins: list[dict[str, Any]] = []
+        outs: list[dict[str, Any]] = []
+        inouts: list[dict[str, Any]] = []
+        ret: list[dict[str, Any]] = []
+        for label, rows in _md_tables(body):
+            lab = label.lower()
+            vs = _vars_of(rows)
+            if not vs:
+                continue
+            if re.search(r"var_in_out|in[ /_-]?out|inputs?\s*/\s*outputs?", lab):
+                inouts += vs
+            elif re.search(r"var_output|\boutputs?\b", lab):
+                outs += vs
+            elif re.search(r"var_input|\binputs?\b", lab):
+                ins += vs
+            elif re.search(r"\breturn\s+values?\b", lab):
+                ret += vs
+        if not (ins or outs or inouts or ret):
+            continue                                   # no IEC parameters tabled: not a symbol of the PLC
+        rv = next((x for x in ret if x["name"].lower() == name.lower()), ret[0] if len(ret) == 1 else None)
+        rtype = (rv or {}).get("type")
+        hdr = {"Method": "METHOD", "Property": "PROPERTY", "Function": "FUNCTION", "Action": "ACTION"}[kw]
+        text = [f"{hdr} {name}" + (f" : {rtype}" if rtype else "") + "   (* reconstructed from the page's tables *)"]
+        for sec, items in (("VAR_INPUT", ins), ("VAR_OUTPUT", outs), ("VAR_IN_OUT", inouts)):
+            if items:
+                text += [sec, *_var_lines(items), "END_VAR"]
+        prose = _prose_of(body)
+        summary = re.split(r"(?<=[.!?])\s", prose, maxsplit=1)[0] if prose else None
+        decl = {"name": name, "kind": kw, "declaration": "\n".join(text), "extends": None, "implements": None,
+                "return_type": rtype, "inputs": ins, "outputs": outs, "in_out": inouts, "members": [], "enum_values": [],
+                "description": {}, "section": head, "reconstructed": "from the page's tables (it shows no code)"}
+        if rv and rv.get("description"):
+            decl["return_description"] = rv["description"]
+        if summary:
+            decl["summary"] = summary
+        out.append({"name": name, "owner": owner, "kind": kw, "section": head, "decl": decl})
+        members.append({"name": name, "kind": kw, "description": summary})
+    said = None
+    if owner and members and own != owner.lower():
+        words = " ".join(_text_of(md).split())
+        said = next((k for w, k in _OWNER_KINDS
+                     if re.search(rf"\b{w}\s+[\"'„“]?{re.escape(owner)}\b", words, re.I)), None)
+    if said:
+        out.append({"name": owner, "owner": None, "kind": said, "section": None, "decl": {
+            "name": owner, "kind": said, "extends": None, "implements": None, "return_type": None,
+            "declaration": f"{dict(_OWNER_KINDS_IEC)[said]} {owner}   (* methods only — the page shows no VAR blocks *)",
+            "inputs": [], "outputs": [], "in_out": [], "members": [], "enum_values": [], "description": {},
+            "methods": [{"name": x["name"], "definition_location": None, "description": x["description"]}
+                        for x in members if x["kind"] == "Method"],
+            "properties": [{"name": x["name"], "description": x["description"]} for x in members if x["kind"] == "Property"],
+            "reconstructed": "from the page's method sections (it shows no code)"}})
+    if kind not in ("Enum", "Struct", "Union", "Alias"):
+        for head, text, hits in _constant_tables(md):
+            gvl = re.search(r"\b(?:GVL|global variable list)\s+([A-Za-z_]\w*)", text)
+            typ = re.search(r"\bdata\s+type\s+([A-Z][A-Z0-9_]*)\b", text)
+            for r in hits:
+                d = {"name": r[0], "kind": "Constant", "value": r[1], "type": typ.group(1) if typ else None,
+                     "description": r[2] if len(r) > 2 and r[2] else None, "section": head or None,
+                     "declaration": f"{r[0]}" + (f" : {typ.group(1)}" if typ else "") + f" := {r[1]};"}
+                if gvl:
+                    d["gvl"] = gvl.group(1)
+                out.append({"name": r[0], "owner": gvl.group(1) if gvl else None, "kind": "Constant",
+                            "section": head or None, "decl": d})
+    seen: set[tuple[str, str]] = set()
+    uniq = []
+    for x in out:                              # a table under nested headings is read once
+        k = (x["name"].lower(), (x["owner"] or "").lower())
+        if k not in seen:
+            seen.add(k)
+            uniq.append(x)
+    return uniq
+
+
+_OWNER_KINDS_IEC = (("FunctionBlock", "FUNCTION_BLOCK"), ("Interface", "INTERFACE"), ("Program", "PROGRAM"))
+
+
 def _return_in_header(text: str, short: str, rtype: str, kw: str) -> str:
     """R24: Infosys documents a FUNCTION's return value as a VAR_OUTPUT line named like the function. Drop that line
     from every VAR_OUTPUT block (and the block once nothing but blanks is left), and give the header its ': type' —
@@ -1687,6 +2087,8 @@ class InfosysIndex:
     #              this few-MB table instead of scanning the whole page store (R18: 16.9 s cold)
     # code_blocks: one row per code sample, \xa0 normalised (R17), language stored as is ('' = unlabelled, R22);
     #              searched in one pass over the samples alone, with the language filter in SQL (R19)
+    # symbols:     the symbols a page documents in its sections and tables (heading_symbols, N170): a method of an FB
+    #              whose page has no code, an FB known only by its methods, a constant of a constants table
     # Built from the stored pages — no page is parsed again; kept in step after every index run.
     def _init_derived(self, con: Any) -> None:
         con.executescript("""
@@ -1698,6 +2100,11 @@ class InfosysIndex:
             CREATE INDEX IF NOT EXISTS code_blocks_page ON code_blocks(page_rowid);
             CREATE INDEX IF NOT EXISTS code_blocks_lang ON code_blocks(lang COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS code_src(page_rowid INTEGER PRIMARY KEY, url TEXT, fetched REAL);
+            CREATE TABLE IF NOT EXISTS symbols(id INTEGER PRIMARY KEY, page_rowid INTEGER, name TEXT, owner TEXT,
+                                               kind TEXT, section TEXT, decl TEXT);
+            CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS symbols_page ON symbols(page_rowid);
+            CREATE TABLE IF NOT EXISTS symbol_src(page_rowid INTEGER PRIMARY KEY, url TEXT, fetched REAL);
         """)
 
     def sync_derived(self) -> dict[str, Any]:
@@ -1735,9 +2142,29 @@ class InfosysIndex:
                                 (row["rowid"], row["url"], row["title"], row["library"], lang.strip(), code))
                     added += 1
                 con.execute("INSERT OR REPLACE INTO code_src VALUES (?, ?, ?)", (row["rowid"], row["url"], row["fetched"]))
+            # N170: the symbols documented inside the pages (a page with no table documents none)
+            for (pr,) in con.execute("SELECT page_rowid FROM symbol_src WHERE NOT " + same.format(t="symbol_src", k="page_rowid")).fetchall():
+                con.execute("DELETE FROM symbols WHERE page_rowid = ?", (pr,))
+                con.execute("DELETE FROM symbol_src WHERE page_rowid = ?", (pr,))
+            syms = 0
+            for row in con.execute("SELECT rowid, url, title, kind, markdown, fetched FROM pages WHERE rowid NOT IN "
+                                   "(SELECT page_rowid FROM symbol_src)").fetchall():
+                for x in heading_symbols(row["title"], row["markdown"] or "", row["kind"]):
+                    con.execute("INSERT INTO symbols(page_rowid, name, owner, kind, section, decl) VALUES (?,?,?,?,?,?)",
+                                (row["rowid"], x["name"], x["owner"], x["kind"], x["section"],
+                                 json.dumps(x["decl"], ensure_ascii=False)))
+                    syms += 1
+                con.execute("INSERT OR REPLACE INTO symbol_src VALUES (?, ?, ?)", (row["rowid"], row["url"], row["fetched"]))
             con.execute("INSERT OR REPLACE INTO meta VALUES ('derived_sig', ?)", (f"{DERIVED_VERSION}|{sig}",))
         return {"changed": True, "pages_added": len(batch), "pages_removed": len(gone), "code_blocks_added": added,
-                "seconds": round(time.time() - t0, 2)}
+                "symbols_added": syms, "seconds": round(time.time() - t0, 2)}
+
+    def symbol_counts(self) -> dict[str, int]:
+        """N170: {kind: count} of the symbols documented inside pages (the build log names them)."""
+        with self._db() as con:
+            if not has_symbols(con):
+                return {}
+            return {k: n for k, n in con.execute("SELECT kind, COUNT(*) FROM symbols GROUP BY kind ORDER BY kind")}
 
     def warm(self) -> dict[str, Any]:
         """R18 at start: the first search reads only the derived lookup tables — read them once now (and, for the
@@ -2432,9 +2859,18 @@ class InfosysIndex:
             if found.get("auto_indexed"):
                 every, docs = documents()
         if not docs:
+            # N170 (0.8.14 retest): no page and no section documents the symbol — a page with the name as a word of
+            # its title ('Library Recipe Management - RecipeManCommands') answers as a page, with its outline
+            with self._db() as con:
+                titled = title_word_documents(con, s, keep)
+                close = near_symbols(con, s, keep) if len(titled) != 1 else []
+            if len(titled) == 1:
+                return self._title_answer(s, titled[0])
             complete = self.local is not None and self.index_complete()
+            near = [f"{r['title']} ({r['url']})" for r in close]           # N159: the owner, where the member is from
+            near += [it["name"] for it in found["items"] if not any(it["url"] == r["url"] for r in close)]
             raise InfosysError(f"no symbol page titled {s!r}" + (f" in {library}" if library else "") +
-                               (f"; near: {[it['name'] for it in found['items']]}" if found["items"] else
+                               (f"; near: {near}" if near else
                                 (" in the complete index" if complete else "; " + self._not_indexed_hint())))
         if len(docs) > 1:
             # R23 (0.8.8 retest): MC_MoveAbsolute exists in Tc2_MC2 and Tc3_DriveMotionControl with different
@@ -2451,10 +2887,20 @@ class InfosysIndex:
         row = docs[0][0]
         decl = json.loads(row["decl"]) if row["decl"] else {"name": row["title"], "kind": row["kind"], "declaration": None}
         decl.update({"url": row["url"], "library": row["library"]})
-        with self._db() as con:
-            fam = page_family(con, row["url"], limit=0)
-        if fam.get("parent"):
-            decl["parent"] = fam["parent"]                # N126: a method's FB, from the contents (format 6)
+        if is_symbol_row(row):
+            # N170: documented in a section or table of a page — the page, the section, the FB of a method
+            decl["page_title"] = row["page_title"]
+            if row["owner"] and row["kind"] != "Constant":
+                decl["parent"] = {"title": row["owner"], "url": row["url"]}
+                decl.update(defined_in(s, row["owner"]) or {})
+            if len(docs[0]) > 1:
+                decl["documented_on"] = [{"title": r["page_title"], "url": r["url"]} for r in docs[0]]
+        else:
+            with self._db() as con:
+                fam = page_family(con, row["url"], limit=0)
+            if fam.get("parent"):
+                decl["parent"] = fam["parent"]            # N126: a method's FB, from the contents (format 6)
+                decl.update(defined_in(s, fam["parent"]["title"]) or {})
         chosen = {r["rid"] for r in docs[0]}
         mine = (row["library"] or "").lower()
         others: dict[str, str] = {}
@@ -2464,7 +2910,7 @@ class InfosysIndex:
                     others.setdefault(r["library"].lower(), r["library"])
         if others:
             decl["also_in"] = sorted(others.values())     # the other libraries with a symbol of this name
-        copies = [r["book"] for r in docs[0][1:]]
+        copies = [r["book"] for r in docs[0][1:] if r["book"] != row["book"] or not is_symbol_row(r)]
         if copies:
             decl["same_page_in"] = list(dict.fromkeys(copies))   # the same document in other books (N100)
         if self.local is not None:
@@ -2474,6 +2920,23 @@ class InfosysIndex:
                 decl["doc_version"] = v["version"]
             decl.update(self._answer_meta())
         return decl
+
+    def _title_answer(self, name: str, group: list[Any]) -> dict[str, Any]:
+        """N170: the answer for a name no symbol page and no section documents, when one page has it as a word of its
+        title: that page, kind Page, match 'title', its outline."""
+        row = group[0]
+        out: dict[str, Any] = {"name": name, "kind": "Page", "match": "title", "title": row["title"], "url": row["url"],
+                               "library": row["library"], "declaration": None,
+                               "outline": [h for _lvl, h, _t in _md_sections(row["body"] or "")],
+                               "note": f"no page or section documents a symbol named {name}; this page has the name in "
+                                       "its title — infosys_get_page(<url>) for its text"}
+        if len(group) > 1:
+            out["same_page_in"] = list(dict.fromkeys(r["book"] for r in group[1:]))
+        if self.local is not None:
+            if row["version"]:
+                out["doc_version"] = row["version"]
+            out.update(self._answer_meta())
+        return out
 
     # -- ms-xhelp links (R26) ------------------------------------------------------
     # Help Viewer pages link to each other as ms-xhelp:///?Id=<Microsoft.Help.Id>. Every page's id goes into helpids

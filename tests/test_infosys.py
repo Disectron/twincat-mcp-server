@@ -660,7 +660,7 @@ def test_n126_an_fbs_methods_are_tied_to_it_through_the_contents(idx):
     'Call' of FB_WG_Weighing could not be told apart, and the FB's page linked only one of its methods. Format 6 stores
     each page's parent in the Help Viewer contents (Microsoft.Help.TOCParent): the FB lists its children, a method
     names its FB, and 'FB_WG_ComboFilter.Call' finds the Call below FB_WG_ComboFilter."""
-    assert inf.INDEXER_VERSION == 6
+    assert inf.INDEXER_VERSION >= 6                             # format 6 stores the parents (7 keeps them)
     W = "tf3685_tc3_weighing_library"
     _store_with(idx, f"{W}/15084337291", "FB_WG_ComboFilter", "<pre>FUNCTION_BLOCK FB_WG_ComboFilter\nVAR_INPUT\n"
                 "    stConfig : ST_WG_ComboFilter;\nEND_VAR</pre>", "beckhoff-combo")
@@ -943,3 +943,67 @@ def test_n99b_one_source_page_placed_twice_in_a_book_is_one_hit_and_code_tables_
     first = r["items"][0]
     assert first["url"].endswith("/tcplclib_tc2_system/374277003.html")          # the library's own book shown
     assert first["same_page_in"] == ["tf6500_tc3_iec60870_5_10x"], first          # its two placements: one book
+
+
+def _rows_table(head, *rows):
+    return ("<table><tr>" + "".join(f"<th>{h}</th>" for h in head) + "</tr>"
+            + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows) + "</table>")
+
+
+def store_eventlogger(store) -> None:
+    """FB_TcMessage EXTENDS FB_TcEventBase IMPLEMENTS I_TcMessage, as Tc3_EventLogger documents it: FB_TcMessage's
+    methods table says where each method is defined; 'Send' has a page below I_TcMessage only, 'RequestEventText'
+    below FB_TcEventBase only. FB_Derived (no methods table) extends FB_TcEventBase. A DALI FB whose TEXT mentions
+    TcMessage and Send."""
+    E = "tcplclib_tc3_eventlogger"
+    store(f"{E}/5003786635", "I_TcMessage", "<pre>INTERFACE I_TcMessage EXTENDS I_TcEventBase</pre><h2>Methods</h2>"
+          + _rows_table(("Name", "Description"), ("Send", "Sends a message")), "i-tcmessage")
+    store(f"{E}/5051076107", "Send", "<pre>METHOD Send : HRESULT\nVAR_INPUT\n    nTimeStamp : ULINT;\nEND_VAR</pre>",
+          "i-tcmessage-send", "i-tcmessage")
+    store(f"{E}/5002595467", "FB_TcEventBase", "<pre>FUNCTION_BLOCK FB_TcEventBase\nVAR_INPUT\n    bX : BOOL;\n"
+          "END_VAR</pre>" + _rows_table(("Name", "Definition location", "Description"),
+                                        ("RequestEventText()", "Local", "Returns the text for the event.")),
+          "fb-tceventbase")
+    store(f"{E}/5002603531", "RequestEventText", "<pre>METHOD RequestEventText : BOOL\nVAR_INPUT\n    nLangId : DINT;\n"
+          "END_VAR</pre>", "fb-tceventbase-ret", "fb-tceventbase")
+    store(f"{E}/5003041163", "FB_TcMessage", "<pre>FUNCTION_BLOCK FB_TcMessage EXTENDS FB_TcEventBase IMPLEMENTS "
+          "I_TcMessage\nVAR_INPUT\n    bY : BOOL;\nEND_VAR</pre>"
+          + _rows_table(("Name", "Definition location", "Description"),
+                        ("RequestEventText()", "Inherited from FB_TcEventBase", "Returns the text for the event."),
+                        ("Create()", "Local", "Creates a message instance in the EventLogger."),
+                        ("Send()", "I_TcMessage", "Sends a message.")), "fb-tcmessage")
+    store(f"{E}/5003041199", "FB_Derived", "<pre>FUNCTION_BLOCK FB_Derived EXTENDS FB_TcEventBase\nVAR_INPUT\n"
+          "    bZ : BOOL;\nEND_VAR</pre>", "fb-derived")
+    store("tcplclib_tc3_dali/10368229515", "FB_DALI_Osram_Coupler_HF_G2", "<pre>FUNCTION_BLOCK FB_DALI_Osram_Coupler_HF_G2"
+          "\nVAR_INPUT\n    bStart : BOOL;\nEND_VAR</pre><p>Sends a TcMessage when the coupler reports an error; Send is "
+          "called once.</p>", "dali-coupler")
+
+
+def test_n158_n159_a_member_defined_elsewhere_and_what_is_near(idx):
+    """N158 (0.8.14 retest): FB_TcMessage.Send → not found, though FB_TcMessage lists Send with definition location
+    I_TcMessage and I_TcMessage.Send resolves. A member the owner does not document itself is looked up where the
+    owner's page says it is defined, then up EXTENDS and IMPLEMENTS — and the answer says whose it is. N159: the near
+    list for FB_TcMessage.Send was eight DALI FBs: the title filter of the near search held only for its first word
+    (the others matched the page text). It offers the owner and the types the member comes from."""
+    store_eventlogger(lambda ref, title, body, hid, parent=None: _store_with(idx, ref, title, body, hid, parent))
+    idx.resolve_help_links()
+    idx.sync_derived()
+    E = "https://infosys.beckhoff.com/content/1033/tcplclib_tc3_eventlogger/"
+    d = idx.declaration("FB_TcMessage.Send")
+    assert d["url"] == E + "5051076107.html" and d["parent"]["title"] == "I_TcMessage", d
+    assert (d["asked_as"], d["defined_in"]) == ("FB_TcMessage.Send", "I_TcMessage") and d["return_type"] == "HRESULT"
+    d = idx.declaration("FB_TcMessage.RequestEventText")          # 'Inherited from FB_TcEventBase'
+    assert d["url"] == E + "5002603531.html" and d["defined_in"] == "FB_TcEventBase", d
+    d = idx.declaration("FB_Derived.RequestEventText")            # no methods table: EXTENDS
+    assert d["url"] == E + "5002603531.html" and d["defined_in"] == "FB_TcEventBase", d
+    assert "defined_in" not in idx.declaration("I_TcMessage.Send")          # its own member: nothing to say
+    with pytest.raises(InfosysError, match="no symbol page") as e:
+        idx.declaration("FB_TcMessage.Create")                    # 'Local', and no page: not found
+    msg = str(e.value)
+    assert msg.index("FB_TcMessage (") < msg.index("FB_TcEventBase (") and "I_TcMessage (" in msg, msg
+    assert "DALI" not in msg, msg
+    with idx._db() as con:
+        near = [r["title"] for r in inf.near_symbols(con, "FB_TcMessage.Sendx")]
+        assert near[:3] == ["FB_TcMessage", "FB_TcEventBase", "I_TcMessage"] and "FB_DALI_Osram_Coupler_HF_G2" not in near, near
+        near = [r["title"] for r in inf.near_symbols(con, "TcMessage Send")]
+        assert "FB_DALI_Osram_Coupler_HF_G2" not in near, near        # the title, not the text

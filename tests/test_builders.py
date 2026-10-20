@@ -783,3 +783,45 @@ def test_esi_builder_update_stats_and_queries(tmp_path):
     assert p.returncode == 1 and "the nearest" in json.loads(p.stdout)["error"]
     p = run("esi_db.py", "update", "--kb", str(kb), "--no-esi-dirs", "--no-twincat")
     assert p.returncode == 0 and "indexed 2 device revisions" in p.stdout, p.stdout
+
+
+def test_n170_the_skill_and_the_cli_answer_symbols_documented_inside_a_page(kb, tmp_path):
+    """N170 (0.8.14 retest): `decl RecipeManCommands`, `decl CreateRecipe` (CLI and skill) → 'no page for symbol' — the
+    methods are sections of one page with tables and no code. Built by the builder the user runs, the skill and the
+    CLI answer them like infosys_declaration does (C1–C5), docs_page opens a method's section — that section alone,
+    not 'Method CreateRecipeNoSave' too — and the CLI prints the reconstructed declaration."""
+    from tests.test_infosys_local import RECIPE_PAGES, _tbl, _VARS
+    pages = dict(RECIPE_PAGES)
+    page = pages["tc3_plc_intro/1033/2525821323.html"]
+    extra = ("<h2>Method CreateRecipeNoSave</h2><p>Creates a recipe without saving it.</p><p><b>Inputs (VAR_INPUT)</b></p>"
+             + _tbl(_VARS, ("RecipeName", "STRING", "Name of the recipe")) + "<h2>Return values</h2>")
+    pages["tc3_plc_intro/1033/2525821323.html"] = page.replace("<h2>Return values</h2>", extra, 1)
+    p = build(kb, mshc(tmp_path / "BKINFOSYS3_VS_100_EN-US.2.mshc", pages))
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "symbols documented inside pages: 7 Constant, 1 FunctionBlock, 4 Method" in p.stdout + p.stderr, p.stdout
+    r = kbdocs(kb, "docs_declaration", "symbol=RecipeManCommands")
+    assert r["kind"] == "FunctionBlock" and r["ref"] == "tc3_plc_intro/2525821323", r
+    assert [m["name"] for m in r["methods"]] == ["CreateRecipe", "GetRecipeNames", "GetRecipeValues", "CreateRecipeNoSave"]
+    assert r["declaration_blocks"] == [] and "examples" in r["note"]             # the page's code is a sample
+    for q in ("RecipeManCommands.CreateRecipe", "CreateRecipe", "createRecipe"):
+        r = kbdocs(kb, "docs_declaration", f"symbol={q}")
+        assert (r["kind"], r["return_type"], r["section"]) == ("Method", "DWORD", "Method CreateRecipe"), (q, r)
+        assert [x["name"] for x in r["inputs"]] == ["RecipeDefinitionName", "RecipeName"]
+        assert r["parent"] == {"title": "RecipeManCommands", "ref": "tc3_plc_intro/2525821323"}
+        assert "section='Method CreateRecipe'" in r["note"]
+    r = kbdocs(kb, "docs_declaration", "symbol=ERR_RECIPE_NOT_FOUND")
+    assert (r["kind"], r["value"], r["type"], r["gvl"]) == ("Constant", "16#4003", "UDINT", "ReturnValues"), r
+    r = kbdocs(kb, "docs_declaration", "symbol=AlarmCommands")               # only a title has the name
+    assert (r["kind"], r["match"], r["ref"]) == ("Page", "title", "tc3_plc_intro/2525822000"), r
+    r = kbdocs(kb, "docs_page", "ref=CreateRecipe")
+    assert r["section"] == "Method CreateRecipe" and r["text"].startswith("## Method CreateRecipe\n"), r
+    assert "CreateRecipeNoSave" not in r["text"] and "Return value" in r["text"]
+    r = kbdocs(kb, "docs_page", "ref=tc3_plc_intro/2525821323", "section=Method CreateRecipe")
+    assert "CreateRecipeNoSave" not in r["text"]
+    r = kbdocs(kb, "docs_page", "ref=tc3_plc_intro/2525821323", "section=CreateRecipe")     # a part: every match
+    assert "CreateRecipeNoSave" in r["text"] and "## Method CreateRecipe\n" in r["text"]
+    p = run("infosys_local.py", "--kb", str(kb), "decl", "CreateRecipe")
+    assert p.returncode == 0 and "METHOD CreateRecipe : DWORD" in p.stdout and "RecipeName           : STRING;" in p.stdout, p.stdout
+    assert "Method — section 'Method CreateRecipe'" in p.stdout, p.stdout
+    p = run("infosys_local.py", "--kb", str(kb), "decl", "ERR_RECIPE_NOT_FOUND")
+    assert "ERR_RECIPE_NOT_FOUND : UDINT := 16#4003;" in p.stdout and "Value: 16#4003 (GVL ReturnValues)" in p.stdout, p.stdout
