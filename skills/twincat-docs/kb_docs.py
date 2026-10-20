@@ -38,7 +38,6 @@ if sys.version_info < MIN_PYTHON:   # before anything else, so an older Python g
              f"{sys.version.split()[0]} ({sys.executable}). Run it with a newer python.exe, e.g. "
              r"C:\Users\<you>\AppData\Local\Programs\Python\Python312\python.exe")
 
-import datetime as _dt  # noqa: E402 — after the version check on purpose
 import difflib
 import fnmatch
 import json

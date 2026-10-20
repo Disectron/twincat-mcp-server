@@ -998,3 +998,30 @@ def test_review_0815_hw_search_pages_when_one_title_has_hundreds_of_hits(esi_kb)
         off = r["next_offset"]
     assert r["total"] == 6 and len(got) == 6 and len(set(got)) == 6 and got[0] == "#x9999 Filler", got
     assert next(i for i in x.search("zzfill", kinds=["object"], limit=1)["items"])["variants"] == 400
+
+
+def test_rereview_0815_hw_search_reads_a_page_in_two_full_text_queries(esi_kb, monkeypatch):
+    """Re-review of 0.8.15: each title of a page cost two more full-text queries (its best row's snippet, its number
+    of hits) — 'Ch' at limit=100 went from 1.7 to 3.9 s on the user's index. A page is one query for the titles (best
+    row, hits, number of titles) and one for their snippets, whatever the limit; the answer is the same."""
+    import sqlite3
+    _build(esi_kb)
+    db = esi_kb[2]
+    con = sqlite3.connect(db)
+    oid = con.execute("SELECT id FROM obj LIMIT 1").fetchone()[0]
+    con.executemany("INSERT INTO search (kind, ref, title, body) VALUES ('object', ?, ?, ?)",
+                    [(str(oid), f"#x99{k:02d} Item {k}", "zzmany " * (k % 3 + 1)) for k in range(30)] * 2)
+    con.commit()
+    con.close()
+    seen: list[str] = []
+    real = E.connect_ro
+
+    def traced(path):
+        c = real(path)
+        c.set_trace_callback(lambda sql: seen.append(sql) if "MATCH" in sql.upper() else None)
+        return c
+    monkeypatch.setattr(E, "connect_ro", traced)
+    r = E.EsiIndex(db).search("zzmany", kinds=["object"], limit=20)
+    assert r["count"] == 20 and r["total"] == 30 and all(i["variants"] == 2 for i in r["items"]), r
+    assert all("snippet" in i for i in r["items"]), r["items"][:2]
+    assert len(seen) == 2, seen

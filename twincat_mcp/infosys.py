@@ -1729,12 +1729,20 @@ _SYNTAX_LABEL = re.compile(r"^[#*\t ]*Syntax\b([^:*\n]*)[*\t ]*:?[*\t ]*:?[\t ]*
 _LABEL_LINE = re.compile(r"^\s*(?:#{1,6}\s|\*\*[^*]+\*\*\s*:?\s*$)")
 
 
+_INTRO_LABEL = re.compile(r"^[*\s]*[A-Za-z][A-Za-z ,'\-/]*[*\s]*:[*\s]*$")     # 'Definition:', 'Declaration:'
+_SENTENCE_END = re.compile(r"[\w)\]]\.\s*$")
+
+
 def _syntax_parts(markdown: str) -> list[tuple[str, bool]]:
     """(text, is code) of what each 'Syntax' label of a page gives: the text on its line ('**Syntax:** `OUT := MAX(IN0,
     IN1, ...)`'), else the code blocks right below it, else the one line of text below it ('CAL <function block>
     (…)'); 'Syntax in the declaration:' / 'Syntax for the call:' are both read. Below the next label or heading nothing
     belongs to the syntax (review of 0.8.15: the first code block within 2000 characters was the sample under
-    'Example' / 'Samples' — CAL, SEL — and 'in the declaration:' was read as __VARINFO's syntax)."""
+    'Example' / 'Samples' — CAL, SEL — and 'in the declaration:' was read as __VARINFO's syntax).
+    A line that ends with ':' introduces what follows (re-review): 'Definition:' under 3708 Syntax headings (the
+    EventLogger's FB_TcAlarm …) was read as the syntax and the declaration below it was not; SEL's 'OUT := SEL(G, IN0,
+    IN1) means:' lost the two lines it introduces. A label of words alone gives nothing itself; what follows is read up
+    to the next label, heading, table, code block or sentence."""
     lines = (markdown or "").split("\n")
     out: list[tuple[str, bool]] = []
     i = 0
@@ -1744,24 +1752,43 @@ def _syntax_parts(markdown: str) -> list[tuple[str, bool]]:
         if not m:
             continue
         inline = m.group(2).strip().strip("*").strip().strip("`").strip()
-        if inline:
+        read = 0                                   # what this label gave so far
+        if inline and not _INTRO_LABEL.match(inline):
             out.append((inline, False))
-            continue
-        while i < len(lines) and not lines[i].strip():
+            read = 1
+        introduced = inline.endswith(":")          # a line that ends with ':' — what follows belongs to it
+        more = not inline or introduced
+        while more:
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            if i < len(lines) and lines[i].startswith("```"):
+                while i < len(lines) and lines[i].startswith("```"):          # the code blocks right below
+                    j = i + 1
+                    while j < len(lines) and not lines[j].startswith("```"):
+                        j += 1
+                    block = "\n".join(lines[i + 1:j]).strip()
+                    if block:
+                        out.append((block, True))
+                    i = j + 1
+                    while i < len(lines) and not lines[i].strip():
+                        i += 1
+                break
+            if (i >= len(lines) or _LABEL_LINE.match(lines[i]) or _SYNTAX_LABEL.match(lines[i])
+                    or lines[i].lstrip().startswith("|")):
+                break
+            t = lines[i].strip().strip("`").strip()
+            if _INTRO_LABEL.match(t):
+                if read:
+                    break                                  # 'Permitted data types:' — the next label
+                i += 1
+                continue                                   # 'Definition:' — what it introduces is the syntax
+            if read and _SENTENCE_END.search(t):
+                break                                      # prose about the syntax, not the syntax
+            out.append((t, False))                         # a line of text: the syntax as prose
+            read += 1
             i += 1
-        if i < len(lines) and lines[i].startswith("```"):
-            while i < len(lines) and lines[i].startswith("```"):          # the code blocks right below the label
-                j = i + 1
-                while j < len(lines) and not lines[j].startswith("```"):
-                    j += 1
-                block = "\n".join(lines[i + 1:j]).strip()
-                if block:
-                    out.append((block, True))
-                i = j + 1
-                while i < len(lines) and not lines[i].strip():
-                    i += 1
-        elif i < len(lines) and not _LABEL_LINE.match(lines[i]) and not _SYNTAX_LABEL.match(lines[i]):
-            out.append((lines[i].strip().strip("`").strip(), False))      # one line of text: the syntax as prose
+            introduced = introduced or t.endswith(":")
+            more = introduced
     return out
 
 
@@ -1796,8 +1823,10 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
     syntax_decl = None
     if not any((m := _HEAD_RE.search(c)) and m.group(1) not in ("TYPE", "VAR_GLOBAL")
                and _ident_matches(m.group(2) or "", decl["name"]) for _l, c in doc.code_blocks):
+        # a template's header ('FUNCTION_BLOCK FB_T[n]_DataSource', TE3500's generated code) names no symbol
         syntax_decl = next((c.strip() for c in syntax_code if (m := _HEAD_RE.search(c)) and m.group(2)
-                            and _KIND_OF.get(m.group(1)) == kind), None)
+                            and _KIND_OF.get(m.group(1)) == kind and not (m.group(3) or "").startswith(("[", "<"))),
+                           None)
     for _lang, code in doc.code_blocks:
         m = _HEAD_RE.search(code)
         if not m:

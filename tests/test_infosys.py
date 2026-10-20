@@ -1256,3 +1256,31 @@ def test_rereview_0815_library_picks_the_owner_and_its_base_class_may_be_in_anot
     for lib in (None, B):
         d = idx.declaration("FB_BA_Derived.Calc", library=lib)
         assert d["url"].endswith(f"{A}/3003.html") and d["defined_in"] == "FB_BA_Base2", (lib, d)
+
+
+def test_rereview_0815_a_line_ending_with_a_colon_introduces_the_syntax():
+    """Re-review of 0.8.15: SEL's syntax read 'OUT := SEL(G, IN0, IN1) means:' — the two lines it introduces were
+    lost. The same reader took 'Definition:' (under 3708 Syntax headings: the EventLogger, TF3520 …) as the syntax and
+    missed the declaration below it — 'SetInital' (Beckhoff's typo) declares METHOD SetInitial there. A line that
+    ends with ':' introduces what follows, up to the next label, heading, table, code block or sentence; a label of
+    words alone gives nothing itself. A template's header (FB_T[n]_DataSource) names no symbol."""
+    from twincat_mcp.infosys import _syntax_parts
+
+    def kind(title, body):
+        return parse_declaration(title, _page(title, body))
+    sel = kind("SEL", "<p>The IEC operator is used for bitwise selection.</p><p><b>Syntax:</b></p>"
+                      "<p>OUT := SEL(G, IN0, IN1) means:</p><p>OUT := IN0; if G = FALSE</p><p>OUT := IN1; if G = TRUE</p>"
+                      "<p>Permitted data types:</p><p>G: BOOL</p><h2>Samples:</h2><pre>nVar1 := SEL(TRUE,3,4);</pre>")
+    assert sel["kind"] == "Operator", sel
+    assert sel["declaration"] == "OUT := SEL(G, IN0, IN1) means:\nOUT := IN0; if G = FALSE\nOUT := IN1; if G = TRUE", sel
+    si = kind("SetInital", "<p>This method sets the initial value.</p><h2>Syntax</h2><p>Definition:</p>"
+                           "<pre>METHOD SetInitial : BOOL\nVAR_INPUT\n    nCount : ULINT;\nEND_VAR</pre>")
+    assert (si["kind"], si["declared_as"], si["return_type"]) == ("Method", "SetInitial", "BOOL"), si
+    assert [x["name"] for x in si["inputs"]] == ["nCount"], si
+    tp = kind("FB_DataSource", "<p>The function block is generated for each data source.</p><h2>Syntax</h2>"
+                               "<p>Definition:</p><pre>FUNCTION_BLOCK FB_T[n]_DataSource IMPLEMENTS I_DataSource\n"
+                               "VAR_INPUT\n    bX : BOOL;\nEND_VAR</pre>")
+    assert tp["kind"] == "FunctionBlock" and "declared_as" not in tp, tp
+    prog = _page("Object Program", "<p><b>Syntax:</b></p><p>&lt;program&gt;(&lt;input variable&gt; := &lt;value&gt;):</p>"
+                                   "<p>If you add a program call via the input assistant, TwinCAT adds the parameters.</p>")
+    assert _syntax_parts(prog.markdown) == [("<program>(<input variable> := <value>):", False)]

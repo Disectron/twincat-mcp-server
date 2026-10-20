@@ -1901,9 +1901,12 @@ class EsiIndex:
             kinds = ",".join("?" * len(want))
             # N167 (0.8.14 retest; review of 0.8.15): one item per title at its best hit, cut in SQL — a window of
             # (offset + limit) * 8 rows held 3 titles of 33 for 'Device type' (hundreds of revisions share a title),
-            # and the next page said 'past the last hit'
-            group_sql = (f"SELECT kind, title, MIN(rank) AS r FROM search WHERE search MATCH ? AND kind IN ({kinds}) "
-                         "GROUP BY kind, title ORDER BY r, kind, title LIMIT ? OFFSET ?")
+            # and the next page said 'past the last hit'. Re-review: the title's best row (SQLite takes the bare rowid
+            # from the row of the MIN), its hits (variants) and the number of titles come from this one query — one
+            # more full-text query per title for its snippet and one for its count made limit=100 twice as slow
+            group_sql = (f"SELECT kind, title, MIN(rank) AS r, rowid AS best, COUNT(*) AS n, COUNT(*) OVER () AS titles "
+                         f"FROM search WHERE search MATCH ? AND kind IN ({kinds}) GROUP BY kind, title "
+                         "ORDER BY r, kind, title LIMIT ? OFFSET ?")
             try:
                 heads = con.execute(group_sql, [q, *want, int(limit), int(offset)]).fetchall()
                 how = "fts"
@@ -1912,12 +1915,14 @@ class EsiIndex:
                 heads = con.execute(group_sql, ['"' + q.replace('"', '""') + '"', *want, int(limit), int(offset)]).fetchall()
                 how = "phrase"
             expr = q if how == "fts" else '"' + q.replace('"', '""') + '"'
-            total = con.execute(f"SELECT COUNT(*) FROM (SELECT DISTINCT kind, title FROM search WHERE search MATCH ? "
-                                f"AND kind IN ({kinds}))", [expr, *want]).fetchone()[0]
-            best = ("SELECT kind, ref, title, snippet(search, 3, '[', ']', '…', 12) AS snip FROM search WHERE search "
-                    "MATCH ? AND kind = ? AND title = ? ORDER BY rank LIMIT 1")
-            page = [con.execute(best, (expr, h["kind"], h["title"])).fetchone() for h in heads]
-            page = [r for r in page if r is not None]
+            total = heads[0]["titles"] if heads else con.execute(
+                f"SELECT COUNT(*) FROM (SELECT DISTINCT kind, title FROM search WHERE search MATCH ? AND kind IN "
+                f"({kinds}))", [expr, *want]).fetchone()[0]
+            snips = {r["rowid"]: r for r in con.execute(
+                "SELECT rowid, kind, ref, title, snippet(search, 3, '[', ']', '…', 12) AS snip FROM search WHERE "
+                f"search MATCH ? AND rowid IN ({','.join('?' * len(heads))})", [expr, *(h["best"] for h in heads)])}
+            page = [snips[h["best"]] for h in heads if h["best"] in snips]
+            hits = {(h["kind"], h["title"]): h["n"] for h in heads}
             if not page and int(offset) and total:
                 raise EsiError(f"offset {offset} is past the last hit ({total} items) — offset=0 for the first ones")
             items: list[dict[str, Any]] = []
@@ -1944,11 +1949,9 @@ class EsiIndex:
                     it.update(module=m["type"], ident=_hx(m["ident"], 8))
                 items.append(it)
             # variants: every hit with that title, counted over the whole index (not only the rows read)
-            for (kind, title), it in groups.items():
-                n = con.execute("SELECT COUNT(*) FROM search WHERE search MATCH ? AND kind = ? AND title = ?",
-                                (expr, kind, title)).fetchone()[0]
-                if n > 1:
-                    it["variants"] = n
+            for key, it in groups.items():
+                if hits.get(key, 0) > 1:
+                    it["variants"] = hits[key]
         nxt = int(offset) + len(items) if int(offset) + len(items) < total else None
         out: dict[str, Any] = {"query": q, "kinds": want, "count": len(items), "total": total, "offset": int(offset),
                                "next_offset": nxt, "truncated": nxt is not None, "items": items}
