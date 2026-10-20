@@ -799,6 +799,16 @@ def test_s4_0814_a_shared_file_is_walked_with_the_types_of_its_plc_project(tmp_p
         assert r["resolved"] and r["hops"][-1]["declared_in"] == "ST_Data", (port, r)
         assert Path(r["hops"][-1]["file"]).parts[-3] == ("Plc1" if port == 851 else "Plc2")
     assert not p.resolve_symbol("GVL_Common.stData.bTwo", 851)["resolved"]
+    # re-review: the shared file with other types in each PLC project is not judged as one (proj_vs_runtime) …
+    v = p.variables()
+    assert "GVL_Common" in v["ambiguous_roots"] and "other types in each" in v["note"], v.get("note")
+    # … and one that is the same in each is listed once, with both PLC projects (rec_scan counted it twice)
+    (tmp_path / "Plc2" / "DUTs" / "ST_Data.TcDUT").write_text((tmp_path / "Plc1" / "DUTs" / "ST_Data.TcDUT").read_text())
+    p = idx(tmp_path)
+    v = p.variables("GVL_Common")
+    assert [(i["path"], [Path(x).stem for x in i["plc_projects"]]) for i in v["items"]] == [
+        ("GVL_Common.stData.nOne", ["Plc1", "Plc2"])], v["items"]
+    assert "note" not in v and "plc_project" not in v["items"][0]
 
 
 def test_review_0815_n141_with_three_plc_projects(tmp_path):

@@ -1208,17 +1208,19 @@ class ProjectIndex:
         # shared file was labelled with both and walked with the first one's types)
         multi = len(self.plcproj) > 1 and not isinstance(self, PlcView)
         if not multi:
-            pairs: list[tuple[CodeUnit, str | None]] = [(r, None) for r in roots]
+            plan: list[tuple[CodeUnit, list[str | None]]] = [(r, [None]) for r in roots]
         elif len(walked) == 1:
-            pairs = [(r, walked[0]) for r in roots]
+            plan = [(r, [walked[0]]) for r in roots]
         else:
-            pairs = [(r, plc) for r in roots for plc in self.plcs_of_file(r.file)]
+            plan = [(r, self.plcs_of_file(r.file)) for r in roots]
         ix: list[ProjectIndex] = [self]
+        sink: list[list[dict[str, Any]]] = [items]
+        differ: list[str] = []
 
         def walk(path: str, u: CodeUnit, depth: int, seen: tuple[str, ...], inherited: dict[str, str] | None = None) -> None:
             nonlocal truncated
             for v in u.vars:
-                if len(items) >= max_items:
+                if len(items) + (len(sink[0]) if sink[0] is not items else 0) >= max_items:
                     truncated = True
                     return
                 if v.section == "VAR_TEMP" and not include_temp:
@@ -1226,19 +1228,33 @@ class ProjectIndex:
                 if v.section == "VAR_EXTERNAL":
                     continue
                 attrs = {**(inherited or {}), **v.attrs}   # an instance's pragma applies to its whole subtree
-                ix[0]._emit(f"{path}.{v.name}", v.type, u, v, depth, seen, items, max_array, walk, attrs)
+                ix[0]._emit(f"{path}.{v.name}", v.type, u, v, depth, seen, sink[0], max_array, walk, attrs)
             for e in u.extends:
                 eu = ix[0]._view(u).get(e.lower())
                 if eu and eu.name.lower() not in seen:
                     walk(path, eu, depth, seen + (eu.name.lower(),), inherited)
 
-        for r, plc in pairs:
-            ix[0] = self.walk_view(plc) if multi else self
-            first = len(items)
-            walk(r.name, r, 0, (r.name.lower(),), dict(r.attrs) if hasattr(r, "attrs") else None)
-            if multi and len(walked) != 1:
-                for it in items[first:]:
-                    it["plc_project"] = plc
+        tag = multi and len(walked) != 1
+        for r, plcs in plan:
+            got: list[list[dict[str, Any]]] = []
+            for plc in plcs:
+                ix[0] = self.walk_view(plc) if multi else self
+                sink[0] = [] if tag else items
+                walk(r.name, r, 0, (r.name.lower(),), dict(r.attrs) if hasattr(r, "attrs") else None)
+                got.append(sink[0])
+            sink[0] = items
+            if not tag:
+                continue
+            if len(got) > 1 and all([(i["path"], i["type"]) for i in g] == [(i["path"], i["type"]) for i in got[0]]
+                                    for g in got[1:]):
+                # one file several PLC projects compile, the same in each: listed once (review: rec_scan counted
+                # it twice), named with all of them
+                items.extend({**i, "plc_projects": list(plcs)} for i in got[0])
+                continue
+            if len(got) > 1:
+                differ.append(r.name)          # the same file, other types in each: per PLC project, not judged as one
+            for plc, g in zip(plcs, got):
+                items.extend({**i, "plc_project": plc} for i in g)
         kinds: dict[str, int] = {}
         for it in items:
             kinds[it["type"]] = kinds.get(it["type"], 0) + 1
@@ -1249,8 +1265,17 @@ class ProjectIndex:
             if len(walked) == 1:
                 out["plc_project"] = walked[0]
             else:
-                out["plc_projects"] = list(dict.fromkeys(plc for _r, plc in pairs)) or [pp["file"] for pp in self.plcproj]
-                out["note_plc_projects"] = "each item names the PLC project it was walked in (plc_project)"
+                out["plc_projects"] = (list(dict.fromkeys(plc for _r, plcs in plan for plc in plcs))
+                                       or [pp["file"] for pp in self.plcproj])
+                out["note_plc_projects"] = ("each item names the PLC project it was walked in (plc_project), or all of "
+                                            "them (plc_projects: one file they compile, the same in each)")
+        if differ:
+            # review: a file two PLC projects compile, with other types in each — its paths depend on the PLC project
+            # the runtime is; not judged against one runtime (proj_vs_runtime), like a name declared twice
+            note = ((note + "; ") if note else "") + (
+                f"{differ} are files several PLC projects compile, with other types in each: listed per PLC project "
+                "(plc_project) — name the ADS port (AmsPort in the .tsproj) or pin '<PLC project>@<name>'")
+            twice = sorted(set(twice) | set(differ))
         if note:
             out["note"] = note
             out["ambiguous_roots"] = twice

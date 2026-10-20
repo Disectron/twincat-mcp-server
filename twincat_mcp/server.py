@@ -3154,9 +3154,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             from .recorder import path_selected, selection_regex
             rx = selection_regex(pattern) if pattern else None
             pv = await app.proj_call(app.proj.variables, prefix, 64, max_items * 4, False, port=app.ads.port)
-            leaves = [{"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")}
-                      for it in pv["items"] if "[*]" not in it["path"]
-                      and (rx is None or path_selected(rx, it["path"]))][:max_items]
+            seen_paths: set[str] = set()
+            leaves = []
+            for it in pv["items"]:
+                # a path listed for two PLC projects (port not mapped) is one leaf to record (review of S4)
+                if "[*]" in it["path"] or it["path"].lower() in seen_paths or (rx is not None and not path_selected(rx, it["path"])):
+                    continue
+                seen_paths.add(it["path"].lower())
+                leaves.append({"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")})
+            leaves = leaves[:max_items]
             src_note = pv.get("note")
         else:
             raise ToolError("source must be runtime | project")
