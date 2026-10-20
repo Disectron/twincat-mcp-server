@@ -426,7 +426,9 @@ class Ctx:
 # ---------------------------------------------------------------------------------------------- shared helpers
 _WS = re.compile(r"\s+")
 _MSXHELP = re.compile(r"ms-xhelp:/*\?id=([^&#\s]+)", re.I)
-_URL = re.compile(r"/content/\d+/([^/]+)/(\d+)\.html?", re.I)
+# an Infosys page URL: /content/<lcid>/<book>/<page id>.htm[l] — the page id is the page's file name ('30866571',
+# 'index', '6778772363_30967009'), as twincat_mcp.infosys.book_of reads it
+_URL = re.compile(r"/content/\d+/([^/?#\s]+)/([^/?#.\s]+)\.html?", re.I)
 _HEAD = re.compile(r"(?m)^(#{1,4}) (.*)$")
 _TYPES = (r"(?:BOOL|BYTE|[DL]?WORD|U?[SDL]?INT|L?REAL|L?TIME|DATE|TOD|DT|W?STRING|PVOID|AXIS_REF|REFERENCE|POINTER|"
           r"T_[A-Za-z]|ST_[A-Za-z]|E_[A-Za-z]|MC_[A-Za-z]|I_[A-Za-z])")
@@ -690,9 +692,30 @@ def _parsed_declaration(r: sqlite3.Row) -> dict[str, Any]:
         out["return_type"] = d.get("return_type")
         if out["return_type"] is None:
             out["return_type_note"] = "the page names no return type (no header, no return-value table) — not known"
-    for k in ("kind_note", "extends", "implements", "declaration"):
+    # N103b narrowed (0.8.13 retest): only kind / return type / extends / implements / declaration were passed — the
+    # members (inputs, outputs, methods, enum values …) the index stores, and infosys_declaration gives, were not
+    for k in ("kind_note", "extends", "implements", "declaration", "inputs", "outputs", "in_out", "members",
+              "enum_values", "methods", "properties", "description"):
         if d.get(k):
             out[k] = d[k]
+    return out
+
+
+def _family(con: sqlite3.Connection, r: sqlite3.Row) -> dict[str, Any]:
+    """N126: the page's parent and child pages in the Help Viewer contents (Infosys format 6), as refs docs_page
+    opens — an FB's page lists its method and property pages, a method page names its FB."""
+    fam = INF.page_family(con, r["url"])
+
+    def ref(u: str) -> str:
+        b = INF.book_of(u)
+        return f"{b[0]}/{b[1]}" if b else u
+    out: dict[str, Any] = {}
+    if fam.get("parent"):
+        out["parent"] = {"title": fam["parent"]["title"], "ref": ref(fam["parent"]["url"])}
+    if fam.get("children"):
+        out["children"] = [{"title": c["title"], "ref": ref(c["url"]), "kind": c["kind"]} for c in fam["children"]]
+        if fam.get("children_count"):
+            out["children_count"] = fam["children_count"]
     return out
 
 
@@ -712,6 +735,9 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = _page_head(ctx, r)
     out.update({"resolved_by": how, **_parsed_declaration(r), "intro": _intro(body), "declaration_blocks": shown,
                 "requirements": req.group(1).strip() if req else None, "also_in": _also_in(con, r)})
+    fam = _family(con, r)
+    if fam.get("parent"):
+        out["parent"] = fam["parent"]
     lk = _links(con, body)
     if lk:
         out["links"] = lk
@@ -757,6 +783,7 @@ def cmd_docs_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     also = _also_in(con, r)
     if also:
         out["also_in"] = also
+    out.update(_family(con, r))
     out["source"] = ctx.source("infosys")
     return out
 

@@ -2382,6 +2382,7 @@ class Recorder:
     # set by the server from the project index: (name of a program, ADS port it is read from) → the tasks that run it
     # ([] = no program, e.g. a GVL; None = the project cannot tell). N62; N114: the port picks the PLC project.
     task_of: Callable[[str, int | None], list[dict[str, Any]] | None] | None = None
+    task_reason: Callable[[str, int | None], str | None] | None = None
 
     def _task_check(self, rec: Any, syms: list[SymbolEntry], cycle_ms: float) -> dict[str, Any]:
         man = (getattr(rec, "meta", None) or {}).get("manifest") or {}
@@ -2418,8 +2419,14 @@ class Recorder:
                     continue
             if fastest is None:
                 continue
+            other = None
+            if owners is None and getattr(self, "task_reason", None) is not None:
+                try:
+                    other = self.task_reason(r, port if isinstance(port, int) else None)
+                except Exception:  # noqa: BLE001
+                    other = None
             why = ("a GVL / no program: written by any task — compared with the fastest task" if owners == [] else
-                   "the project's task configuration is not available — compared with the fastest task")
+                   other or "the project's task configuration is not available — compared with the fastest task")
             checked[r] = {"task": None, "cycle_ms": fastest, "basis": why}
             if cycle_ms < fastest - 1e-9:
                 below.append({"what": f"{r} (no single task)", "cycle_ms": fastest, "basis": why})

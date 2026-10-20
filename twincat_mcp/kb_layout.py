@@ -149,7 +149,8 @@ edit; outside index\\ the plugin writes only the builder stubs in tools\\ (a cop
 Each index records its format version and the stamp of its source. When a plugin update changes a format, or the
 source changes (a new Help Viewer package, new PDFs, new ESI files), the index is reported as needing a rebuild and
 stays in use as it is until you approve the rebuild. A rebuild writes a new file beside the old one (.building) and
-swaps it in only when it is complete; knowledge.db changes in one transaction. (knowledge.db of 0.8.11 and before also
+swaps it in only when it is complete; knowledge.db changes in one transaction per folder, one change at a time
+(knowledge.db.lock). (knowledge.db of 0.8.11 and before also
 holds an ESI table: no longer read — esi.db replaced it.) Apart from an index replaced by its
 complete rebuild, the plugin never deletes a file here or anywhere in the knowledge folder; files it no longer reads
 are listed by kb_status for you to delete.

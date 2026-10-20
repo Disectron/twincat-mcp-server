@@ -127,16 +127,27 @@ async def test_n117_rec_stop_exports_the_csv_from_the_saved_svdx(monkeypatch, pr
     async with client_for(srv) as s:
         r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
-        assert fake_xae.calls == ["start", "stop", "save"]                      # no ExportCSV in XAE
+        assert fake_xae.calls == ["start", "stop", "save", "csv"]               # ExportCSV only as the cross-check
         sc = out["scope"]
         assert sc["export_csv"]["via"] == "TC3ScopeExportTool.exe from the saved .svdx" and sc["export_csv"]["lines"] == 5
         assert Path(sc["export_csv"]["path"]).name == f"{r['id']}.scope.csv"
+        # N117 (0.8.13 retest): the CSV of the saved .svdx and XAE's in-memory ExportCSV, compared every time
+        cc = sc["cross_check"]
+        assert (cc["svdx_export_lines"], cc["xae_export_lines"], cc["differ_by"]) == (5, 3, -2)
+        assert "2 line(s) more than XAE's ExportCSV" in cc["warning"] and Path(cc["xae_export"]).name == f"{r['id']}.scope.xae.csv"
+        link = json.loads(Path(sc["link"]["file"]).read_text(encoding="utf-8"))
+        assert f"{r['id']}.scope.xae.csv" in link["files"] and is_read_only(Path(cc["xae_export"]))
         assert [e.endswith("Ads-Error 0xA2 (162)") for e in sc["scope_view_log"]["errors"]] == [True]   # not the old one
         # without the tool: XAE's ExportCSV, flagged
         cfg.scope.export_tool = str(tmp_path / "missing.exe")
         sv = payload(await s.call_tool("scope_record", {"action": "save"}))
         assert sv["export_csv"]["via"] == "XAE ExportCSV" and "N117" in sv["export_csv"]["check"]
         assert "not found" in sv["export_csv"]["export_tool"] and fake_xae.calls[-2:] == ["save", "csv"]
+        # scope audit (0.8.13): the fallback never writes over an existing CSV, and an unchanged file is not 'written'
+        monkeypatch.setattr("twincat_mcp.server.time.strftime", lambda fmt, *a: "20261020-120000")
+        payload(await s.call_tool("scope_record", {"action": "save"}))
+        sv = payload(await s.call_tool("scope_record", {"action": "save"}))         # the same names again
+        assert "exists — XAE's ExportCSV was not run over it" in sv["export_csv"]["error"]
 
 
 @pytest.mark.anyio
@@ -194,3 +205,51 @@ def test_r11_retest_start_record_returning_1_is_not_a_warning(monkeypatch, fake_
     out = xb.scope_action("stop")
     assert "an error code" in out["warning"] and "0x80004005" in out["warning"]
     assert "result_note" not in xb.scope_action("save_svd", path=str(tmp_path / "r11.svdx"))
+
+
+def test_review_0813_an_unchanged_file_is_not_written(monkeypatch, fake_xae, tmp_path):
+    """Scope audit (0.8.13 retest): 'written' was 'is a file and not empty' — a CSV left from before counted as the
+    one ExportCSV wrote, although ExportCSV wrote nothing."""
+    from twincat_mcp.config import XaeConfig
+    xb = X.XaeBackend(XaeConfig())
+    old = tmp_path / "old.csv"
+    old.write_text("Name;x\n0;1\n", encoding="utf-8")
+    monkeypatch.setattr(fake_xae, "ExportCSV", lambda path: 0)                 # returns, writes nothing
+    with pytest.raises(X.XaeError, match="the file that was there is unchanged"):
+        xb.scope_action("export_csv", path=str(old))
+    with pytest.raises(X.XaeError, match="no file was written"):
+        xb.scope_action("export_csv", path=str(tmp_path / "new.csv"))
+
+
+@pytest.mark.anyio
+async def test_review_0814_a_svdx_still_being_written_is_not_sealed(monkeypatch, project_dir, fake_xae):
+    """Review of 0.8.14: when the saved .svdx still grew, the export was skipped but _scope_link hashed the partial
+    file into the signed link and set it read-only; the message suggested scope_export(svd_path=…) — the parameter is
+    svd."""
+    import threading
+    import time as _t
+    from twincat_mcp import server as SV
+    monkeypatch.setattr(SV, "SCOPE_SETTLE_S", (0.2, 0.6))
+
+    def save_growing(path):
+        fake_xae.calls.append("save")
+        Path(path).write_bytes(b"SVDX")
+
+        def grow():
+            for _ in range(20):
+                _t.sleep(0.1)
+                with open(path, "ab") as fh:
+                    fh.write(b"more")
+        threading.Thread(target=grow, daemon=True).start()
+        return 0
+    monkeypatch.setattr(fake_xae, "SaveSVD", save_growing)
+    install(monkeypatch)
+    async with client_for(build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        sc = payload(await s.call_tool("rec_stop", {"id": r["id"]}))["scope"]
+        svdx = Path(sc["save_svd"]["path"])
+        assert "scope_export(svd=" in sc["export_csv"]["skipped"] and "svd_path" not in sc["export_csv"]["skipped"]
+        link = json.loads(Path(sc["link"]["file"]).read_text(encoding="utf-8"))
+        assert svdx.name not in link["files"] and link["not_sealed"]["file"] == svdx.name, link
+        assert not is_read_only(svdx)
+    _t.sleep(2.2)                                    # let the writer thread finish before tmp_path goes

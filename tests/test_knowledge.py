@@ -585,7 +585,8 @@ def test_review_known_errors_and_kb_search_edge_cases(kb, project_dir, tmp_path)
     k.set_location(str(tmp / "kbdata"))
     k.add_project(str(project_dir), "sample")
     r = k.search("Valve license")
-    assert r["known_error"] and r["hits"] and r["hits"][0]["unit"].startswith("FB_Valve"), r
+    # N130 (0.8.13 retest): searched — and no licence note: words of the code are no error message
+    assert "known_error" not in r and r["hits"] and r["hits"][0]["unit"].startswith("FB_Valve"), r
     assert isinstance(k.search("WHILE")["hits"], list)                   # searched as written, not refused
     # every word common in a big project: the least common one still picks units (the tier was empty)
     big = tmp_path / "big" / "POUs"
@@ -755,3 +756,293 @@ def test_review_0812_phrases_only_and_code_hits_beyond_the_window(kb, tmp_path):
     assert {h["unit"] for h in r["hits"][:2]} == {"FB_Valve", "FB_Both"}, r      # name / identifier bResetValve
     assert r["hits"][0]["unit"] == "FB_Valve"                                   # the name names it
     assert all(h.get("match_in") == "comments" for h in r["hits"][2:]) and len(r["hits"]) == 5, r
+
+
+def test_n128_project_folders_that_are_not_projects_or_overlap_are_refused(kb, project_dir, tmp_path, monkeypatch):
+    """N128 (0.8.13 retest): kb_add_project took the plugin folder (its test fixture's MAIN then ranked above P15's
+    MAIN), the knowledge folder itself (0 units, no warning) and a child of an indexed folder (every unit twice)."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    plugin = Path(K.__file__).resolve().parents[1]
+    with pytest.raises(K.KnowledgeError, match="inside the plugin folder"):
+        k.add_project(str(plugin / "tests"))
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path / "around" / "plugin-data"))
+    (tmp_path / "around" / "plugin-data").mkdir(parents=True)
+    with pytest.raises(K.KnowledgeError, match="contains the plugin folder"):
+        k.add_project(str(tmp_path / "around"))
+    monkeypatch.delenv("CLAUDE_PLUGIN_DATA")
+    with pytest.raises(K.KnowledgeError, match="is the knowledge folder"):
+        k.add_project(str(tmp / "kbdata"))
+    with pytest.raises(K.KnowledgeError, match="inside the knowledge folder"):
+        k.add_project(str(tmp / "kbdata" / "index"))
+    k.add_project(str(project_dir), "p")
+    with pytest.raises(K.KnowledgeError, match=r"inside the indexed folder .*kb_reindex 'p'"):
+        k.add_project(str(project_dir / "Plc"))
+    with pytest.raises(K.KnowledgeError, match=r"inside the indexed folder"):         # review: '\\?\' spelling
+        k.add_project("\\\\?\\" + str(project_dir / "Plc"))
+    with pytest.raises(K.KnowledgeError, match="contains the indexed folder .*kb_remove_project"):
+        k.add_project(str(project_dir.parent))
+    assert [p["path"] for p in k.status()["projects"]] == [str(project_dir)]
+    assert k.add_project(str(project_dir) + "/")["note"].startswith(str(project_dir))      # same folder: re-indexed
+
+
+def test_n136_location_messages_long_paths_sync_names_drive_root_and_fallback(kb, tmp_path):
+    """N136 (0.8.13 retest): a file → 'not writable ([WinError 183])'; '\\\\?\\C:\\…' treated as UNC; 'D:\\Toolbox
+    Drive' refused as Box Drive (substring); a drive root accepted; use_fallback silently replaced a given path."""
+    k, tmp = kb
+    f = tmp / "a_file.txt"
+    f.write_text("x")
+    assert K.check_location(f) == ["it is a file, not a folder"]
+    assert K.check_location(f / "kb") == [f"{f} is a file, not a folder"]
+    assert K.strip_long_prefix("\\\\?\\C:\\TwinCAT-MCP\\knowledge") == "C:\\TwinCAT-MCP\\knowledge"
+    assert K.strip_long_prefix("\\\\?\\UNC\\srv\\share\\kb") == "\\\\srv\\share\\kb"
+    assert K.strip_long_prefix("D:\\kb") == "D:\\kb"
+    assert K.check_location(tmp / "Toolbox Drive" / "kb") == []
+    for synced in ("OneDrive - Contoso", "Dropbox (Personal)", "Google Drive", "iCloudDrive", "Box Sync"):
+        assert "it is inside a cloud-synced folder" in K.check_location(tmp / synced / "kb"), synced
+    assert any("drive root" in p for p in K.check_location(Path(tmp.anchor)))
+    with pytest.raises(K.KnowledgeError, match="either path=… or use_fallback=true, not both"):
+        k.set_location(str(tmp / "kbdata"), use_fallback=True)
+    assert k.location()[0] is None
+
+
+def test_agent_findings_registration_write_lock_and_reads_that_create_nothing(kb, project_dir, tmp_path, monkeypatch):
+    """Agent findings of the 0.8.13 retest (code): kb_add_project registered the folder before indexing it (a crash
+    left it with 0 units); knowledge.db had no lock — two adds of one new folder ended in an IntegrityError; kb_status
+    and kb_search (READ) created index\\ and the tables."""
+    k, tmp = kb
+    kbf = tmp_path / "kb_ro"
+    kbf.mkdir()
+    k2 = K.Knowledge(tmp_path / "home_ro", str(kbf))
+    st = k2.status()
+    assert st["projects"] == [] and "not created yet" in st["database_state"]
+    assert k2.search("FB_Valve")["projects_indexed"] == 0
+    assert not (kbf / "index" / "knowledge.db").exists()
+    with pytest.raises(K.KnowledgeError, match="not in the knowledge base"):
+        k2.remove_project(str(project_dir))
+    # review of 0.8.14: the empty stand-in of those reads must not be taken for the database — the first add then had
+    # no search table ('no such table: units_fts') and the folder stayed on the LIKE fallback
+    other = tmp_path / "other_proj"
+    import shutil as _sh
+    _sh.copytree(project_dir, other)
+    assert k2.add_project(str(other), "o")["reindexed"][0]["units"] >= 8
+    import sqlite3 as _sq
+    assert _sq.connect(kbf / "index" / "knowledge.db").execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'units_fts'").fetchone()
+    assert K.Knowledge(tmp_path / "home_ro", str(kbf)).search("Valve")["hits"][0]["unit"].startswith("FB_Valve")
+    # a knowledge folder in use at a drive root keeps working (only choosing one is refused)
+    assert not any("drive root" in x for x in K.check_location(Path(tmp_path.anchor), probe=False, space=False))
+    # a folder whose scan fails is not registered
+    k.set_location(str(tmp / "kbdata"))
+    from twincat_mcp import project_backend as PB
+
+    def broken(self, root=None):
+        raise RuntimeError("disk read error")
+    monkeypatch.setattr(PB.ProjectIndex, "scan", broken)
+    r = k.add_project(str(project_dir), "p")
+    assert r["reindexed"][0]["error"] == "disk read error" and r["reindexed"][0]["note"].startswith("not added"), r
+    assert k.status()["projects"] == []
+    monkeypatch.undo()
+    # one change at a time: a second writer is refused with what runs
+    from twincat_mcp import kb_lock
+    with kb_lock.IndexLock(tmp / "kbdata" / "index" / "knowledge.db.lock") as lk:
+        lk.update(phase="kb_reindex (every changed folder)")
+        for call in (lambda: k.add_project(str(project_dir)), lambda: k.reindex(), lambda: k.remove_project("p")):
+            with pytest.raises(K.KnowledgeError, match=r"another change of the knowledge base is running \(kb_reindex"):
+                call()
+        assert k.search("FB_Valve")["projects_indexed"] == 0               # reads are not blocked
+        with pytest.raises(K.KnowledgeError, match="still running"):       # nor is the location switched under it
+            k.set_location(str(tmp_path / "kb_elsewhere"))
+    assert k.add_project(str(project_dir), "p")["reindexed"][0]["units"] >= 8
+
+
+def test_n132_unreadable_files_are_named_utf16_read_and_no_text_cut(kb, project_dir, tmp_path):
+    """N132 (0.8.13 retest): parse errors were only counted (no file); a UTF-16 .TcPOU (valid XML) was a parse error,
+    cp1252 umlauts became U+FFFD; a source no PLC project compiles was skipped without a word; code after 20,000
+    characters and comments after 5,000 were not searchable."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    pous = project_dir / "Plc" / "POUs"
+    _pou(pous, "FB_Utf16", "FUNCTION_BLOCK FB_Utf16\nVAR\n    nDurchfluss : INT; // Durchfluß\nEND_VAR")
+    f16 = pous / "FB_Utf16.TcPOU"
+    f16.write_bytes(f16.read_text(encoding="utf-8").replace('encoding="utf-8"', 'encoding="utf-16"').encode("utf-16"))
+    _pou(pous, "FB_Ansi", "FUNCTION_BLOCK FB_Ansi\nVAR\n    nMenge : INT; // Größe\nEND_VAR")
+    fa = pous / "FB_Ansi.TcPOU"
+    fa.write_bytes(fa.read_text(encoding="utf-8").encode("cp1252"))          # claims UTF-8, holds cp1252 bytes
+    (pous / "FB_Broken.TcPOU").write_text("<?xml version='1.0'?><TcPlcObject><POU Name='FB_Broken'>", encoding="utf-8")
+    _pou(pous, "FB_Long", "FUNCTION_BLOCK FB_Long\nVAR\nEND_VAR", ";\n" * 15000 + "nZzqFinalWord := 1; // zzqlastcomment")
+    from tests.conftest import register_sources
+    register_sources(project_dir / "Plc" / "Plc.plcproj")
+    _pou(project_dir / "Plc" / "Backup", "FB_KbDup", "FUNCTION_BLOCK FB_KbDup\nVAR\nEND_VAR")   # not compiled
+    r = k.add_project(str(project_dir), "p")["reindexed"][0]
+    assert r["parse_errors"] == 1 and [e["file"] for e in r["parse_error_files"]] == [str(pous / "FB_Broken.TcPOU")]
+    assert list(r["read_notes"]) == [str(fa)] and "Windows-1252" in r["read_notes"][str(fa)], r
+    assert r["not_in_project"]["count"] == 1 and r["not_in_project"]["files"][0].endswith("FB_KbDup.TcPOU"), r
+    assert k.search("nDurchfluss")["hits"][0]["unit"] == "FB_Utf16"
+    assert "Größe" in k.search("nMenge")["hits"][0]["declaration"]
+    assert k.search("nZzqFinalWord")["hits"][0]["unit"] == "FB_Long"
+    assert k.search("zzqlastcomment")["hits"][0]["unit"] == "FB_Long"
+    pr = k.status()["projects"][0]
+    assert pr["parse_errors"] == 1 and pr["not_in_project_count"] == 1 and pr["problems"]["read_notes"], pr
+    # the project index reads it the same way; an edit keeps UTF-16 UTF-16 and refuses the mis-encoded file
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex, ProjectError
+    idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
+    sc = idx.scan()
+    assert sc["parse_errors"][0]["file"].endswith("FB_Broken.TcPOU") and str(fa) in sc["read_notes"]
+    idx.set_code("FB_Utf16", None, "nDurchfluss := 1; // ß")
+    assert f16.read_bytes()[:2] == b"\xff\xfe" and "nDurchfluss := 1; // ß" in f16.read_text(encoding="utf-16")
+    with pytest.raises(ProjectError, match="not valid UTF-8 .*not edited"):
+        idx.set_code("FB_Ansi", None, "nMenge := 1;")
+    # review of 0.8.14: proj_validate_xml reads and writes the files as the index does
+    from twincat_mcp import codecheck
+    v = codecheck.validate_xml(idx)
+    rules = {(Path(i["file"]).name, i["rule"]) for i in v["items"]}
+    assert ("FB_Utf16.TcPOU", "xml") not in rules and ("FB_Ansi.TcPOU", "encoding") in rules, v["items"]
+    # a UTF-8 file with a BOM and one bad byte stays UTF-8 (its good umlauts are kept); bytes alone decide otherwise
+    from twincat_mcp.project_backend import decode_source
+    t, enc, bom, note = decode_source(b"\xef\xbb\xbf<a>Gr\xc3\xb6\xc3\x9fe \x96</a>")
+    assert t == "<a>Größe \ufffd</a>" and enc == "utf-8" and "U+FFFD" in note
+    t, enc, bom, note = decode_source(b"<a>Gr\xc3\xb6\xc3\x9fe \x96</a>")
+    assert t.startswith("<a>Größe") and enc == "utf-8"
+    t, enc, bom, note = decode_source(b"<a>Gr\xf6\xdfe \x96</a>")
+    assert t == "<a>Größe –</a>" and enc == "cp1252" and "Windows-1252" in note
+    # re-review: one valid-looking pair ('ß“' = DF 93) does not make a Windows-1252 file UTF-8
+    t, enc, bom, note = decode_source("<a>Größe: „Maß“ – Öl</a>".encode("cp1252"))
+    assert t == "<a>Größe: „Maß“ – Öl</a>" and enc == "cp1252", t
+
+
+def test_n133_a_changed_renamed_or_deleted_folder_is_reported(kb, project_dir, tmp_path):
+    """N133 (0.8.13 retest): after editing / deleting files and renaming the folder kb_search answered from the old
+    units without a note; kb_status never looked at the folders; the change stamp ignored .tsproj / .xti."""
+    import os
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    k.add_project(str(project_dir), "p")
+    assert "stale" not in k.search("FB_Valve") and k.status()["projects"][0]["state"] == "current"
+    # review of 0.8.14: a folder indexed by 0.8.13 (its stamp of sources only) is not 'changed' after the update
+    import sqlite3 as _sq
+    db = _sq.connect(tmp / "kbdata" / "index" / "knowledge.db")
+    db.execute("UPDATE projects SET files=?", (K._legacy_tree_stamp(project_dir),))
+    db.commit()
+    assert k.status()["projects"][0]["state"] == "current" and "stale" not in k.search("FB_Valve")
+    (project_dir / "Plc" / "POUs" / "MAIN.TcPOU").write_text(
+        (project_dir / "Plc" / "POUs" / "MAIN.TcPOU").read_text() + "\n")
+    assert k.status()["projects"][0]["state"].startswith("files changed")
+    k.reindex("p")
+    ts = project_dir / "Machine.tsproj"
+    os.utime(ts, ns=(ts.stat().st_atime_ns, ts.stat().st_mtime_ns + 10**9))
+    st = k.status()["projects"][0]["state"]
+    assert st.startswith("files changed since it was indexed") and "kb_reindex" in st
+    r = k.search("FB_Valve")
+    assert r["hits"] and r["stale"][0]["project"] == str(project_dir) and r["stale"][0]["label"] == "p", r
+    assert k.reindex()["reindexed"][0]["units"] >= 8 and "stale" not in k.search("FB_Valve")
+    project_dir.rename(project_dir.with_name("renamed"))
+    r = k.search("FB_Valve")
+    assert r["hits"] and r["stale"][0]["state"].startswith("folder not found"), r
+    assert k.status()["projects"][0]["state"].startswith("folder not found")
+
+
+def test_n131_n134_n135_declaring_unit_first_kind_pou_and_query_handling(kb, tmp_path):
+    """N131: the declaring unit was not preferred (MAX_ALARMS → GVL_Param 6th of 7, nErrorCode → its struct last).
+    N134: kinds=['POU'] never matched a parsed unit. N135: 'OR' silently meant AND; 'alarm OR NEAR(state) -reset* ^x'
+    searched only 'x'; single letters were search words; '_' was 'no unit contains _'; a phrase in a string literal
+    was labelled match_in 'comments'."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "decl"
+    gvl = src / "GVL_Param.TcGVL"
+    src.mkdir(parents=True)
+    gvl.write_text('<?xml version="1.0" encoding="utf-8"?><TcPlcObject><GVL Name="GVL_Param"><Declaration><![CDATA['
+                   "VAR_GLOBAL CONSTANT\n    MAX_ALARMS : INT := 10;\nEND_VAR]]></Declaration></GVL></TcPlcObject>",
+                   encoding="utf-8")
+    for i in range(6):
+        _pou(src, f"FB_User{i}", f"FUNCTION_BLOCK FB_User{i}\nVAR\n    aList : ARRAY[1..GVL_Param.MAX_ALARMS] OF INT;\n"
+             "    stStatus : ST_ModuleStatus;\nEND_VAR",
+             "IF stStatus.nErrorCode > MAX_ALARMS THEN stStatus.nErrorCode := 0; END_IF")
+    (src / "ST_ModuleStatus.TcDUT").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><DUT Name="ST_ModuleStatus"><Declaration><![CDATA['
+        "TYPE ST_ModuleStatus :\nSTRUCT\n    bBusy : BOOL;\n    nErrorCode : DINT;\nEND_STRUCT\nEND_TYPE]]>"
+        "</Declaration></DUT></TcPlcObject>", encoding="utf-8")
+    _pou(src, "FB_Edge", "FUNCTION_BLOCK FB_Edge\nVAR\n    sMsg : STRING := 'rising edge seen';\nEND_VAR",
+         "bReset := bEnable;")
+    _pou(src, "FB_Edge2", "FUNCTION_BLOCK FB_Edge2\nVAR\nEND_VAR", "// on a rising edge\n;")
+    k.add_project(str(src), "decl")
+    r = k.search("MAX_ALARMS")
+    assert r["hits"][0]["unit"] == "GVL_Param" and r["hits"][0]["declares"], [h["unit"] for h in r["hits"]]
+    r = k.search("nErrorCode")
+    assert r["hits"][0]["unit"] == "ST_ModuleStatus" and r["hits"][0]["declares"], [h["unit"] for h in r["hits"]]
+    assert len(r["hits"]) == 7 and not any(h.get("declares") for h in r["hits"][1:]), r
+    # N134
+    assert {h["unit"] for h in k.search("nErrorCode", kinds=["POU"])["hits"]} == {f"FB_User{i}" for i in range(6)}
+    assert [h["unit"] for h in k.search("nErrorCode", kinds=["STRUCT"])["hits"]] == ["ST_ModuleStatus"]
+    # N135
+    r = k.search("bEnable OR bReset")
+    assert "not a search operator" in r["words_ignored"]["OR"] and "operators_note" in r, r
+    assert [h["unit"] for h in r["hits"]] == ["FB_Edge"], r
+    r = k.search("MAX_ALARMS OR NEAR(nErrorCode) -bBusy* ^x")
+    assert "single character" in r["words_ignored"]["x"] and "x" not in r.get("words_used", []), r
+    assert r["operators_note"].startswith("kb_search has no query operators"), r
+    with pytest.raises(K.KnowledgeError, match="no searchable word"):
+        k.search("_")
+    r = k.search('"rising edge"')
+    labels = {h["unit"]: h.get("match_in") for h in r["hits"]}
+    assert labels == {"FB_Edge": "string literals or comments", "FB_Edge2": "comments"}, r
+
+
+def test_n129_n130_error_messages_keep_their_names_and_known_errors_need_their_context(kb, tmp_path):
+    """N129 (0.8.13 retest): 'ADS error 1808 fbCounter' searched nothing ('fbCounter' was "error message text");
+    'nCycleCount 0x705' got the ADS 1797 note (any bare 0x700–0x7FF was ADS) and 0 hits. N130: 'License' got the
+    licence note; 'Ads-Error 0xA2' (no note) was searched as words — 'Error' listed 16 units; '0x6 port', 'not
+    permitted', 'timeout elapsed', 'logged in' in plain text matched; ADSERR_* names and unquoted identifiers were
+    not recognised; a bare C0046 was claimed as covered."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "err"
+    _pou(src, "PRG_Machine", "PROGRAM PRG_Machine\nVAR\n    fbCounter : FB_Counter;\n    nCycleCount : UDINT;\nEND_VAR",
+         "fbCounter(bEnable := TRUE);\nnCycleCount := nCycleCount + 1;\n// error handling below")
+    _pou(src, "FB_Counter", "FUNCTION_BLOCK FB_Counter\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR")
+    _pou(src, "FB_ErrorHandler", "FUNCTION_BLOCK FB_ErrorHandler\nVAR\n    nError : UDINT;\nEND_VAR")
+    k.add_project(str(src), "err")
+    r = k.search("ADS error 1808 fbCounter")
+    assert r["known_error"]["code"] == "ADS return code 0x710 (1808) ADSERR_DEVICE_SYMBOLNOTFOUND", r
+    assert [h["unit"] for h in r["hits"]] == ["PRG_Machine"], r
+    r = k.search("nCycleCount 0x705")
+    assert "known_error" not in r and r["hits"][0]["unit"] == "PRG_Machine", r
+    assert K.known_error("nCycleCount 0x705") is None
+    assert "known_error" not in k.search("License")
+    r = k.search("Ads-Error 0xA2")
+    assert r["known_error"] is None and r["hits"] == [] and "not searched" in r["note"], r
+    assert "1861" in r["known_errors_covered"], r
+    r = k.search("error handler")                                          # words of the code: searched as such
+    assert "known_error" not in r and r["hits"][0]["unit"] == "FB_ErrorHandler", r
+    for plain in ("0x6 port 3", "Operation not permitted", "timeout elapsed while waiting"):
+        assert K.known_error(plain) is None, plain
+    assert "known_error" not in k.search("logged in") and "known_error" not in k.search("timeout elapsed")
+    assert K.annotate("PermissionError: [Errno 1] Operation not permitted") == \
+        "PermissionError: [Errno 1] Operation not permitted"
+    # the code in every notation the local ADS return-code table gives — and pyads' text, in a message about ADS
+    for q in ("ADSERR_CLIENT_SYNCTIMEOUT", "0x98110745", "ADS-Error: 0x745", "ADSError 1861", "0x745", "error 1861",
+              "nErrId := 1861", "ADSError: timeout elapsed", "ADSError: Timeout elapsed (1861). "):
+        assert K.known_error(q)["code"].startswith("ADS return code 0x745 (1861)"), q
+        assert K.is_error_message(q) or q == "ADSError: timeout elapsed", q
+    # review of 0.8.14: pyads' own text is an error message for kb_search (it was searched as words)
+    r = k.search("ADSError: symbol not found (1808). ")
+    assert r["known_error"]["code"].endswith("ADSERR_DEVICE_SYMBOLNOTFOUND") and r["hits"] == [], r
+    # … and words of the code are not: identifiers beginning with ERR_ / err_, numbers, model numbers, sentences
+    for q in ("ERR_TIMEOUT", "err_count reset", "851", "16#FF", "C6015", "the unknown type of data", "1861"):
+        assert not K.is_error_message(q), q
+    # re-review of 0.8.14: pyads' text with parentheses of its own, 'error no. N', and ST's 16# numbers
+    assert K._ads_codes("ADSError: invalid parameter value(s) (1798). ") == [1798]
+    assert K.is_error_message("ADSError: invalid parameter value(s) (1798). ")
+    assert K.known_error("Error No.: 1808")["code"].endswith("ADSERR_DEVICE_SYMBOLNOTFOUND")
+    assert K._ads_codes("ADS: nErrId := 16#745") == [1861] and K._ads_codes("error 16#745 at offset 3") == [1861]
+    assert K.known_error("the unknown type of data") is None and K.known_error("identifier is not defined") is None
+    assert K.known_error("TIPC^Plc1^Plc1 Project is not logged in — start acts on the online session") is None
+    assert K.known_error("ADSError 1796: reading or writing not permitted")["code"].endswith("ADSERR_DEVICE_INVALIDACCESS")
+    assert K.known_error("Target port not found – ADS server is not started (ADS)")["code"].endswith("ERR_TARGETPORTNOTFOUND")
+    assert "'nFoo' is not declared" in K.known_error("identifier nFoo not defined")["cause"]
+    r = k.search("C0046: identifier fbCounter not defined")
+    assert r["known_error"] and r["hits"][0]["unit"] == "PRG_Machine", r
+    r = k.search("C0046")
+    assert r["known_error"] is None and "C-number alone is not documented locally" in r["known_errors_covered"], r

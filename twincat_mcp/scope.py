@@ -13,6 +13,7 @@ way rec_export does (R10).
 """
 from __future__ import annotations
 
+import codecs
 import datetime as dt
 import json
 import os
@@ -21,7 +22,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 TOOL_NAME = "TC3ScopeExportTool.exe"
 _FUNCTION_DIRS = ("TE130X-Scope-View", "TE130x-Scope-View", "TF3300-Scope-Server")
@@ -73,8 +74,11 @@ def status(configured: str | None = None) -> dict[str, Any]:
 # TE130x writes what goes wrong to TcScopeView.log (0.8.12 retest: "Server error on ordering data … insufficient Router
 # memory", Ads-Error 0xA2) — nothing of it reached a tool result. A call marks where the log ends when it begins and
 # reports the ERROR entries written after that mark.
-_LEVEL = re.compile(r"\[(ERROR|FATAL|WARN(?:ING)?|INFO|DEBUG|TRACE|VERBOSE)\]", re.I)
-_LOG_READ_MAX = 4 << 20
+# N119 (0.8.13 retest): TcScopeView.log pads its tags — '[ ERROR ]', '[ INFO  ]', '[WARNING]'. Without the spaces the
+# padded ERROR lines were never read, and one '[WARNING]' (a TwinCAT state change always writes one) turned the
+# fallback off: 2 real errors → error_count 0
+_LEVEL = re.compile(r"\[\s*(ERROR|FATAL|WARN(?:ING)?|INFO|DEBUG|TRACE|VERBOSE)\s*\]", re.I)
+_LOG_CHUNK = 4 << 20
 
 
 def view_log_path(configured: str | None = None) -> Path:
@@ -98,10 +102,42 @@ def log_mark(path: Path | None) -> dict[str, Any]:
         return {"path": str(path), "size": None, "error": str(exc)}
 
 
-def _decode(raw: bytes) -> str:
-    if raw.startswith(b"\xff\xfe") or (len(raw) > 3 and raw[1] == 0 and raw[3] == 0 and raw[0] != 0):
-        return raw.decode("utf-16-le", errors="replace").lstrip("\ufeff")
-    return raw.decode("utf-8", errors="replace").lstrip("\ufeff")
+def _log_encoding(path: Path) -> str:
+    """The log's encoding from its first bytes (the BOM / the UTF-16 zero bytes), not from a slice in its middle."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return "utf-8"
+    if head.startswith(b"\xff\xfe") or (len(head) == 4 and head[1] == 0 and head[3] == 0 and head[0] != 0):
+        return "utf-16-le"
+    return "utf-8"
+
+
+def _new_lines(path: Path, start: int, end: int) -> Iterator[str]:
+    """The lines of the log between byte offsets start and end, read in chunks (no size limit: errors in a long
+    window were dropped when only its last 4 MiB were read)."""
+    enc = _log_encoding(path)
+    if enc == "utf-16-le" and start % 2:
+        start += 1
+    dec = codecs.getincrementaldecoder(enc)(errors="replace")
+    rest = ""
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        left = end - start
+        while left > 0:
+            raw = fh.read(min(_LOG_CHUNK, left))
+            if not raw:
+                break
+            left -= len(raw)
+            text = rest + dec.decode(raw)
+            lines = text.splitlines(keepends=True)
+            rest = lines.pop() if lines and not lines[-1].endswith(("\n", "\r")) else ""
+            for ln in lines:
+                yield ln.lstrip("\ufeff").rstrip("\r\n")
+    tail = rest + dec.decode(b"", final=True)
+    if tail:
+        yield tail.lstrip("\ufeff")
 
 
 def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
@@ -125,36 +161,32 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
     if size < start:
         out["note"] = "the log is shorter than when the call began (rotated?) — read from its start"
         start = 0
-    if size - start > _LOG_READ_MAX:
-        out["note"] = f"{size - start} new bytes — only the last {_LOG_READ_MAX} read"
-        start = size - _LOG_READ_MAX
+    entries: list[list[str]] = []
+    said: list[str] = []                  # untagged lines that say error — used only when no line is tagged at all
+    cur: list[str] | None = None
+    tagged = False
     try:
-        with open(path, "rb") as fh:
-            fh.seek(start)
-            raw = fh.read(size - start)
+        for ln in _new_lines(path, start, size):
+            m = _LEVEL.search(ln)
+            if m:
+                tagged = True
+                cur = [ln.strip()] if m.group(1).upper() in ("ERROR", "FATAL") else None
+                if cur is not None:
+                    entries.append(cur)
+            elif cur is not None and ln.strip() and len(cur) < 6:
+                cur.append(ln.strip())
+            elif not tagged and re.search(r"error|fehler|exception|fatal", ln, re.I):
+                said.append(ln.strip())
     except OSError as exc:
         return {**out, "errors": [], "note": f"the Scope View log cannot be read: {exc}"}
-    entries: list[list[str]] = []
-    cur: list[str] | None = None
-    text = _decode(raw)
-    tagged = False
-    for ln in text.splitlines():
-        m = _LEVEL.search(ln)
-        if m:
-            tagged = True
-            cur = [ln.strip()] if m.group(1).upper() in ("ERROR", "FATAL") else None
-            if cur is not None:
-                entries.append(cur)
-        elif cur is not None and ln.strip() and len(cur) < 6:
-            cur.append(ln.strip())
-    if text.strip() and not tagged:
-        # the level tags this reads ([ERROR], [INFO] …) are not in the new text: the log's format is not the one
-        # expected — its lines that say 'error' are given, and that the format was not recognised
-        entries = [[ln.strip()] for ln in text.splitlines() if re.search(r"error|fehler|exception", ln, re.I)]
+    if not tagged and said:
+        # no level tag ([ ERROR ], [INFO] …) in the new lines at all: the log's format is not the one expected — its
+        # lines that say 'error' are given, and that the format was not recognised
+        entries = [[x] for x in said]
         out["note"] = ((out.get("note") + "; ") if out.get("note") else "") + (
             "no level tag ([ERROR], [INFO] …) in the new lines: the log's format was not recognised — the lines that "
             "say 'error' / 'exception' are listed")
-    out.update({"new_bytes": len(raw), "error_count": len(entries),
+    out.update({"new_bytes": size - start, "error_count": len(entries),
                 "errors": [" | ".join(e)[:800] for e in entries[-limit:]]})
     return out
 
@@ -177,13 +209,17 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
         raise ScopeError("target must be a .csv file (TDMS/DAT need a full Scope licence and are not offered here)")
     if out.exists() and not overwrite:
         raise ScopeError(f"{out} exists; pass overwrite=true or another target")
+    if out.exists() and is_read_only(out):
+        # a CSV rec_stop sealed (its SHA-256 is in the signed <id>.scope.json): replacing it would break the seal
+        raise ScopeError(f"{out} is sealed (read-only, written by rec_stop with the recording) — it is never replaced; "
+                         "export to another file name")
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
-        if out.exists():
-            make_writable(out)
-            out.unlink()
     except OSError as exc:
-        raise ScopeError(f"the target {out} cannot be written (open in another program?): {exc} — nothing was exported") from exc
+        raise ScopeError(f"the folder of {out} cannot be created: {exc} — nothing was exported") from exc
+    # the tool writes a work file beside the target; the target is replaced only by a complete CSV — overwrite=true
+    # deleted the old CSV before the tool ran, so a failed export lost it
+    work = out.with_name(f".{out.stem}.tcmcp-{os.getpid()}-{time.monotonic_ns()}.csv")
     try:
         ssha, ssize = file_sha256(src)
     except OSError as exc:
@@ -209,7 +245,7 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
             copy_note = {"copy": str(run_on), "sha256_identical": True,
                          "why": "the source is read-only (rec_stop seals its Scope files like the recording): exported "
                                 "from a byte-identical writable copy, deleted afterwards — the CSV's File line names the copy"}
-        cmd = [str(tool), f"svd={run_on}", f"target={out}", "silent"]
+        cmd = [str(tool), f"svd={run_on}", f"target={work}", "silent"]
         t0 = time.monotonic()
         try:
             r = subprocess.run(cmd, cwd=str(tool.parent), capture_output=True, text=True, errors="replace",
@@ -225,15 +261,29 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
                 copy_note = {**(copy_note or {}), "left_behind": str(tmp)}   # Windows still held a handle: said, not hidden
     elapsed = round(time.monotonic() - t0, 2)
     log = log_errors_since(mark) if view_log is not None else None
-    if not out.is_file() or out.stat().st_size == 0:
+    if not work.is_file() or work.stat().st_size == 0:
         said = (r.stderr or r.stdout or "").strip()
+        try:
+            work.unlink()
+        except OSError:
+            pass
+        left = (copy_note or {}).get("left_behind")
         raise ScopeError(f"{TOOL_NAME} exited with code {r.returncode} after {elapsed} s and wrote no CSV"
                          + (f"; its output: {said[:400]}" if said else "; it printed nothing")
                          + f"; source {src.name}: {ssize} bytes, "
                          + ("read-only — run on a writable copy" if read_only else "writable")
+                         + (f"; the copy's folder {left} could not be removed (delete it)" if left else "")
                          + (f"; Scope View log, new errors: {log['errors']}" if log and log.get("errors") else
                             f"; Scope View log: no new error ({log.get('note') or log.get('log')})" if log else "")
+                         + (f"; {out.name} is unchanged" if out.exists() else "")
                          + " — open the file in XAE's Scope View to see whether Beckhoff can read it.")
+    try:
+        if out.exists():
+            make_writable(out)
+        os.replace(work, out)
+    except OSError as exc:
+        raise ScopeError(f"{TOOL_NAME} wrote {work.name}, but it could not replace {out} (open in another program?): "
+                         f"{exc} — the new CSV is {work}") from exc
     try:
         with open(out, "r", encoding="utf-8-sig", errors="replace") as fh:
             head = [fh.readline().rstrip("\r\n") for _ in range(3)]
@@ -245,6 +295,7 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
     prov: dict[str, Any] = {"_provenance": 1, "kind": "scope_export", "export_file": out.name, "export_sha256": esha,
                             "export_bytes": esize, "source_file": str(src), "source_sha256": ssha, "source_bytes": ssize,
                             "tool": str(tool), "tool_sha256": tsha, "command": cmd, "exit_code": r.returncode,
+                            "written_as": work.name,     # the tool's work file, renamed to export_file when complete
                             "exporter": f"twincat-mcp {version}", "created": dt.datetime.now(dt.timezone.utc).isoformat()}
     if copy_note:
         prov["exported_from_copy"] = copy_note

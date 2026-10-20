@@ -993,6 +993,8 @@ async def test_d44_build_refuses_until_shell_edits_are_on_disk(monkeypatch, proj
     writes = {"on": False, "calls": 0}
 
     async def xae_call(fn, *a, **kw):
+        if fn.__name__ == "item_exists":
+            return True                    # N124: the created object is in the shell, only not in a file
         assert fn.__name__ == "save_all"
         writes["calls"] += 1
         if writes["on"]:
@@ -1049,6 +1051,42 @@ async def test_n113_save_check_compares_each_plc_projects_own_main(monkeypatch, 
     with pytest.raises(ToolError, match=r"Plc2 Project\^POUs\^MAIN: implementation on disk differs"):
         await app.save_verified("xae_build")
 
+
+
+@pytest.mark.anyio
+async def test_n124_an_edit_of_a_deleted_object_no_longer_blocks_every_build(monkeypatch, tmp_path):
+    """N124 (0.8.13 retest, S2): FB_RetestTmp was edited through the server, then deleted (file and .plcproj entry
+    gone): every xae_build (save_first) refused with the same path until the server restarted — the edit was cleared
+    only by a successful check. The shell is asked: an object that is gone has its edit dropped (said); one that is
+    still there, or a shell that cannot say, keeps the refusal. xae_tree_delete drops the edits below the item."""
+    from tests.test_project import _plc, _tsproj
+    from twincat_mcp.server import App, ToolError
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _tsproj(tmp_path, ("Plc1", 851))
+    app = App(mk_cfg(tmp_path))
+    exists = {"v": False}
+
+    async def xae_call(fn, *a, **kw):
+        if getattr(fn, "__name__", "") == "item_exists":
+            return exists["v"]
+        return {"saved": True, "dirty_before": [], "dirty_after": []}
+    monkeypatch.setattr(app, "xae_call", xae_call)
+    monkeypatch.setattr("twincat_mcp.server.asyncio.sleep", lambda d: _noop())
+    gone = "TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp^Value^Get"
+    for shell_says in (True, None):                       # still in the shell / the shell cannot say: refused
+        exists["v"] = shell_says
+        app.note_edit(gone, None, "Value := nValue;")
+        with pytest.raises(ToolError, match="not in any source file"):
+            await app.save_verified("xae_build")
+    exists["v"] = False                                   # deleted: dropped, the build goes on
+    app.note_edit("TIPC^Plc1^Plc1 Project^POUs^MAIN", None, "n := n + 1;")
+    r = await app.save_verified("xae_build")
+    assert [d["path"] for d in r["edits_dropped"]] == [gone] and "no longer exists" in r["edits_dropped"][0]["why"]
+    assert r["edits_on_disk"] == ["TIPC^Plc1^Plc1 Project^POUs^MAIN"] and not app.pending_edits
+    app.note_edit(gone, None, "x")
+    app.note_edit("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmpX", None, "x")
+    assert app.drop_edits_under("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp") == [gone]
+    assert list(app.pending_edits) == ["TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmpX"]
 
 
 @pytest.mark.anyio
@@ -1476,3 +1514,103 @@ async def test_n109_a_scaffold_the_project_does_not_compile_is_not_gated_by_conf
         register_sources(project_dir / "Plc" / "Plc.plcproj")
         res = await s.call_tool("tcunit_scaffold", {"fb_name": "FB_Valve", "add_to_plcproj": False, "overwrite": True})
         assert res.is_error and "is in RUN — switch to CONFIG first" in text(res), text(res)
+
+
+def test_n42_an_xae_token_is_bound_to_the_machine_not_the_ads_port(tmp_path):
+    """N42 (0.8.13 retest, S4): the token for xae_plc download on Plc2 (port 852) said scope '…:851' — the ADS
+    connection's port. An XAE confirmation is bound to the machine; the PLC project is in its target."""
+    from twincat_mcp.server import App
+    app = App(mk_cfg(tmp_path))
+    app.ads.net_id, app.ads.port = "192.168.1.5.1.1", 851
+    assert app.scope("xae_plc") == "192.168.1.5.1.1" and app.scope("xae_deploy") == "192.168.1.5.1.1"
+    assert app.scope("ads_write") == "192.168.1.5.1.1:851" and app.scope() == "192.168.1.5.1.1:851"
+    tok = app.guard.request_token("xae_plc", "download:TIPC^Plc2^Plc2 Project@192.168.1.5.1.1", app.scope("xae_plc"))
+    assert ":851" not in tok["scope"] and ":851" not in tok["note"]
+
+
+@pytest.mark.anyio
+async def test_n127_kb_changes_are_gated_by_the_mode_and_audited(monkeypatch, project_dir, tmp_path):
+    """N127 (0.8.13 retest, S1): kb_set_location / kb_add_project / kb_remove_project / kb_reindex are EDIT tools but
+    never asked the guard — kb_reindex rewrote 47 units in readonly while xae_pou_set was refused — and kb_reindex
+    left no audit record; kb_rebuild skipped the mode gate (to always ask) and so was not blocked by readonly."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="readonly", max_mode="guarded")
+    cfg.knowledge.location = str(tmp_path / "kb")
+    from tests.test_knowledge import ESI
+    (tmp_path / "esi").mkdir()
+    (tmp_path / "esi" / "Beckhoff EL2xxx.xml").write_text(ESI, encoding="utf-8")
+    cfg.knowledge.esi_dirs = [str(tmp_path / "esi")]
+    async with client_for(build_server(cfg)) as s:
+        r = payload(await s.call_tool("kb_set_location", {}))           # a question: answered in readonly
+        assert r["changed"] is False
+        for tool, args in (("kb_add_project", {"path": str(project_dir)}), ("kb_reindex", {}),
+                           ("kb_remove_project", {"path": str(project_dir)}),
+                           ("kb_set_location", {"path": str(tmp_path / "kb2")}),
+                           ("kb_rebuild", {"index": "esi", "force": True})):
+            res = await s.call_tool(tool, args)
+            assert res.is_error and "readonly mode" in text(res), (tool, text(res))
+        assert not (tmp_path / "kb2").exists()
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 20}))
+        refused = {a["tool"] for a in audit if a["outcome"] == "refused"}
+        assert {"kb_add_project", "kb_reindex", "kb_remove_project", "kb_set_location", "kb_rebuild"} <= refused, audit
+    cfg.safety.mode = "guarded"
+    async with client_for(build_server(cfg)) as s:
+        r = payload(await s.call_tool("kb_add_project", {"path": str(project_dir), "label": "p"}))
+        assert r["reindexed"][0]["units"] >= 8
+        payload(await s.call_tool("kb_reindex", {"path": "p"}))
+        payload(await s.call_tool("kb_remove_project", {"path": "p"}))
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 20}))
+        ok = [(a["tool"], a["outcome"]) for a in audit if a["tool"].startswith("kb_")]
+        assert ("kb_add_project", "ok") in ok and ("kb_reindex", "ok") in ok and ("kb_remove_project", "ok") in ok, ok
+        res = await s.call_tool("kb_reindex", {"path": "nothing-like-this"})
+        assert res.is_error
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 3}))
+        assert audit[-1]["tool"] == "kb_reindex" and audit[-1]["outcome"] == "error", audit
+
+
+@pytest.mark.anyio
+async def test_review_0814_plugin_composed_xae_errors_get_no_known_error_note(tmp_path):
+    """Review of 0.8.14: the plugin's own '… 5 s later the project is logged in, application Run …' (an online command
+    that may have acted) got 'XAE is logged in to the PLC … log out first' appended, and 'is not logged in' matched
+    the logged-in note. A message the plugin composed carries its own cause; a negated phrase is not the state."""
+    from twincat_mcp import xae_backend as XB
+    from twincat_mcp.server import App, ToolError
+    app = App(mk_cfg(tmp_path))
+    app.dialogs_now = lambda: []                                      # no shell on this machine
+
+    def acted():
+        raise XB._ActedUnconfirmed("ITcPlcOnline.Login on TIPC^P^P Project returned, but 5 s later the project is "
+                                   "logged in, application Stop — the command may have acted; check xae_status")
+    with pytest.raises(ToolError) as ei:
+        await app.xae_call(acted)
+    assert "known cause" not in str(ei.value) and "may have acted" in str(ei.value)
+
+    def raw():
+        raise XB.XaeError("ExecuteCommand: the project is not logged in")
+    with pytest.raises(ToolError) as ei:
+        await app.xae_call(raw)
+    assert "known cause" not in str(ei.value), str(ei.value)
+
+
+@pytest.mark.anyio
+async def test_review_0814_the_binding_flags_are_on_the_tools_own_result(monkeypatch, project_dir):
+    """Review of 0.8.14: `reattached` went on the first XAE call of a tool — the token-target lookup, whose result is
+    thrown away — so xae_plc / xae_activate_configuration never said it; Scope results copied only their own keys."""
+    from twincat_mcp import xae_backend as X
+    install(monkeypatch)
+    lookups = {"n": 0}
+
+    def target_get(self):
+        lookups["n"] += 1
+        self.reattach_note = f"the XAE shell went away; re-attached (lookup {lookups['n']})"
+        return {"target_net_id": "5.1.2.3.1.1", "twincat_started": True}
+    monkeypatch.setattr(X.XaeBackend, "target_get", target_get)
+    monkeypatch.setattr(X.XaeBackend, "mismatch_note", lambda self: "bound to C:\\P\\Other.sln, not xae.solution_path")
+    monkeypatch.setattr(X.XaeBackend, "_nested_projects", lambda self, p=None: ["TIPC^Plc^Plc Project"])
+    monkeypatch.setattr(X.XaeBackend, "plc_action", lambda self, a, p=None: {"action": a, "ok": True})
+    async with client_for(build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))) as s:
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "args": {"action": "login"}}))
+        r = payload(await s.call_tool("xae_plc", {"action": "login", "confirm_token": tok["confirm_token"]}))
+        assert r["ok"] and r["solution_mismatch"] and "re-attached" in r["reattached"], r
+        r = payload(await s.call_tool("proj_scan", {}))                   # no XAE call: no XAE flags
+        assert "solution_mismatch" not in r and "reattached" not in r

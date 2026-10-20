@@ -179,8 +179,8 @@ def infosys_rank(con: sqlite3.Connection) -> str:
 
 def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, extra: list[Any],
                  limit: int, title_key: str | None = None, fts: str = "fts",
-                 arrange: Callable[[list[Any]], list[Any]] | None = None
-                 ) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
+                 arrange: Callable[[list[Any]], list[Any]] | None = None, title_col: str | None = None,
+                 title_sql: str | None = None) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
     """N36/N65: a question in words falls back in steps, and only on words that can pick a page:
       1. every word as written (stop words included: a precise query stays precise);
       2. every informative word that occurs in the index — stop words, 1-2 letter words and words on no page dropped;
@@ -188,8 +188,11 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
       4. some of them (OR) — without words that are on more than 20 % of the pages.
     Nothing informative left: no hits. N79: a query of nothing but stop words is refused; one word alone ('the') is
     searched as written. title_key: the hits of a tier are ordered by title_order (N105); arrange: instead, a function
-    that orders the hits read (more than `limit`). FTS5 syntax or code punctuation runs as written (run_fts, with the
-    phrase retry). Needs vocab(con, fts) for the term statistics.
+    that orders the hits read (more than `limit`). title_col, title_sql (with title_key or arrange): the FTS column of
+    the titles and `sql` ordered by the title's length — the hits of the tier that begin with the query or hold its words in
+    the title are read as well (title_hits), not only the best by bm25: a page titled as the query is ordered by its
+    title wherever bm25 ranks it. FTS5 syntax or code punctuation
+    runs as written (run_fts, with the phrase retry). Needs vocab(con, fts) for the term statistics.
     -> (rows, total, mode, expression, info: words used / ignored with the reason)."""
     q = query_text(query).strip()
     if not natural(q):
@@ -233,6 +236,10 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
         tiers.append(("some words (no page has all of them)", " OR ".join(ph(w) + "*" for w in some), some))
     for label, expr, used in tiers:
         rows = con.execute(sql, [expr, *extra, _fetch(limit, title_key or arrange)]).fetchall()
+        if rows and title_col and title_sql and (title_key or arrange):
+            rows = rows + title_hits(con, title_sql, expr, used,
+                                     label.endswith("(as prefixes)") or label.startswith("some"), extra, title_col,
+                                     {r[0] for r in rows}, q)
         if rows:
             rows = _arranged(rows, q, title_key, arrange)
             info: dict[str, Any] = {"words_used": used}
@@ -245,6 +252,43 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
     if ignored:
         info["words_ignored"] = ignored
     return [], 0, tiers[-1][0], tiers[-1][1], info
+
+
+def title_hits(con: sqlite3.Connection, sql: str, expr: str, used: list[str], prefix: bool, extra: list[Any],
+               title_col: str, have: set[Any], query: str = "") -> list[sqlite3.Row]:
+    """The hits of a tier (expr) that the title order must see, read besides the best by bm25, which it sees alone
+    otherwise ('Data type' did not find the page titled 'Data type': bm25 rank 685, behind 300 'Data types' pages full
+    of 'data type'): the hits whose title begins with the query's words in their order — the page titled as the query
+    is one of them however common its words are ('TwinCAT', 'MC', 'Object Method') — then those whose title holds
+    every informative word the tier used. They are hits of the tier, so its count is unchanged. sql orders them by
+    the title's length — the shortest title that begins with the query is the query ('TwinCAT' before 300
+    'TwinCAT …' pages whose text says TwinCAT more often; bm25 cannot tell when every title holds the word). Rows
+    already read (`have`, by the first column) are left out; at most _TITLE_HITS of each."""
+    def q_(w: str) -> str:
+        return w.replace('"', '""')
+    conds = []
+    toks = re.findall(r"[^\W_]+", query_text(query))
+    if toks:
+        conds.append(f'{title_col} : ^"{q_(" ".join(toks))}"')
+    words = [w for w in used if fold(w) not in STOP_WORDS and (len(w) >= 3 or w.isdigit())]
+    if words:
+        star = "*" if prefix else ""
+        conds.append(" AND ".join(f'{title_col} : "{q_(w)}"{star}' for w in words))
+    out: list[sqlite3.Row] = []
+    seen = set(have)
+    for cond in conds:
+        try:
+            rows = con.execute(sql, [f"({expr}) AND ({cond})", *extra, _TITLE_HITS]).fetchall()
+        except sqlite3.OperationalError:
+            continue
+        for r in rows:
+            if r[0] not in seen:
+                seen.add(r[0])
+                out.append(r)
+    return out
+
+
+_TITLE_HITS = 300
 
 
 def _fetch(limit: int, ordered: Any) -> int:
@@ -287,8 +331,14 @@ def _title_terms(title: str) -> tuple[set[str], int]:
     return own | set(words), len(set(words)) or 1
 
 
+def _word_seq(s: str) -> tuple[str, ...]:
+    return tuple(fold(w) for w in re.findall(r"[^\W_]+", s or ""))
+
+
 def title_order(rows: list[Any], query: str, title_key: str = "title", library_key: str | None = None) -> list[Any]:
-    """N105: the page whose title names most of the query's informative words first ('tcp client connect socket' →
+    """The page whose title is the query — its words in its order, nothing else ('Internal cycle process' before
+    'Process (internal cycle)') — first. N105: then the page whose title names most of the query's informative
+    words ('tcp client connect socket' →
     FB_SocketConnect: socket, connect), then — library_key — the page whose title and library together name most
     (the library is part of a symbol's name: 'EtherCAT slave state' → the slave-state symbols of Tc2_EtherCAT before
     'State Machine Slave Settings'), then the title that is exactly one of the query's words ('ADSREAD xyzqq' → ADSREAD
@@ -297,6 +347,7 @@ def title_order(rows: list[Any], query: str, title_key: str = "title", library_k
     q = query_text(query)
     want = informative_words(q)
     raw = {fold(w) for w in re.findall(r"\S+", q)}
+    seq = _word_seq(q)
     keyed = []
     for i, r in enumerate(rows):
         title = str(r[title_key] or "")
@@ -305,7 +356,8 @@ def title_order(rows: list[Any], query: str, title_key: str = "title", library_k
         lib = _title_terms(str(r[library_key] or ""))[0] if library_key else set()
         with_lib = sum(1 for w in want if any(_same_word(t, w) for t in terms | lib)) if lib else cov
         exact = fold(title.strip()) in raw
-        keyed.append(((-cov, -with_lib, not exact, -cov / size, i), r))
+        whole = bool(seq) and _word_seq(title) == seq
+        keyed.append(((not whole, -cov, -with_lib, not exact, -cov / size, i), r))
     keyed.sort(key=lambda x: x[0])
     return [r for _, r in keyed]
 
@@ -313,32 +365,54 @@ def title_order(rows: list[Any], query: str, title_key: str = "title", library_k
 # ------------------------------------------------------------------------------------------- error codes (N99)
 _HEX = re.compile(r"^(?:0x|16#|#x)([0-9a-f_]+)$", re.I)
 # words that make a decimal number of the query an error / return code
-_CODE_WORDS = frozenset("""error errors err errid nerrid errorid errorcode errcode errno code codes return returncode
-result hresult adserr adserror fehler fehlercode fehlernummer""".split())
+_CODE_WORDS = frozenset("""error errors err errid nerrid errorid nerrorid errorcode nerrorcode errcode errno errnum
+code codes return returncode result hresult adserr adserror fehler fehlercode fehlernummer""".split())
+# 'error number 1861', 'error ID 1861', 'Fehler Nr. 1861': a code word followed by one of these right before the number
+_CODE_WORD_SUFFIX = frozenset("number id no nr code nummer".split())
 
 
 def code_forms(query: str) -> dict[str, Any] | None:
     """An error / return code in the query, in the forms the code tables write it (N99): '0x745' → value 1861, hex
     0x745 / 0x0745 / 0x00000745, decimal 1861. One code token in the query: hex (0x…, 16#…, #x…), or a decimal number
-    of two digits or more next to a word that says it is a code ('error 1861', 'ADS return code 1861' — 'ADS port
-    851' or 'build 4024' is no code, review 0.8.12); else None."""
+    of two digits or more that is the whole query ('1861', N122) or stands next to a word that says it is a code
+    ('error 1861', 'ADS return code 1861' — 'ADS port 851' or 'build 4024' is no code, review 0.8.12); else None."""
     q = query_text(query)
-    toks = re.findall(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", q)
-    if len(toks) != 1:
+    toks = list(re.finditer(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", q))
+    # N122 (0.8.13 retest): a number that IS the query ('1861') is a code too, as the tool describes it — inside other
+    # words a decimal needs a code word next to it ('error 1861'; 'ADS error on port 851' is no code 851, N121); a hex
+    # number is a code. Review of 0.8.14: the query's other numbers do not cancel it ('ADS error 1861 on port 851',
+    # 'ADS error 0x745 (1861)' — one code, written twice); two different codes are none
+    cands: list[tuple[str, int]] = []
+    for tk in toks:
+        t = tk.group(0)
+        m = _HEX.match(t)
+        if not m and q.strip() != t and not _next_to_code_word(q, tk.start(), tk.end()):
+            continue
+        try:
+            cands.append((t, int(m.group(1).replace("_", ""), 16) if m else int(t)))
+        except ValueError:
+            continue
+    if len({v for _t, v in cands}) != 1:
         return None
-    t = toks[0]
-    m = _HEX.match(t)
-    if not m and not _CODE_WORDS & {fold(w) for w in re.findall(r"[^\W\d_]+", q)}:
-        return None
-    try:
-        value = int(m.group(1).replace("_", ""), 16) if m else int(t)
-    except ValueError:
-        return None
+    t, value = cands[0]
     if value < 16:
         return None
     h = f"{value:x}"
     hexes = sorted({f"0x{h}", f"0x{h.zfill(4)}", f"0x{h.zfill(8)}"}, key=len)
     return {"token": t, "value": value, "hex": hexes, "dec": str(value)}
+
+
+def _next_to_code_word(q: str, start: int, end: int) -> bool:
+    """The decimal number q[start:end] stands alone (not part of a name: 'P-CHAN-00020', 'EL3102_1') and the word
+    right before or after it says it is a code ('error 1861', 'nErrId = 1861', '1861 error')."""
+    if re.search(r"[\w-]$", q[:start]) or re.match(r"[\w-]", q[end:]):
+        return False
+    before = re.search(r"([^\W\d_]+)[\s:=#(]{1,6}$", q[:start])        # 'nErrId := 1861' (ST's ' := ')
+    after = re.match(r"[\s:)]{1,3}([^\W\d_]+)", q[end:])
+    if any(x is not None and fold(x.group(1)) in _CODE_WORDS for x in (before, after)):
+        return True
+    two = re.search(r"([^\W\d_]+)\s+([^\W\d_]+)\.?[\s:=#(]{1,6}$", q[:start])
+    return bool(two and fold(two.group(1)) in _CODE_WORDS and fold(two.group(2)) in _CODE_WORD_SUFFIX)
 
 
 def _cell_value(cell: str) -> tuple[str, int] | None:

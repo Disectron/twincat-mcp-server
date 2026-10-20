@@ -35,9 +35,19 @@ def test_code_forms_and_where_a_code_is_defined():
     f = D.code_forms("ADS return codes 0x745")
     assert (f["value"], f["dec"], f["hex"]) == (1861, "1861", ["0x745", "0x0745", "0x00000745"])
     assert D.code_forms("ADS error 1861")["hex"][0] == "0x745" and D.code_forms("16#745")["value"] == 1861
-    assert D.code_forms("error 7") is None and D.code_forms("0x745 1861") is None and D.code_forms("ADSREAD") is None
+    assert D.code_forms("error 7") is None and D.code_forms("ADSREAD") is None
+    # review of 0.8.14: other numbers of the query do not cancel the code; two different codes are none
+    assert D.code_forms("0x745 1861")["value"] == 1861 and D.code_forms("ADS error 0x745 (1861)")["value"] == 1861
+    assert D.code_forms("ADS error 1861 on port 851")["value"] == 1861 and D.code_forms("0x745 0x710") is None
+    assert D.code_forms("nErrId := 1861")["value"] == 1861 and D.code_forms("nErrorID := 1861")["value"] == 1861
+    assert D.code_forms("error number 1861")["value"] == 1861 and D.code_forms("error ID 1861")["value"] == 1861
+    assert D.code_forms("part number 1861") is None
     # a decimal number is a code only when a word says so (review 0.8.12): a port or a build is none
-    assert D.code_forms("1861") is None and D.code_forms("ADS port 851") is None and D.code_forms("build 4024") is None
+    assert D.code_forms("ADS port 851") is None and D.code_forms("build 4024") is None
+    # N122 (0.8.13 retest): a number that is the whole query is a code ('1861' listed Tc3_Vision pages first)
+    assert D.code_forms("1861")["value"] == 1861 and D.code_forms(" 1861 ")["value"] == 1861
+    assert D.code_forms("ADS error on port 851") is None                                 # N121: not next to 'error'
+    assert D.code_forms("7") is None                                                     # one digit: no code
     table = "| Hex | Dec | Name |\n|---|---|---|\n| 0x745 | 1861 | ADSERR_CLIENT_SYNCTIMEOUT |"
     assert D.definition_score(table, 1861) == 2
     assert D.definition_score("| Code |\n| 0x00000745 |", 1861) == 1
@@ -51,6 +61,17 @@ def test_titles_that_name_the_query_come_first():
                                                                                           "FB_TlsSocketConnect"]
     assert D.title_order(rows, "ADSREAD xyzqq")[0]["title"] == "ADSREAD"      # exactly a query word, before a prefix
 
+
+
+def test_kbv_the_title_that_is_the_query_comes_first():
+    """kb_verify on the real index (0.8.13): 'Internal cycle process' listed ten pages titled 'Process (internal
+    cycle)' before the page of that title — the same words, so nothing told them apart but bm25. The title that is the
+    query (its words, in order, nothing else) comes first."""
+    rows = [{"title": "Process (internal cycle)"}] * 3 + [{"title": "Internal cycle process"}, {"title": "Cycle"}]
+    assert D.title_order(rows, "Internal cycle process")[0]["title"] == "Internal cycle process"
+    assert D.title_order(rows, "internal  cycle process:")[0]["title"] == "Internal cycle process"
+    rows = [{"title": "Parameters"}, {"title": "Description of parameters"}]
+    assert D.title_order(rows, "Description of parameters")[0]["title"] == "Description of parameters"
 
 
 def test_n105_the_library_names_query_words_too():
@@ -166,3 +187,48 @@ def test_second_review_0812_the_page_id_wins_whatever_the_order():
         groups = sorted(sorted(x["rid"] for x in g) for g in same_documents(order))
         assert groups == [[1, 3], [2]], (order, groups)
     assert D.code_forms("ErrorCode 1861")["value"] == 1861 and D.code_forms("nErrId 1861")["value"] == 1861
+
+
+def test_kbv_a_number_is_a_code_only_next_to_a_code_word():
+    """kb_verify full run on the real index (0.8.13): 'Number of errors per row (P-CHAN-00020)' listed the pages that
+    define error code 20 before the page of that title — 'errors' anywhere in the query made 00020 a code, though the
+    rule (review 0.8.12) is a number NEXT TO a word that says it is a code, and 00020 is part of a parameter name."""
+    assert D.code_forms("Number of errors per row (P-CHAN-00020)") is None
+    assert D.code_forms("errors in P-CHAN-00020") is None and D.code_forms("error in row 25 of the table") is None
+    assert D.code_forms("ADS error 1861")["value"] == 1861 and D.code_forms("error code 1861")["value"] == 1861
+    assert D.code_forms("nErrId = 1861")["value"] == 1861 and D.code_forms("1861 error")["value"] == 1861
+    assert D.code_forms("ADS return codes 0x745")["value"] == 1861          # hex needs no word
+
+
+def test_kbv_a_page_titled_as_the_query_is_found(idx):
+    """kb_verify on the real index (0.8.13): 'Data type' did not find the page titled 'Data type' in the top 50 — the
+    hits are ordered by their titles, but only the 150–300 best by bm25 were read, and 300 'Data types' pages full of
+    'data type' came first (the page was bm25 rank 685). The pages whose title holds the query's words are read too."""
+    with idx._db() as con:
+        for n in range(320):
+            idx._store(con, f"{C}tf{n:03d}_lib/{1000 + n}.html", "",
+                       _page("Data types", f"<p>Library {n}: " + "the data type of the data type. " * 5 + "</p>"))
+        idx._store(con, f"{C}tf5050_tc3_nc_camming/1003565323.html", "",
+                   _page("Data type", "<p>" + " ".join(f"word{k}" for k in range(400)) + " The type of data.</p>"))
+        idx._store(con, f"{C}tf5225_cycles/323079947.html", "", _page("Internal cycle process", "<p>"
+                   + " ".join(f"word{k}" for k in range(400)) + " internal cycle process.</p>"))
+        for n in range(12):
+            idx._store(con, f"{C}tf52{n:02d}_cyc/{5000 + n}.html", "", _page(
+                "Process (internal cycle)", f"<p>Cycle {n}: internal cycle process, internal cycle process.</p>"))
+        # full run on the real index: a title of one common word ('TwinCAT': thousands of titles hold it) or of a
+        # word shorter than 3 letters ('MC', no informative word at all)
+        for n in range(320):
+            idx._store(con, f"{C}tc3_x{n:03d}/{7000 + n}.html", "", _page(
+                f"TwinCAT component {n}", f"<p>TwinCAT {n}: " + "TwinCAT runtime. " * 4 + "</p>"))
+            idx._store(con, f"{C}tcplclib_tc2_mc2_{n:03d}/{8000 + n}.html", "", _page(
+                f"MC_Function{n}", f"<p>MC function {n}: MC MC MC.</p>"))
+        idx._store(con, f"{C}tc3_c/6778770443.html", "", _page(
+            "TwinCAT", "<p>" + " ".join(f"word{k}" for k in range(400)) + " TwinCAT.</p>"))
+        idx._store(con, f"{C}tc3_io_intro/1999768587.html", "", _page(
+            "MC", "<p>" + " ".join(f"word{k}" for k in range(400)) + " MC.</p>"))
+    for q in ("Data type", "Internal cycle process", "TwinCAT", "MC"):
+        r = idx.search(q, limit=10)
+        assert r["items"][0]["title"] == q, (q, [i["title"] for i in r["items"]])
+    r = idx.search("Data type", limit=10)
+    assert r["total"] == 321 and r["query_mode"] == "all words"          # the count is the tier's, unchanged
+

@@ -31,10 +31,11 @@ import sqlite3
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
+import contextvars
 import functools
 import secrets
 
@@ -53,7 +54,7 @@ import pyads
 
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
-from .xae_backend import XaeBackend, XaeError, sta_init, sta_teardown
+from .xae_backend import XaeBackend, XaeError, XaeExplained, sta_init, sta_teardown
 from .project_backend import PlcView, ProjectIndex, ProjectError, not_on_target, parse_tcunit_xml, plc_projects_declaring
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
@@ -399,6 +400,7 @@ class App:
         def _task_of(name: str, port: int | None = None) -> list[dict[str, Any]] | None:
             return self.proj.tasks_of(name, port)
         self.rec.task_of = _task_of
+        self.rec.task_reason = lambda name, port=None: self.proj.task_reason(name, port)
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
         self.profiles = capture.ProfileStore(Path(cfg.safety.audit_log).parent / "profiles")
@@ -419,7 +421,6 @@ class App:
                 if cfg.docs.source == "local":
                     from . import helpviewer as HV
                     from . import infosys_build as IB
-                    from . import kb_layout as L
                     pk = HV.find_packages(cfg.docs.mshc)
                     if not pk:
                         where = cfg.docs.mshc or " / ".join(str(r) for r in HV.catalog_roots())
@@ -816,7 +817,21 @@ class App:
                             f"{d.get('buttons')}; text {str(d.get('text', ''))[:200]!r}). Answer it first "
                             f"(xae_dialog_resolve(button=...)), then retry. {done}")
 
+    def xae_flags(self) -> dict[str, Any]:
+        """N116: what the result of a tool that used the XAE shell says about the binding — bound to another solution
+        than xae.solution_path (every time), re-attached since the last such result (once)."""
+        out: dict[str, Any] = {}
+        note = getattr(self.xae, "mismatch_note", lambda: None)()
+        if note:
+            out.update(solution_mismatch=True, solution_note=note)
+        again = getattr(self.xae, "reattach_note", None)
+        if again:
+            out["reattached"] = again
+            self.xae.reattach_note = None
+        return out
+
     async def xae_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
+        _XAE_USED.set(True)
         job = getattr(fn, "__name__", "XAE call")
         self._held_check(job)
         before = {d.get("hwnd") for d in self.dialogs_now()}
@@ -854,6 +869,8 @@ class App:
             elif ("0x80010001" in low or "0x8001010a" in low or "-2147418111" in low or "-2147417846" in low
                     or "call was rejected" in low or "retry later" in low):
                 msg += " — XAE refused the COM call: it is busy or a modal dialog has the shell." + await asyncio.to_thread(self._dialog_hint)
+            if isinstance(exc, XaeExplained):
+                raise ToolError(msg) from exc          # it carries its own cause and what to do
             lic = _license_hint(msg)
             if lic:
                 msg += " " + lic
@@ -871,7 +888,7 @@ class App:
             if live:                       # N87: the call ran, but the shell has a dialog waiting — say so
                 res = {**res, "open_dialogs": [{k: d.get(k) for k in ("hwnd", "title", "text", "buttons")}
                                                for d in live[:5]]}
-        return res
+        return res              # N116: the binding's flags are added to the tool's own result (_tool_boundary)
 
     def guard_safety_path(self, path: str, action: str) -> None:
         """TwinSAFE (TISC / Safety) projects are never edited unless explicitly enabled."""
@@ -889,16 +906,18 @@ class App:
     # -- N113: the source analyses run inside ONE PLC project when names are declared in several ------------------
     def proj_views(self, name: str | None) -> list[ProjectIndex]:
         """The index itself when no name is declared twice; else the PLC project that declares `name` (several and no
-        'file@name' pin: refused, nothing is picked), or — no name — each PLC project in turn."""
+        '<PLC project>@name' pin: refused, nothing is picked), or — no name — each PLC project in turn."""
         p = self.proj
         p._ensure()
-        if not p.duplicates:
+        # multi-PLC audit (0.8.13): split only when names were declared twice — with two PLC projects a lint of the whole
+        # tree compared one project's declarations with the other's code. Several PLC projects: each in turn, always
+        if not p.duplicates and len(p.plcproj) <= 1:
             return [p]
         if name:
             plcs = plc_projects_declaring(p, name)
             if len(plcs) > 1:
                 raise ToolError(f"{name!r} is declared in several PLC projects {[x or '(files of no PLC project)' for x in plcs]} "
-                                f"— pin one: '<file-substring>@{name.split('@')[-1]}' (nothing was chosen)")
+                                f"— pin one: '<PLC project>@{name.split('@')[-1]}' (nothing was chosen)")
             return [PlcView(p, plcs[0])] if plcs else [p]       # not declared: the analysis says so itself
         return [PlcView(p, plc) for plc in sorted({p._plc_of(f) for f in p._by_file}, key=lambda x: x or "")]
 
@@ -909,7 +928,7 @@ class App:
         if p.root is None:
             return p
         p._ensure()
-        if not p.duplicates:
+        if not p.duplicates and len(p.plcproj) <= 1:
             return p
         plc = p.plc_project(port=port or self.ads.port)
         return PlcView(p, plc) if plc is not None else p
@@ -918,7 +937,7 @@ class App:
         """A function file -> the view of its PLC project, the views built once (in the worker thread that calls this)."""
         p = self.proj
         p._ensure()
-        if not p.duplicates:
+        if not p.duplicates and len(p.plcproj) <= 1:
             return lambda _f: p
         views: dict[str | None, ProjectIndex] = {}
 
@@ -1071,7 +1090,12 @@ class App:
         except OSError as exc:            # a file the OS refuses (read-only, in use): the reason, never an empty error (D7)
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
 
-    def scope(self) -> str:
+    def scope(self, action: str = "") -> str:
+        """The machine a confirmation is bound to: the ADS target '<NetId>:<port>'; for an xae_* action the machine
+        alone — the PLC project (and so its port) is in the token's target (N42, 0.8.13 retest: a token for Plc2 on
+        port 852 said ':851', the ADS connection's port)."""
+        if action.startswith("xae_"):
+            return self.ads.net_id or "local"
         return self.ads.target_label()
 
     def write_check(self, symbol: str) -> str | None:
@@ -1279,6 +1303,14 @@ class App:
             raise ToolError(f"{what} path {str(rp)!r}: its folder could not be created ({exc}) — nothing was written") from exc
         return rp
 
+    def drop_edits_under(self, path: str) -> list[str]:
+        """N124: forget the pending shell edits of an object and everything below it (it was deleted)."""
+        low = path.lower()
+        gone = [p for p in self.pending_edits if p.lower() == low or p.lower().startswith(low + "^")]
+        for p in gone:
+            self.pending_edits.pop(p, None)
+        return sorted(gone)
+
     def note_edit(self, path: str, declaration: str | None, implementation: str | None) -> None:
         cur = self.pending_edits.setdefault(path, {"path": path, "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
         if declaration is not None:
@@ -1327,7 +1359,19 @@ class App:
             r = await self.xae_call(self.xae.save_all, timeout=120)
             out.update(r)
             bad = await self.proj_call(self._edits_not_on_disk)
-        out["edits_checked"] = len(self.pending_edits)
+        # N124 (0.8.13 retest, S2): an edit of an object deleted since (in XAE, or its file) can never reach a source
+        # file — it blocked every save_first build until the server restarted. The shell is asked whether the object
+        # still exists; one that is gone has its edit dropped and said (unknown — shell busy — stays a refusal)
+        dropped = []
+        for b in [b for b in bad if "file" not in b]:
+            if await self.xae_call(self.xae.item_exists, b["path"], timeout=60) is False:
+                self.pending_edits.pop(b["path"], None)
+                dropped.append({"path": b["path"], "edited_at": b["edited_at"],
+                                "why": "the object no longer exists in the shell (deleted) — its edit cannot be saved"})
+        if dropped:
+            out["edits_dropped"] = dropped
+            bad = [b for b in bad if b["path"] in self.pending_edits]
+        out["edits_checked"] = len(self.pending_edits) + len(dropped)
         if bad:
             out["edits_not_on_disk"] = bad
             raise ToolError(f"{tool}: File.SaveAll ran but {len(bad)} edit(s) made in the shell are not in the source files "
@@ -1380,6 +1424,10 @@ class App:
                 # check cannot be made; guarded mode refuses (as without a project source)
                 return (f"{name!r}: {exc}. A write to a CONSTANT cannot be ruled out — guarded mode refuses it. Name "
                         "the PLC projects' ADS ports in the .tsproj (AmsPort), or switch to full mode.")
+            if "several PLC projects" in str(exc):
+                # full mode (0.8.13 retest, S3): the check was skipped silently. It is made in every PLC project that
+                # declares the name: a CONSTANT in any of them refuses the write (which one the target runs is unknown)
+                return self._constant_in_any_plc(name)
             return None                                 # unknown in source: the runtime check is all we have
         except Exception:  # noqa: BLE001
             return None
@@ -1388,6 +1436,23 @@ class App:
                 return (f"{name!r}: {h['segment']} is declared in a VAR ... CONSTANT block ({h.get('declared_in')}, "
                         f"{Path(h.get('file') or '').name}:{h.get('line')}). The runtime accepts the write, but a constant changed "
                         "at runtime desynchronises array bounds and code compiled against it — change it in source and download")
+        return None
+
+    def _constant_in_any_plc(self, name: str) -> str | None:
+        from .project_backend import plc_projects_declaring
+        head = re.split(r"\.(?![^\[]*\])", name.strip())[0]
+        for plc in plc_projects_declaring(self.proj, head):
+            try:
+                r = self.proj.resolve_symbol(name, plc=plc)
+            except ProjectError:
+                continue
+            for h in r.get("hops", []):
+                if h.get("constant"):
+                    return (f"{name!r}: {h['segment']} is declared in a VAR ... CONSTANT block in PLC project "
+                            f"{Path(plc).stem if plc else '(none)'} ({h.get('declared_in')}, {Path(h.get('file') or '').name}:"
+                            f"{h.get('line')}) — the name is declared in several PLC projects and which one the target "
+                            "runs is not known, so the write is refused (a constant changed at runtime desynchronises "
+                            "code compiled against it). Name the ADS ports in the .tsproj (AmsPort) to tell them apart.")
         return None
 
     async def write_preflight(self, name: str, value: Any, port: int | None = None) -> None:
@@ -1415,9 +1480,9 @@ class App:
             return await self.token_target(action, args)
         except ToolError as xae_exc:
             try:
-                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope())
+                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope(action))
             except SafetyError as exc:
-                self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
+                self.guard.audit(action, {"target": "", "scope": self.scope(action)}, op, "refused", str(exc))
                 if isinstance(xae_exc, TargetArgsError) and "needs a confirm_token" in str(exc):
                     # N41/N42 polish: the shell answered, the arguments do not name a target — that reason first; the
                     # guard's "needs a confirm_token … target ''" suggested a token for '', which can never be right
@@ -1435,9 +1500,9 @@ class App:
             return (await self.xae_call(self.xae.target_get, timeout=60)).get("target_net_id", "")
         except ToolError as xae_exc:
             try:
-                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope())
+                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope(action))
             except SafetyError as exc:
-                self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
+                self.guard.audit(action, {"target": "", "scope": self.scope(action)}, op, "refused", str(exc))
                 raise ToolError(f"{exc} (and no XAE shell is attached: {str(xae_exc)[:160]})") from exc
             raise
 
@@ -1504,19 +1569,24 @@ class App:
 
     # --- safety ------------------------------------------------------------
     async def permit(self, ctx: Context | None, op: OpClass, action: str, target: str = "",
-                     confirm_token: str | None = None, mode_gate: bool = True) -> None:
+                     confirm_token: str | None = None, mode_gate: bool = True, always_confirm: bool = False) -> None:
         """Check the guard; for CONTROL/DESTRUCTIVE without a token, try to
         ask the human through elicitation before failing. ``mode_gate=False`` skips the
         readonly/guarded gating and only demands the confirmation — for tc_set_mode, which must be
-        able to leave readonly mode with a human's consent."""
-        scope = self.scope()
+        able to leave readonly mode with a human's consent. ``always_confirm``: readonly refuses it like any other
+        change, and every other mode demands the confirmation (kb_rebuild: the user approves every rebuild, rule 6 —
+        N127: it ran in readonly because it skipped the mode gate to get that)."""
+        scope = self.scope(action)
         if op is OpClass.EDIT and action in CODE_EDIT_ACTIONS and self.cfg.safety.edit_requires_config_mode:
             await self._require_config_mode(action, target)
         try:
-            if mode_gate:
-                self.guard.check(op, action=action, target=target, confirm_token=confirm_token, scope=scope)
-            else:
+            if not mode_gate:
                 self.guard.consume_token(confirm_token, action, target, scope)
+            elif always_confirm:
+                self.guard.check_mode(op, action)
+                self.guard.consume_token(confirm_token, action, target, scope)
+            else:
+                self.guard.check(op, action=action, target=target, confirm_token=confirm_token, scope=scope)
             return
         except SafetyError as exc:
             # elicitation only replaces a *missing* token; a wrong/stale/foreign token is a hard error
@@ -1855,7 +1925,14 @@ def _deliberate(exc: BaseException) -> bool:
             or isinstance(exc, (OSError, sqlite3.Error, ValueError, pyads.ADSError)))
 
 
-def _tool_boundary(fn: Any) -> Any:
+# how SaveSVD's file is watched after the call returned: unchanged for (seconds), given up after (seconds)
+SCOPE_SETTLE_S = (0.5, 15.0)
+
+# set by every XAE call of the tool invocation running in this task: its result then carries the binding's flags
+_XAE_USED: contextvars.ContextVar[bool] = contextvars.ContextVar("tcmcp_xae_used", default=False)
+
+
+def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]] | None] = lambda: None) -> Any:
     """What leaves a tool. mcp >= 2.1 passes only a ToolError's text to the client — any other exception arrives as a
     bare "Error executing tool X" (R37: never an empty error): a deliberate error keeps its text; a defect says its
     type and message and is logged with its traceback under a crash id. A question for the user (prompting.AskUser)
@@ -1864,8 +1941,15 @@ def _tool_boundary(fn: Any) -> Any:
 
     @functools.wraps(fn)
     async def run(*args: Any, **kwargs: Any) -> Any:
+        used = _XAE_USED.set(False)
         try:
-            return await fn(*args, **kwargs)
+            res = await fn(*args, **kwargs)
+            flags = xae_flags()
+            if _XAE_USED.get() and flags is not None and isinstance(res, dict):
+                # N116 / review of 0.8.14: the binding's flags go on the result the tool returns — not on the first
+                # XAE call's (a token-target lookup's result is thrown away, a Scope result copies only its own keys)
+                res = {**res, **{k: v for k, v in flags().items() if k not in res}}
+            return res
         except ASK.AskUser as ask:
             return ask.result
         except (ToolError, MCPError):
@@ -1878,6 +1962,8 @@ def _tool_boundary(fn: Any) -> Any:
             raise ToolError(f"internal error in {name} ({type(exc).__name__}: {str(exc)[:300] or 'no message'}) — a "
                             f"defect in twincat-mcp, not in the call; its traceback is in the server log as crash "
                             f"{cid}") from exc
+        finally:
+            _XAE_USED.reset(used)
     return run
 
 
@@ -1897,11 +1983,13 @@ def _dialog_awaits(d: dict[str, Any]) -> bool:
 class TcMcpServer(MCPServer):
     """MCPServer whose tools go through _tool_boundary."""
 
+    xae_flags: Callable[[], dict[str, Any]] | None = None     # App.xae_flags, set by build_server
+
     def tool(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
         register = super().tool(*args, **kwargs)
 
         def decorator(fn: Any) -> Any:
-            register(_tool_boundary(fn))
+            register(_tool_boundary(fn, lambda: self.xae_flags))
             return fn                     # the closure keeps the plain function (tools that call each other)
         return decorator
 
@@ -1913,6 +2001,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # start), so subscribe / listChanged are not advertised (mcp 2.3)
     mcp = TcMcpServer("twincat-mcp", instructions=connection_instructions(app), version=__version__,
                       subscriptions=False)
+    mcp.xae_flags = app.xae_flags
 
     # ======================================================================
     # tc_* meta
@@ -2166,10 +2255,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                        "esi": app.spawn_esi_build}[idx], force, dry_run=True)
         if not pre.get("would_start"):
             if pre.get("stale_work_file"):          # not a rebuild: the left work file is discarded, the index unchanged
+                await app.permit(None, OpClass.EDIT, "kb_rebuild", idx)          # N127: a change — not in readonly
                 pre = await asyncio.to_thread(app.spawn_esi_build, force)
             app.audit("kb_rebuild", {"index": idx, "force": force}, OpClass.CONTROL, "not-started", pre)
             return pre
-        await app.permit(ctx, OpClass.CONTROL, "kb_rebuild", idx, confirm_token, mode_gate=False)
+        await app.permit(ctx, OpClass.CONTROL, "kb_rebuild", idx, confirm_token, always_confirm=True)
         if idx == "infosys":
             res = await asyncio.to_thread(app.spawn_infosys_build, force)
         elif idx == "manuals":
@@ -2183,36 +2273,49 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def kb_set_location(path: str | None = None, use_fallback: bool = False) -> dict[str, Any]:
         """Choose the folder for the knowledge database — ONLY with a path the user gave you (or use_fallback=true
-        once the user agreed to D:\\TwinCAT-MCP\\knowledge). The folder is checked: local fixed drive (no network
-        share / mapped drive / USB), not inside OneDrive/Dropbox/Google Drive/iCloud, not inside the plugin folder,
-        writable, >= 1 GB free — a failing condition is named and nothing is changed. An existing database is never
-        moved or deleted. Without arguments it returns the current location (and changes nothing)."""
-        res = await app.kb_call(app.kb.set_location, path, use_fallback)
-        moved = await asyncio.to_thread(app.docs_retarget)
-        if moved:
-            res["infosys_index"] = moved
-        app.audit("kb_set_location", {"path": path, "use_fallback": use_fallback}, OpClass.EDIT, "ok", res)
-        return res
+        once the user agreed to D:\\TwinCAT-MCP\\knowledge; not both). The folder is checked: a folder (not a file, not a
+        drive root) on a local fixed drive (no network share / mapped drive / USB), not inside OneDrive/Dropbox/Google
+        Drive/iCloud/Box, not inside the plugin folder, writable, >= 1 GB free — a failing condition is named and
+        nothing is changed. An existing database is never
+        moved or deleted. Without arguments it returns the current location (and changes nothing). A change is
+        refused in readonly mode and audited, as every EDIT tool (N127)."""
+        if not path and not use_fallback:                    # R38: a question, not a change — no gate, no audit
+            return await app.kb_call(app.kb.set_location, None, False)
+        args = {"path": path, "use_fallback": use_fallback}
+        await app.permit(None, OpClass.EDIT, "kb_set_location", path or "fallback")
+
+        async def body() -> dict[str, Any]:
+            res = await app.kb_call(app.kb.set_location, path, use_fallback)
+            moved = await asyncio.to_thread(app.docs_retarget)
+            if moved:
+                res["infosys_index"] = moved
+            return res
+        return await app.confirmed("kb_set_location", args, OpClass.EDIT, body())
 
     @mcp.tool(annotations=EDIT)
     async def kb_add_project(path: str, label: str | None = None) -> dict[str, Any]:
         """Index a project folder for kb_search (cross-project pattern search) — ONLY a folder the user named. Reads
-        .TcPOU/.TcDUT/.TcGVL/.TcIO beneath it into the knowledge database; nothing is indexed by default."""
-        res = await app.kb_call(app.kb.add_project, path, label)
-        app.audit("kb_add_project", {"path": path}, OpClass.EDIT, "ok", res)
-        return res
+        .TcPOU/.TcDUT/.TcGVL/.TcIO beneath it into the knowledge database; nothing is indexed by default. Refused: the
+        plugin's folders, the knowledge folder, a folder inside or around one already indexed (its units would be
+        there twice). The answer names the files that could not be read (`parse_errors`) and the files no PLC project
+        compiles (`not_in_project`). Refused in readonly mode; audited (N127)."""
+        await app.permit(None, OpClass.EDIT, "kb_add_project", path)
+        return await app.confirmed("kb_add_project", {"path": path, "label": label}, OpClass.EDIT,
+                                   app.kb_call(app.kb.add_project, path, label))
 
     @mcp.tool(annotations=EDIT)
     async def kb_remove_project(path: str) -> dict[str, Any]:
-        """Remove a project folder from the knowledge base (index entries only; the files are untouched)."""
-        res = await app.kb_call(app.kb.remove_project, path)
-        app.audit("kb_remove_project", {"path": path}, OpClass.EDIT, "ok", res)
-        return res
+        """Remove a project folder from the knowledge base (index entries only; the files are untouched). Refused in
+        readonly mode; audited (N127)."""
+        await app.permit(None, OpClass.EDIT, "kb_remove_project", path)
+        return await app.confirmed("kb_remove_project", {"path": path}, OpClass.EDIT,
+                                   app.kb_call(app.kb.remove_project, path))
 
     @mcp.tool(annotations=EDIT)
     async def kb_reindex(path: str | None = None) -> dict[str, Any]:
-        """Re-index one project folder (or every changed one) after edits."""
-        return await app.kb_call(app.kb.reindex, path)
+        """Re-index one project folder (or every changed one) after edits. Refused in readonly mode; audited (N127)."""
+        await app.permit(None, OpClass.EDIT, "kb_reindex", path or "every changed folder")
+        return await app.confirmed("kb_reindex", {"path": path}, OpClass.EDIT, app.kb_call(app.kb.reindex, path))
 
     @mcp.tool(annotations=READ)
     async def kb_search(query: str, kinds: list[str] | None = None, project: str | None = None, limit: int = 20) -> dict[str, Any]:
@@ -2222,13 +2325,21 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         FB_CounterModule); a unit whose code holds the words before one that has them only in comments
         (match_in='comments'); only when none has them all, units with some words
         (match='some words', with the words each unit holds; words on no unit or on most units are not used and
-        are listed). Stop words ('how', 'to', 'the') are not searched; a query of stop words only is refused. A copy
-        name (PRG_X_9) that no unit has falls back to the name it was copied from. "quoted text" is a phrase. kinds
-        (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION, METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT
-        (= every data type) …; project = the folder (any spelling) or its label; limit 1–200. An error message gives
-        its known cause/fix (ADS errors 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation — ADSError 1861,
-        ADS error 1861, 0x745 —, license, XAE busy / dialog / disconnected, logged in, compiler: identifier not
-        defined, cannot convert type, unknown type) and is searched only for the names it quotes.
+        are listed). A unit that declares the name (variable, constant, member, enum value, its own name) comes first
+        (`declares`). Stop words ('how', 'to', 'the') and, in a query of several words, single characters are not
+        searched; a query of stop words only is refused. There are no query operators: OR / AND / NOT / NEAR, '-',
+        '^', '*' are not read as such (`operators_note`). A copy name (PRG_X_9) that no unit has falls back to the
+        name it was copied from. "quoted text" is a phrase. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
+        POU (= those three), METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …;
+        project = the folder (any spelling) or its label; limit 1–200. `stale`: folders changed, renamed or deleted
+        since they were indexed — their hits are those of the last indexing (kb_reindex). An error message — a code in
+        a notation that says so (ADSError 1861, pyads' 'ADSError: … (1861)', ADS error 1861, error 1861, nErrId :=
+        1861, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT), a compiler message (C0046: …), or a 0x number alone; not the
+        word 'error', a decimal / 16# literal alone, a hex number anywhere or an ERR_… identifier of the code — gets the plugin's note
+        in known_error (ADS return codes 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 with code and symbol, license, XAE
+        busy / dialog / disconnected, logged in, compiler: identifier not defined, cannot convert type, unknown type;
+        null + known_errors_covered when it has none) and is searched only for the names of the code it holds
+        (quoted, or identifiers such as fbCounter, FB_Valve, MAIN.fbX).
         Beckhoff documentation is not here: the twincat-docs skill."""
         return await app.kb_call(app.kb.search, query, kinds, project, limit)
 
@@ -2336,7 +2447,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             target = computed
         xae_bound = act in netid_actions + ("xae_plc", "xae_command") or (
             act == "xae_boot_project" and bool((a or {}).get("activate_after_generate")))
-        tok = app.guard.request_token(act, target, app.scope())
+        tok = app.guard.request_token(act, target, app.scope(act))
         if xae_bound:
             real = await app._xae_netid()
             tok["xae_target"] = real
@@ -2722,8 +2833,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (default 'auto': native when installed). The response says which engine ran and why. After stopping: rec_verify.
         also_scope: also run the TwinCAT Scope configuration open in XAE (scope = its name when several are open) —
         StartRecord now; at rec_stop StopRecord and SaveSVD into <recordings>/scope/<id>.svdx, the CSV <id>.scope.csv
-        exported from that file with Beckhoff's export tool (XAE's ExportCSV only without it, flagged), a signed link
-        file, and the Scope View log's new ERROR lines (scope_view_log). What Scope records (channels, sample time) is set in that configuration. With
+        exported from that file with Beckhoff's export tool (XAE's ExportCSV only without it, flagged), XAE's ExportCSV of
+        what Scope holds in memory beside it (<id>.scope.xae.csv) with both row counts compared (cross_check — a saved
+        .svdx shorter than memory, or the reverse, is a warning), a signed link file, and the Scope View log's new
+        ERROR / FATAL lines (scope_view_log). A .svdx still being written 15 s after SaveSVD is not exported. What Scope records (channels, sample time) is set in that configuration. With
         recorder.also_scope = 'ask' (default) and a Scope configuration open, leaving also_scope unset asks the user
         (prompt, or an error that tells you to ask and call again with true/false)."""
         # R6: arguments that can never work are refused here, before the call queues behind a long job on the worker
@@ -2799,7 +2912,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def _scope_save(name: str | None, svdx: Path, csv: Path, overwrite: bool = False) -> dict[str, Any]:
         """SaveSVD, then the CSV FROM THE SAVED FILE with Beckhoff's export tool (N117: XAE's ExportCSV right after
         SaveSVD wrote a CSV that lacked the end of the .svdx — 600 ms, and 3 rows of a 58 s recording; exported from the
-        .svdx, the CSV holds what the file holds). XAE's ExportCSV only when the tool is missing or fails, flagged."""
+        .svdx, the CSV holds what the file holds). XAE's ExportCSV only when the tool is missing or fails, flagged.
+        N117 (0.8.13 retest): on another recording the saved .svdx was 34 rows SHORTER than what Scope still had in
+        memory — so both are compared every time: XAE's ExportCSV of the in-memory data is written beside it
+        (<name>.xae.csv) and the row counts are reported (cross_check), whichever is longer."""
         from . import scope as S
         out: dict[str, Any] = {}
         try:
@@ -2808,7 +2924,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         except ToolError as exc:
             out["save_svd"] = {"error": str(exc)}
             return out
-        out["save_svd"]["size_watch"] = await asyncio.to_thread(_settled, svdx)
+        watch = await asyncio.to_thread(_settled, svdx)
+        out["save_svd"]["size_watch"] = watch
+        if watch.get("still_growing_after_s") or "note" in watch:
+            # scope audit (0.8.13): the export ran on a file still being written — its CSV could lack the end
+            out["export_csv"] = {"skipped": "the saved .svdx " + ("was still being written after "
+                                 f"{watch.get('still_growing_after_s')} s" if watch.get("still_growing_after_s") else
+                                 "could not be watched") + " — nothing was exported from it; export it when it is "
+                                 f"complete: scope_export(svd={str(svdx)!r})"}
+            out["svdx_incomplete"] = out["export_csv"]["skipped"]
+            return out
         tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
         failed = None
         if tool is not None:
@@ -2818,9 +2943,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 out["export_csv"] = {"path": e["file"], "via": "TC3ScopeExportTool.exe from the saved .svdx",
                                      "lines": e["lines"], "provenance": e["provenance"],
                                      **{k: e[k] for k in ("warning", "exported_from_copy") if k in e}}
+                out["cross_check"] = await _scope_cross_check(name, csv, e["lines"], overwrite)
                 return out
             except S.ScopeError as exc:
                 failed = str(exc)
+        if csv.exists() and not overwrite:
+            # scope audit (0.8.13): the fallback wrote over an existing CSV (or counted the stale one as written)
+            out["export_csv"] = {"error": f"{csv.name} exists — XAE's ExportCSV was not run over it (overwrite=true "
+                                          "replaces it)", "export_tool": failed}
+            return out
         try:
             r = await app.xae_call(app.xae.scope_action, "export_csv", name, str(csv), timeout=600)
             out["export_csv"] = {**{k: r[k] for k in ("result_code", "path", "warning", "result_note") if k in r},
@@ -2833,10 +2964,37 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                                       + S.status(app.cfg.scope.export_tool)["note"])
         return out
 
-    def _settled(p: Path, quiet_s: float = 0.5, limit_s: float = 15.0) -> dict[str, Any]:
+    def _csv_rows(p: Path) -> int:
+        with open(p, "rb") as fh:
+            return sum(1 for _ in fh)
+
+    async def _scope_cross_check(name: str | None, csv: Path, svdx_lines: int, overwrite: bool) -> dict[str, Any]:
+        """N117: XAE's ExportCSV of what Scope holds in memory, beside the CSV of the saved .svdx, and how their row
+        counts compare — evidence either way (0.8.12: the in-memory CSV lacked the end; 0.8.13: the .svdx did)."""
+        xcsv = csv.with_name(csv.name[:-4] + ".xae.csv") if csv.name.lower().endswith(".csv") else csv.with_suffix(".xae.csv")
+        if xcsv.exists() and not overwrite:
+            return {"skipped": f"{xcsv.name} exists (overwrite=true replaces it)"}
+        try:
+            await app.xae_call(app.xae.scope_action, "export_csv", name, str(xcsv), timeout=600)
+            xl = await asyncio.to_thread(_csv_rows, xcsv)
+        except (ToolError, OSError) as exc:
+            return {"error": f"XAE's ExportCSV of the in-memory data failed: {exc}"}
+        d: dict[str, Any] = {"svdx_export_lines": svdx_lines, "xae_export": str(xcsv), "xae_export_lines": xl,
+                             "differ_by": xl - svdx_lines}
+        if xl != svdx_lines:
+            d["warning"] = (f"the CSV of the saved .svdx has {abs(xl - svdx_lines)} line(s) "
+                            + ("fewer" if xl > svdx_lines else "more")
+                            + " than XAE's ExportCSV of what Scope held in memory — "
+                            + ("the saved file may lack the end of the recording" if xl > svdx_lines else
+                               "the in-memory export lacks part of what was saved")
+                            + " (N117); both files are kept")
+        return d
+
+    def _settled(p: Path) -> dict[str, Any]:
         """Whether SaveSVD's file still grew after the call returned (not documented either way): its size watched
         until it stayed the same for quiet_s — what that shows, no more (an unchanged size is not proof the writer is
         done)."""
+        quiet_s, limit_s = SCOPE_SETTLE_S
         t0 = time.monotonic()
         try:
             last = p.stat().st_size
@@ -2873,32 +3031,37 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
         else:
             out.update(await _scope_save(run["name"], svdx, csv))
-            out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv)
+            out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv, out.get("svdx_incomplete"))
             app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
                       OpClass.EDIT, "ok")
         if run.get("log_mark"):
             out["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, run["log_mark"])
         return out
 
-    def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path) -> dict[str, Any]:
+    def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path, incomplete: str | None = None) -> dict[str, Any]:
         """Signed <id>.scope.json tying the ADS recording to the Scope files (SHA-256 each); the files are set
-        read-only like the recording (R9)."""
+        read-only like the recording (R9). incomplete: the .svdx was still being written — review of 0.8.14: it was
+        hashed and set read-only as it was; now it is neither, and the link says why."""
         from .recorder import _manifest_sig, file_sha256
         import os as _os
         import stat as _stat
         files = {}
-        for p in (svdx, csv):
+        xcsv = csv.with_name(csv.name[:-4] + ".xae.csv")
+        sealed = [p for p in (csv, xcsv) if not incomplete] + ([] if incomplete else [svdx])
+        for p in sealed:
             if p.is_file():
                 sha, n = file_sha256(p)
                 files[p.name] = {"sha256": sha, "bytes": n}
         link: dict[str, Any] = {"_scope_link": 1, "recording": rid, "scope": run["scope"], "started": run["started"],
                                 "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "files": files,
                                 "recorder": f"twincat-mcp {__version__}"}
+        if incomplete:
+            link["not_sealed"] = {"file": svdx.name, "why": incomplete}
         if app.rec.key:
             link["hmac"] = _manifest_sig(app.rec.key, link)
         lp = svdx.with_name(f"{rid}.scope.json")
         lp.write_text(json.dumps(link, indent=1) + "\n", encoding="utf-8")
-        for p in (svdx, csv, lp):
+        for p in sealed + [lp]:
             if p.is_file():
                 try:
                     _os.chmod(p, p.stat().st_mode & ~(_stat.S_IWUSR | _stat.S_IWGRP | _stat.S_IWOTH))
@@ -3034,7 +3197,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             pv = await app.proj_call(app.proj.variables, scope, 64, 200_000, False, port=app.ads.port)
             if pv.get("note"):
                 raise ToolError(f"from_attributes: {pv['note']} — which PLC project's attributes to take is not known; "
-                                "connect to the PLC project's ADS port (ads_connect) or pass scope='<file-substring>@<name>'")
+                                "connect to the PLC project's ADS port (ads_connect) or pass scope='<PLC project>@<name>'")
             try:
                 found = capture.items_from_attributes(pv["items"], cycle_ms)
             except capture.ProfileError as exc:
@@ -3335,7 +3498,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def scope_record(action: str, scope: str | None = None, path: str | None = None) -> dict[str, Any]:
         """Drive a Scope configuration open in XAE (Automation Interface IMeasurementScope): action = start | stop |
         save (SaveSVD → <recordings>/scope/<scope>-<time>.svdx, or path=<file>.svdx; the .csv exported from that file
-        with Beckhoff's export tool — XAE's ExportCSV only without it, flagged; the Scope View log's new ERROR lines).
+        with Beckhoff's export tool — XAE's ExportCSV only without it, flagged, and never over an existing CSV; XAE's
+        ExportCSV of the in-memory data beside it, <name>.xae.csv, row counts compared in cross_check; the Scope View
+        log's new ERROR / FATAL lines).
         scope = its name when several are open. Affects only the Scope recording, not the PLC."""
         if action in ("start", "stop"):
             r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
@@ -3674,8 +3839,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Every variable the project source declares, flattened to runtime instance paths by
         walking programs and GVLs through FB/STRUCT definitions (MAIN.fbFill.fbValve.bOpen …).
         scope = one program/GVL/FB to walk instead of all. Library-typed variables stay as one
-        item with their type."""
-        return await app.proj_call(app.proj.variables, scope, max_array, max_items, include_temp)
+        item with their type. A name declared in several PLC projects is walked in the PLC project on the connected ADS
+        port (the .tsproj's AmsPort); pin another with '<PLC project>@<name>'."""
+        return await app.proj_call(app.proj.variables, scope, max_array, max_items, include_temp, port=app.ads.port)
 
     @mcp.tool(annotations=READ)
     async def proj_vs_runtime(scope: str | None = None, max_items: int = 200_000) -> dict[str, Any]:
@@ -4096,8 +4262,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         initial value) of an FB, plus the ST declaration text and the page URL. The thing to call
         before writing code against an FB you have not used before. A name documented by different pages (two
         libraries, two methods of one name) is refused as ambiguous with the candidates — pass library=; one page in
-        several books is one answer (same_page_in); also_in names the other libraries. The twincat-docs skill's
-        docs_declaration resolves names by the same rule."""
+        several books is one answer (same_page_in); also_in names the other libraries. A member as '<FB>.<name>'
+        (FB_WG_ComboFilter.Call): the page below that FB in the Help Viewer contents (Beckhoff titles a method page with
+        its bare name); parent names the FB of a member. The twincat-docs skill's docs_declaration resolves names by
+        the same rule."""
         return await app.docs_call("declaration", symbol, library, timeout=1800)
 
     @mcp.tool(annotations=READ)
@@ -4106,8 +4274,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]); "quoted phrases"
         stay together, limit 1..50. A question in words falls back in tiers (query_mode, words_used); identifiers
         count as their words (FB_SocketConnect: socket, connect); titles that name the query come first; an error
-        code (0x745, 1861) lists the pages whose table defines it first (code_note); one page in several books is
-        listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
+        code (0x745, 1861 alone, 'error 1861') lists the pages whose table defines it first, code tables before other
+        pages (code_note); one page in several books — or placed twice in one — is listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
         so), results carry the page's doc version and the package date. docs.source='web': when the index has nothing,
         a DuckDuckGo site: query verified against the sitemap; the 'backend' field says which path answered."""
         return await app.docs_call("search", query, library, limit, web_fallback, timeout=300)
@@ -4126,7 +4294,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def infosys_get_page(ref: str, refresh: bool = False, max_chars: int = 60000) -> dict[str, Any]:
         """A documentation page as Markdown (headings, tables, fenced code). ref: full Infosys URL, 'book/pageid', a
         bare page id, or a symbol name ('ADSREAD'). Read from the local Help Viewer package (any page in it, indexed or
-        not; doc version + breadcrumb included) or, with docs.source='web', fetched live. Use max_chars to keep it short."""
+        not; doc version + breadcrumb included) or, with docs.source='web', fetched live. Use max_chars to keep it short.
+        parent / children: the page's place in the Help Viewer contents — an FB's page lists its method and property
+        pages, a method page names its FB."""
         return await app.docs_call("get_page", ref, refresh, max_chars, timeout=600)
 
     # ======================================================================
@@ -4282,7 +4452,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         recs = app.guard.tail_audit(1000)
         since = time.strftime("%Y-%m-%dT%H:%M", time.localtime(app.started))
         mine = [r for r in recs if r.get("ts", "") >= since]
-        lines = [f"# twincat-mcp session report", f"- started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(app.started))}",
+        lines = ["# twincat-mcp session report", f"- started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(app.started))}",
                  f"- target: {app.scope()}", f"- mode now: {app.guard.mode}", "", "## Mutating calls"]
         for r in mine:
             if r.get("op") in ("write", "control", "destructive", "edit"):
@@ -4680,6 +4850,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         app.guard_safety_path(parent_path, "xae_tree_delete")
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_tree_delete", tgt, confirm_token)
         res = await app.confirmed("xae_tree_delete", {"target": tgt}, OpClass.DESTRUCTIVE, app.xae_call(app.xae.tree_delete_child, parent_path, name, timeout=120))
+        gone = app.drop_edits_under(tgt)         # N124: an edit of a deleted object can never reach a source file
+        if gone and isinstance(res, dict):
+            res = {**res, "pending_edits_dropped": gone}
         return res
 
     # ---- PLC objects -----------------------------------------------------

@@ -540,3 +540,177 @@ def test_n113_review_an_unresolved_tsproj_reference_keeps_every_plc_project(tmp_
     r = p.scan()
     assert len(p.plcproj) == 2 and p.plcproj_not_in_project == []
     assert "could not be found" in r["plc_projects_note"] and r["plc_projects_not_found"][0]["unresolved"] is True
+
+
+def test_n123_a_property_accessor_is_found_by_its_tree_path(tmp_path):
+    """N123 (0.8.13 retest, S2): xae_pou_set of …^FB_RetestTmp^Value^Get, then xae_build (save_first) refused 'not in any
+    source file of PLC project …' although the file held the accessor — the lookup tried 'value.get' and 'get', the
+    unit is 'fb_retesttmp.value.get'."""
+    d = _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    (d / "POUs" / "FB_RetestTmp.TcPOU").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="FB_RetestTmp"><Declaration><![CDATA['
+        'FUNCTION_BLOCK FB_RetestTmp\nVAR\n  nValue : INT;\nEND_VAR]]></Declaration><Implementation><ST><![CDATA[]]>'
+        '</ST></Implementation><Method Name="M_Start"><Declaration><![CDATA[METHOD M_Start : BOOL]]></Declaration>'
+        '<Implementation><ST><![CDATA[M_Start := TRUE;]]></ST></Implementation></Method>'
+        '<Property Name="Value"><Declaration><![CDATA[PROPERTY Value : INT]]></Declaration>'
+        '<Get Name="Get"><Declaration><![CDATA[VAR\nEND_VAR]]></Declaration><Implementation><ST><![CDATA[Value := nValue;]]>'
+        '</ST></Implementation></Get></Property></POU></TcPlcObject>', encoding="utf-8")
+    register_sources(d / "Plc1.plcproj")
+    _tsproj(tmp_path, ("Plc1", 851))
+    p = idx(tmp_path)
+    for path, name, text in (("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp^Value^Get", "FB_RetestTmp.Value.Get", "Value := nValue;"),
+                             ("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp^M_Start", "FB_RetestTmp.M_Start", "M_Start := TRUE;"),
+                             ("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp", "FB_RetestTmp", None)):
+        u, why = p.unit_at_tree_path(path)
+        assert why is None and u.name == name, (path, why)
+        assert text is None or text in u.implementation
+
+
+def test_pin_is_the_plc_project_not_a_path_substring(tmp_path):
+    """0.8.13 retest (S4): 'X@Name' matched X as a substring of the absolute file path — 'Documents@MAIN' found MAIN
+    through C:\\Users\\…\\Documents, 'Plc2@MAIN' worked only because the folder was named Plc2. A pin is the PLC project
+    (its XAE tree name from the .tsproj, or its .plcproj name), else a whole folder or file name below the root."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    (tmp_path / "Machine.tsproj").write_text(
+        '<?xml version="1.0"?><TcSmProject TcVersion="3.1.4026.14"><Project><System/><Plc>'
+        '<Project GUID="{1}" Name="Filling" PrjFilePath="Plc1\\Plc1.plcproj" AmsPort="851"/>'
+        '<Project GUID="{2}" Name="Dosing" PrjFilePath="Plc2\\Plc2.plcproj" AmsPort="852"/></Plc></Project></TcSmProject>',
+        encoding="utf-8")
+    p = idx(tmp_path)
+    assert "n + 1" in p.get_unit("Filling@MAIN").implementation          # the tree name
+    assert "n + 2" in p.get_unit("dosing@MAIN").implementation           # any case
+    assert "n + 2" in p.get_unit("Plc2@MAIN").implementation             # the .plcproj name
+    assert "n + 1" in p.get_unit("Plc1@MAIN").implementation
+    assert sorted(p.plc_names()) == ["Dosing", "Filling"]
+    part = tmp_path.name[:6]                                            # a piece of the absolute path
+    with pytest.raises(ProjectError, match=r"matches 0 units; the PLC projects: \['Dosing', 'Filling'\]"):
+        p.get_unit(f"{part}@MAIN")
+    with pytest.raises(ProjectError, match="matches 0 units"):
+        p.get_unit("Plc@MAIN")                                          # no substring of 'Plc1' / 'Plc2'
+    with pytest.raises(ProjectError, match="folder or file 'POUs' of the project.*matches 2 units"):
+        p.get_unit("POUs@MAIN")                                         # a folder both have: still two
+
+
+def test_multi_plc_audit_a_name_read_on_a_port_is_that_plc_projects(tmp_path):
+    """Multi-PLC audit (0.8.13 retest): a name declared once was taken from any PLC project — PRG_B (Plc2's only) read
+    on port 851 resolved into Plc2's source; the task check then called that program 'a GVL'."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000, prog="PRG_B")
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert p.named("PRG_B", 851) is None and p.named("PRG_B", 852).name == "PRG_B"
+    assert p.named("PRG_B").name == "PRG_B"                       # no port: the only one
+    assert p.named("MAIN", 851).name == "MAIN" and p.named("MAIN", 852) is None
+    assert p.tasks_of("PRG_B", 851) is None and [t["name"] for t in p.tasks_of("PRG_B", 852)] == ["PlcTask"]
+    why = p.task_reason("PRG_B", 851)
+    assert "not declared in PLC project Plc1 (ADS port 851)" in why and "Plc2" in why
+    assert p.task_reason("PRG_B", 852) is None and p.task_reason("PRG_B") is None
+    with pytest.raises(ProjectError):
+        p.resolve_symbol("PRG_B.n", 851)
+    assert p.resolve_symbol("PRG_B.n", 852)["hops"][0]["declared_in"] == "PRG_B"
+
+
+def test_multi_plc_audit_a_tsproj_copy_no_solution_names_is_ignored(tmp_path):
+    """Multi-PLC audit: a backup copy of the .tsproj under the root kept a PLC project removed from the tree 'in the
+    project'. The .tsproj files the .sln names decide; the copy is listed as ignored."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _tsproj(tmp_path, ("Plc1", 851))                                # Plc2 was removed from the tree …
+    (tmp_path / "Backup").mkdir()
+    (tmp_path / "Backup" / "Machine.tsproj").write_text(                # … but the old copy still names it
+        '<?xml version="1.0"?><TcSmProject><Project><Plc>'
+        '<Project GUID="{1}" Name="Plc1" PrjFilePath="..\\Plc1\\Plc1.plcproj" AmsPort="851"/>'
+        '<Project GUID="{2}" Name="Plc2" PrjFilePath="..\\Plc2\\Plc2.plcproj" AmsPort="852"/></Plc></Project>'
+        '</TcSmProject>', encoding="utf-8")
+    from twincat_mcp.project_backend import _parse_tsproj
+    assert [r["plcproj"] is not None for r in _parse_tsproj(tmp_path / "Backup" / "Machine.tsproj")["plc"]] == [True, True]
+    (tmp_path / "Machine.sln").write_text(
+        'Microsoft Visual Studio Solution File, Format Version 12.00\n'
+        'Project("{B1E792BE-AA5F-4E3C-8C82-674BF9C0715B}") = "Machine", "Machine.tsproj", "{1}"\nEndProject\n',
+        encoding="utf-8")
+    p = idx(tmp_path)
+    r = p.scan()
+    assert [x["tree_name"] for x in r["plcproj"]] == ["Plc1"], r["plcproj"]
+    assert r["tsproj_ignored"]["files"] == [str(tmp_path / "Backup" / "Machine.tsproj")]
+    assert [Path(x["file"]).name for x in r["plcproj_not_in_project"]] == ["Plc2.plcproj"]
+
+
+def test_multi_plc_audit_one_missing_xti_keeps_the_others_ports(tmp_path):
+    """Multi-PLC audit: Plc2's .xti missing made every .plcproj count (right: not known) AND dropped the port mapping
+    of all of them — Plc1's port 851, named inline, was lost too."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    (tmp_path / "Machine.tsproj").write_text(
+        '<?xml version="1.0"?><TcSmProject><Project><Plc>'
+        '<Project GUID="{1}" Name="Plc1" PrjFilePath="Plc1\\Plc1.plcproj" AmsPort="851"/>'
+        '<Project File="Plc2.xti"/></Plc></Project></TcSmProject>', encoding="utf-8")
+    p = idx(tmp_path)
+    r = p.scan()
+    assert len(r["plcproj"]) == 2 and "keep their ADS port" in r["plc_projects_note"]
+    assert p.plc_project(port=851) == str(tmp_path / "Plc1" / "Plc1.plcproj")
+    assert p.tasks_of("MAIN", 851)[0]["cycle_ms"] == 10.0
+
+
+def test_n137_a_type_has_no_return_type(tmp_path):
+    """N137 (0.8.13 retest, S4): proj_list gave every ENUM return_type '(' and every STRUCT 'STRUCT' — the header's
+    ': <type>' part crossed the line end. A TYPE has none; a FUNCTION / METHOD / PROPERTY keeps its own."""
+    d = _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    (d / "DUTs").mkdir()
+    (d / "DUTs" / "E_Mode.TcDUT").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><DUT Name="E_Mode"><Declaration><![CDATA[TYPE E_Mode :\n(\n'
+        '  eIdle := 0,\n  eRun\n);\nEND_TYPE]]></Declaration></DUT></TcPlcObject>', encoding="utf-8")
+    (d / "DUTs" / "ST_X.TcDUT").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><DUT Name="ST_X"><Declaration><![CDATA[TYPE ST_X :\nSTRUCT\n'
+        '  n : INT;\nEND_STRUCT\nEND_TYPE]]></Declaration></DUT></TcPlcObject>', encoding="utf-8")
+    (d / "POUs" / "F_Add.TcPOU").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="F_Add"><Declaration><![CDATA[FUNCTION F_Add : DINT\n'
+        'VAR_INPUT\n  a : DINT;\nEND_VAR]]></Declaration><Implementation><ST><![CDATA[F_Add := a;]]></ST></Implementation>'
+        '</POU></TcPlcObject>', encoding="utf-8")
+    register_sources(d / "Plc1.plcproj")
+    p = idx(tmp_path)
+    got = {u["name"]: u.get("return_type") for u in p.list_units()["units"]}
+    assert got["E_Mode"] is None and got["ST_X"] is None and got["F_Add"] == "DINT", got
+
+
+def test_review_0814_a_port_means_its_plc_project_also_without_shared_names(tmp_path):
+    """Review of 0.8.14: _scope_units returned every unit when no name was declared twice — with Plc1 on 851 and Plc2
+    (PRG_B only) on 852, variables(port=851) listed PRG_B and resolve_symbol on 851 resolved into Plc2's source."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000, prog="PRG_B")
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert not p.duplicates
+    assert p.variables(port=851)["roots"] == ["MAIN"] and p.variables(port=852)["roots"] == ["PRG_B"]
+    with pytest.raises(ProjectError, match="not declared in PLC project Plc1 \\(ADS port 851\\)"):
+        p.variables("PRG_B", port=851)
+    assert p.variables("PRG_B", port=852)["roots"] == ["PRG_B"]
+    with pytest.raises(ProjectError):
+        p.resolve_symbol("PRG_B.n", 851)
+    v = p.variables()
+    assert sorted(v["roots"]) == ["MAIN", "PRG_B"] and "2 PLC projects and no ADS port was given" in v["note"], v
+
+
+def test_review_0814_a_pin_and_a_file_linked_into_two_plc_projects(tmp_path):
+    """Re-review of 0.8.14: variables('Plc2@MAIN', port=851) was refused (the port-bound lookup ignored the pin); a file
+    linked into both PLC projects (..\\Common\\GVL_Common.TcGVL) had one owner — the last .plcproj — and vanished from
+    the other port's variables and symbol resolution."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    common = tmp_path / "Common"
+    common.mkdir()
+    (common / "GVL_Common.TcGVL").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><GVL Name="GVL_Common"><Declaration><![CDATA[VAR_GLOBAL\n'
+        "  nShared : INT;\nEND_VAR]]></Declaration></GVL></TcPlcObject>", encoding="utf-8")
+    for plc in ("Plc1", "Plc2"):
+        pp = tmp_path / plc / f"{plc}.plcproj"
+        pp.write_text(pp.read_text().replace("</Project>", '<ItemGroup><Compile Include="..\\Common\\GVL_Common.TcGVL">'
+                                              "<SubType>Code</SubType></Compile></ItemGroup></Project>"))
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert "n + 2" in p.get_unit("Plc2@MAIN").implementation
+    assert p.variables("Plc2@MAIN", port=851)["items"][0]["path"] == "MAIN.n"
+    for port in (851, 852):
+        assert "GVL_Common" in p.variables(port=port)["roots"], port
+        assert p.resolve_symbol("GVL_Common.nShared", port)["resolved"], port
+    assert "gvl_common" in p.plc_units(p.plc_project(port=852))[0] and "gvl_common" not in p.duplicates

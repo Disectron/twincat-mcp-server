@@ -180,17 +180,21 @@ class Guard:
                 return p
         return None
 
+    def check_mode(self, op: OpClass, action: str) -> None:
+        """The mode matrix's first column: in readonly every class but READ is refused."""
+        if op is not OpClass.READ and self.mode == "readonly":
+            raise SafetyError(
+                f"server is in readonly mode; {action} ({op.value}) refused. "
+                "tc_set_mode('guarded'|'full') if the ceiling allows, or restart with TCMCP_MODE."
+            )
+
     def check(self, op: OpClass, *, action: str, target: str = "",
               confirm_token: str | None = None, scope: str = "") -> None:
         """Raise SafetyError if ``op`` is not permitted right now."""
         mode = self.mode
         if op is OpClass.READ:
             return
-        if mode == "readonly":
-            raise SafetyError(
-                f"server is in readonly mode; {action} ({op.value}) refused. "
-                "tc_set_mode('guarded'|'full') if the ceiling allows, or restart with TCMCP_MODE."
-            )
+        self.check_mode(op, action)
         if op is OpClass.EDIT:
             return
         if op is OpClass.WRITE:

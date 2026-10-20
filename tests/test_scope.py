@@ -54,7 +54,10 @@ def test_export_runs_tool_and_records_provenance(tool, tmp_path):
     assert r["lines"] == 5 and r["export_sha256"] == file_sha256(out)[0]
     p = json.loads(provenance_path(out).read_text(encoding="utf-8"))
     assert p["source_sha256"] == file_sha256(svd)[0] and p["tool_sha256"] == file_sha256(tool)[0]
-    assert p["command"][1:] == [f"svd={svd}", f"target={out}", "silent"] and p["hmac"]
+    assert p["command"][1] == f"svd={svd}" and p["command"][3] == "silent" and p["hmac"]
+    # the tool writes a work file beside the target, renamed when complete (an old CSV is never deleted first)
+    assert p["command"][2] == f"target={out.with_name(p['written_as'])}" and p["written_as"].startswith(".scope.tcmcp-")
+    assert sorted(x.name for x in out.parent.iterdir()) == sorted([out.name, provenance_path(out).name])
     with pytest.raises(S.ScopeError, match="exists"):
         S.export(svd, out, tool=tool)
     S.export(svd, out, tool=tool, overwrite=True)
@@ -156,3 +159,72 @@ def test_review_scope_export_failures_are_said_never_raw(tool, tmp_path, monkeyp
     got = S.log_errors_since(mark)
     assert got["errors"] == ["2026-10-19 15:24:25 Scope View: Server error on ordering data"]
     assert "format was not recognised" in got["note"]
+
+
+REAL_LOG = (  # the shape of TcScopeView.log at 06:04 on 2026-10-20 (0.8.13 retest): padded tags, WARNINGs around
+    "2026-10-20 06:04:31.112 [WARNING] TwinCAT State on local system changed: Run -> Config\n"
+    "2026-10-20 06:04:49.870 [ INFO  ] Reply mode entered\n"
+    "2026-10-20 06:04:50.201 [ ERROR ] Scope View: Server error on ordering data. This is often a hint at insufficient "
+    "Router memory\n"
+    "2026-10-20 06:04:50.202 [ ERROR ] Ads-Error 0xA2 (162)\n"
+    "   at TwinCAT.Scope.Server.Order()\n"
+    "2026-10-20 06:04:51.000 [WARNING] TwinCAT State on local system changed: Config -> Run\n"
+    "2026-10-20 06:04:52.000 [ INFO  ] ErrorCount=0\n"
+    "2026-10-20 06:04:53.000 [ FATAL ] view closed\n")
+
+
+def test_n119_the_padded_tags_of_the_real_log_are_read(tmp_path):
+    """N119 (0.8.13 retest, S2): the real log pads its tags ('[ ERROR ]', '[ INFO  ]') — the regex allowed no spaces,
+    so the padded errors were never read, and the '[WARNING]' a mode change always writes turned the fallback off: a
+    window with 2 router-memory / 0xA2 errors reported error_count 0. '[ INFO  ] ErrorCount=0' is no error; '[ FATAL ]'
+    is one without the word; '[ERROR] a' then '[ ERROR ] b' are two entries."""
+    log = tmp_path / "TcScopeView.log"
+    log.write_text("2026-10-20 06:00:00.000 [ ERROR ] before the call\n", encoding="utf-8")
+    mark = S.log_mark(log)
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(REAL_LOG)
+    got = S.log_errors_since(mark)
+    assert got["error_count"] == 3 and "note" not in got, got
+    assert got["errors"] == [
+        "2026-10-20 06:04:50.201 [ ERROR ] Scope View: Server error on ordering data. This is often a hint at "
+        "insufficient Router memory",
+        "2026-10-20 06:04:50.202 [ ERROR ] Ads-Error 0xA2 (162) | at TwinCAT.Scope.Server.Order()",
+        "2026-10-20 06:04:53.000 [ FATAL ] view closed"]
+    log.write_text("x [ERROR] a\ny [ ERROR ] b\n", encoding="utf-8")
+    assert S.log_errors_since({"path": str(log), "size": 0})["errors"] == ["x [ERROR] a", "y [ ERROR ] b"]
+
+
+def test_review_0813_a_long_log_window_is_read_whole(tmp_path, monkeypatch):
+    """Scope audit (0.8.13 retest): more than 4 MiB of new log → only the last 4 MiB were read; an error before them
+    was lost. The window is read in chunks, all of it — also UTF-16 and a line cut by a chunk border."""
+    monkeypatch.setattr(S, "_LOG_CHUNK", 64)
+    log = tmp_path / "TcScopeView.log"
+    body = "t [ ERROR ] first\n" + "t [ INFO  ] filler line number xx\n" * 50 + "t [ ERROR ] last\n"
+    log.write_text(body, encoding="utf-8")
+    assert S.log_errors_since({"path": str(log), "size": 0})["errors"] == ["t [ ERROR ] first", "t [ ERROR ] last"]
+    log.write_bytes(("﻿" + body).encode("utf-16-le"))
+    assert S.log_errors_since({"path": str(log), "size": 2})["errors"] == ["t [ ERROR ] first", "t [ ERROR ] last"]
+
+
+def test_review_0813_a_failed_export_keeps_the_old_csv_and_a_sealed_one_is_never_replaced(tool, tmp_path):
+    """Scope audit (0.8.13 retest): overwrite=true deleted the old CSV before the tool ran — a failed export lost it;
+    a CSV rec_stop sealed (read-only, its SHA in the signed .scope.json) could be replaced, breaking the seal."""
+    from twincat_mcp.recorder import make_writable
+    import stat as _stat
+    svd, bad = tmp_path / "a.svdx", tmp_path / "e.svdx"
+    svd.write_bytes(b"SCOPEDATA")
+    bad.write_bytes(b"EMPTY")
+    out = tmp_path / "a.csv"
+    S.export(svd, out, tool=tool)
+    before = out.read_bytes()
+    with pytest.raises(S.ScopeError, match="wrote no CSV.*a.csv is unchanged"):
+        S.export(bad, out, tool=tool, overwrite=True)
+    assert out.read_bytes() == before
+    assert sorted(x.name for x in tmp_path.iterdir() if x.name.startswith(".a.tcmcp")) == []     # no work file left
+    os.chmod(out, out.stat().st_mode & ~(_stat.S_IWUSR | _stat.S_IWGRP | _stat.S_IWOTH))      # sealed by rec_stop
+    try:
+        with pytest.raises(S.ScopeError, match="sealed .* never replaced"):
+            S.export(svd, out, tool=tool, overwrite=True)
+        assert out.read_bytes() == before
+    finally:
+        make_writable(out)

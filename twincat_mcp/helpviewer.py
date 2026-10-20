@@ -170,9 +170,43 @@ class HelpViewerSource:
         return d
 
 
+_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([\w-]+)""", re.I)
+
+
+def decode_page(raw: bytes) -> str:
+    """A package page's text. UTF-8 — the packages' encoding — strictly; a page that is not valid UTF-8 is decoded in
+    the charset its <meta> declares, else Windows-1252 (N138 retest: tf5200 pages written in Windows-1252 kept their
+    curly quotes and dashes as U+FFFD — 'Use of the parameter \ufffdrt_cycles.enable\ufffd')."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    # review of 0.8.14: a page that is not valid UTF-8 but declares utf-8 was decoded as UTF-8 with replacement — the
+    # cp1252 fallback was never reached. A declaration these bytes contradict is not followed: not UTF-8 (just
+    # failed), not UTF-16/32 (the <meta> was found as ASCII bytes); another one is tried strictly
+    m = _CHARSET.search(raw[:4096])
+    named = m.group(1).decode("ascii", "replace").lower() if m else ""
+    if named and not re.match(r"utf-?(8|16|32)", named):
+        try:
+            return raw.decode(named, errors="replace")      # a legacy charset the page declares (gb2312 …)
+        except LookupError:
+            pass
+    return raw.decode("utf-8", errors="replace") if utf8_majority(raw) else raw.decode("cp1252", errors="replace")
+
+
+def utf8_majority(raw: bytes) -> bool:
+    """Bytes that are not valid UTF-8: UTF-8 with a few bad bytes (more valid multi-byte characters than bad bytes),
+    or text of a single-byte code page (re-review of 0.8.14: one valid-looking pair such as 'ß“' = DF 93 in a
+    Windows-1252 file is not UTF-8 — counting decides, not the first sequence found)."""
+    text = raw.decode("utf-8", errors="replace")
+    bad = text.count("\ufffd")
+    good = sum(1 for c in text if ord(c) > 0x7F and c != "\ufffd")
+    return good > bad
+
+
 def page_meta(raw: bytes | str, limit: int = 8000) -> dict[str, str]:
     """<meta name=… content=…> of a package page (first occurrence wins)."""
-    text = raw[:limit].decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw[:limit]
+    text = decode_page(raw)[:limit] if isinstance(raw, bytes) else raw[:limit]
     out: dict[str, str] = {}
     for k, v in _META.findall(text):
         out.setdefault(k, v)
@@ -186,7 +220,7 @@ _CRUMB = re.compile(r"<ol[^>]*class\s*=\s*[\"'][^\"']*breadcrumb[^\"']*[\"'][^>]
 def body_html(raw: bytes) -> tuple[str, str]:
     """(html to convert, breadcrumb text). Keeps <head> (title/meta) + the <article> when there is one, drops the
     breadcrumb list so it does not end up as the first lines of every page."""
-    text = raw.decode("utf-8", errors="replace")
+    text = decode_page(raw)
     crumb = ""
     m = _CRUMB.search(text)
     if m:
