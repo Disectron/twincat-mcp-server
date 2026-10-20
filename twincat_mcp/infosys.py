@@ -34,6 +34,7 @@ import html
 import io
 import fnmatch
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -166,7 +167,7 @@ def _bump_gen(con: Any) -> None:
     con.execute("INSERT OR REPLACE INTO meta VALUES ('pages_gen', ?)", (str(n),))
 
 KINDS = ("FunctionBlock", "Function", "Program", "Method", "Property", "Action", "Enum", "Struct",
-         "Union", "Alias", "Interface", "GlobalVariable", "Library", "Page")
+         "Union", "Alias", "Interface", "GlobalVariable", "Library", "Operator", "Constant", "Page")
 
 # TwinCAT 2 book slugs. TC3 PLC libraries are tcplclib_tc2_* / tcplclib_tc3_*; the TC2 ones have no underscore.
 TC2_BOOK_RES = (re.compile(r"^tcplclib[a-z0-9]+$"), re.compile(r"twincat2"), re.compile(r"^tc2(?:[^_]|$)"),
@@ -1098,42 +1099,161 @@ def _callable_kind(title: str, code_blocks: list[tuple[str, str]], intro: str) -
     return None
 
 
+_OPERATOR_INTRO = re.compile(r"(?:^|[.!?:]\s+)(?:The|This)\s+(?:\S+\s+)?operator\b")
+_GVL_BLOCK = re.compile(r"\bVAR_GLOBAL(?:[_\s]+(?:CONSTANT|RETAIN|PERSISTENT))*\b.*?\bEND_VAR\b", re.S | re.I)
+_TYPE_BLOCK = re.compile(r"\bTYPE\b.*?\bEND_TYPE\b", re.S | re.I)
+
+
+def _code_only(code: str, block: re.Pattern) -> bool:
+    """The code holds nothing but declarations of this kind (comments, pragmas and region marks aside)."""
+    c = re.sub(r"\(\*.*?\*\)|//[^\n]*|\{[^}]*\}", " ", code, flags=re.S)
+    return bool(block.search(c)) and not block.sub(" ", c).strip(" \n\t;.…")
+
+
+def _gvl_page(code_blocks: list[tuple[str, str]], intro: str = "") -> bool:
+    """N157 (0.8.14 retest): a page whose code is nothing but VAR_GLOBAL declarations — or whose first code is, when
+    it says it documents a global variable list (TcMarkOption: '… in this global variable list …' + a usage sample) —
+    documents a global variable list. A VAR_GLOBAL block among other code is a sample (TestAndSet,
+    FB_IecCriticalSection, Samples, __TRY: 73 pages were kind GlobalVariable through one)."""
+    if not code_blocks:
+        return False
+    if all(_code_only(c, _GVL_BLOCK) for _l, c in code_blocks):
+        return True
+    return (_code_only(code_blocks[0][1], _GVL_BLOCK)
+            and bool(re.search(r"\bglobal\s+(?:variable\s+list|constants?|variables)\b|\bGVL\b", intro or "", re.I)))
+
+
+def _operator_page(title: str, intro: str) -> bool:
+    """N150 (0.8.14 retest): a page whose own sentences say it documents an operator ('The operator is an extension of
+    the IEC 61131-3 standard.', 'The __NEW operator …') — not a page of an FB, a function … (a prefix says so: an FB
+    page's 'The operator can acknowledge …' means a person)."""
+    if any(title.startswith(pre) for pre, _k in _PREFIX_KIND):
+        return False
+    return bool(_OPERATOR_INTRO.search(_prose(intro)))
+
+
+def _similar_name(a: str, b: str) -> bool:
+    """A doc error copies a sibling's header: 'METHOD OnAlarmConfirmed' on OnAlarmDisposed, 'METHOD ChildByName' on
+    Child — the names share their start; a sample's FB_Base on SUPER does not."""
+    a, b = a.lower(), b.lower()
+    common = len(os.path.commonprefix([a, b]))
+    return common >= 4 and common >= min(len(a), len(b)) // 2
+
+
+def _param_kind(title: str, code_blocks: list[tuple[str, str]], tables: list[list[list[str]]] | None,
+                table_titles: list[str] | None, intro: str) -> str | None:
+    """The kind of a page that documents its symbol's parameters — on a page titled as an identifier, or one whose
+    sentences name it ('The function block Profiler …'): 'Refactoring' / 'Operands' show such blocks as samples.
+    VAR_INPUT blocks without a header: what the page calls itself, a function block else (as before 0.8.15);
+    VAR_IN_OUT / VAR_OUTPUT blocks or Inputs / Outputs tables (Name | Type): only what the page calls itself (N157:
+    TestAndSet, 'You can use this function …' with a VAR_IN_OUT block) — none: not told."""
+    if not (_identifier_title(title) or re.search(r"\b(?:function\s+block|FB|function|method)\s+" + re.escape(title)
+                                                  + r"\b", _prose(intro))):
+        return None
+    said = _callable_of_intro(intro, title)
+    if any(not _HEAD_RE.search(c) and re.search(r"\bVAR_INPUT\b", c) for _l, c in code_blocks):
+        return said or "FunctionBlock"
+    if any(not _HEAD_RE.search(c) and re.search(r"\bVAR_(?:IN_OUT|OUTPUT)\b", c) for _l, c in code_blocks):
+        return said
+    if any(k < len(table_titles or []) and re.search(r"\b(?:inputs?|outputs?|in[ /_-]?outs?)\b", (table_titles or [])[k] or "",
+                                                       re.I) and rows and {"name", "type"} <= {c.strip().lower() for c in rows[0]}
+           for k, rows in enumerate(tables or [])):
+        return said
+    return None
+
+
+def _prose(intro: str) -> str:
+    """The page's first sentences without their code (a sample's 'FUNCTION F_X' is no word of the page)."""
+    return " ".join(re.sub(r"```.*?(?:```|$)", " ", intro or "", flags=re.S).split())
+
+
+_CALL = r"function\s+blocks?|FBs?|methods?|functions?"
+
+
+def _callable_of_intro(intro: str, title: str = "") -> str | None:
+    """What the page's own sentences call its symbol: next to its name ('The IOF_DeviceReset function block …', 'The
+    function block Profiler …'), else at the start of one of its first two sentences or after 'this' ('This callback
+    method …', 'Method reads …', 'You can use this function …'). A word elsewhere names nothing ('… structure,
+    functions, and …', '… The function corresponds to the online reset …')."""
+    prose = _prose(intro)
+    word = None
+    nm = symbol_name(title) or title.strip()
+    if nm:
+        w = re.search(rf"\b{re.escape(nm)}\s+({_CALL})\b|\b({_CALL})\s+{re.escape(nm)}\b", prose, re.I)
+        if w:
+            word = w.group(1) or w.group(2)
+    if word is None:
+        for sent in re.split(r"(?<=[.!?])\s+", prose)[:2]:
+            w = (re.match(rf"\s*(?:(?:The|This|A|An)\s+(?:[\w-]+\s+)?)?({_CALL})\b", sent, re.I)
+                 or re.search(rf"\bthis\s+(?:[\w-]+\s+)?({_CALL})\b", sent, re.I))
+            if w:
+                word = w.group(1)
+                break
+    if word is None:
+        return None
+    t = word.lower()
+    return "Method" if t.startswith("method") else "FunctionBlock" if ("block" in t or t.startswith("fb")) else "Function"
+
+
+def _identifier_title(title: str) -> bool:
+    """A title written as an identifier (TestAndSet, ReceiveByte, MC_PATH_DATA_REF, ADSREAD) — not a word of a
+    sentence ('Refactoring', 'Operands'): the parameter blocks of such a page are the symbol's, not a sample's."""
+    return bool(re.search(r"[_\d]|[a-z][A-Z]", title)) or (title.isupper() and len(title) > 1)
+
+
 def classify(title: str, code_blocks: list[tuple[str, str]], headings: list[tuple[int, str]] | None = None,
              tables: list[list[list[str]]] | None = None, table_titles: list[str] | None = None,
              intro: str = "") -> str:
     """The kind of a page, from the evidence for the page's own symbol, strongest first: its header in the code;
-    its header as the title or a heading (N103); a type or global list on a symbol page; a 'Return value' row named
-    like it (a function); the name prefix (FB_, F_ …); VAR_INPUT blocks on a symbol page. A page that documents no
-    symbol (a sentence as title) is a Page, whatever code it shows (N101)."""
+    its header as the title or a heading (N103); an operator page (N150); a 'Return value' row named like it (a
+    function); the name prefix (FB_, F_ …); a doc error — a header under another name of the kind the page's
+    sentences name ('This method …' over 'METHOD OnAlarmConfirmed'), a type under another name on a page of nothing
+    but types; parameter blocks without a header (VAR_INPUT / VAR_IN_OUT / VAR_OUTPUT) on a page titled as an
+    identifier — what the page calls itself, a function block else; a page of VAR_GLOBAL code (N157). A sample's code
+    is no evidence (0.8.14 retest: N150, N157). A page that documents no symbol (a sentence as title) is a Page,
+    whatever code it shows (N101)."""
     name = title.strip()
     syms = page_symbols(name)
     if syms:
-        typed: str | None = None
+        other: list[tuple[str, str]] = []                         # headers under another name: (keyword, code)
         for _lang, code in code_blocks:
             m = _HEAD_RE.search(code)
             if not m:
                 continue
             kw, ident = m.group(1), m.group(2) or ""
             if kw == "VAR_GLOBAL":
-                typed = typed or "GlobalVariable"                 # a GVL page: its name is the title
-            elif ident.lower() in syms:
+                continue                                          # N157: decided by _gvl_page, last
+            if ident.lower() in syms:
                 return _kind_of_type(code, m.start()) if kw == "TYPE" else _KIND_OF[kw]
-            elif kw == "TYPE" and typed is None:
-                typed = _kind_of_type(code, m.start())            # the page's type under another name (a doc error)
+            other.append((kw, code))
         head = page_header(name, headings)
         if head:
             return head[0]
-        if typed:
-            return typed
+        if _operator_page(name, intro):
+            return "Operator"                                     # N150: its samples' TYPE / FB are not its kind
         if return_from_table(name, tables, table_titles):
             # a return value: not a function block. Which callable the page does not say: a function (parse_declaration
             # says so in kind_note) — a method page says 'method' or carries its FB's name
             return _callable_kind(name, code_blocks, intro) or "Function"
+        for kw, code in other:
+            if kw == "TYPE" and all(_code_only(c, _TYPE_BLOCK) for _l, c in code_blocks):
+                return _kind_of_type(code, 0)     # the page's type under another name on a page of types (a doc error)
         for pre, kind in _PREFIX_KIND:
             if name.startswith(pre):
                 return kind
-        if any(re.search(r"\bVAR_INPUT\b", c) for _l, c in code_blocks):
-            return "FunctionBlock"
+        said = _callable_of_intro(intro, name)
+        for kw, code in other:
+            hm = _HEAD_RE.search(code)
+            if (kw not in ("TYPE", "VAR_GLOBAL") and hm and _similar_name(hm.group(2) or "", symbol_name(name) or name)
+                    and (_KIND_OF.get(kw) == said or (said is None and _identifier_title(name)))):
+                # a doc error: a sibling's header ('METHOD OnAlarmConfirmed' on OnAlarmDisposed, 'METHOD SetInitial' on
+                # SetInital) — the page's sentences do not say otherwise
+                return _KIND_OF[kw]
+        pk = _param_kind(name, code_blocks, tables, table_titles, intro)
+        if pk:
+            return pk                                             # N157: TestAndSet was a GlobalVariable
+        if _gvl_page(code_blocks, intro):
+            return "GlobalVariable"
     if re.search(r"\bPLC\s+Lib(?:rary)?\b", name, re.I):
         return "Library"
     return "Page"
@@ -1270,12 +1390,37 @@ def library_from_book(book: str) -> str | None:
     return gen.capitalize() + "_" + "".join(p.capitalize() for p in rest.split("_"))
 
 
+def _operator_syntax(markdown: str) -> str | None:
+    """N150: an operator page's syntax — the code block under its 'Syntax' label, or the text on that line
+    ('**Syntax:** __DELETE (<Pointer>)')."""
+    m = re.search(r"(?im)^[#*\t ]*Syntax[\t ]*[*:]*[\t ]*[*:]*[\t ]*(.*)$", markdown or "")
+    if not m:
+        return None
+    inline = m.group(1).strip().strip("*").strip()
+    if inline:
+        return inline
+    code = re.search(r"```[^\n`]*\n(.*?)\n```", markdown[m.end():m.end() + 2000], re.S)
+    return code.group(1).strip() if code else None
+
+
+_TYPE_KINDS = ("Struct", "Union", "Enum", "Alias")
+
+
 def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
-    kind = classify(title, doc.code_blocks, doc.headings, doc.tables, doc.table_titles, _intro_text(doc.markdown))
+    intro = _intro_text(doc.markdown)
+    kind = classify(title, doc.code_blocks, doc.headings, doc.tables, doc.table_titles, intro)
     decl: dict[str, Any] = {"name": symbol_name(title) or title.strip(), "kind": kind, "declaration": None, "extends": None, "implements": None,
                             "return_type": None, "inputs": [], "outputs": [], "in_out": [], "members": [],
                             "enum_values": [], "description": {}}
+    if kind == "Operator":
+        # N150 (0.8.14 retest): __NEW was a Struct with the sample's 'TYPE ST_Sample …' as its declaration — an
+        # operator's declaration is its syntax; the page's samples are not read
+        decl["declaration"] = _operator_syntax(doc.markdown)
+        decl["description"] = {}
+        return decl
     desc = _descriptions(doc.tables, doc.table_titles)
+    own_type = any((m := _HEAD_RE.search(c)) and m.group(1) == "TYPE" and _ident_matches(m.group(2) or "", decl["name"])
+                   for _l, c in doc.code_blocks)
     fragments: list[str] = []   # header-less VAR_INPUT/VAR_OUTPUT blocks (how Infosys documents most FBs)
     for _lang, code in doc.code_blocks:
         m = _HEAD_RE.search(code)
@@ -1290,6 +1435,15 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
                 continue
             if kw in ("TYPE", "VAR_GLOBAL") and not page_symbols(decl["name"]):
                 continue                                  # a manual page's example (N101)
+            if kw == "TYPE" and not _ident_matches(ident, decl["name"]) and (kind not in _TYPE_KINDS or own_type):
+                continue                                  # N150: a sample's type (TYPE ST_Sample on __NEW)
+            if kw == "VAR_GLOBAL" and kind != "GlobalVariable":
+                # N157: a sample's global list (TestAndSet's bGlobalTestFlag) is not the page's declaration; N172: a
+                # constant the symbol uses (T_MaxString: MAX_STRING_LENGTH) is named under constants, not members
+                if re.match(r"\s*(?:\{[^}]*\}\s*)*VAR_GLOBAL\s+CONSTANT\b", code):
+                    for sm in _SECTION_RE.finditer(code + ("\nEND_VAR" if not re.search(r"(?i)END_VAR", code) else "")):
+                        decl.setdefault("constants", []).extend(_parse_vars(sm.group(2)))
+                continue
             if decl["declaration"] is None:
                 decl["declaration"] = code.strip()
         if kw in ("FUNCTION", "METHOD", "PROPERTY"):
@@ -1341,6 +1495,11 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
                 and _callable_kind(title, doc.code_blocks, _intro_text(doc.markdown)) is None):
             decl["kind_note"] = ("the page gives a return value and no header: a function, or a method of a function "
                                  "block — it does not say which")
+    if kind == "Function" and not decl["return_type"] and re.search(r"\breturns?\s+(?:the\s+value\s+)?(?:TRUE|FALSE)\b",
+                                                                    intro):
+        # N157: TestAndSet documents no header or 'Return value' table — 'the function returns TRUE …' does
+        decl["return_type"] = "BOOL"
+        decl["return_type_note"] = "from the page's text ('returns TRUE / FALSE'); the page gives no header"
     if decl["declaration"] is None and fragments:
         head = {"FunctionBlock": "FUNCTION_BLOCK", "Program": "PROGRAM", "Function": "FUNCTION",
                 "Method": "METHOD"}.get(kind)

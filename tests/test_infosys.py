@@ -839,6 +839,67 @@ def test_n161_symbol_search_takes_globs(idx):
     assert idx.search_symbols("FB_EcCoE", limit=10, auto_index=False)["count"] == 3
 
 
+_TESTANDSET = ("<p>You can use this function to check and set a flag. If the function call is successful, the function "
+               "returns TRUE and the desired data can be accessed.</p><h2>Inputs/outputs</h2><pre>VAR_IN_OUT\n"
+               "    Flag : BOOL; (* Flag to check if TRUE or FALSE *)\nEND_VAR</pre>"
+               "<table><tr><th>Name</th><th>Type</th><th>Description</th></tr><tr><td>Flag</td><td>BOOL</td>"
+               "<td>Boolean flag to be checked</td></tr></table><h2>Sample</h2><pre>VAR_GLOBAL\n    bGlobalTestFlag : BOOL;"
+               "\nEND_VAR</pre><pre>VAR\n    nLocalBlockedCounter : DINT;\nEND_VAR</pre>"
+               "<pre>IF TestAndSet(GVL.bGlobalTestFlag) THEN\n    GVL.bGlobalTestFlag := FALSE;\nEND_IF</pre>")
+_NEW = ("<p>The operator is an extension of the IEC 61131-3 standard.</p><p>The __NEW operator dynamically reserves memory "
+        "for function blocks.</p><p><b>Syntax</b>:</p><pre>&lt;pointer name&gt; := __NEW( &lt;type&gt; ( , &lt;size&gt; )? );"
+        "\n__DELETE( &lt;pointer name&gt; );</pre><p><b>Sample:</b></p><pre>TYPE ST_Sample :\nSTRUCT\n    a,b,c,d,e,f : INT;"
+        "\nEND_STRUCT\nEND_TYPE</pre><pre>pScalarType := __NEW(ScalarType, length);</pre>")
+_DELETE = ("<p>The operator is an extension of the IEC 61131-3 standard.</p><p>The operator releases the memory of instances."
+           "</p><p><b>Syntax:</b> __DELETE (&lt;Pointer&gt;)</p><p><b>Sample:</b></p><pre>FUNCTION_BLOCK FB_Dynamic\nVAR_INPUT"
+           "\n    nIn1, nIn2 : INT;\nEND_VAR</pre><pre>__DELETE(_dut);</pre>")
+_SIZEOF = ("<p>The operator is an extension of the IEC 61131-3 standard.</p><p>The operator is used to determine the number "
+           "of bytes required by the specified variable x.</p><p><b>Syntax: </b></p><pre>&lt;return value&gt; := SIZEOF( "
+           "&lt;variable name&gt; | &lt;date type name&gt; );</pre><p><b>Sample:</b></p><pre>PROGRAM MAIN\nVAR\n"
+           "    aArr1 : ARRAY[0..4] OF INT;\nEND_VAR</pre>")
+_MAXSTRING = ("<p>The variable of this type is PLC string with the maximal length.</p><pre>TYPE T_MaxString : "
+              "STRING(MAX_STRING_LENGTH);\nEND_TYPE</pre><pre>VAR_GLOBAL CONSTANT\n    MAX_STRING_LENGTH : UDINT := 255;"
+              "\nENd_VAR</pre>")
+
+
+def test_n150_n151_n157_n172_kinds_from_the_page_not_its_samples(idx):
+    """0.8.14 retest. N157: TestAndSet (a FUNCTION returning BOOL) was kind GlobalVariable, its declaration the sample's
+    'VAR_GLOBAL bGlobalTestFlag : BOOL; END_VAR' — 73 pages were GlobalVariable through a sample's VAR_GLOBAL
+    (FB_IecCriticalSection, Samples, __TRY …). A VAR_GLOBAL block makes a global variable list only on a page whose
+    code is nothing else. N150: __NEW was a Struct (the sample's TYPE ST_Sample), __DELETE a FunctionBlock (a sample
+    FB) — an operator page is kind Operator with its Syntax as the declaration. N151: SIZEOF (an operator page) was
+    not found by docs_declaration. N172: T_MaxString listed the constant MAX_STRING_LENGTH it uses as a member."""
+    P, S = "tc3_plc_intro", "tcplclib_tc2_system"
+    with idx._db() as con:
+        for ref, title, body in [
+                (f"{S}/31023115", "TestAndSet", _TESTANDSET), (f"{P}/2529171083", "__NEW", _NEW),
+                (f"{P}/2529160331", "__DELETE", _DELETE), (f"{P}/2528896907", "SIZEOF", _SIZEOF),
+                (f"{S}/31062795", "T_MaxString", _MAXSTRING),
+                (f"{S}/2326017163", "FB_IecCriticalSection",
+                 "<p>The function block allows critical sections.</p><pre>VAR_GLOBAL\n    fbCriticalSection : "
+                 "FB_IecCriticalSection;\nEND_VAR\n\nIF fbCriticalSection.Enter() THEN\n    ;\nEND_IF</pre>"),
+                (f"{P}/12073949323", "Samples", "<p>Samples of the tutorial.</p><pre>VAR_GLOBAL\n    nSocketPort : INT;"
+                                               "\nEND_VAR</pre><pre>PROGRAM MAIN\nVAR\nEND_VAR</pre>"),
+                ("tcplclib_tc3_dali/5627593995", "Constants", "<pre>VAR_GLOBAL CONSTANT\n    cMaxDevices : INT := 64;"
+                                                             "\nEND_VAR</pre>")]:
+            idx._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", _page(title, body))
+        kinds = dict(con.execute("SELECT title, kind FROM pages"))
+    assert kinds == {"TestAndSet": "Function", "__NEW": "Operator", "__DELETE": "Operator", "SIZEOF": "Operator",
+                     "T_MaxString": "Alias", "FB_IecCriticalSection": "FunctionBlock", "Samples": "Page",
+                     "Constants": "GlobalVariable"}, kinds
+    d = idx.declaration("TestAndSet")
+    assert d["return_type"] == "BOOL" and "bGlobalTestFlag" not in (d["declaration"] or ""), d
+    assert [x["name"] for x in d["in_out"]] == ["Flag"] and d["declaration"].startswith("FUNCTION TestAndSet : BOOL"), d
+    d = idx.declaration("__NEW")
+    assert d["kind"] == "Operator" and d["declaration"].startswith("<pointer name> := __NEW("), d
+    assert "ST_Sample" not in json.dumps(d), d
+    assert idx.declaration("__DELETE")["declaration"] == "__DELETE (<Pointer>)"
+    assert idx.declaration("SIZEOF")["declaration"].startswith("<return value> := SIZEOF(")
+    d = idx.declaration("T_MaxString")
+    assert d["members"] == [] and [c["name"] for c in d["constants"]] == ["MAX_STRING_LENGTH"], d
+    assert idx.declaration("Constants")["members"][0]["name"] == "cMaxDevices"
+
+
 def test_n138_a_page_that_is_not_utf8_keeps_its_characters():
     """N138 (0.8.13 retest): the stored text of 4 tf5200 pages had U+FFFD for Beckhoff's curly quotes — the package
     page was Windows-1252, read as UTF-8 with errors replaced. (The ADS return-code table itself stores its dashes:
