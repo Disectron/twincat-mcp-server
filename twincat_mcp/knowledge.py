@@ -44,6 +44,7 @@ from typing import Any
 from . import docsearch as DS
 from . import esi_index as E
 from . import kb_layout as L
+from . import kb_lock
 
 FALLBACK_LOCATION = r"D:\TwinCAT-MCP\knowledge"
 MIN_FREE_BYTES = 1 << 30
@@ -566,12 +567,41 @@ class Knowledge:
         p.parent.mkdir(parents=True, exist_ok=True)
         return _Conn(p, self)
 
-    def _init(self, con: sqlite3.Connection) -> None:
+    def _db_if_any(self) -> "_Conn | None":
+        """For reads: the database if it exists — a read never creates index\\ or knowledge.db (agent finding of the
+        0.8.13 retest: kb_status / kb_search made both). None: no project folder was ever added here."""
+        p = L.locate(self.require(), "knowledge")
+        return _Conn(p, self, write=False) if p.is_file() else None
+
+    def _db_read(self) -> "_Conn":
+        """For a read that lists or searches: the database, or — when there is none yet — an empty one in memory with
+        the same tables (nothing is created on disk)."""
+        return self._db_if_any() or _Conn(Path(":memory:"), self)
+
+    def _write_lock(self, what: str) -> "_WriteLock":
+        """One change of knowledge.db at a time (kb_lock on index\\knowledge.db.lock, as the builds): a second
+        kb_add_project / kb_reindex / kb_remove_project — another thread of this server after a kb_call timeout, or
+        another server — is refused with what is running, instead of racing (two adds of one new folder ended in an
+        IntegrityError)."""
+        return _WriteLock(L.index_dir(self.require()) / "knowledge.db.lock", what)
+
+    def _init(self, con: sqlite3.Connection, write: bool = True) -> None:
+        """A writer creates what is missing (tables, the problems column of 0.8.14, the search table); a reader only
+        looks what is there — it never changes the database (agent finding of the 0.8.13 retest)."""
+        if not write:
+            if self._fts is None:
+                row = con.execute("SELECT sql FROM sqlite_master WHERE name = 'units_fts'").fetchone()
+                self._fts = row is not None
+                self._fts_words = bool(row and " code," in (row[0] or ""))
+            return
         con.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         con.execute("CREATE TABLE IF NOT EXISTS projects (path TEXT PRIMARY KEY, label TEXT, added TEXT, indexed TEXT, units INTEGER, files TEXT)")
         con.execute("CREATE TABLE IF NOT EXISTS units (project TEXT, name TEXT, kind TEXT, file TEXT, line INTEGER, "
                     "declaration TEXT, implementation TEXT, comments TEXT)")
         con.execute("CREATE INDEX IF NOT EXISTS units_project ON units(project)")
+        cols = {r[1] for r in con.execute("PRAGMA table_info(projects)")}
+        if "problems" not in cols:               # N132 (0.8.14): what could not be read, kept for kb_status
+            con.execute("ALTER TABLE projects ADD COLUMN problems TEXT")
         if self._fts is None:
             try:
                 con.execute(UNITS_FTS)
@@ -594,9 +624,12 @@ class Knowledge:
         low = [x for x in check_location(loc, probe=False, space=True) if "GB free" in x]
         if low:
             out["warning"] = low[0] + " — reads keep working; indexing may fail"
-        with self._db() as con:
-            out["database"] = str(L.locate(loc, "knowledge"))
-            out["projects"] = [dict(r) for r in con.execute("SELECT path, label, added, indexed, units FROM projects ORDER BY path")]
+        db_file = L.locate(loc, "knowledge")
+        if not db_file.is_file():
+            out["database_state"] = "not created yet — kb_add_project creates it"
+        with self._db_read() as con:
+            out["database"] = str(db_file)
+            out["projects"] = self._project_rows(con)
             out["fts5"] = bool(self._fts)
             old_esi = con.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('esi', 'esi_files')").fetchall()
         dup: dict[str, list[str]] = {}
@@ -704,6 +737,23 @@ class Knowledge:
         return n
 
     @staticmethod
+    def _project_rows(con: sqlite3.Connection) -> list[dict[str, Any]]:
+        """The indexed folders for kb_status, each with its state against the files now (N133: kb_status never looked
+        at the folders) and what of it could not be indexed (N132)."""
+        cols = {r[1] for r in con.execute("PRAGMA table_info(projects)")}
+        sel = "path, label, added, indexed, units, files" + (", problems" if "problems" in cols else "")
+        out = []
+        for r in con.execute(f"SELECT {sel} FROM projects ORDER BY path"):
+            pr = dict(r)
+            pr["state"] = folder_state(pr["path"], pr.pop("files"))
+            probs = json.loads(pr.pop("problems", None) or "null")
+            if probs:
+                pr.update(_problem_counts(probs))
+                pr["problems"] = probs
+            out.append(pr)
+        return out
+
+    @staticmethod
     def _project_list(con: sqlite3.Connection) -> list[str]:
         return [f"{r['label']} ({r['path']})" for r in con.execute("SELECT path, label FROM projects ORDER BY path")]
 
@@ -742,54 +792,70 @@ class Knowledge:
         if not p.is_dir():
             raise KnowledgeError(f"{path!r} is not an existing absolute folder")
         self._refuse_project_folder(p)
-        merged: list[str] = []
-        with self._db() as con:
-            self._refuse_overlap(con, p)
-            same = self._match_projects(con, str(p))
-            same = [r for r in same if norm_path(r["path"]) == norm_path(p)]       # a label is no folder match here
-            if same:
-                keep = same[0]["path"]
-                for d in same[1:]:                                                  # R35: earlier double entries
-                    self._drop_project(con, d["path"])
-                    merged.append(d["path"])
-                if label:
-                    con.execute("UPDATE projects SET label=? WHERE path=?", (label, keep))
-            else:
-                keep = str(p)
-                con.execute("INSERT INTO projects(path, label, added) VALUES (?,?,?)",
-                            (keep, label or p.name, time.strftime("%Y-%m-%dT%H:%M:%S")))
-        res = self._reindex_rows([{"path": keep, "files": None}], force=True)
-        if same:
+        with self._write_lock(f"kb_add_project {p}"):
+            db = self._db_if_any()
+            same: list[dict[str, Any]] = []
+            if db is not None:
+                with db as con:
+                    self._refuse_overlap(con, p)
+                    same = [r for r in self._match_projects(con, str(p)) if norm_path(r["path"]) == norm_path(p)]
+            keep = same[0]["path"] if same else str(p)
+            # agent finding (0.8.13): the folder was registered before it was indexed — a failed scan left it in the
+            # list with 0 units. Now it is registered in the transaction that stores its units, or not at all
+            res = self._reindex_rows([{"path": keep, "files": None,
+                                       "register": {"label": label or p.name, "relabel": label,
+                                                    "merge": [d["path"] for d in same[1:]]}}], force=True)
+        r0 = res["reindexed"][0]
+        if r0.get("error"):
+            r0["registered"] = bool(same)
+            if not same:
+                r0["note"] = "not added: nothing was stored for this folder"
+        elif same:
             res["note"] = f"{keep} was already in the knowledge base — re-indexed it instead of adding it again"
-        if merged:
-            res["merged_duplicates"] = merged
+        if same[1:] and not r0.get("error"):
+            res["merged_duplicates"] = [d["path"] for d in same[1:]]                # R35: earlier double entries
         return res
 
     def remove_project(self, path: str) -> dict[str, Any]:
-        with self._db() as con:
-            hit = self._match_projects(con, path or "")
-            if not hit:
-                raise KnowledgeError(f"{path!r} is not in the knowledge base; indexed: {self._project_list(con) or 'none'}")
-            by_folder = {norm_path(r["path"]) for r in hit}
-            if len(by_folder) > 1:
-                raise KnowledgeError(f"the label {path!r} names {len(by_folder)} different folders: "
-                                     f"{[r['path'] for r in hit]} — nothing was removed; pass the folder path")
-            n = sum(self._drop_project(con, r["path"]) for r in hit)
+        with self._write_lock(f"kb_remove_project {path}"):
+            db = self._db_if_any()
+            if db is None:
+                raise KnowledgeError(f"{path!r} is not in the knowledge base; indexed: none")
+            with db as con:
+                hit = self._match_projects(con, path or "")
+                if not hit:
+                    raise KnowledgeError(f"{path!r} is not in the knowledge base; indexed: {self._project_list(con) or 'none'}")
+                by_folder = {norm_path(r["path"]) for r in hit}
+                if len(by_folder) > 1:
+                    raise KnowledgeError(f"the label {path!r} names {len(by_folder)} different folders: "
+                                         f"{[r['path'] for r in hit]} — nothing was removed; pass the folder path")
+            with self._db() as con:
+                n = sum(self._drop_project(con, r["path"]) for r in hit)
         return {"removed": [r["path"] for r in hit], "units_removed": n,
                 "note": "only the index entries were removed; your files are untouched"}
 
     def reindex(self, path: str | None = None) -> dict[str, Any]:
-        with self._db() as con:
-            if path:
-                rows = self._match_projects(con, path)
-                if not rows:
-                    raise KnowledgeError(f"{path!r} is not in the knowledge base (indexed: {self._project_list(con) or 'none'}); "
-                                         "kb_add_project first")
-            else:
-                rows = [dict(r) for r in con.execute("SELECT path, files FROM projects")]
-        return self._reindex_rows(rows, force=bool(path))
+        with self._write_lock(f"kb_reindex {path or '(every changed folder)'}"):
+            db = self._db_if_any()
+            if db is None:
+                if path:
+                    raise KnowledgeError(f"{path!r} is not in the knowledge base (indexed: none); kb_add_project first")
+                return {"reindexed": [], "note": "no project folders in the knowledge base yet — kb_add_project(path)"}
+            with db as con:
+                if path:
+                    rows = self._match_projects(con, path)
+                    if not rows:
+                        raise KnowledgeError(f"{path!r} is not in the knowledge base (indexed: "
+                                             f"{self._project_list(con) or 'none'}); kb_add_project first")
+                else:
+                    rows = [dict(r) for r in con.execute("SELECT path, files FROM projects")]
+            return self._reindex_rows(rows, force=bool(path))
 
     def _reindex_rows(self, rows: list[dict[str, Any]], force: bool) -> dict[str, Any]:
+        """Read each folder, then store its units — and, for a folder being added (`register`), its entry — in one
+        transaction. N132: the files that could not be read, the files no PLC project compiles and the files read
+        in another encoding than they claim are named in the answer and kept with the entry (kb_status); the whole
+        code and comments are stored (they were cut at 20,000 / 5,000 characters and not searchable after that)."""
         from .config import ProjectConfig
         from .project_backend import ProjectIndex
         out = []
@@ -810,22 +876,34 @@ class Knowledge:
                 out.append({"project": r["path"], "error": str(exc)})
                 continue
             units = [u for u in idx.all_units() if u.kind != "PARSE_ERROR"]     # both MAINs of two PLC projects
+            problems = _problems(idx)
+            reg = r.get("register")
             with self._db() as con:
+                if reg is not None:
+                    for d in reg["merge"]:
+                        self._drop_project(con, d)
+                    if con.execute("SELECT 1 FROM projects WHERE path=?", (r["path"],)).fetchone():
+                        if reg["relabel"]:
+                            con.execute("UPDATE projects SET label=? WHERE path=?", (reg["relabel"], r["path"]))
+                    else:
+                        con.execute("INSERT INTO projects(path, label, added) VALUES (?,?,?)",
+                                    (r["path"], reg["label"], time.strftime("%Y-%m-%dT%H:%M:%S")))
                 con.execute("DELETE FROM units WHERE project=?", (r["path"],))
                 if self._fts:
                     con.execute("DELETE FROM units_fts WHERE project=?", (r["path"],))
                 for u in units:
                     txt = (u.declaration or "") + "\n" + (u.implementation or "")
                     comments = " ".join(a or b for a, b in re.findall(r"\(\*(.*?)\*\)|//([^\n]*)", txt, re.S))
-                    row = (r["path"], u.name, u.kind, u.file, u.decl_line0, u.declaration or "", (u.implementation or "")[:20000], comments[:5000])
+                    row = (r["path"], u.name, u.kind, u.file, u.decl_line0, u.declaration or "", u.implementation or "", comments)
                     con.execute("INSERT INTO units VALUES (?,?,?,?,?,?,?,?)", row)
                     if self._fts:
                         con.execute(f"INSERT INTO units_fts({UNITS_FTS_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?)",
                                     (row[0], row[1], row[2], row[3], row[5], row[6], row[7], *unit_words(row[1], row[5], row[6])))
-                con.execute("UPDATE projects SET indexed=?, units=?, files=? WHERE path=?",
-                            (time.strftime("%Y-%m-%dT%H:%M:%S"), len(units), stamp, r["path"]))
-            out.append({"project": r["path"], "units": len(units), "files": scan.get("files"),
-                        "parse_errors": sum(1 for u in idx.units.values() if u.kind == "PARSE_ERROR")})
+                con.execute("UPDATE projects SET indexed=?, units=?, files=?, problems=? WHERE path=?",
+                            (time.strftime("%Y-%m-%dT%H:%M:%S"), len(units), stamp,
+                             json.dumps(problems) if problems else None, r["path"]))
+            out.append({"project": r["path"], "units": len(units), "files": scan.get("files"), **_problem_counts(problems),
+                        **problems})
         res: dict[str, Any] = {"reindexed": out}
         if upgraded is not None:
             res["search_table"] = upgraded
@@ -904,7 +982,7 @@ class Knowledge:
         if not phrases and not informative and not err:
             raise KnowledgeError(f"the query {q!r} has only stop words ({', '.join(ignored)}): kb_search looks for the "
                                  "names and words of the code — give a unit or variable name, or specific words")
-        with self._db() as con:
+        with self._db_read() as con:
             nproj = con.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
             hits: list[dict[str, Any]] = []
             info: dict[str, Any] = {}
@@ -915,6 +993,10 @@ class Knowledge:
                     raise KnowledgeError(f"no indexed project is {project!r} (path or label); indexed: "
                                          f"{self._project_list(con) or 'none'}")                    # R35 / R39
                 scope = [r["path"] for r in m]
+            # N133: a folder edited, renamed or deleted after indexing was answered from its old units, silently
+            stale = [{"project": r["path"], "label": r["label"], "state": st}
+                     for r in con.execute("SELECT path, label, files FROM projects ORDER BY path")
+                     if (not scope or r["path"] in scope) and (st := folder_state(r["path"], r["files"])) != "current"]
             base_note = None
             if nproj and (phrases or informative):
                 hits, info = self._search_tiers(con, phrases, informative, want_kinds, scope, limit)
@@ -932,6 +1014,8 @@ class Knowledge:
                             base_note = (f"no unit contains {', '.join(bases)}; these contain the name it is a copy "
                                          f"of ({', '.join(bases.values())}) — TwinCAT names copies <name>_<n>")
         out: dict[str, Any] = {"query": q, "hits": hits, "projects_indexed": nproj}
+        if stale:
+            out["stale"] = stale
         if ignored or info.get("ignored"):
             out["words_ignored"] = {**ignored, **info.get("ignored", {})}
         if info.get("used") is not None and info.get("tier") == "some words":
@@ -1295,15 +1379,60 @@ def _lib_row(name: str, resolution: str, kind: str, installed: dict[str, dict[st
     return row
 
 
+_STAMP_EXT = (".tcpou", ".tcdut", ".tcgvl", ".tcio", ".plcproj", ".tsproj", ".xti", ".sln")
+_STAMP_SKIP = {".git", ".vs", ".svn", "_boot", "_compileinfo", "_libraries"}
+
+
 def _tree_stamp(root: Path) -> str:
+    """What the index of a folder depends on: its sources, and what decides which of them are units — the .plcproj
+    files (N106), the .tsproj / .xti files that name the PLC projects and the .sln that names the .tsproj (N133: an
+    edit of those changed the units without changing the stamp). Folders the scan never reads are not walked."""
     import hashlib
     h = hashlib.sha256()
-    for f in sorted(root.rglob("*")):
-        # N106: a .plcproj decides which source files are units — a change of it changes the index
-        if f.suffix.lower() in (".tcpou", ".tcdut", ".tcgvl", ".tcio", ".plcproj") and f.is_file():
-            st = f.stat()
-            h.update(f"{f}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+    found: list[tuple[str, int, int]] = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d.lower() not in _STAMP_SKIP]
+        for name in files:
+            if name.lower().endswith(_STAMP_EXT):
+                f = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(f)
+                except OSError:
+                    continue
+                found.append((f, st.st_size, st.st_mtime_ns))
+    for f, size, mt in sorted(found):
+        h.update(f"{f}:{size}:{mt}\n".encode())
     return h.hexdigest()
+
+
+def folder_state(path: str, stamp: str | None) -> str:
+    """N133: an indexed folder against its files now — 'current', or what kb_search answers from (the units of the
+    last indexing) and what to do."""
+    if not Path(path).is_dir():
+        return "folder not found (moved, renamed or deleted?) — its units are those of the last indexing: kb_remove_project, or kb_add_project the new place"
+    if stamp != _tree_stamp(Path(path)):
+        return "files changed since it was indexed — its units are those of the last indexing: kb_reindex"
+    return "current"
+
+
+def _problems(idx: Any) -> dict[str, Any]:
+    """N132: what of a folder is not in the index, by file — the files that are no XML, the files read in another
+    encoding than they claim, the files no PLC project compiles (a backup copy beside the project)."""
+    out: dict[str, Any] = {}
+    errs = idx.parse_errors()
+    if errs:
+        out["parse_errors"] = errs
+    if idx.read_notes:
+        out["read_notes"] = dict(sorted(idx.read_notes.items()))
+    if idx.not_in_project:
+        out["not_in_project"] = {"count": len(idx.not_in_project), "files": idx.not_in_project[:50],
+                                 "why": "no PLC project of the folder compiles them (.plcproj): not units"}
+    return out
+
+
+def _problem_counts(problems: dict[str, Any]) -> dict[str, int]:
+    return {"parse_errors": len(problems.get("parse_errors", [])),
+            "not_in_project_count": (problems.get("not_in_project") or {}).get("count", 0)}
 
 
 def ro_uri(db: Path) -> str:
@@ -1620,20 +1749,44 @@ def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
     return {"manuals": found, "manuals_more": "twincat-docs skill: manual_search query=… doc=… / manual_page"}
 
 
+class _WriteLock:
+    """with kb._write_lock(what): … — kb_lock's operating-system lock on index\\knowledge.db.lock; KnowledgeError
+    naming the running change when another holds it."""
+
+    def __init__(self, path: Path, what: str):
+        self.lk = kb_lock.IndexLock(path)
+        self.what = what
+
+    def __enter__(self) -> "_WriteLock":
+        try:
+            self.lk.__enter__()
+        except kb_lock.Held as h:
+            i = h.info or {}
+            raise KnowledgeError(f"another change of the knowledge base is running ({i.get('phase') or 'unknown'}, "
+                                 f"pid {i.get('pid')}, started {i.get('started')}) — wait until it is finished, then "
+                                 "repeat this call (kb_status shows the result)") from None
+        self.lk.update(phase=self.what)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.lk.__exit__(*exc)
+
+
 class _Conn:
-    def __init__(self, path: Path, kb: Knowledge):
-        self.path, self.kb = path, kb
+    def __init__(self, path: Path, kb: Knowledge, write: bool = True):
+        self.path, self.kb, self.write = path, kb, write
         self.con: sqlite3.Connection | None = None
 
     def __enter__(self) -> sqlite3.Connection:
         self.con = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
-        try:
-            self.con.execute("PRAGMA journal_mode=WAL")
-            self.con.execute("PRAGMA synchronous=NORMAL")
-        except sqlite3.DatabaseError:
-            pass
-        self.kb._init(self.con)
+        if self.write:
+            try:
+                self.con.execute("PRAGMA journal_mode=WAL")
+                self.con.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.DatabaseError:
+                pass
+        self.kb._init(self.con, self.write)
         return self.con
 
     def __exit__(self, et, ev, tb):

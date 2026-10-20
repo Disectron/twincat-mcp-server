@@ -81,7 +81,11 @@ resolved to page addresses. Readers never repair stored data; a fix to what is s
     the next manuals update starts again from the index in use (PDFs already in it are not read again), the next
     ESI build starts over (minutes).
   - `knowledge.db` holds the project folders, so it is never swapped as a file: it changes in one transaction per
-    folder (the database is WAL — readers keep the rows of before until the commit). Its search table (`units_fts`)
+    folder (the database is WAL — readers keep the rows of before until the commit); a folder being added is
+    registered in the transaction that stores its units, or not at all. One change at a time: `kb_add_project`,
+    `kb_reindex`, `kb_remove_project` hold the lock on `knowledge.db.lock` (as a build holds `<index>.lock`); a
+    second one is refused with what is running. A read (`kb_status`, `kb_search`) never creates `index\` or
+    `knowledge.db`. Its search table (`units_fts`)
     is derived from the stored units: a new layout of it (0.8.12: the words of names and identifiers, the code
     without comments) is rebuilt from them in one transaction at the next `kb_reindex` / `kb_add_project` — no
     project file is read for it; until then `kb_search` uses the table as it is and says so. The ESI table it held

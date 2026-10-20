@@ -40,6 +40,55 @@ def _norm(p: Path) -> str:
         return os.path.normcase(str(p))
 
 
+_BOMS = ((b"\xef\xbb\xbf", "utf-8"), (b"\xff\xfe\x00\x00", "utf-32-le"), (b"\x00\x00\xfe\xff", "utf-32-be"),
+         (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be"))
+_XML_ENCODING = re.compile(r"""^<\?xml[^>]*?\bencoding\s*=\s*["']([A-Za-z0-9._:-]+)["']""")
+
+
+def decode_source(raw: bytes) -> tuple[str, str, bytes, str | None]:
+    """(text, encoding, BOM, note) of a TwinCAT XML source file, read as an XML parser reads it: the byte-order mark,
+    else UTF-16 by its first character, else the encoding the XML declaration names, else UTF-8. N132: a UTF-16
+    .TcPOU (valid XML) was a parse error — every file was read as UTF-8 with bad bytes replaced. Nothing is replaced
+    silently: a file that is not valid in its encoding gets a note (one that claims, or defaults to, UTF-8 and is not,
+    is read as Windows-1252 — what a German Windows wrote — and the note says so)."""
+    bom, enc = b"", None
+    for b, e in _BOMS:
+        if raw.startswith(b):
+            bom, enc = b, e
+            break
+    if enc is None and raw[:4] in (b"<\x00?\x00", b"\x00<\x00?"):
+        enc = "utf-16-le" if raw[0] == 0x3C else "utf-16-be"
+    body = raw[len(bom):]
+    named = None
+    if enc is None:
+        m = _XML_ENCODING.match(body[:200].decode("ascii", "replace"))
+        named = m.group(1) if m else None
+        enc = named or "utf-8"
+    try:
+        import codecs
+        enc = codecs.lookup(enc).name
+    except LookupError:
+        note = f"the XML declaration names an unknown encoding {named!r} — read as UTF-8"
+        enc = "utf-8"
+        try:
+            return body.decode("utf-8"), enc, bom, note
+        except UnicodeDecodeError:
+            return body.decode("cp1252", "replace"), "cp1252", bom, note + " (not valid UTF-8: read as Windows-1252)"
+    try:
+        return body.decode(enc), enc, bom, None
+    except UnicodeDecodeError as exc:
+        where = f"byte 0x{body[exc.start]:02X} at offset {exc.start + len(bom)}"
+        if enc == "utf-8":
+            return (body.decode("cp1252", "replace"), "cp1252", bom,
+                    f"not valid UTF-8 ({where}) — read as Windows-1252; check its umlauts")
+        return body.decode(enc, "replace"), enc, bom, f"not valid {enc} ({where}) — such bytes read as U+FFFD"
+
+
+def read_source(p: Path) -> str:
+    """The text of a TwinCAT XML file (decode_source), for reading."""
+    return decode_source(Path(p).read_bytes())[0]
+
+
 def _compiled_files(plcproj: list[dict[str, Any]]) -> dict[str, str] | None:
     """N106: the files the PLC projects compile (<Compile Include="POUs\\MAIN.TcPOU"/>, relative to the .plcproj,
     MSBuild-escaped), each with the .plcproj that compiles it — None when there is no .plcproj (a folder of loose
@@ -96,7 +145,7 @@ def _parse_tsproj(p: Path) -> dict[str, Any]:
     "path_in_file", "why"?}]}. PrjFilePath is relative to the file that holds it; the .tsproj's folder is tried too."""
     d: dict[str, Any] = {"file": str(p), "plc": [], "error": None}
     try:
-        root = ET.fromstring(p.read_text(encoding="utf-8-sig", errors="replace"))
+        root = ET.fromstring(read_source(p))
     except (ET.ParseError, OSError) as exc:
         d["error"] = f"{type(exc).__name__}: {exc}"
         return d
@@ -112,7 +161,7 @@ def _parse_tsproj(p: Path) -> dict[str, Any]:
                                      "unresolved": True})
                     continue
                 try:
-                    xr = ET.fromstring(xti.read_text(encoding="utf-8-sig", errors="replace"))
+                    xr = ET.fromstring(read_source(xti))
                 except (ET.ParseError, OSError) as exc:
                     d["plc"].append({"name": el.get("Name"), "plcproj": None, "ams_port": None,
                                      "why": f"{str(xti)!r} cannot be read: {exc}", "unresolved": True})
@@ -370,9 +419,10 @@ class _Index:
     the published dicts, which are never changed in place; a scan swaps in complete new ones)."""
     by_file: dict[str, dict[str, CodeUnit]]   # file -> its units by lower-case name: every file's units are kept
     files: dict[str, float]
+    notes: dict[str, str] = field(default_factory=dict)     # file -> how it was read, when not as it claims (N132)
 
     def copy(self) -> "_Index":
-        return _Index(dict(self.by_file), dict(self.files))
+        return _Index(dict(self.by_file), dict(self.files), dict(self.notes))
 
     def merged(self) -> tuple[dict[str, CodeUnit], dict[str, list[str]]]:
         """The name -> unit view (a name declared in two files: the file indexed last) and the names declared in
@@ -401,6 +451,7 @@ class ProjectIndex:
         self._by_file: dict[str, dict[str, CodeUnit]] = {}   # N113: file -> its units (names in two files both kept)
         self._plc_cache: tuple[Any, Any, dict[Any, tuple[dict[str, CodeUnit], set[str]]], dict[str, str | None]] | None = None
         self.files: dict[str, float] = {}         # path -> mtime
+        self.read_notes: dict[str, str] = {}      # file -> how it was read when not as it claims (N132)
         self.solutions: list[str] = []
         self.tsproj: list[str] = []
         self.tsproj_ignored: list[str] = []     # .tsproj files no .sln under the root names (a backup copy)
@@ -434,7 +485,7 @@ class ProjectIndex:
             raise ProjectError(f"project root not set or not a directory: {self.root}. "
                                "Pass root= or set TCMCP_PROJECT_ROOT / TCMCP_SOLUTION.")
         t0 = time.time()
-        ix = _Index({}, {})
+        ix = _Index({}, {}, {})
         stamp = _plcproj_stamp(self.root)            # before reading: a change made during the scan rescans next time
         solutions = [str(p) for p in self.root.rglob("*.sln")]
         tsproj_files, ts_ignored = _solution_tsproj([Path(x) for x in solutions], list(self.root.rglob("*.tsproj")))
@@ -481,6 +532,11 @@ class ProjectIndex:
                             **({"tree_name": p["tree_name"], "ams_port": p["ams_port"]} if "tree_name" in p else {}),
                             **({"error": p["error"]} if p.get("error") else {})} for p in self.plcproj],
                "duration_s": round(time.time() - t0, 2)}
+        errs = self.parse_errors()
+        if errs:
+            out["parse_errors"] = errs
+        if self.read_notes:
+            out["read_notes"] = dict(sorted(self.read_notes.items()))
         missing = [r for r in self.plc_refs if not r.get("plcproj")]
         if missing:
             out["plc_projects_not_found"] = missing
@@ -492,6 +548,12 @@ class ProjectIndex:
     def _publish(self, ix: _Index) -> None:
         units, dup = ix.merged()
         self.units, self.duplicates, self._by_file, self.files = units, dup, ix.by_file, ix.files
+        self.read_notes = ix.notes
+
+    def parse_errors(self) -> list[dict[str, str]]:
+        """N132: the files that could not be read as XML, each with the parser's message — named, not only counted."""
+        return sorted(({"file": u.file, "error": u.declaration} for us in self._by_file.values() for u in us.values()
+                       if u.kind == "PARSE_ERROR"), key=lambda d: d["file"])
 
     @staticmethod
     def _parse_error(p: Path, exc: Exception, ix: _Index) -> None:
@@ -631,7 +693,7 @@ class ProjectIndex:
                     "rescanned": "a .plcproj, .tsproj or .xti changed"}
         changed, added, removed = [], [], []
         seen: set[str] = set()
-        ix = _Index(dict(self._by_file), dict(self.files))
+        ix = _Index(dict(self._by_file), dict(self.files), dict(self.read_notes))
         for p in self.root.rglob("*"):
             if p.suffix.lower() in SRC_EXT and p.is_file():
                 if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
@@ -656,6 +718,7 @@ class ProjectIndex:
                 removed.append(sp)
                 ix.by_file.pop(sp, None)
                 ix.files.pop(sp, None)
+                ix.notes.pop(sp, None)
         if changed or added or removed:
             self._publish(ix)                         # published whole (N88)
         self.scanned_at = time.time()
@@ -665,7 +728,7 @@ class ProjectIndex:
         """Re-index one file now (after an edit): its units replaced, the index published whole (N88). Raises
         ET.ParseError — and publishes nothing — when the file does not parse."""
         with self._scan_lock:
-            ix = _Index(dict(self._by_file), dict(self.files))
+            ix = _Index(dict(self._by_file), dict(self.files), dict(self.read_notes))
             self._index_file(p, ix)
             self._publish(ix)
 
@@ -734,12 +797,16 @@ class ProjectIndex:
     def _index_file(self, p: Path, ix: _Index) -> None:
         """Index one file into ix.by_file[file] (replacing what the file held). Raises ET.ParseError before anything
         of ix is changed."""
-        text = p.read_text(encoding="utf-8-sig", errors="replace")
+        text, _enc, _bom, note = decode_source(p.read_bytes())
         mtime = p.stat().st_mtime
         root = ET.fromstring(text)
         mine: dict[str, CodeUnit] = {}
         ix.files[str(p)] = mtime
         ix.by_file[str(p)] = mine
+        if note:
+            ix.notes[str(p)] = note
+        else:
+            ix.notes.pop(str(p), None)
         kind_tag = SRC_EXT[p.suffix.lower()]
         obj = root.find(kind_tag)
         if obj is None:
@@ -1141,8 +1208,12 @@ class ProjectIndex:
             raise ProjectError(f"{u.name} is a PROPERTY; edit {u.name}.Get / {u.name}.Set implementations instead")
         p = Path(u.file)
         raw = p.read_bytes()
-        bom = raw.startswith(b"\xef\xbb\xbf")
-        text = raw[3:].decode("utf-8", errors="replace") if bom else raw.decode("utf-8", errors="replace")
+        text, enc, bom_bytes, note = decode_source(raw)
+        if note:
+            # N132: written back, the replaced / re-read bytes would change text the edit never touched
+            raise ProjectError(f"{u.file} is {note.split(' — ')[0]}: not edited (it would be written back changed) — "
+                               "fix the file's encoding in XAE first")
+        bom = bool(bom_bytes)
         eol = "\r\n" if "\r\n" in text else "\n"
         if declaration is not None:
             declaration = declaration.replace("\r\n", "\n").replace("\n", eol)
@@ -1185,7 +1256,11 @@ class ProjectIndex:
             return {"file": u.file, "changed": [], "note": "no change"}
         bak = p.with_suffix(p.suffix + ".bak")
         bak.write_bytes(raw)
-        out = (b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8")
+        try:
+            out = bom_bytes + new.encode(enc)                 # the file's own encoding (UTF-16 stays UTF-16)
+        except UnicodeEncodeError as exc:
+            raise ProjectError(f"{new[exc.start:exc.end]!r} cannot be written in {u.file}'s encoding ({enc}): "
+                               "nothing was changed") from exc
         p.write_bytes(out)
         # re-index this file
         try:
@@ -1362,7 +1437,7 @@ class ProjectIndex:
             if left and self._nearest(f, self.plcproj + left) in {pp["file"] for pp in left}:
                 continue                      # N114: a task of a PLC project no .tsproj names is no task of the project
             try:
-                task = ET.fromstring(f.read_text(encoding="utf-8-sig", errors="replace")).find("Task")
+                task = ET.fromstring(read_source(f)).find("Task")
             except (ET.ParseError, OSError):
                 continue
             if task is None:
@@ -1460,8 +1535,13 @@ class ProjectIndex:
         self.assert_inside(p)
         if not p.is_file():
             raise ProjectError(f"file not found: {p}")
-        txt = p.read_text(encoding="utf-8-sig", errors="replace")
-        return {"file": str(p), "chars": len(txt), "text": txt[:max_chars], "truncated": len(txt) > max_chars}
+        txt, enc, _bom, note = decode_source(p.read_bytes())
+        out = {"file": str(p), "chars": len(txt), "text": txt[:max_chars], "truncated": len(txt) > max_chars}
+        if note or enc not in ("utf-8", "ascii"):
+            out["encoding"] = enc
+        if note:
+            out["read_note"] = note
+        return out
 
     def allowed_roots(self) -> list[Path]:
         roots: list[Path] = []

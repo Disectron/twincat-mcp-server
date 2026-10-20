@@ -801,3 +801,100 @@ def test_n136_location_messages_long_paths_sync_names_drive_root_and_fallback(kb
     with pytest.raises(K.KnowledgeError, match="either path=… or use_fallback=true, not both"):
         k.set_location(str(tmp / "kbdata"), use_fallback=True)
     assert k.location()[0] is None
+
+
+def test_agent_findings_registration_write_lock_and_reads_that_create_nothing(kb, project_dir, tmp_path, monkeypatch):
+    """Agent findings of the 0.8.13 retest (code): kb_add_project registered the folder before indexing it (a crash
+    left it with 0 units); knowledge.db had no lock — two adds of one new folder ended in an IntegrityError; kb_status
+    and kb_search (READ) created index\\ and the tables."""
+    k, tmp = kb
+    kbf = tmp_path / "kb_ro"
+    kbf.mkdir()
+    k2 = K.Knowledge(tmp_path / "home_ro", str(kbf))
+    st = k2.status()
+    assert st["projects"] == [] and "not created yet" in st["database_state"]
+    assert k2.search("FB_Valve")["projects_indexed"] == 0
+    assert not (kbf / "index" / "knowledge.db").exists()
+    with pytest.raises(K.KnowledgeError, match="not in the knowledge base"):
+        k2.remove_project(str(project_dir))
+    # a folder whose scan fails is not registered
+    k.set_location(str(tmp / "kbdata"))
+    from twincat_mcp import project_backend as PB
+
+    def broken(self, root=None):
+        raise RuntimeError("disk read error")
+    monkeypatch.setattr(PB.ProjectIndex, "scan", broken)
+    r = k.add_project(str(project_dir), "p")
+    assert r["reindexed"][0]["error"] == "disk read error" and r["reindexed"][0]["note"].startswith("not added"), r
+    assert k.status()["projects"] == []
+    monkeypatch.undo()
+    # one change at a time: a second writer is refused with what runs
+    from twincat_mcp import kb_lock
+    with kb_lock.IndexLock(tmp / "kbdata" / "index" / "knowledge.db.lock") as lk:
+        lk.update(phase="kb_reindex (every changed folder)")
+        for call in (lambda: k.add_project(str(project_dir)), lambda: k.reindex(), lambda: k.remove_project("p")):
+            with pytest.raises(K.KnowledgeError, match=r"another change of the knowledge base is running \(kb_reindex"):
+                call()
+        assert k.search("FB_Valve")["projects_indexed"] == 0               # reads are not blocked
+    assert k.add_project(str(project_dir), "p")["reindexed"][0]["units"] >= 8
+
+
+def test_n132_unreadable_files_are_named_utf16_read_and_no_text_cut(kb, project_dir, tmp_path):
+    """N132 (0.8.13 retest): parse errors were only counted (no file); a UTF-16 .TcPOU (valid XML) was a parse error,
+    cp1252 umlauts became U+FFFD; a source no PLC project compiles was skipped without a word; code after 20,000
+    characters and comments after 5,000 were not searchable."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    pous = project_dir / "Plc" / "POUs"
+    _pou(pous, "FB_Utf16", "FUNCTION_BLOCK FB_Utf16\nVAR\n    nDurchfluss : INT; // Durchfluß\nEND_VAR")
+    f16 = pous / "FB_Utf16.TcPOU"
+    f16.write_bytes(f16.read_text(encoding="utf-8").replace('encoding="utf-8"', 'encoding="utf-16"').encode("utf-16"))
+    _pou(pous, "FB_Ansi", "FUNCTION_BLOCK FB_Ansi\nVAR\n    nMenge : INT; // Größe\nEND_VAR")
+    fa = pous / "FB_Ansi.TcPOU"
+    fa.write_bytes(fa.read_text(encoding="utf-8").encode("cp1252"))          # claims UTF-8, holds cp1252 bytes
+    (pous / "FB_Broken.TcPOU").write_text("<?xml version='1.0'?><TcPlcObject><POU Name='FB_Broken'>", encoding="utf-8")
+    _pou(pous, "FB_Long", "FUNCTION_BLOCK FB_Long\nVAR\nEND_VAR", ";\n" * 15000 + "nZzqFinalWord := 1; // zzqlastcomment")
+    from tests.conftest import register_sources
+    register_sources(project_dir / "Plc" / "Plc.plcproj")
+    _pou(project_dir / "Plc" / "Backup", "FB_KbDup", "FUNCTION_BLOCK FB_KbDup\nVAR\nEND_VAR")   # not compiled
+    r = k.add_project(str(project_dir), "p")["reindexed"][0]
+    assert [e["file"] for e in r["parse_errors"]] == [str(pous / "FB_Broken.TcPOU")] and r["parse_errors"][0]["error"]
+    assert list(r["read_notes"]) == [str(fa)] and "Windows-1252" in r["read_notes"][str(fa)], r
+    assert r["not_in_project"]["count"] == 1 and r["not_in_project"]["files"][0].endswith("FB_KbDup.TcPOU"), r
+    assert k.search("nDurchfluss")["hits"][0]["unit"] == "FB_Utf16"
+    assert "Größe" in k.search("nMenge")["hits"][0]["declaration"]
+    assert k.search("nZzqFinalWord")["hits"][0]["unit"] == "FB_Long"
+    assert k.search("zzqlastcomment")["hits"][0]["unit"] == "FB_Long"
+    pr = k.status()["projects"][0]
+    assert pr["parse_errors"] == 1 and pr["not_in_project_count"] == 1 and pr["problems"]["read_notes"], pr
+    # the project index reads it the same way; an edit keeps UTF-16 UTF-16 and refuses the mis-encoded file
+    from twincat_mcp.config import ProjectConfig
+    from twincat_mcp.project_backend import ProjectIndex, ProjectError
+    idx = ProjectIndex(ProjectConfig(root=str(project_dir)))
+    sc = idx.scan()
+    assert sc["parse_errors"][0]["file"].endswith("FB_Broken.TcPOU") and str(fa) in sc["read_notes"]
+    idx.set_code("FB_Utf16", None, "nDurchfluss := 1; // ß")
+    assert f16.read_bytes()[:2] == b"\xff\xfe" and "nDurchfluss := 1; // ß" in f16.read_text(encoding="utf-16")
+    with pytest.raises(ProjectError, match="not valid UTF-8 .*not edited"):
+        idx.set_code("FB_Ansi", None, "nMenge := 1;")
+
+
+def test_n133_a_changed_renamed_or_deleted_folder_is_reported(kb, project_dir, tmp_path):
+    """N133 (0.8.13 retest): after editing / deleting files and renaming the folder kb_search answered from the old
+    units without a note; kb_status never looked at the folders; the change stamp ignored .tsproj / .xti."""
+    import os
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    k.add_project(str(project_dir), "p")
+    assert "stale" not in k.search("FB_Valve") and k.status()["projects"][0]["state"] == "current"
+    ts = project_dir / "Machine.tsproj"
+    os.utime(ts, ns=(ts.stat().st_atime_ns, ts.stat().st_mtime_ns + 10**9))
+    st = k.status()["projects"][0]["state"]
+    assert st.startswith("files changed since it was indexed") and "kb_reindex" in st
+    r = k.search("FB_Valve")
+    assert r["hits"] and r["stale"][0]["project"] == str(project_dir) and r["stale"][0]["label"] == "p", r
+    assert k.reindex()["reindexed"][0]["units"] >= 8 and "stale" not in k.search("FB_Valve")
+    project_dir.rename(project_dir.with_name("renamed"))
+    r = k.search("FB_Valve")
+    assert r["hits"] and r["stale"][0]["state"].startswith("folder not found"), r
+    assert k.status()["projects"][0]["state"].startswith("folder not found")
