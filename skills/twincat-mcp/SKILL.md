@@ -6,7 +6,7 @@ description: Use when working on a Beckhoff TwinCAT 3 project with the `twincat`
 # twincat-mcp tool chains
 
 Documentation questions (library FBs, types, error codes, concepts, hardware manuals) → the **twincat-docs**
-skill, never the ads_* tools: those read the running PLC only.
+skill, never the ads_* tools: those read the running PLC only. An error code → `err_lookup` first.
 
 Always: `tc_doctor` once per session. Prefer reading over assuming. Writes are gated; never
 bypass by raw address. State the recording / snapshot ids you create.

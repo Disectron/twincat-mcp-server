@@ -5,7 +5,10 @@ here. Changes: 2026-10-19 (0.8.12, Ryan asked for an index of the ESI files he p
 — the ESI devices have their own index, `index\esi.db`, built from the ESI files in `manuals\` and TwinCAT's ESI
 folders; `knowledge.db` keeps the project folders only (rules 1, 2, 5, 6). 2026-10-19 (0.8.12, the 0.8.11 retest
 N102) — `knowledge.db`'s search table is derived from its stored units; a new layout of it is rebuilt from them at the
-next `kb_reindex` / `kb_add_project` (rule 6). Code that touches the knowledge folder follows these rules;
+next `kb_reindex` / `kb_add_project` (rule 6). 2026-10-20 (0.8.16, N125, Ryan's decisions on the error-index spec) —
+the documented error codes have their own index, `index\errors.db`, built from the plugin's own indexes (the Infosys
+index, `manuals.db`, `esi.db`) — never from the package or the PDFs again — and checked before it replaces the one in
+use (rules 1, 2, 5, 6). Code that touches the knowledge folder follows these rules;
 `twincat_mcp/kb_layout.py` is the one place that names its paths.
 
 ## 1. Layout and ownership
@@ -21,6 +24,7 @@ next `kb_reindex` / `kb_add_project` (rule 6). Code that touches the knowledge f
     infosys-<lcid>.db      Beckhoff Information System (the local Help Viewer package)
     manuals.db             the PDFs in manuals\
     esi.db                 the EtherCAT device descriptions: the ESI files in manuals\ and TwinCAT's ESI folders
+    errors.db              the documented error codes: from infosys-<lcid>.db, manuals.db and esi.db
     knowledge.db           project folders added with kb_add_project
     README.md              what each index is, its format, how it is rebuilt
 ```
@@ -37,9 +41,19 @@ These names are final. The move into this layout happens once (0.8.11): an index
 | the PDFs in `manuals\` | `index\manuals.db` | `tools\manuals_db.py update` |
 | the ESI files (`.xml` whose root is EtherCATInfo / EtherCATModule / EtherCATDict / EtherCATDiag) in `manuals\`, TwinCAT's `Config\Io\EtherCAT` and `knowledge.esi_dirs` | `index\esi.db` | the plugin's `esi_db.py update` (`twincat_mcp/esi_index.py`) |
 | project folders added by Ryan | `index\knowledge.db` | `kb_add_project` / `kb_reindex` |
+| the three indexes above (not their sources): the code tables of `infosys-<lcid>.db`, the AL status pages of `manuals.db`, the diagnosis text ids of `esi.db` (linked, not copied); and the plugin's own notes with each one's check | `index\errors.db` | the plugin's `errors_db.py update` (`twincat_mcp/errors_index.py`) |
 
 Every reader uses that one index: the `infosys_*` tools and the twincat-docs skill read the same
-`infosys-<lcid>.db`, the `hw_*` tools and the skill's `hw_*` commands the same `esi.db`. A second index of the same source is not built again.
+`infosys-<lcid>.db`, the `hw_*` tools and the skill's `hw_*` commands the same `esi.db`, the `err_lookup` tool and
+the skill's `err_lookup` command the same `errors.db` with the same function. A second index of the same source is
+not built again.
+
+`errors.db` (N125): the code tables are read by a table-aware parser — the columns by what their headers (or cells)
+mean, never by their position; every candidate page goes into its `source_report` with what came out of it (a page
+that gives 0 rows says why); the copies of one table in several books are one source, kept per variant with their
+books. AL status codes are rows where a manual's table parses cleanly, else a link to the page (with the reason). What
+no local source documents (CoE SDO abort codes, the compiler's C0xxx messages) is answered `documented: false` — never
+guessed, never fetched. The plugin's own notes (cause / fix) are always shown as the plugin's, never as Beckhoff's text.
 
 ## 3. Sources are local
 
@@ -56,30 +70,42 @@ resolved to page addresses. Readers never repair stored data; a fix to what is s
 
 - Every index records its format version, what it was built from and who built it (builder and plugin version):
   `infosys-<lcid>.db` the package's content stamp and file; `manuals.db` each PDF's path, size, modification time
-  and SHA-256; `esi.db` every ESI file's path, size, modification time and content hash, and the folders it read.
+  and SHA-256; `esi.db` every ESI file's path, size, modification time and content hash, and the folders it read;
+  `errors.db` each source index's path, format and build stamp (one that is missing: so).
   An index a build can leave half-done also records its state.
 - Adding a table or a column needs no new format version; changing or removing one does.
 - A test fingerprints the code that produces each format and fails when that code changes without a new format
-  version (Infosys extraction, manuals text, ESI index).
+  version (Infosys extraction, manuals text, ESI index, errors index). The plugin's own notes are not part of the
+  errors format: every reader takes them from the plugin; `errors.db` keeps each note's check, matched by its content
+  (a newer note is answered as not checked yet).
 - A reader reads an index of an older format as it is and says that a rebuild is due.
 
 ## 6. Rebuilds
 
 - **The first build** of an index that does not exist yet starts by itself (there is nothing to keep): Infosys at
   server start or when a knowledge folder is chosen, manuals at server start when `manuals\` holds PDFs and the
-  server's Python can read them, ESI at server start (or the first `hw_*` call) when an ESI file is there.
+  server's Python can read them, ESI at server start (or the first `hw_*` call) when an ESI file is there, errors at
+  server start (or the first `err_lookup`) once a source index is there and none is being built (with a local Help
+  Viewer package: once its Infosys index is there).
 - **One build at a time**: a build holds an operating-system lock on `<index>.lock` for its whole life; the
   operating system releases it however the build ends, so whether a build runs is known, never guessed.
-- **A new format, or a changed source** (a new Help Viewer package, new or changed PDFs, new ESI files): the index
+- **A new format, or a changed source** (a new Help Viewer package, new or changed PDFs, new ESI files; for
+  `errors.db`: a source index rebuilt, or one that was missing at its build and is there now): the index
   is reported as `rebuild_needed` / `outdated`, with the reason, in `kb_status`, `tc_doctor` and every
   documentation answer — and **stays in use as it is until Ryan approves the rebuild** (`kb_rebuild`, which asks
-  him, or the builder command).
+  him, or the builder command). A source index that is gone is said; `errors.db` answers from what it has.
+- **Checks before the swap** (`errors.db`): a build must pass its golden checks (the ADS table with its 139 codes,
+  0x745 = ADSERR_CLIENT_SYNCTIMEOUT / 1861 / 0x98110745, 0x6, 0x710, Win32 6 = ERROR_INVALID_HANDLE, 0x6's text
+  without U+FFFD) and may not lose codes of a domain against the last build — only a forced rebuild accepts a loss,
+  and records it. A build that fails is marked incomplete, its work file kept for the report (the next build discards
+  it), and the index in use stays.
 - How an index changes, so that a reader sees the old index or the new one, never half of one:
-  - `infosys-<lcid>.db`, `manuals.db`, `esi.db`: the build writes `<index>.building` beside the index (the manuals update
-    starts from a copy of the current one) and replaces the index only when the new one is complete. An
+  - `infosys-<lcid>.db`, `manuals.db`, `esi.db`, `errors.db`: the build writes `<index>.building` beside the index (the
+    manuals update starts from a copy of the current one) and replaces the index only when the new one is complete
+    (`errors.db`: and checked). An
     interrupted build never replaces anything and is reported as interrupted; the next Infosys build resumes it,
     the next manuals update starts again from the index in use (PDFs already in it are not read again), the next
-    ESI build starts over (minutes).
+    ESI or errors build starts over (minutes; seconds).
   - `knowledge.db` holds the project folders, so it is never swapped as a file: it changes in one transaction per
     folder (the database is WAL — readers keep the rows of before until the commit); a folder being added is
     registered in the transaction that stores its units, or not at all. One change at a time: `kb_add_project`,

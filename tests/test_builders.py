@@ -84,7 +84,7 @@ def _as_python_311(path: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", timeout=60)
 
 
-@pytest.mark.parametrize("script", ["infosys_local.py", "manuals_db.py", "esi_db.py"])
+@pytest.mark.parametrize("script", ["infosys_local.py", "manuals_db.py", "esi_db.py", "errors_db.py"])
 def test_minimum_python_is_enforced_with_a_message(script):
     assert "needs Python 3.12" not in run(script, "stats").stderr                 # this Python (3.12+) runs it
     p = _as_python_311(B / script, "stats")
@@ -107,7 +107,8 @@ def test_builders_compile_on_this_python():
     """The version check only helps if an older Python can compile the file to reach it (no 3.12-only syntax above
     the check: checked with the 3.8 grammar)."""
     import ast
-    for f in (B / "infosys_local.py", B / "manuals_db.py", B / "esi_db.py", KBD, ROOT / "scripts" / "launch.py",
+    for f in (B / "infosys_local.py", B / "manuals_db.py", B / "esi_db.py", B / "errors_db.py", KBD,
+              ROOT / "scripts" / "launch.py",
               ROOT / "twincat_mcp" / "__main__.py"):
         ast.parse(f.read_text(encoding="utf-8"), str(f), feature_version=(3, 8))
 
@@ -301,7 +302,7 @@ def test_a_builder_copy_outside_the_plugin_says_so(tmp_path):
     """Version 3 / 5 run the plugin's own code (twincat_mcp, kb_docs.py beside them): a copy on its own — no plugin
     folder around it, nothing installed (-I -S) — stops with one line saying how to run it, not a traceback."""
     import shutil
-    for n in ("infosys_local.py", "manuals_db.py", "esi_db.py"):
+    for n in ("infosys_local.py", "manuals_db.py", "esi_db.py", "errors_db.py"):
         d = tmp_path / n.split(".")[0] / "tools"
         d.mkdir(parents=True)
         shutil.copy(B / n, d / n)
@@ -783,6 +784,31 @@ def test_esi_builder_update_stats_and_queries(tmp_path):
     assert p.returncode == 1 and "the nearest" in json.loads(p.stdout)["error"]
     p = run("esi_db.py", "update", "--kb", str(kb), "--no-esi-dirs", "--no-twincat")
     assert p.returncode == 0 and "indexed 2 device revisions" in p.stdout, p.stdout
+
+
+def test_n125_errors_builder_update_stats_lookup_and_a_failed_check(tmp_path):
+    """N125: errors_db.py update builds index\\errors.db from the knowledge folder's indexes (the plugin's
+    errors_index, behind kb_lock, swapped in when complete and checked), a second update leaves it, stats tells the
+    state, lookup answers as err_lookup; a build that fails the golden checks replaces nothing and exits non-zero."""
+    import sqlite3 as _sq
+    from tests.test_errors_index import make_kb
+    kb = make_kb(tmp_path)
+    p = run("errors_db.py", "update", "--kb", str(kb))
+    assert p.returncode == 0 and "codes (" in p.stdout, p.stdout + p.stderr
+    p = run("errors_db.py", "update", "--kb", str(kb))
+    assert p.returncode == 0 and "up to date" in p.stdout, p.stdout
+    st = json.loads(run("errors_db.py", "stats", "--kb", str(kb), "--json").stdout)
+    assert st["state"] == "complete" and st["domains_detail"]["ads"]["codes"] == 139, st
+    r = json.loads(run("errors_db.py", "lookup", "0x745", "--kb", str(kb)).stdout)
+    assert r["matches"][0]["symbol"] == "ADSERR_CLIENT_SYNCTIMEOUT", r
+    con = _sq.connect(kb / "index" / "infosys-1033.db")
+    con.execute("DELETE FROM pages WHERE page_id = '391166347'")
+    con.commit()
+    con.close()
+    before = (kb / "index" / "errors.db").read_bytes()
+    p = run("errors_db.py", "update", "--kb", str(kb), "--force")
+    assert p.returncode == 3 and "FAILED its checks" in p.stderr and "win32 0x6" in p.stderr, p.stdout + p.stderr
+    assert (kb / "index" / "errors.db").read_bytes() == before
 
 
 def test_n170_the_skill_and_the_cli_answer_symbols_documented_inside_a_page(kb, tmp_path):

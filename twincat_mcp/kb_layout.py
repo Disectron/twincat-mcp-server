@@ -9,6 +9,7 @@
         infosys-<lcid>.db  the Beckhoff Information System of the local Help Viewer package
         manuals.db         the PDFs in manuals\\
         esi.db             the EtherCAT device descriptions: ESI files in manuals\\ and TwinCAT's ESI folders (hw_*)
+        errors.db          the documented error codes, from the three indexes above (err_lookup, N125)
         knowledge.db       added project folders (kb_search)
         README.md          what each index is, its format, how it is rebuilt
 
@@ -22,10 +23,11 @@ from pathlib import Path
 from typing import Any
 
 INDEX_DIR = "index"
-FILES = {"infosys": "infosys-{lcid}.db", "manuals": "manuals.db", "esi": "esi.db", "knowledge": "knowledge.db"}
+FILES = {"infosys": "infosys-{lcid}.db", "manuals": "manuals.db", "esi": "esi.db", "errors": "errors.db",
+         "knowledge": "knowledge.db"}
 # where an index lived before the layout was fixed (0.8.11): moved into index\ once, never copied
 LEGACY = {"infosys": ["infosys/helpviewer-{lcid}/index.sqlite"], "manuals": ["manualsdb/manuals.db"], "esi": [],
-          "knowledge": ["knowledge.db"]}
+          "errors": [], "knowledge": ["knowledge.db"]}
 # files the plugin no longer reads — reported (with their size) for the user to delete; never deleted here
 OBSOLETE = ["helpviewer/infosys_en.db", "helpviewer/infosys_en.db.building", "helpviewer/infosys_en.db.lock"]
 SIDECARS = ("-wal", "-shm", "-journal")
@@ -144,10 +146,12 @@ edit; outside index\\ the plugin writes only the builder stubs in tools\\ (a cop
 | infosys-<lcid>.db | the Beckhoff Information System package of the local Help Viewer (BKINFOSYS3_*.mshc) | tools\\infosys_local.py index, or kb_rebuild('infosys') |
 | manuals.db | the PDF manuals in ..\\manuals\\ | tools\\manuals_db.py update, or kb_rebuild('manuals') |
 | esi.db | the EtherCAT device descriptions (ESI .xml) in ..\\manuals\\ and TwinCAT's Config\\Io\\EtherCAT | the plugin's esi_db.py update, or kb_rebuild('esi'); its first build starts by itself |
+| errors.db | the error codes the three indexes above document (the code tables of infosys-<lcid>.db, the AL status codes of manuals.db, the diagnosis text ids of esi.db) and the plugin's own notes | the plugin's errors_db.py update, or kb_rebuild('errors'); its first build starts by itself |
 | knowledge.db | project folders you added (kb_add_project) | kb_add_project / kb_reindex |
 
 Each index records its format version and the stamp of its source. When a plugin update changes a format, or the
-source changes (a new Help Viewer package, new PDFs, new ESI files), the index is reported as needing a rebuild and
+source changes (a new Help Viewer package, new PDFs, new ESI files; for errors.db: an index it is built from was
+rebuilt), the index is reported as needing a rebuild and
 stays in use as it is until you approve the rebuild. A rebuild writes a new file beside the old one (.building) and
 swaps it in only when it is complete; knowledge.db changes in one transaction per folder, one change at a time
 (knowledge.db.lock). (knowledge.db of 0.8.11 and before also

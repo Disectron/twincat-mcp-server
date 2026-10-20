@@ -7,6 +7,8 @@ docs/KNOWLEDGE_BASE.md of the twincat plugin):
   <kb>\\index\\manuals.db         PDF hardware manuals, built by builders\\manuals_db.py update
   <kb>\\index\\esi.db             EtherCAT device descriptions (ESI files in manuals\\ and TwinCAT's ESI folders), built by
                                  builders\\esi_db.py update — the same index the plugin's hw_* tools read
+  <kb>\\index\\errors.db          the documented error codes, built from the three above by builders\\errors_db.py update
+                                 — the same index (and the same function) as the plugin's err_lookup tool
 (the builders ship next to this script and need Python 3.12+; <kb>\\tools\\ holds stubs that run them)
 Nothing is written: both are opened with SQLite's read-only mode, and what they hold is shown as stored (it is
 normalised when indexed, never repaired here). Standard library only (and the plugin's own twincat_mcp package beside
@@ -48,13 +50,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "5"           # 2: index state in every answer, links as refs, builders shipped beside it; 3: Python 3.12+
+VERSION = "6"           # 2: index state in every answer, links as refs, builders shipped beside it; 3: Python 3.12+
                         # 4: the plugin's one Infosys index (index\\infosys-<lcid>.db), the permanent layout (0.8.11)
                         # 5: hw_* commands on the ESI index (index\\esi.db), its state in status; a name resolved by the
                         #    plugin's rule (one page in several books is one page; a symbol is documented by a symbol
                         #    page), as infosys_declaration does (0.8.12, N100); docs_search is the plugin's search
                         #    (twincat_mcp.infosys.search_index: identifier words, titles first, a code's table first,
                         #    copies once — N99, N105)
+                        # 6: err_lookup on the error-code index (index\\errors.db, N125); docs_search's code_lookup
 FALLBACK_KB = r"D:\TwinCAT-MCP\knowledge"
 WEB = "https://infosys.beckhoff.com/content/{lcid}/{book}/{pid}.html"
 BUILDERS = Path(__file__).resolve().parent / "builders"
@@ -63,6 +66,7 @@ _PLUGIN = Path(__file__).resolve().parents[2]          # <plugin>/skills/twincat
 if "twincat_mcp" not in sys.modules and (_PLUGIN / "twincat_mcp" / "kb_layout.py").is_file() and str(_PLUGIN) not in sys.path:
     sys.path.insert(0, str(_PLUGIN))
 from twincat_mcp import esi_index as ESI  # noqa: E402 — the ESI index: one implementation (the server's hw_* tools)
+from twincat_mcp import errors_index as ERR  # noqa: E402 — the error-code index: err_lookup, one function (N125)
 from twincat_mcp import infosys_build as IB  # noqa: E402 — the index's state: one implementation for every reader
 from twincat_mcp import infosys as INF  # noqa: E402 — which pages document a name: the plugin's one rule (N100)
 from twincat_mcp import docsearch as DS  # noqa: E402 — searching: the plugin's one ranking (N105)
@@ -76,6 +80,9 @@ BUILD_MANUALS = (r"copy the PDF manuals into <kb>\manuals\ (sub-folders allowed)
 
 RULES = [
     "Documentation questions use this skill; ads_* tools read the running PLC only and never return documentation.",
+    "An error code, a code's name or an error message -> err_lookup first: domain, symbol, Beckhoff's text (every "
+    "variant) and the page; documented=false means the local documentation does not have it — say so, never guess "
+    "a meaning. plugin_note is the plugin's own note, not Beckhoff's text: say so when you use it.",
     "Known symbol -> docs_declaration; unknown -> docs_search -> ref -> docs_page section=...",
     "A name documented by different pages is never resolved silently: 'ambiguous' + candidates. Pick the library "
     "the project uses (proj_libraries), call again with book= or ref=, and say which one you used. One page in "
@@ -364,8 +371,10 @@ def overview(kb: Path) -> dict[str, Any]:
     except sqlite3.Error as exc:
         m = {"state": "error", "message": f"manuals database not readable: {exc}"}
     e = ESI.state(L.index_file(kb, "esi"), kb)
-    return {"knowledge_base": str(kb), "infosys": i, "manuals": m, "esi": e,
-            "summary": f"Infosys index: {i['message']}. Manuals: {m['message']}. ESI index: {e['message']}."}
+    x = ERR.state(L.index_file(kb, "errors"), kb)
+    return {"knowledge_base": str(kb), "infosys": i, "manuals": m, "esi": e, "errors": x,
+            "summary": f"Infosys index: {i['message']}. Manuals: {m['message']}. ESI index: {e['message']}. "
+                       f"Errors index: {x['message']}."}
 
 
 class Ctx:
@@ -700,6 +709,11 @@ def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     if res["code"]:
         out["code"] = {k: res["code"][k] for k in ("value", "hex", "dec")}
         out["code_note"] = INF.code_note(res)
+        # N125: where the errors index has the code documented (symbol, text, ref — copies merged, variants named);
+        # the plugin's infosys_search adds the same block (errors_index.code_summary)
+        cl = ERR.code_summary(ctx.kb, res["code"]["value"])
+        if cl:
+            out["code_lookup"] = cl
     if not items:
         out["hint"] = ("no page contains these words" + (f" in books {a['book']!r}" if a["book"] else "")
                        + (f" of library {a['library']!r}" if a["library"] else "") + " — try fewer or other words, OR, prefix*")
@@ -1203,6 +1217,7 @@ def cmd_status(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         except Err as exc:
             out[which] = {"missing": exc.message, **exc.extra}
     out["esi_state"] = ov["esi"]
+    out["errors_state"] = ov["errors"]
     out["rules"] = [kbtext(r) for r in RULES]
     return out
 
@@ -1254,6 +1269,16 @@ def cmd_hw_diag(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 
 def cmd_hw_module(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     return _esi(ctx, "module", a["ident"], a["device"], a["revision"])
+
+
+# ---------------------------------------------------------------------------------------------- err_lookup (N125)
+def cmd_err_lookup(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
+    """The plugin's err_lookup — one function (twincat_mcp.errors_index.err_lookup) on index\\errors.db: the server's
+    err_lookup tool gives the same answer."""
+    try:
+        return ERR.err_lookup(a["query"], a["domain"], kb=ctx.kb, limit=a["limit"])
+    except ERR.ErrError as exc:
+        raise Err(exc.code, str(exc)) from None
 
 
 COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[str, P], str]] = {
@@ -1328,6 +1353,13 @@ COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[
     "hw_module": (cmd_hw_module, {"ident": P(required=True, doc="ModuleIdent #x…"), "device": P(doc="exact type"),
                                   "revision": P(doc="#x…")},
                   "a module of a modular device by its ModuleIdent"),
+    "err_lookup": (cmd_err_lookup, {"query": P(required=True, doc="a code (0x745, 1861, 16#745, 0x98110745), a name "
+                                                                  "(ADSERR_CLIENT_SYNCTIMEOUT) or the whole error message"),
+                                    "domain": P(doc="narrow to a domain: ads, win32, nc, ethercat_al … or part of a "
+                                                    "library page's book/page id"),
+                                    "limit": P("int", default=5, lo=1, hi=ERR.LIMIT_MAX, doc="matches shown")},
+                   "what an error code / name / message is in the local documentation: domain, code forms, symbol, "
+                   "Beckhoff's text (every variant) and the page — or documented=false; the plugin's notes labelled"),
     "status": (cmd_status, {}, "where the knowledge base is, what is indexed, the rules"),
 }
 

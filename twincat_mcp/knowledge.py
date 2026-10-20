@@ -2,8 +2,9 @@
 
 What it holds, and where each part comes from:
 
-* known errors (K6)      — a seeded table in this file: error text → known cause → fix. Attached to tool errors.
-                           Nothing is learned automatically.
+* known errors (K6)      — the plugin's own notes (errors_index.ANNOTATIONS, N125): error text / code → known cause
+                           → fix, attached to tool errors and labelled as the plugin's note; what Beckhoff documents
+                           for a code comes from index\\errors.db (err_lookup). Nothing is learned automatically.
 * library versions (K3)  — the .plcproj of the project (what each placeholder resolves to) against the library
                            versions installed on this PC (folder names in TwinCAT's managed-library repository).
                            Encrypted .compiled-library files are never opened.
@@ -21,6 +22,7 @@ The folder's layout and rules are permanent (docs/KNOWLEDGE_BASE.md; kb_layout n
   index\\knowledge.db           this module (projects, ESI)
   index\\infosys-<lcid>.db      the one Infosys index (infosys_* tools and the twincat-docs skill), infosys_build
   index\\manuals.db             the PDFs in manuals\\, tools\\manuals_db.py
+  index\\errors.db              the documented error codes, from the indexes above (errors_index, N125)
   manuals\\, sop\\               the user's (read, never written)
   tools\\                        builder stubs
 kb_status reports all of it; hw_lookup adds the manuals that mention a product code (read-only). A rebuild of an
@@ -42,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from . import docsearch as DS
+from . import errors_index as X
 from . import esi_index as E
 from . import kb_layout as L
 from . import kb_lock
@@ -86,87 +89,22 @@ LOCATION_CONDITIONS = [
 ]
 
 # --------------------------------------------------------------------------------------------- K6 known errors
-# (pattern, cause, fix) — first match wins. Seeded from the field reports; extend here, never from tool output.
-_ELEMENTARY = frozenset("BOOL BYTE WORD DWORD LWORD SINT USINT INT UINT DINT UDINT LINT ULINT REAL LREAL TIME LTIME "
-                        "DATE TOD TIME_OF_DAY DT DATE_AND_TIME STRING WSTRING".split())
-
-
-def _convert_fix(a: str, b: str) -> str:
-    """C0032: the conversion that exists — {A}_TO_{B} only between elementary types; INT → BOOL is a comparison."""
-    ua, ub = a.upper(), b.upper()
-    if ua in _ELEMENTARY and ub in _ELEMENTARY:
-        if ub == "BOOL":
-            return f"compare instead: (value <> 0) turns the {ua} into a BOOL (or {ua}_TO_BOOL(…) when that is meant)"
-        return (f"convert explicitly: {ua}_TO_{ub}(…)" + (" — TRUE → 1, FALSE → 0" if ua == "BOOL" else "")
-                + ", or declare both sides with the same type")
-    return (f"{a} and {b} are not assignment-compatible: assign member by member / element by element, use a variable "
-            f"of type {b}, or (pointer / reference) the referenced type")
-
-
-KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [(re.compile(p, re.I), c, f) for p, c, f in [
-    # N70: the TwinCAT compiler's messages, by their text (the C-numbers differ between builds; the text does not).
-    # First: their quoted names may contain anything the broader patterns below look for ('bLicenseOk')
-    (r"identifier '([^']+)' (?:is )?not defined|identifier (?!(?:is|was|not)\b)([A-Za-z_][\w.]*) (?:is )?not defined",
-     "'{1}' is not declared where it is used: a typo, a variable declared in another POU or GVL without the "
-     "qualifier, a library that is not referenced, or a namespace / qualified_only GVL ('GVL.{1}')",
-     "proj_search {1} (this project) / kb_search {1} (added folders) show where it is declared; declare it, qualify "
-     "it, or add the library (proj_libraries)"),
-    (r"cannot convert type '([^']+)' to type '([^']+)'",
-     "IEC 61131-3 has no implicit conversion from {1} to {2} here",
-     _convert_fix),
-    (r"unknown type:? '([^']+)'|unknown type: ([A-Za-z_][\w.]*)",
-     "the type '{1}' is not known to the compiler: a typo, a DUT not in the project, or a library not referenced",
-     "kb_search {1} / infosys_declaration {1} shows where it comes from; add the DUT or the library"),
-    (r"0x98110724|2551252772|\blicen[cs]es?\b",
-     "TwinCAT license missing or expired on the target (TwinCAT falls back to CONFIG)",
-     "XAE → SYSTEM → License → '7 Days Trial License…', activate the configuration again, restart TwinCAT"),
-    (r"0x80010001|-2147418111|0x8001010a|-2147417846|call was rejected|retry later|blocked by dialog",
-     "the XAE shell is busy or a modal dialog has it",
-     "xae_dialogs shows the dialog; answer it with xae_dialog_resolve(button=…), then repeat the call"),
-    (r"0x800706ba|-2147023174|rpc server is unavailable|disconnected \(closed",
-     "the XAE shell was closed/reopened or crashed; the COM proxy is dead",
-     "the next xae_* call re-attaches by itself; if not, xae_attach"),
-    (r"(?<!not )(?<!n't )logged in(?:to)?\b",
-     "XAE is logged in to the PLC; the project cannot be changed online",
-     "xae_plc('logout'), make the change, build, log in again"),
-]]
-# The ADS return codes the plugin has a note for. Symbol and Beckhoff's text (what pyads / the ADS router put in a
-# message) as the local Infosys "ADS Return Codes" table has them (tcplclib_tc2_system/374277003, checked 2026-10-20);
-# cause and fix are the plugin's own. A text counts only in a message about ADS (N130: 'not permitted' of any program
-# was ADS 1796); the code in any notation: ADSError 1796, ADS error 1796, 0x704 next to ADS, 0x98110704, the symbol.
+# N125 (0.8.16): the plugin's notes are the rows of ONE table, errors_index.ANNOTATIONS — before, three tables
+# (KNOWN_ERRORS and ADS_NOTES here, ads_backend._ADS_HINTS) that cited no page and could disagree. Every build of
+# index\\errors.db checks them against the documented rows (verified_on); every answer labels them as the plugin's own
+# note, never as Beckhoff's text. What follows are views of that table for the rules of this module.
+_ELEMENTARY = X._ELEMENTARY
+_convert_fix = X.convert_fix
+# (pattern, cause, fix) — first match wins: the notes on a message's text, in the table's order (the compiler's first)
+KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [
+    (re.compile(a["pattern"], re.I), a["cause"], X.FIX_FUNCTIONS[a["fix_fn"]] if a.get("fix_fn") else a["fix"])
+    for a in X.ANNOTATIONS if a.get("pattern")]
+# The ADS return codes the plugin has a note for: code → (symbol, Beckhoff's text as pyads / the ADS router put it in
+# a message, cause, fix). A text counts only in a message about ADS (N130: 'not permitted' of any program was ADS
+# 1796); the code in any notation: ADSError 1796, ADS error 1796, 0x704 next to ADS, 0x98110704, the symbol.
 ADS_NOTES: dict[int, tuple[str, str, str, str]] = {
-    6: ("ERR_TARGETPORTNOTFOUND", r"target port not found",
-        "nothing listens on that AMS port: TwinCAT is in CONFIG (PLC runtimes exist only in RUN), no PLC project is "
-        "activated on it, or the port number is wrong (851 = first PLC runtime, 852 = second …)",
-        "ads_status port=10000 shows RUN/CONFIG; ads_system_mode run, or activate the PLC project"),
-    7: ("ERR_TARGETMACHINENOTFOUND", r"target (?:machine|computer) not found",
-        "no route to that AMS NetId",
-        "ads_add_route_to_plc / XAE → Choose Target → Search; check ams_net_id in the config"),
-    0x701: ("ADSERR_DEVICE_SRVNOTSUPP", r"service is not supported",
-            "the target/port does not offer this ADS service (e.g. sum commands, file access on this OS)",
-            "use the non-sum variant or another port; for files check that the target OS supports the System Service "
-            "file API"),
-    0x704: ("ADSERR_DEVICE_INVALIDACCESS", r"not permitted",
-            "reading/writing this index group/offset is not permitted (read-only area or protected symbol)",
-            "write a writable symbol instead; check READONLY flags with ads_symbol_info"),
-    0x705: ("ADSERR_DEVICE_INVALIDSIZE", r"parameter size not correct",
-            "the value does not fit the variable (string too long, wrong array length or type size)",
-            "check the declared type (ads_symbol_info); write elements by index for arrays"),
-    0x707: ("ADSERR_DEVICE_NOTREADY", r"device (?:is )?not ready",
-            "the runtime is not running (TwinCAT in CONFIG, or the PLC stopped)",
-            "ads_status; switch to RUN (ads_system_mode run) / start the PLC (ads_plc_state run)"),
-    0x710: ("ADSERR_DEVICE_SYMBOLNOTFOUND", r"symbol not found",
-            "the symbol is not in the runtime: typo, not downloaded yet, or optimised away (unused, not referenced)",
-            "ads_list_symbols pattern=…; after a code change: build + download / online change"),
-    0x745: ("ADSERR_CLIENT_SYNCTIMEOUT", r"timeout (?:elapsed|has occurred)",
-            "the target did not answer in time: missing/broken route, firewall (TCP 48898), target busy or stopped",
-            "ads_ping; ads_routes; check the route on both sides and the Windows firewall"),
-}
-# an RPC method call that fails with 0x705: the parameter block, not a variable's size
-_RPC_SIZE = ("the RPC parameter block does not match the method's signature: an input missing or extra, a wrong base "
-             "type, or outputs / return_type that differ from the declaration",
-             "pass every VAR_INPUT in declaration order with its exact base type (inputs=[{type, value}, …]), every "
-             "VAR_OUTPUT in outputs and the method's return type in return_type; check the method in proj_interface")
+    v: (a["symbol"], a["message_text"], a["cause"], a["fix"])
+    for a in X.ANNOTATIONS if a["domain"] == "ads" and a.get("message_text") for v in a["values"]}
 _ADS_SYMBOLS = {sym: code for code, (sym, *_r) in ADS_NOTES.items()}
 KNOWN_ERRORS_COVERED = ("ADS return codes 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation (ADSError 1861, "
                         "ADS error 1861, ADS-Error: 0x745, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT; a bare hex number "
@@ -314,15 +252,14 @@ def _ads_codes(msg: str) -> list[int]:
     return list(dict.fromkeys(codes))
 
 
-def _fill(t: str, groups: list[str]) -> str:
-    """{1}, {2}: the pattern's groups (other braces are text: {type, value})."""
-    return re.sub(r"\{(\d)\}", lambda g: groups[int(g.group(1))] if int(g.group(1)) < len(groups) else g.group(0), t)
+_fill = X.fill
 
 
 def _match_known(msg: str) -> tuple[str, str, str, str | None] | None:
-    """(cause, fix, fix template, the ADS code it is) of the first note that fits: the general table (compiler messages by their text,
-    license, XAE), then the ADS return codes the message names (_ads_codes, most explicit first: 'ADSError 1796 at
-    offset 0x7' is 1796, not 7)."""
+    """(cause, fix, fix template, the ADS code it is) of the first note that fits: the notes on a message's text
+    (compiler messages, license, XAE), then the ADS return codes the message names (_ads_codes, most explicit first:
+    'ADSError 1796 at offset 0x7' is 1796, not 7) — for a code, the note whose context the message has first (an RPC
+    call's 0x705 is the parameter block, not a variable's size)."""
     for pat, cause, fix in KNOWN_ERRORS:
         m = pat.search(msg)
         if not m:
@@ -335,22 +272,23 @@ def _match_known(msg: str) -> tuple[str, str, str, str | None] | None:
     for code in _ads_codes(msg):
         if code not in ADS_NOTES:
             continue
-        sym, _text, cause, fix = ADS_NOTES[code]
-        if code == 0x705 and re.search(r"\brpc call\b", msg, re.I):
-            cause, fix = _RPC_SIZE
-        return cause, fix, fix, f"ADS return code 0x{code:X} ({code}) {sym}"
+        a = X.notes_for("ads", code, msg)
+        if a is None:
+            continue
+        return a["cause"], a["fix"], a["fix"], f"ADS return code 0x{code:X} ({code}) {a.get('symbol') or ADS_NOTES[code][0]}"
     return None
 
 
 def known_error(msg: str) -> dict[str, str] | None:
-    """The plugin's note on an error message: cause and fix (its own words, not Beckhoff's), and for an ADS return code
-    which one it is (code, symbol)."""
+    """The plugin's note on an error message: cause and fix (its own words, not Beckhoff's — origin / label say so,
+    N125), and for an ADS return code which one it is (code, symbol)."""
     k = _match_known(msg or "")
     if k is None:
         return None
     out = {"cause": k[0], "fix": k[1]}
     if k[3]:
         out["code"] = k[3]
+    out.update(origin="plugin", label=X.PLUGIN_NOTE)
     return out
 
 
@@ -365,7 +303,8 @@ def annotate(msg: str) -> str:
     tools = re.findall(r"\b[a-z]+_[a-z_]+\b", m[2])
     if any(t in low for t in tools) or k["fix"][:30].lower() in low:
         return msg                                                # the message already says what to do
-    return f"{msg} [known cause: {k['cause']}. fix: {k['fix']}]"
+    # N125: labelled as the plugin's own note — never to be read as Beckhoff's text
+    return f"{msg} [known cause: {k['cause']}. fix: {k['fix']} (plugin's note)]"
 
 
 class KnowledgeError(RuntimeError):
@@ -747,6 +686,8 @@ class Knowledge:
                                          "kb_add_project on it merges them into one")
         out["known_errors"] = len(KNOWN_ERRORS)
         out["esi"] = self.esi_state()
+        # N125: the error-code index — codes / rows / variants per domain, the candidate pages that gave 0 rows
+        out["errors"] = self.errors_state(detail=True)
         out["docs"] = self.docs_layout(loc)
         lay: dict[str, Any] = {"index": str(L.index_dir(loc)), "rules": "docs/KNOWLEDGE_BASE.md in the plugin; "
                                "index\\README.md in the folder"}
@@ -810,13 +751,16 @@ class Knowledge:
         from . import infosys_build as IB
         ok = not IB.problem(inf)
         esi = self.esi_state()
+        err = self.errors_state()
         out: dict[str, Any] = {"knowledge_folder": str(loc), "infosys": inf.get("message"), "manuals": man.get("message"),
                                "esi": esi.get("message"), "infosys_state": inf.get("state"),
                                "manuals_state": man.get("state"), "esi_state": esi.get("state"), "ok": ok,
                                "infosys_rebuild": (inf.get("rebuild") or {}).get("state"),
                                "esi_rebuild": (esi.get("rebuild") or {}).get("state"),
+                               "errors": err.get("message"), "errors_state": err.get("state"),
+                               "errors_rebuild": (err.get("rebuild") or {}).get("state"),
                                "summary": f"Infosys index: {inf.get('message')}. Manuals: {man.get('message')}. "
-                                          f"ESI index: {esi.get('message')}."}
+                                          f"ESI index: {esi.get('message')}. Errors index: {err.get('message')}."}
         if inf.get("command"):
             out["infosys_command"] = inf["command"]
         if man.get("command"):
@@ -1116,6 +1060,14 @@ class Knowledge:
         error_msg = is_error_message(q)
         err = known_error(q) if error_msg else None
         if error_msg:
+            # N125 (0.8.16): what the local Beckhoff documentation says about the message's code (symbol, text, the
+            # page) beside the plugin's own note — from the errors index (err_lookup's rows), when there is one
+            doc = self.documented(q)
+            if doc:
+                d0 = doc[0]
+                err = dict(err) if err else {"code": f"{d0['domain']} {d0['hex']} ({d0['dec']}) {d0.get('symbol') or ''}"
+                                                     .strip()}
+                err["documented"] = doc
             names = message_names(q)
             for w in informative:
                 ignored.setdefault(w, "error message text (not a name of the code)")
@@ -1206,7 +1158,10 @@ class Knowledge:
                                "folder(s))")
         elif error_msg and not informative and not phrases:
             out["note"] = ("an error message without a name to look for in the code: known_error has its cause and fix"
-                           if err else "an error message without a name to look for in the code, and not one the "
+                           if err and "cause" in err else
+                           "an error message without a name to look for in the code: known_error.documented names its "
+                           "code in the local Beckhoff documentation (the plugin has no note on it)" if err else
+                           "an error message without a name to look for in the code, and not one the "
                            "plugin has a note on (known_errors_covered) — its words are not searched")
         if error_msg:
             out["known_error"] = err
@@ -1485,6 +1440,61 @@ class Knowledge:
                            built_by="twincat-mcp server")
         except E.EsiError as exc:
             raise KnowledgeError(str(exc)) from None
+
+    # -- the error-code index (index\\errors.db, twincat_mcp/errors_index.py — N125) -------------------
+    def infosys_db(self, loc: Path | None = None) -> Path | None:
+        """The Infosys index this server reads (its package's language), in the knowledge folder."""
+        loc = loc or self.location()[0]
+        if loc is None:
+            return None
+        lcid = getattr(getattr(self, "docs_local", None), "lcid", None) or L.DEFAULT_LCID
+        return L.locate(loc, "infosys", lcid)
+
+    def errors_state(self, detail: bool = False) -> dict[str, Any]:
+        """The errors index's state (errors_index.state): missing | complete | rebuild_needed (another format, or a
+        source index rebuilt since), with a build that runs / was interrupted / failed its checks. In use as it is
+        until the user approves kb_rebuild(index='errors'); its first build starts by itself (the server). detail
+        (kb_status): codes / rows / variants per domain, the candidate pages that gave 0 rows."""
+        try:
+            loc = self.require()
+        except KnowledgeError as exc:
+            return {"state": "unknown", "message": str(exc)}
+        # the sources as the index records them (the Infosys index it was built from) — as the skill reads it
+        return X.state(L.index_file(loc, "errors"), loc, detail=detail)
+
+    def errors_build(self, force: bool = False, log: Any = None) -> dict[str, Any]:
+        """Build the errors index in this process (the builder errors_db.py does the same in its own; the server runs
+        that one). Raises KnowledgeError when no source is ready or another build runs."""
+        loc = self.require()
+        try:
+            return X.build(L.index_file(loc, "errors"), loc, force=force, log=log or (lambda m: None),
+                           built_by="twincat-mcp server", infosys_db=self.infosys_db(loc))
+        except X.ErrError as exc:
+            raise KnowledgeError(str(exc)) from None
+
+    def err_lookup(self, query: str, domain: str | None = None, limit: int = 5) -> dict[str, Any]:
+        """errors_index.err_lookup on this knowledge folder — the function the twincat-docs skill's err_lookup runs
+        (one function: one answer). Without a knowledge folder: the plugin's own notes only, said so."""
+        loc = self.location()[0]
+        try:
+            # exactly the skill's call (the knowledge folder only): the same index, the same answer
+            return X.err_lookup(query, domain, kb=loc, limit=limit)
+        except X.ErrError as exc:
+            raise KnowledgeError(str(exc)) from None
+
+    def documented(self, msg: str) -> list[dict[str, Any]] | None:
+        """kb_search: what the errors index documents for the codes / code names of an error message (Beckhoff's
+        symbol, text, ref) — by value, HRESULT or symbol, never by a text match; None without an index or a row."""
+        loc = self.location()[0]
+        if loc is None or not L.index_file(loc, "errors").is_file():
+            return None
+        try:
+            r = X.err_lookup(msg, kb=loc, limit=3, fulltext=False)
+        except (X.ErrError, sqlite3.Error):
+            return None
+        rows = [{k: m[k] for k in ("domain", "value", "hex", "dec", "symbol", "text", "ref", "url") if m.get(k) is not None}
+                for m in r.get("matches") or [] if m.get("matched_by") in ("value", "hresult", "symbol", "dotnet name")]
+        return rows or None
 
     HW_DETAILS = E.DETAILS
 

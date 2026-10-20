@@ -181,7 +181,7 @@ def test_manual_commands(kbdir):
 def test_commands_status_help_and_location(kbdir, tmp_path):
     rc, r = run(kbdir, "ads_read")
     assert rc == 1 and r["error"] == "unknown_command" and "never return documentation" in r["message"]
-    assert len(r["commands"]) == 15
+    assert len(r["commands"]) == 16 and "err_lookup" in r["commands"]            # 0.8.16: err_lookup (N125)
     rc, r = run(kbdir, "help")
     assert rc == 0 and set(r["commands"]) >= {"docs_search", "manual_page", "status"} and r["rules"]
     rc, r = run(kbdir, "status")

@@ -30,12 +30,17 @@ MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes
 ESI_FINGERPRINT = ("2", "49f0ad9346541e7b")    # index\\esi.db (esi_index.py): format 2 — modules found by their
 #                                                 devices (N156, 0.8.14 retest), one object per index of a dictionary
 #                                                 (EL6653, kb_verify E2; format 2 is not released yet); 1 since 0.8.12
+ERRORS_FINGERPRINT = ("1", "5442b5ad3b7b4454")  # index\\errors.db (errors_index.py): format 1 — 0.8.16 (N125)
 
 EXCLUDE = frozenset({
     "_db", "_Conn", "_file_sig", "_probe", "_writable", "missing_text", "ro_uri", "source", "has_fts", "_bump_gen",
     "InfosysError", "HelpViewerError", "_sitemap_locs", "_sitemap_urlset",
     "connect", "_meta",
     "_RES_CACHE",                 # esi_index: the RES\\ folder listings of this process (runtime state, not a rule)
+    # errors_index: the plugin's own notes — every reader takes them from the plugin, the index keeps only the build's
+    # check of each (matched by the note's sha256: a note newer than the index answers 'not checked yet'), so a note
+    # that changes leaves the stored index right; connect_ro / ErrError: connection handling, an error type
+    "ANNOTATIONS", "connect_ro", "ErrError",
 })
 
 
@@ -162,6 +167,33 @@ def test_the_esi_closure_reaches_the_parsers():
                  "_Build", "_Writer", "SCHEMA", "FTS", "_resolve_ref", "_title", "_hash", "_pack",
                  "module_candidates"):           # N156: the slot rule decides a module's search text
         assert name in found, name
+
+
+def errors_code() -> dict[str, str]:
+    """What the source indexes become in index\\errors.db: the candidate pages, the domains, the table-aware parser
+    (header meanings, cell numbers, the shared reader of the stored pipe tables infosys._md_tables), the AL status
+    rule, the variants, the aliases, the golden checks and the schema (errors_index._build_into reaches them all)."""
+    from twincat_mcp import docsearch as ds
+    from twincat_mcp import errors_index as X
+    from twincat_mcp import infosys as inf
+    return _closure([X._build_into], [X, inf, ds])
+
+
+def test_errors_format_tracks_the_index_code():
+    from twincat_mcp import errors_index as X
+    got = (X.FORMAT, _digest(errors_code()))
+    assert got == ERRORS_FINGERPRINT, (
+        f"errors index code changed: bump errors_index.FORMAT and set ERRORS_FINGERPRINT = {got!r}")
+
+
+def test_the_errors_closure_reaches_the_parser_and_the_checks():
+    found = errors_code()
+    for name in ("parse_table", "cell_numbers", "header_meaning", "_HEADER", "_RANGE", "_RESIDUE", "_same_num",
+                 "page_tables", "_md_tables", "_md_cell", "parse_al_page", "AL_PAGE", "CODE_PAGE", "API_PAGE",
+                 "ALIAS_PAGES", "DOMAINS", "_Build", "golden", "GOLDEN_SYMBOLS", "GOLDEN_MIN_CODES", "SCHEMA",
+                 "MAIN_ORDER", "_ann_sha"):
+        assert name in found or f"_Build.{name}" in found, name
+    assert "ANNOTATIONS" not in found and "FIX_FUNCTIONS" not in found
 
 
 def test_the_closure_reaches_what_decides_stored_content():

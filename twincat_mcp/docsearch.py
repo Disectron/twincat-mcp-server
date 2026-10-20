@@ -455,27 +455,41 @@ code codes return returncode result hresult adserr adserror fehler fehlercode fe
 _CODE_WORD_SUFFIX = frozenset("number id no nr code nummer".split())
 
 
+def code_tokens(query: str, min_digits: int = 2, hex_anywhere: bool = True) -> list[dict[str, Any]]:
+    """The code tokens of a query, by the rules of code_forms (N99, N121, N122) — one implementation for the docs
+    search and the error index's err_lookup (N125). A hex number (0x…, 16#…, #x…) is a code anywhere when hex_anywhere,
+    else only as the whole query or next to a word that says it is a code; a decimal number of min_digits digits or more
+    (a minus sign right before it belongs to it: '-6908') only as the whole query ('1861') or next to such a word
+    ('error 1861', 'nErrId := 1808', '1861 error' — 'ADS error on port 851' is no code 851, N121). -> [{token, value,
+    how: 'hex' | 'dec', whole, next_to_code_word, start, end}] in the order of the query."""
+    q = query_text(query)
+    out: list[dict[str, Any]] = []
+    for tk in re.finditer(r"(?:0x|16#|#x)[0-9a-fA-F_]+|(?:(?<![\w.\-])-)?\b\d{%d,}\b" % max(1, int(min_digits)), q):
+        t = tk.group(0)
+        m = _HEX.match(t)
+        whole = q.strip() == t
+        near = _next_to_code_word(q, tk.start(), tk.end())
+        if not whole and not near and not (m and hex_anywhere):
+            continue
+        try:
+            value = int(m.group(1).replace("_", ""), 16) if m else int(t)
+        except ValueError:
+            continue
+        out.append({"token": t, "value": value, "how": "hex" if m else "dec", "whole": whole,
+                    "next_to_code_word": near, "start": tk.start(), "end": tk.end()})
+    return out
+
+
 def code_forms(query: str) -> dict[str, Any] | None:
     """An error / return code in the query, in the forms the code tables write it (N99): '0x745' → value 1861, hex
     0x745 / 0x0745 / 0x00000745, decimal 1861. One code token in the query: hex (0x…, 16#…, #x…), or a decimal number
     of two digits or more that is the whole query ('1861', N122) or stands next to a word that says it is a code
     ('error 1861', 'ADS return code 1861' — 'ADS port 851' or 'build 4024' is no code, review 0.8.12); else None."""
-    q = query_text(query)
-    toks = list(re.finditer(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", q))
     # N122 (0.8.13 retest): a number that IS the query ('1861') is a code too, as the tool describes it — inside other
     # words a decimal needs a code word next to it ('error 1861'; 'ADS error on port 851' is no code 851, N121); a hex
     # number is a code. Review of 0.8.14: the query's other numbers do not cancel it ('ADS error 1861 on port 851',
     # 'ADS error 0x745 (1861)' — one code, written twice); two different codes are none
-    cands: list[tuple[str, int]] = []
-    for tk in toks:
-        t = tk.group(0)
-        m = _HEX.match(t)
-        if not m and q.strip() != t and not _next_to_code_word(q, tk.start(), tk.end()):
-            continue
-        try:
-            cands.append((t, int(m.group(1).replace("_", ""), 16) if m else int(t)))
-        except ValueError:
-            continue
+    cands = [(c["token"], c["value"]) for c in code_tokens(query) if not c["token"].startswith("-")]
     if len({v for _t, v in cands}) != 1:
         return None
     t, value = cands[0]

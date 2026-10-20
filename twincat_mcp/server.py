@@ -328,7 +328,7 @@ TOKEN_TARGET_DOC = {
     "ipc_write_file / ipc_delete_file / ipc_start_process": "the remote path", "ipc_eventlog": "the log name",
     "ipc_reboot": "the literal 'target'", "rec_delete": "the recording id", "tc_set_mode": "the mode",
     "tc_allow_write": "the pattern ('-pattern' to remove)", "exp_run": "the experiment name",
-    "kb_rebuild": "the index: 'infosys', 'manuals' or 'esi'",
+    "kb_rebuild": "the index: 'infosys', 'manuals', 'esi' or 'errors'",
 }
 TOKEN_TARGET_ARGS = {"xae_target": "net_id", "ads_plc_state": "action", "ads_system_mode": "action",
                      "ads_connect": "ams_net_id", "ads_add_route_to_plc": "plc_ip", "ipc_write_file": "path",
@@ -420,9 +420,13 @@ class App:
         self.ads.interface_hint = self.is_source_interface
         self.ads.alias_hint = self.source_alias
         from .config import _home
+        self.init_done = threading.Event()        # set when __init__ is through (errors_first_build waits for it)
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
         # the permanent layout of the knowledge folder (docs/KNOWLEDGE_BASE.md) before anything opens an index
         self.kb.layout()
+        # N125: an ADS error text names Beckhoff's symbol, text and page of its code (the errors index)
+        from . import ads_backend as _adsb
+        _adsb.set_error_describer(self.ads_error_text)
         # the builder stubs in <kb>\tools run this plugin's builders: record where they are, turn old copies into stubs
         threading.Thread(target=self._builder_upkeep, name="tcmcp-builders", daemon=True).start()
         # N174: crash tracebacks (and rejected COM calls) in a file next to the other logs, named in the error message
@@ -481,6 +485,7 @@ class App:
             self.docs_warm = {"state": "warming", "started": time.time()}
             threading.Thread(target=self._warm_docs, name="tcmcp-infosys-warm", daemon=True).start()
         self.started = time.time()
+        self.init_done.set()
 
     def _warm_docs(self) -> None:
         if self.docs is not None and self.docs.local is not None:
@@ -682,6 +687,140 @@ class App:
                 "note": ("the first build of the ESI index" if st["state"] == "missing" else
                          "the current ESI index stays in use until the new one is complete") + "; kb_status shows it"}
 
+    # --- the error-code index (N125, 0.8.16): built from the other indexes, as esi.db is built -----------------------
+    def spawn_errors_build(self, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
+        """errors_db.py update for the knowledge folder in its own process, with this server's Python (standard library
+        only), from the knowledge folder's Infosys index, manuals.db and esi.db. dry_run: every check, nothing started
+        -> {'would_start': True} or why not (N96)."""
+        import subprocess
+        from . import errors_index as X
+        from . import kb_layout as L
+        loc = self.kb.location()[0]
+        b = K.builders_dir()
+        if loc is None or b is None or not (b / "errors_db.py").is_file():
+            return {"started": False, "error": "no knowledge folder chosen yet" if loc is None else
+                    "the plugin's builder errors_db.py (skills/twincat-docs/builders) was not found"}
+        st = self.kb.errors_state()
+        if (st.get("rebuild") or {}).get("state") == "running":
+            return {"started": False, "already_running": st["rebuild"], "message": st["message"]}
+        if st["state"] == "complete" and not force and not st.get("rebuild"):
+            return {"started": False, "up_to_date": True, "message": st["message"]}
+        final = L.index_file(loc, "errors")
+        infosys = self.kb.infosys_db(loc) if st["state"] == "missing" else None
+        if st["state"] == "complete" and not force and (st.get("rebuild") or {}).get("state") in ("stale", "incomplete"):
+            # a work file left next to the complete, current index (a stale one, or a build that failed its checks):
+            # no rebuild — discarded (rule 7), nothing asked
+            if dry_run:
+                return {"started": False, "up_to_date": True, "stale_work_file": st["rebuild"].get("file"),
+                        "message": st["message"]}
+            try:
+                r = X.build(final, loc, log=lambda m: None, built_by="twincat-mcp server")
+            except X.ErrError as exc:
+                return {"started": False, "error": str(exc)}
+            return {"started": False, "up_to_date": True, **({"discarded": r["discarded"]} if r.get("discarded") else {}),
+                    "message": self.kb.errors_state()["message"]}
+        ok, why = X.sources_ready(X.identities(loc, infosys_db=infosys or X.recorded_infosys(final)), loc)
+        if not ok:
+            return {"started": False, "error": why}
+        if dry_run:
+            return {"would_start": True}
+        cmd = [sys.executable, str(b / "errors_db.py"), "update", "--kb", str(loc)] + \
+            (["--infosys-db", str(infosys)] if infosys else []) + (["--force"] if force else [])
+        logs = Path(self.cfg.safety.audit_log).parent / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log_file = logs / "errors-build.log"
+        kw: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000} if os.name == "nt" \
+            else {"start_new_session": True}
+        with open(log_file, "ab") as fh:
+            fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(cmd)}\n".encode())
+            fh.flush()
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, cwd=str(loc), **kw)
+        self.errors_build_proc = p
+        return {"started": True, **_builder_pid(p, X.side_files(final)[1]), "log": str(log_file), "index": str(final),
+                "note": ("the first build of the errors index" if st["state"] == "missing" else
+                         "the current errors index stays in use until the new one is complete and has passed its "
+                         "checks") + "; kb_status shows it"}
+
+    def errors_first_build(self) -> dict[str, Any] | None:
+        """Rule 6: the first build of an errors index that does not exist yet starts by itself — once a source index
+        is there and none is being built. An index that exists is left to the user's approval. None: nothing to do."""
+        from . import errors_index as X
+        from . import kb_layout as L
+        loc = self.kb.location()[0]
+        if loc is None or L.index_file(loc, "errors").exists():
+            return None
+        st = self.kb.errors_state()
+        if st["state"] != "missing" or (st.get("rebuild") or {}).get("state") in ("running", "incomplete"):
+            return None                       # a first build that failed its checks waits for kb_rebuild (reported)
+        infosys = self.kb.infosys_db(loc)
+        ready = getattr(self, "init_done", None)
+        if ready is not None:
+            ready.wait(60)                    # the server start's thread: whether a local package is read is known
+        docs = getattr(self, "docs", None)
+        if docs is not None and docs.local is not None and (infosys is None or not infosys.is_file()):
+            return None                       # the Infosys index of the local package is coming: built from it then
+        if not X.sources_ready(X.identities(loc, infosys_db=infosys), loc)[0]:
+            return None
+        return self.spawn_errors_build()
+
+    def ads_error_text(self, code: int) -> str | None:
+        """N125: Beckhoff's symbol and text of an ADS return code, with its page — from the errors index (None without
+        one): what ads_backend's error texts add."""
+        from . import errors_index as X
+        d = X.describe_code(self.kb.location()[0], "ads", int(code))
+        if not d:
+            return None
+        return f"{d['symbol'] + ': ' if d.get('symbol') else ''}{d.get('text') or ''} (Beckhoff, {d['ref']})"
+
+    def doc_note(self, msg: str) -> str:
+        """N125: an error text with the documented meaning of the code it names (err_lookup's rule: a code is a number
+        next to a word that says so, a code's symbol, an HRESULT), when the errors index has it and the text does not
+        say it already."""
+        try:
+            rows = self.kb.documented(msg)
+        except Exception:  # noqa: BLE001 — an addition to an error; the error itself must come through
+            rows = None
+        if not rows:
+            return msg
+        r = rows[0]
+        if (r.get("symbol") and r["symbol"] in msg) or (r.get("text") and r["text"] in msg):
+            return msg
+        return (f"{msg} [documented: {r['domain']} {r['hex']}" + (f" {r['symbol']}" if r.get("symbol") else "")
+                + f": {r.get('text') or ''} ({r['ref']})]")
+
+    def log_codes(self, log: dict[str, Any] | None) -> dict[str, Any] | None:
+        """N125: the codes in the Scope View log's error lines (0xA2, HRESULTs) looked up in the errors index —
+        documented (domain, symbol, text, ref) or documented=false; an entry per error line that names a code."""
+        if not log or not log.get("errors"):
+            return log
+        loc = self.kb.location()[0]
+        from . import errors_index as X
+        codes = []
+        for i, e in enumerate(log["errors"]):
+            read = X.read_query(e)
+            if not read["codes"] and not read["names"]:
+                continue
+            try:
+                r = X.err_lookup(e, kb=loc, limit=3, fulltext=False)
+            except X.ErrError:
+                continue
+            codes.append({"error": i, "read_as": [c["token"] for c in r["read_as"]] + r.get("names", []),
+                          "documented": r.get("documented"),
+                          "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref") if m.get(k)}
+                                      for m in r.get("matches") or []],
+                          **({"note": r["note"]} if r.get("note") else {})})
+        return {**log, "codes": codes} if codes else log
+
+    def code_lookup(self, query: str) -> list[dict[str, Any]] | None:
+        """infosys_search: where the errors index documents the code of the query (the skill's docs_search adds the
+        same block: errors_index.code_summary)."""
+        from . import docsearch as DS
+        from . import errors_index as X
+        forms = DS.code_forms(query)
+        if forms is None:
+            return None
+        return X.code_summary(self.kb.location()[0], forms["value"])
+
     def esi_first_build(self) -> dict[str, Any] | None:
         """Rule 6: the first build of an ESI index that does not exist yet starts by itself (when an ESI source
         exists). An index that exists is left to the user's approval. None when there is nothing to do."""
@@ -721,6 +860,12 @@ class App:
                 log.info("ESI index: first build %s", "started" if first.get("started") else first)
         except Exception as exc:  # noqa: BLE001 — a convenience; kb_status shows the state either way
             log.warning("ESI first build: %s", exc)
+        try:
+            first = self.errors_first_build()
+            if first:
+                log.info("errors index: first build %s", "started" if first.get("started") else first)
+        except Exception as exc:  # noqa: BLE001 — a convenience; kb_status shows the state either way
+            log.warning("errors first build: %s", exc)
         res = self.kb.builder_upkeep(__version__)
         for n, v in (res.get("tools") or {}).items():
             if isinstance(v, dict) and v.get("state") == "replaced":
@@ -770,7 +915,13 @@ class App:
                 "ads_system_mode('run') or activate + restart, then retry") if mode == "CONFIG" else ""
 
     async def _ads_explain(self, msg: str, port: Any) -> str:
-        """Known cause/fix for an ADS error; ADSError 6 is explained from the real port and TwinCAT mode (N17)."""
+        """Known cause/fix for an ADS error; ADSError 6 is explained from the real port and TwinCAT mode (N17); a code
+        the message names that the errors index documents is said with Beckhoff's text and page (N125: rec_* errors,
+        ADS errors that did not pass ads_backend's error text)."""
+        out = await self._ads_explain_note(msg, port)
+        return await asyncio.to_thread(self.doc_note, out)
+
+    async def _ads_explain_note(self, msg: str, port: Any) -> str:
         if "datatype table unavailable" in msg:
             return K.annotate(msg + await self._config_hint())
         if re.search(r"ADSError 6 \(0x6\)", msg):
@@ -920,7 +1071,8 @@ class App:
             lic = _license_hint(msg)
             if lic:
                 msg += " " + lic
-            raise ToolError(K.annotate(msg)) from exc
+            # N125: an HRESULT / code the message names that the errors index documents: Beckhoff's text and page
+            raise ToolError(await asyncio.to_thread(self.doc_note, K.annotate(msg))) from exc
         except WorkerBusy as exc:
             raise ToolError(f"{exc} — the XAE call was NOT started; the shell is still busy with the earlier call "
                             "(a build, an activation or a modal dialog — xae_dialogs).") from exc
@@ -2282,6 +2434,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             if ds.get("esi_state") in ("outdated", "rebuild_needed") or ds.get("esi_rebuild") in (
                     "running", "interrupted", "waiting_to_replace"):
                 infos.append("ESI index: " + ds["esi"])
+            if ds.get("errors_state") in ("outdated", "rebuild_needed") or ds.get("errors_rebuild") in (
+                    "running", "interrupted", "waiting_to_replace", "incomplete"):
+                infos.append("errors index: " + ds["errors"])
         except Exception as exc:  # noqa: BLE001
             rep["offline_docs"] = {"error": f"{type(exc).__name__}: {exc}"}
         if infos_el:
@@ -2405,12 +2560,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def kb_status() -> dict[str, Any]:
         """Knowledge base (layout and rules: docs/KNOWLEDGE_BASE.md): where it is (or the question to ask the user if
-        no folder was chosen yet), the project folders indexed for kb_search, the ESI index for hw_lookup — and under
+        no folder was chosen yet), the project folders indexed for kb_search, the ESI index for hw_lookup, the
+        error-code index for err_lookup (`errors`: codes / rows / table variants per domain in domains_detail, the
+        candidate pages that gave 0 rows with why, build date, format, the sources it was built from) — and under
         `docs` the documentation indexes the infosys_* tools and the twincat-docs skill read: index\\infosys-<lcid>.db
         (the one Infosys index) and index\\manuals.db (PDF manuals, with the PDFs not in it yet), the SOPs, and the
         command that runs the skill's script on this folder. Each index: complete, or rebuild_needed / outdated (in use
-        as it is until the user approves kb_rebuild), or a build running / interrupted. `layout` lists files the
-        plugin no longer reads (never deleted by it) with their size."""
+        as it is until the user approves kb_rebuild), or a build running / interrupted (errors: or failed its checks —
+        `rebuild.failures`). `layout` lists files the plugin no longer reads (never deleted by it) with their size."""
         return await app.kb_call(app.kb.status)
 
     @mcp.tool(annotations=CONTROL)
@@ -2422,31 +2579,30 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         the plugin's extractor, in its own process — minutes; the current index stays in use until the new one is
         complete and then replaces it), 'manuals' (the PDFs in manuals\\, in its own process), 'esi' (the ESI files in
         manuals\\ and TwinCAT's ESI folders → index\\esi.db, in its own process — minutes; the current index stays in
-        use until the new one is complete). Without force an index that is complete and current is left as it is.
-        Nothing is deleted. kb_status / tc_doctor show the progress."""
+        use until the new one is complete), 'errors' (the error codes the Infosys index, manuals.db and esi.db document
+        → index\\errors.db, in its own process — seconds; it replaces the index only when it passes its checks, a
+        failure is reported and the old index kept; force also accepts a domain with fewer codes than before). Without
+        force an index that is complete and current is left as it is. Nothing is deleted. kb_status / tc_doctor show
+        the progress."""
         idx = (index or "").strip().lower()
-        if idx not in ("infosys", "manuals", "esi"):
-            raise ToolError(f"index must be 'infosys', 'manuals' or 'esi' (got {index!r})")
+        if idx not in ("infosys", "manuals", "esi", "errors"):
+            raise ToolError(f"index must be 'infosys', 'manuals', 'esi' or 'errors' (got {index!r})")
         if idx == "infosys" and (app.docs is None or app.docs.local is None):
             raise ToolError("no index of a local Help Viewer package here (docs.source = 'local' and a package are "
                             "needed) — " + (app.docs_error or "docs.source = 'web' keeps a web cache, not an index"))
         # N96: everything that can stop the rebuild is checked BEFORE the user is asked — the prompt came first and
         # then 'this server's Python has no PDF library'
-        pre = await asyncio.to_thread({"infosys": app.spawn_infosys_build, "manuals": app.spawn_manuals_update,
-                                       "esi": app.spawn_esi_build}[idx], force, dry_run=True)
+        spawn = {"infosys": app.spawn_infosys_build, "manuals": app.spawn_manuals_update, "esi": app.spawn_esi_build,
+                 "errors": app.spawn_errors_build}[idx]
+        pre = await asyncio.to_thread(spawn, force, dry_run=True)
         if not pre.get("would_start"):
             if pre.get("stale_work_file"):          # not a rebuild: the left work file is discarded, the index unchanged
                 await app.permit(None, OpClass.EDIT, "kb_rebuild", idx)          # N127: a change — not in readonly
-                pre = await asyncio.to_thread(app.spawn_esi_build, force)
+                pre = await asyncio.to_thread(spawn, force)
             app.audit("kb_rebuild", {"index": idx, "force": force}, OpClass.CONTROL, "not-started", pre)
             return pre
         await app.permit(ctx, OpClass.CONTROL, "kb_rebuild", idx, confirm_token, always_confirm=True)
-        if idx == "infosys":
-            res = await asyncio.to_thread(app.spawn_infosys_build, force)
-        elif idx == "manuals":
-            res = await asyncio.to_thread(app.spawn_manuals_update, force)
-        else:
-            res = await asyncio.to_thread(app.spawn_esi_build, force)
+        res = await asyncio.to_thread(spawn, force)
         app.audit("kb_rebuild", {"index": idx, "force": force}, OpClass.CONTROL,
                   "ok" if res.get("started", True) or res.get("up_to_date") else "not-started", res)
         return res
@@ -2524,9 +2680,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         word 'error', a decimal / 16# literal alone, a hex number anywhere or an ERR_… identifier of the code — gets the plugin's note
         in known_error (ADS return codes 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 with code and symbol, license, XAE
         busy / dialog / disconnected, logged in, compiler: identifier not defined, cannot convert type, unknown type;
-        null + known_errors_covered when it has none) and is searched only for the names of the code it holds
-        (quoted, or identifiers such as fbCounter, FB_Valve, MAIN.fbX).
-        Beckhoff documentation is not here: the twincat-docs skill."""
+        labelled origin='plugin'; null + known_errors_covered when it has none) and, when the errors index documents
+        its code, known_error.documented (Beckhoff's symbol, text and page: err_lookup's rows) — and is searched only for
+        the names of the code it holds (quoted, or identifiers such as fbCounter, FB_Valve, MAIN.fbX).
+        Beckhoff documentation is not here: err_lookup for a code, the twincat-docs skill for the rest."""
         return await app.kb_call(app.kb.search, query, kinds, project, limit)
 
     @mcp.tool(annotations=READ)
@@ -2603,6 +2760,29 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         res = await app.kb_call(app.kb.hw_module, ident, device, revision, timeout=60)
         if first:
             res["esi_first_build"] = first
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def err_lookup(query: str, domain: str | None = None, limit: int = 5) -> dict[str, Any]:
+        """What an error code, a code's name or a whole error message is in the LOCAL Beckhoff documentation (the error
+        index index\\errors.db, built from the Infosys index, manuals.db and esi.db — N125). query: a number in any
+        notation (0x745, 1861, 16#745, 0x00000745, an HRESULT 0x98110745 or its decimal), a symbol
+        (ADSERR_CLIENT_SYNCTIMEOUT, ERROR_INVALID_HANDLE, the .NET name TargetPortNotFound) or the message ('ADSError
+        1861 (0x745): …', 'Ads-Error 0xA2', 'nErrId := 1808'). A number is a code only as the whole query or next to a
+        word that says so ('ADS error on port 851' has no code 851). Each match: domain (ads, win32, hresult, nc,
+        labview, ethercat_al, ethercat_diag, or a library's code page: book/page id), hex / dec / HRESULT, symbol,
+        Beckhoff's text — every text when the copies of the table differ (texts, with their books; main = the text of
+        the most books) and the copies that lack it (missing_in) — ref + url of the page, and the plugin's own note
+        (plugin_note: labelled, never Beckhoff's text). A number documented in several domains lists all, ranked by the
+        message's words; a message that names a domain ('ADS error 6') is answered for it and the same number elsewhere
+        is listed apart (other_domains); `ranking` says why. Not documented: documented=false, the domains searched,
+        no_local_source (CoE SDO abort codes, compiler C0xxx), full-text hits marked as such — never a guessed meaning.
+        domain= narrows (an id, or part of a page's id/title); limit 1-20. The twincat-docs skill's err_lookup command
+        is the same function (the same answer); the index's first build starts by itself."""
+        first = await asyncio.to_thread(app.errors_first_build)
+        res = await app.kb_call(app.kb.err_lookup, query, domain, limit, timeout=60)
+        if first:
+            res["errors_first_build"] = first
         return res
 
     async def tc_request_confirmation(action: str, target: str = "", args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3230,7 +3410,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
                       OpClass.EDIT, "ok")
         if run.get("log_mark"):
-            out["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, run["log_mark"])
+            out["scope_view_log"] = await asyncio.to_thread(
+                lambda: app.log_codes(S.log_errors_since(run["log_mark"])))       # N125: its codes looked up
         return out
 
     def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path, incomplete: str | None = None) -> dict[str, Any]:
@@ -3687,6 +3868,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         except S.ScopeError as exc:
             raise ToolError(str(exc)) from exc
         app.audit("scope_export", {"svd": str(src), "target": str(out), "sha256": res["export_sha256"]}, OpClass.EDIT, "ok")
+        if res.get("scope_view_log"):
+            res["scope_view_log"] = await asyncio.to_thread(app.log_codes, res["scope_view_log"])   # N125
         return res
 
     @mcp.tool(annotations=READ)
@@ -3713,7 +3896,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             r = await _scope_save(scope, Path(str(base) + ".svdx"), Path(str(base) + ".csv"))
             if "error" in r["save_svd"]:
                 raise ToolError(f"Scope save: {r['save_svd']['error']}")
-            r["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, mark)
+            r["scope_view_log"] = await asyncio.to_thread(lambda: app.log_codes(S.log_errors_since(mark)))   # N125
         else:
             raise ToolError("action must be start | stop | save")
         app.audit("scope_record", {"action": action, "scope": scope, "path": path}, OpClass.EDIT, "ok")
@@ -4489,10 +4672,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         comes first ('ST instruction FOR'); code punctuation that finds nothing as written is searched as its words
         ('THIS^ SUPER^', 'S= R='); titles that name the query come first; an error
         code (0x745, 1861 alone, 'error 1861') lists the pages whose table defines it first, code tables before other
-        pages (code_note); one page in several books — or placed twice in one — is listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
+        pages (code_note), and — from the errors index — where it is documented (code_lookup: domain, symbol, text,
+        ref, the table's variants; err_lookup gives all of it); one page in several books — or placed twice in one — is listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
         so), results carry the page's doc version and the package date. docs.source='web': when the index has nothing,
         a DuckDuckGo site: query verified against the sitemap; the 'backend' field says which path answered."""
-        return await app.docs_call("search", query, library, limit, web_fallback, offset, timeout=300)
+        res = await app.docs_call("search", query, library, limit, web_fallback, offset, timeout=300)
+        if isinstance(res, dict) and res.get("code_note"):
+            cl = await asyncio.to_thread(app.code_lookup, query)
+            if cl:
+                res["code_lookup"] = cl
+        return res
 
     @mcp.tool(annotations=READ)
     async def infosys_search_code(query: str, language: str | None = None, limit: Limit50 = 10,

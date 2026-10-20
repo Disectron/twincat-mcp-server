@@ -253,7 +253,7 @@ async def test_kb_rebuild_only_with_approval_and_a_server_start_never_rebuilds(m
         r = await s.call_tool("kb_rebuild", {"index": "infosys", "force": True})   # a rebuild: never without approval
         assert r.is_error and "tc_request_confirmation" in text(r)
         r = await s.call_tool("kb_rebuild", {"index": "everything"})
-        assert r.is_error and "'infosys', 'manuals' or 'esi'" in text(r)
+        assert r.is_error and "'infosys', 'manuals', 'esi' or 'errors'" in text(r)        # 0.8.16: errors (N125)
     c = sqlite3.connect(live)
     c.execute("UPDATE meta SET value = '3' WHERE key = 'indexer_version'")
     c.commit()

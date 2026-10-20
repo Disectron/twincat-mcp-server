@@ -1,6 +1,6 @@
 ---
 name: twincat-docs
-description: Use for ANY Beckhoff documentation question — what a library FB/function/struct/enum does, its inputs/outputs/types (ADSREAD, MC_MoveAbsolute, FB_FileOpen …), error codes, TwinCAT concepts, code examples, hardware details from manuals (LEDs, wiring, diagnostics of an IPC/terminal), or EtherCAT device data from the ESI files (PDOs, CoE objects with defaults, diagnosis text ids). Looks it up OFFLINE in the local Infosys (Help Viewer package), PDF-manual and ESI knowledge base. Never use ads_* tools for documentation.
+description: Use for ANY Beckhoff documentation question — what a library FB/function/struct/enum does, its inputs/outputs/types (ADSREAD, MC_MoveAbsolute, FB_FileOpen …), error codes (err_lookup first), TwinCAT concepts, code examples, hardware details from manuals (LEDs, wiring, diagnostics of an IPC/terminal), or EtherCAT device data from the ESI files (PDOs, CoE objects with defaults, diagnosis text ids). Looks it up OFFLINE in the local Infosys (Help Viewer package), PDF-manual and ESI knowledge base. Never use ads_* tools for documentation.
 ---
 
 # twincat-docs — offline Beckhoff documentation
@@ -29,8 +29,9 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 ## Which command
 | Question | Command |
 |---|---|
+| **An error code, a code's name or an error message** (`0x745`, `1861`, `16#745`, `0x98110745`, `ADSERR_CLIENT_SYNCTIMEOUT`, `ADSError 1861 (0x745): …`, `Ads-Error 0xA2`, `nErrId := 1808`, `AL status code 0x0011`) | `err_lookup query=… [domain=ads\|win32\|nc\|ethercat_al\|…] [limit=1-20]` — **first**, before docs_search: domain, hex / dec / HRESULT, symbol, Beckhoff's text (every text when the copies of the table differ: `texts` with their books, `main` = the text of the most books; `missing_in` = the copies that lack the code), `ref` + `url` of the page, the plugin's own note (`plugin_note`). The same function as the twincat server's `err_lookup` tool. |
 | Inputs/outputs/members of a known FB, function, struct or enum | `docs_declaration symbol=ADSREAD book=tcplclib_tc2_system` (or `library=Tc2_System`, as `infosys_*` take it) |
-| Concept, how-to, error text, error code, anything else in Infosys | `docs_search query=… [book=glob] [library=] [limit=1-50] [offset=]` → `ref` → `docs_page ref=… section=…` (the plugin's infosys_search: identifiers count as their words, titles that name the query first, an error code's defining table first — `code_note` —, one page in several books once — `same_page_in`) |
+| Concept, how-to, error text, anything else in Infosys | `docs_search query=… [book=glob] [library=] [limit=1-50] [offset=]` → `ref` → `docs_page ref=… section=…` (the plugin's infosys_search: identifiers count as their words, titles that name the query first, an error code's defining table first — `code_note`, and `code_lookup` from the error index —, one page in several books once — `same_page_in`) |
 | A page or a link from an answer | `docs_page ref=<book/pageid, Infosys URL, page id, exact title, ms-xhelp link> [section=] [offset=] [max_chars=200-60000]` |
 | Which books exist | `docs_books filter=tcplclib_tc2_*` |
 | Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so; a code the index's product table lacks but its page text names is answered from the text: `matched_as: page text`, `note` says why) |
@@ -45,6 +46,13 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 
 ## Rules
 1. Documentation → this skill. Live PLC values and types → the ads_* tools.
+   **An error code → `err_lookup` first.** A number counts as a code only as the whole query or next to a word that
+   says so (`error 1861`, `nErrId := 1808`) — `ADS error on port 851` holds no code. A number of several domains is
+   listed in all of them, ranked by the message's words; a message that names a domain (`ADS error 6`) is answered for
+   it and the same number elsewhere comes in `other_domains` — never pick one silently. `documented: false` = not in
+   the local documentation (CoE SDO abort codes and the compiler's C0xxx messages have no local source at all —
+   `no_local_source`): say so, never guess a meaning; `fulltext` hits only mention the code. `plugin_note` is the
+   plugin's own cause / fix, not Beckhoff's text: say so when you use it.
 2. Symbol known → `docs_declaration`. Unknown → `docs_search` → take a `ref` → `docs_page section=`.
    `docs_declaration` gives `kind`, `return_type` (function, method, property), `declaration` with its header and
    the members (`inputs`, `outputs`, `in_out`, `members`, `enum_values`, `methods`, `properties`) as the index parsed
@@ -105,6 +113,7 @@ indexed yet.
 | `<kb>\index\infosys-1033.db` | the TwinCAT 3 books of the Help Viewer package — the same index the twincat server's `infosys_*` tools read | the plugin itself the first time; later `<kb>\tools\infosys_local.py index` or `kb_rebuild(index='infosys')` (minutes) |
 | `<kb>\index\manuals.db` | PDF manuals from `<kb>\manuals\`, one row per page, chapters, product codes | `<kb>\tools\manuals_db.py update` or `kb_rebuild(index='manuals')` (Python 3.12+ with PyMuPDF or pypdf) |
 | `<kb>\index\esi.db` | the ESI files (`.xml`) in `<kb>\manuals\` and TwinCAT's ESI folders: devices, PDOs, CoE dictionaries, diagnosis messages, modules — the same index the twincat server's `hw_*` tools read | the plugin itself the first time; later `kb_rebuild(index='esi')` or the plugin's `builders\esi_db.py update` (minutes) |
+| `<kb>\index\errors.db` | the error codes the three indexes above document: the code tables of the Infosys index (ADS, Win32, NC, the libraries' error-code pages), the AL status codes of the manuals (rows where the table parses, else a page link), the diagnosis text ids of esi.db (linked) — the same index the twincat server's `err_lookup` reads | the plugin itself the first time; later `kb_rebuild(index='errors')` or the plugin's `builders\errors_db.py update` (seconds); it replaces the index only when it passes its checks |
 
 `status`, and `source.state` in every answer, give the state of the index: `complete`; `rebuild_needed` (built by
 another format) or `outdated` (the package or the PDFs changed) — both are used as they are; or `missing`. A build

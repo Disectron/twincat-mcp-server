@@ -2278,17 +2278,25 @@ def _csv_val(v: Any) -> Any:
     return v
 
 
-_ADS_HINTS = {
-    6: "target port not found — nothing is listening on that AMS port",
-    7: "target machine not found — the AMS route to that NetId is missing or the target is off",
-    1797: "parameter size not correct — the value does not fit the variable (string too long, wrong array length or type)",
-    1808: "symbol not found — check the spelling (ads_list_symbols) or whether the program was downloaded",
-    1861: "timeout — the target did not answer (router, route, or the target is busy/stopped)",
-}
+# N125 (0.8.16): what the local Beckhoff documentation says about an ADS return code (symbol, text, page) — from the
+# errors index of the knowledge folder, through the describer the server installs (set_error_describer). The
+# hand-written hint table that was here (6, 7, 1797, 1808, 1861) is part of the plugin's notes now
+# (errors_index.ANNOTATIONS): the server's error path adds them, labelled as the plugin's note.
+_DESCRIBE: Callable[[int], str | None] | None = None
+
+
+def set_error_describer(fn: Callable[[int], str | None] | None) -> None:
+    global _DESCRIBE
+    _DESCRIBE = fn
 
 
 def _fmt_exc(exc: BaseException) -> str:
     if isinstance(exc, pyads.ADSError):
-        hint = _ADS_HINTS.get(exc.err_code)
-        return f"ADSError {exc.err_code} (0x{exc.err_code:X}): {exc.msg}" + (f" — {hint}" if hint else "")
+        doc = None
+        if _DESCRIBE is not None:
+            try:
+                doc = _DESCRIBE(exc.err_code)
+            except Exception:  # noqa: BLE001 — a description is an addition; the error itself must come through
+                doc = None
+        return f"ADSError {exc.err_code} (0x{exc.err_code:X}): {exc.msg}" + (f" — {doc}" if doc else "")
     return f"{type(exc).__name__}: {exc}"
