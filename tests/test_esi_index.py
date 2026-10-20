@@ -594,6 +594,10 @@ async def test_the_server_builds_it_once_by_itself_and_answers_from_it(monkeypat
         assert r["devices"][0]["pdo_assignments"][0]["name"] == "Standard (INT32)" and "esi_first_build" not in r
         o = payload(await c.call_tool("hw_object", {"device": "EL3356-0010", "index": "#x8000"}))
         assert {s["sub"]: s for s in o["subitems"]}[17]["default"] == {"value": 2, "text": "IIR1"}
+        # N152 / N155 (0.8.14 retest): one sub-index through the server; its answers carry the index's source
+        o = payload(await c.call_tool("hw_object", {"device": "EL3356-0010", "index": "8000:11"}))
+        assert o["sub"] == 17 and [s["name"] for s in o["subitems"]] == ["Mode0 filter settings"], o
+        assert o["source"]["database"] == str(db) and o["source"]["state"] == "complete" and r["source"] == o["source"]
         f = payload(await c.call_tool("hw_search", {"query": "shielding"}))
         assert f["items"][0]["code"] == "#xD196"
         g = payload(await c.call_tool("hw_diag", {"code": "0xD196", "device": "AX5206-0000-0216"}))
@@ -801,3 +805,118 @@ def test_second_review_0812_state_and_flags(esi_kb, tmp_path, monkeypatch):
     same = con.execute("SELECT COUNT(DISTINCT dict_id) FROM devices WHERE type IN ('AX9206', 'AX5206-0000-0216')").fetchone()[0]
     con.close()
     assert same == 1                                                 # the file's one dictionary, stored once
+
+
+# ---------------------------------------------------------------------------------------------- 0.8.14 retest
+def test_n152_one_sub_index_of_an_object(esi_kb):
+    """N152 (0.8.14 retest, S3): hw_object index=8000:11 silently dropped ':11' and answered the whole object 0x8000
+    (sub 0 … 0x14 here) — the index reader cut the text at ':'. The CoE notation index:sub-index (sub-index in hex,
+    as Beckhoff's manuals and TwinCAT write it: 8000:11 = sub-index 17) gives that sub-index only; a sub-index the
+    object does not have is named with the ones it has; a form that is none of the accepted ones is refused with
+    them; a diagnosis code or a ModuleIdent has no sub-index and says so."""
+    kb, tc, db = esi_kb
+    _build(esi_kb)
+    x = E.EsiIndex(db)
+    for form in ("8000:11", "#x8000:11", "0x8000:0x11", "8000:#x11", " 8000 : 11 "):
+        o = x.object("EL3356-0010", form)
+        assert (o["index"], o["sub"], o["name"]) == ("#x8000", 17, "RMB Settings"), (form, o)
+        assert [(s["sub"], s["name"]) for s in o["subitems"]] == [(17, "Mode0 filter settings")], (form, o)
+        assert o["subitems"][0]["default"] == {"value": 2, "text": "IIR1"}
+    assert len(x.object("EL3356-0010", "8000")["subitems"]) == 4 and "sub" not in x.object("EL3356-0010", "8000")
+    assert x.object("EL3356-0010", "1c12:2")["subitems"][0]["default"] == 0x1601     # an array element
+    with pytest.raises(E.EsiError, match=r"#x8000 'RMB Settings' has no sub-index #x12 \(18\); its sub-indices: "
+                                         r"#x00 \(0\), #x01 \(1\), #x11 \(17\), #x14 \(20\)") as ei:
+        x.object("EL3356-0010", "8000:12")
+    assert ei.value.code == "not_found"
+    # an object without sub-indices: its value is sub-index 0
+    assert x.object("EL3356-0010", "#x1018:0")["default"] == 0x0D1C3052
+    with pytest.raises(E.EsiError, match="is a single value, it has no sub-index #x01 .* its value is sub-index 0") as ei:
+        x.object("EL3356-0010", "#x1018:1")
+    assert ei.value.code == "not_found"
+    for bad in ("8000:zz", "8000:017", "8000:", "8000:#x100", "8000:11:2"):
+        with pytest.raises(E.EsiError, match="sub-index") as ei:
+            x.object("EL3356-0010", bad)
+        assert ei.value.code == "bad_param" and "8000:11" in str(ei.value), (bad, ei.value)
+    with pytest.raises(E.EsiError, match="no sub-index") as ei:
+        x.diag("#x4101:1")
+    assert ei.value.code == "bad_param"
+    with pytest.raises(E.EsiError, match="no sub-index"):
+        x.module("#x006b0064:1")
+
+
+def test_n153_a_revision_that_is_not_indexed_is_said_so_not_the_device(esi_kb):
+    """N153 (0.8.14 retest, S2): hw_lookup EL3356-0010 revision=#x00190000 (and revision=9999) answered 'not in the ESI
+    files of this PC — copy the vendor's ESI XML … kb_rebuild' although the device is indexed (with other
+    revisions): the note was given for any empty answer, whatever filter emptied it. And hw_object / hw_diag /
+    hw_module with that revision said the device was 'not in the ESI index' (listing itself as a type with that
+    text). Now the answer names what is not there — the revision — and the revisions that are."""
+    kb, tc, db = esi_kb
+    _build(esi_kb)
+    x = E.EsiIndex(db)
+    r = x.lookup("EL3356-0010", revision="#x00190000")
+    assert r["matches"] == 0 and r["devices"] == [], r
+    assert "copy the vendor's ESI" not in r["note"] and "kb_rebuild" not in r["note"], r
+    assert r["note"].startswith("EL3356-0010 has no revision #x00190000"), r
+    assert r["revisions_available"] == {"EL3356-0010": ["#x0019000A", "#x0018000A"]}, r
+    r = x.lookup("EL3356-0010", revision="9999")                        # a number: read as decimal, said so
+    assert "no revision #x0000270F (decimal 9999)" in r["note"] and "copy the vendor's ESI" not in r["note"], r
+    r = x.lookup("Resistor Bridge", revision=1)                          # a name fragment: its types' revisions
+    assert "has no revision #x00000001" in r["note"] and r["revisions_available"]["EL3356-0010"][0] == "#x0019000A"
+    # a device that is not indexed at all: still the hint to add its ESI file (with or without a revision)
+    for rev in (None, "#x1"):
+        assert "copy the vendor's ESI XML" in x.lookup("EL9999", revision=rev)["note"]
+    for call in (lambda: x.object("EL3356-0010", "#x8000", revision="#x00190000"),
+                 lambda: x.diag("#x4101", device="EL3356-0010", revision="#x00190000"),
+                 lambda: x.module("#x00000cf2", device="EL3356-0010", revision="#x00190000")):
+        with pytest.raises(E.EsiError, match=r"EL3356-0010 has no revision #x00190000 in the ESI index; its revisions "
+                                             r"\(newest first\): #x0019000A, #x0018000A") as ei:
+            call()
+        assert ei.value.code == "not_found" and "is not in the ESI index" not in str(ei.value)
+
+
+def test_n154_a_product_code_in_every_form(esi_kb):
+    """N154 (0.8.14 retest, S3): hw_lookup query=219951186 (= #x0D1C3052, decimal) found nothing and answered 'copy the
+    vendor's ESI XML' — only '#x…' / '0x…' were read as a product code. A number is now read as a decimal product
+    code as well (a type or name containing the digits still matches: '3356'); '#x' / '0x' followed by no hex number
+    is refused with the accepted forms; an answer that finds nothing names them; a revision is read the same way."""
+    kb, tc, db = esi_kb
+    _build(esi_kb)
+    x = E.EsiIndex(db)
+    for q in ("219951186", "#x0D1C3052", "#x0d1c3052", "0x0D1C3052", "0X0d1c3052"):
+        r = x.lookup(q)
+        assert r["matches"] == 2 and r["types"] == ["EL3356-0010"], (q, r)
+    assert "product code #x0D1C3052" in x.lookup("219951186")["read_as"]
+    assert x.lookup("3356")["types"] == ["EL3356-0010"]                 # digits of a type: found as before
+    with pytest.raises(E.EsiError, match="is not a hex number") as ei:
+        x.lookup("#x0D1C30G2")
+    assert ei.value.code == "bad_param" and "decimal" in str(ei.value)
+    n = x.lookup("0D1C3052")                                             # hex without #x: text, which matches nothing
+    assert n["matches"] == 0 and "'#x0D1C3052', '0x0D1C3052' or decimal" in n["note"], n
+    for rev in ("#x0018000a", "0x0018000A", "1572874", 1572874):         # 0x0018000A = 1572874
+        assert x.lookup("EL3356-0010", revision=rev)["devices"][0]["revision"] == "#x0018000A", rev
+    with pytest.raises(E.EsiError, match="revision must be .*0x0019000A.* or decimal"):
+        x.lookup("EL3356-0010", revision="0018000A")
+
+
+def test_n156_a_module_is_found_by_its_device(esi_kb):
+    """N156 (0.8.14 retest, S4): hw_search AX8000 kinds=module found nothing although the AX8000 modules are indexed —
+    they are named generically (DeviceMain, SynchronousMotor …) and their search text held only their own name and
+    PDOs. The search text of a module now holds the devices whose slots take it (type, name, group — the rule of
+    hw_lookup's slots), so a module is found by its device; the index format is 2."""
+    kb, tc, db = esi_kb
+    _build(esi_kb)
+    x = E.EsiIndex(db)
+    r = x.search("AX8206", kinds=["module"])
+    assert {(i["module"], i["title"]) for i in r["items"]} == {("DeviceMain", "DeviceMain 0106"),
+                                                               ("DeviceMain", "DeviceMain 0107")}, r
+    assert "AX8206" in r["items"][0]["snippet"]
+    r = x.search("Servo drive", kinds=["module"])                        # words of the device's name
+    assert r["count"] == 2, r
+    t = x.search("Resistor Bridge", kinds=["module"])                    # EL3356-0010's slot module (TSC), own file
+    assert "TSC" in {i["title"].split()[-1] for i in t["items"]}, t
+    # a module goes with the devices of its rule only: the 0106 module file is not the 0107 device's
+    con = sqlite3.connect(db)
+    body = dict(con.execute("SELECT title, body FROM search WHERE kind = 'module'").fetchall())
+    con.close()
+    assert "AX8206-0210-0107" in body["DeviceMain 0107"] and "AX8206-0210-0107" not in body["DeviceMain 0106"], body
+    assert E.FORMAT == "2" and E.state(db, kb, [tc], twincat=False)["format"] == "2"

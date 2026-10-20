@@ -373,6 +373,49 @@ def test_hw_commands_read_the_esi_index_with_its_state(kbdir, tmp_path):
     assert {k: v for k, v in _digest(kbdir).items() if "EL34xx" not in k} == before
 
 
+def test_n155_the_server_and_the_skill_answer_hw_with_one_envelope(kbdir, tmp_path):
+    """N155 (0.8.14 retest, S4): the same ESI data came in two envelopes — the server's hw_lookup / hw_object had no
+    `source` block (database, state, built; the index state was `esi_index_note`), the skill's hw_lookup had no
+    `manuals` / `manuals_more`. Both build the answer the same way now: every key and value the same (N152's
+    sub-index answer included), also when the index is not current (`source.state_note`)."""
+    from tests.test_esi_index import EL33, VENDOR
+    from twincat_mcp import esi_index as E
+    from twincat_mcp import knowledge as K
+    m = kbdir / "manuals" / "Beckhoff_EtherCAT_XML"
+    m.mkdir(parents=True)
+    (m / "Beckhoff EL33xx.xml").write_text(EL33.format(vendor=VENDOR.format(fv=10)), encoding="utf-8")
+    E.build(kbdir / "index" / "esi.db", kbdir, [], twincat=False, log=lambda s: None)
+    k = K.Knowledge(tmp_path / "home", str(kbdir), [], [])
+    calls = [(k.hw_lookup, ("EL3356-0010", 1, None, "newest"), ["hw_lookup", "query=EL3356-0010", "limit=1"]),
+             (k.hw_lookup, ("CX9020", 3, None, "newest"), ["hw_lookup", "query=CX9020"]),
+             (k.hw_object, ("EL3356-0010", "#x8000", None), ["hw_object", "device=EL3356-0010", "index=#x8000"]),
+             (k.hw_object, ("EL3356-0010", "8000:11", None), ["hw_object", "device=EL3356-0010", "index=8000:11"]),
+             (k.hw_search, ("Underrange", ["device"], 20), ["hw_search", "query=Underrange", "kinds=device"]),
+             (k.hw_diag, ("#x4101", None, None), ["hw_diag", "code=#x4101"]),
+             (k.hw_module, ("#x00000cf2", "EL3356-0010", None), ["hw_module", "ident=#x00000cf2", "device=EL3356-0010"])]
+
+    def both(fn, args, cli):
+        server = json.loads(json.dumps(fn(*args), default=str))
+        rc, skill = run(kbdir, *cli)
+        skill.pop("elapsed_ms")
+        assert rc == 0, skill
+        return server, skill
+    for fn, args, cli in calls:
+        server, skill = both(fn, args, cli)
+        assert list(server) == list(skill) and server == skill, (cli, server, skill)
+        assert server["source"] == {"database": str(kbdir / "index" / "esi.db"), "state": "complete",
+                                    "built": E.read_meta(kbdir / "index" / "esi.db")["built"]}, server
+    server, _skill = both(*calls[0])
+    assert "manuals_more" in server or "manuals_note" in server, server
+    server, _skill = both(*calls[1])
+    assert server["manuals"]["CX9020"][0]["doc"] == "CX9020.pdf" and server["manuals_more"], server
+    # an index that is not current: said in source.state_note by both
+    (m / "Beckhoff EL34xx.xml").write_text(EL33.format(vendor=VENDOR.format(fv=1)).replace("EL3356", "EL3456"),
+                                           encoding="utf-8")
+    server, skill = both(*calls[2])
+    assert server == skill and "OUTDATED" in server["source"]["state_note"] and "esi_index_note" not in server
+
+
 def test_n100_docs_declaration_follows_the_plugins_rule(kbdir):
     """N100 (0.8.11 retest): docs_declaration T_MaxString was 'ambiguous' — the same page id in two books (a library's
     page copied into another product's book) — and ADSREAD ambiguous with the C++ AdsRead page, while infosys_declaration
