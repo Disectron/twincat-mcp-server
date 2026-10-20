@@ -724,7 +724,7 @@ def _intro(body: str) -> str:
     return t[:600] + ("…" if len(t) > 600 else "")
 
 
-def _parsed_declaration(r: sqlite3.Row) -> dict[str, Any]:
+def _parsed_declaration(r: sqlite3.Row, con: sqlite3.Connection | None = None) -> dict[str, Any]:
     """N103b: what the index stored for the page when it was built (the plugin's parse_declaration — the same answer
     infosys_declaration gives): the kind, the return type of a function / method / property, and the declaration
     with its header ('FUNCTION MEMCPY : UDINT' — Beckhoff often writes the header as a heading, so the page's code
@@ -736,6 +736,8 @@ def _parsed_declaration(r: sqlite3.Row) -> dict[str, Any]:
     if not isinstance(d, dict):
         return {"kind": r["kind"], "declaration_note": "the index holds no parsed declaration for this page — the "
                                                        "kind is the page's, the return type is not known"}
+    if con is not None and d.get("syntax_header"):
+        d = INF.header_answer(con, r, d)        # third review of 0.8.15: the plugin's one rule for a Syntax header
     out: dict[str, Any] = {"kind": d.get("kind") or r["kind"]}
     if out["kind"] in ("Function", "Method", "Property"):
         out["return_type"] = d.get("return_type")
@@ -747,13 +749,12 @@ def _parsed_declaration(r: sqlite3.Row) -> dict[str, Any]:
               "enum_values", "methods", "properties", "description"):
         if d.get(k):
             out[k] = d[k]
-    if INF.is_symbol_row(r) or d.get("declared_as"):
-        # N170: a symbol documented in a section or table of a page — its value, GVL, section, how it was read; the
-        # name the page's Syntax section declares (re-review of 0.8.15)
-        for k in ("value", "type", "gvl", "return_description", "summary", "reconstructed", "declared_as",
-                  "declared_as_note"):
-            if d.get(k):
-                out[k] = d[k]
+    # N170: a symbol documented in a section or table of a page — its value, GVL, section, how it was read; a
+    # Syntax-section header under another name (re-review of 0.8.15): the name it declares, or why it is not used
+    for k in ("value", "type", "gvl", "return_description", "summary", "reconstructed", "declared_as",
+              "declared_as_note", "syntax_header", "syntax_header_note"):
+        if d.get(k) and (INF.is_symbol_row(r) or k.startswith(("declared_as", "syntax_header"))):
+            out[k] = d[k]
     return out
 
 
@@ -797,7 +798,7 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         used += len(b)
     req = re.search(r"(?ms)^#{1,4} (?:Requirements|Prerequisites|Voraussetzungen)\s*\n(.*?)(?=^#{1,4} |\Z)", body)
     out: dict[str, Any] = _page_head(ctx, r)
-    out.update({"resolved_by": how, **_parsed_declaration(r), "intro": _intro(body), "declaration_blocks": shown,
+    out.update({"resolved_by": how, **_parsed_declaration(r, con), "intro": _intro(body), "declaration_blocks": shown,
                 "requirements": req.group(1).strip() if req else None, "also_in": _also_in(con, r)})
     if INF.is_symbol_row(r):
         # N170: documented in a section or table of a page (it has no page of its own)

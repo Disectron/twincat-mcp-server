@@ -1160,9 +1160,11 @@ def test_review_0815_syntax_sections_operator_names_and_the_page_own_header():
 
 
 def store_declared_as(store):
-    """Re-review of 0.8.15: pages whose Syntax section declares their symbol under another name — the 39 tf8560 core
-    function pages ('ActualsActuator' declares FB_ActuatorActuals), and Beckhoff's copy of a neighbour's header
-    (SendMessageEx2 shows METHOD SendMessageEx; its Inputs table has the sJsonAttribute the header lacks)."""
+    """Re-review of 0.8.15: pages whose Syntax section declares another name than their title — the 39 tf8560 core
+    function pages ('ActualsActuator' declares FB_ActuatorActuals), and Beckhoff's copies of a neighbour's header
+    (SendMessageEx2 shows METHOD SendMessageEx — its Inputs table has the sJsonAttribute the header lacks;
+    F_TimeToSeconds() shows FUNCTION F_SecondsToTime, which has its own page). Third review: FB_MTP_Procedure's Syntax
+    shows how to derive from it; FB_BA_Device and FB_BA_WeatherParameter both show a header of FB_BA_Settings."""
     store("tf8560_plastic_technology_functions/16259000001", "ActualsActuator",
           "<p>This class supplies the actual values of an actuator.</p><h2>Syntax:</h2>"
           "<pre>FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR</pre>",
@@ -1170,6 +1172,12 @@ def store_declared_as(store):
     store("tf85xx_plastic_application/13193000002", "SendHresult()",
           "<p>Logs a message in the EventLogger.</p><h2>Syntax:</h2><pre>METHOD SendEqualMessage : HRESULT\nVAR_INPUT\n"
           "    hr : HRESULT;\nEND_VAR</pre>", "pl-send")
+    store("tf85xx_plastic_application/13193276299", "F_TimeToSeconds()",
+          "<p>Converts a time of type TIME to seconds of type LREAL.</p><h2>Syntax:</h2><pre>FUNCTION F_SecondsToTime : "
+          "LREAL\nVAR_INPUT\n    tTime : TIME;\nEND_VAR</pre>", "pl-t2s")
+    store("tf85xx_plastic_application/13193276000", "F_SecondsToTime()",
+          "<p>Converts seconds of type LREAL to a time of type TIME.</p><h2>Syntax:</h2><pre>FUNCTION F_SecondsToTime : "
+          "TIME\nVAR_INPUT\n    fTime : LREAL;\nEND_VAR</pre>", "pl-s2t")
     store("tcplclib_tc3_eventlogger/13724785419", "SendMessageEx2",
           "<p>This method sends a message.</p><h2>Syntax</h2><pre>METHOD SendMessageEx : HRESULT\nVAR_INPUT\n"
           "    stEventEntry : TcEventEntry;\nEND_VAR</pre><h2>Inputs</h2>"
@@ -1181,31 +1189,38 @@ def store_declared_as(store):
     store("tcplclib_tc3_eventlogger/13724785000", "SendMessageEx",
           "<p>This method sends a message.</p><h2>Syntax</h2><pre>METHOD SendMessageEx : HRESULT\nVAR_INPUT\n"
           "    stEventEntry : TcEventEntry;\n    ipSourceInfo : I_TcSourceInfo := 0;\nEND_VAR</pre>", "el-ex")
+    store("tf8400_tc3_mtp_runtime/1001", "FB_MTP_Procedure",
+          "<p>The function block is abstract and must be derived.</p><h2>Syntax</h2><pre>FUNCTION_BLOCK "
+          "FB_MTP_Procedure_1_Service EXTENDS FB_MTP_Procedure\nVAR_INPUT\n    nX : INT;\nEND_VAR</pre>", "mtp-proc")
+    store("tf8040_tc3_buildingautomation/2001", "FB_BA_Device",
+          "<p>The template includes several basic functions.</p><h2>Syntax</h2><pre>FUNCTION_BLOCK FB_BA_Settings "
+          "EXTENDS FB_BA_View\nVAR_INPUT CONSTANT\n    Trend : FB_BA_TrendLogging;\nEND_VAR</pre>", "ba-dev")
+    store("tf8040_tc3_buildingautomation/2002", "FB_BA_WeatherParameter",
+          "<p>The template contains the weather parameters.</p><h2>Syntax</h2><pre>FUNCTION_BLOCK FB_BA_Settings "
+          "EXTENDS FB_BA_View\nVAR_INPUT\n    fTWth : REAL;\nEND_VAR</pre>", "ba-wth")
 
 
 def test_rereview_0815_a_syntax_header_under_another_name_is_the_page_declaration(idx):
     """Re-review of 0.8.15 (S3): the header in a page's Syntax section gave the page its kind and was then dropped —
     'ActualsActuator' (tf8560) was FunctionBlock 'ActualsActuator' with no declaration and no EXTENDS, while the page
     declares FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals, and FB_ActuatorActuals — the name code
-    uses — was not found; SendHresult() was a Method with no return type under METHOD SendEqualMessage : HRESULT. The
-    header is the page's declaration, the name it declares is said (declared_as) and finds the page — unless a page of
-    the same library / book documents that name (SendMessageEx2's copy of METHOD SendMessageEx does not take
-    SendMessageEx). What the page's tables document and the header does not declare is said, not dropped."""
+    uses — was not found. Third review (S3-1): taking every such header as the page's second name gave
+    F_TimeToSeconds() the header of F_SecondsToTime ('Beckhoff's page uses both'), FB_MTP_Procedure an EXTENDS of
+    itself and FB_BA_Settings two pages that do not document it. The header is the page's declaration only when
+    nothing contradicts it: no page of its library or book documents the name, the page's tables document nothing
+    the header lacks, and it does not derive from the page's own symbol; otherwise why is said."""
     def kind(title, body):
         return parse_declaration(title, _page(title, body))
     got = {}
     store_declared_as(lambda ref, title, body, hid: got.setdefault(title, kind(title, body)))
     a = got["ActualsActuator"]
-    assert (a["kind"], a["extends"], a["declared_as"]) == ("FunctionBlock", "FB_MotionActuals", "FB_ActuatorActuals"), a
-    assert a["declaration"].startswith("FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals"), a
-    assert [x["name"] for x in a["inputs"]] == ["bEnable"] and "titled 'ActualsActuator'" in a["declared_as_note"], a
-    s = got["SendHresult()"]
-    assert (s["kind"], s["return_type"], s["declared_as"]) == ("Method", "HRESULT", "SendEqualMessage"), s
-    assert s["declaration"].startswith("METHOD SendEqualMessage : HRESULT"), s
+    assert a["kind"] == "FunctionBlock" and a["declaration"] is None and a["syntax_header"]["name"] == "FB_ActuatorActuals"
+    assert a["syntax_header"]["extends"] == "FB_MotionActuals" and a["syntax_header"]["undeclared"] == [], a
     e = got["SendMessageEx2"]
-    assert e["declared_as"] == "SendMessageEx" and "also document sJsonAttribute," in e["declared_as_note"], e
-    assert "stEventEntry" not in e["declared_as_note"]
-    assert "declared_as" not in got["SendMessageEx"]
+    assert e["syntax_header"]["name"] == "SendMessageEx" and e["syntax_header"]["undeclared"] == ["sJsonAttribute"], e
+    m = got["FB_MTP_Procedure"]
+    assert "syntax_header" not in m and m["extends"] is None and "how to derive from it" in m["syntax_header_note"], m
+    assert "syntax_header" not in got["SendMessageEx"]
 
     store_declared_as(lambda ref, title, body, hid: _store_with(idx, ref, title, body, hid))
     idx.resolve_help_links()
@@ -1214,10 +1229,24 @@ def test_rereview_0815_a_syntax_header_under_another_name_is_the_page_declaratio
     assert d["url"].endswith("tf8560_plastic_technology_functions/16259000001.html"), d
     assert (d["kind"], d["extends"], d["declared_as"], d["page_title"]) == (
         "FunctionBlock", "FB_MotionActuals", "FB_ActuatorActuals", "ActualsActuator"), d
-    assert idx.declaration("ActualsActuator")["url"] == d["url"]
-    x = idx.declaration("SendMessageEx")
-    assert x["url"].endswith("tcplclib_tc3_eventlogger/13724785000.html") and "declared_as" not in x, x
-    assert idx.declaration("SendEqualMessage")["page_title"] == "SendHresult()"
+    a = idx.declaration("ActualsActuator")
+    assert a["url"] == d["url"] and a["declaration"].startswith("FUNCTION_BLOCK FB_ActuatorActuals EXTENDS"), a
+    assert "no other page of its library documents" in a["declared_as_note"], a
+    s = idx.declaration("SendHresult()")
+    assert (s["return_type"], s["declared_as"]) == ("HRESULT", "SendEqualMessage"), s
+    t = idx.declaration("F_TimeToSeconds()")      # a copy of the header of F_SecondsToTime, which has its own page
+    assert t["declaration"] is None and "declared_as" not in t and t["syntax_header"]["name"] == "F_SecondsToTime", t
+    assert "F_SecondsToTime has its own page" in t["syntax_header_note"], t
+    assert idx.declaration("F_SecondsToTime")["url"].endswith("13193276000.html")
+    x = idx.declaration("SendMessageEx2")
+    assert x["declaration"] is None and "sJsonAttribute, which that header does not declare" in x["syntax_header_note"]
+    assert "SendMessageEx has its own page" in x["syntax_header_note"], x
+    assert idx.declaration("SendMessageEx")["url"].endswith("tcplclib_tc3_eventlogger/13724785000.html")
+    with pytest.raises(InfosysError, match="no symbol page titled 'FB_MTP_Procedure_1_Service'"):
+        idx.declaration("FB_MTP_Procedure_1_Service")            # the user's own derived class, not a Beckhoff page
+    with pytest.raises(InfosysError, match="no symbol page titled 'FB_BA_Settings'"):
+        idx.declaration("FB_BA_Settings")                         # two pages' headers, differently: neither documents it
+    assert idx.declaration("FB_BA_Device").get("declared_as") == "FB_BA_Settings"
 
 
 def test_rereview_0815_a_derived_version_bump_rebuilds_the_derived_tables(idx, monkeypatch):
@@ -1275,12 +1304,60 @@ def test_rereview_0815_a_line_ending_with_a_colon_introduces_the_syntax():
     assert sel["declaration"] == "OUT := SEL(G, IN0, IN1) means:\nOUT := IN0; if G = FALSE\nOUT := IN1; if G = TRUE", sel
     si = kind("SetInital", "<p>This method sets the initial value.</p><h2>Syntax</h2><p>Definition:</p>"
                            "<pre>METHOD SetInitial : BOOL\nVAR_INPUT\n    nCount : ULINT;\nEND_VAR</pre>")
-    assert (si["kind"], si["declared_as"], si["return_type"]) == ("Method", "SetInitial", "BOOL"), si
-    assert [x["name"] for x in si["inputs"]] == ["nCount"], si
+    h = si["syntax_header"]
+    assert (si["kind"], h["name"], h["return_type"]) == ("Method", "SetInitial", "BOOL"), si
+    assert [x["name"] for x in h["inputs"]] == ["nCount"] and h["undeclared"] == [], si
     tp = kind("FB_DataSource", "<p>The function block is generated for each data source.</p><h2>Syntax</h2>"
                                "<p>Definition:</p><pre>FUNCTION_BLOCK FB_T[n]_DataSource IMPLEMENTS I_DataSource\n"
                                "VAR_INPUT\n    bX : BOOL;\nEND_VAR</pre>")
-    assert tp["kind"] == "FunctionBlock" and "declared_as" not in tp, tp
+    assert tp["kind"] == "FunctionBlock" and "syntax_header" not in tp, tp
     prog = _page("Object Program", "<p><b>Syntax:</b></p><p>&lt;program&gt;(&lt;input variable&gt; := &lt;value&gt;):</p>"
                                    "<p>If you add a program call via the input assistant, TwinCAT adds the parameters.</p>")
     assert _syntax_parts(prog.markdown) == [("<program>(<input variable> := <value>):", False)]
+
+
+def test_third_review_0815_a_member_comes_from_the_owners_library_first(idx):
+    """Third review of 0.8.15 (S4-2): FB_D of Tc3_LibA EXTENDS FB_Base; LibA documents its own FB_Base (no Calc), LibB
+    another FB_Base with a Calc — 'FB_D.Calc' (library=Tc3_LibA or none) answered LibB's Calc, as if FB_D derived from
+    LibB's class. Where a member comes from is looked up in the owner's library; another library only when the
+    owner's has no page of that class."""
+    A, B = "tcplclib_tc3_liba", "tcplclib_tc3_libb"
+    _store_with(idx, f"{A}/4001", "FB_D", "<pre>FUNCTION_BLOCK FB_D EXTENDS FB_Base\nVAR_INPUT\n    bD : BOOL;\nEND_VAR</pre>",
+                "a-d")
+    _store_with(idx, f"{A}/4002", "FB_Base", "<pre>FUNCTION_BLOCK FB_Base\nVAR_INPUT\n    bA : BOOL;\nEND_VAR</pre>", "a-b")
+    _store_with(idx, f"{B}/4003", "FB_Base", "<pre>FUNCTION_BLOCK FB_Base\nVAR_INPUT\n    bB : BOOL;\nEND_VAR</pre>", "b-b")
+    _store_with(idx, f"{B}/4004", "Calc", "<pre>METHOD Calc : BOOL\nVAR_INPUT\n    fIn : LREAL;\nEND_VAR</pre>", "b-c",
+                "b-b")
+    idx.resolve_help_links()
+    idx.sync_derived()
+    for lib in (None, A):
+        with pytest.raises(InfosysError, match="no symbol page titled 'FB_D.Calc'"):
+            idx.declaration("FB_D.Calc", library=lib)
+
+
+def test_third_review_0815_a_derived_rebuild_is_one_transaction(idx, monkeypatch):
+    """Third review of 0.8.15 (S4-1): the rebuild after a DERIVED_VERSION change dropped the tables with executescript,
+    which commits at once — another reader saw empty catalog / symbols tables for up to 10 s and answered 'not found'.
+    The drop and the rebuild are one transaction: a reader sees the old tables until the new ones are complete."""
+    import sqlite3
+    import twincat_mcp.infosys as I
+    store_declared_as(lambda ref, title, body, hid: _store_with(idx, ref, title, body, hid))
+    idx.sync_derived()
+    with idx._db() as con:
+        before = con.execute("SELECT COUNT(*) FROM catalog").fetchone()[0]
+    seen: list[object] = []
+    real = type(idx)._init_derived
+
+    def watched(self, con):
+        real(self, con)
+        r = sqlite3.connect(idx.db_file)                     # another reader, during the rebuild
+        try:
+            seen.append(r.execute("SELECT COUNT(*) FROM catalog").fetchone()[0])
+        except sqlite3.OperationalError as e:
+            seen.append(str(e))
+        finally:
+            r.close()
+    monkeypatch.setattr(type(idx), "_init_derived", watched)
+    monkeypatch.setattr(I, "DERIVED_VERSION", I.DERIVED_VERSION + 1)
+    assert idx.sync_derived()["changed"] is True
+    assert before > 0 and seen and all(x == before for x in seen), (before, seen)

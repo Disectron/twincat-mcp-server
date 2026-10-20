@@ -811,6 +811,10 @@ def test_n170_the_skill_and_the_cli_answer_symbols_documented_inside_a_page(kb, 
         assert "section='Method CreateRecipe'" in r["note"]
     r = kbdocs(kb, "docs_declaration", "symbol=ERR_RECIPE_NOT_FOUND")
     assert (r["kind"], r["value"], r["type"], r["gvl"]) == ("Constant", "16#4003", "UDINT", "ReturnValues"), r
+    # third review of 0.8.15 (S3-2): a constant's declaration is reconstructed too — 'the page has no code block' was
+    # said of a page with code, and the section was lost
+    assert "reconstructed from the page's tables" in r["note"] and "section='Return values'" in r["note"], r["note"]
+    assert r["declaration_blocks"] == [], r
     r = kbdocs(kb, "docs_declaration", "symbol=AlarmCommands")               # only a title has the name
     assert (r["kind"], r["match"], r["ref"]) == ("Page", "title", "tc3_plc_intro/2525822000"), r
     r = kbdocs(kb, "docs_page", "ref=CreateRecipe")
@@ -839,9 +843,11 @@ def test_rereview_0815_the_built_index_finds_a_symbol_by_the_name_its_page_decla
     assert p.returncode == 0, p.stdout + p.stderr
     r = kbdocs(kb, "docs_declaration", "symbol=FB_ActuatorActuals")
     assert (r["ref"], r["declared_as"]) == ("tf8560_plastic_technology_functions/16259000001", "FB_ActuatorActuals"), r
+    c = run("infosys_local.py", "--kb", str(kb), "decl", "ActualsActuator")
+    assert c.returncode == 0 and "Declared as FB_ActuatorActuals: the page is titled 'ActualsActuator'" in c.stdout
     c = run("infosys_local.py", "--kb", str(kb), "decl", "SendMessageEx2")
-    assert c.returncode == 0 and "Declared as SendMessageEx: the page is titled 'SendMessageEx2'" in c.stdout, c.stdout
-    assert "also document sJsonAttribute" in c.stdout and "METHOD SendMessageEx : HRESULT" in c.stdout, c.stdout
+    assert c.returncode == 0 and "Syntax header: the header in its Syntax section declares SendMessageEx" in c.stdout
+    assert "sJsonAttribute, which that header does not declare" in c.stdout, c.stdout
 
 
 def test_n167_n168_n169_the_cli_pages_reads_on_and_shows_its_ranges(kb, tmp_path):

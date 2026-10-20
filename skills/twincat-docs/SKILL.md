@@ -55,10 +55,12 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    IMPLEMENTS (`FB_TcMessage.Send` → `I_TcMessage`'s; `defined_in` says so). A symbol documented inside another page
    (RecipeManCommands' methods as `## Method X` sections, a GVL's constants as a table) answers with `section` and a
    declaration reconstructed from the page's tables (`reconstructed`); `docs_page ref=<that name>` opens its section.
-   A page whose Syntax section declares another name than its title (`ActualsActuator` declares
-   `FB_ActuatorActuals`; Beckhoff's copy of a neighbour's header) answers with `declared_as` and `declared_as_note`
-   — both names are the page's; the note lists what its tables document and the header does not. The declared name
-   finds the page too, unless a page of the same library documents it.
+   A page whose Syntax section declares another name than its title: when no other page of its library documents
+   that name and the page's tables document nothing the header lacks, the header is its declaration (`declared_as`,
+   `declared_as_note`: `ActualsActuator` declares `FB_ActuatorActuals`) and the declared name finds the page.
+   Otherwise the header is another symbol's (Beckhoff's copy of a neighbour's: `SendMessageEx2` shows
+   `METHOD SendMessageEx`) — `syntax_header_note` says why, and the page shows no declaration of its own; read the
+   page's tables (`docs_page`) rather than that header.
    A name that only a page title has as a word answers that page (`kind: Page`, `match: title`, `outline`).
 3. `ambiguous` = the name is documented by different pages (Tc2_MC2 vs Tc3_DriveMotionControl, or two methods of
    that name in one library). Nothing was chosen for you. Find the library the project uses (`proj_libraries` of the

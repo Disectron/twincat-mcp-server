@@ -216,6 +216,8 @@ def cmd_decl(args) -> int:
         parts.append("```\n" + out["declaration"] + "\n```")          # reconstructed by the index (N170)
     if out.get("declared_as"):
         parts.append(f"Declared as {out['declared_as']}: {out.get('declared_as_note') or ''}")    # re-review of 0.8.15
+    if out.get("syntax_header_note"):
+        parts.append(f"Syntax header: {out['syntax_header_note']}")
     if out.get("value") is not None:
         parts.append(f"Value: {out['value']}" + (f" (GVL {out['gvl']})" if out.get("gvl") else "")
                      + (f" — {out['description']}" if isinstance(out.get("description"), str) else ""))
