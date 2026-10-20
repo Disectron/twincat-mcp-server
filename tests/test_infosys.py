@@ -603,3 +603,35 @@ def test_review_0812_a_web_answer_carries_no_fts_counts(idx, monkeypatch):
     """Review 0.8.12: when the web fallback answered, total / query_mode described the empty local search."""
     r = idx.search("technology data SAF")
     assert r["backend"] == "duckduckgo+sitemap" and "total" not in r and "query_mode" not in r, r
+
+
+def test_kbv_book_slash_id_for_ids_that_are_not_numbers(kb_copy):
+    """kb_verify on the real index (0.8.13): infosys_get_page('aml_dataexchange/index') and
+    ('tcplclib_tc3_eventlogger/13785931531_21345065') were refused ("neither an Infosys URL, 'book/id' …") — 'book/id'
+    was read with digits only, and 1169 of the 51,655 pages have another id. A 'book/id' whose id is not a number is a
+    page when the index has it; otherwise it is a title with a slash, as before."""
+    import sqlite3
+    from twincat_mcp.infosys import InfosysIndex
+    db = kb_copy / "index" / "infosys-1033.db"
+    old = "https://infosys.beckhoff.com/content/1033/tcplclib_tc2_system/31059723.html"
+    new = "https://infosys.beckhoff.com/content/1033/tcplclib_tc2_system/index.html"
+    con = sqlite3.connect(db)
+    with con:
+        con.execute("UPDATE pages SET url = ?, page_id = 'index' WHERE url = ?", (new, old))
+        con.execute("UPDATE pages SET title = 'Send/Receive' WHERE title = 'ADSWRITE'")
+        con.execute("UPDATE pages SET url = replace(url, '30868043', 'beckhoff-0cad-46d4'), page_id = 'beckhoff-0cad-46d4'"
+                    " WHERE title = 'MEMCPY'")
+    con.close()
+    ix = InfosysIndex(db_file=db, read_only=True, web_fallback=False)
+    assert ix.get_page("tcplclib_tc2_system/index", max_chars=50)["title"] == "T_AmsNetID"
+    assert ix.get_page("tcplclib_tc2_system/index.html", max_chars=50)["url"] == new
+    assert ix.get_page("Send/Receive", max_chars=50)["title"] == "Send/Receive"       # a title with a slash
+    assert ix.get_page("tcplclib_tc2_system/beckhoff-0cad-46d4", max_chars=50)["title"] == "MEMCPY"
+    # book slugs with '.' and '-' (tc3_ads.net, tf5110-tf5113_tc3_kinematic_transformation) were refused too
+    con = sqlite3.connect(db)
+    with con:
+        con.execute("UPDATE pages SET url = replace(url, '/tcplclib_tc2_utilities/', '/tc3_ads.net/'), "
+                    "book = 'tc3_ads.net' WHERE book = 'tcplclib_tc2_utilities'")
+    con.close()
+    url = InfosysIndex(db_file=db, read_only=True, web_fallback=False).get_page("tc3_ads.net/35409035")["url"]
+    assert url == "https://infosys.beckhoff.com/content/1033/tc3_ads.net/35409035.html"

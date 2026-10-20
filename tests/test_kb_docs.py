@@ -399,3 +399,29 @@ def test_n100_docs_declaration_follows_the_plugins_rule(kbdir):
     assert rc == 0 and r["ref"] == "tcplclib_tc2_system/30866571"
     rc, r = run(kbdir, "docs_declaration", "symbol=MC_MoveAbsolute")    # two libraries: still refused
     assert rc == 1 and r["error"] == "ambiguous" and len(r["candidates"]) == 2
+
+
+def test_kbv_pages_whose_id_is_not_a_number(kbdir):
+    """kb_verify on the real index (0.8.13): docs_page with the Infosys URL of a book's index page ('…/el6851/
+    index.html') or of a page id like '6778772363_30967009' — 1169 of the 51,655 pages — said not_found (looked up as
+    title), and links to them were left out of `links`: the skill read only digits as a page id. A page id is what the
+    page's file is named (twincat_mcp.infosys.book_of)."""
+    import sqlite3
+    db = kbdir / "index" / "infosys-1033.db"
+    old = "https://infosys.beckhoff.com/content/1033/tcplclib_tc2_system/31059723.html"
+    new = "https://infosys.beckhoff.com/content/1033/tcplclib_tc2_system/index.html"
+    mc = "https://infosys.beckhoff.com/content/1033/tcplclib_tc2_mc2/70094731.html"
+    mc_new = "https://infosys.beckhoff.com/content/1033/tcplclib_tc2_mc2/6778772363_70094731.html"
+    con = sqlite3.connect(db)
+    with con:
+        con.execute("UPDATE pages SET url = ?, page_id = 'index' WHERE url = ?", (new, old))
+        con.execute("UPDATE pages SET url = ?, page_id = '6778772363_70094731' WHERE url = ?", (mc_new, mc))
+        con.execute("UPDATE helpids SET url = ? WHERE url = ?", (new, old))
+        con.execute("UPDATE pages SET markdown = replace(markdown, ?, ?)", (old, new))
+    con.close()
+    rc, r = run(kbdir, "docs_page", f"ref={new}")
+    assert rc == 0 and r["ref"] == "tcplclib_tc2_system/index" and r["title"] == "T_AmsNetID", r
+    rc, r = run(kbdir, "docs_page", f"ref={mc_new}#section")
+    assert rc == 0 and r["ref"] == "tcplclib_tc2_mc2/6778772363_70094731", r
+    rc, r = run(kbdir, "docs_page", "ref=tcplclib_tc2_system/30866571")             # ADSREAD links T_AmsNetID
+    assert rc == 0 and {"text": "T_AmsNetID", "ref": "tcplclib_tc2_system/index"} in r["links"], r.get("links")

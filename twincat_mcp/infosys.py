@@ -828,7 +828,7 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
         return out
 
     rows, total, mode, expr, info = DS.search_tiers(con, sql, count_sql, query, extra, limit, fts="pages_fts",
-                                                    arrange=arrange)
+                                                    arrange=arrange, title_col="title")
     outside = 0                                 # defining pages without the tier's words: listed, so counted
     if not rows and defined:                    # the code's table, though no tier found the query's other words
         rows, total, mode = arrange([])[:limit], 0, "the code's table (no page has the other words)"
@@ -2241,9 +2241,19 @@ class InfosysIndex:
             return u
         if r.startswith("content/"):
             return f"{INFOSYS}/{r}"
-        m = re.fullmatch(r"([a-z0-9_]+)/(\d+)(?:\.html)?", r, re.I)
-        if m:
+        # a book slug as the package names it ('tc3_ads.net', 'tf5110-tf5113_tc3_kinematic_transformation': 4437 pages)
+        m = re.fullmatch(r"([a-z0-9_][a-z0-9_.\-]*)/([a-z0-9_][a-z0-9_\-]*)(?:\.html?)?", r, re.I)
+        if m and m.group(2).isdigit():
             return f"{CONTENT_PREFIX}{m.group(1)}/{m.group(2)}.html"
+        if m:
+            # a page id is the page's file name — a number, 'index', '6778772363_30967009', 'beckhoff-0cad-46d4-…'
+            # (1169 of 51,655 pages);
+            # one that is not a number is a page when the index or the package has it, else a title ('Send/Receive')
+            url = f"{CONTENT_PREFIX}{m.group(1).lower()}/{m.group(2)}.html"
+            with self._db() as con:
+                stored = con.execute("SELECT 1 FROM pages WHERE url = ?", (url,)).fetchone() is not None
+            if stored or (self.local is not None and url in self.sitemap()):
+                return url
         if re.fullmatch(r"\d{6,}", r):
             hits = [u for u in self.sitemap() if u.endswith(f"/{r}.html")]
             if hits:

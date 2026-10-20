@@ -426,7 +426,9 @@ class Ctx:
 # ---------------------------------------------------------------------------------------------- shared helpers
 _WS = re.compile(r"\s+")
 _MSXHELP = re.compile(r"ms-xhelp:/*\?id=([^&#\s]+)", re.I)
-_URL = re.compile(r"/content/\d+/([^/]+)/(\d+)\.html?", re.I)
+# an Infosys page URL: /content/<lcid>/<book>/<page id>.htm[l] — the page id is the page's file name ('30866571',
+# 'index', '6778772363_30967009'), as twincat_mcp.infosys.book_of reads it
+_URL = re.compile(r"/content/\d+/([^/?#\s]+)/([^/?#.\s]+)\.html?", re.I)
 _HEAD = re.compile(r"(?m)^(#{1,4}) (.*)$")
 _TYPES = (r"(?:BOOL|BYTE|[DL]?WORD|U?[SDL]?INT|L?REAL|L?TIME|DATE|TOD|DT|W?STRING|PVOID|AXIS_REF|REFERENCE|POINTER|"
           r"T_[A-Za-z]|ST_[A-Za-z]|E_[A-Za-z]|MC_[A-Za-z]|I_[A-Za-z])")
