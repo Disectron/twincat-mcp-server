@@ -1246,7 +1246,9 @@ class ProjectIndex:
         segs = [x for x in path.split("^") if x]
         if not segs:
             return None, "empty tree path"
-        keys = ([f"{segs[-2]}.{segs[-1]}".lower()] if len(segs) >= 2 else []) + [segs[-1].lower()]
+        # the unit's key is the object and its owners joined with '.': FB_X, FB_X.M_Start, MAIN.Act, and for a property
+        # accessor FB_X.Value.Get (N123: only 'value.get' / 'get' were tried — every accessor edit was refused)
+        keys = [".".join(segs[-n:]).lower() for n in (3, 2, 1) if len(segs) >= n]
         plc = self.plc_project(name=segs[1]) if len(segs) >= 3 and segs[0].upper() == "TIPC" else None
         if plc is not None:
             units, dup = self.plc_units(plc)

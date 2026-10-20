@@ -1183,3 +1183,78 @@ def test_n116_second_review_status_keeps_an_explicit_solution_over_the_configure
         be.attach(_internal=True)                                   # what xae_status does now
     assert be.bound_solution == r"C:\D\DrumFillingMachine.sln"
     assert be.attach()["solution_bound"] == r"C:\P\Project15.sln"  # xae_attach() without a path: back to the config
+
+
+class _DeadSysMan:
+    """The ITcSysManager of a solution closed and reopened in the same shell: every call errors (E_POINTER), it
+    never acts (0.8.13 retest N120: 'LookupTreeItem TIPC: com_error … E_POINTER')."""
+    def __getattr__(self, name):
+        def dead(*_a, **_k):
+            e = ComError(X.DISP_E_EXCEPTION, "Invalid pointer")
+            e.excepinfo = (0, "TcSysManager", "Invalid pointer", None, 0, X.E_POINTER)
+            raise e
+        return dead
+
+
+def test_n120_the_first_call_after_a_same_shell_reopen_works(xae):
+    """N120 (0.8.13 retest): close + reopen of the solution in the SAME shell — the first xae call failed, the second
+    worked. _retry refreshed the System Manager, but the retried lambda called the object captured before (sm = …;
+    _retry(lambda: sm.X())), so the retry hit the stale one again. Every retried call takes its object at call time."""
+    be, dte, sm = xae
+    be.attach()
+    fresh = FakeSysMan()
+    fresh.net = "5.1.2.3.1.1"
+
+    def reopen():
+        be.sysman = _DeadSysMan()                        # what the server still holds after the reopen …
+        dte.Solution.Projects = FakeProjects([FakeProject("Other", None), FakeProject("Machine", fresh)])
+    for call, check in (
+            (lambda: be.target_get(), lambda r: r["target_net_id"] == "5.1.2.3.1.1"),
+            (lambda: be.tree_xml("TIPC^Plc"), lambda r: r["xml"] == "<TreeItem/>"),
+            (lambda: be.pou_get("TIPC^Plc^Plc Project^POUs^MAIN", include_subitems=False), lambda r: r["Name"] == "MAIN"),
+            (lambda: be.target_set("5.1.2.3.1.1"), lambda r: fresh.net == "5.1.2.3.1.1"),
+            (lambda: be.activate_configuration(), lambda r: fresh.activated == 1 and r["target"] == "5.1.2.3.1.1"),
+            (lambda: be.restart_twincat(), lambda r: fresh.restarted == 1),
+            (lambda: be.tree_delete_child("TIPC^Plc^Plc Project^POUs", "MAIN"),
+             lambda r: fresh.items["TIPC^Plc^Plc Project^POUs"].deleted[-1] == "MAIN"),
+            (lambda: be.status(), lambda r: r.get("target_net_id") == "5.1.2.3.1.1")):
+        reopen()
+        r = call()                                       # … the FIRST call works
+        assert check(r), r
+        assert be.sysman is fresh
+
+
+def test_n116_every_result_says_when_another_solution_is_worked_on(monkeypatch):
+    """N116 (0.8.13 retest, S3): after xae_attach(solution_path=<other>) only that call's result had solution_mismatch;
+    xae_plc_projects / xae_status while bound to the other solution said nothing. mismatch_note() says it every time
+    (the server adds it to each XAE result); the configured solution bound again → no note."""
+    be = X.XaeBackend(XaeConfig(solution_path=r"C:\P\Machine.sln", com_retry_s=0.3))
+    sm = FakeSysMan()
+    dte = FakeDTE(sm)
+    dte.Solution.FullName = r"C:\P\Other.sln"
+    monkeypatch.setattr(be, "_require_win", lambda: None)
+    monkeypatch.setattr(be, "_rot_candidates", lambda: [{"progid": "TcXaeShell.DTE.17.0", "moniker": "!TcXaeShell.DTE.17.0:1",
+                                                         "dte": dte, "solution": dte.Solution.FullName}])
+    monkeypatch.setattr(be, "_dte2", lambda: None)
+    assert be.mismatch_note() is None                     # not attached
+    be.attach(solution_path=r"C:\P\Other.sln")
+    assert "C:\\P\\Other.sln" in be.mismatch_note() and "xae.solution_path" in be.mismatch_note()
+    be.bound_solution = r"c:\p\machine.SLN"               # the configured one, any spelling
+    assert be.mismatch_note() is None
+
+
+def test_n116_a_reattach_after_the_shell_went_away_is_said(xae):
+    """N116 (0.8.13 retest, S4): the shell exited and the solution was opened in a new one — the tools re-attached
+    silently (reattach_note was only set when the bound solution was found in another running shell)."""
+    be, dte, sm = xae
+    be.attach()
+    calls = {"n": 0}
+
+    def dead_then_ok():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ComError(X.RPC_S_SERVER_UNAVAILABLE, "The RPC server is unavailable")
+        return "ok"
+    assert be._retry(dead_then_ok, "DTE.Version") == "ok"
+    assert "went away" in be.reattach_note
+    assert "went away" in be.status()["reattached"] and be.reattach_note is None

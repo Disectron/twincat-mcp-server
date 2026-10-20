@@ -871,6 +871,15 @@ class App:
             if live:                       # N87: the call ran, but the shell has a dialog waiting — say so
                 res = {**res, "open_dialogs": [{k: d.get(k) for k in ("hwnd", "title", "text", "buttons")}
                                                for d in live[:5]]}
+            # N116 (0.8.13 retest): bound to another solution than xae.solution_path — said in every result, not only
+            # in xae_attach's; a re-attach the call made (the shell went away) as well
+            note = getattr(self.xae, "mismatch_note", lambda: None)()
+            if note and "solution_mismatch" not in res:
+                res = {**res, "solution_mismatch": True, "solution_note": note}
+            again = getattr(self.xae, "reattach_note", None)
+            if again and "reattached" not in res:
+                res = {**res, "reattached": again}
+                self.xae.reattach_note = None
         return res
 
     def guard_safety_path(self, path: str, action: str) -> None:
@@ -1071,7 +1080,12 @@ class App:
         except OSError as exc:            # a file the OS refuses (read-only, in use): the reason, never an empty error (D7)
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
 
-    def scope(self) -> str:
+    def scope(self, action: str = "") -> str:
+        """The machine a confirmation is bound to: the ADS target '<NetId>:<port>'; for an xae_* action the machine
+        alone — the PLC project (and so its port) is in the token's target (N42, 0.8.13 retest: a token for Plc2 on
+        port 852 said ':851', the ADS connection's port)."""
+        if action.startswith("xae_"):
+            return self.ads.net_id or "local"
         return self.ads.target_label()
 
     def write_check(self, symbol: str) -> str | None:
@@ -1279,6 +1293,14 @@ class App:
             raise ToolError(f"{what} path {str(rp)!r}: its folder could not be created ({exc}) — nothing was written") from exc
         return rp
 
+    def drop_edits_under(self, path: str) -> list[str]:
+        """N124: forget the pending shell edits of an object and everything below it (it was deleted)."""
+        low = path.lower()
+        gone = [p for p in self.pending_edits if p.lower() == low or p.lower().startswith(low + "^")]
+        for p in gone:
+            self.pending_edits.pop(p, None)
+        return sorted(gone)
+
     def note_edit(self, path: str, declaration: str | None, implementation: str | None) -> None:
         cur = self.pending_edits.setdefault(path, {"path": path, "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
         if declaration is not None:
@@ -1327,7 +1349,19 @@ class App:
             r = await self.xae_call(self.xae.save_all, timeout=120)
             out.update(r)
             bad = await self.proj_call(self._edits_not_on_disk)
-        out["edits_checked"] = len(self.pending_edits)
+        # N124 (0.8.13 retest, S2): an edit of an object deleted since (in XAE, or its file) can never reach a source
+        # file — it blocked every save_first build until the server restarted. The shell is asked whether the object
+        # still exists; one that is gone has its edit dropped and said (unknown — shell busy — stays a refusal)
+        dropped = []
+        for b in [b for b in bad if "file" not in b]:
+            if await self.xae_call(self.xae.item_exists, b["path"], timeout=60) is False:
+                self.pending_edits.pop(b["path"], None)
+                dropped.append({"path": b["path"], "edited_at": b["edited_at"],
+                                "why": "the object no longer exists in the shell (deleted) — its edit cannot be saved"})
+        if dropped:
+            out["edits_dropped"] = dropped
+            bad = [b for b in bad if b["path"] in self.pending_edits]
+        out["edits_checked"] = len(self.pending_edits) + len(dropped)
         if bad:
             out["edits_not_on_disk"] = bad
             raise ToolError(f"{tool}: File.SaveAll ran but {len(bad)} edit(s) made in the shell are not in the source files "
@@ -1415,9 +1449,9 @@ class App:
             return await self.token_target(action, args)
         except ToolError as xae_exc:
             try:
-                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope())
+                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope(action))
             except SafetyError as exc:
-                self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
+                self.guard.audit(action, {"target": "", "scope": self.scope(action)}, op, "refused", str(exc))
                 if isinstance(xae_exc, TargetArgsError) and "needs a confirm_token" in str(exc):
                     # N41/N42 polish: the shell answered, the arguments do not name a target — that reason first; the
                     # guard's "needs a confirm_token … target ''" suggested a token for '', which can never be right
@@ -1435,9 +1469,9 @@ class App:
             return (await self.xae_call(self.xae.target_get, timeout=60)).get("target_net_id", "")
         except ToolError as xae_exc:
             try:
-                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope())
+                self.guard.check(op, action=action, target="", confirm_token=confirm_token, scope=self.scope(action))
             except SafetyError as exc:
-                self.guard.audit(action, {"target": "", "scope": self.scope()}, op, "refused", str(exc))
+                self.guard.audit(action, {"target": "", "scope": self.scope(action)}, op, "refused", str(exc))
                 raise ToolError(f"{exc} (and no XAE shell is attached: {str(xae_exc)[:160]})") from exc
             raise
 
@@ -1509,7 +1543,7 @@ class App:
         ask the human through elicitation before failing. ``mode_gate=False`` skips the
         readonly/guarded gating and only demands the confirmation — for tc_set_mode, which must be
         able to leave readonly mode with a human's consent."""
-        scope = self.scope()
+        scope = self.scope(action)
         if op is OpClass.EDIT and action in CODE_EDIT_ACTIONS and self.cfg.safety.edit_requires_config_mode:
             await self._require_config_mode(action, target)
         try:
@@ -2336,7 +2370,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             target = computed
         xae_bound = act in netid_actions + ("xae_plc", "xae_command") or (
             act == "xae_boot_project" and bool((a or {}).get("activate_after_generate")))
-        tok = app.guard.request_token(act, target, app.scope())
+        tok = app.guard.request_token(act, target, app.scope(act))
         if xae_bound:
             real = await app._xae_netid()
             tok["xae_target"] = real
@@ -4680,6 +4714,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         app.guard_safety_path(parent_path, "xae_tree_delete")
         await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_tree_delete", tgt, confirm_token)
         res = await app.confirmed("xae_tree_delete", {"target": tgt}, OpClass.DESTRUCTIVE, app.xae_call(app.xae.tree_delete_child, parent_path, name, timeout=120))
+        gone = app.drop_edits_under(tgt)         # N124: an edit of a deleted object can never reach a source file
+        if gone and isinstance(res, dict):
+            res = {**res, "pending_edits_dropped": gone}
         return res
 
     # ---- PLC objects -----------------------------------------------------

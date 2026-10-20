@@ -540,3 +540,27 @@ def test_n113_review_an_unresolved_tsproj_reference_keeps_every_plc_project(tmp_
     r = p.scan()
     assert len(p.plcproj) == 2 and p.plcproj_not_in_project == []
     assert "could not be found" in r["plc_projects_note"] and r["plc_projects_not_found"][0]["unresolved"] is True
+
+
+def test_n123_a_property_accessor_is_found_by_its_tree_path(tmp_path):
+    """N123 (0.8.13 retest, S2): xae_pou_set of …^FB_RetestTmp^Value^Get, then xae_build (save_first) refused 'not in any
+    source file of PLC project …' although the file held the accessor — the lookup tried 'value.get' and 'get', the
+    unit is 'fb_retesttmp.value.get'."""
+    d = _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    (d / "POUs" / "FB_RetestTmp.TcPOU").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><POU Name="FB_RetestTmp"><Declaration><![CDATA['
+        'FUNCTION_BLOCK FB_RetestTmp\nVAR\n  nValue : INT;\nEND_VAR]]></Declaration><Implementation><ST><![CDATA[]]>'
+        '</ST></Implementation><Method Name="M_Start"><Declaration><![CDATA[METHOD M_Start : BOOL]]></Declaration>'
+        '<Implementation><ST><![CDATA[M_Start := TRUE;]]></ST></Implementation></Method>'
+        '<Property Name="Value"><Declaration><![CDATA[PROPERTY Value : INT]]></Declaration>'
+        '<Get Name="Get"><Declaration><![CDATA[VAR\nEND_VAR]]></Declaration><Implementation><ST><![CDATA[Value := nValue;]]>'
+        '</ST></Implementation></Get></Property></POU></TcPlcObject>', encoding="utf-8")
+    register_sources(d / "Plc1.plcproj")
+    _tsproj(tmp_path, ("Plc1", 851))
+    p = idx(tmp_path)
+    for path, name, text in (("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp^Value^Get", "FB_RetestTmp.Value.Get", "Value := nValue;"),
+                             ("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp^M_Start", "FB_RetestTmp.M_Start", "M_Start := TRUE;"),
+                             ("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp", "FB_RetestTmp", None)):
+        u, why = p.unit_at_tree_path(path)
+        assert why is None and u.name == name, (path, why)
+        assert text is None or text in u.implementation

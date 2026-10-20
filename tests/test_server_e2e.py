@@ -993,6 +993,8 @@ async def test_d44_build_refuses_until_shell_edits_are_on_disk(monkeypatch, proj
     writes = {"on": False, "calls": 0}
 
     async def xae_call(fn, *a, **kw):
+        if fn.__name__ == "item_exists":
+            return True                    # N124: the created object is in the shell, only not in a file
         assert fn.__name__ == "save_all"
         writes["calls"] += 1
         if writes["on"]:
@@ -1049,6 +1051,42 @@ async def test_n113_save_check_compares_each_plc_projects_own_main(monkeypatch, 
     with pytest.raises(ToolError, match=r"Plc2 Project\^POUs\^MAIN: implementation on disk differs"):
         await app.save_verified("xae_build")
 
+
+
+@pytest.mark.anyio
+async def test_n124_an_edit_of_a_deleted_object_no_longer_blocks_every_build(monkeypatch, tmp_path):
+    """N124 (0.8.13 retest, S2): FB_RetestTmp was edited through the server, then deleted (file and .plcproj entry
+    gone): every xae_build (save_first) refused with the same path until the server restarted — the edit was cleared
+    only by a successful check. The shell is asked: an object that is gone has its edit dropped (said); one that is
+    still there, or a shell that cannot say, keeps the refusal. xae_tree_delete drops the edits below the item."""
+    from tests.test_project import _plc, _tsproj
+    from twincat_mcp.server import App, ToolError
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _tsproj(tmp_path, ("Plc1", 851))
+    app = App(mk_cfg(tmp_path))
+    exists = {"v": False}
+
+    async def xae_call(fn, *a, **kw):
+        if getattr(fn, "__name__", "") == "item_exists":
+            return exists["v"]
+        return {"saved": True, "dirty_before": [], "dirty_after": []}
+    monkeypatch.setattr(app, "xae_call", xae_call)
+    monkeypatch.setattr("twincat_mcp.server.asyncio.sleep", lambda d: _noop())
+    gone = "TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp^Value^Get"
+    for shell_says in (True, None):                       # still in the shell / the shell cannot say: refused
+        exists["v"] = shell_says
+        app.note_edit(gone, None, "Value := nValue;")
+        with pytest.raises(ToolError, match="not in any source file"):
+            await app.save_verified("xae_build")
+    exists["v"] = False                                   # deleted: dropped, the build goes on
+    app.note_edit("TIPC^Plc1^Plc1 Project^POUs^MAIN", None, "n := n + 1;")
+    r = await app.save_verified("xae_build")
+    assert [d["path"] for d in r["edits_dropped"]] == [gone] and "no longer exists" in r["edits_dropped"][0]["why"]
+    assert r["edits_on_disk"] == ["TIPC^Plc1^Plc1 Project^POUs^MAIN"] and not app.pending_edits
+    app.note_edit(gone, None, "x")
+    app.note_edit("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmpX", None, "x")
+    assert app.drop_edits_under("TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmp") == [gone]
+    assert list(app.pending_edits) == ["TIPC^Plc1^Plc1 Project^POUs^FB_RetestTmpX"]
 
 
 @pytest.mark.anyio
@@ -1476,3 +1514,15 @@ async def test_n109_a_scaffold_the_project_does_not_compile_is_not_gated_by_conf
         register_sources(project_dir / "Plc" / "Plc.plcproj")
         res = await s.call_tool("tcunit_scaffold", {"fb_name": "FB_Valve", "add_to_plcproj": False, "overwrite": True})
         assert res.is_error and "is in RUN — switch to CONFIG first" in text(res), text(res)
+
+
+def test_n42_an_xae_token_is_bound_to_the_machine_not_the_ads_port(tmp_path):
+    """N42 (0.8.13 retest, S4): the token for xae_plc download on Plc2 (port 852) said scope '…:851' — the ADS
+    connection's port. An XAE confirmation is bound to the machine; the PLC project is in its target."""
+    from twincat_mcp.server import App
+    app = App(mk_cfg(tmp_path))
+    app.ads.net_id, app.ads.port = "192.168.1.5.1.1", 851
+    assert app.scope("xae_plc") == "192.168.1.5.1.1" and app.scope("xae_deploy") == "192.168.1.5.1.1"
+    assert app.scope("ads_write") == "192.168.1.5.1.1:851" and app.scope() == "192.168.1.5.1.1:851"
+    tok = app.guard.request_token("xae_plc", "download:TIPC^Plc2^Plc2 Project@192.168.1.5.1.1", app.scope("xae_plc"))
+    assert ":851" not in tok["scope"] and ":851" not in tok["note"]
