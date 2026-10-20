@@ -671,3 +671,21 @@ def test_n137_a_type_has_no_return_type(tmp_path):
     p = idx(tmp_path)
     got = {u["name"]: u.get("return_type") for u in p.list_units()["units"]}
     assert got["E_Mode"] is None and got["ST_X"] is None and got["F_Add"] == "DINT", got
+
+
+def test_review_0814_a_port_means_its_plc_project_also_without_shared_names(tmp_path):
+    """Review of 0.8.14: _scope_units returned every unit when no name was declared twice — with Plc1 on 851 and Plc2
+    (PRG_B only) on 852, variables(port=851) listed PRG_B and resolve_symbol on 851 resolved into Plc2's source."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000, prog="PRG_B")
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert not p.duplicates
+    assert p.variables(port=851)["roots"] == ["MAIN"] and p.variables(port=852)["roots"] == ["PRG_B"]
+    with pytest.raises(ProjectError, match="not declared in PLC project Plc1 \\(ADS port 851\\)"):
+        p.variables("PRG_B", port=851)
+    assert p.variables("PRG_B", port=852)["roots"] == ["PRG_B"]
+    with pytest.raises(ProjectError):
+        p.resolve_symbol("PRG_B.n", 851)
+    v = p.variables()
+    assert sorted(v["roots"]) == ["MAIN", "PRG_B"] and "2 PLC projects and no ADS port was given" in v["note"], v

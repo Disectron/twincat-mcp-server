@@ -1002,15 +1002,19 @@ class ProjectIndex:
                     stack.append(eu)
         return None
 
+    def port_plc(self, port: int | None) -> str | None:
+        """The PLC project (its .plcproj) the runtime on ADS `port` runs — when there are several and the .tsproj maps
+        the port; None with one PLC project (every unit is its) or when it cannot be told."""
+        return self.plc_project(port=port) if port is not None and len(self.plcproj) > 1 else None
+
     def _scope_units(self, port: int | None = None, plc: str | None = None) -> Iterable[CodeUnit]:
-        """The units the runtime on `port` can have: that PLC project's when names are declared in several PLC
-        projects and the .tsproj maps the port; else every file's. plc: that PLC project's."""
+        """The units the runtime on `port` can have: that PLC project's when there are several and the .tsproj maps
+        the port — also when no name is declared twice (review of 0.8.14: Plc2's PRG_B / GVL_B were listed and
+        resolved on port 851); else every file's. plc: that PLC project's."""
+        plc = plc if plc is not None else self.port_plc(port)
         if plc is not None:
             return self.plc_units(plc)[0].values()
-        if not self.duplicates:
-            return self.units.values()
-        plc = self.plc_project(port=port) if port is not None else None
-        return self.plc_units(plc)[0].values() if plc is not None else self.all_units()
+        return self.units.values() if not self.duplicates else self.all_units()
 
     def _find_var_anywhere(self, name: str, kinds: Iterable[str], port: int | None = None,
                            plc: str | None = None) -> list[tuple[CodeUnit, VarDecl]]:
@@ -1119,17 +1123,25 @@ class ProjectIndex:
         roots: list[CodeUnit]
         note = None
         twice: list[str] = []
+        on_port = self.port_plc(port)
         if scope:
-            u0 = self.named(scope, port) if scope.strip().lower() in self.duplicates else None
+            if on_port is not None:
+                u0 = self.named(scope, port)
+                if u0 is None:
+                    raise ProjectError(f"{scope!r} is not declared in PLC project {Path(on_port).stem} (ADS port {port})"
+                                       f"{' — or twice in it' if scope.strip().lower() in self.plc_units(on_port)[1] else ''}"
+                                       f"; the PLC projects: {self.plc_names()}")
+            else:
+                u0 = self.named(scope, port) if scope.strip().lower() in self.duplicates else None
             roots = [u0 if u0 is not None else self.get_unit(scope)]
         else:
             roots = [u for u in self._scope_units(port) if u.kind in ("PROGRAM", "GVL") and not u.parent]
-            if self.duplicates and (port is None or self.plc_project(port=port) is None):
+            if len(self.plcproj) > 1 and on_port is None:
                 twice = sorted({r.name for r in roots if r.name.lower() in self.duplicates})
-                if twice:
-                    note = (f"{twice} are declared in several PLC projects and "
-                            + ("no ADS port was given" if port is None else f"the .tsproj gives no PLC project port {port}")
-                            + ": the paths of each are listed (same path, different files)")
+                note = (f"{len(self.plcproj)} PLC projects and "
+                        + ("no ADS port was given" if port is None else f"the .tsproj gives no PLC project port {port}")
+                        + ": the programs and GVLs of every PLC project are listed"
+                        + (f" — {twice} are declared in several PLC projects (same path, different files)" if twice else ""))
         items: list[dict[str, Any]] = []
         truncated = False
 
