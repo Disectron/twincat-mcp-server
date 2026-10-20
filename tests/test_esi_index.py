@@ -967,8 +967,12 @@ def test_an_object_defined_twice_in_one_dictionary_is_one_object(esi_kb):
     d = x.lookup("EL3356-0010", 1, None, "newest")["devices"][0]
     idx = [o["index"] for o in d["coe_objects"]]
     assert idx == ["#x1018", "#x1C12", "#x8000"] and d["coe_count"] == 3, (idx, d["coe_count"])
+    # re-review of 0.8.15: hw_object gave a bare 'defined_again_differs': 1; the list did not show it
+    assert [o.get("defined_again_differs") for o in d["coe_objects"]] == [None, 1, None], d["coe_objects"]
     o = x.object("EL3356-0010", "#x1c12")
     assert o["name"] == "RxPDO assign" and o["defined_again_differs"] == 1, o
+    assert o["defined_again_note"] == ("the dictionary defines #x1C12 2 times with different content; this is its "
+                                       "first definition — the other one is not used"), o
     assert "defined_again_differs" not in x.object("EL3356-0010", "#x1018")
 
 

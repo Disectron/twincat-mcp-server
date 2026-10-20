@@ -748,9 +748,11 @@ def _parsed_declaration(r: sqlite3.Row) -> dict[str, Any]:
               "enum_values", "methods", "properties", "description"):
         if d.get(k):
             out[k] = d[k]
-    if INF.is_symbol_row(r):
-        # N170: a symbol documented in a section or table of a page — its value, GVL, section, how it was read
-        for k in ("value", "type", "gvl", "return_description", "summary", "reconstructed"):
+    if INF.is_symbol_row(r) or d.get("declared_as"):
+        # N170: a symbol documented in a section or table of a page — its value, GVL, section, how it was read; the
+        # name the page's Syntax section declares (re-review of 0.8.15)
+        for k in ("value", "type", "gvl", "return_description", "summary", "reconstructed", "declared_as",
+                  "declared_as_note"):
             if d.get(k):
                 out[k] = d[k]
     return out
@@ -784,7 +786,7 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     body = r["body"] or ""
     blocks = [b.strip("\n") for b in re.findall(r"```[^\n`]*\n(.*?)\n```", body, re.S)]
     samples = 0
-    if INF.is_symbol_row(r):
+    if INF.symbol_reconstructed(r):
         # N170: the declaration is reconstructed from the page's tables — its code blocks are examples, not it
         samples, blocks = len(blocks), []
     shown, used, rest = [], 0, 0
@@ -814,7 +816,7 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         out["links"] = lk
     if rest:
         out["blocks_not_shown"] = f"{rest} more code block(s) — docs_page ref={out['ref']} for the whole page"
-    if INF.is_symbol_row(r):
+    if INF.symbol_reconstructed(r):
         where = f"docs_page ref={out['ref']}" + (f" section={r['section']!r}" if r["section"] else "")
         out["note"] = ("no code declares it: the declaration is reconstructed from the page's tables"
                        + (f"; the {samples} code block(s) there are examples" if samples else "") + f" — {where} for the text")

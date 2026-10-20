@@ -597,3 +597,32 @@ def test_n103b_n126_the_skill_gives_the_stored_members_and_the_contents_family(k
     assert r["parent"] == {"title": "ADSREAD", "ref": "tcplclib_tc2_system/30866571"}
     rc, r = run(kbdir, "docs_declaration", "symbol=T_AmsNetID")
     assert r["parent"]["ref"] == "tcplclib_tc2_system/30866571"
+
+
+def test_rereview_0815_the_skill_finds_a_symbol_by_the_name_its_page_declares(kbdir):
+    """Re-review of 0.8.15 (S3): docs_declaration answers as infosys_declaration — FB_ActuatorActuals finds the page
+    titled 'ActualsActuator' that declares it, with the name it declares and why; SendMessageEx is its own page, not
+    SendMessageEx2's copy of its header."""
+    from tests.test_infosys import store_declared_as
+    from twincat_mcp.infosys import InfosysIndex, html_to_doc, _bump_gen
+    ix = InfosysIndex(db_file=kbdir / "index" / "infosys-1033.db")
+
+    def store(ref, title, body, hid):
+        d = html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
+        d.meta = {"Microsoft.Help.Id": hid}
+        with ix._db() as con:
+            ix._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", d)
+    store_declared_as(store)
+    ix.resolve_help_links()
+    with ix._db() as con:
+        _bump_gen(con)
+    ix.sync_derived()
+    del ix
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_ActuatorActuals")
+    assert rc == 0 and r["ref"] == "tf8560_plastic_technology_functions/16259000001", r
+    assert (r["kind"], r["declared_as"]) == ("FunctionBlock", "FB_ActuatorActuals"), r
+    assert r["declaration_blocks"] and "titled 'ActualsActuator'" in r["declared_as_note"], r
+    rc, r = run(kbdir, "docs_declaration", "symbol=SendMessageEx2")
+    assert rc == 0 and r["declared_as"] == "SendMessageEx" and "sJsonAttribute" in r["declared_as_note"], r
+    rc, r = run(kbdir, "docs_declaration", "symbol=SendMessageEx")
+    assert rc == 0 and r["ref"] == "tcplclib_tc3_eventlogger/13724785000" and "declared_as" not in r, r

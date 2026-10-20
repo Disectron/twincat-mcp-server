@@ -24,10 +24,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (7, "82482f0a39e6a29a")   # 0.8.15: kinds from the page's own evidence (N150 N151 N157 N172),
+INFOSYS_FINGERPRINT = (7, "0cde345533eb7338")   # 0.8.15: kinds from the page's own evidence (N150 N151 N157 N172),
 #                                                    symbols inside pages (N170)
 MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes of every family (N163)
-ESI_FINGERPRINT = ("2", "90374d1987a8c788")    # index\\esi.db (esi_index.py): format 2 — modules found by their
+ESI_FINGERPRINT = ("2", "49f0ad9346541e7b")    # index\\esi.db (esi_index.py): format 2 — modules found by their
 #                                                 devices (N156, 0.8.14 retest), one object per index of a dictionary
 #                                                 (EL6653, kb_verify E2; format 2 is not released yet); 1 since 0.8.12
 

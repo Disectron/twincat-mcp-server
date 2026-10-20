@@ -827,6 +827,23 @@ def test_n170_the_skill_and_the_cli_answer_symbols_documented_inside_a_page(kb, 
     assert "ERR_RECIPE_NOT_FOUND : UDINT := 16#4003;" in p.stdout and "Value: 16#4003 (GVL ReturnValues)" in p.stdout, p.stdout
 
 
+def test_rereview_0815_the_built_index_finds_a_symbol_by_the_name_its_page_declares(kb, tmp_path):
+    """Re-review of 0.8.15 (S3): built by the builder the user runs, `decl FB_ActuatorActuals` finds the tf8560 page
+    titled 'ActualsActuator' that declares it, and the CLI says under which name the page declares it."""
+    from tests.test_infosys import store_declared_as
+    from tests.test_infosys_local import _hv_page
+    pages: dict[str, str] = {}
+    store_declared_as(lambda ref, title, body, hid: pages.__setitem__(
+        ref.replace("/", "/1033/", 1) + ".html", _hv_page(title, body, hid)))
+    p = build(kb, mshc(tmp_path / "BKINFOSYS3_VS_100_EN-US.2.mshc", pages))
+    assert p.returncode == 0, p.stdout + p.stderr
+    r = kbdocs(kb, "docs_declaration", "symbol=FB_ActuatorActuals")
+    assert (r["ref"], r["declared_as"]) == ("tf8560_plastic_technology_functions/16259000001", "FB_ActuatorActuals"), r
+    c = run("infosys_local.py", "--kb", str(kb), "decl", "SendMessageEx2")
+    assert c.returncode == 0 and "Declared as SendMessageEx: the page is titled 'SendMessageEx2'" in c.stdout, c.stdout
+    assert "also document sJsonAttribute" in c.stdout and "METHOD SendMessageEx : HRESULT" in c.stdout, c.stdout
+
+
 def test_n167_n168_n169_the_cli_pages_reads_on_and_shows_its_ranges(kb, tmp_path):
     """N167 / N168 / N169 (0.8.14 retest): `search … --limit 300` was refused and had no --offset; `show` had no
     --offset ('… [N more chars; --max or --section]', and --max 40000 was refused); -h showed `--limit LIMIT` /

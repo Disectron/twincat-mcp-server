@@ -83,7 +83,8 @@ ALLOWED_HOSTS = {"infosys.beckhoff.com"}
 DDG_HOSTS = {"html.duckduckgo.com", "duckduckgo.com"}
 USER_AGENT = "twincat-mcp/0.6 (+https://github.com/; documentation lookup for an engineering tool)"
 CODE_SEP = "\n\x1e\n"
-DERIVED_VERSION = 2          # catalog / code_blocks / symbols layout; a bump brings them in step from the stored pages
+DERIVED_VERSION = 3          # catalog / code_blocks / symbols layout and rules; a bump rebuilds them from the stored pages
+                             # (3: the names pages declare under another title, declared_symbols)
                              # (no re-parse). 2: symbols — the methods and constants documented inside pages (N170)
 
 
@@ -675,6 +676,30 @@ def has_symbols(con: Any) -> bool:
     return con.execute("SELECT 1 FROM sqlite_master WHERE name = 'symbols'").fetchone() is not None
 
 
+def declared_symbols(row: Any) -> list[dict[str, Any]]:
+    """Re-review of 0.8.15: a page whose Syntax section declares its symbol under another name ('ActualsActuator'
+    declares FUNCTION_BLOCK FB_ActuatorActuals) is that symbol's page too — FB_ActuatorActuals, the name code uses,
+    found nothing. One entry {name, owner, kind, section, decl} for the symbols table (a page of that name in the same
+    library or book still wins, symbol_documents)."""
+    try:
+        d = json.loads(row["decl"]) if row["decl"] else {}
+    except ValueError:
+        return []
+    alias = d.get("declared_as") if isinstance(d, dict) else None
+    if not alias or alias.lower() == str(d.get("name") or "").lower():
+        return []
+    return [{"name": alias, "owner": None, "kind": row["kind"], "section": None, "decl": {**d, "name": alias}}]
+
+
+def symbol_reconstructed(r: Any) -> bool:
+    """A symbol row whose declaration the index reconstructed from tables (a '## Method X' section, a constants table)
+    — not one a page declares in code (declared_symbols)."""
+    try:
+        return is_symbol_row(r) and bool(json.loads(r["decl"] or "{}").get("reconstructed"))
+    except ValueError:
+        return False
+
+
 def _section_text(markdown: str, heading: str | None) -> str:
     """The section of a page under this heading, the heading line included; the whole page without one."""
     if not heading:
@@ -954,7 +979,11 @@ def symbol_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = N
         # document itself is looked up where the owner's page says it is defined, then up EXTENDS and IMPLEMENTS
         for via in member_sources(con, owner, member, keep):
             if via.lower() not in _seen:
-                docs = symbol_documents(con, f"{via}.{member}", keep, _seen | {owner.lower(), via.lower()})
+                seen = _seen | {owner.lower(), via.lower()}
+                # keep picks the owner (member_sources); where the member comes from may be another library — a base
+                # class of another library (re-review of 0.8.15): the owner's library first, then any
+                docs = (symbol_documents(con, f"{via}.{member}", keep, seen)
+                        or (symbol_documents(con, f"{via}.{member}", None, seen) if keep is not None else []))
                 if docs:
                     break
     return docs
@@ -1051,16 +1080,28 @@ def owner_sources(con: Any, owner: str, member: str, keep: Callable[[Any], bool]
 
 def owner_note(con: Any, name: str, keep: Callable[[Any], bool] | None = None) -> str | None:
     """Why 'Owner.Member' found nothing when Owner is documented by several pages that differ in where its members
-    come from (review of 0.8.15) — None otherwise."""
+    come from (review of 0.8.15), and the library= that finds it — None otherwise, also when no library= would find
+    it (re-review: 'FB_BA_SeqCtrl.bEnable' got the advice, and library= still found nothing)."""
     if "." not in name:
         return None
     owner, member = name.rsplit(".", 1)
     docs = symbol_documents(con, owner, keep, frozenset({owner.lower()}))
     if len(docs) < 2 or len(owner_sources(con, owner, member, keep)) < 2:
         return None
+    finds = []
+    for g in docs:
+        lib = str(g[0]["library"] or g[0]["book"])
+
+        def pick(r: Any, lib: str = lib.lower()) -> bool:          # what library=<lib> keeps (declaration, the skill)
+            return (keep is None or keep(r)) and lib in ((r["library"] or "").lower(), (r["book"] or "").lower())
+        if symbol_documents(con, name, pick):
+            finds.append(lib)
+    if not finds:
+        return None
     where = ", ".join(f"{g[0]['library'] or g[0]['book']}" for g in docs[:6])
     return (f"{owner} is documented by {len(docs)} pages ({where}) that differ in what it extends or implements, so "
-            f"where its {member} is defined is not known — pass library= with the one the project uses")
+            f"where its {member} is defined is not known — pass library= with the one the project uses (found with "
+            + " / ".join(f"library={x}" for x in finds) + ")")
 
 
 def title_documents(con: Any, title: str, keep: Callable[[Any], bool] | None = None) -> list[list[Any]]:
@@ -1734,8 +1775,8 @@ _TYPE_KINDS = ("Struct", "Union", "Enum", "Alias")
 
 def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
     intro = _intro_text(doc.markdown)
-    kind = classify(title, doc.code_blocks, doc.headings, doc.tables, doc.table_titles, intro,
-                    [t for t, code in _syntax_parts(doc.markdown) if code])
+    syntax_code = [t for t, code in _syntax_parts(doc.markdown) if code]
+    kind = classify(title, doc.code_blocks, doc.headings, doc.tables, doc.table_titles, intro, syntax_code)
     decl: dict[str, Any] = {"name": symbol_name(title) or title.strip(), "kind": kind, "declaration": None, "extends": None, "implements": None,
                             "return_type": None, "inputs": [], "outputs": [], "in_out": [], "members": [],
                             "enum_values": [], "description": {}}
@@ -1749,6 +1790,14 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
     own_type = any((m := _HEAD_RE.search(c)) and m.group(1) == "TYPE" and _ident_matches(m.group(2) or "", decl["name"])
                    for _l, c in doc.code_blocks)
     fragments: list[str] = []   # header-less VAR_INPUT/VAR_OUTPUT blocks (how Infosys documents most FBs)
+    # re-review of 0.8.15: the header in the page's Syntax section that gave the kind under another name is the page's
+    # declaration — 'ActualsActuator' declares FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals; its kind
+    # without it had no declaration, no EXTENDS, no return type. Not when a header names the page's own symbol
+    syntax_decl = None
+    if not any((m := _HEAD_RE.search(c)) and m.group(1) not in ("TYPE", "VAR_GLOBAL")
+               and _ident_matches(m.group(2) or "", decl["name"]) for _l, c in doc.code_blocks):
+        syntax_decl = next((c.strip() for c in syntax_code if (m := _HEAD_RE.search(c)) and m.group(2)
+                            and _KIND_OF.get(m.group(1)) == kind), None)
     for _lang, code in doc.code_blocks:
         m = _HEAD_RE.search(code)
         if not m:
@@ -1759,7 +1808,11 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
         else:
             kw, ident, rest = m.group(1), m.group(2) or "", m.group(3) or ""
             if kw not in ("TYPE", "VAR_GLOBAL") and ident and not _ident_matches(ident, decl["name"]):
-                continue
+                if code.strip() != syntax_decl or decl["declaration"] is not None:
+                    continue
+                decl["declared_as"] = ident
+                decl["declared_as_note"] = (f"the page is titled {title.strip()!r}; the declaration in its Syntax section "
+                                            f"names {ident} — Beckhoff's page uses both")
             if kw in ("TYPE", "VAR_GLOBAL") and not page_symbols(decl["name"]):
                 continue                                  # a manual page's example (N101)
             if kw == "TYPE" and not _ident_matches(ident, decl["name"]) and (kind not in _TYPE_KINDS or own_type):
@@ -1854,8 +1907,18 @@ def parse_declaration(title: str, doc: HtmlDoc) -> dict[str, Any]:
             if ret.get("description"):
                 decl["return_description"] = ret["description"]
         if decl["return_type"] and decl["declaration"]:
-            decl["declaration"] = _return_in_header(decl["declaration"], short, decl["return_type"],
-                                                    "FUNCTION" if kind == "Function" else "METHOD")
+            # the header names the declared symbol (declared_as: Beckhoff's 'METHOD SendEqualMessage' on SendHresult())
+            decl["declaration"] = _return_in_header(decl["declaration"], decl.get("declared_as") or short,
+                                                    decl["return_type"], "FUNCTION" if kind == "Function" else "METHOD")
+    if decl.get("declared_as"):
+        # the header names another symbol (on most of these pages a copy of a neighbour's: SendMessageEx2 shows METHOD
+        # SendMessageEx) — what the page's own tables document and the header does not declare is said, not dropped
+        text = decl["declaration"] or ""
+        extra = [n for n in desc if re.fullmatch(r"[A-Za-z_]\w*", n) and not re.search(rf"(?i)\b{n}\b", text)
+                 and n.lower() != short.lower()]
+        if extra:
+            decl["declared_as_note"] += (f"; the page's tables also document {', '.join(extra)}, which this declaration "
+                                         "does not declare")
     _tidy_declaration(decl)                 # rule 4: stored as every reader needs it
     return decl
 
@@ -2280,6 +2343,13 @@ class InfosysIndex:
             r = con.execute("SELECT value FROM meta WHERE key = 'derived_sig'").fetchone()
             if r is not None and r[0] == f"{DERIVED_VERSION}|{sig}":
                 return {"changed": False, "seconds": round(time.time() - t0, 3)}
+            if r is None or r[0].split("|", 1)[0] != str(DERIVED_VERSION):
+                # another layout or rule: every derived row again — the passes below add the pages they have not seen
+                # and kept every row the old rule made (a bump brought nothing in step)
+                con.executescript("DROP TABLE IF EXISTS catalog; DROP TABLE IF EXISTS code_blocks; "
+                                  "DROP TABLE IF EXISTS code_src; DROP TABLE IF EXISTS symbols; "
+                                  "DROP TABLE IF EXISTS symbol_src;")
+                self._init_derived(con)
             # identity = rowid + url + fetched: a page stored again may get its old rowid back
             same = "EXISTS (SELECT 1 FROM pages p WHERE p.rowid = {t}.{k} AND p.url = {t}.url AND p.fetched IS {t}.fetched)"
             con.execute("DELETE FROM catalog WHERE NOT " + same.format(t="catalog", k="rowid"))
@@ -2307,9 +2377,9 @@ class InfosysIndex:
                 con.execute("DELETE FROM symbols WHERE page_rowid = ?", (pr,))
                 con.execute("DELETE FROM symbol_src WHERE page_rowid = ?", (pr,))
             syms = 0
-            for row in con.execute("SELECT rowid, url, title, kind, markdown, fetched FROM pages WHERE rowid NOT IN "
+            for row in con.execute("SELECT rowid, url, title, kind, markdown, decl, fetched FROM pages WHERE rowid NOT IN "
                                    "(SELECT page_rowid FROM symbol_src)").fetchall():
-                for x in heading_symbols(row["title"], row["markdown"] or "", row["kind"]):
+                for x in heading_symbols(row["title"], row["markdown"] or "", row["kind"]) + declared_symbols(row):
                     con.execute("INSERT INTO symbols(page_rowid, name, owner, kind, section, decl) VALUES (?,?,?,?,?,?)",
                                 (row["rowid"], x["name"], x["owner"], x["kind"], x["section"],
                                  json.dumps(x["decl"], ensure_ascii=False)))

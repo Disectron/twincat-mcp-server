@@ -418,8 +418,11 @@ def parse_dictionary(dic: Any) -> list[dict[str, Any]] | None:
             # kb_verify E2 (0.8.14 full run): Beckhoff's EL66xx.xml defines #x1C32 / #x1C33 of EL6653 and EL6653-0010
             # twice, the same bytes — the devices listed 17 objects and counted 19. An index defined again is one object: the
             # same definition is dropped, another one leaves the first in place and is said (never silently lost)
-            if obj != {k: v for k, v in first.items() if k != "defined_again_differs"}:
-                first["defined_again_differs"] = first.get("defined_again_differs", 0) + 1
+            if obj != {k: v for k, v in first.items() if k not in ("defined_again_differs", "defined_again_note")}:
+                n = first["defined_again_differs"] = first.get("defined_again_differs", 0) + 1
+                first["defined_again_note"] = (f"the dictionary defines {_hx(idx)} {n + 1} times with different "
+                                               "content; this is its first definition — the other "
+                                               + ("one is" if n == 1 else f"{n} are") + " not used")
             continue
         seen[idx] = obj
         objects.append(obj)
@@ -1725,9 +1728,11 @@ class EsiIndex:
             d["coe_objects"] = [
                 {"index": _hx(o["idx"]), "name": o["name"], "type": o["type"],
                  **({"access": o["access"]} if o["access"] else {}),
-                 **({"pdo_mapping": o["pdo_mapping"]} if o["pdo_mapping"] else {})}
-                for o in con.execute("SELECT o.idx, o.name, o.type, o.access, o.pdo_mapping FROM dict_obj x JOIN obj o "
-                                     "ON o.id = x.obj_id WHERE x.dict_id = ? ORDER BY x.idx", (r["dict_id"],))]
+                 **({"pdo_mapping": o["pdo_mapping"]} if o["pdo_mapping"] else {}),
+                 # re-review of 0.8.15: an index the dictionary defines again differently says so in the list too
+                 **({"defined_again_differs": n} if (n := (_unpack(o["data"]) or {}).get("defined_again_differs")) else {})}
+                for o in con.execute("SELECT o.idx, o.name, o.type, o.access, o.pdo_mapping, o.data FROM dict_obj x "
+                                     "JOIN obj o ON o.id = x.obj_id WHERE x.dict_id = ? ORDER BY x.idx", (r["dict_id"],))]
             d["coe_note"] = ("one object with its sub-indices, defaults, limits and enumeration texts: "
                              "hw_object(device, index)")
         return d

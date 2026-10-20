@@ -1111,7 +1111,10 @@ def test_review_0815_a_member_through_an_owner_of_two_pages_is_not_guessed(idx):
         idx.declaration("FB_BA_SeqCtrl")
     with pytest.raises(InfosysError, match=r"FB_BA_SeqCtrl is documented by 2 pages .* pass library=") as e:
         idx.declaration("FB_BA_SeqCtrl.Calc")
-    assert "FB_BA_Loop's" not in str(e.value)
+    assert "FB_BA_Loop's" not in str(e.value) and f"(found with library={B})" in str(e.value), e.value
+    with pytest.raises(InfosysError) as e:       # re-review: no library= finds it — no advice that leads nowhere
+        idx.declaration("FB_BA_SeqCtrl.bEnable")
+    assert "pass library=" not in str(e.value) and "infosys_search(" in str(e.value), e.value
     d = idx.declaration("FB_BA_SeqCtrl.Calc", library=B)
     assert d["url"].endswith(f"{B}/2003.html") and d["defined_in"] == "FB_BA_Loop", d
 
@@ -1154,3 +1157,102 @@ def test_review_0815_syntax_sections_operator_names_and_the_page_own_header():
                                  "<pre>FUNCTION BLOCK FB_OCPP1_Client EXTENDS FB_Base\nVAR_OUTPUT\n    bValid : BOOL;\nEND_VAR</pre>")
     assert oc["kind"] == "FunctionBlock" and oc["declaration"].startswith("FUNCTION BLOCK FB_OCPP1_Client"), oc
     assert oc["extends"] == "FB_Base" and [x["name"] for x in oc["outputs"]] == ["bValid"], oc
+
+
+def store_declared_as(store):
+    """Re-review of 0.8.15: pages whose Syntax section declares their symbol under another name — the 39 tf8560 core
+    function pages ('ActualsActuator' declares FB_ActuatorActuals), and Beckhoff's copy of a neighbour's header
+    (SendMessageEx2 shows METHOD SendMessageEx; its Inputs table has the sJsonAttribute the header lacks)."""
+    store("tf8560_plastic_technology_functions/16259000001", "ActualsActuator",
+          "<p>This class supplies the actual values of an actuator.</p><h2>Syntax:</h2>"
+          "<pre>FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR</pre>",
+          "pl-act")
+    store("tf85xx_plastic_application/13193000002", "SendHresult()",
+          "<p>Logs a message in the EventLogger.</p><h2>Syntax:</h2><pre>METHOD SendEqualMessage : HRESULT\nVAR_INPUT\n"
+          "    hr : HRESULT;\nEND_VAR</pre>", "pl-send")
+    store("tcplclib_tc3_eventlogger/13724785419", "SendMessageEx2",
+          "<p>This method sends a message.</p><h2>Syntax</h2><pre>METHOD SendMessageEx : HRESULT\nVAR_INPUT\n"
+          "    stEventEntry : TcEventEntry;\nEND_VAR</pre><h2>Inputs</h2>"
+          "<table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
+          "<tr><td>stEventEntry</td><td>TcEventEntry</td><td>Event definition</td></tr>"
+          "<tr><td>sJsonAttribute</td><td>STRING</td><td>Sent in addition to the event text.</td></tr></table>"
+          "<h2>Return value</h2><table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
+          "<tr><td>SendMessageEx2</td><td>HRESULT</td><td>S_OK or the error</td></tr></table>", "el-ex2")
+    store("tcplclib_tc3_eventlogger/13724785000", "SendMessageEx",
+          "<p>This method sends a message.</p><h2>Syntax</h2><pre>METHOD SendMessageEx : HRESULT\nVAR_INPUT\n"
+          "    stEventEntry : TcEventEntry;\n    ipSourceInfo : I_TcSourceInfo := 0;\nEND_VAR</pre>", "el-ex")
+
+
+def test_rereview_0815_a_syntax_header_under_another_name_is_the_page_declaration(idx):
+    """Re-review of 0.8.15 (S3): the header in a page's Syntax section gave the page its kind and was then dropped —
+    'ActualsActuator' (tf8560) was FunctionBlock 'ActualsActuator' with no declaration and no EXTENDS, while the page
+    declares FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals, and FB_ActuatorActuals — the name code
+    uses — was not found; SendHresult() was a Method with no return type under METHOD SendEqualMessage : HRESULT. The
+    header is the page's declaration, the name it declares is said (declared_as) and finds the page — unless a page of
+    the same library / book documents that name (SendMessageEx2's copy of METHOD SendMessageEx does not take
+    SendMessageEx). What the page's tables document and the header does not declare is said, not dropped."""
+    def kind(title, body):
+        return parse_declaration(title, _page(title, body))
+    got = {}
+    store_declared_as(lambda ref, title, body, hid: got.setdefault(title, kind(title, body)))
+    a = got["ActualsActuator"]
+    assert (a["kind"], a["extends"], a["declared_as"]) == ("FunctionBlock", "FB_MotionActuals", "FB_ActuatorActuals"), a
+    assert a["declaration"].startswith("FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals"), a
+    assert [x["name"] for x in a["inputs"]] == ["bEnable"] and "titled 'ActualsActuator'" in a["declared_as_note"], a
+    s = got["SendHresult()"]
+    assert (s["kind"], s["return_type"], s["declared_as"]) == ("Method", "HRESULT", "SendEqualMessage"), s
+    assert s["declaration"].startswith("METHOD SendEqualMessage : HRESULT"), s
+    e = got["SendMessageEx2"]
+    assert e["declared_as"] == "SendMessageEx" and "also document sJsonAttribute," in e["declared_as_note"], e
+    assert "stEventEntry" not in e["declared_as_note"]
+    assert "declared_as" not in got["SendMessageEx"]
+
+    store_declared_as(lambda ref, title, body, hid: _store_with(idx, ref, title, body, hid))
+    idx.resolve_help_links()
+    idx.sync_derived()
+    d = idx.declaration("FB_ActuatorActuals")
+    assert d["url"].endswith("tf8560_plastic_technology_functions/16259000001.html"), d
+    assert (d["kind"], d["extends"], d["declared_as"], d["page_title"]) == (
+        "FunctionBlock", "FB_MotionActuals", "FB_ActuatorActuals", "ActualsActuator"), d
+    assert idx.declaration("ActualsActuator")["url"] == d["url"]
+    x = idx.declaration("SendMessageEx")
+    assert x["url"].endswith("tcplclib_tc3_eventlogger/13724785000.html") and "declared_as" not in x, x
+    assert idx.declaration("SendEqualMessage")["page_title"] == "SendHresult()"
+
+
+def test_rereview_0815_a_derived_version_bump_rebuilds_the_derived_tables(idx, monkeypatch):
+    """A new DERIVED_VERSION ('a bump brings them in step from the stored pages') re-ran only the incremental pass:
+    the pages already seen kept the symbols the old rule made, and the new rule (declared names) reached none of them.
+    A bump rebuilds every derived table from the stored pages."""
+    import twincat_mcp.infosys as I
+    store_declared_as(lambda ref, title, body, hid: _store_with(idx, ref, title, body, hid))
+    idx.sync_derived()
+    with idx._db() as con:
+        con.execute("DELETE FROM symbols")                  # what an index of the earlier rule holds
+        con.execute("INSERT INTO symbols(page_rowid, name, owner, kind, section, decl) VALUES (1, 'Stale', NULL, "
+                    "'Constant', NULL, '{}')")
+    assert idx.sync_derived()["changed"] is False
+    monkeypatch.setattr(I, "DERIVED_VERSION", I.DERIVED_VERSION + 1)
+    assert idx.sync_derived()["changed"] is True
+    with idx._db() as con:
+        names = {r[0] for r in con.execute("SELECT name FROM symbols")}
+    assert "Stale" not in names and {"FB_ActuatorActuals", "SendEqualMessage"} <= names, names
+
+
+def test_rereview_0815_library_picks_the_owner_and_its_base_class_may_be_in_another_library(idx):
+    """Re-review of 0.8.15 (N158): library= filtered the inherited member's page too — FB_BA_Derived (tf8040) EXTENDS
+    FB_BA_Base2 of Tc3_BaCommon: 'FB_BA_Derived.Calc' with library=tf8040 was not found, as if a base class had to be
+    in the library of the FB. library= picks the owner; its base class is looked up in that library first, then in
+    any."""
+    B, A = "tf8040_tc3_buildingautomation", "tcplclib_tc3_bacommon"
+    _store_with(idx, f"{B}/3001", "FB_BA_Derived", "<pre>FUNCTION_BLOCK FB_BA_Derived EXTENDS FB_BA_Base2\nVAR_INPUT\n"
+                "    bB : BOOL;\nEND_VAR</pre>", "b-der")
+    _store_with(idx, f"{A}/3002", "FB_BA_Base2", "<pre>FUNCTION_BLOCK FB_BA_Base2\nVAR_INPUT\n    bA : BOOL;\nEND_VAR</pre>",
+                "a-base")
+    _store_with(idx, f"{A}/3003", "Calc", "<pre>METHOD Calc : BOOL\nVAR_INPUT\n    fIn : LREAL;\nEND_VAR</pre>", "a-calc",
+                "a-base")
+    idx.resolve_help_links()
+    idx.sync_derived()
+    for lib in (None, B):
+        d = idx.declaration("FB_BA_Derived.Calc", library=lib)
+        assert d["url"].endswith(f"{A}/3003.html") and d["defined_in"] == "FB_BA_Base2", (lib, d)
