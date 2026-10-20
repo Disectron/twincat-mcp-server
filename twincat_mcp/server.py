@@ -2389,12 +2389,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         and TwinCAT's ESI folders): name, product code, revisions, E-bus current, mailbox, DC modes, sync managers,
         PDOs with every entry (index, subindex, bit length, type; gaps marked), the predefined PDO assignments, slots
         of modular devices with their modules, the CoE object list, the diagnosis catalogue size, the ESI file(s).
-        query = type / order code ('EL3356-0010'), part of a name, or a product code ('#x07D83052'). detail: 'newest'
-        (default) = all of that for the newest revision of each type (or of `revision`), other revisions as one line
-        each; 'summary' = counts only; 'full' = everything for every revision. One CoE object with sub-indices,
-        defaults and enum texts: hw_object; full-text: hw_search; a diagnosis text id: hw_diag. The index's first build
-        starts by itself (minutes); until it is there the answer says so. `manuals` names the indexed PDF manuals that
-        mention the product, with pages (the twincat-docs skill reads them)."""
+        query = type / order code ('EL3356-0010'), part of a name, or a product code ('#x07D83052', '0x07D83052'; a
+        number is read as a decimal product code and as digits of a type or name — `read_as`). revision: '#x…' as
+        shown, '0x…' or decimal. detail: 'newest' (default) = all of that for the newest revision of each type (or of
+        `revision`), other revisions as one line each; 'summary' = counts only; 'full' = everything for every
+        revision. Nothing found: `note` says what is not there — a revision of an indexed device
+        (`revisions_available`), or the device (then: add its ESI file). One CoE object with sub-indices, defaults
+        and enum texts: hw_object; full-text: hw_search; a diagnosis text id: hw_diag. The index's first build starts
+        by itself (minutes); until it is there the answer says so. `source`: the index the answer came from (state,
+        built; `state_note` when it is not current). `manuals` names the indexed PDF manuals that mention the
+        product, with pages (the twincat-docs skill reads them)."""
         first = await asyncio.to_thread(app.esi_first_build)
         res = await app.kb_call(app.kb.hw_lookup, query, limit, revision, detail, timeout=120)
         if first:
@@ -2405,9 +2409,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def hw_search(query: str, kinds: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
         """Full-text search of the ESI index: devices (names, PDOs and their entries, PDO assignments), CoE objects
         (names, descriptions, sub-index names), diagnosis messages (text, description, causes, remedies) and modules.
-        kinds: any of 'device', 'object', 'diag', 'module' (default all). FTS5 syntax (words ANDed, "phrase",
-        prefix*); other text is searched as one phrase. Hits with the same title (revisions of one type, one text in
-        several catalogues) are one item with `variants`; objects and messages name the device types that have them."""
+        kinds: any of 'device', 'object', 'diag', 'module' (default all; a module is found by its own name and PDOs
+        and by the devices whose slots take it — type, name, group). FTS5 syntax (words ANDed, "phrase", prefix*);
+        other text is searched as one phrase. Hits with the same title (revisions of one type, one text in several
+        catalogues) are one item with `variants`; objects and messages name the device types that have them."""
         first = await asyncio.to_thread(app.esi_first_build)
         res = await app.kb_call(app.kb.hw_search, query, kinds, limit, timeout=120)
         if first:
@@ -2419,7 +2424,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """One CoE object of a device from its ESI (newest revision unless `revision`): every sub-index with type, bit
         size and offset, access, PDO mapping, backup/setting flags, the default (decoded from DefaultData, enum text
         when there is one), min/max, unit code, enumeration texts; array elements one by one. index: '#x8000' or
-        '0x8000' (4 hex digits alone are read as hex). device: the exact type ('EL3356-0010')."""
+        '0x8000' (4 hex digits alone are read as hex); one sub-index in CoE notation '8000:11' (the sub-index in hex,
+        as Beckhoff's manuals write it: 8000:11 = sub-index 17) → `sub` and `subitems` with just that one. device:
+        the exact type ('EL3356-0010')."""
         first = await asyncio.to_thread(app.esi_first_build)
         res = await app.kb_call(app.kb.hw_object, device, index, revision, timeout=60)
         if first:

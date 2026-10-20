@@ -25,9 +25,10 @@ What is read — four document kinds, told apart by their root element:
   EtherCATDiag   diagnosis message catalogues (text id, message, description, causes and remedies, reaction, reset).
 Identical objects, dictionaries and diagnosis messages (most revisions share them) are stored once; those only a
 replaced description used are dropped before the index is complete (the counts are of what is kept). Devices,
-objects, diagnosis messages and modules are full-text searchable. EtherCATInfo / EtherCATModule files are read
-element by element (each device dropped once read); a dictionary or diagnosis file is read whole (the AX5000
-dictionaries: 1.6 MB).
+objects, diagnosis messages and modules are full-text searchable — a module also by the devices whose slots take it
+(their type, name and group: AX8000 modules are named DeviceMain, SynchronousMotor …). EtherCATInfo / EtherCATModule
+files are read element by element (each device dropped once read); a dictionary or diagnosis file is read whole (the
+AX5000 dictionaries: 1.6 MB).
 
 Build discipline (as the other indexes): one build at a time (an OS lock on <db>.lock with the progress), written as
 <db>.building and swapped in when complete — the index in use stays as it is until then; an interrupted build
@@ -57,7 +58,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 from . import kb_lock
 
-FORMAT = "1"
+FORMAT = "2"            # 1: 0.8.12; 2: a module's search text holds the devices whose slots take it (N156, 0.8.14 retest)
 ROOT_KINDS = {"EtherCATInfo": "info", "EtherCATModule": "module", "EtherCATDict": "dict", "EtherCATDiag": "diag"}
 SIDE = ("-journal", "-wal", "-shm")
 SWAP_WAIT_S = 60.0
@@ -931,6 +932,38 @@ def _resolve_ref(ref: str, file: Path, by_name: dict[str, list[Path]]) -> Path |
     return same[0] if len(same) == 1 else None
 
 
+def module_candidates(con: sqlite3.Connection, vendor: str, dev_file: str, ident: int) -> tuple[list[Any], str]:
+    """Which modules a device's slot means by a ModuleIdent, by rule — never a guess:
+    1. a module of the device's own file (Descriptions\\Modules);
+    2. a module of a module file paired with the device file by name: '<prefix> Modules….xml' where <prefix>
+       begins the device file's name ('Beckhoff AX8yxx-zzzz-0107 Modules.xml' → 'Beckhoff AX8yxx-zzzz-0107.xml';
+       'Beckhoff AX8yxx Modules Safety.xml' → every 'Beckhoff AX8yxx…'), the longest prefix first;
+    3. the only module of the vendor with that ident (several: every one).
+    -> (the modules of the first rule that applies: rows (id, type, name, data, file path), that rule). One rule for
+    hw_lookup's slots, hw_module(device=…) and the modules' search text (N156) — the build reads it too."""
+    rows = con.execute("SELECT m.id, m.type, m.name, m.data, f.path FROM modules m JOIN files f ON f.id = m.file_id "
+                       "WHERE m.ident = ? AND m.vendor = ?", (ident, vendor)).fetchall()
+    if not rows:
+        return [], ""
+    own = [c for c in rows if os.path.normcase(c[4]) == os.path.normcase(dev_file)]
+    if own:
+        return own, "the device's own file"
+    dev = Path(dev_file).stem.lower()
+    best, paired = -1, []
+    for c in rows:
+        stem = Path(c[4]).stem.lower()
+        k = stem.find(" modules")
+        if k <= 0 or not dev.startswith(stem[:k]):
+            continue
+        if k > best:
+            best, paired = k, [c]
+        elif k == best:
+            paired.append(c)
+    if paired:
+        return paired, "the module file of this device file"
+    return rows, "the only module with this ident" if len(rows) == 1 else "every module with this ident"
+
+
 class _Build:
     """One pass over the files (see the module text for the rules on duplicates)."""
 
@@ -1126,6 +1159,33 @@ class _Build:
         self.w.search = [r for r in self.w.search if (int(r[1]) in objs if r[0] == "object" else
                                                       int(r[1]) in msgs if r[0] == "diag" else True)]
 
+    def _module_hosts(self) -> dict[int, list[str]]:
+        """N156 (0.8.14 retest): module id -> the devices whose slots take it (type and name as the device's search
+        title, its group), by the rule of hw_lookup's slots (module_candidates; several at that rule: each of them).
+        A module's own name is generic (the AX8000's DeviceMain, SynchronousMotor …): its search text holds these,
+        so hw_search finds a module by its device."""
+        con = self.con
+        rule: dict[tuple[str, str, int], list[int]] = {}
+        hosts: dict[int, dict[str, None]] = {}
+        devs = con.execute("SELECT d.type, d.name, d.vendor, d.data, f.path FROM devices d JOIN files f ON "
+                           "f.id = d.file_id ORDER BY d.type, d.revision DESC").fetchall()
+        for typ, name, vendor, blob, path in devs:
+            data = _unpack(blob) or {}
+            if not data.get("slots"):
+                continue
+            text = " ".join(x for x in (_title(typ, name), data.get("group_name")) if x)
+            for sl in data["slots"].get("slots") or []:
+                for m in sl.get("modules") or []:
+                    ident = _num(m.get("ident"))
+                    if ident is None:
+                        continue                   # a ModuleClass: not resolved (hw_lookup's slots neither)
+                    key = (vendor, os.path.normcase(path), ident)
+                    if key not in rule:
+                        rule[key] = [c[0] for c in module_candidates(con, vendor, path, ident)[0]]
+                    for mid in rule[key]:
+                        hosts.setdefault(mid, {})[text] = None      # each device text once, in type order
+        return {mid: list(t) for mid, t in hosts.items()}
+
     def finish(self) -> dict[str, Any]:
         con = self.con
         self._prune()
@@ -1142,10 +1202,12 @@ class _Build:
                                 + [f"{x['name']} " + " ".join(e["name"] for e in x["entries"]) for x in data["pdos"]]
                                 + [m["name"] for m in data.get("mappings") or []])
                 rows.append(("device", str(r[0]), _title(r[1], r[2]), body))
+            hosts = self._module_hosts()
             for r in con.execute("SELECT id, type, name, data FROM modules"):
                 data = _unpack(r[3])
                 rows.append(("module", str(r[0]), _title(r[1], r[2]),
-                             " ".join(f"{x['name']} " + " ".join(e["name"] for e in x["entries"]) for x in data["pdos"])))
+                             " ".join([f"{x['name']} " + " ".join(e["name"] for e in x["entries"]) for x in data["pdos"]]
+                                      + hosts.get(r[0], []))))
             con.executemany("INSERT INTO search (kind, ref, title, body) VALUES (?, ?, ?, ?)", rows)
             con.execute("INSERT INTO search(search) VALUES ('optimize')")
         n = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("dicts", "obj", "msg")}
@@ -1414,6 +1476,30 @@ def message(s: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------------------------- reading
 DETAILS = ("newest", "summary", "full")
 _KINDS = ("device", "object", "diag", "module")
+# N152 / N154 (0.8.14 retest): the forms every hw_* reader takes a number in — '#x' / '0x' hex, else decimal; an
+# object index, a text id and a ModuleIdent also as 4 hex digits alone (8000 = #x8000) — named when a value is none
+FORMS = {
+    "index": "'#x8000', '0x8000', 4 hex digits alone ('8000' = #x8000) or decimal (32768); one sub-index in CoE "
+             "notation: '8000:11' (the sub-index in hex, 1–2 digits as Beckhoff's manuals and TwinCAT write it: "
+             "8000:11 = sub-index 17; or '8000:#x11', '8000:0x11')",
+    "code": "'#x4101', '0x4101', 4 hex digits alone ('4101' = #x4101) or decimal (16641)",
+    "ident": "'#x006B0064' as hw_lookup's slots show it, '0x006B0064', 4 hex digits alone or decimal",
+    "product code": "'#x0D1C3052', '0x0D1C3052' or decimal (219951186)",
+    "revision": "'#x0019000A' (as hw_lookup shows it), '0x0019000A' or decimal (1638410)",
+}
+_NOT_IN_ESI = ("not in the ESI files of this PC — copy the vendor's ESI XML into the knowledge folder's manuals\\ (any "
+               "sub-folder) and approve kb_rebuild(index='esi'), or update TwinCAT's device descriptions (XAE: TwinCAT "
+               "→ EtherCAT Devices → Update Device Descriptions)")
+
+
+def answer_source(db: Path, st: dict[str, Any]) -> dict[str, Any]:
+    """N155 (0.8.14 retest): the index an hw_* answer came from, the same block in the server's hw_* tools and the
+    skill's hw_* commands — database, state, built; and, when it is not the current one (rule 6), what it is
+    (state_note: the answer comes from that index as it is)."""
+    src: dict[str, Any] = {"database": str(db), "state": st["state"], "built": st.get("built")}
+    if st["state"] != "complete" or st.get("rebuild"):
+        src["state_note"] = st["message"]
+    return src
 
 
 class EsiIndex:
@@ -1445,27 +1531,58 @@ class EsiIndex:
     def _rev(revision: int | str | None) -> int | None:
         if revision is None:
             return None
-        n = revision if isinstance(revision, int) else _num(str(revision).replace("0x", "#x").replace("0X", "#x"))
+        n = revision if isinstance(revision, int) else _num(str(revision))     # _num: #x / 0x hex, else decimal
         if n is None or isinstance(n, bool):
-            raise EsiError(f"revision must be a number or '#x…' as hw_lookup shows it (got {revision!r})")
+            raise EsiError(f"revision must be {FORMS['revision']} (got {revision!r})")
         return EsiIndex._range(n, "revision", 32, revision)
+
+    @staticmethod
+    def _shown_rev(rev: int, given: int | str | None) -> str:
+        """A revision as hw_lookup shows it, and the decimal number it was read from when it was given as one."""
+        dec = isinstance(given, int) or bool(re.fullmatch(r"\s*\d+\s*", str(given)))
+        return _hx(rev, 8) + (f" (decimal {rev})" if dec else "")
 
     @staticmethod
     def _index(v: str | int, what: str = "index") -> int:
         if isinstance(v, int):
             n: int | None = v
         else:
-            s = str(v).strip().split(":")[0]
+            s = str(v).strip()
+            if ":" in s:
+                # N152 (0.8.14 retest): the text after ':' was cut off silently ('8000:11' read as 8000); an object's
+                # sub-index is read by _address, a diagnosis code or a ModuleIdent has none
+                raise EsiError(f"{what} {v!r}: no sub-index here, a {what} is one number — {FORMS[what]}")
             n = _num(s if s[:2].lower() in ("#x", "0x") else ("#x" + s if re.fullmatch(r"[0-9A-Fa-f]{4}", s) else s))
         if n is None:
-            raise EsiError(f"{what} must be like '#x8000' or 0x8000 (got {v!r})")
+            raise EsiError(f"{what} must be {FORMS[what]} (got {v!r})")
         return EsiIndex._range(n, what, 16 if what == "index" else 32, v)
+
+    @staticmethod
+    def _address(v: str | int) -> tuple[int, int | None]:
+        """An object's index, or one of its sub-indices in CoE notation -> (index, sub-index or None). N152 (0.8.14
+        retest): '8000:11' was read as the whole object 0x8000. The sub-index is hex as the notation writes it
+        (8000:11 = sub-index 17, as in Beckhoff's manuals and TwinCAT): 1–2 hex digits, or '#x…' / '0x…'."""
+        if isinstance(v, int) or ":" not in str(v):
+            return EsiIndex._index(v), None
+        head, _c, tail = str(v).partition(":")
+        idx = EsiIndex._index(head)
+        t = tail.strip()
+        m = re.fullmatch(r"(?:#x|0x)([0-9a-f]+)|([0-9a-f]{1,2})", t, re.I)
+        if m is None:
+            raise EsiError(f"sub-index {t!r} of {v!r} is none of the forms: {FORMS['index']}")
+        sub = int(m.group(1) or m.group(2), 16)
+        if sub > 0xFF:
+            raise EsiError(f"sub-index {t!r} of {v!r} is out of range (0 … 0xFF) — {FORMS['index']}")
+        return idx, sub
 
     def lookup(self, query: str, limit: int = 5, revision: int | str | None = None,
                detail: str = "newest") -> dict[str, Any]:
-        """Devices by type / order code ('EL3356-0010'), product code ('#x0d1c3052') or part of a name. detail:
+        """Devices by type / order code ('EL3356-0010'), product code ('#x0d1c3052', '0x0d1c3052'; a number is read
+        as a decimal product code and as digits of a type or name: read_as) or part of a name. detail:
         'newest' — the full description of the newest revision of each type (or of `revision`), the other revisions
-        as one line each; 'summary' — no PDOs or objects, their counts only; 'full' — every revision in full."""
+        as one line each; 'summary' — no PDOs or objects, their counts only; 'full' — every revision in full.
+        Nothing found: `note` says what is not there — a revision of an indexed device (with revisions_available),
+        or the device itself (then: add its ESI file)."""
         q = (query or "").strip()
         if not q:
             raise EsiError("empty query (e.g. 'EL3356-0010', 'EL3102', '#x0c1e3052')", "empty_query")
@@ -1476,17 +1593,31 @@ class EsiIndex:
         rev = self._rev(revision)
         rs, rp = (" AND d.revision = ?", [rev]) if rev is not None else ("", [])
         sel = "SELECT d.*, f.path AS file FROM devices d JOIN files f ON f.id = d.file_id WHERE "
+        read_as = None
         with self._con() as con:
-            pc = _num(q.replace("0x", "#x")) if q[:2].lower() in ("#x", "0x") else None
-            if pc is not None:
+            # which devices the query means is decided by the query alone; the revision filters them after (N153)
+            if q[:2].lower() in ("#x", "0x"):
+                pc = _num(q)
+                if pc is None:
+                    # N154 (0.8.14 retest): '#x…' / '0x…' that is no hex number was searched as text and answered
+                    # 'not in the ESI files … copy the ESI'
+                    raise EsiError(f"product code {q!r} is not a hex number — a product code is "
+                                   f"{FORMS['product code']}")
                 self._range(pc, "product code", 32, q)
-                where, params, order = f"d.product_code = ?{rs}", [pc, *rp], "d.revision DESC"
+                base, bparams, order = "d.product_code = ?", [pc], "d.revision DESC"
             else:
-                where, params, order = f"d.type = ? COLLATE NOCASE{rs}", [q, *rp], "d.revision DESC"
-                if not con.execute(f"SELECT 1 FROM devices d WHERE {where} LIMIT 1", params).fetchone():
+                base, bparams, order = "d.type = ? COLLATE NOCASE", [q], "d.revision DESC"
+                if not con.execute(f"SELECT 1 FROM devices d WHERE {base} LIMIT 1", bparams).fetchone():
                     pat = "%" + _like(q) + "%"           # the text as typed: '%' and '_' match only themselves
-                    where = f"(d.type LIKE ? ESCAPE '\\' OR d.name LIKE ? ESCAPE '\\'){rs}"
-                    params, order = [pat, pat, *rp], "d.type, d.revision DESC"
+                    base = "d.type LIKE ? ESCAPE '\\' OR d.name LIKE ? ESCAPE '\\'"
+                    bparams, order = [pat, pat], "d.type, d.revision DESC"
+                    if re.fullmatch(r"[0-9]+", q) and int(q) < 1 << 32:
+                        # N154 (0.8.14 retest): a decimal product code (219951186 = #x0D1C3052) was only searched as
+                        # text — a number is both: the product code, and digits of a type or name ('3356')
+                        base, bparams = f"d.product_code = ? OR {base}", [int(q), *bparams]
+                        read_as = (f"the product code {_hx(int(q), 8)} (decimal {q}), and text in a type or name")
+                    base = f"({base})"
+            where, params = base + rs, bparams + rp
             rows = con.execute(sel + f"{where} ORDER BY {order} LIMIT 200", params).fetchall()
             # the counts are of every match (the rows read are the first 200 in that order)
             n_all, n_types = con.execute(f"SELECT COUNT(*), COUNT(DISTINCT lower(d.type)) FROM devices d WHERE {where}",
@@ -1507,7 +1638,17 @@ class EsiIndex:
                 full = detail == "full" or (detail == "newest" and (first or rev is not None))
                 out_rows.append(self._device(con, r, full))
                 trimmed += 0 if full else 1
-        res: dict[str, Any] = {"query": q, "matches": n_all, "types": types, "detail": detail, "devices": out_rows}
+            # N153 (0.8.14 retest): an empty answer said 'not in the ESI files … copy the ESI, kb_rebuild' whatever
+            # emptied it — also for a device that is indexed, only not with the revision asked for
+            avail: dict[str, list[str]] = {}
+            if not rows and rev is not None:
+                for t, rv in con.execute(f"SELECT d.type, d.revision FROM devices d WHERE {base} "
+                                         "ORDER BY lower(d.type), d.revision DESC", bparams):
+                    if t not in avail and len(avail) == 10:
+                        break
+                    avail.setdefault(t, []).append(_hx(rv, 8))
+        res: dict[str, Any] = {"query": q, **({"read_as": read_as} if read_as else {}), "matches": n_all,
+                               "types": types, "detail": detail, "devices": out_rows}
         if n_types > len(types):
             res["types_count"] = n_types              # 'types' lists the first 40 by name
         if n_all > int(limit):
@@ -1515,10 +1656,24 @@ class EsiIndex:
         if trimmed:
             res["detail_note"] = (f"{trimmed} device row(s) as one line (detail={detail!r}): detail='full', or "
                                   "revision='#x…' (as shown), gives them in full")
-        if not rows:
-            res["note"] = ("not in the ESI files of this PC — copy the vendor's ESI XML into the knowledge folder's "
-                           "manuals\\ (any sub-folder) and approve kb_rebuild(index='esi'), or update TwinCAT's device "
-                           "descriptions (XAE: TwinCAT → EtherCAT Devices → Update Device Descriptions)")
+        if avail:
+            shown = self._shown_rev(rev, revision)
+            if len(avail) == 1:
+                t, revs = next(iter(avail.items()))
+                res["note"] = (f"{t} has no revision {shown} in the ESI index; its revisions (newest first): "
+                               f"{', '.join(revs)}")
+            else:
+                res["note"] = (f"none of the types that match {q!r} has revision {shown} in the ESI index; their "
+                               "revisions: revisions_available")
+            res["revisions_available"] = avail
+        elif not rows:
+            if q[:2].lower() in ("#x", "0x"):
+                what = f"no device has the product code {_hx(_num(q), 8)}"
+            else:
+                what = (f"no device type or name contains {q!r}" + (f", no device has the product code "
+                                                                      f"{_hx(int(q), 8)} (decimal {q})" if read_as else "")
+                        + f" (a product code is {FORMS['product code']})")
+            res["note"] = f"{what} — {_NOT_IN_ESI}"
         return res
 
     def _device(self, con: sqlite3.Connection, r: sqlite3.Row, full: bool) -> dict[str, Any]:
@@ -1584,50 +1739,32 @@ class EsiIndex:
 
     @staticmethod
     def _resolve_module(con: sqlite3.Connection, r: sqlite3.Row, ident: int) -> dict[str, Any]:
-        """Which module a device's slot means by a ModuleIdent, by rule — never a guess:
-        1. a module of the device's own file (Descriptions\\Modules);
-        2. a module of a module file paired with the device file by name: '<prefix> Modules….xml' where <prefix>
-           begins the device file's name ('Beckhoff AX8yxx-zzzz-0107 Modules.xml' → 'Beckhoff AX8yxx-zzzz-0107.xml';
-           'Beckhoff AX8yxx Modules Safety.xml' → every 'Beckhoff AX8yxx…'), the longest prefix first;
-        3. the only module of the vendor with that ident.
+        """Which module a device's slot means by a ModuleIdent, by the rule of module_candidates — never a guess.
         Several different modules at the first rule that applies: all are named, none is chosen."""
-        rows = con.execute("SELECT m.id, m.type, m.name, m.data, f.path FROM modules m JOIN files f ON f.id = m.file_id "
-                           "WHERE m.ident = ? AND m.vendor = ?", (ident, r["vendor"])).fetchall()
-        if not rows:
+        cands, how = module_candidates(con, r["vendor"], r["file"], ident)
+        if not cands:
             return {"module": None, "note": "no module with this ident in the ESI files"}
-
-        def one(cands: list[sqlite3.Row], how: str) -> dict[str, Any]:
-            distinct = {(c["type"], c["name"], bytes(c["data"])): c for c in cands}
-            if len(distinct) == 1:
-                c = next(iter(distinct.values()))
-                return {"module": c["type"], "name": c["name"], "from": Path(c["path"]).name, "how": how}
-            return {"module": None, "how": how, "candidates": [{"module": c["type"], "name": c["name"],
-                                                                  "from": Path(c["path"]).name}
-                                                                 for c in distinct.values()][:8],
-                    "note": "several different modules have this ident at the same rule — none is chosen"}
-        own = [c for c in rows if os.path.normcase(c["path"]) == os.path.normcase(r["file"])]
-        if own:
-            return one(own, "the device's own file")
-        dev = Path(r["file"]).stem.lower()
-        best, paired = -1, []
-        for c in rows:
-            stem = Path(c["path"]).stem.lower()
-            k = stem.find(" modules")
-            if k <= 0 or not dev.startswith(stem[:k]):
-                continue
-            if k > best:
-                best, paired = k, [c]
-            elif k == best:
-                paired.append(c)
-        if paired:
-            return one(paired, "the module file of this device file")
-        return one(rows, "the only module with this ident" if len(rows) == 1 else "every module with this ident")
+        distinct = {(c["type"], c["name"], bytes(c["data"])): c for c in cands}
+        if len(distinct) == 1:
+            c = next(iter(distinct.values()))
+            return {"module": c["type"], "name": c["name"], "from": Path(c["path"]).name, "how": how}
+        return {"module": None, "how": how, "candidates": [{"module": c["type"], "name": c["name"],
+                                                              "from": Path(c["path"]).name}
+                                                             for c in distinct.values()][:8],
+                "note": "several different modules have this ident at the same rule — none is chosen"}
 
     def _one(self, con: sqlite3.Connection, device: str, revision: int | str | None) -> sqlite3.Row:
         rev = self._rev(revision)
         q = "SELECT d.*, f.path AS file FROM devices d JOIN files f ON f.id = d.file_id WHERE d.type = ? COLLATE NOCASE"
         rows = con.execute(q + (" AND d.revision = ?" if rev is not None else "") + " ORDER BY d.revision DESC LIMIT 1",
                            [device.strip()] + ([rev] if rev is not None else [])).fetchall()
+        if not rows and rev is not None:
+            # N153 (0.8.14 retest): an indexed device without that revision was called 'not in the ESI index'
+            have = con.execute("SELECT type, revision FROM devices WHERE type = ? COLLATE NOCASE ORDER BY revision "
+                               "DESC", (device.strip(),)).fetchall()
+            if have:
+                raise EsiError(f"{have[0][0]} has no revision {self._shown_rev(rev, revision)} in the ESI index; its "
+                               f"revisions (newest first): {', '.join(_hx(x[1], 8) for x in have)}", "not_found")
         if not rows:
             near = [x[0] for x in con.execute("SELECT DISTINCT type FROM devices WHERE type LIKE ? ESCAPE '\\' "
                                               "ORDER BY type LIMIT 8", ("%" + _like(device.strip()) + "%",))]
@@ -1638,8 +1775,9 @@ class EsiIndex:
 
     def object(self, device: str, index: str | int, revision: int | str | None = None) -> dict[str, Any]:
         """One CoE object of a device (its newest revision unless `revision`): every sub-index with type, bit offset,
-        access, PDO mapping, default (decoded), limits, unit code and enumeration texts."""
-        idx = self._index(index)
+        access, PDO mapping, default (decoded), limits, unit code and enumeration texts. index '8000:11' (CoE
+        notation, the sub-index in hex): that sub-index only — `sub` names it, `subitems` holds just it."""
+        idx, sub = self._address(index)
         with self._con() as con:
             r = self._one(con, device, revision)
             if not r["dict_id"]:
@@ -1654,7 +1792,22 @@ class EsiIndex:
                 raise EsiError(f"{r['type']} has no object {_hx(idx)}; the nearest: {near}", "not_found")
         obj = _unpack(o["data"])
         obj["index"] = _hx(obj["index"])
-        return {"device": r["type"], "revision": _hx(r["revision"], 8), **obj}
+        if sub is None:
+            return {"device": r["type"], "revision": _hx(r["revision"], 8), **obj}
+        # N152 (0.8.14 retest): the sub-index asked for, not the whole object
+        what = f"{r['type']} {obj['index']} {obj['name']!r}"
+        subs = obj.get("subitems")
+        if not subs:
+            if sub:
+                raise EsiError(f"{what} is a single value, it has no sub-index {_hx(sub, 2)} ({sub}): its value is "
+                               f"sub-index 0 (index={obj['index']} gives it)", "not_found")
+            return {"device": r["type"], "revision": _hx(r["revision"], 8), "index": obj.pop("index"), "sub": 0, **obj}
+        one = [s for s in subs if s.get("sub") == sub]
+        if not one:
+            have = ", ".join(f"{_hx(s['sub'], 2)} ({s['sub']})" for s in subs if s.get("sub") is not None)
+            raise EsiError(f"{what} has no sub-index {_hx(sub, 2)} ({sub}); its sub-indices: {have}", "not_found")
+        obj["subitems"] = one
+        return {"device": r["type"], "revision": _hx(r["revision"], 8), "index": obj.pop("index"), "sub": sub, **obj}
 
     def diag(self, code: str | int, device: str | None = None, revision: int | str | None = None) -> dict[str, Any]:
         """A diagnosis message by its text id (#x4101, 0x4101 — as in the diagnosis history, object 0x10F3) — of one

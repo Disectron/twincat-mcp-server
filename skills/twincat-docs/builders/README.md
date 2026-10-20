@@ -269,7 +269,7 @@ was built with. `--no-twincat` leaves TwinCAT's own ESI folders out and is recor
 updates keep it); `--twincat` reads them again. A work file (`esi.db.building`) left next to a complete, current index
 is discarded by the next `update`. Standard library only; the queries print the JSON of the server's `hw_*` tools.
 
-### What is read (`twincat_mcp/esi_index.py`, format 1)
+### What is read (`twincat_mcp/esi_index.py`, format 2)
 
 Every `*.xml` below the sources whose root element is an ESI document — files of other roots are listed (`not_esi`)
 and skipped:
@@ -304,7 +304,10 @@ and skipped:
 - **Modules are per file**: the same ModuleIdent is a different module in each AX8000 module file. A device's slot
   module is resolved when read, by rule: the device's own file; else the module file paired with it by name
   (`<prefix> Modules….xml`, `<prefix>` beginning the device file's name, the longest first); else the only module
-  with that ident. Several different modules at the first rule that applies: all are named, none chosen.
+  with that ident. Several different modules at the first rule that applies: all are named, none chosen. The same
+  rule gives each module the devices whose slots take it: their type, name and group are part of the module's
+  search text, so `hw_search … kinds=module` finds a module by its device (format 2, 0.8.14 retest N156 — the
+  AX8000 modules are named DeviceMain, SynchronousMotor …).
 - A `DictionaryFile` / `DiagFile` is looked up beside the device file as written, else as the one source file of that
   name; not found: the device says so (`dictionary_note`), `stats` counts it (`missing_refs`).
 
@@ -316,7 +319,7 @@ interrupted build replaces nothing and the next one starts over. Without `--forc
 exactly these files (paths, sizes, times — `sources_stamp`) is left as it is (`up to date`). Full-text search
 (`search`) needs SQLite with FTS5; without it everything else works.
 
-### Schema (format 1)
+### Schema (format 2; the same tables as format 1 — format 2 adds the host devices to a module's search text)
 
 ```sql
 files(id, path, source, kind, size, mtime, hash, same_as, items, error)

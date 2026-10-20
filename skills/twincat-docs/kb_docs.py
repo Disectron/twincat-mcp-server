@@ -974,17 +974,19 @@ def _esi(ctx: Ctx, fn: str, *a: Any) -> dict[str, Any]:
         out = getattr(ESI.EsiIndex(db), fn)(*a)
     except ESI.EsiError as exc:
         raise Err(exc.code, str(exc)) from None
-    src: dict[str, Any] = {"database": str(db), "state": st["state"], "built": st.get("built")}
-    if st["state"] != "complete" or st.get("rebuild"):
-        src["state_note"] = st["message"]
-    out["source"] = src
+    out["source"] = ESI.answer_source(db, st)      # N155: the block the server's hw_* tools give (one implementation)
     return out
 
 
 def cmd_hw_lookup(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     if a["detail"] not in ESI.DETAILS:
         raise Err("bad_param", f"detail must be one of {list(ESI.DETAILS)} (got {a['detail']!r})")
-    return _esi(ctx, "lookup", a["query"], a["limit"], a["revision"], a["detail"])
+    out = _esi(ctx, "lookup", a["query"], a["limit"], a["revision"], a["detail"])
+    # N155 (0.8.14 retest): the server's hw_lookup names the indexed PDF manuals of the product (manuals /
+    # manuals_more), the skill's did not — the plugin's one implementation, on the same manuals index
+    from twincat_mcp.knowledge import hw_manuals
+    out.update(hw_manuals(ctx.kb, a["query"].strip(), out.get("types")))
+    return out
 
 
 def cmd_hw_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
@@ -1028,16 +1030,21 @@ COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[
                                       "max_chars": P("int", default=4000, lo=200, hi=20000)},
                     "page text of a manual with the section of each page"),
     "manual_docs": (cmd_manual_docs, {"filter": P(doc="file name / title glob or word")}, "the indexed manuals"),
-    "hw_lookup": (cmd_hw_lookup, {"query": P(required=True, doc="type / order code, part of a name, or product code #x…"),
-                                  "limit": P("int", default=3, lo=1, hi=30), "revision": P(doc="#x… as shown, or a number"),
+    "hw_lookup": (cmd_hw_lookup, {"query": P(required=True, doc="type / order code, part of a name, or product code "
+                                                               "#x… / 0x… / decimal"),
+                                  "limit": P("int", default=3, lo=1, hi=30),
+                                  "revision": P(doc="#x… as shown, 0x… or a decimal number"),
                                   "detail": P(default="newest", doc="newest | summary | full")},
-                  "EtherCAT device from the ESI index: identity, PDOs and entries, PDO assignments, DC, slots, CoE list"),
+                  "EtherCAT device from the ESI index: identity, PDOs and entries, PDO assignments, DC, slots, CoE "
+                  "list; the indexed manuals that name it"),
     "hw_search": (cmd_hw_search, {"query": P(required=True, doc="FTS5 query"),
                                   "kinds": P(doc="comma list of device, object, diag, module"),
                                   "limit": P("int", default=20, lo=1, hi=100)},
                   "ESI full text: devices, CoE objects, diagnosis messages, modules"),
     "hw_object": (cmd_hw_object, {"device": P(required=True, doc="exact type, e.g. EL3356-0010"),
-                                  "index": P(required=True, doc="#x8000 / 0x8000 / 8000"), "revision": P(doc="#x…")},
+                                  "index": P(required=True, doc="#x8000 / 0x8000 / 8000; one sub-index: 8000:11 (CoE "
+                                                                "notation, sub-index hex: 8000:11 = sub-index 17)"),
+                                  "revision": P(doc="#x…")},
                   "one CoE object: sub-indices, types, bit offsets, defaults, limits, enum texts"),
     "hw_diag": (cmd_hw_diag, {"code": P(required=True, doc="text id, e.g. #x4101"), "device": P(doc="exact type"),
                               "revision": P(doc="#x…")},

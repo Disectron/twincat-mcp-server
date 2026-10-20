@@ -1387,8 +1387,9 @@ class Knowledge:
     HW_DETAILS = E.DETAILS
 
     def _hw(self, fn: str, *a: Any) -> dict[str, Any]:
-        """One read of the ESI index, with its state: no index yet → what is happening (the first build), an index
-        that is not current → esi_index_note (rule 6: an answer from an index that is not current says so)."""
+        """One read of the ESI index, with its state: no index yet → what is happening (the first build); else the
+        answer carries `source` (database, state, built), with `state_note` when the index is not current (rule 6:
+        an answer from an index that is not current says so) — the block the skill's hw_* commands give (N155)."""
         st = self.esi_state()
         if st["state"] == "missing":
             rb = st.get("rebuild") or {}
@@ -1404,12 +1405,14 @@ class Knowledge:
                 note = ("no ESI index yet: its first build starts by itself (server start, or this call through the "
                         "server); or approve kb_rebuild(index='esi')")
             return {"esi_index": st, "note": note}
+        db = L.index_file(self.require(), "esi")
         try:
-            res = getattr(E.EsiIndex(L.index_file(self.require(), "esi")), fn)(*a)
+            res = getattr(E.EsiIndex(db), fn)(*a)
         except E.EsiError as exc:
             raise KnowledgeError(str(exc)) from None
-        if st["state"] != "complete" or st.get("rebuild"):
-            res["esi_index_note"] = st["message"]
+        # N155 (0.8.14 retest): the server's answer had no source block (its state was esi_index_note), the skill's
+        # had one — one envelope, built by esi_index for both
+        res["source"] = E.answer_source(db, st)
         return res
 
     def hw_lookup(self, query: str, limit: int = 5, revision: int | str | None = None,
@@ -1422,14 +1425,7 @@ class Knowledge:
         if detail not in self.HW_DETAILS:
             raise KnowledgeError(f"detail must be one of {list(self.HW_DETAILS)} (got {detail!r})")
         res = self._hw("lookup", q, limit, revision, detail)
-        # the PDF manuals of the knowledge folder for the same product codes (N34: ESI type names carry text — 'CX9020
-        # EtherCAT slave' — so the order codes are taken out of the query and the types)
-        codes: list[str] = []
-        for t in [q] + list(res.get("types") or [])[:5]:
-            for c in _PRODUCT_IN.findall(t.upper()):
-                if c not in codes:
-                    codes.append(c)
-        res.update(manuals_for(self.location()[0], codes))
+        res.update(hw_manuals(self.location()[0], q, res.get("types")))
         return res
 
     def hw_search(self, query: str, kinds: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
@@ -1923,6 +1919,19 @@ def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
         return {"manuals_note": f"no indexed manual mentions {', '.join(codes[:3])} — copy its PDF into "
                                 f"{loc / 'manuals'} and run manuals_db.py update"}
     return {"manuals": found, "manuals_more": "twincat-docs skill: manual_search query=… doc=… / manual_page"}
+
+
+def hw_manuals(loc: Path | None, query: str, types: list[str] | None) -> dict[str, Any]:
+    """The manuals block of an hw_lookup answer (manuals / manuals_more, or manuals_note): the PDF manuals of the
+    knowledge folder that name the product. N34: ESI type names carry text ('CX9020 EtherCAT slave'), so the order
+    codes are taken out of the query and the types found. N155 (0.8.14 retest): the server's hw_lookup and the
+    skill's give the same block — both call this."""
+    codes: list[str] = []
+    for t in [query] + list(types or [])[:5]:
+        for c in _PRODUCT_IN.findall(t.upper()):
+            if c not in codes:
+                codes.append(c)
+    return manuals_for(loc, codes)
 
 
 class _WriteLock:

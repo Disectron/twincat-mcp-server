@@ -37,10 +37,10 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 | Hardware: LEDs, wiring, diagnostics, error codes | `manual_search query=… [doc=CX9020]` → `manual_page doc=… pages=N-M` (≤ 21 pages) |
 | Chapters of a manual | `manual_toc doc=CX9020 [depth=1-6]` |
 | Which manuals are indexed | `manual_docs [filter=…]` |
-| EtherCAT device from its ESI: PDOs and entries, PDO assignments, DC modes, slots, CoE object list | `hw_lookup query=EL3356-0010 [revision=#x…] [detail=newest\|summary\|full] [limit=1-30]` (a product code `#x0d1c3052` or part of a name works too) |
-| One CoE object: sub-indices, types, bit offsets, defaults (decoded), limits, enum texts | `hw_object device=EL3356-0010 index=#x8000 [revision=]` |
+| EtherCAT device from its ESI: PDOs and entries, PDO assignments, DC modes, slots, CoE object list, the indexed manuals that name it | `hw_lookup query=EL3356-0010 [revision=#x…] [detail=newest\|summary\|full] [limit=1-30]` (a product code `#x0d1c3052` / `0x0d1c3052` / decimal `219951186`, or part of a name works too; a revision that is not indexed: `note` + `revisions_available`) |
+| One CoE object: sub-indices, types, bit offsets, defaults (decoded), limits, enum texts | `hw_object device=EL3356-0010 index=#x8000 [revision=]` — one sub-index: `index=8000:11` (CoE notation, sub-index hex: 17) |
 | A diagnosis message (diagnosis history text id, object 0x10F3) | `hw_diag code=#x4101 [device=EL7211-0010]` |
-| Which device / object / message mentions a word | `hw_search query=… [kinds=device,object,diag,module] [limit=1-100]` |
+| Which device / object / message / module mentions a word | `hw_search query=… [kinds=device,object,diag,module] [limit=1-100]` (a module is found by its devices too: `query=AX8206 kinds=module`) |
 | A module of a modular device (AX8000 slots, TSC) | `hw_module ident=#x006b0064 [device=AX8206-0210-0107]` |
 
 ## Rules

@@ -111,7 +111,7 @@ def test_hw_lookup_from_esi(kb):
     assert k.esi_build()["devices"] == 2
     r = k.hw_lookup("EL2008")
     d = r["devices"][0]
-    assert d["product_code"] == "#x07D83052" and d["group"] == "DigOut" and "esi_index_note" not in r
+    assert d["product_code"] == "#x07D83052" and d["group"] == "DigOut" and "state_note" not in r["source"]
     rx = [p for p in d["pdo"] if p["index"] == "#x1601"][0]
     assert [(e["index"], e.get("gap", False), e["bits"]) for e in rx["entries"]] == [("#x0000", True, 7),
                                                                                   ("#x7010", False, 1)]
@@ -619,8 +619,10 @@ def test_review_hw_lookup_revision_text_and_newest_of_every_type_first(kb):
 
 def test_esi_index_is_built_once_by_itself_and_rebuilt_only_when_asked(kb):
     """docs/KNOWLEDGE_BASE.md rule 6 for index\\esi.db: its first build starts by itself (the server); an index that
-    exists is used as it is — new ESI files or another format are reported (esi_state, the answer's esi_index_note)
-    until kb_rebuild(index='esi') runs the builder. Nothing of the old knowledge.db ESI table is read."""
+    exists is used as it is — new ESI files or another format are reported (esi_state, the answer's
+    source.state_note — N155, 0.8.14 retest: it was esi_index_note, the skill's hw_* commands said it in
+    source.state_note; one envelope now) until kb_rebuild(index='esi') runs the builder. Nothing of the old
+    knowledge.db ESI table is read."""
     k, tmp = kb
     k.set_location(str(tmp / "kbdata"))
     assert k.esi_state()["state"] == "missing"
@@ -634,7 +636,7 @@ def test_esi_index_is_built_once_by_itself_and_rebuilt_only_when_asked(kb):
     st = k.esi_state()
     assert st["state"] == "outdated" and "kb_rebuild(index='esi')" in st["message"]
     r = k.hw_lookup("EL1008")
-    assert r["matches"] == 0 and "OUTDATED" in r["esi_index_note"]
+    assert r["matches"] == 0 and r["source"]["state"] == "outdated" and "OUTDATED" in r["source"]["state_note"]
     assert k.esi_build()["result"] == "built" and k.hw_lookup("EL1008")["matches"] == 1
     assert k.esi_state()["state"] == "complete" and k.esi_build()["result"] == "up_to_date"
     # the ESI files in the knowledge folder's manuals\\ are read too
