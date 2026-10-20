@@ -1111,6 +1111,57 @@ async def test_n113_review_analyses_run_inside_one_plc_project(monkeypatch, tmp_
         assert todo and all(f["plc_project"].endswith("Plc2.plcproj") for f in todo)
 
 
+@pytest.mark.anyio
+async def test_n141_n142_s4_0814_two_plc_projects_and_a_shared_file(monkeypatch, tmp_path):
+    """0.8.14 retest §34b. N142 (S3): proj_lint / proj_interface refused a file both PLC projects compile, and the pin
+    the refusal asked for ('PlcA@GVL_Common') was refused the same way — a dead end. The pin names its PLC project; the
+    unpinned name is analysed in each, one answer when they agree. N141: PRG_B (Plc2) resolved on port 851 said 'no
+    program/GVL/FB named'. S4: proj_variables / proj_list / proj_search / proj_references name the PLC project."""
+    from tests.fake_ads import install
+    from tests.test_project import _plc, _tsproj
+    install(monkeypatch)
+    _plc(tmp_path, "Plc1", "n := n + 1; GVL_Common.nShared := n;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    _plc(tmp_path / "Plc2", "B", "n := 3;", 2000, prog="PRG_B")
+    (tmp_path / "Plc2" / "B" / "B.plcproj").unlink()
+    (tmp_path / "Plc2" / "POUs" / "PRG_B.TcPOU").write_bytes((tmp_path / "Plc2" / "B" / "POUs" / "PRG_B.TcPOU").read_bytes())
+    import shutil
+    shutil.rmtree(tmp_path / "Plc2" / "B")
+    common = tmp_path / "Common"
+    common.mkdir()
+    (common / "GVL_Common.TcGVL").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><GVL Name="GVL_Common"><Declaration><![CDATA[VAR_GLOBAL\n'
+        "  nShared : INT; // shared\nEND_VAR]]></Declaration></GVL></TcPlcObject>", encoding="utf-8")
+    from tests.test_project import register_sources
+    for plc in ("Plc1", "Plc2"):
+        pp = tmp_path / plc / f"{plc}.plcproj"
+        register_sources(pp)
+        pp.write_text(pp.read_text().replace("</Project>", '<ItemGroup><Compile Include="..\\Common\\GVL_Common.TcGVL">'
+                                              "<SubType>Code</SubType></Compile></ItemGroup></Project>"))
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    async with client_for(build_server(mk_cfg(tmp_path))) as s:
+        for tool in ("proj_lint", "proj_interface"):
+            r = payload(await s.call_tool(tool, {"name": "Plc2@GVL_Common"}))
+            assert r["plc_project"].endswith("Plc2.plcproj"), (tool, r)
+            r = payload(await s.call_tool(tool, {"name": "GVL_Common"}))
+            assert [Path(x).stem for x in r["plc_projects"]] == ["Plc1", "Plc2"] and "same result" in r["note_plc_projects"]
+        r = await s.call_tool("proj_interface", {"name": "MAIN"})              # two files: still refused
+        assert r.is_error and "declared in several PLC projects" in text(r) and "@MAIN" in text(r)
+        r = await s.call_tool("proj_resolve_symbol", {"symbol": "PRG_B.n"})
+        assert r.is_error and "not declared in PLC project Plc1 (ADS port 851)" in text(r) and "Plc2" in text(r)
+        v = payload(await s.call_tool("proj_variables", {"scope": "Plc2@GVL_Common"}))
+        assert v["plc_project"].endswith("Plc2.plcproj") and v["roots"] == ["GVL_Common"]
+        assert payload(await s.call_tool("proj_variables", {"scope": "GVL_Common"}))["plc_project"].endswith("Plc1.plcproj")
+        units = {(u["name"], Path(u.get("plc_project") or "").stem): u for u in
+                 payload(await s.call_tool("proj_list", {}))["units"]}
+        assert ("MAIN", "Plc1") in units and ("MAIN", "Plc2") in units and ("PRG_B", "Plc2") in units
+        assert [Path(x).stem for x in units[("GVL_Common", "")]["plc_projects"]] == ["Plc1", "Plc2"]
+        hits = payload(await s.call_tool("proj_search", {"regex": "n := n"}))["hits"]
+        assert sorted(Path(h["plc_project"]).stem for h in hits) == ["Plc1", "Plc2"]
+        refs = payload(await s.call_tool("proj_references", {"name": "GVL_Common"}))
+        assert [Path(h["plc_project"]).stem for h in refs["mentions"]] == ["Plc1"], refs
+
+
 async def _noop():
     return None
 

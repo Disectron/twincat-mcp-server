@@ -194,6 +194,36 @@ def test_n119_the_padded_tags_of_the_real_log_are_read(tmp_path):
     assert S.log_errors_since({"path": str(log), "size": 0})["errors"] == ["x [ERROR] a", "y [ ERROR ] b"]
 
 
+def test_n140_the_logs_nul_padding_is_no_text(tmp_path):
+    """N140 (0.8.14 retest, S4): each scope_view_log error string carried the log's NUL padding (hundreds of U+0000).
+    NUL is no text of the log: an entry ends where its text ends, a line of NULs is no continuation line. The mark is
+    where the text ends, so an entry written over trailing padding (in place, below the file's size) is still read."""
+    log = tmp_path / "TcScopeView.log"
+    pad = "\x00" * 600
+    log.write_bytes(("t [ INFO  ] before\n" + pad).encode("utf-8"))          # bytes: no '\r\n' on Windows
+    mark = S.log_mark(log)
+    assert mark["size"] == len("t [ INFO  ] before\n")
+    with open(log, "r+b") as fh:                              # written in place, over the padding
+        fh.seek(mark["size"])
+        fh.write(("t [ ERROR ] Invalid ScopeState!" + "\x00" * 300 + "\r\n" + pad[:200] + "\n"
+                  "t [ ERROR ] second\n").encode("utf-8"))
+    got = S.log_errors_since(mark)
+    assert got["errors"] == ["t [ ERROR ] Invalid ScopeState!", "t [ ERROR ] second"], got
+    assert all("\x00" not in e for e in got["errors"])
+    wide = ("\ufeff" + "t [ ERROR ] wide" + "\x00" * 40 + "\n").encode("utf-16-le")
+    log.write_bytes(wide + b"\x00" * 64)
+    assert S.log_errors_since({"path": str(log), "size": 2})["errors"] == ["t [ ERROR ] wide"]
+    assert S.log_mark(log)["size"] == len(wide) - 1          # after the '\n' byte, the last that is not NUL
+    # review of N140: the mark is below the padded file's size — a log rotated to a new one that grew past the mark is
+    # told by its beginning (else its first entries were skipped); new_bytes counts text, not padding
+    log.write_text("2026-10-20 t [ INFO  ] old\n" + pad, encoding="utf-8")
+    mark = S.log_mark(log)
+    assert S.log_errors_since(mark)["new_bytes"] == 0
+    log.write_text("2026-10-21 t [ ERROR ] in the new log\n" + "t [ INFO  ] filler\n" * 3, encoding="utf-8")
+    got = S.log_errors_since(mark)
+    assert got["errors"] == ["2026-10-21 t [ ERROR ] in the new log"] and "a new log" in got["note"], got
+
+
 def test_review_0813_a_long_log_window_is_read_whole(tmp_path, monkeypatch):
     """Scope audit (0.8.13 retest): more than 4 MiB of new log → only the last 4 MiB were read; an error before them
     was lost. The window is read in chunks, all of it — also UTF-16 and a line cut by a chunk border."""

@@ -55,7 +55,7 @@ import pyads
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeBackend, XaeError, XaeExplained, sta_init, sta_teardown
-from .project_backend import PlcView, ProjectIndex, ProjectError, not_on_target, parse_tcunit_xml, plc_projects_declaring
+from .project_backend import PlcView, ProjectIndex, ProjectError, declaring, not_on_target, parse_tcunit_xml
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
 from . import codecheck
@@ -328,6 +328,25 @@ def _plc_iec_path(path: str) -> str:
     return _plc_split(path)[1]
 
 
+def _builder_pid(proc: Any, lock: Path, wait_s: float = 3.0) -> dict[str, Any]:
+    """The pid of the build a kb_rebuild started, as kb_status gives it: the one its lock names. S4 (0.8.14 retest):
+    kb_rebuild returned the pid of the process it started and kb_status another — on Windows a venv's python.exe
+    starts the interpreter that builds as its child. Nothing else builds meanwhile (checked before the start), so the
+    pid in the held lock is this build's; not written yet within wait_s, or the process ended: the process started."""
+    from . import kb_lock
+    end = time.monotonic() + wait_s
+    while time.monotonic() < end:
+        if kb_lock.held(lock):
+            pid = kb_lock.read(lock)[0].get("pid")
+            if isinstance(pid, int):
+                return {"pid": pid} if pid == proc.pid else {"pid": pid, "launcher_pid": proc.pid}
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    return {"pid": proc.pid, "pid_note": "the process started; the build had not taken its lock yet — on Windows a "
+                                         "venv's python.exe runs it in a child process, whose pid kb_status gives"}
+
+
 def _merge_checks(outs: list[tuple[str | None, dict[str, Any]]]) -> dict[str, Any]:
     """N113: the results of one analysis per PLC project as one: numbers added, number tables added per key, lists
     joined (each dict item tagged with its plc_project), other values kept per PLC project when they differ."""
@@ -548,7 +567,8 @@ class App:
                                                        stderr=subprocess.STDOUT, cwd=str(target.parent), **kw)
         log.info("infosys index: %s started (pid %s) → %s", "first build" if first else "rebuild",
                  self.infosys_build_proc.pid, target)
-        return {"started": True, "pid": self.infosys_build_proc.pid, "index": str(target), "log": str(log_file),
+        return {"started": True, **_builder_pid(self.infosys_build_proc, IB.side_files(target)[1]), "index": str(target),
+                "log": str(log_file),
                 "why": "no index yet" if first else (st.get("reason") or st["state"]) if not force else "forced",
                 "note": "the current index (if any) stays in use until the new one is complete; kb_status / tc_doctor "
                         "show the progress"}
@@ -641,7 +661,8 @@ class App:
             fh.flush()
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, cwd=str(loc), **kw)
         self.esi_build_proc = p
-        return {"started": True, "pid": p.pid, "log": str(log_file), "index": str(L.index_file(loc, "esi")),
+        return {"started": True, **_builder_pid(p, E.side_files(L.index_file(loc, "esi"))[1]), "log": str(log_file),
+                "index": str(L.index_file(loc, "esi")),
                 "note": ("the first build of the ESI index" if st["state"] == "missing" else
                          "the current ESI index stays in use until the new one is complete") + "; kb_status shows it"}
 
@@ -904,9 +925,10 @@ class App:
             raise ToolError(K.annotate(str(exc))) from exc
 
     # -- N113: the source analyses run inside ONE PLC project when names are declared in several ------------------
-    def proj_views(self, name: str | None) -> list[ProjectIndex]:
+    def proj_views(self, name: str | None, shared: bool = False) -> list[ProjectIndex]:
         """The index itself when no name is declared twice; else the PLC project that declares `name` (several and no
-        '<PLC project>@name' pin: refused, nothing is picked), or — no name — each PLC project in turn."""
+        '<PLC project>@name' pin: refused, nothing is picked), or — no name — each PLC project in turn. shared: a name
+        whose one file several PLC projects compile gives each of them (N142, the caller compares the results)."""
         p = self.proj
         p._ensure()
         # multi-PLC audit (0.8.13): split only when names were declared twice — with two PLC projects a lint of the whole
@@ -914,10 +936,14 @@ class App:
         if not p.duplicates and len(p.plcproj) <= 1:
             return [p]
         if name:
-            plcs = plc_projects_declaring(p, name)
+            plcs, files = declaring(p, name)
             if len(plcs) > 1:
-                raise ToolError(f"{name!r} is declared in several PLC projects {[x or '(files of no PLC project)' for x in plcs]} "
-                                f"— pin one: '<PLC project>@{name.split('@')[-1]}' (nothing was chosen)")
+                if shared and len(files) == 1:
+                    return [PlcView(p, plc) for plc in plcs]
+                names = [p.plc_label(x) for x in plcs]
+                raise ToolError(f"{name!r} is " + (f"one file ({files[0]}) compiled by several PLC projects {names}"
+                                                   if len(files) == 1 else f"declared in several PLC projects {names}")
+                                + f" — pin one: '<PLC project>@{name.split('@')[-1]}' (nothing was chosen)")
             return [PlcView(p, plcs[0])] if plcs else [p]       # not declared: the analysis says so itself
         return [PlcView(p, plc) for plc in sorted({p._plc_of(f) for f in p._by_file}, key=lambda x: x or "")]
 
@@ -953,13 +979,24 @@ class App:
     async def proj_check(self, fn, name: str | None, *a: Any) -> dict[str, Any]:
         """A codecheck analysis fn(index, name, *a) on the views of proj_views: one result, or the results of each PLC
         project merged (counts added, lists joined with plc_project on each item)."""
-        views = await self.proj_call(self.proj_views, name)
+        views = await self.proj_call(self.proj_views, name, True)
         if len(views) == 1:
             r = await self.proj_call(fn, views[0], name, *a)
             if isinstance(views[0], PlcView) and isinstance(r, dict):
                 r["plc_project"] = views[0].plc
             return r
-        return _merge_checks([(v.plc, await self.proj_call(fn, v, name, *a)) for v in views])
+        outs = [(v.plc, await self.proj_call(fn, v, name, *a)) for v in views]
+
+        def core(r: Any) -> Any:              # what the analysis says, not how many files its PLC project has
+            return {k: v for k, v in r.items() if k != "files_indexed"} if isinstance(r, dict) else r
+        if name and isinstance(outs[0][1], dict) and all(core(r) == core(outs[0][1]) for _plc, r in outs[1:]):
+            # N142 (0.8.14 retest): one file several PLC projects compile — the same answer in each is given once
+            out = {**outs[0][1], "plc_projects": [plc for plc, _r in outs],
+                   "note_plc_projects": f"one file compiled by {len(outs)} PLC projects — the same result in each"}
+            if "files_indexed" in out:
+                out["files_indexed"] = {plc or "": r.get("files_indexed") for plc, r in outs}
+            return out
+        return _merge_checks(outs)
 
     async def kb_call(self, fn, *a, timeout: float = 600, **kw) -> Any:
         try:
@@ -983,7 +1020,9 @@ class App:
             p = self.infosys_build_proc
             if p is not None:
                 rc = p.poll()
-                st["started_here"] = {"pid": p.pid, "exit_code": rc} if rc is not None else {"pid": p.pid, "running": True}
+                # S4 (0.8.14 retest): the process this server started — on Windows a venv launcher whose child builds
+                # (rebuild.pid, from the build's lock); named so, not a second 'pid'
+                st["started_here"] = {"process_pid": p.pid, **({"exit_code": rc} if rc is not None else {"running": True})}
             return st
         st = dict(self.docs_bg)
         if st.get("started") and not st.get("finished"):
@@ -3115,9 +3154,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             from .recorder import path_selected, selection_regex
             rx = selection_regex(pattern) if pattern else None
             pv = await app.proj_call(app.proj.variables, prefix, 64, max_items * 4, False, port=app.ads.port)
-            leaves = [{"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")}
-                      for it in pv["items"] if "[*]" not in it["path"]
-                      and (rx is None or path_selected(rx, it["path"]))][:max_items]
+            seen_paths: set[str] = set()
+            leaves = []
+            for it in pv["items"]:
+                # a path listed for two PLC projects (port not mapped) is one leaf to record (review of S4)
+                if "[*]" in it["path"] or it["path"].lower() in seen_paths or (rx is not None and not path_selected(rx, it["path"])):
+                    continue
+                seen_paths.add(it["path"].lower())
+                leaves.append({"path": it["path"], "type": it["type"], "size": None, "attrs": it.get("attrs")})
+            leaves = leaves[:max_items]
             src_note = pv.get("note")
         else:
             raise ToolError("source must be runtime | project")
@@ -4364,7 +4409,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         safe fixes (.bak written); regenerate_lineids rebuilds LineIds blocks."""
         if fix:
             await app.permit(None, OpClass.EDIT, "proj_validate_xml", name or "*")
-        res = await app.proj_check(codecheck.validate_xml, name, fix, regenerate_lineids)
+        res = await app.proj_check(codecheck.validate_xml, name, fix, regenerate_lineids, set())   # one .bak per file
         if fix and res.get("fixed"):
             app.audit("proj_validate_xml", {"name": name, "fixed": res["fixed"]}, OpClass.EDIT, "ok")
         return res

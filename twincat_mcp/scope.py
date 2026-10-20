@@ -89,13 +89,43 @@ def view_log_path(configured: str | None = None) -> Path:
         "TE130X-Scope-View" / "TcScopeView.log"
 
 
+def _content_end(path: Path, size: int) -> int:
+    """The byte offset after the log's last byte that is not NUL. N140 (0.8.14 retest): TcScopeView.log carries NUL
+    padding; a writer that fills such padding in place writes below the file's size — the mark is where the text
+    ends, so what is written there later is read."""
+    with open(path, "rb") as fh:
+        pos = size
+        while pos > 0:
+            n = min(1 << 16, pos)
+            fh.seek(pos - n)
+            kept = fh.read(n).rstrip(b"\x00")
+            if kept:
+                return pos - n + len(kept)
+            pos -= n
+    return 0
+
+
+_HEAD = 4096
+
+
+def _head(path: Path, n: int) -> str:
+    """A fingerprint of the log's first n bytes — a new log (rotated) begins otherwise."""
+    import hashlib
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read(n)).hexdigest()[:16]
+
+
 def log_mark(path: Path | None) -> dict[str, Any]:
-    """Where the Scope View log ends now ({"path", "size"}): size 0 when there is no log yet (all of a log written
-    later is new); "error" when it exists but cannot be read (nothing can be compared then)."""
+    """Where the Scope View log's text ends now ({"path", "size", "head"}; trailing NUL padding not counted, N140):
+    size 0 when there is no log yet (all of a log written later is new); "error" when it exists but cannot be read
+    (nothing can be compared then). head: the fingerprint of its beginning — a log rotated to one that has grown past
+    the mark is told by it (review of N140: a padded log's text end is below its file size)."""
     if path is None:
         return {"path": None, "size": None}
     try:
-        return {"path": str(path), "size": path.stat().st_size}
+        end = _content_end(path, path.stat().st_size)
+        n = min(_HEAD, end)
+        return {"path": str(path), "size": end, **({"head": _head(path, n), "head_bytes": n} if n else {})}
     except FileNotFoundError:
         return {"path": str(path), "size": 0}
     except OSError as exc:
@@ -130,12 +160,13 @@ def _new_lines(path: Path, start: int, end: int) -> Iterator[str]:
             if not raw:
                 break
             left -= len(raw)
-            text = rest + dec.decode(raw)
+            # N140 (0.8.14 retest): the log's NUL padding is no text — each error string carried hundreds of U+0000
+            text = rest + dec.decode(raw).replace("\x00", "")
             lines = text.splitlines(keepends=True)
             rest = lines.pop() if lines and not lines[-1].endswith(("\n", "\r")) else ""
             for ln in lines:
                 yield ln.lstrip("\ufeff").rstrip("\r\n")
-    tail = rest + dec.decode(b"", final=True)
+    tail = rest + dec.decode(b"", final=True).replace("\x00", "")
     if tail:
         yield tail.lstrip("\ufeff")
 
@@ -161,6 +192,13 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
     if size < start:
         out["note"] = "the log is shorter than when the call began (rotated?) — read from its start"
         start = 0
+    elif mark.get("head"):
+        try:
+            if _head(path, int(mark.get("head_bytes") or 0)) != mark["head"]:
+                out["note"] = "the log begins otherwise than when the call began (a new log) — read from its start"
+                start = 0
+        except OSError as exc:
+            return {**out, "errors": [], "note": f"the Scope View log cannot be read: {exc}"}
     entries: list[list[str]] = []
     said: list[str] = []                  # untagged lines that say error — used only when no line is tagged at all
     cur: list[str] | None = None
@@ -186,7 +224,11 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
         out["note"] = ((out.get("note") + "; ") if out.get("note") else "") + (
             "no level tag ([ERROR], [INFO] …) in the new lines: the log's format was not recognised — the lines that "
             "say 'error' / 'exception' are listed")
-    out.update({"new_bytes": size - start, "error_count": len(entries),
+    try:
+        new = max(0, _content_end(path, size) - start)          # the text written, not the padding (review of N140)
+    except OSError:
+        new = size - start
+    out.update({"new_bytes": new, "error_count": len(entries),
                 "errors": [" | ".join(e)[:800] for e in entries[-limit:]]})
     return out
 

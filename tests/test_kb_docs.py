@@ -401,6 +401,41 @@ def test_n100_docs_declaration_follows_the_plugins_rule(kbdir):
     assert rc == 1 and r["error"] == "ambiguous" and len(r["candidates"]) == 2
 
 
+def test_kbv_i13_the_skill_ties_a_member_to_its_fb(kbdir):
+    """kb_verify I13 (0.8.14): docs_declaration 'FB_JsonSaxWriter.AddKey' flagged the PrettyWriter's AddKey copies as
+    same_document (one declaration, 3 books each); 'FB_CammingLookUp.LookUp' (page titled 'LookUp()') was not found."""
+    from tests.test_infosys import store_json_members
+    from twincat_mcp.infosys import InfosysIndex, html_to_doc
+    ix = InfosysIndex(db_file=kbdir / "index" / "infosys-1033.db")
+
+    def store(ref, title, body, hid, parent=None):
+        d = html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
+        d.meta = {"Microsoft.Help.Id": hid, **({"Microsoft.Help.TOCParent": parent} if parent else {})}
+        with ix._db() as con:
+            ix._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", d)
+    store_json_members(store)
+    store("tf8560_plastic_technology_functions/16232286603", "FB_CammingLookUp",
+          "<pre>FUNCTION_BLOCK FB_CammingLookUp\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR</pre>", "camming")
+    store("tf8560_plastic_technology_functions/16233574155", "LookUp()", "<pre>METHOD LookUp : BOOL</pre>",
+          "camming-lookup", "camming")
+    ix.resolve_help_links()
+    from twincat_mcp.infosys import _bump_gen
+    with ix._db() as con:
+        _bump_gen(con)                     # pages stored: the catalog the symbol lookup reads, as a build leaves it
+    ix.sync_derived()
+    del ix
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_JsonSaxWriter.AddKey")
+    assert rc == 0 and r["ref"] == "tcplclib_tc3_jsonxml/4220504971_57616766", r
+    same = sorted(a["ref"] for a in r["also_in"] if a.get("same_document"))
+    assert same == ["tf6701_tc3_iot_communication_mqtt/4220504971_62687",
+                    "tf6760_tc3_iot_https_rest/4220504971_2530563"], r["also_in"]
+    rc, r = run(kbdir, "docs_declaration", "symbol=AddKey")
+    assert rc == 1 and r["error"] == "ambiguous" and len(r["candidates"]) == 2
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_CammingLookUp.LookUp")
+    assert rc == 0 and r["ref"] == "tf8560_plastic_technology_functions/16233574155", r
+    assert r["parent"]["title"] == "FB_CammingLookUp"
+
+
 def test_kbv_pages_whose_id_is_not_a_number(kbdir):
     """kb_verify on the real index (0.8.13): docs_page with the Infosys URL of a book's index page ('…/el6851/
     index.html') or of a page id like '6778772363_30967009' — 1169 of the 51,655 pages — said not_found (looked up as
