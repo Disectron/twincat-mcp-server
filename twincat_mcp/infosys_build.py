@@ -379,6 +379,9 @@ def build(final: Path, package: Path, lcid: str = "1033", force: bool = False, b
         links = idx.resolve_help_links()
         lk.update(phase="lookup tables")
         idx.sync_derived()
+        syms = idx.symbol_counts()
+        # N170: the symbols documented inside pages (a method section, a constants table) — how many the build found
+        log("symbols documented inside pages: " + (", ".join(f"{n} {k}" for k, n in syms.items()) or "none"))
         with idx._db() as con:
             n_pages = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
             n_books = con.execute("SELECT COUNT(DISTINCT book) FROM pages").fetchone()[0]
@@ -399,4 +402,4 @@ def build(final: Path, package: Path, lcid: str = "1033", force: bool = False, b
         log(f"indexed {n_pages} pages ({n_books} books, {links['resolved']} of {links['links']} help links resolved) "
             f"from {src.path} into {final} in {took} s ({final.stat().st_size / 1e6:.0f} MB)")
         return {"result": "built", "index": str(final), "pages": n_pages, "books": n_books, "seconds": took,
-                "links": links}
+                "links": links, "symbols_in_pages": syms}

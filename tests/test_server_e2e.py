@@ -1665,3 +1665,28 @@ async def test_review_0814_the_binding_flags_are_on_the_tools_own_result(monkeyp
         assert r["ok"] and r["solution_mismatch"] and "re-attached" in r["reattached"], r
         r = payload(await s.call_tool("proj_scan", {}))                   # no XAE call: no XAE flags
         assert "solution_mismatch" not in r and "reattached" not in r
+
+
+@pytest.mark.anyio
+async def test_n162_the_connection_instructions_say_when_they_were_read_and_where_the_current_state_is(
+        monkeypatch, project_dir, kb_copy):
+    """N162 (S3, 0.8.14 retest): the session-start text said Infosys 'REBUILD is due — format 5 … built 2026-10-19
+    14:33' while the index was format 6, built 2026-10-20 16:11 (kb_status agreed with the files). It is sent once
+    per connection and cannot follow a rebuild that finishes during the session: it says when it was read and that
+    kb_status is the current state — and a new initialisation reads the state again."""
+    import sqlite3
+    from tests.fake_ads import install
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb_copy)
+    srv = build_server(cfg)
+    ins = srv._lowlevel_server.instructions
+    assert "not refreshed while the session runs — kb_status gives the current state" in ins and " read 20" in ins
+    db = kb_copy / "index" / "infosys-1033.db"
+    c = sqlite3.connect(db)
+    c.execute("UPDATE meta SET value = '3' WHERE key = 'indexer_version'")      # the index changes after the start
+    c.commit()
+    c.close()
+    assert "format 3" not in srv._lowlevel_server.instructions
+    fresh = srv._lowlevel_server.create_initialization_options().instructions
+    assert "check kb_status first" in fresh and "kb_rebuild(index='infosys')" in fresh, fresh

@@ -31,7 +31,7 @@ import sqlite3
 import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Annotated, Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -54,7 +54,7 @@ import pyads
 
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
-from .xae_backend import XaeBackend, XaeError, XaeExplained, sta_init, sta_teardown
+from .xae_backend import XaeBackend, XaeBusy, XaeError, XaeExplained, sta_init, sta_teardown
 from .project_backend import PlcView, ProjectIndex, ProjectError, declaring, not_on_target, parse_tcunit_xml
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
@@ -119,6 +119,20 @@ EDIT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 DESTR = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False)
 CONTROL = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)   # changes the server's own state under confirmation
+
+
+# N169 (0.8.14 retest): ranges are in the tool schemas, not only in the refusal. A search's limit has no maximum in
+# the schema: a larger one is used as the maximum and said so (N167, clamped); max_chars is refused out of range, with
+# the way to read on — so the bounds are the schema's, the check (and its message) the tool's
+PageLimit = Annotated[int, Field(json_schema_extra={"minimum": 1}, description="hits per page, 1-50; a larger limit is "
+                                 "used as 50 (clamped: true)")]
+HwLimit = Annotated[int, Field(json_schema_extra={"minimum": 1}, description="items per page, 1-100; a larger limit is "
+                               "used as 100 (clamped: true)")]
+Offset = Annotated[int, Field(json_schema_extra={"minimum": 0}, description="skipped first: the next page is "
+                              "offset=<next_offset>")]
+Limit50 = Annotated[int, Field(json_schema_extra={"minimum": 1, "maximum": 50}, description="results shown, 1-50")]
+PageChars = Annotated[int, Field(json_schema_extra={"minimum": 200, "maximum": 60000},
+                                 description="characters shown, 200-60000; read on with section= or offset=")]
 
 
 class ConfirmSchema(BaseModel):
@@ -411,6 +425,8 @@ class App:
         self.kb.layout()
         # the builder stubs in <kb>\tools run this plugin's builders: record where they are, turn old copies into stubs
         threading.Thread(target=self._builder_upkeep, name="tcmcp-builders", daemon=True).start()
+        # N174: crash tracebacks (and rejected COM calls) in a file next to the other logs, named in the error message
+        self.server_log = install_server_log(Path(cfg.safety.audit_log).parent / "logs" / "server.log")
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
         self.scope_runs: dict[str, dict[str, Any]] = {}     # recording id → Scope recording started with it
         self.rec.rcfg = cfg.recorder
@@ -771,8 +787,8 @@ class App:
 
     def _dialog_hint(self) -> str:
         """What is open in the shell right now — the usual reason a COM call is rejected or hangs."""
+        from . import dialogs as _dlg
         try:
-            from . import dialogs as _dlg
             live = [d.to_dict() for d in _dlg.list_dialogs(self.xae.pid)]
         except Exception:  # noqa: BLE001
             live = []
@@ -781,7 +797,8 @@ class App:
         live += [d for d in pend if d.get("hwnd") not in seen]
         if not live:
             return " No dialog is visible in the shell (xae_dialogs); the shell may be mid-build or mid-login — retry in a few seconds."
-        return " Open dialog(s): " + "; ".join(f"'{d.get('title')}' [{', '.join(d.get('buttons') or [])}] {str(d.get('text', ''))[:160]}"
+        # N173: a modal window that is not a #32770 dialog has its class and, when unknown, says its buttons are unknown
+        return " Open dialog(s): " + "; ".join(f"{_dlg.label(d)} [{_dlg.buttons_text(d)}] {str(d.get('text', ''))[:160]}"
                                             for d in live[:3]) + " — answer it with xae_dialog_resolve(button=...)."
 
     # --- XAE dialogs (N85 / N87) ----------------------------------------------
@@ -801,8 +818,9 @@ class App:
             self.xae_held = None
             return
         d = held["dialog"]
-        raise ToolError(f"{job} NOT started: XAE is held by the dialog '{d.get('title')}' that {held['job']} opened "
-                        f"{time.monotonic() - held['since']:.0f} s ago (buttons {d.get('buttons')}; text "
+        from . import dialogs as _dlg
+        raise ToolError(f"{job} NOT started: XAE is held by the dialog {_dlg.label(d)} that {held['job']} opened "
+                        f"{time.monotonic() - held['since']:.0f} s ago ({_dlg.buttons_text(d)}; text "
                         f"{str(d.get('text', ''))[:200]!r}). Answer it with xae_dialog_resolve(button=...) — the held "
                         "call's own result is then listed by xae_dialogs (late_results).")
 
@@ -834,8 +852,9 @@ class App:
         live = [d for d in self.dialogs_now() if _dialog_awaits(d)]
         if live:
             d = live[0]
-            raise ToolError(f"{action} refused: the XAE shell has a dialog open — '{d.get('title')}' (buttons "
-                            f"{d.get('buttons')}; text {str(d.get('text', ''))[:200]!r}). Answer it first "
+            from . import dialogs as _dlg
+            raise ToolError(f"{action} refused: the XAE shell has a dialog open — {_dlg.label(d)} "
+                            f"({_dlg.buttons_text(d)}; text {str(d.get('text', ''))[:200]!r}). Answer it first "
                             f"(xae_dialog_resolve(button=...)), then retry. {done}")
 
     def xae_flags(self) -> dict[str, Any]:
@@ -876,17 +895,23 @@ class App:
         except _BlockedByDialog as b:
             self._hold(job, b.dialog, b.job_future)  # type: ignore[attr-defined]
             d = b.dialog
-            raise ToolError(f"{job}: BLOCKED BY DIALOG '{d.get('title')}' — the shell opened it during this call and "
-                            f"waits for an answer (buttons {d.get('buttons')}; text {str(d.get('text', ''))[:300]!r}). "
-                            "The call is still pending inside XAE: what it does depends on the answer. Answer with "
-                            "xae_dialog_resolve(button=...); the call's own result is then listed by xae_dialogs "
-                            "(late_results). Until then every XAE call is refused at once. blocked_by_dialog: "
-                            + json.dumps({k: d.get(k) for k in ("hwnd", "title", "text", "buttons")}, default=str)) from None
+            from . import dialogs as _dlg
+            # N173: the window's class, and buttons_note when its buttons could not be read (then: close it in XAE)
+            answer = ("Answer with xae_dialog_resolve(button=...)" if d.get("buttons") is not None else
+                      "Its buttons can't be pressed by the tool: close it in XAE")
+            raise ToolError(f"{job}: BLOCKED BY DIALOG {_dlg.label(d)} — the shell opened it during this call and "
+                            f"waits for an answer ({_dlg.buttons_text(d)}; text {str(d.get('text', ''))[:300]!r}). "
+                            f"The call is still pending inside XAE: what it does depends on the answer. {answer}; the "
+                            "call's own result is then listed by xae_dialogs (late_results). Until then every XAE call "
+                            "is refused at once. blocked_by_dialog: "
+                            + json.dumps(_dialog_fields(d), default=str)) from None
         except XaeError as exc:
             msg = str(exc)
             low = msg.lower()
             if "blocked by dialog" in low:
                 pass                                   # the backend already named the dialog
+            elif isinstance(exc, XaeBusy):
+                msg += await asyncio.to_thread(self._dialog_hint)      # N174: it says busy itself; what is open
             elif ("0x80010001" in low or "0x8001010a" in low or "-2147418111" in low or "-2147417846" in low
                     or "call was rejected" in low or "retry later" in low):
                 msg += " — XAE refused the COM call: it is busy or a modal dialog has the shell." + await asyncio.to_thread(self._dialog_hint)
@@ -900,16 +925,30 @@ class App:
             raise ToolError(f"{exc} — the XAE call was NOT started; the shell is still busy with the earlier call "
                             "(a build, an activation or a modal dialog — xae_dialogs).") from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            pend = self.xae.watchdog.status().get("pending") or []
-            hint = (" Open dialog(s): " + "; ".join(f"'{d['title']}' buttons {d['buttons']}" for d in pend[:3])
-                    + " — xae_dialog_resolve(button=...)") if pend else " (xae_dialogs shows open prompts)"
-            raise ToolError("XAE call timed out; a modal dialog in the shell is the usual cause." + hint) from exc
+            raise ToolError(f"{job}: XAE call timed out — " + await asyncio.to_thread(self._timeout_cause)) from exc
         if isinstance(res, dict):
             live = self.dialogs_now()
             if live:                       # N87: the call ran, but the shell has a dialog waiting — say so
-                res = {**res, "open_dialogs": [{k: d.get(k) for k in ("hwnd", "title", "text", "buttons")}
-                                               for d in live[:5]]}
+                res = {**res, "open_dialogs": [_dialog_fields(d) for d in live[:5]]}
         return res              # N116: the binding's flags are added to the tool's own result (_tool_boundary)
+
+    def _timeout_cause(self) -> str:
+        """N173 (0.8.14 retest): a timed-out call said 'a modal dialog in the shell is the usual cause' from the
+        watchdog's last list, which never had a non-#32770 window. The shell is looked at again now: the modal window by
+        name, a main window that is disabled with no window to name, or no modal window at all."""
+        from . import dialogs as _dlg
+        if self.xae.pid is None:
+            return ("no XAE process is known, so its windows could not be looked at — xae_status; a modal window in the "
+                    "shell is the usual cause")
+        live = self.dialogs_now()
+        if not live:
+            return ("no modal window is open in XAE now (its main window is not disabled): the call is still running "
+                    "inside the shell (a long build, activation or login?) — xae_status / xae_dialogs, then retry")
+        return ("open in XAE now: " + "; ".join(f"{_dlg.label(d)} ({_dlg.buttons_text(d)}) "
+                                                f"{str(d.get('text', ''))[:160]!r}" for d in live[:3])
+                + (" — answer it with xae_dialog_resolve(button=...)" if any(d.get("buttons") is not None for d in live)
+                   else " — the tool cannot press its buttons: close it in XAE")
+                + "; blocked_by_dialog: " + json.dumps(_dialog_fields(live[0]), default=str))
 
     def guard_safety_path(self, path: str, action: str) -> None:
         """TwinSAFE (TISC / Safety) projects are never edited unless explicitly enabled."""
@@ -1946,10 +1985,16 @@ def connection_instructions(app: "App") -> str:
         ds = app.kb.docs_status()
     except Exception as exc:  # noqa: BLE001 — never block the start
         return INSTRUCTIONS + f"\nOffline documentation: state not readable at this connection ({type(exc).__name__}: {exc}).\n"
-    line = f"\nOffline documentation, state at this connection ({ds.get('knowledge_folder', 'no folder')}): {ds['summary']}"
+    # N162 (0.8.14 retest): this text is sent once, when the client connects, and never again — a rebuild finished
+    # later in the session left it saying 'REBUILD is due — format 5' about a format-6 index, and agents asked the
+    # user for a rebuild nobody needed. It says when it was read, and that kb_status is the current state
+    line = (f"\nOffline documentation, state at this connection ({ds.get('knowledge_folder', 'no folder')}; read "
+            f"{time.strftime('%Y-%m-%d %H:%M')}, not refreshed while the session runs — kb_status gives the current "
+            f"state): {ds['summary']}")
     if not ds.get("ok") and ds.get("infosys_command"):
-        line += (" An index that exists is rebuilt only when the user approves it (docs/KNOWLEDGE_BASE.md): tell the user, "
-                 "and on approval kb_rebuild(index='infosys') — or the user runs " + ds["infosys_command"] + ".")
+        line += (" An index that exists is rebuilt only when the user approves it (docs/KNOWLEDGE_BASE.md): check "
+                 "kb_status first (a rebuild may have finished since this was read), then tell the user, and on "
+                 "approval kb_rebuild(index='infosys') — or the user runs " + ds["infosys_command"] + ".")
     return INSTRUCTIONS + line + "\n"
 
 
@@ -1971,11 +2016,69 @@ SCOPE_SETTLE_S = (0.5, 15.0)
 _XAE_USED: contextvars.ContextVar[bool] = contextvars.ContextVar("tcmcp_xae_used", default=False)
 
 
-def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]] | None] = lambda: None) -> Any:
+# N174 (0.8.14 retest): a crash's traceback was in no file the user could find (the client's MCP log has only the tool
+# result; ~/.twincat_mcp/logs held only build logs). WARNING and above of the twincat_mcp loggers go to
+# <audit log folder>/logs/server.log, rotating over 5 files of 5 MB; the internal-error message names it.
+SERVER_LOG_BYTES = 5 * 1024 * 1024
+SERVER_LOG_FILES = 5
+_SERVER_LOG: dict[str, Any] = {"path": None, "handler": None}
+
+
+def install_server_log(path: Path) -> Path | None:
+    """One rotating file handler per process on the 'twincat_mcp' logger, moved when the path changes (a test or a
+    second App with another home); None when the folder cannot be written."""
+    import logging.handlers
+    path = Path(path)
+    cur = _SERVER_LOG.get("handler")
+    if cur is not None and _SERVER_LOG.get("path") == path:
+        return path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        h = logging.handlers.RotatingFileHandler(path, maxBytes=SERVER_LOG_BYTES, backupCount=SERVER_LOG_FILES - 1,
+                                                 encoding="utf-8", delay=True)
+    except OSError as exc:
+        log.warning("server log %s cannot be written: %s", path, exc)
+        return None
+    h.setLevel(logging.WARNING)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    pkg = logging.getLogger("twincat_mcp")
+    if cur is not None:
+        pkg.removeHandler(cur)
+        cur.close()
+    pkg.addHandler(h)
+    _SERVER_LOG.update(path=path, handler=h)
+    return path
+
+
+_RPC_BUSY = (-2147418111, -2147417846)      # RPC_E_CALL_REJECTED 0x80010001, RPC_E_SERVERCALL_RETRYLATER 0x8001010A
+
+
+def _com_hresult(exc: BaseException) -> int | None:
+    """The HRESULT of a COM error (pywintypes.com_error: .hresult, or args[0]); None for anything else."""
+    hr = getattr(exc, "hresult", None)
+    if hr is None and type(exc).__name__ == "com_error" and exc.args and isinstance(exc.args[0], int):
+        hr = exc.args[0]
+    return hr if isinstance(hr, int) else None
+
+
+def _com_detail(exc: BaseException, hr: int) -> str:
+    """A COM error as a defect message names it: the HRESULT in hex, its text and the COM source / description."""
+    info = getattr(exc, "excepinfo", None) or (exc.args[2] if type(exc).__name__ == "com_error" and len(exc.args) > 2
+                                               else None) or ()
+    text = getattr(exc, "strerror", None) or (exc.args[1] if len(exc.args) > 1 and isinstance(exc.args[1], str) else str(exc))
+    src = str(info[1]) if len(info) > 1 and info[1] else ""
+    desc = str(info[2]) if len(info) > 2 and info[2] else ""
+    return (f"{type(exc).__name__} 0x{hr & 0xFFFFFFFF:08X} {str(text)[:200]!r}" + (f", source {src!r}" if src else "")
+            + (f": {desc[:300]}" if desc else ""))
+
+
+def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]] | None] = lambda: None,
+                   dialog_hint: Callable[[], Callable[[], str] | None] = lambda: None) -> Any:
     """What leaves a tool. mcp >= 2.1 passes only a ToolError's text to the client — any other exception arrives as a
     bare "Error executing tool X" (R37: never an empty error): a deliberate error keeps its text; a defect says its
-    type and message and is logged with its traceback under a crash id. A question for the user (prompting.AskUser)
-    is this round's result. MCPError (a protocol error) and cancellation pass through."""
+    type and message and is logged with its traceback under a crash id (N174: in server.log, which the message
+    names). A COM call the XAE shell rejected (busy) is said as that, never as a defect. A question for the user
+    (prompting.AskUser) is this round's result. MCPError (a protocol error) and cancellation pass through."""
     name = getattr(fn, "__name__", "tool")
 
     @functools.wraps(fn)
@@ -1997,10 +2100,29 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
             if _deliberate(exc):
                 raise ToolError(_exc_text(exc)) from exc
             cid = secrets.token_hex(4)
+            hr = _com_hresult(exc)
+            if hr in _RPC_BUSY:
+                # N174 (0.8.14 retest): 'Call was rejected by callee' left xae_build / xae_deploy as "internal error … a
+                # defect" — a rejected call ran nothing; the backend retries it, and one that escapes is said as busy
+                log.warning("tool %s: XAE rejected a COM call (0x%08X, busy) — crash %s", name, hr & 0xFFFFFFFF, cid,
+                            exc_info=exc)
+                hint = ""
+                get_hint = dialog_hint()
+                if get_hint is not None:
+                    try:
+                        hint = await asyncio.to_thread(get_hint)
+                    except Exception:  # noqa: BLE001
+                        hint = ""
+                raise ToolError(f"{name}: XAE is busy (call rejected, 0x{hr & 0xFFFFFFFF:08X}) and did not run this "
+                                "call — repeat it; if it keeps happening, a modal window or a long build holds the shell "
+                                f"(xae_dialogs).{hint} (logged as {cid})") from exc
             log.error("tool %s: crash %s", name, cid, exc_info=exc)
-            raise ToolError(f"internal error in {name} ({type(exc).__name__}: {str(exc)[:300] or 'no message'}) — a "
-                            f"defect in twincat-mcp, not in the call; its traceback is in the server log as crash "
-                            f"{cid}") from exc
+            detail = (_com_detail(exc, hr) if hr is not None
+                      else f"{type(exc).__name__}: {str(exc)[:300] or 'no message'}")
+            where = _SERVER_LOG.get("path")
+            raise ToolError(f"internal error in {name} ({detail}) — a defect in twincat-mcp, not in the call; "
+                            + (f"traceback: {where}, crash {cid}" if where is not None else
+                               f"its traceback is in the server log as crash {cid}")) from exc
         finally:
             _XAE_USED.reset(used)
     return run
@@ -2014,21 +2136,31 @@ class _BlockedByDialog(Exception):
 
 
 def _dialog_awaits(d: dict[str, Any]) -> bool:
-    """A dialog the shell waits on: a push button other than Cancel / Abort (a progress window offers only those)."""
-    from .dialogs import _NOT_AN_ANSWER
-    return any(str(c).lower() not in _NOT_AN_ANSWER for c in (d.get("buttons") or []))
+    """A dialog the shell waits on: a push button other than Cancel / Abort (a progress window offers only those).
+    N173: a modal window whose buttons are unknown is taken as waiting."""
+    from .dialogs import awaits
+    return awaits(d)
+
+
+def _dialog_fields(d: dict[str, Any]) -> dict[str, Any]:
+    """What a result says about one dialog: hwnd, title, class, text, buttons — and (N173) buttons_note when its
+    buttons are unknown, unidentified when the shell is modal but no window could be named."""
+    out = {k: d.get(k) for k in ("hwnd", "title", "class", "text", "buttons")}
+    out.update({k: d[k] for k in ("buttons_note", "unidentified") if d.get(k)})
+    return out
 
 
 class TcMcpServer(MCPServer):
     """MCPServer whose tools go through _tool_boundary."""
 
     xae_flags: Callable[[], dict[str, Any]] | None = None     # App.xae_flags, set by build_server
+    dialog_hint: Callable[[], str] | None = None              # App._dialog_hint (N174), set by build_server
 
     def tool(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
         register = super().tool(*args, **kwargs)
 
         def decorator(fn: Any) -> Any:
-            register(_tool_boundary(fn, lambda: self.xae_flags))
+            register(_tool_boundary(fn, lambda: self.xae_flags, lambda: self.dialog_hint))
             return fn                     # the closure keeps the plain function (tools that call each other)
         return decorator
 
@@ -2041,6 +2173,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     mcp = TcMcpServer("twincat-mcp", instructions=connection_instructions(app), version=__version__,
                       subscriptions=False)
     mcp.xae_flags = app.xae_flags
+    mcp.dialog_hint = app._dialog_hint
+    # N162: the instructions are read again whenever a connection is initialised (a transport that serves several
+    # sessions from one process asks for them per session), not only when the process started
+    low = mcp._lowlevel_server
+    _init_options = low.create_initialization_options
+
+    def _fresh_init_options(*a: Any, **kw: Any) -> Any:
+        low.instructions = connection_instructions(app)
+        return _init_options(*a, **kw)
+    low.create_initialization_options = _fresh_init_options  # type: ignore[method-assign]
 
     # ======================================================================
     # tc_* meta
@@ -2368,10 +2510,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (`declares`). Stop words ('how', 'to', 'the') and, in a query of several words, single characters are not
         searched; a query of stop words only is refused. There are no query operators: OR / AND / NOT / NEAR, '-',
         '^', '*' are not read as such (`operators_note`). A copy name (PRG_X_9) that no unit has falls back to the
-        name it was copied from. "quoted text" is a phrase. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
-        POU (= those three), METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …;
-        project = the folder (any spelling) or its label; limit 1–200. `stale`: folders changed, renamed or deleted
-        since they were indexed — their hits are those of the last indexing (kb_reindex). An error message — a code in
+        name it was copied from. "quoted text" is a phrase; tokens joined by punctuation ('STRING(40)', 'fbTimer(IN:=')
+        are searched as one sequence (`searched_as_sequence`), a qualified name ('GVL_X.nY') as its names. A unit whose
+        own name holds the words comes before its members. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
+        POU (= those three), METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …; with
+        kinds, a member is answered as its owner of those kinds (`via_member`: 'Execute' kinds=[INTERFACE] → I_Module);
+        no hit names the units of other kinds that have the words. `words_not_in_code`: the words a hit has only in
+        comments / string literals. project = the folder (any spelling) or its label; limit 1–200. `stale`: folders
+        changed, renamed or deleted since they were indexed — their hits are those of the last indexing (kb_reindex);
+        `changed_files` / `added_files` / `removed_files` name them. An error message — a code in
         a notation that says so (ADSError 1861, pyads' 'ADSError: … (1861)', ADS error 1861, error 1861, nErrId :=
         1861, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT), a compiler message (C0046: …), or a 0x number alone; not the
         word 'error', a decimal / 16# literal alone, a hex number anywhere or an ERR_… identifier of the code — gets the plugin's note
@@ -2389,12 +2536,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         and TwinCAT's ESI folders): name, product code, revisions, E-bus current, mailbox, DC modes, sync managers,
         PDOs with every entry (index, subindex, bit length, type; gaps marked), the predefined PDO assignments, slots
         of modular devices with their modules, the CoE object list, the diagnosis catalogue size, the ESI file(s).
-        query = type / order code ('EL3356-0010'), part of a name, or a product code ('#x07D83052'). detail: 'newest'
-        (default) = all of that for the newest revision of each type (or of `revision`), other revisions as one line
-        each; 'summary' = counts only; 'full' = everything for every revision. One CoE object with sub-indices,
-        defaults and enum texts: hw_object; full-text: hw_search; a diagnosis text id: hw_diag. The index's first build
-        starts by itself (minutes); until it is there the answer says so. `manuals` names the indexed PDF manuals that
-        mention the product, with pages (the twincat-docs skill reads them)."""
+        query = type / order code ('EL3356-0010'), part of a name, or a product code ('#x07D83052', '0x07D83052'; a
+        number is read as a decimal product code and as digits of a type or name — `read_as`). revision: '#x…' as
+        shown, '0x…' or decimal. detail: 'newest' (default) = all of that for the newest revision of each type (or of
+        `revision`), other revisions as one line each; 'summary' = counts only; 'full' = everything for every
+        revision. Nothing found: `note` says what is not there — a revision of an indexed device
+        (`revisions_available`), or the device (then: add its ESI file). One CoE object with sub-indices, defaults
+        and enum texts: hw_object; full-text: hw_search; a diagnosis text id: hw_diag. The index's first build starts
+        by itself (minutes); until it is there the answer says so. `source`: the index the answer came from (state,
+        built; `state_note` when it is not current). `manuals` names the indexed PDF manuals that mention the
+        product, with pages (the twincat-docs skill reads them)."""
         first = await asyncio.to_thread(app.esi_first_build)
         res = await app.kb_call(app.kb.hw_lookup, query, limit, revision, detail, timeout=120)
         if first:
@@ -2402,14 +2553,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return res
 
     @mcp.tool(annotations=READ)
-    async def hw_search(query: str, kinds: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
+    async def hw_search(query: str, kinds: list[str] | None = None, limit: HwLimit = 20,
+                        offset: Offset = 0) -> dict[str, Any]:
         """Full-text search of the ESI index: devices (names, PDOs and their entries, PDO assignments), CoE objects
         (names, descriptions, sub-index names), diagnosis messages (text, description, causes, remedies) and modules.
-        kinds: any of 'device', 'object', 'diag', 'module' (default all). FTS5 syntax (words ANDed, "phrase",
-        prefix*); other text is searched as one phrase. Hits with the same title (revisions of one type, one text in
-        several catalogues) are one item with `variants`; objects and messages name the device types that have them."""
+        kinds: any of 'device', 'object', 'diag', 'module' (default all; a module is found by its own name and PDOs
+        and by the devices whose slots take it — type, name, group). FTS5 syntax (words ANDed, "phrase", prefix*);
+        other text is searched as one phrase. Hits with the same title (revisions of one type, one text in several
+        catalogues) are one item with `variants`; objects and messages name the device types that have them. Pages:
+        total items, offset / next_offset; a limit above 100 is used as 100 (clamped)."""
         first = await asyncio.to_thread(app.esi_first_build)
-        res = await app.kb_call(app.kb.hw_search, query, kinds, limit, timeout=120)
+        res = await app.kb_call(app.kb.hw_search, query, kinds, limit, offset, timeout=120)
         if first:
             res["esi_first_build"] = first
         return res
@@ -2419,7 +2573,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """One CoE object of a device from its ESI (newest revision unless `revision`): every sub-index with type, bit
         size and offset, access, PDO mapping, backup/setting flags, the default (decoded from DefaultData, enum text
         when there is one), min/max, unit code, enumeration texts; array elements one by one. index: '#x8000' or
-        '0x8000' (4 hex digits alone are read as hex). device: the exact type ('EL3356-0010')."""
+        '0x8000' (4 hex digits alone are read as hex); one sub-index in CoE notation '8000:11' (the sub-index in hex,
+        as Beckhoff's manuals write it: 8000:11 = sub-index 17) → `sub` and `subitems` with just that one. device:
+        the exact type ('EL3356-0010')."""
         first = await asyncio.to_thread(app.esi_first_build)
         res = await app.kb_call(app.kb.hw_object, device, index, revision, timeout=60)
         if first:
@@ -3941,8 +4097,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # ======================================================================
     @mcp.tool(annotations=READ)
     async def xae_dialogs() -> dict[str, Any]:
-        """Modal dialogs currently open in the attached XAE shell (title, text, buttons), the
-        watchdog's auto-answer rules and its recent log. A pending dialog blocks every COM call."""
+        """Modal dialogs currently open in the attached XAE shell (title, class, text, buttons), the
+        watchdog's auto-answer rules and its recent log. A pending dialog blocks every COM call. Any window that
+        holds the shell modal (its main window disabled) is listed, whatever its class (WPF About / Options, WinForms):
+        its buttons read through UI Automation, or buttons null + buttons_note when they cannot be read; unidentified
+        when the shell is modal but no window could be named."""
         out = await asyncio.to_thread(lambda: {**app.xae.watchdog.status(), "live": app.dialogs_now()})
         held = app.xae_held
         if held is not None and not held["future"].done():
@@ -3958,13 +4117,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                  confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Click a button on an open XAE dialog ('OK', 'Yes', 'No', 'Cancel'…). remember=true adds an
         auto-answer rule for that title (never for machine-affecting prompts). Control-class;
-        machine-affecting prompts (activate/run/download/login/delete/safety) are destructive-class."""
+        machine-affecting prompts (activate/run/download/login/delete/safety) are destructive-class. A window that is
+        not a standard dialog is pressed through UI Automation; one whose buttons cannot be read is refused (close it
+        in XAE) — never closed by the tool."""
         pend = await asyncio.to_thread(lambda: __import__("twincat_mcp.dialogs", fromlist=["list_dialogs"]).list_dialogs(app.xae.pid))
         target = next((d for d in pend if hwnd is None or d.hwnd == hwnd), None)
         op = OpClass.DESTRUCTIVE if (target and target.machine_affecting()) else OpClass.CONTROL
         await app.permit(ctx, op, "xae_dialog_resolve", f"{(target.title if target else '?')}:{button}", confirm_token)
         res = await asyncio.to_thread(app.xae.watchdog.resolve, button, hwnd, remember)
-        app.audit("xae_dialog_resolve", {"button": button, "dialog": target.title if target else None}, op, "ok" if res.get("resolved") else "not-found", res)
+        from .dialogs import CANNOT_PRESS
+        outcome = ("ok" if res.get("resolved") else "refused" if str(res.get("reason", "")).endswith(CANNOT_PRESS)
+                   else "not-found")                   # N173: a window whose buttons the tool cannot press
+        app.audit("xae_dialog_resolve", {"button": button, "dialog": target.title if target else None}, op, outcome, res)
         return res
 
     @mcp.tool(annotations=EDIT)
@@ -4291,9 +4455,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def infosys_search_symbols(query: str, kind: str | None = None, library: str | None = None,
-                                     limit: int = 10) -> dict[str, Any]:
+                                     limit: Limit50 = 10) -> dict[str, Any]:
         """Find library symbols (function blocks, functions, structs, enums, aliases, interfaces,
-        GVLs) by name fragment in the indexed books; exact > prefix > contains. kind: FunctionBlock |
+        GVLs) by name fragment in the indexed books; exact > prefix > contains; with * or ? a glob on the name
+        ('FB_EcCoE*', 'FB_Ec*Write'). kind: FunctionBlock |
         Function | Program | Method | Property | Action | Enum | Struct | Union | Alias | Interface |
         GlobalVariable | Library. library: 'Tc2_System' or the book slug. Indexes the default
         libraries on first use if nothing is indexed."""
@@ -4314,19 +4479,23 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await app.docs_call("declaration", symbol, library, timeout=1800)
 
     @mcp.tool(annotations=READ)
-    async def infosys_search(query: str, library: str | None = None, limit: int = 10,
-                             web_fallback: bool | None = None) -> dict[str, Any]:
+    async def infosys_search(query: str, library: str | None = None, limit: PageLimit = 10,
+                             web_fallback: bool | None = None, offset: Offset = 0) -> dict[str, Any]:
         """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]); "quoted phrases"
-        stay together, limit 1..50. A question in words falls back in tiers (query_mode, words_used); identifiers
-        count as their words (FB_SocketConnect: socket, connect); titles that name the query come first; an error
+        stay together. Pages: limit 1..50 (a larger one is used as 50, clamped), offset / next_offset for the next
+        hits. A question in words falls back in tiers (query_mode, words_used); identifiers
+        count as their words (FB_SocketConnect: socket, connect); a word in capitals is a keyword or acronym and always
+        searched (FOR, BY, THIS, ST, AL — in lower case 'for', 'this' are English stop words), and a title that has it
+        comes first ('ST instruction FOR'); code punctuation that finds nothing as written is searched as its words
+        ('THIS^ SUPER^', 'S= R='); titles that name the query come first; an error
         code (0x745, 1861 alone, 'error 1861') lists the pages whose table defines it first, code tables before other
         pages (code_note); one page in several books — or placed twice in one — is listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
         so), results carry the page's doc version and the package date. docs.source='web': when the index has nothing,
         a DuckDuckGo site: query verified against the sitemap; the 'backend' field says which path answered."""
-        return await app.docs_call("search", query, library, limit, web_fallback, timeout=300)
+        return await app.docs_call("search", query, library, limit, web_fallback, offset, timeout=300)
 
     @mcp.tool(annotations=READ)
-    async def infosys_search_code(query: str, language: str | None = None, limit: int = 10,
+    async def infosys_search_code(query: str, language: str | None = None, limit: Limit50 = 10,
                                   ignore_spacing: bool = False) -> dict[str, Any]:
         """Search the code examples of the indexed pages for a fragment — a call pattern, an attribute, a constant
         (case-insensitive substring of the code as written; non-breaking spaces count as spaces). language: one
@@ -4336,13 +4505,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await app.docs_call("search_code", query, language, limit, ignore_spacing, timeout=120)
 
     @mcp.tool(annotations=READ)
-    async def infosys_get_page(ref: str, refresh: bool = False, max_chars: int = 60000) -> dict[str, Any]:
+    async def infosys_get_page(ref: str, refresh: bool = False, max_chars: PageChars = 60000,
+                               section: str | None = None, offset: Offset = 0) -> dict[str, Any]:
         """A documentation page as Markdown (headings, tables, fenced code). ref: full Infosys URL, 'book/pageid', a
-        bare page id, or a symbol name ('ADSREAD'). Read from the local Help Viewer package (any page in it, indexed or
-        not; doc version + breadcrumb included) or, with docs.source='web', fetched live. Use max_chars to keep it short.
+        bare page id, or a symbol name ('ADSREAD'; a method documented in a section of its FB's page opens at that
+        section). Read from the local Help Viewer package (any page in it, indexed or not; doc version + breadcrumb
+        included) or, with docs.source='web', fetched live. outline lists the headings; section= gives the part under
+        one heading (one named exactly wins, else every heading that contains it); max_chars (200-60000) of it from
+        offset, next_offset when more follows — as the twincat-docs skill's docs_page.
         parent / children: the page's place in the Help Viewer contents — an FB's page lists its method and property
         pages, a method page names its FB."""
-        return await app.docs_call("get_page", ref, refresh, max_chars, timeout=600)
+        return await app.docs_call("get_page", ref, refresh, max_chars, section, offset, timeout=600)
 
     # ======================================================================
     # exports for MES / HMI code, snapshots apply, XML validation, reports

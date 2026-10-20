@@ -62,10 +62,10 @@ def test_docs_search_ranking_total_and_phrase_retry(kbdir):
 
 @pytest.mark.parametrize("args, code, text", [
     (["query=x", "limit=0"], "bad_param", "limit must be 1-50 (got 0)"),
-    (["query=x", "limit=51"], "bad_param", "refused, not clamped"),
+    (["query=x", "offset=-1"], "bad_param", "offset must be >= 0 (got -1) — refused"),   # N167: limit=51 is clamped now
     (["query=  "], "empty_query", "empty"),
     (["query=:="], "empty_query", "no searchable word"),
-    (["query=ADSREAD", "bogus=1"], "bad_param", "allowed: query, book, limit"),
+    (["query=ADSREAD", "bogus=1"], "bad_param", "allowed: query, book, library, limit, offset"),
     (["query=ADSREAD", "book=nosuch*"], "not_found", "no book matches"),
     ([], "bad_param", "query is required"),
 ])
@@ -133,7 +133,7 @@ def test_docs_page_refs_sections_and_paging(kbdir):
     assert rc == 1 and r["error"] == "bad_param" and "past the end" in r["message"]
     rc, r = run(kbdir, "docs_page", "ref=tcplclib_tc2_system/30866571", "section=Bogus")
     assert rc == 1 and r["error"] == "not_found" and r["outline"][0] == "ADSREAD"
-    for bad in ("max_chars=199", "max_chars=20001", "offset=-1"):
+    for bad in ("max_chars=199", "max_chars=60001", "offset=-1"):      # N160: infosys_get_page's range, 200-60000
         rc, r = run(kbdir, "docs_page", "ref=30866571", bad)
         assert rc == 1 and r["error"] == "bad_param", bad
 
@@ -373,6 +373,49 @@ def test_hw_commands_read_the_esi_index_with_its_state(kbdir, tmp_path):
     assert {k: v for k, v in _digest(kbdir).items() if "EL34xx" not in k} == before
 
 
+def test_n155_the_server_and_the_skill_answer_hw_with_one_envelope(kbdir, tmp_path):
+    """N155 (0.8.14 retest, S4): the same ESI data came in two envelopes — the server's hw_lookup / hw_object had no
+    `source` block (database, state, built; the index state was `esi_index_note`), the skill's hw_lookup had no
+    `manuals` / `manuals_more`. Both build the answer the same way now: every key and value the same (N152's
+    sub-index answer included), also when the index is not current (`source.state_note`)."""
+    from tests.test_esi_index import EL33, VENDOR
+    from twincat_mcp import esi_index as E
+    from twincat_mcp import knowledge as K
+    m = kbdir / "manuals" / "Beckhoff_EtherCAT_XML"
+    m.mkdir(parents=True)
+    (m / "Beckhoff EL33xx.xml").write_text(EL33.format(vendor=VENDOR.format(fv=10)), encoding="utf-8")
+    E.build(kbdir / "index" / "esi.db", kbdir, [], twincat=False, log=lambda s: None)
+    k = K.Knowledge(tmp_path / "home", str(kbdir), [], [])
+    calls = [(k.hw_lookup, ("EL3356-0010", 1, None, "newest"), ["hw_lookup", "query=EL3356-0010", "limit=1"]),
+             (k.hw_lookup, ("CX9020", 3, None, "newest"), ["hw_lookup", "query=CX9020"]),
+             (k.hw_object, ("EL3356-0010", "#x8000", None), ["hw_object", "device=EL3356-0010", "index=#x8000"]),
+             (k.hw_object, ("EL3356-0010", "8000:11", None), ["hw_object", "device=EL3356-0010", "index=8000:11"]),
+             (k.hw_search, ("Underrange", ["device"], 20), ["hw_search", "query=Underrange", "kinds=device"]),
+             (k.hw_diag, ("#x4101", None, None), ["hw_diag", "code=#x4101"]),
+             (k.hw_module, ("#x00000cf2", "EL3356-0010", None), ["hw_module", "ident=#x00000cf2", "device=EL3356-0010"])]
+
+    def both(fn, args, cli):
+        server = json.loads(json.dumps(fn(*args), default=str))
+        rc, skill = run(kbdir, *cli)
+        skill.pop("elapsed_ms")
+        assert rc == 0, skill
+        return server, skill
+    for fn, args, cli in calls:
+        server, skill = both(fn, args, cli)
+        assert list(server) == list(skill) and server == skill, (cli, server, skill)
+        assert server["source"] == {"database": str(kbdir / "index" / "esi.db"), "state": "complete",
+                                    "built": E.read_meta(kbdir / "index" / "esi.db")["built"]}, server
+    server, _skill = both(*calls[0])
+    assert "manuals_more" in server or "manuals_note" in server, server
+    server, _skill = both(*calls[1])
+    assert server["manuals"]["CX9020"][0]["doc"] == "CX9020.pdf" and server["manuals_more"], server
+    # an index that is not current: said in source.state_note by both
+    (m / "Beckhoff EL34xx.xml").write_text(EL33.format(vendor=VENDOR.format(fv=1)).replace("EL3356", "EL3456"),
+                                           encoding="utf-8")
+    server, skill = both(*calls[2])
+    assert server == skill and "OUTDATED" in server["source"]["state_note"] and "esi_index_note" not in server
+
+
 def test_n100_docs_declaration_follows_the_plugins_rule(kbdir):
     """N100 (0.8.11 retest): docs_declaration T_MaxString was 'ambiguous' — the same page id in two books (a library's
     page copied into another product's book) — and ADSREAD ambiguous with the C++ AdsRead page, while infosys_declaration
@@ -436,6 +479,77 @@ def test_kbv_i13_the_skill_ties_a_member_to_its_fb(kbdir):
     assert r["parent"]["title"] == "FB_CammingLookUp"
 
 
+def test_n158_n159_the_skill_follows_a_member_to_where_it_is_defined(kbdir):
+    """N158 (0.8.14 retest): docs_declaration FB_TcMessage.Send → not_found (Send is I_TcMessage's; FB_TcMessage's
+    methods table says so). N159: its near list was 8 Tc3_DALI FBs — the title filter held for the first word only;
+    FB_TcMessage, I_TcMessage were not offered."""
+    from tests.test_infosys import store_eventlogger
+    from twincat_mcp.infosys import InfosysIndex, html_to_doc, _bump_gen
+    ix = InfosysIndex(db_file=kbdir / "index" / "infosys-1033.db")
+
+    def store(ref, title, body, hid, parent=None):
+        d = html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
+        d.meta = {"Microsoft.Help.Id": hid, **({"Microsoft.Help.TOCParent": parent} if parent else {})}
+        with ix._db() as con:
+            ix._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", d)
+    store_eventlogger(store)
+    ix.resolve_help_links()
+    with ix._db() as con:
+        _bump_gen(con)
+    ix.sync_derived()
+    del ix
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_TcMessage.Send")
+    assert rc == 0 and r["ref"] == "tcplclib_tc3_eventlogger/5051076107", r
+    assert r["parent"]["title"] == "I_TcMessage" and r["defined_in"] == "I_TcMessage" and r["return_type"] == "HRESULT"
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_Derived.RequestEventText")
+    assert rc == 0 and r["ref"] == "tcplclib_tc3_eventlogger/5002603531" and r["defined_in"] == "FB_TcEventBase", r
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_TcMessage.Sendx")
+    assert rc == 1 and r["error"] == "not_found", r
+    near = [c["title"] for c in r["near"]]
+    assert near[:3] == ["FB_TcMessage", "FB_TcEventBase", "I_TcMessage"] and not any("DALI" in t for t in near), near
+
+
+def test_n167_n160_docs_search_pages_takes_library_and_answers_as_infosys_search(kbdir):
+    """N167 (0.8.14 retest): docs_search limit=300 was refused and there was no offset — hits 51… unreachable. N160:
+    library= was refused by the skill (infosys_* take it); docs_search and infosys_search page alike, one order."""
+    from tests.test_infosys import _visu_pages
+    from twincat_mcp.infosys import InfosysIndex, html_to_doc, _bump_gen
+    ix = InfosysIndex(db_file=kbdir / "index" / "infosys-1033.db")
+    with ix._db() as con:
+        for ref, title, body in _visu_pages(200):
+            ix._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "",
+                      html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>"))
+        _bump_gen(con)
+    ix.sync_derived()
+    mcp = []
+    off = 0
+    while off is not None:
+        r = ix.search("Visu", limit=50, offset=off)
+        mcp += [i["url"] for i in r["items"]]
+        off = r["next_offset"]
+    del ix
+    skill, off = [], 0
+    while off is not None:
+        rc, r = run(kbdir, "docs_search", "query=Visu", "limit=50", f"offset={off}")
+        assert rc == 0 and r["total"] == 200 and r["offset"] == off, r
+        skill += [i["url"] for i in r["items"]]
+        off = r["next_offset"]
+    assert skill == mcp and len(set(skill)) == 200
+    rc, r = run(kbdir, "docs_search", "query=Visu", "limit=300")
+    assert rc == 0 and r["count"] == 50 and r["clamped"] is True and "offset=50" in r["clamped_note"], r
+    rc, r = run(kbdir, "docs_search", "query=Visu", "offset=200")
+    assert rc == 1 and r["error"] == "bad_param" and "past the last hit" in r["message"], r
+    # library= as infosys_* take it: a library name or a book slug
+    rc, r = run(kbdir, "docs_search", "query=ADSREAD", "library=Tc2_System")
+    assert rc == 0 and r["count"] and all(i["book"].startswith("tcplclib_tc2_system") for i in r["items"]), r
+    rc, r = run(kbdir, "docs_declaration", "symbol=ADSREAD", "library=tcplclib_tc2_system")
+    assert rc == 0 and r["ref"] == "tcplclib_tc2_system/30866571", r
+    rc, r = run(kbdir, "docs_page", "ref=ADSREAD", "library=Tc2_System", "max_chars=60000")
+    assert rc == 0 and r["ref"] == "tcplclib_tc2_system/30866571", r
+    rc, r = run(kbdir, "docs_search", "query=ADSREAD", "library=Tc2_Sytem")
+    assert rc == 1 and r["error"] == "not_found" and "Tc2_System" in r["near"], r
+
+
 def test_kbv_pages_whose_id_is_not_a_number(kbdir):
     """kb_verify on the real index (0.8.13): docs_page with the Infosys URL of a book's index page ('…/el6851/
     index.html') or of a page id like '6778772363_30967009' — 1169 of the 51,655 pages — said not_found (looked up as
@@ -483,3 +597,35 @@ def test_n103b_n126_the_skill_gives_the_stored_members_and_the_contents_family(k
     assert r["parent"] == {"title": "ADSREAD", "ref": "tcplclib_tc2_system/30866571"}
     rc, r = run(kbdir, "docs_declaration", "symbol=T_AmsNetID")
     assert r["parent"]["ref"] == "tcplclib_tc2_system/30866571"
+
+
+def test_rereview_0815_the_skill_finds_a_symbol_by_the_name_its_page_declares(kbdir):
+    """Re-review of 0.8.15 (S3): docs_declaration answers as infosys_declaration — FB_ActuatorActuals finds the page
+    titled 'ActualsActuator' that declares it, with the name it declares and why; SendMessageEx is its own page, not
+    SendMessageEx2's copy of its header (third review: which is not SendMessageEx2's declaration either)."""
+    from tests.test_infosys import store_declared_as
+    from twincat_mcp.infosys import InfosysIndex, html_to_doc, _bump_gen
+    ix = InfosysIndex(db_file=kbdir / "index" / "infosys-1033.db")
+
+    def store(ref, title, body, hid):
+        d = html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
+        d.meta = {"Microsoft.Help.Id": hid}
+        with ix._db() as con:
+            ix._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", d)
+    store_declared_as(store)
+    ix.resolve_help_links()
+    with ix._db() as con:
+        _bump_gen(con)
+    ix.sync_derived()
+    del ix
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_ActuatorActuals")
+    assert rc == 0 and r["ref"] == "tf8560_plastic_technology_functions/16259000001", r
+    assert (r["kind"], r["declared_as"]) == ("FunctionBlock", "FB_ActuatorActuals"), r
+    assert r["declaration_blocks"] and "the Syntax section of the page 'ActualsActuator' declares it" in r["declared_as_note"], r
+    rc, r = run(kbdir, "docs_declaration", "symbol=SendMessageEx2")      # third review: another symbol's header
+    assert rc == 0 and "declared_as" not in r and r["syntax_header"]["name"] == "SendMessageEx", r
+    assert "SendMessageEx has its own page" in r["syntax_header_note"] and "sJsonAttribute" in r["syntax_header_note"]
+    rc, r = run(kbdir, "docs_declaration", "symbol=FB_BA_Settings")
+    assert rc == 1 and r["error"] == "not_found", r
+    rc, r = run(kbdir, "docs_declaration", "symbol=SendMessageEx")
+    assert rc == 0 and r["ref"] == "tcplclib_tc3_eventlogger/13724785000" and "declared_as" not in r, r

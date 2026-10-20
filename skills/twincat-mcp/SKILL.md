@@ -54,6 +54,8 @@ previous batch's ids. Check `ads_task_stats` once with the profile live; thin it
 
 ## When XAE stalls
 `xae_dialogs` → read title/buttons → `xae_dialog_resolve button=...` (machine-affecting prompts need confirmation).
+A window with `buttons: null` (not a standard dialog, buttons unreadable) cannot be pressed by the tool: ask the user to
+close it in XAE. "XAE is busy (call rejected …) and did not run this call" → nothing ran: repeat the call.
 
 ## Library FB / type you have not used
 The twincat-docs skill first (`docs_declaration`, offline, every book). Fallback when its database is missing:

@@ -199,7 +199,7 @@ def test_get_page_resolution_forms(idx):
         idx.get_page("https://example.com/x.html")
     with pytest.raises(InfosysError, match="404"):
         idx.get_page("tcplclib_tc2_system/1")
-    assert idx.get_page("ADSREAD", max_chars=50)["truncated"] is True
+    assert idx.get_page("ADSREAD", max_chars=200)["truncated"] is True          # N160: 200-60000, as the skill
 
 
 def test_fetcher_host_allowlist():
@@ -341,8 +341,12 @@ def test_r27_r28_r29_r31_infosys_queries(idx):
     for bad in (dict(limit=-1), dict(limit=0), dict(limit=1000)):
         with pytest.raises(InfosysError, match="limit"):
             idx.search_symbols("ADSREAD", auto_index=False, **bad)
+    for bad in (dict(limit=-1), dict(limit=0)):
         with pytest.raises(InfosysError, match="limit"):
             idx.search("ADSREAD", **bad)
+    # N167 (0.8.14 retest): a search's limit above 50 is used as 50 and said so — refusing it left hits 51… unreachable
+    r = idx.search("ADSREAD", limit=1000)
+    assert r["clamped"] is True and r["clamped_note"].startswith("limit 1000 is above the maximum (1-50): 50 used"), r
     with pytest.raises(InfosysError, match="category 'bogus' unknown"):
         idx.books(category="bogus")
     with pytest.raises(InfosysError, match="max_pages"):
@@ -630,10 +634,10 @@ def test_kbv_book_slash_id_for_ids_that_are_not_numbers(kb_copy):
                     " WHERE title = 'MEMCPY'")
     con.close()
     ix = InfosysIndex(db_file=db, read_only=True, web_fallback=False)
-    assert ix.get_page("tcplclib_tc2_system/index", max_chars=50)["title"] == "T_AmsNetID"
-    assert ix.get_page("tcplclib_tc2_system/index.html", max_chars=50)["url"] == new
-    assert ix.get_page("Send/Receive", max_chars=50)["title"] == "Send/Receive"       # a title with a slash
-    assert ix.get_page("tcplclib_tc2_system/beckhoff-0cad-46d4", max_chars=50)["title"] == "MEMCPY"
+    assert ix.get_page("tcplclib_tc2_system/index", max_chars=200)["title"] == "T_AmsNetID"
+    assert ix.get_page("tcplclib_tc2_system/index.html", max_chars=200)["url"] == new
+    assert ix.get_page("Send/Receive", max_chars=200)["title"] == "Send/Receive"       # a title with a slash
+    assert ix.get_page("tcplclib_tc2_system/beckhoff-0cad-46d4", max_chars=200)["title"] == "MEMCPY"
     # book slugs with '.' and '-' (tc3_ads.net, tf5110-tf5113_tc3_kinematic_transformation) were refused too
     con = sqlite3.connect(db)
     with con:
@@ -660,7 +664,7 @@ def test_n126_an_fbs_methods_are_tied_to_it_through_the_contents(idx):
     'Call' of FB_WG_Weighing could not be told apart, and the FB's page linked only one of its methods. Format 6 stores
     each page's parent in the Help Viewer contents (Microsoft.Help.TOCParent): the FB lists its children, a method
     names its FB, and 'FB_WG_ComboFilter.Call' finds the Call below FB_WG_ComboFilter."""
-    assert inf.INDEXER_VERSION == 6
+    assert inf.INDEXER_VERSION >= 6                             # format 6 stores the parents (7 keeps them)
     W = "tf3685_tc3_weighing_library"
     _store_with(idx, f"{W}/15084337291", "FB_WG_ComboFilter", "<pre>FUNCTION_BLOCK FB_WG_ComboFilter\nVAR_INPUT\n"
                 "    stConfig : ST_WG_ComboFilter;\nEND_VAR</pre>", "beckhoff-combo")
@@ -781,6 +785,125 @@ def test_review_0815_a_members_owner_above_a_topic_page_and_by_its_own_name(idx)
     assert idx.declaration("FB_A.Run")["url"] in (f"{C}tf1000_book_one/101.html", f"{C}tf4000_book_four/101.html")
 
 
+def _store_pages(idx, pages):
+    with idx._db() as con:
+        for ref, title, body in pages:
+            idx._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", _page(title, body))
+
+
+def test_n148_n149_iec_keywords_and_operators_are_searchable(idx):
+    """0.8.14 retest §34d. N148: IEC keywords were dropped as English stop words — 'THIS pointer' ignored THIS (the
+    page THIS unreachable by search), 'FOR loop BY step' ranked the CNC '$FOR' page first. A word written in capitals
+    is a keyword or an acronym of the documentation (FOR, BY, THIS, ST, AL), never a stop word or a too-short word.
+    N149: 'THIS^ SUPER^' (a phrase) found nothing and nothing else was tried; 'REF=' found AXIS_REF … instead of the
+    page of the operator REF=. A page whose title holds the operator comes first; a query whose punctuation finds
+    nothing is searched as its words."""
+    P = "tc3_plc_intro"
+    _store_pages(idx, [
+        (f"{P}/2528843147", "THIS", "<p>THIS is a special variable: a pointer to the own function block instance. "
+                                    "Use THIS^ to dereference it.</p>"),
+        (f"{P}/2528837771", "SUPER", "<p>SUPER is a pointer to the function block instance of the basic function block "
+                                     "(SUPER^).</p>"),
+        (f"{P}/1000000001", "POINTER TO", "<p>A pointer holds the address of a variable; this pointer type …</p>"),
+        (f"{P}/2528897931", "ST instruction FOR", "<p>The FOR loop: FOR nCounter := 1 TO 10 BY 2 DO … END_FOR. The step "
+                                                  "size is given BY the increment.</p>"),
+        ("tf5200_cnc/1000000002", "Counting loop ($FOR)", "<p>The counting loop $FOR repeats a block; the loop counter "
+                                                         "runs step by step up to the end value. FOR loop of the CNC.</p>"),
+        (f"{P}/4978163979", "Assignment operator REF=", "<p>REF= assigns a reference to a variable.</p>"),
+        ("tcplclib_tc2_mc2/1000000003", "AXIS_REF", "<p>AXIS_REF is the axis reference (REF) of every motion FB.</p>"),
+        (f"{P}/1000000004", "Set operator S=", "<p>S= sets a BOOL variable: set and reset assignment.</p>"),
+        (f"{P}/1000000005", "Reset operator R=", "<p>R= resets a BOOL variable: set and reset assignment.</p>"),
+    ])
+    idx.sync_derived()
+    first = lambda q: [i["title"] for i in idx.search(q, limit=5)["items"]]           # noqa: E731
+    assert first("THIS pointer")[0] == "THIS", first("THIS pointer")
+    assert first("FOR loop BY step")[0] == "ST instruction FOR", first("FOR loop BY step")
+    assert first("REF=")[0] == "Assignment operator REF=", first("REF=")
+    got = first("THIS^ SUPER^")
+    assert {"THIS", "SUPER"} <= set(got[:2]), got
+    got = first("set reset S= R=")
+    assert set(got[:2]) == {"Set operator S=", "Reset operator R="}, got
+    # lower case is English: 'this' is a stop word once the words as written find nothing — said so, with the way out
+    r = idx.search("this pointer xyzzyq", limit=5)
+    assert "in capitals (THIS)" in r["words_ignored"]["this"] and "this" not in r["words_used"], r
+    r = idx.search("THIS pointer", limit=5)                      # N166: a word the search used is not 'ignored'
+    assert "words_ignored" not in r and r["words_used"] == ["THIS", "pointer"], r
+
+
+def test_n161_symbol_search_takes_globs(idx):
+    """N161 (0.8.14 retest): infosys_search_symbols 'FB_EcCoE*' → 0, the '*' taken literally (infosys_books takes
+    globs); 'FB_EcCoE' → 7."""
+    _store_pages(idx, [(f"tcplclib_tc2_ethercat/{i}", t, f"<pre>FUNCTION_BLOCK {t}\nVAR_INPUT\n    sNetId : STRING;\n"
+                                                         "END_VAR</pre>")
+                       for i, t in enumerate(["FB_EcCoESdoRead", "FB_EcCoESdoWrite", "FB_EcCoeReadBIC", "FB_EcGetSlaveState"])])
+    r = idx.search_symbols("FB_EcCoE*", limit=10, auto_index=False)
+    assert sorted(i["name"] for i in r["items"]) == ["FB_EcCoESdoRead", "FB_EcCoESdoWrite", "FB_EcCoeReadBIC"], r
+    r = idx.search_symbols("FB_Ec*Write", limit=10, auto_index=False)
+    assert [i["name"] for i in r["items"]] == ["FB_EcCoESdoWrite"], r
+    assert idx.search_symbols("FB_EcCoE", limit=10, auto_index=False)["count"] == 3
+
+
+_TESTANDSET = ("<p>You can use this function to check and set a flag. If the function call is successful, the function "
+               "returns TRUE and the desired data can be accessed.</p><h2>Inputs/outputs</h2><pre>VAR_IN_OUT\n"
+               "    Flag : BOOL; (* Flag to check if TRUE or FALSE *)\nEND_VAR</pre>"
+               "<table><tr><th>Name</th><th>Type</th><th>Description</th></tr><tr><td>Flag</td><td>BOOL</td>"
+               "<td>Boolean flag to be checked</td></tr></table><h2>Sample</h2><pre>VAR_GLOBAL\n    bGlobalTestFlag : BOOL;"
+               "\nEND_VAR</pre><pre>VAR\n    nLocalBlockedCounter : DINT;\nEND_VAR</pre>"
+               "<pre>IF TestAndSet(GVL.bGlobalTestFlag) THEN\n    GVL.bGlobalTestFlag := FALSE;\nEND_IF</pre>")
+_NEW = ("<p>The operator is an extension of the IEC 61131-3 standard.</p><p>The __NEW operator dynamically reserves memory "
+        "for function blocks.</p><p><b>Syntax</b>:</p><pre>&lt;pointer name&gt; := __NEW( &lt;type&gt; ( , &lt;size&gt; )? );"
+        "\n__DELETE( &lt;pointer name&gt; );</pre><p><b>Sample:</b></p><pre>TYPE ST_Sample :\nSTRUCT\n    a,b,c,d,e,f : INT;"
+        "\nEND_STRUCT\nEND_TYPE</pre><pre>pScalarType := __NEW(ScalarType, length);</pre>")
+_DELETE = ("<p>The operator is an extension of the IEC 61131-3 standard.</p><p>The operator releases the memory of instances."
+           "</p><p><b>Syntax:</b> __DELETE (&lt;Pointer&gt;)</p><p><b>Sample:</b></p><pre>FUNCTION_BLOCK FB_Dynamic\nVAR_INPUT"
+           "\n    nIn1, nIn2 : INT;\nEND_VAR</pre><pre>__DELETE(_dut);</pre>")
+_SIZEOF = ("<p>The operator is an extension of the IEC 61131-3 standard.</p><p>The operator is used to determine the number "
+           "of bytes required by the specified variable x.</p><p><b>Syntax: </b></p><pre>&lt;return value&gt; := SIZEOF( "
+           "&lt;variable name&gt; | &lt;date type name&gt; );</pre><p><b>Sample:</b></p><pre>PROGRAM MAIN\nVAR\n"
+           "    aArr1 : ARRAY[0..4] OF INT;\nEND_VAR</pre>")
+_MAXSTRING = ("<p>The variable of this type is PLC string with the maximal length.</p><pre>TYPE T_MaxString : "
+              "STRING(MAX_STRING_LENGTH);\nEND_TYPE</pre><pre>VAR_GLOBAL CONSTANT\n    MAX_STRING_LENGTH : UDINT := 255;"
+              "\nENd_VAR</pre>")
+
+
+def test_n150_n151_n157_n172_kinds_from_the_page_not_its_samples(idx):
+    """0.8.14 retest. N157: TestAndSet (a FUNCTION returning BOOL) was kind GlobalVariable, its declaration the sample's
+    'VAR_GLOBAL bGlobalTestFlag : BOOL; END_VAR' — 73 pages were GlobalVariable through a sample's VAR_GLOBAL
+    (FB_IecCriticalSection, Samples, __TRY …). A VAR_GLOBAL block makes a global variable list only on a page whose
+    code is nothing else. N150: __NEW was a Struct (the sample's TYPE ST_Sample), __DELETE a FunctionBlock (a sample
+    FB) — an operator page is kind Operator with its Syntax as the declaration. N151: SIZEOF (an operator page) was
+    not found by docs_declaration. N172: T_MaxString listed the constant MAX_STRING_LENGTH it uses as a member."""
+    P, S = "tc3_plc_intro", "tcplclib_tc2_system"
+    with idx._db() as con:
+        for ref, title, body in [
+                (f"{S}/31023115", "TestAndSet", _TESTANDSET), (f"{P}/2529171083", "__NEW", _NEW),
+                (f"{P}/2529160331", "__DELETE", _DELETE), (f"{P}/2528896907", "SIZEOF", _SIZEOF),
+                (f"{S}/31062795", "T_MaxString", _MAXSTRING),
+                (f"{S}/2326017163", "FB_IecCriticalSection",
+                 "<p>The function block allows critical sections.</p><pre>VAR_GLOBAL\n    fbCriticalSection : "
+                 "FB_IecCriticalSection;\nEND_VAR\n\nIF fbCriticalSection.Enter() THEN\n    ;\nEND_IF</pre>"),
+                (f"{P}/12073949323", "Samples", "<p>Samples of the tutorial.</p><pre>VAR_GLOBAL\n    nSocketPort : INT;"
+                                               "\nEND_VAR</pre><pre>PROGRAM MAIN\nVAR\nEND_VAR</pre>"),
+                ("tcplclib_tc3_dali/5627593995", "Constants", "<pre>VAR_GLOBAL CONSTANT\n    cMaxDevices : INT := 64;"
+                                                             "\nEND_VAR</pre>")]:
+            idx._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", _page(title, body))
+        kinds = dict(con.execute("SELECT title, kind FROM pages"))
+    assert kinds == {"TestAndSet": "Function", "__NEW": "Operator", "__DELETE": "Operator", "SIZEOF": "Operator",
+                     "T_MaxString": "Alias", "FB_IecCriticalSection": "FunctionBlock", "Samples": "Page",
+                     "Constants": "GlobalVariable"}, kinds
+    d = idx.declaration("TestAndSet")
+    assert d["return_type"] == "BOOL" and "bGlobalTestFlag" not in (d["declaration"] or ""), d
+    assert [x["name"] for x in d["in_out"]] == ["Flag"] and d["declaration"].startswith("FUNCTION TestAndSet : BOOL"), d
+    d = idx.declaration("__NEW")
+    assert d["kind"] == "Operator" and d["declaration"].startswith("<pointer name> := __NEW("), d
+    assert "ST_Sample" not in json.dumps(d), d
+    assert idx.declaration("__DELETE")["declaration"] == "__DELETE (<Pointer>)"
+    assert idx.declaration("SIZEOF")["declaration"].startswith("<return value> := SIZEOF(")
+    d = idx.declaration("T_MaxString")
+    assert d["members"] == [] and [c["name"] for c in d["constants"]] == ["MAX_STRING_LENGTH"], d
+    assert idx.declaration("Constants")["members"][0]["name"] == "cMaxDevices"
+
+
 def test_n138_a_page_that_is_not_utf8_keeps_its_characters():
     """N138 (0.8.13 retest): the stored text of 4 tf5200 pages had U+FFFD for Beckhoff's curly quotes — the package
     page was Windows-1252, read as UTF-8 with errors replaced. (The ADS return-code table itself stores its dashes:
@@ -824,3 +947,417 @@ def test_n99b_one_source_page_placed_twice_in_a_book_is_one_hit_and_code_tables_
     first = r["items"][0]
     assert first["url"].endswith("/tcplclib_tc2_system/374277003.html")          # the library's own book shown
     assert first["same_page_in"] == ["tf6500_tc3_iec60870_5_10x"], first          # its two placements: one book
+
+
+def _rows_table(head, *rows):
+    return ("<table><tr>" + "".join(f"<th>{h}</th>" for h in head) + "</tr>"
+            + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows) + "</table>")
+
+
+def store_eventlogger(store) -> None:
+    """FB_TcMessage EXTENDS FB_TcEventBase IMPLEMENTS I_TcMessage, as Tc3_EventLogger documents it: FB_TcMessage's
+    methods table says where each method is defined; 'Send' has a page below I_TcMessage only, 'RequestEventText'
+    below FB_TcEventBase only. FB_Derived (no methods table) extends FB_TcEventBase. A DALI FB whose TEXT mentions
+    TcMessage and Send."""
+    E = "tcplclib_tc3_eventlogger"
+    store(f"{E}/5003786635", "I_TcMessage", "<pre>INTERFACE I_TcMessage EXTENDS I_TcEventBase</pre><h2>Methods</h2>"
+          + _rows_table(("Name", "Description"), ("Send", "Sends a message")), "i-tcmessage")
+    store(f"{E}/5051076107", "Send", "<pre>METHOD Send : HRESULT\nVAR_INPUT\n    nTimeStamp : ULINT;\nEND_VAR</pre>",
+          "i-tcmessage-send", "i-tcmessage")
+    store(f"{E}/5002595467", "FB_TcEventBase", "<pre>FUNCTION_BLOCK FB_TcEventBase\nVAR_INPUT\n    bX : BOOL;\n"
+          "END_VAR</pre>" + _rows_table(("Name", "Definition location", "Description"),
+                                        ("RequestEventText()", "Local", "Returns the text for the event.")),
+          "fb-tceventbase")
+    store(f"{E}/5002603531", "RequestEventText", "<pre>METHOD RequestEventText : BOOL\nVAR_INPUT\n    nLangId : DINT;\n"
+          "END_VAR</pre>", "fb-tceventbase-ret", "fb-tceventbase")
+    store(f"{E}/5003041163", "FB_TcMessage", "<pre>FUNCTION_BLOCK FB_TcMessage EXTENDS FB_TcEventBase IMPLEMENTS "
+          "I_TcMessage\nVAR_INPUT\n    bY : BOOL;\nEND_VAR</pre>"
+          + _rows_table(("Name", "Definition location", "Description"),
+                        ("RequestEventText()", "Inherited from FB_TcEventBase", "Returns the text for the event."),
+                        ("Create()", "Local", "Creates a message instance in the EventLogger."),
+                        ("Send()", "I_TcMessage", "Sends a message.")), "fb-tcmessage")
+    store(f"{E}/5003041199", "FB_Derived", "<pre>FUNCTION_BLOCK FB_Derived EXTENDS FB_TcEventBase\nVAR_INPUT\n"
+          "    bZ : BOOL;\nEND_VAR</pre>", "fb-derived")
+    store("tcplclib_tc3_dali/10368229515", "FB_DALI_Osram_Coupler_HF_G2", "<pre>FUNCTION_BLOCK FB_DALI_Osram_Coupler_HF_G2"
+          "\nVAR_INPUT\n    bStart : BOOL;\nEND_VAR</pre><p>Sends a TcMessage when the coupler reports an error; Send is "
+          "called once.</p>", "dali-coupler")
+
+
+def test_n158_n159_a_member_defined_elsewhere_and_what_is_near(idx):
+    """N158 (0.8.14 retest): FB_TcMessage.Send → not found, though FB_TcMessage lists Send with definition location
+    I_TcMessage and I_TcMessage.Send resolves. A member the owner does not document itself is looked up where the
+    owner's page says it is defined, then up EXTENDS and IMPLEMENTS — and the answer says whose it is. N159: the near
+    list for FB_TcMessage.Send was eight DALI FBs: the title filter of the near search held only for its first word
+    (the others matched the page text). It offers the owner and the types the member comes from."""
+    store_eventlogger(lambda ref, title, body, hid, parent=None: _store_with(idx, ref, title, body, hid, parent))
+    idx.resolve_help_links()
+    idx.sync_derived()
+    E = "https://infosys.beckhoff.com/content/1033/tcplclib_tc3_eventlogger/"
+    d = idx.declaration("FB_TcMessage.Send")
+    assert d["url"] == E + "5051076107.html" and d["parent"]["title"] == "I_TcMessage", d
+    assert (d["asked_as"], d["defined_in"]) == ("FB_TcMessage.Send", "I_TcMessage") and d["return_type"] == "HRESULT"
+    d = idx.declaration("FB_TcMessage.RequestEventText")          # 'Inherited from FB_TcEventBase'
+    assert d["url"] == E + "5002603531.html" and d["defined_in"] == "FB_TcEventBase", d
+    d = idx.declaration("FB_Derived.RequestEventText")            # no methods table: EXTENDS
+    assert d["url"] == E + "5002603531.html" and d["defined_in"] == "FB_TcEventBase", d
+    assert "defined_in" not in idx.declaration("I_TcMessage.Send")          # its own member: nothing to say
+    with pytest.raises(InfosysError, match="no symbol page") as e:
+        idx.declaration("FB_TcMessage.Create")                    # 'Local', and no page: not found
+    msg = str(e.value)
+    assert msg.index("FB_TcMessage (") < msg.index("FB_TcEventBase (") and "I_TcMessage (" in msg, msg
+    assert "DALI" not in msg, msg
+    with idx._db() as con:
+        near = [r["title"] for r in inf.near_symbols(con, "FB_TcMessage.Sendx")]
+        assert near[:3] == ["FB_TcMessage", "FB_TcEventBase", "I_TcMessage"] and "FB_DALI_Osram_Coupler_HF_G2" not in near, near
+        near = [r["title"] for r in inf.near_symbols(con, "TcMessage Send")]
+        assert "FB_DALI_Osram_Coupler_HF_G2" not in near, near        # the title, not the text
+
+
+def _visu_pages(n: int = 200):
+    """n pages with 'Visu' — every 3rd in its title (the title order moves those up), the others in their text."""
+    out = []
+    for i in range(n):
+        title = f"VisuElem{i:03d}" if i % 3 == 0 else f"Element {i:03d}"
+        out.append((f"tc3_plc_intro/{9000000 + i}", title, f"<p>The Visu element number {i}. " + "Visu text. " * (i % 7)
+                    + "</p>"))
+    return out
+
+
+def test_n167_n160_the_search_pages_through_every_hit_once(idx):
+    """N167 (S3, 0.8.14 retest): 'search Visu* --limit 300' was refused and there was no offset — hits 51… could not
+    be reached at all. A limit above 50 is used as 50 and said so (clamped); offset / next_offset page through the
+    hits, every page cut from one order: no hit twice, none skipped — also past the hits the title order sees (150)."""
+    _store_pages(idx, _visu_pages(200))
+    idx.sync_derived()
+    seen, off, pages = [], 0, 0
+    while off is not None:
+        r = idx.search("Visu", limit=50, offset=off)
+        assert r["offset"] == off and r["total"] == 200 and r["count"] == len(r["items"]) <= 50, r
+        seen += [i["url"] for i in r["items"]]
+        off, pages = r["next_offset"], pages + 1
+        assert pages <= 5
+    assert len(seen) == 200 and len(set(seen)) == 200, (len(seen), len(set(seen)))
+    first = idx.search("Visu", limit=10)
+    assert [i["url"] for i in first["items"]] == seen[:10] and first["next_offset"] == 10       # one order
+    assert first["items"][0]["title"].startswith("VisuElem")                                   # titles still first
+    r = idx.search("Visu", limit=300)
+    assert r["count"] == 50 and r["clamped"] is True and "offset=50" in r["clamped_note"], r
+    with pytest.raises(InfosysError, match="past the last hit"):
+        idx.search("Visu", offset=200)
+    with pytest.raises(InfosysError, match="offset"):
+        idx.search("Visu", offset=-1)
+
+
+def test_n160_get_page_reads_a_part_as_the_skill_does_and_not_found_says_how_on(idx):
+    """N160 (S3, 0.8.14 retest): infosys_get_page had no section and no offset (the skill's docs_page has both), took
+    max_chars=50 where the skill refused below 200, and a name that is not found was a bare error — the skill names
+    what is near and how to search. One reader of a page part (page_part), one range (200-60000) for both."""
+    p = idx.get_page("ADSREAD", max_chars=200)
+    assert p["truncated"] is True and p["next_offset"] == 200 and p["outline"] and p["offset"] == 0, p
+    q = idx.get_page("ADSREAD", max_chars=200, offset=200)
+    assert q["offset"] == 200 and q["markdown"] and q["markdown"] != p["markdown"]
+    head = p["outline"][1] if len(p["outline"]) > 1 else p["outline"][0]
+    s = idx.get_page("ADSREAD", section=head)
+    assert s["section"] == head and s["markdown"].lstrip("#").strip().startswith(head), s["markdown"][:80]
+    for bad in (dict(max_chars=199), dict(max_chars=60001), dict(offset=-1)):
+        with pytest.raises(InfosysError, match="max_chars|offset") as e:
+            idx.get_page("ADSREAD", **bad)
+        assert "section=" in str(e.value) or "next_offset" in str(e.value)       # N169: the way to read on
+    with pytest.raises(InfosysError, match="no section heading contains"):
+        idx.get_page("ADSREAD", section="Bogus heading")
+    with pytest.raises(InfosysError, match=r"infosys_search\(query='NoSuchSymbolXyz'\) finds pages by their text"):
+        idx.declaration("NoSuchSymbolXyz")
+    with pytest.raises(InfosysError, match=r"infosys_search\(query='NoSuchSymbolXyz'\)"):
+        idx.get_page("NoSuchSymbolXyz")
+
+
+def test_review_0815_an_acronym_in_capitals_does_not_outrank_the_words_of_the_query(idx):
+    """Review of 0.8.15 (N148's title key): every word in capitals counted as a keyword the title should hold —
+    'PLC persistent variables' ranked 'Resetting the PLC project' above 'Remanent Variables - PERSISTENT, RETAIN',
+    'CX9020 LED' dropped 'Diagnostic LEDs'. An acronym is a word of the query like any other; only an IEC keyword
+    (THIS, FOR) puts the page it titles first."""
+    P = "tc3_plc_intro"
+    _store_pages(idx, [
+        (f"{P}/1000000101", "Remanent Variables - PERSISTENT, RETAIN", "<p>Persistent variables keep their values. "
+                                                                       "PLC data.</p>"),
+        (f"{P}/1000000102", "Resetting the PLC project", "<p>Reset the PLC project: persistent variables stay, other "
+                                                         "variables are reset.</p>"),
+        (f"{P}/1000000103", "THIS", "<p>THIS is a pointer to the own instance.</p>"),
+        (f"{P}/1000000104", "Pointer", "<p>A pointer and THIS pointer: an address.</p>"),
+    ])
+    idx.sync_derived()
+    first = lambda q: [i["title"] for i in idx.search(q, limit=5)["items"]]           # noqa: E731
+    assert first("PLC persistent variables")[0] == "Remanent Variables - PERSISTENT, RETAIN", first("PLC persistent variables")
+    assert first("THIS pointer")[0] == "THIS", first("THIS pointer")
+
+
+def test_review_0815_a_member_through_an_owner_of_two_pages_is_not_guessed(idx):
+    """Review of 0.8.15 (N158): FB_BA_SeqCtrl is documented by Tc3_BaCommon (no EXTENDS) and by tf8040 (EXTENDS
+    FB_BA_Loop) — 'FB_BA_SeqCtrl.Calc' answered FB_BA_Loop.Calc ('it is FB_BA_Loop's') as if the owner were known,
+    while 'FB_BA_SeqCtrl' alone is ambiguous. The sources of an owner of several pages that differ are not merged:
+    not found, saying why, and library= picks the owner."""
+    B, C = "tf8040_tc3_buildingautomation", "tcplclib_tc3_bacommon"
+    _store_with(idx, f"{C}/1001", "FB_BA_SeqCtrl", "<pre>FUNCTION_BLOCK FB_BA_SeqCtrl\nVAR_INPUT\n    bA : BOOL;\nEND_VAR"
+                "</pre>", "c-seq")
+    _store_with(idx, f"{B}/2001", "FB_BA_SeqCtrl", "<pre>FUNCTION_BLOCK FB_BA_SeqCtrl EXTENDS FB_BA_Loop\nVAR_INPUT\n"
+                "    bB : BOOL;\nEND_VAR</pre>", "b-seq")
+    _store_with(idx, f"{B}/2002", "FB_BA_Loop", "<pre>FUNCTION_BLOCK FB_BA_Loop\nVAR_INPUT\n    bC : BOOL;\nEND_VAR</pre>",
+                "b-loop")
+    _store_with(idx, f"{B}/2003", "Calc", "<pre>METHOD Calc : BOOL\nVAR_INPUT\n    fIn : LREAL;\nEND_VAR</pre>", "b-calc",
+                "b-loop")
+    idx.resolve_help_links()
+    idx.sync_derived()
+    with pytest.raises(InfosysError, match="ambiguous"):
+        idx.declaration("FB_BA_SeqCtrl")
+    with pytest.raises(InfosysError, match=r"FB_BA_SeqCtrl is documented by 2 pages .* pass library=") as e:
+        idx.declaration("FB_BA_SeqCtrl.Calc")
+    assert "FB_BA_Loop's" not in str(e.value) and f"(found with library={B})" in str(e.value), e.value
+    with pytest.raises(InfosysError) as e:       # re-review: no library= finds it — no advice that leads nowhere
+        idx.declaration("FB_BA_SeqCtrl.bEnable")
+    assert "pass library=" not in str(e.value) and "infosys_search(" in str(e.value), e.value
+    d = idx.declaration("FB_BA_SeqCtrl.Calc", library=B)
+    assert d["url"].endswith(f"{B}/2003.html") and d["defined_in"] == "FB_BA_Loop", d
+
+
+def test_review_0815_syntax_sections_operator_names_and_the_page_own_header():
+    """Review of 0.8.15 (N150 / N157 rules). An operator's syntax is what its 'Syntax' label gives — not the first
+    code block within 2000 characters (CAL got its Example, __VARINFO 'in the declaration:'); an operator is named
+    in capitals or as TwinCAT's __ ones (MathOperation's 'The operator can be selected' is a setting). The header in
+    a page's Syntax section is its declaration, also under another name (FB_ExternalHydAxisLibRef on
+    ExternalHydAxisLibRef, the copy-paste METHOD SendEqualMessage on SendHresult()); 'the Subscription method' names
+    the page's kind as 'the method Subscription' does; 'FUNCTION BLOCK X' (44 pages write the space) is a header."""
+    def page(title, body):
+        return html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>")
+
+    def kind(title, body):
+        return parse_declaration(title, page(title, body))
+    cal = kind("CAL", "<p>The CAL operator is used to call a function block.</p><p><b>Syntax:</b></p>"
+                      "<p>CAL &lt;function block&gt; (&lt;input&gt; := &lt;value&gt;)</p><p><b>Example:</b></p>"
+                      "<pre>CAL fbInst(nVar1 := 0)</pre>")
+    assert cal["kind"] == "Operator" and cal["declaration"] == "CAL <function block> (<input> := <value>)", cal
+    vi = kind("__VARINFO", "<p>The operator __VARINFO returns information.</p><p><b>Syntax in the declaration:</b></p>"
+                           "<pre>&lt;info&gt; : __SYSTEM.VAR_INFO;</pre><p><b>Syntax for the call:</b></p>"
+                           "<pre>&lt;info&gt; := __VARINFO( &lt;variable&gt; );</pre><p><b>Sample:</b></p><pre>x := 1;</pre>")
+    assert vi["declaration"] == "<info> : __SYSTEM.VAR_INFO;\n<info> := __VARINFO( <variable> );", vi
+    mx = kind("MAX", "<p>The MAX operator returns the largest value.</p><p><b>Syntax:</b> <code>OUT := MAX(IN0, IN1)</code></p>")
+    assert mx["declaration"] == "OUT := MAX(IN0, IN1)", mx
+    assert kind("MathOperation", "<p>Symbols are calculated with the MathOperation block. The operator can be "
+                                 "selected under MathOperator.</p>")["kind"] == "Page"
+    hyd = kind("ExternalHydAxisLibRef", "<p>This class represents a standard hydraulic axis.</p><h2>Syntax:</h2>"
+                                        "<pre>FUNCTION_BLOCK FB_ExternalHydAxisLibRef\nVAR_INPUT\n    stAxisRef : AXIS_REF;"
+                                        "\nEND_VAR</pre><h2>Sample</h2><pre>METHOD Other</pre>")
+    assert hyd["kind"] == "FunctionBlock", hyd
+    sh = kind("SendHresult()", "<p>Logs a message in the EventLogger.</p><h2>Syntax:</h2><pre>METHOD SendEqualMessage : "
+                               "HRESULT\nVAR_INPUT\n    hr : HRESULT;\nEND_VAR</pre>")
+    assert sh["kind"] == "Method", sh
+    sub = kind("Subscription", "<p>You can use the Subscription method to request OCA objects.</p><h2>Syntax</h2>"
+                               "<pre>VAR_INPUT\n    bExecute : BOOL;\nEND_VAR</pre>")
+    assert sub["kind"] == "Method", sub
+    oc = kind("FB_OCPP1_Client", "<p>This function block represents an OCPP client.</p><h2>Syntax</h2>"
+                                 "<pre>FUNCTION BLOCK FB_OCPP1_Client EXTENDS FB_Base\nVAR_OUTPUT\n    bValid : BOOL;\nEND_VAR</pre>")
+    assert oc["kind"] == "FunctionBlock" and oc["declaration"].startswith("FUNCTION BLOCK FB_OCPP1_Client"), oc
+    assert oc["extends"] == "FB_Base" and [x["name"] for x in oc["outputs"]] == ["bValid"], oc
+
+
+def store_declared_as(store):
+    """Re-review of 0.8.15: pages whose Syntax section declares another name than their title — the 39 tf8560 core
+    function pages ('ActualsActuator' declares FB_ActuatorActuals), and Beckhoff's copies of a neighbour's header
+    (SendMessageEx2 shows METHOD SendMessageEx — its Inputs table has the sJsonAttribute the header lacks;
+    F_TimeToSeconds() shows FUNCTION F_SecondsToTime, which has its own page). Third review: FB_MTP_Procedure's Syntax
+    shows how to derive from it; FB_BA_Device and FB_BA_WeatherParameter both show a header of FB_BA_Settings."""
+    store("tf8560_plastic_technology_functions/16259000001", "ActualsActuator",
+          "<p>This class supplies the actual values of an actuator.</p><h2>Syntax:</h2>"
+          "<pre>FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR</pre>",
+          "pl-act")
+    store("tf85xx_plastic_application/13193000002", "SendHresult()",
+          "<p>Logs a message in the EventLogger.</p><h2>Syntax:</h2><pre>METHOD SendEqualMessage : HRESULT\nVAR_INPUT\n"
+          "    hr : HRESULT;\nEND_VAR</pre>", "pl-send")
+    store("tf85xx_plastic_application/13193276299", "F_TimeToSeconds()",
+          "<p>Converts a time of type TIME to seconds of type LREAL.</p><h2>Syntax:</h2><pre>FUNCTION F_SecondsToTime : "
+          "LREAL\nVAR_INPUT\n    tTime : TIME;\nEND_VAR</pre>", "pl-t2s")
+    store("tf85xx_plastic_application/13193276000", "F_SecondsToTime()",
+          "<p>Converts seconds of type LREAL to a time of type TIME.</p><h2>Syntax:</h2><pre>FUNCTION F_SecondsToTime : "
+          "TIME\nVAR_INPUT\n    fTime : LREAL;\nEND_VAR</pre>", "pl-s2t")
+    store("tcplclib_tc3_eventlogger/13724785419", "SendMessageEx2",
+          "<p>This method sends a message.</p><h2>Syntax</h2><pre>METHOD SendMessageEx : HRESULT\nVAR_INPUT\n"
+          "    stEventEntry : TcEventEntry;\nEND_VAR</pre><h2>Inputs</h2>"
+          "<table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
+          "<tr><td>stEventEntry</td><td>TcEventEntry</td><td>Event definition</td></tr>"
+          "<tr><td>sJsonAttribute</td><td>STRING</td><td>Sent in addition to the event text.</td></tr></table>"
+          "<h2>Return value</h2><table><tr><th>Name</th><th>Type</th><th>Description</th></tr>"
+          "<tr><td>SendMessageEx2</td><td>HRESULT</td><td>S_OK or the error</td></tr></table>", "el-ex2")
+    store("tcplclib_tc3_eventlogger/13724785000", "SendMessageEx",
+          "<p>This method sends a message.</p><h2>Syntax</h2><pre>METHOD SendMessageEx : HRESULT\nVAR_INPUT\n"
+          "    stEventEntry : TcEventEntry;\n    ipSourceInfo : I_TcSourceInfo := 0;\nEND_VAR</pre>", "el-ex")
+    store("tf8400_tc3_mtp_runtime/1001", "FB_MTP_Procedure",
+          "<p>The function block is abstract and must be derived.</p><h2>Syntax</h2><pre>FUNCTION_BLOCK "
+          "FB_MTP_Procedure_1_Service EXTENDS FB_MTP_Procedure\nVAR_INPUT\n    nX : INT;\nEND_VAR</pre>", "mtp-proc")
+    store("tf8040_tc3_buildingautomation/2001", "FB_BA_Device",
+          "<p>The template includes several basic functions.</p><h2>Syntax</h2><pre>FUNCTION_BLOCK FB_BA_Settings "
+          "EXTENDS FB_BA_View\nVAR_INPUT CONSTANT\n    Trend : FB_BA_TrendLogging;\nEND_VAR</pre>", "ba-dev")
+    store("tf8040_tc3_buildingautomation/2002", "FB_BA_WeatherParameter",
+          "<p>The template contains the weather parameters.</p><h2>Syntax</h2><pre>FUNCTION_BLOCK FB_BA_Settings "
+          "EXTENDS FB_BA_View\nVAR_INPUT\n    fTWth : REAL;\nEND_VAR</pre>", "ba-wth")
+
+
+def test_rereview_0815_a_syntax_header_under_another_name_is_the_page_declaration(idx):
+    """Re-review of 0.8.15 (S3): the header in a page's Syntax section gave the page its kind and was then dropped —
+    'ActualsActuator' (tf8560) was FunctionBlock 'ActualsActuator' with no declaration and no EXTENDS, while the page
+    declares FUNCTION_BLOCK FB_ActuatorActuals EXTENDS FB_MotionActuals, and FB_ActuatorActuals — the name code
+    uses — was not found. Third review (S3-1): taking every such header as the page's second name gave
+    F_TimeToSeconds() the header of F_SecondsToTime ('Beckhoff's page uses both'), FB_MTP_Procedure an EXTENDS of
+    itself and FB_BA_Settings two pages that do not document it. The header is the page's declaration only when
+    nothing contradicts it: no page of its library or book documents the name, the page's tables document nothing
+    the header lacks, and it does not derive from the page's own symbol; otherwise why is said."""
+    def kind(title, body):
+        return parse_declaration(title, _page(title, body))
+    got = {}
+    store_declared_as(lambda ref, title, body, hid: got.setdefault(title, kind(title, body)))
+    a = got["ActualsActuator"]
+    assert a["kind"] == "FunctionBlock" and a["declaration"] is None and a["syntax_header"]["name"] == "FB_ActuatorActuals"
+    assert a["syntax_header"]["extends"] == "FB_MotionActuals" and a["syntax_header"]["undeclared"] == [], a
+    e = got["SendMessageEx2"]
+    assert e["syntax_header"]["name"] == "SendMessageEx" and e["syntax_header"]["undeclared"] == ["sJsonAttribute"], e
+    m = got["FB_MTP_Procedure"]
+    assert "syntax_header" not in m and m["extends"] is None and "how to derive from it" in m["syntax_header_note"], m
+    assert "syntax_header" not in got["SendMessageEx"]
+
+    store_declared_as(lambda ref, title, body, hid: _store_with(idx, ref, title, body, hid))
+    idx.resolve_help_links()
+    idx.sync_derived()
+    d = idx.declaration("FB_ActuatorActuals")
+    assert d["url"].endswith("tf8560_plastic_technology_functions/16259000001.html"), d
+    assert (d["kind"], d["extends"], d["declared_as"], d["page_title"]) == (
+        "FunctionBlock", "FB_MotionActuals", "FB_ActuatorActuals", "ActualsActuator"), d
+    a = idx.declaration("ActualsActuator")
+    assert a["url"] == d["url"] and a["declaration"].startswith("FUNCTION_BLOCK FB_ActuatorActuals EXTENDS"), a
+    assert "no other page of its library documents" in a["declared_as_note"], a
+    s = idx.declaration("SendHresult()")
+    assert (s["return_type"], s["declared_as"]) == ("HRESULT", "SendEqualMessage"), s
+    t = idx.declaration("F_TimeToSeconds()")      # a copy of the header of F_SecondsToTime, which has its own page
+    assert t["declaration"] is None and "declared_as" not in t and t["syntax_header"]["name"] == "F_SecondsToTime", t
+    assert "F_SecondsToTime has its own page" in t["syntax_header_note"], t
+    assert idx.declaration("F_SecondsToTime")["url"].endswith("13193276000.html")
+    x = idx.declaration("SendMessageEx2")
+    assert x["declaration"] is None and "sJsonAttribute, which that header does not declare" in x["syntax_header_note"]
+    assert "SendMessageEx has its own page" in x["syntax_header_note"], x
+    assert idx.declaration("SendMessageEx")["url"].endswith("tcplclib_tc3_eventlogger/13724785000.html")
+    with pytest.raises(InfosysError, match="no symbol page titled 'FB_MTP_Procedure_1_Service'"):
+        idx.declaration("FB_MTP_Procedure_1_Service")            # the user's own derived class, not a Beckhoff page
+    with pytest.raises(InfosysError, match="no symbol page titled 'FB_BA_Settings'"):
+        idx.declaration("FB_BA_Settings")                         # two pages' headers, differently: neither documents it
+    assert idx.declaration("FB_BA_Device").get("declared_as") == "FB_BA_Settings"
+
+
+def test_rereview_0815_a_derived_version_bump_rebuilds_the_derived_tables(idx, monkeypatch):
+    """A new DERIVED_VERSION ('a bump brings them in step from the stored pages') re-ran only the incremental pass:
+    the pages already seen kept the symbols the old rule made, and the new rule (declared names) reached none of them.
+    A bump rebuilds every derived table from the stored pages."""
+    import twincat_mcp.infosys as I
+    store_declared_as(lambda ref, title, body, hid: _store_with(idx, ref, title, body, hid))
+    idx.sync_derived()
+    with idx._db() as con:
+        con.execute("DELETE FROM symbols")                  # what an index of the earlier rule holds
+        con.execute("INSERT INTO symbols(page_rowid, name, owner, kind, section, decl) VALUES (1, 'Stale', NULL, "
+                    "'Constant', NULL, '{}')")
+    assert idx.sync_derived()["changed"] is False
+    monkeypatch.setattr(I, "DERIVED_VERSION", I.DERIVED_VERSION + 1)
+    assert idx.sync_derived()["changed"] is True
+    with idx._db() as con:
+        names = {r[0] for r in con.execute("SELECT name FROM symbols")}
+    assert "Stale" not in names and {"FB_ActuatorActuals", "SendEqualMessage"} <= names, names
+
+
+def test_rereview_0815_library_picks_the_owner_and_its_base_class_may_be_in_another_library(idx):
+    """Re-review of 0.8.15 (N158): library= filtered the inherited member's page too — FB_BA_Derived (tf8040) EXTENDS
+    FB_BA_Base2 of Tc3_BaCommon: 'FB_BA_Derived.Calc' with library=tf8040 was not found, as if a base class had to be
+    in the library of the FB. library= picks the owner; its base class is looked up in that library first, then in
+    any."""
+    B, A = "tf8040_tc3_buildingautomation", "tcplclib_tc3_bacommon"
+    _store_with(idx, f"{B}/3001", "FB_BA_Derived", "<pre>FUNCTION_BLOCK FB_BA_Derived EXTENDS FB_BA_Base2\nVAR_INPUT\n"
+                "    bB : BOOL;\nEND_VAR</pre>", "b-der")
+    _store_with(idx, f"{A}/3002", "FB_BA_Base2", "<pre>FUNCTION_BLOCK FB_BA_Base2\nVAR_INPUT\n    bA : BOOL;\nEND_VAR</pre>",
+                "a-base")
+    _store_with(idx, f"{A}/3003", "Calc", "<pre>METHOD Calc : BOOL\nVAR_INPUT\n    fIn : LREAL;\nEND_VAR</pre>", "a-calc",
+                "a-base")
+    idx.resolve_help_links()
+    idx.sync_derived()
+    for lib in (None, B):
+        d = idx.declaration("FB_BA_Derived.Calc", library=lib)
+        assert d["url"].endswith(f"{A}/3003.html") and d["defined_in"] == "FB_BA_Base2", (lib, d)
+
+
+def test_rereview_0815_a_line_ending_with_a_colon_introduces_the_syntax():
+    """Re-review of 0.8.15: SEL's syntax read 'OUT := SEL(G, IN0, IN1) means:' — the two lines it introduces were
+    lost. The same reader took 'Definition:' (under 3708 Syntax headings: the EventLogger, TF3520 …) as the syntax and
+    missed the declaration below it — 'SetInital' (Beckhoff's typo) declares METHOD SetInitial there. A line that
+    ends with ':' introduces what follows, up to the next label, heading, table, code block or sentence; a label of
+    words alone gives nothing itself. A template's header (FB_T[n]_DataSource) names no symbol."""
+    from twincat_mcp.infosys import _syntax_parts
+
+    def kind(title, body):
+        return parse_declaration(title, _page(title, body))
+    sel = kind("SEL", "<p>The IEC operator is used for bitwise selection.</p><p><b>Syntax:</b></p>"
+                      "<p>OUT := SEL(G, IN0, IN1) means:</p><p>OUT := IN0; if G = FALSE</p><p>OUT := IN1; if G = TRUE</p>"
+                      "<p>Permitted data types:</p><p>G: BOOL</p><h2>Samples:</h2><pre>nVar1 := SEL(TRUE,3,4);</pre>")
+    assert sel["kind"] == "Operator", sel
+    assert sel["declaration"] == "OUT := SEL(G, IN0, IN1) means:\nOUT := IN0; if G = FALSE\nOUT := IN1; if G = TRUE", sel
+    si = kind("SetInital", "<p>This method sets the initial value.</p><h2>Syntax</h2><p>Definition:</p>"
+                           "<pre>METHOD SetInitial : BOOL\nVAR_INPUT\n    nCount : ULINT;\nEND_VAR</pre>")
+    h = si["syntax_header"]
+    assert (si["kind"], h["name"], h["return_type"]) == ("Method", "SetInitial", "BOOL"), si
+    assert [x["name"] for x in h["inputs"]] == ["nCount"] and h["undeclared"] == [], si
+    tp = kind("FB_DataSource", "<p>The function block is generated for each data source.</p><h2>Syntax</h2>"
+                               "<p>Definition:</p><pre>FUNCTION_BLOCK FB_T[n]_DataSource IMPLEMENTS I_DataSource\n"
+                               "VAR_INPUT\n    bX : BOOL;\nEND_VAR</pre>")
+    assert tp["kind"] == "FunctionBlock" and "syntax_header" not in tp, tp
+    prog = _page("Object Program", "<p><b>Syntax:</b></p><p>&lt;program&gt;(&lt;input variable&gt; := &lt;value&gt;):</p>"
+                                   "<p>If you add a program call via the input assistant, TwinCAT adds the parameters.</p>")
+    assert _syntax_parts(prog.markdown) == [("<program>(<input variable> := <value>):", False)]
+
+
+def test_third_review_0815_a_member_comes_from_the_owners_library_first(idx):
+    """Third review of 0.8.15 (S4-2): FB_D of Tc3_LibA EXTENDS FB_Base; LibA documents its own FB_Base (no Calc), LibB
+    another FB_Base with a Calc — 'FB_D.Calc' (library=Tc3_LibA or none) answered LibB's Calc, as if FB_D derived from
+    LibB's class. Where a member comes from is looked up in the owner's library; another library only when the
+    owner's has no page of that class."""
+    A, B = "tcplclib_tc3_liba", "tcplclib_tc3_libb"
+    _store_with(idx, f"{A}/4001", "FB_D", "<pre>FUNCTION_BLOCK FB_D EXTENDS FB_Base\nVAR_INPUT\n    bD : BOOL;\nEND_VAR</pre>",
+                "a-d")
+    _store_with(idx, f"{A}/4002", "FB_Base", "<pre>FUNCTION_BLOCK FB_Base\nVAR_INPUT\n    bA : BOOL;\nEND_VAR</pre>", "a-b")
+    _store_with(idx, f"{B}/4003", "FB_Base", "<pre>FUNCTION_BLOCK FB_Base\nVAR_INPUT\n    bB : BOOL;\nEND_VAR</pre>", "b-b")
+    _store_with(idx, f"{B}/4004", "Calc", "<pre>METHOD Calc : BOOL\nVAR_INPUT\n    fIn : LREAL;\nEND_VAR</pre>", "b-c",
+                "b-b")
+    idx.resolve_help_links()
+    idx.sync_derived()
+    for lib in (None, A):
+        with pytest.raises(InfosysError, match="no symbol page titled 'FB_D.Calc'"):
+            idx.declaration("FB_D.Calc", library=lib)
+
+
+def test_third_review_0815_a_derived_rebuild_is_one_transaction(idx, monkeypatch):
+    """Third review of 0.8.15 (S4-1): the rebuild after a DERIVED_VERSION change dropped the tables with executescript,
+    which commits at once — another reader saw empty catalog / symbols tables for up to 10 s and answered 'not found'.
+    The drop and the rebuild are one transaction: a reader sees the old tables until the new ones are complete."""
+    import sqlite3
+    import twincat_mcp.infosys as I
+    store_declared_as(lambda ref, title, body, hid: _store_with(idx, ref, title, body, hid))
+    idx.sync_derived()
+    with idx._db() as con:
+        before = con.execute("SELECT COUNT(*) FROM catalog").fetchone()[0]
+    seen: list[object] = []
+    real = type(idx)._init_derived
+
+    def watched(self, con):
+        real(self, con)
+        r = sqlite3.connect(idx.db_file)                     # another reader, during the rebuild
+        try:
+            seen.append(r.execute("SELECT COUNT(*) FROM catalog").fetchone()[0])
+        except sqlite3.OperationalError as e:
+            seen.append(str(e))
+        finally:
+            r.close()
+    monkeypatch.setattr(type(idx), "_init_derived", watched)
+    monkeypatch.setattr(I, "DERIVED_VERSION", I.DERIVED_VERSION + 1)
+    assert idx.sync_derived()["changed"] is True
+    assert before > 0 and seen and all(x == before for x in seen), (before, seen)

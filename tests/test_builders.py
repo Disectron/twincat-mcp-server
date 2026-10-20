@@ -783,3 +783,93 @@ def test_esi_builder_update_stats_and_queries(tmp_path):
     assert p.returncode == 1 and "the nearest" in json.loads(p.stdout)["error"]
     p = run("esi_db.py", "update", "--kb", str(kb), "--no-esi-dirs", "--no-twincat")
     assert p.returncode == 0 and "indexed 2 device revisions" in p.stdout, p.stdout
+
+
+def test_n170_the_skill_and_the_cli_answer_symbols_documented_inside_a_page(kb, tmp_path):
+    """N170 (0.8.14 retest): `decl RecipeManCommands`, `decl CreateRecipe` (CLI and skill) → 'no page for symbol' — the
+    methods are sections of one page with tables and no code. Built by the builder the user runs, the skill and the
+    CLI answer them like infosys_declaration does (C1–C5), docs_page opens a method's section — that section alone,
+    not 'Method CreateRecipeNoSave' too — and the CLI prints the reconstructed declaration."""
+    from tests.test_infosys_local import RECIPE_PAGES, _tbl, _VARS
+    pages = dict(RECIPE_PAGES)
+    page = pages["tc3_plc_intro/1033/2525821323.html"]
+    extra = ("<h2>Method CreateRecipeNoSave</h2><p>Creates a recipe without saving it.</p><p><b>Inputs (VAR_INPUT)</b></p>"
+             + _tbl(_VARS, ("RecipeName", "STRING", "Name of the recipe")) + "<h2>Return values</h2>")
+    pages["tc3_plc_intro/1033/2525821323.html"] = page.replace("<h2>Return values</h2>", extra, 1)
+    p = build(kb, mshc(tmp_path / "BKINFOSYS3_VS_100_EN-US.2.mshc", pages))
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "symbols documented inside pages: 7 Constant, 1 FunctionBlock, 4 Method" in p.stdout + p.stderr, p.stdout
+    r = kbdocs(kb, "docs_declaration", "symbol=RecipeManCommands")
+    assert r["kind"] == "FunctionBlock" and r["ref"] == "tc3_plc_intro/2525821323", r
+    assert [m["name"] for m in r["methods"]] == ["CreateRecipe", "GetRecipeNames", "GetRecipeValues", "CreateRecipeNoSave"]
+    assert r["declaration_blocks"] == [] and "examples" in r["note"]             # the page's code is a sample
+    for q in ("RecipeManCommands.CreateRecipe", "CreateRecipe", "createRecipe"):
+        r = kbdocs(kb, "docs_declaration", f"symbol={q}")
+        assert (r["kind"], r["return_type"], r["section"]) == ("Method", "DWORD", "Method CreateRecipe"), (q, r)
+        assert [x["name"] for x in r["inputs"]] == ["RecipeDefinitionName", "RecipeName"]
+        assert r["parent"] == {"title": "RecipeManCommands", "ref": "tc3_plc_intro/2525821323"}
+        assert "section='Method CreateRecipe'" in r["note"]
+    r = kbdocs(kb, "docs_declaration", "symbol=ERR_RECIPE_NOT_FOUND")
+    assert (r["kind"], r["value"], r["type"], r["gvl"]) == ("Constant", "16#4003", "UDINT", "ReturnValues"), r
+    # third review of 0.8.15 (S3-2): a constant's declaration is reconstructed too — 'the page has no code block' was
+    # said of a page with code, and the section was lost
+    assert "reconstructed from the page's tables" in r["note"] and "section='Return values'" in r["note"], r["note"]
+    assert r["declaration_blocks"] == [], r
+    r = kbdocs(kb, "docs_declaration", "symbol=AlarmCommands")               # only a title has the name
+    assert (r["kind"], r["match"], r["ref"]) == ("Page", "title", "tc3_plc_intro/2525822000"), r
+    r = kbdocs(kb, "docs_page", "ref=CreateRecipe")
+    assert r["section"] == "Method CreateRecipe" and r["text"].startswith("## Method CreateRecipe\n"), r
+    assert "CreateRecipeNoSave" not in r["text"] and "Return value" in r["text"]
+    r = kbdocs(kb, "docs_page", "ref=tc3_plc_intro/2525821323", "section=Method CreateRecipe")
+    assert "CreateRecipeNoSave" not in r["text"]
+    r = kbdocs(kb, "docs_page", "ref=tc3_plc_intro/2525821323", "section=CreateRecipe")     # a part: every match
+    assert "CreateRecipeNoSave" in r["text"] and "## Method CreateRecipe\n" in r["text"]
+    p = run("infosys_local.py", "--kb", str(kb), "decl", "CreateRecipe")
+    assert p.returncode == 0 and "METHOD CreateRecipe : DWORD" in p.stdout and "RecipeName           : STRING;" in p.stdout, p.stdout
+    assert "Method — section 'Method CreateRecipe'" in p.stdout, p.stdout
+    p = run("infosys_local.py", "--kb", str(kb), "decl", "ERR_RECIPE_NOT_FOUND")
+    assert "ERR_RECIPE_NOT_FOUND : UDINT := 16#4003;" in p.stdout and "Value: 16#4003 (GVL ReturnValues)" in p.stdout, p.stdout
+
+
+def test_rereview_0815_the_built_index_finds_a_symbol_by_the_name_its_page_declares(kb, tmp_path):
+    """Re-review of 0.8.15 (S3): built by the builder the user runs, `decl FB_ActuatorActuals` finds the tf8560 page
+    titled 'ActualsActuator' that declares it, and the CLI says under which name the page declares it."""
+    from tests.test_infosys import store_declared_as
+    from tests.test_infosys_local import _hv_page
+    pages: dict[str, str] = {}
+    store_declared_as(lambda ref, title, body, hid: pages.__setitem__(
+        ref.replace("/", "/1033/", 1) + ".html", _hv_page(title, body, hid)))
+    p = build(kb, mshc(tmp_path / "BKINFOSYS3_VS_100_EN-US.2.mshc", pages))
+    assert p.returncode == 0, p.stdout + p.stderr
+    r = kbdocs(kb, "docs_declaration", "symbol=FB_ActuatorActuals")
+    assert (r["ref"], r["declared_as"]) == ("tf8560_plastic_technology_functions/16259000001", "FB_ActuatorActuals"), r
+    c = run("infosys_local.py", "--kb", str(kb), "decl", "ActualsActuator")
+    assert c.returncode == 0 and "Declared as FB_ActuatorActuals: the page is titled 'ActualsActuator'" in c.stdout
+    c = run("infosys_local.py", "--kb", str(kb), "decl", "SendMessageEx2")
+    assert c.returncode == 0 and "Syntax header: the header in its Syntax section declares SendMessageEx" in c.stdout
+    assert "sJsonAttribute, which that header does not declare" in c.stdout, c.stdout
+
+
+def test_n167_n168_n169_the_cli_pages_reads_on_and_shows_its_ranges(kb, tmp_path):
+    """N167 / N168 / N169 (0.8.14 retest): `search … --limit 300` was refused and had no --offset; `show` had no
+    --offset ('… [N more chars; --max or --section]', and --max 40000 was refused); -h showed `--limit LIMIT` /
+    `--max MAX` with no range or default. The CLI pages like the skill, its cut marker and footer name the next
+    --offset, and -h gives every range."""
+    from tests.test_infosys_local import RECIPE_PAGES
+    p = build(kb, mshc(tmp_path / "BKINFOSYS3_VS_100_EN-US.2.mshc", RECIPE_PAGES))
+    assert p.returncode == 0, p.stdout + p.stderr
+    a = run("infosys_local.py", "--kb", str(kb), "search", "recipe", "--limit", "1")
+    assert a.returncode == 0 and "--offset 1 for the next ones" in a.stdout, a.stdout
+    b = run("infosys_local.py", "--kb", str(kb), "search", "recipe", "--limit", "1", "--offset", "1")
+    assert b.returncode == 0 and b.stdout.splitlines()[0] != a.stdout.splitlines()[0], (a.stdout, b.stdout)
+    c = run("infosys_local.py", "--kb", str(kb), "search", "recipe", "--limit", "300")
+    assert c.returncode == 0 and "limit 300 is above the maximum (1-50): 50 used" in c.stdout, c.stdout + c.stderr
+    s = run("infosys_local.py", "--kb", str(kb), "show", "tc3_plc_intro/2525821323", "--max", "300")
+    assert s.returncode == 0 and "more chars; --offset 300]" in s.stdout, s.stdout
+    t = run("infosys_local.py", "--kb", str(kb), "show", "tc3_plc_intro/2525821323", "--max", "300", "--offset", "300")
+    assert t.returncode == 0 and "--offset 600]" in t.stdout and t.stdout != s.stdout, t.stdout
+    big = run("infosys_local.py", "--kb", str(kb), "show", "tc3_plc_intro/2525821323", "--max", "40000")
+    assert big.returncode == 0 and "more chars" not in big.stdout, big.stdout + big.stderr
+    for cmd, want in (("search", ["1-50", "default 10", "--offset"]), ("show", ["200-60000", "default 4000", "--offset"])):
+        h = run("infosys_local.py", cmd, "-h")
+        assert all(w in " ".join(h.stdout.split()) for w in want), (cmd, h.stdout)

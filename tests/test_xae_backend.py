@@ -817,6 +817,109 @@ def test_r15_n44_listing_fails_after_a_replace_import(xae, tmp_path):
     assert proj.deleted == [] and orig.ImplementationText == "// impl of PRG_TcUnitRunner"
 
 
+class _BusyFolder(FakeItem):
+    """A folder whose ChildCount the shell rejects (RPC_E_CALL_REJECTED) while `busy` is set."""
+    busy = True
+
+    @property
+    def ChildCount(self):
+        if self.busy:
+            raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+        return len(self._children)
+
+
+def test_n44_a_listing_that_fails_before_a_replace_import_imports_nothing(xae, tmp_path):
+    """N44 (0.8.14 retest, S4): a listing failure BEFORE the import must not end in an import. 'replace' already
+    refused an unreadable or raising listing, but tree_children read a rejected ChildCount (XAE busy, right after an
+    import or a build) as 'no children': the folder looked empty, the snapshot complete, the import ran — and with
+    the original missing from the snapshot its copy (PRG_TcUnitRunner_1) was left at the project root. A shell that
+    stays busy now fails the listing, and the replace is refused before anything is imported."""
+    be, dte, sm = xae
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path)
+    folder = sm.items["TIPC^Plc^Plc Project^95_UnitTests"]
+    busy = _BusyFolder(folder.Name, folder.PathName, [orig])
+    proj._children = [busy if c is folder else c for c in proj._children]
+    sm.items[busy.PathName] = busy
+    proj.on_import = dup
+    with pytest.raises(X.XaeError, match=r"could not be listed completely.*nothing was imported"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert proj.imported == [] and not any(c.Name == "PRG_TcUnitRunner_1" for c in proj._children)
+    # the shell answers again: the same import replaces in place
+    busy.busy = False
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert r["copies_removed"] == ["TIPC^Plc^Plc Project^PRG_TcUnitRunner_1"] and len(proj.imported) == 1, r
+
+
+def _itf_xml(methods: dict[str, str]) -> str:
+    """An interface as TwinCAT exports it to PLCopen XML: <Interface> under the project's addData, each method with
+    its declaration as plain text — and no plain text of the INTERFACE header itself."""
+    ns = 'xmlns="http://www.w3.org/1999/xhtml"'
+    meth = "".join(
+        f'<Method name="{n}" ObjectId="{{0000000{i}-0000-0000-0000-000000000000}}"><interface><returnType><BOOL />'
+        '</returnType><addData><data name="http://www.3s-software.com/plcopenxml/interfaceasplaintext" '
+        f'handleUnknown="implementation"><InterfaceAsPlainText><xhtml {ns}>{d}</xhtml></InterfaceAsPlainText></data>'
+        '</addData></interface><addData /></Method>' for i, (n, d) in enumerate(methods.items()))
+    return ('<?xml version="1.0" encoding="utf-8"?><project xmlns="http://www.plcopen.org/xml/tc6_0200">'
+            '<types><dataTypes /><pous /></types><instances><configurations /></instances><addData>'
+            '<data name="http://www.3s-software.com/plcopenxml/interface" handleUnknown="implementation">'
+            '<Interface name="I_Module" Id="{11111111-0000-0000-0000-000000000000}"><addData>'
+            '<data name="http://www.3s-software.com/plcopenxml/method" handleUnknown="implementation">' + meth +
+            '</data></addData></Interface></data></addData></project>')
+
+
+def test_n175_an_interface_is_checked_against_the_xml_like_a_function_block(xae, tmp_path):
+    """N175 (0.8.14 retest, S4): xae_plcopen_import(replace) reported checked_against 'name' for I_Module and 'xml' for
+    the FB and the struct: the oracle kept only objects that carry a text of their own, and TwinCAT's export carries
+    an interface's methods with their declarations but no plain text of the INTERFACE header — so the interface was
+    left out and its method texts never compared. Now its methods are compared with the XML (a difference refuses
+    the replace), and what the XML has no text for — the header — is named in not_in_xml (checked by name only)."""
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    decl = {"M_Init": "METHOD M_Init : BOOL\nVAR_INPUT\n\tbReset : BOOL;\nEND_VAR\n", "M_Cyclic": "METHOD M_Cyclic : BOOL\n"}
+    base = "TIPC^Plc^Plc Project^10_Interfaces^I_Module"
+    kids = []
+    for n in decl:
+        k = FakeItem(n, f"{base}^{n}")
+        k.DeclarationText, k.ImplementationText = f"METHOD {n} : BOOL // old\n", None
+        kids.append(k)
+    orig = FakeItem("I_Module", base, kids)
+    orig.DeclarationText, orig.ImplementationText = "INTERFACE I_Module EXTENDS __SYSTEM.IQueryInterface\n", None
+    folder = FakeItem("10_Interfaces", "TIPC^Plc^Plc Project^10_Interfaces", [orig])
+    proj._children.append(folder)
+    for it in [folder, orig, *kids]:
+        sm.items[it.PathName] = it
+    f = tmp_path / "itf.xml"
+    f.write_text(_itf_xml(decl), encoding="utf-8")
+
+    def dup(changed=None):
+        cbase = "TIPC^Plc^Plc Project^I_Module_1"
+        ck = []
+        for n, d in decl.items():
+            k = FakeItem(n, f"{cbase}^{n}")
+            k.DeclarationText, k.ImplementationText = (changed or {}).get(n, d), None
+            ck.append(k)
+        c = FakeItem("I_Module_1", cbase, ck)
+        c.DeclarationText, c.ImplementationText = "INTERFACE I_Module_1 EXTENDS __SYSTEM.IQueryInterface\n", None
+        proj._children.append(c)
+        for it in [c, *ck]:
+            sm.items[it.PathName] = it
+    # a method that differs from the XML (an unknown transformation by TwinCAT): nothing written, the copy kept
+    proj.on_import = lambda: dup({"M_Init": "METHOD M_Init : INT\n"})
+    with pytest.raises(X.XaeError, match=r"differs from the imported XML at .*I_Module\^M_Init \(declaration\).*"
+                                         r"nothing written.*copies kept"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert kids[0].DeclarationText == "METHOD M_Init : BOOL // old\n" and proj.deleted == []
+    proj._children = [c for c in proj._children if c.Name != "I_Module_1"]
+    # the copy as the XML has it: checked against the XML; the header, which the XML has no text for, is named
+    proj.on_import = dup
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    rec = r["replaced"][0]
+    assert rec["checked_against"] == "xml" and rec["not_in_xml"] == [f"{base} (declaration)"], rec
+    assert "no plain text" in rec["not_in_xml_note"] and "name" in rec["not_in_xml_note"], rec
+    assert orig.DeclarationText == "INTERFACE I_Module EXTENDS __SYSTEM.IQueryInterface\n"
+    assert kids[0].DeclarationText == decl["M_Init"] and proj.deleted == ["I_Module_1"]
+
+
 def test_n10_n45_online_commands_and_check_all_objects_via_the_automation_interface(xae):
     """#10: login/logout needed an active PLC project (UI selection never took); #45 Check all objects never ran.
     Both now go through the documented Automation Interface first: ConsumeXml online commands and
@@ -991,8 +1094,9 @@ def test_n81_a_graphical_body_is_named_from_the_language_before_any_text(xae):
     be, dte, sm = xae
     tree = {"_it": type("I", (), {"Language": 1})(), "kids": {
         "Act": {"_it": type("I", (), {"Language": 5})(), "kids": {}}}}
-    assert X.XaeBackend._non_st_language(tree, "POUs^FB_A") == "POUs^FB_A^Act (CFC)"
-    assert X.XaeBackend._non_st_language({"_it": type("I", (), {"Language": 0})(), "kids": {}}, "GVL") is None
+    # (a method since N174: the Language read goes through the backend's _retry)
+    assert be._non_st_language(tree, "POUs^FB_A") == "POUs^FB_A^Act (CFC)"
+    assert be._non_st_language({"_it": type("I", (), {"Language": 0})(), "kids": {}}, "GVL") is None
 
 
 def test_silent_mode_is_on_only_during_a_confirmed_command(xae):
@@ -1049,7 +1153,7 @@ def test_review_plcimportoptions_are_read_from_the_type_library_as_pywin32_gives
     obj = type("Item", (), {"_oleobj_": Ole()})()
     assert X._typelib_enum(obj, "PLCIMPORTOPTIONS") == {"PLCIMPORTOPTIONS_NONE": 0, "PLCIMPORTOPTIONS_REPLACE": 1,
                                                         "PLCIMPORTOPTIONS_RENAME": 2, "PLCIMPORTOPTIONS_SKIP": 3}
-    be = X.XaeBackend.__new__(X.XaeBackend)
+    be = X.XaeBackend(XaeConfig())               # (N174: the type library is read through the backend's _retry)
     m, src = be._import_options(obj)
     assert m == {"none": 0, "replace": 1, "rename": 2, "skip": 3} and src.startswith("type library"), (m, src)
 
@@ -1328,3 +1432,238 @@ def test_rereview_0814_a_stale_object_error_never_repeats_an_action(xae, monkeyp
             raise ComError(X.E_POINTER)
         return "5.1.2.3.1.1"
     assert be._retry(read, "GetTargetNetId") == "5.1.2.3.1.1" and reads["k"] == 2      # a read still retries
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# N174 (0.8.14 retest, S3): xae_build and xae_deploy right after a PLCopen import failed with "internal error …
+# com_error (-2147418111, 'Call was rejected by callee.') — a defect in twincat-mcp"; repeating them worked. A COM
+# access outside _retry let the busy shell's rejection escape (and accesses inside a bare try/except read a busy shell
+# as "no value"). Every public XAE method runs below against a shell that rejects each COM access — every property
+# read, property write and method call, at each line of xae_backend.py — the first times it is made, and against one
+# that rejects for ever.
+# ---------------------------------------------------------------------------------------------------------------------
+import sys as _sys
+import types as _types
+
+
+class _BusyShell:
+    """Counts what a busy shell rejected: per (line of xae_backend.py, object type, member, get/set/call)."""
+
+    def __init__(self, times):
+        self.times = times                 # None: rejected for ever
+        self.count: dict = {}
+        self.rejected = 0
+
+    @staticmethod
+    def _site() -> int:
+        f = _sys._getframe(3)
+        while f is not None and not f.f_code.co_filename.replace("\\", "/").endswith("twincat_mcp/xae_backend.py"):
+            f = f.f_back
+        return f.f_lineno if f is not None else 0
+
+    def hit(self, target, member, kind):
+        key = (self._site(), type(target).__name__, member, kind)
+        n = self.count.get(key, 0)
+        if self.times is None or n < self.times:
+            self.count[key] = n + 1
+            self.rejected += 1
+            raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+
+    def wrap(self, v):
+        if v is None or isinstance(v, (str, bytes, int, float, bool, list, tuple, dict, set)):
+            return v
+        return _Busy(v, self)
+
+
+class _Busy:
+    """A fake COM object served by a busy shell: what it returns is served the same way."""
+
+    def __init__(self, target, shell):
+        object.__setattr__(self, "_busy_t", target)
+        object.__setattr__(self, "_busy_s", shell)
+
+    def __getattr__(self, name):
+        t, s = object.__getattribute__(self, "_busy_t"), object.__getattribute__(self, "_busy_s")
+        if name.startswith("_"):
+            return getattr(t, name)          # Python-side attributes (_oleobj_ …): no COM call
+        s.hit(t, name, "get")
+        v = getattr(t, name)
+        if callable(v) and not isinstance(v, type):
+            def call(*a, **k):
+                s.hit(t, name, "call")
+                return s.wrap(v(*a, **k))
+            return call
+        return s.wrap(v)
+
+    def __setattr__(self, name, value):
+        t, s = object.__getattribute__(self, "_busy_t"), object.__getattribute__(self, "_busy_s")
+        s.hit(t, name, "set")
+        setattr(t, name, value)
+
+
+class _Clock:
+    """xae_backend's `time` on a virtual clock: a retry window of 60 s passes without waiting. step: what one sleep
+    advances it by (None: the time asked for) — a small step keeps a shell that rejects each access a few times from
+    adding up to a minute of back-off over a call of many accesses (a busy shell rejects for a while, not per access)."""
+
+    def __init__(self, step=None):
+        import time as _t
+        self.now = 1_000_000.0
+        self.step = step
+        self.strftime = _t.strftime
+
+    def time(self):
+        return self.now
+
+    monotonic = time
+
+    def sleep(self, s):
+        self.now += self.step if self.step is not None else max(float(s), 0.001)
+
+
+class _Ms:
+    """The Scope configuration of a TwinCAT Measurement project (IMeasurementScope)."""
+    def __init__(self):
+        self.calls = []
+
+    def StartRecord(self):
+        self.calls.append("start")
+        return 0
+
+    def StopRecord(self):
+        self.calls.append("stop")
+        return 0
+
+
+def _world(times, tmp):
+    """The fixture's fake XAE (plus I/O devices, the PLC instance, a Measurement project and a Scope) whose DTE is
+    served by a shell that rejects each COM access `times` times (None: always)."""
+    be = X.XaeBackend(XaeConfig(com_retry_s=60))
+    sm = FakeSysMan()
+    tiid = FakeItem("TIID", "TIID", [FakeItem("Device 1 (EtherCAT)", "TIID^Device 1 (EtherCAT)")])
+    grp = FakeItem("PlcTask Inputs", "TIPC^Plc^Plc Instance^PlcTask Inputs",
+                   xml="<TreeItem><Vars><Var><Name>bIn</Name><Type>BOOL</Type></Var></Vars></TreeItem>")
+    inst = FakeItem("Plc Instance", "TIPC^Plc^Plc Instance", [grp])
+    for it in (tiid, tiid._children[0], grp, inst):
+        sm.items[it.PathName] = it
+    sm.items["TIPC^Plc^Plc Project"].CheckAllObjects = lambda: True
+    dte = FakeDTE(sm)
+    scope_item = _types.SimpleNamespace(Name="Scope_Counter", Object=_Ms(), SubProject=None)
+    meas = _types.SimpleNamespace(Name="Measurement", FullName=r"C:\P\M.tcmproj", ProjectItems=FakeProjects([scope_item]))
+    dte.Solution.Projects._l.append(meas)
+    dte.Solution.Open = lambda p: None
+    dte.Solution.Close = lambda save: None
+    shell = _BusyShell(times)
+    proxy = shell.wrap(dte)
+    be._require_win = lambda: None
+    be._rot_candidates = lambda: [{"progid": "TcXaeShell.DTE.17.0", "moniker": "!TcXaeShell.DTE.17.0:1",
+                                   "dte": proxy, "solution": r"C:\P\Machine.sln"}]
+    be._dte2 = lambda: None
+    return be, sm, shell
+
+
+def _replace_import(be, sm, tmp):
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp)
+    proj.on_import = dup
+    return be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+
+
+_MAIN = "TIPC^Plc^Plc Project^POUs^MAIN"
+_POUS = "TIPC^Plc^Plc Project^POUs"
+# every public method of XaeBackend that touches COM
+_PUBLIC_XAE = {
+    "attach": lambda be, sm, tmp: be.attach(),
+    "status": lambda be, sm, tmp: (be.attach(), be.status())[1],
+    "open_solution": lambda be, sm, tmp: (be.attach(), be.open_solution(str(tmp / "Machine.sln")))[1],
+    "save_all": lambda be, sm, tmp: be.save_all(),
+    "close_solution": lambda be, sm, tmp: be.close_solution(),
+    "build": lambda be, sm, tmp: be.build(),
+    "build(clean)": lambda be, sm, tmp: be.build(clean=True),
+    "errors": lambda be, sm, tmp: be.errors(),
+    "build_output": lambda be, sm, tmp: be.build_output(),
+    "command": lambda be, sm, tmp: be.command("File.SaveAll"),
+    "list_commands": lambda be, sm, tmp: be.list_commands("PLC"),
+    "plc_action": lambda be, sm, tmp: be.plc_action("logout"),
+    "target_get": lambda be, sm, tmp: be.target_get(),
+    "target_set": lambda be, sm, tmp: be.target_set("5.9.9.9.1.1"),
+    "activate_configuration": lambda be, sm, tmp: be.activate_configuration(),
+    "restart_twincat": lambda be, sm, tmp: be.restart_twincat(),
+    "item_exists": lambda be, sm, tmp: be.item_exists(_MAIN),
+    "tree_item": lambda be, sm, tmp: be.tree_item(_MAIN),
+    "tree_children": lambda be, sm, tmp: be.tree_children("TIPC", depth=4),
+    "tree_xml": lambda be, sm, tmp: be.tree_xml("TIRC^Tasks^PlcTask"),
+    "tree_consume_xml": lambda be, sm, tmp: be.tree_consume_xml("TIRC^Tasks^PlcTask", "<TreeItem/>"),
+    "tree_set_values": lambda be, sm, tmp: be.tree_set_values("TIRC^Tasks^PlcTask", {"TaskDef/CycleTime": "50000"}),
+    "tree_create_child": lambda be, sm, tmp: be.tree_create_child(_POUS, "FB_New", 604),
+    "tree_delete_child": lambda be, sm, tmp: be.tree_delete_child(_POUS, "MAIN"),
+    "plc_projects": lambda be, sm, tmp: be.plc_projects(),
+    "pou_get": lambda be, sm, tmp: be.pou_get(_MAIN),
+    "pou_set": lambda be, sm, tmp: be.pou_set(_MAIN, "PROGRAM MAIN\nVAR\nEND_VAR", "x := 1;"),
+    "pou_create": lambda be, sm, tmp: be.pou_create(_POUS, "FB_X", "fb", declaration="FUNCTION_BLOCK FB_X"),
+    "pou_create(property)": lambda be, sm, tmp: be.pou_create(_MAIN, "P", "property", return_type="INT"),
+    "plcopen_import(replace)": _replace_import,
+    "plcopen_export": lambda be, sm, tmp: be.plcopen_export("TIPC^Plc", ["MAIN"], str(tmp / f"x{id(be)}.xml")),
+    "boot_project": lambda be, sm, tmp: be.boot_project("TIPC^Plc", True, True),
+    "io_disable": lambda be, sm, tmp: be.io_disable(True),
+    "links": lambda be, sm, tmp: be.links("TIPC^Plc"),
+    "check_all_objects": lambda be, sm, tmp: be.check_all_objects(),
+    "scope_list": lambda be, sm, tmp: be.scope_list(),
+    "scope_action": lambda be, sm, tmp: be.scope_action("start"),
+}
+_VOLATILE = {"duration_s", "command_s", "elapsed_s", "file"}
+
+
+def _stable(v, run_dir):
+    """A result without its timings, the run's own folder written as <run>."""
+    if isinstance(v, dict):
+        return {k: _stable(x, run_dir) for k, x in v.items() if k not in _VOLATILE}
+    if isinstance(v, list):
+        return [_stable(x, run_dir) for x in v]
+    return v.replace(str(run_dir), "<run>") if isinstance(v, str) else v
+
+
+@pytest.mark.parametrize("name", list(_PUBLIC_XAE))
+def test_n174_a_busy_shell_is_asked_again_by_every_public_method(name, monkeypatch, tmp_path):
+    """B1: each COM access is rejected (RPC_E_CALL_REJECTED) three times, then served: the result is the one an idle
+    shell gives — no raw com_error escapes (the 'internal error' of xae_build / xae_deploy), and no access inside a
+    try/except reads the busy shell as 'nothing there' (a missing tree item, no solution, an empty Error List)."""
+    monkeypatch.setattr(X, "time", _Clock(step=0.01))
+    calm = tmp_path / "calm"
+    busy = tmp_path / "busy"
+    for d in (calm, busy):
+        d.mkdir()
+        (d / "Machine.sln").write_text("")
+    be, sm, shell = _world(0, calm)
+    want = _stable(_PUBLIC_XAE[name](be, sm, calm), calm)
+    be, sm, shell = _world(3, busy)
+    try:
+        got = _stable(_PUBLIC_XAE[name](be, sm, busy), busy)
+    except ComError as exc:
+        pytest.fail(f"{name}: a raw com_error escaped ({exc}) after {shell.rejected} rejections")
+    assert shell.rejected > 0
+    assert got == want, f"{name} on a busy shell:\n{got}\nidle:\n{want}"
+
+
+@pytest.mark.parametrize("name", list(_PUBLIC_XAE))
+def test_n174_a_shell_that_stays_busy_is_said_never_a_raw_error(name, monkeypatch, tmp_path):
+    """B2: every COM access rejected for ever: after com_retry_s the method raises an XaeError that says XAE is busy
+    and did not run the call — never a raw com_error, never a result read from 'nothing'."""
+    monkeypatch.setattr(X, "time", _Clock())
+    (tmp_path / "Machine.sln").write_text("")
+    be, sm, shell = _world(None, tmp_path)
+    if name in ("attach", "status"):
+        # status reports instead of raising: what could not be read says the shell is busy, and nothing is claimed
+        # about the solution (it said 'no solution open' when the read was rejected)
+        try:
+            r = _PUBLIC_XAE[name](be, sm, tmp_path)
+        except ComError as exc:
+            pytest.fail(f"{name}: a raw com_error escaped ({exc})")
+        blob = str(r)
+        assert "XAE is busy" in blob and "no solution open" not in blob, r
+        return
+    if name == "item_exists":
+        assert _PUBLIC_XAE[name](be, sm, tmp_path) is None     # N124: 'the shell cannot say', never 'gone'
+        return
+    with pytest.raises(X.XaeError) as ei:
+        _PUBLIC_XAE[name](be, sm, tmp_path)
+    assert "XAE is busy (call rejected, 0x80010001)" in str(ei.value) and "did not run" in str(ei.value), str(ei.value)

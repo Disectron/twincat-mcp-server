@@ -361,3 +361,137 @@ def test_r26_ms_xhelp_links_resolve_to_pages(tmp_path):
         ix.get_page("ms-xhelp:///?Id=nope")
     with pytest.raises(InfosysError, match="max_chars"):
         ix.get_page(target, max_chars=-1)
+
+
+def _hv_page(title: str, body: str, hid: str) -> str:
+    return (f'<html><head><meta name="Title" content="{title}" /><meta name="Microsoft.Help.Id" content="{hid}" />'
+            f"</head><body><article><h1>{title}</h1>{body}</article></body></html>")
+
+
+def _tbl(head, *rows) -> str:
+    return ("<table><tr>" + "".join(f"<th>{h}</th>" for h in head) + "</tr>"
+            + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows) + "</table>")
+
+
+_VARS = ("Name", "Data type", "Description")
+# The real page tc3_plc_intro/2525821323 (shortened): 22 '## Method X' sections in the original, no code declares
+# anything, and the GVL ReturnValues as a table
+RECIPE_PAGES = {
+    "tc3_plc_intro/1033/2525821323.html": _hv_page(
+        "Library Recipe Management - RecipeManCommands",
+        '<p>The methods of the function block RecipeManCommands from the library "Recipe Management" enable the '
+        "recipes to be managed programmatically.</p>"
+        "<h2>Method CreateRecipe</h2><p>This method creates a new recipe in the specified recipe definition. It then "
+        "reads the current PLC values into the new recipe.</p>"
+        "<p><b>Inputs (VAR_INPUT)</b></p>"
+        + _tbl(_VARS, ("RecipeDefinitionName", "STRING", "Name of the recipe definition"),
+               ("RecipeName", "STRING", "Name of the recipe"))
+        + "<p><b>Return value</b></p>"
+        + _tbl(_VARS, ("CreateRecipe", "DWORD", "ERR_RECIPE_DEFINITION_NOT_FOUND ERR_OK"))
+        + "<h2>Method GetRecipeNames</h2><p>This method returns the recipe names in a recipe definition.</p>"
+        "<p><b>Inputs (VAR_INPUT)</b></p>"
+        + _tbl(_VARS, ("RecipeDefinitionName", "STRING", "Name of the recipe definition"),
+               ("pStrings", "POINTER TO ARRAY [] OF STRING", "Pointer to the array of the recipe names."),
+               ("iSize", "INT", "Number of elements in the STRING array"), ("iStartIndex", "INT", "Start index"))
+        + "<p><b>Return value</b></p>" + _tbl(_VARS, ("GetRecipeNames", "DWORD", "ERR_OK"))
+        + "<p><b>Example:</b></p><pre>strArr: ARRAY[0..9] OF STRING;</pre>"
+        "<h2>Method GetRecipeValues</h2><p>This method returns the values of a recipe.</p>"
+        "<p><b>Inputs (VAR_INPUT)</b></p>"
+        + _tbl(_VARS, ("RecipeName", "", "Name of the recipe")) + "<p><b>Return value</b></p>"
+        + _tbl(_VARS, ("GetRecipeValues", "DWORD", "ERR_OK"))
+        + "<h2>Return values</h2><p>The return values of the functions described above are contained in the GVL "
+        "ReturnValues.</p><p>These are InOut constants of the data type UDINT.</p>"
+        + _tbl(("Name", "Initialization value", "Comment"), ("ERR_OK", "16#0", "The operation was carried out successfully."),
+               ("ERR_FAILED", "16#1", "The operation failed."), ("ERR_RECIPE_NOT_FOUND", "16#4003", "The recipe was not found.")),
+        "recipe-commands"),
+    "tc3_plc_intro/1033/2525822000.html": _hv_page(
+        "Library Alarm Manager - AlarmCommands", "<h2>Overview</h2><p>The commands of the alarm manager.</p>",
+        "alarm-commands"),
+    # the HMI JavaScript function of the name, in lower case: a page about JS, documents no IEC symbol
+    "te2000_tc3_hmi_engineering/1033/5678986763.html": _hv_page(
+        "createRecipe", "<p>Creates a new recipe on the server.</p>"
+        "<pre>TcHmi.Server.RecipeManagement.createRecipe(recipeName, recipeTypeName, values, callback);</pre>",
+        "hmi-create-recipe"),
+    # value tables that are NOT IEC constants: a C enumeration (ADS DLL), a CNC parameter, an enum type's own page
+    "tc3_adsdll2/1033/117590027.html": _hv_page(
+        "ADSSTATE", "<p>The enumeration type ADSSTATE describes the Ads state with the following values</p>"
+        + _tbl(("Const", "Int value", "Description"), ("ADSSTATE_INVALID", "0", "invalid"), ("ADSSTATE_IDLE", "1", "idle"),
+               ("ADSSTATE_RESET", "2", "reset")), "ads-state"),
+    "tc3_adsdll2/1033/117588491.html": _hv_page(
+        "ADSERRORCODES", "<p>Ads errors:</p>" + _tbl(("Const", "Hex value", "Description"),
+                                                     ("ADS_E_ERROR", "0x98117000", "error"),
+                                                     ("ADS_E_SRVNOTSUPP", "0x98117001", "not supported")), "ads-err"),
+    "tf5200_channel_parameter/1033/148909195.html": _hv_page(
+        "Synchronisation types of M functions (P-CHAN-00041)", "<p>Possible values:</p>"
+        + _tbl(("Constant", "Value", "Meaning"), ("NO_SYNCH", "0", "none"), ("MOS_SYNCH", "1", "output")), "cnc-sync"),
+    "tcplclib_tc2_system/1033/31084171.html": _hv_page(
+        "Constants", "<h2>ADS/System Services</h2>"
+        + _tbl(("Reserved Index Groups", "Value", "Description"), ("ADSIGRP_SYMTAB", "16#F000", "symbol table"),
+               ("ADSIGRP_SYMNAME", "16#F001", "symbol name"))
+        + "<h2>Port numbers</h2>" + _tbl(("Port numbers", "Value", "Description"), ("AMSPORT_LOGGER", "100", "logger"),
+                                         ("AMSPORT_EVENTLOG", "110", "event log")), "tc2-constants"),
+    "tf5130_tc3_unival_plc/1033/9821336075.html": _hv_page(
+        "eStateMachine", "<pre>TYPE eStateMachine :\n(\n    SM_POWEROFF := 16#0,\n    SM_STANDBY := 16#1\n);\nEND_TYPE</pre>"
+        + _tbl(("Name", "Initial", "Description"), ("SM_POWEROFF", "16#0", "off"), ("SM_STANDBY", "16#1", "standby")),
+        "unival-sm"),
+}
+
+
+def test_n170_symbols_documented_inside_one_page_are_built_and_answered(tmp_path):
+    """N170 (S3, 0.8.14 retest): decl RecipeManCommands / CreateRecipe / ReadAndSaveRecipe → 'no page for symbol'.
+    All are documented on ONE page (tc3_plc_intro/2525821323) as '## Method X' sections with Inputs / Return value
+    tables and no code, the ERR_ codes of the GVL ReturnValues as a table; nothing built a declaration from them. The
+    build stores those as symbols (a method with its reconstructed declaration, the FB the text names, the constants)
+    and says how many (C7); every reader answers them (C1–C5). Value tables that are not IEC constants — a C
+    enumeration, 0x values, a CNC parameter, an enum type's own values — are no constants."""
+    from twincat_mcp import infosys_build as IB
+    d = tmp_path / "Microsoft" / "HelpLibrary2" / "Catalogs" / "VisualStudio15" / "ContentStore" / "EN-US"
+    d.mkdir(parents=True)
+    pkg = make_mshc(d / "BKINFOSYS3_VS_100_EN-US.2.mshc", RECIPE_PAGES)
+    final = tmp_path / "index" / "infosys-1033.db"
+    lines: list[str] = []
+    res = IB.build(final, pkg, log=lines.append)
+    assert res["result"] == "built", res
+    # C7: the build says what it found inside pages
+    assert res["symbols_in_pages"] == {"Constant": 7, "FunctionBlock": 1, "Method": 3}, res["symbols_in_pages"]
+    assert "symbols documented inside pages: 7 Constant, 1 FunctionBlock, 3 Method" in lines, lines
+    ix = InfosysIndex(db_file=final, fetcher=NoNetwork(), local=HV.HelpViewerSource(pkg), read_only=True)
+    page = C + "tc3_plc_intro/2525821323.html"
+    # C1: the FB is known by its methods
+    fb = ix.declaration("RecipeManCommands")
+    assert fb["kind"] == "FunctionBlock" and fb["url"] == page, fb
+    assert [m["name"] for m in fb["methods"]] == ["CreateRecipe", "GetRecipeNames", "GetRecipeValues"]
+    assert fb["methods"][0]["description"].startswith("This method creates a new recipe")
+    assert fb["declaration"] == "FUNCTION_BLOCK RecipeManCommands   (* methods only — the page shows no VAR blocks *)"
+    # C2: a method, by FB.Method and by its bare name (and the HMI's lower-case JS function is no IEC symbol: C5)
+    for q in ("RecipeManCommands.CreateRecipe", "CreateRecipe", "createRecipe"):
+        m = ix.declaration(q)
+        assert m["kind"] == "Method" and m["return_type"] == "DWORD" and m["url"] == page, (q, m)
+        assert [(x["name"], x["type"]) for x in m["inputs"]] == [("RecipeDefinitionName", "STRING"), ("RecipeName", "STRING")]
+        assert m["parent"] == {"title": "RecipeManCommands", "url": page} and m["section"] == "Method CreateRecipe"
+        assert m["declaration"].splitlines()[0] == "METHOD CreateRecipe : DWORD   (* reconstructed from the page's tables *)"
+    # C3: the parameters exactly as the tables give them — a type the page leaves empty stays unknown
+    g = ix.declaration("GetRecipeNames")
+    assert [(x["name"], x["type"]) for x in g["inputs"]] == [
+        ("RecipeDefinitionName", "STRING"), ("pStrings", "POINTER TO ARRAY [] OF STRING"), ("iSize", "INT"),
+        ("iStartIndex", "INT")]
+    assert ix.declaration("GetRecipeValues")["inputs"][0]["type"] is None
+    assert "(* type not given on the page *)" in ix.declaration("GetRecipeValues")["declaration"]
+    # C4: a constant of the GVL, with its type and value
+    for q in ("ERR_RECIPE_NOT_FOUND", "ReturnValues.ERR_RECIPE_NOT_FOUND"):
+        k = ix.declaration(q)
+        assert (k["kind"], k["value"], k["type"], k["gvl"]) == ("Constant", "16#4003", "UDINT", "ReturnValues"), k
+        assert k["declaration"] == "ERR_RECIPE_NOT_FOUND : UDINT := 16#4003;" and k["section"] == "Return values"
+    assert ix.declaration("AMSPORT_LOGGER")["value"] == "100"        # decimal, on a page that writes IEC values
+    assert ix.declaration("ADSIGRP_SYMTAB")["value"] == "16#F000"
+    for q in ("ADSSTATE_INVALID", "ADS_E_ERROR", "NO_SYNCH", "SM_POWEROFF"):
+        with pytest.raises(InfosysError, match="no symbol page"):
+            ix.declaration(q)
+    # infosys_get_page by a method's name opens its section of the page (as the skill's docs_page)
+    g = ix.get_page("CreateRecipe")
+    assert g["url"] == page and g["section"] == "Method CreateRecipe" and g["markdown"].startswith("## Method CreateRecipe")
+    assert "Method GetRecipeNames" not in g["markdown"] and "Method GetRecipeNames" in g["outline"]
+    # a name no page and no section documents, but one title has as a word: that page, with its outline (§3.2.6)
+    t = ix.declaration("AlarmCommands")
+    assert (t["kind"], t["match"], t["url"]) == ("Page", "title", C + "tc3_plc_intro/2525822000.html"), t
+    assert t["outline"] == ["Library Alarm Manager - AlarmCommands", "Overview"] and t["declaration"] is None

@@ -24,9 +24,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (6, "be63695fc32e063d")   # 0.8.14: TOC parents (N126), page charset (N138)
-MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
-ESI_FINGERPRINT = ("1", "12f26f31cd9afc7d")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
+INFOSYS_FINGERPRINT = (7, "522da891f1fbc1ee")   # 0.8.15: kinds from the page's own evidence (N150 N151 N157 N172),
+#                                                    symbols inside pages (N170)
+MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes of every family (N163)
+ESI_FINGERPRINT = ("2", "49f0ad9346541e7b")    # index\\esi.db (esi_index.py): format 2 — modules found by their
+#                                                 devices (N156, 0.8.14 retest), one object per index of a dictionary
+#                                                 (EL6653, kb_verify E2; format 2 is not released yet); 1 since 0.8.12
 
 EXCLUDE = frozenset({
     "_db", "_Conn", "_file_sig", "_probe", "_writable", "missing_text", "ro_uri", "source", "has_fts", "_bump_gen",
@@ -156,7 +159,8 @@ def test_the_esi_closure_reaches_the_parsers():
     found = esi_code()
     for name in ("parse_device", "parse_dictionary", "parse_diag_messages", "parse_module", "iter_info",
                  "iter_modules", "_templates", "_pdo", "_chn", "_slots", "_mappings", "decode_data", "_INT_TYPES",
-                 "_Build", "_Writer", "SCHEMA", "FTS", "_resolve_ref", "_title", "_hash", "_pack"):
+                 "_Build", "_Writer", "SCHEMA", "FTS", "_resolve_ref", "_title", "_hash", "_pack",
+                 "module_candidates"):           # N156: the slot rule decides a module's search text
         assert name in found, name
 
 

@@ -29,18 +29,18 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 ## Which command
 | Question | Command |
 |---|---|
-| Inputs/outputs/members of a known FB, function, struct or enum | `docs_declaration symbol=ADSREAD book=tcplclib_tc2_system` |
-| Concept, how-to, error text, error code, anything else in Infosys | `docs_search query=… [book=glob] [limit=1-50]` → `ref` → `docs_page ref=… section=…` (the plugin's infosys_search: identifiers count as their words, titles that name the query first, an error code's defining table first — `code_note` —, one page in several books once — `same_page_in`) |
-| A page or a link from an answer | `docs_page ref=<book/pageid, Infosys URL, page id, exact title, ms-xhelp link> [section=] [offset=] [max_chars=200-20000]` |
+| Inputs/outputs/members of a known FB, function, struct or enum | `docs_declaration symbol=ADSREAD book=tcplclib_tc2_system` (or `library=Tc2_System`, as `infosys_*` take it) |
+| Concept, how-to, error text, error code, anything else in Infosys | `docs_search query=… [book=glob] [library=] [limit=1-50] [offset=]` → `ref` → `docs_page ref=… section=…` (the plugin's infosys_search: identifiers count as their words, titles that name the query first, an error code's defining table first — `code_note` —, one page in several books once — `same_page_in`) |
+| A page or a link from an answer | `docs_page ref=<book/pageid, Infosys URL, page id, exact title, ms-xhelp link> [section=] [offset=] [max_chars=200-60000]` |
 | Which books exist | `docs_books filter=tcplclib_tc2_*` |
-| Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so) |
-| Hardware: LEDs, wiring, diagnostics, error codes | `manual_search query=… [doc=CX9020]` → `manual_page doc=… pages=N-M` (≤ 21 pages) |
+| Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so; a code the index's product table lacks but its page text names is answered from the text: `matched_as: page text`, `note` says why) |
+| Hardware: LEDs, wiring, diagnostics, error codes | `manual_search query=… [doc=CX9020] [limit=1-50] [offset=]` → `manual_page doc=… pages=N-M [offset=]` (≤ 21 pages; `next` / `next_pages` + `next_offset` read on) |
 | Chapters of a manual | `manual_toc doc=CX9020 [depth=1-6]` |
 | Which manuals are indexed | `manual_docs [filter=…]` |
-| EtherCAT device from its ESI: PDOs and entries, PDO assignments, DC modes, slots, CoE object list | `hw_lookup query=EL3356-0010 [revision=#x…] [detail=newest\|summary\|full] [limit=1-30]` (a product code `#x0d1c3052` or part of a name works too) |
-| One CoE object: sub-indices, types, bit offsets, defaults (decoded), limits, enum texts | `hw_object device=EL3356-0010 index=#x8000 [revision=]` |
+| EtherCAT device from its ESI: PDOs and entries, PDO assignments, DC modes, slots, CoE object list, the indexed manuals that name it | `hw_lookup query=EL3356-0010 [revision=#x…] [detail=newest\|summary\|full] [limit=1-30]` (a product code `#x0d1c3052` / `0x0d1c3052` / decimal `219951186`, or part of a name works too; a revision that is not indexed: `note` + `revisions_available`) |
+| One CoE object: sub-indices, types, bit offsets, defaults (decoded), limits, enum texts | `hw_object device=EL3356-0010 index=#x8000 [revision=]` — one sub-index: `index=8000:11` (CoE notation, sub-index hex: 17) |
 | A diagnosis message (diagnosis history text id, object 0x10F3) | `hw_diag code=#x4101 [device=EL7211-0010]` |
-| Which device / object / message mentions a word | `hw_search query=… [kinds=device,object,diag,module] [limit=1-100]` |
+| Which device / object / message / module mentions a word | `hw_search query=… [kinds=device,object,diag,module] [limit=1-100] [offset=]` (a module is found by its devices too: `query=AX8206 kinds=module`) |
 | A module of a modular device (AX8000 slots, TSC) | `hw_module ident=#x006b0064 [device=AX8206-0210-0107]` |
 
 ## Rules
@@ -50,7 +50,18 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    the members (`inputs`, `outputs`, `in_out`, `members`, `enum_values`, `methods`, `properties`) as the index parsed
    them — the same answer as `infosys_declaration`; `declaration_blocks` are the page's own code blocks, which often
    lack the header (`FUNCTION MEMCPY : UDINT` is a heading on the page). A method or property of an FB:
-   `symbol=FB_WG_ComboFilter.Call` (Beckhoff titles the page `Call`; the Help Viewer contents tie it to its FB).
+   `symbol=FB_WG_ComboFilter.Call` (Beckhoff titles the page `Call`; the Help Viewer contents tie it to its FB). A
+   member the FB does not document itself is looked up where its page says it is defined, then up EXTENDS /
+   IMPLEMENTS (`FB_TcMessage.Send` → `I_TcMessage`'s; `defined_in` says so). A symbol documented inside another page
+   (RecipeManCommands' methods as `## Method X` sections, a GVL's constants as a table) answers with `section` and a
+   declaration reconstructed from the page's tables (`reconstructed`); `docs_page ref=<that name>` opens its section.
+   A page whose Syntax section declares another name than its title: when no other page of its library documents
+   that name and the page's tables document nothing the header lacks, the header is its declaration (`declared_as`,
+   `declared_as_note`: `ActualsActuator` declares `FB_ActuatorActuals`) and the declared name finds the page.
+   Otherwise the header is another symbol's (Beckhoff's copy of a neighbour's: `SendMessageEx2` shows
+   `METHOD SendMessageEx`) — `syntax_header_note` says why, and the page shows no declaration of its own; read the
+   page's tables (`docs_page`) rather than that header.
+   A name that only a page title has as a word answers that page (`kind: Page`, `match: title`, `outline`).
 3. `ambiguous` = the name is documented by different pages (Tc2_MC2 vs Tc3_DriveMotionControl, or two methods of
    that name in one library). Nothing was chosen for you. Find the library the project uses (`proj_libraries` of the
    twincat server, or ask), call again with `book=` or `ref=`, and say in the answer which library you used. Never
@@ -69,9 +80,15 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    3 letters and words on no page are dropped first (`words_ignored` gives the reason), and in the some-words step a
    word on more than 20 % of the pages does not pick pages (`words_too_common`); each hit then lists the words it holds
    (`matched`). Nothing informative left → no hits: say so instead of reading unrelated pages.
-8. Ranges are refused, not clamped. Read the `message` and correct the call. Do not retry it unchanged.
+   `manual_search`: a hex number or CoE index (`0x8000`, `#x8000`, `16#8000`, `8000:11`) is found in any of these
+   notations, and a unit symbol (`°C`, `mV/V`, `mA`, `µs`, `kΩ`) as written on the page, not as its letters; `terms`
+   says how each was searched.
+8. Ranges are refused — read the `message` (it names the way on) and correct the call; do not retry it unchanged.
+   The searches are the exception: `docs_search` / `manual_search` use a `limit` above 50 as 50, `hw_search` above
+   100 as 100 (`clamped: true`, `clamped_note`); further hits come with `offset=<next_offset>` (`total` counts them).
 9. Long pages: `section=` first (the `outline` lists the headings), then `offset=<next_offset>`. Never page through
-   a whole book.
+   a whole book. A manual's pages cut at `max_chars`: `manual_page pages=<next_pages> offset=<next_offset>` (`next`
+   names the call).
 10. Nothing found → say so. Then try the twincat server's `infosys_*` tools. A manual that is not indexed: the user
     copies the PDF into `<kb>\manuals\` and runs `manuals_db.py update` (`hint` names the command).
 11. Read-only: the script never changes the databases.

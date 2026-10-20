@@ -39,7 +39,42 @@ that the their then there these this to was were what when where which while who
 der die das den dem des ein eine einer eines einem und oder ist sind wie was wann wo warum mit von zu zum zur im in
 am an auf aus bei für nicht kein keine ich es er sie wir ihr
 """.split())
+GERMAN_STOP_WORDS = frozenset(fold(w) for w in """
+der die das den dem des ein eine einer eines einem und oder ist sind wie was wann wo warum mit von zu zum zur im in
+am an auf aus bei für nicht kein keine ich es er sie wir ihr
+""".split()) - frozenset(fold(w) for w in "in an am was".split())
 COMMON_SHARE = 0.2          # a word on more than this share of the pages does not pick a page in the some-words tier
+# N148 (0.8.14 retest): IEC 61131-3 keywords that are English stop words or shorter than 3 letters — 'THIS pointer'
+# dropped THIS (the page THIS could not be found), 'FOR loop BY step' dropped FOR and BY
+IEC_KEYWORDS = frozenset("""
+FOR TO BY DO OF IF THEN ELSE ELSIF CASE WHILE REPEAT UNTIL EXIT RETURN THIS SUPER AND OR NOT XOR MOD AT IN ON ST
+""".split())
+STOP_WORDS_UPPER = frozenset(w.upper() for w in STOP_WORDS)
+# those a lower-case query is told about when they are dropped (not the small words of every English sentence)
+_KEYWORD_HINT = frozenset("THIS SUPER FOR WHILE REPEAT UNTIL CASE EXIT RETURN ELSIF MOD XOR".split())
+
+
+def keyword(w: str) -> bool:
+    """N148: a word written in capitals — an IEC keyword (FOR, BY, THIS, ST) or an acronym of the documentation (AL,
+    RT, DC, ADS): searched as a word, never a stop word or a too-short word. Two letters at least."""
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9]*", w)) and sum(c.isalpha() for c in w) >= 2
+
+
+def ignore_reason(w: str) -> str | None:
+    """Why a word of a question in words is not searched alone (None: it is): a stop word, a word of 1-2 letters —
+    not a word written in capitals (keyword). The reason says how to search an IEC keyword written in lower case."""
+    if keyword(w):
+        return None
+    f = fold(w)
+    if f in STOP_WORDS:
+        why = "stop word" + (" (German)" if f in GERMAN_STOP_WORDS else "")
+        if w.upper() in _KEYWORD_HINT:
+            why += f" — the IEC keyword is searched when written in capitals ({w.upper()})"
+        return why
+    if len(w) < 3 and not w.isdigit():
+        return "shorter than 3 letters" + (f" — written in capitals it is searched ({w.upper()})"
+                                           if w.upper() in IEC_KEYWORDS - STOP_WORDS_UPPER else "")
+    return None
 
 
 # ------------------------------------------------------------------------------------------- identifiers as words
@@ -89,11 +124,12 @@ def natural(q: str) -> bool:
 
 
 def informative_words(q: str) -> list[str]:
-    """The query's words that can pick a page (folded): no stop words, no 1-2 letter words (numbers are kept)."""
+    """The query's words that can pick a page (folded): no stop words, no 1-2 letter words (numbers are kept) —
+    a word written in capitals always (N148: FOR, BY, THIS, ST)."""
     out = []
     for w in re.findall(r"[^\W_]+", query_text(q)):
         f = fold(w)
-        if f not in STOP_WORDS and (len(f) >= 3 or f.isdigit()) and f not in out:
+        if ignore_reason(w) is None and f not in out:
             out.append(f)
     return out
 
@@ -179,8 +215,8 @@ def infosys_rank(con: sqlite3.Connection) -> str:
 
 def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, extra: list[Any],
                  limit: int, title_key: str | None = None, fts: str = "fts",
-                 arrange: Callable[[list[Any]], list[Any]] | None = None, title_col: str | None = None,
-                 title_sql: str | None = None) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
+                 arrange: Callable[..., list[Any]] | None = None, title_col: str | None = None,
+                 title_sql: str | None = None, skip: int = 0) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
     """N36/N65: a question in words falls back in steps, and only on words that can pick a page:
       1. every word as written (stop words included: a precise query stays precise);
       2. every informative word that occurs in the index — stop words, 1-2 letter words and words on no page dropped;
@@ -193,28 +229,47 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
     the title are read as well (title_hits), not only the best by bm25: a page titled as the query is ordered by its
     title wherever bm25 ranks it. FTS5 syntax or code punctuation
     runs as written (run_fts, with the phrase retry). Needs vocab(con, fts) for the term statistics.
+    skip (N167, paging): the hits up to skip + limit are returned, the caller shows those after `skip`. The title order
+    sees the same hits whatever the page — the best _fetch(limit) by bm25 and their title hits — and the hits after
+    those follow in bm25 order (arrange(rows, tail)): a page never repeats or skips a hit of another.
     -> (rows, total, mode, expression, info: words used / ignored with the reason)."""
-    q = query_text(query).strip()
+    # N149 (0.8.14 retest): ST's dereference 'THIS^' / 'pRef^' is no FTS5 initial-token operator ('^word'); the
+    # index has no punctuation — it is the word
+    q = re.sub(r"(?<=\w)\^+", "", query_text(query)).strip()
+    ordered = title_key or arrange
+    head_n = _fetch(limit, ordered)                # the hits the title order sees: the same for every page (N167)
+    want = head_n + (skip + limit) * 3 if skip and ordered else max(head_n, skip + limit)
     if not natural(q):
-        rows, mode, expr = run_fts(con, sql, query, extra + [_fetch(limit, title_key or arrange)])
-        rows = _arranged(rows, q, title_key, arrange)
-        return rows[:limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr, {}
+        rows, mode, expr = run_fts(con, sql, q, extra + [want])
+        if not rows:
+            # N149 (0.8.14 retest): 'THIS^ SUPER^' / 'set reset S= R=' — as written (a phrase) nothing, and nothing
+            # else was tried: its words are searched as a question in words
+            plain = re.sub(r'[^\w\s]|\b(?:AND|OR|NOT|NEAR)\b', " ", q)
+            if has_words(plain) and plain.split() != q.split():
+                got = search_tiers(con, sql, count_sql, plain, extra, limit, title_key, fts, arrange, title_col,
+                                   title_sql, skip)
+                if got[0]:
+                    info = dict(got[4])
+                    info["as_written"] = f"{q!r} as written ({mode}) found nothing — its words were searched"
+                    return got[0], got[1], f"words of the query ({got[2]})", got[3], info
+        rows = _arranged(rows[:head_n] if ordered else rows, q, title_key, arrange, rows[head_n:] if ordered else [])
+        return rows[:skip + limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr, {}
     words = [w for w in re.findall(r"[^\W_]+(?:_[^\W_]+)*", q)]
     if not words:
         raise SearchError("empty_query", f"the query {query!r} has no searchable word (punctuation is not indexed)")
-    if len(words) > 1 and all(fold(w) in STOP_WORDS for w in words):
+    if len(words) > 1 and all(fold(w) in STOP_WORDS and not keyword(w) for w in words):
         raise SearchError("empty_query", f"the query {query!r} has only stop words ({', '.join(words)}): they are on "
-                          "almost every page and pick none — give a name, a product code or specific words")
+                          "almost every page and pick none — give a name, a product code or specific words (an IEC "
+                          "keyword in capitals: FOR, THIS)")
 
     def ph(w: str) -> str:
         return '"' + w.replace('"', '""') + '"'
     ignored: dict[str, str] = {}
     informative = []
     for w in words:
-        if fold(w) in STOP_WORDS:
-            ignored[w] = "stop word"
-        elif len(w) < 3 and not w.isdigit():
-            ignored[w] = "shorter than 3 letters"
+        why = ignore_reason(w)
+        if why:
+            ignored[w] = why
         else:
             informative.append(w)
     pref = []                                  # informative words some term of the index starts with
@@ -231,23 +286,33 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
         tiers.append(("all words found in the index", " ".join(ph(w) for w in pref), pref))
     if pref:
         tiers.append(("all words (as prefixes)", " ".join(ph(w) + "*" for w in pref), pref))
+    kws = [w for w in pref if keyword(w)]
     if len(pref) > 1:
-        some = [w for w in pref if w not in common] or pref     # a word on most pages picks nothing — unless all are
+        # a word on most pages picks nothing — unless all are; N148: nor a keyword in capitals (THIS is 'this' in the
+        # index, on most pages — the pages titled THIS are found through their titles, title_hits)
+        some = [w for w in pref if w not in common or w in kws] or pref
         tiers.append(("some words (no page has all of them)", " OR ".join(ph(w) + "*" for w in some), some))
     for label, expr, used in tiers:
-        rows = con.execute(sql, [expr, *extra, _fetch(limit, title_key or arrange)]).fetchall()
-        if rows and title_col and title_sql and (title_key or arrange):
+        rows = con.execute(sql, [expr, *extra, want]).fetchall()
+        tail = rows[head_n:] if ordered else []
+        rows = rows[:head_n] if ordered else rows
+        if rows and title_col and title_sql and ordered:
             rows = rows + title_hits(con, title_sql, expr, used,
                                      label.endswith("(as prefixes)") or label.startswith("some"), extra, title_col,
-                                     {r[0] for r in rows}, q)
+                                     {r[0] for r in rows}, q, [w for w in kws if w in used])
+            have = {r[0] for r in rows}
+            tail = [r for r in tail if r[0] not in have]
         if rows:
-            rows = _arranged(rows, q, title_key, arrange)
+            rows = _arranged(rows, q, title_key, arrange, tail)
             info: dict[str, Any] = {"words_used": used}
-            if ignored:
-                info["words_ignored"] = ignored
+            # N166 (0.8.14 retest): the first tier searches every word as written — a word it used is not ignored
+            # ('AL status codes': words_used AL and words_ignored AL 'shorter than 3 letters')
+            left = {w: why for w, why in ignored.items() if w not in used}
+            if left:
+                info["words_ignored"] = left
             if label.startswith("some words") and common and set(used) != set(pref):
                 info["words_too_common"] = sorted(common)
-            return rows[:limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], label, expr, info
+            return rows[:skip + limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], label, expr, info
     info = {"words_used": []}
     if ignored:
         info["words_ignored"] = ignored
@@ -255,7 +320,7 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
 
 
 def title_hits(con: sqlite3.Connection, sql: str, expr: str, used: list[str], prefix: bool, extra: list[Any],
-               title_col: str, have: set[Any], query: str = "") -> list[sqlite3.Row]:
+               title_col: str, have: set[Any], query: str = "", keywords: Iterable[str] = ()) -> list[sqlite3.Row]:
     """The hits of a tier (expr) that the title order must see, read besides the best by bm25, which it sees alone
     otherwise ('Data type' did not find the page titled 'Data type': bm25 rank 685, behind 300 'Data types' pages full
     of 'data type'): the hits whose title begins with the query's words in their order — the page titled as the query
@@ -270,10 +335,12 @@ def title_hits(con: sqlite3.Connection, sql: str, expr: str, used: list[str], pr
     toks = re.findall(r"[^\W_]+", query_text(query))
     if toks:
         conds.append(f'{title_col} : ^"{q_(" ".join(toks))}"')
-    words = [w for w in used if fold(w) not in STOP_WORDS and (len(w) >= 3 or w.isdigit())]
+    words = [w for w in used if ignore_reason(w) is None]
     if words:
         star = "*" if prefix else ""
         conds.append(" AND ".join(f'{title_col} : "{q_(w)}"{star}' for w in words))
+    # N148: the pages whose title has a keyword of the query ('THIS', 'FOR') — a common word in the text
+    conds += [f'{title_col} : "{q_(k)}"' for k in keywords]
     out: list[sqlite3.Row] = []
     seen = set(have)
     for cond in conds:
@@ -296,10 +363,13 @@ def _fetch(limit: int, ordered: Any) -> int:
     return min(max(limit * 3, 150), 300) if ordered else limit
 
 
-def _arranged(rows: list[Any], q: str, title_key: str | None, arrange: Callable[[list[Any]], list[Any]] | None) -> list[Any]:
+def _arranged(rows: list[Any], q: str, title_key: str | None, arrange: Callable[..., list[Any]] | None,
+              tail: list[Any] | None = None) -> list[Any]:
+    """The hits in their order: `rows` by their titles (or arrange), then `tail` (the hits after those the title
+    order sees, N167) in bm25 order — arrange(rows, tail) also merges the tail's copies."""
     if arrange is not None:
-        return arrange(rows)
-    return title_order(rows, q, title_key) if title_key else rows
+        return arrange(rows, tail or [])
+    return (title_order(rows, q, title_key) if title_key else rows) + list(tail or [])
 
 
 def matched_words(con: sqlite3.Connection, rowid: int, words: list[str], fts: str = "fts") -> list[str]:
@@ -331,6 +401,10 @@ def _title_terms(title: str) -> tuple[set[str], int]:
     return own | set(words), len(set(words)) or 1
 
 
+# a word of its own: not part of an identifier (AXIS_REF), not after a sigil ($FOR of the CNC, #x, %I)
+_CAPS_TOKEN = re.compile(r"(?<![\w$#%@&])[A-Za-z][A-Za-z0-9]*(?![\w])")
+
+
 def _word_seq(s: str) -> tuple[str, ...]:
     return tuple(fold(w) for w in re.findall(r"[^\W_]+", s or ""))
 
@@ -348,6 +422,13 @@ def title_order(rows: list[Any], query: str, title_key: str = "title", library_k
     want = informative_words(q)
     raw = {fold(w) for w in re.findall(r"\S+", q)}
     seq = _word_seq(q)
+    # review of 0.8.15: an IEC keyword, not every word in capitals — 'PLC persistent variables' put 'Resetting the PLC
+    # project' above 'Remanent Variables - PERSISTENT, RETAIN', 'CX9020 LED' lost 'Diagnostic LEDs': an acronym of
+    # the query is a word like any other (it is searched, keyword()); only a keyword names the page it titles
+    caps = {w for w in _CAPS_TOKEN.findall(q) if w in IEC_KEYWORDS}
+    # N149: an operator of the query as written — a word with its punctuation ('REF=', 'S=', 'THIS^') — that a title
+    # holds as one of its tokens: the page of that operator ('Assignment operator REF=', not AXIS_REF)
+    ops = {t for t in q.split() if re.search(r"\w", t) and re.search(r"[^\w\s]", t)}
     keyed = []
     for i, r in enumerate(rows):
         title = str(r[title_key] or "")
@@ -357,7 +438,10 @@ def title_order(rows: list[Any], query: str, title_key: str = "title", library_k
         with_lib = sum(1 for w in want if any(_same_word(t, w) for t in terms | lib)) if lib else cov
         exact = fold(title.strip()) in raw
         whole = bool(seq) and _word_seq(title) == seq
-        keyed.append(((not whole, -cov, -with_lib, not exact, -cov / size, i), r))
+        # N148: a keyword of the query written in capitals that the title has as a word of its own, in capitals —
+        # 'ST instruction FOR' for 'FOR loop BY step' (not the CNC's '$FOR'), 'THIS' for 'THIS pointer'
+        kw = (len(caps & set(_CAPS_TOKEN.findall(title))) if caps else 0) + (len(ops & set(title.split())) if ops else 0)
+        keyed.append(((not whole, -kw, -cov, -with_lib, not exact, -cov / size, i), r))
     keyed.sort(key=lambda x: x[0])
     return [r for _, r in keyed]
 

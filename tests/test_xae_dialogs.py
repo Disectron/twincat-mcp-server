@@ -1,7 +1,9 @@
-"""N85 / N86 / N87: modal dialogs of the XAE shell around Automation Interface calls (dialog enumeration faked)."""
+"""N85 / N86 / N87 / N173: modal dialogs of the XAE shell around Automation Interface calls (dialog enumeration faked)."""
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import threading
 import time
 
@@ -152,3 +154,506 @@ async def test_n93_a_run_to_run_restart_compares_the_application_it_read(monkeyp
         r = payload(await s.call_tool("xae_restart_twincat", {"confirm_token": "x"}))
     pa = r["plc_application"]
     assert pa["changed"] is True and pa["compiled_before"] is not None and pa["compared_with"] == "before this restart", pa
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# N173 (0.8.14 retest, S2): a modal window that is not a #32770 dialog (VS's About box, the Options window — WPF
+# HwndWrapper[…] or WinForms) was never seen: dialogs.py kept only top-level #32770 windows, so xae_command Help.About
+# hung 120 s and ended as a timeout, and xae_dialogs listed nothing. The window tree is faked below (EnumWindows,
+# GetWindow(GW_OWNER), IsWindowEnabled, …) and UI Automation is a stand-in: what a Windows desktop reports.
+# ---------------------------------------------------------------------------------------------------------------------
+WPF = "HwndWrapper[DefaultDomain;;6f6f2c5e-0a4c-4f3c-9a39-7c1d5c0f3a11]"
+WINFORMS = "WindowsForms10.Window.8.app.0.141b42a_r6_ad1"
+
+
+class _Desk:
+    """Top-level windows (and the child controls of #32770 dialogs) as Windows would report them."""
+
+    def __init__(self) -> None:
+        self.w: dict[int, dict] = {}
+        self.posted: list[tuple[int, int]] = []
+        self.lap: dict[int, int] = {}              # GetLastActivePopup(owner) → popup
+        self.invoked: list[tuple[int, str]] = []
+
+    def top(self, hwnd, cls, title="", pid=100, owner=0, enabled=True, visible=True, ex=0):
+        self.w[hwnd] = {"cls": cls, "title": title, "pid": pid, "owner": owner, "enabled": enabled, "visible": visible,
+                        "ex": ex, "style": 0, "kids": [], "top": True}
+        return hwnd
+
+    def child(self, parent, hwnd, cls, text, style=0):
+        self.w[hwnd] = {"cls": cls, "title": text, "pid": self.w[parent]["pid"], "owner": 0, "enabled": True,
+                        "visible": True, "ex": 0, "style": style, "kids": [], "top": False}
+        self.w[parent]["kids"].append(hwnd)
+
+    def install(self, monkeypatch, uia=None):
+        """Point dialogs.py at this desktop: win32gui / win32process / win32con, GetLastActivePopup and UI Automation
+        (uia: {hwnd: (buttons, texts)}; a window not in it cannot be read through UI Automation)."""
+        import types
+        w = self.w
+
+        def enum_windows(cb, extra):
+            for h in [h for h in w if w[h]["top"]]:
+                if cb(h, extra) is False:
+                    break
+
+        def enum_children(h, cb, extra):
+            for c in list(w[h]["kids"]):
+                cb(c, extra)
+
+        def get_long(h, idx):
+            return w[h]["ex"] if idx == -20 else w[h]["style"]
+        g = types.SimpleNamespace(
+            EnumWindows=enum_windows, EnumChildWindows=enum_children, IsWindowVisible=lambda h: w[h]["visible"],
+            IsWindow=lambda h: h in w,
+            IsWindowEnabled=lambda h: w[h]["enabled"], GetClassName=lambda h: w[h]["cls"],
+            GetWindowText=lambda h: w[h]["title"], GetWindow=lambda h, cmd: w[h]["owner"] if cmd == 4 else 0,
+            GetWindowLong=get_long, PostMessage=lambda h, msg, a, b: self.posted.append((h, msg)))
+        p = types.SimpleNamespace(GetWindowThreadProcessId=lambda h: (1, w[h]["pid"]))
+        c = types.SimpleNamespace(GWL_STYLE=-16, GWL_EXSTYLE=-20, GW_OWNER=4, BM_CLICK=0xF5, WM_CLOSE=0x10)
+        uia = dict(uia or {})
+        monkeypatch.setattr(D, "IS_WIN", True)
+        monkeypatch.setattr(D, "win32gui", g, raising=False)
+        monkeypatch.setattr(D, "win32process", p, raising=False)
+        monkeypatch.setattr(D, "win32con", c, raising=False)
+        monkeypatch.setattr(D, "_last_active_popup", lambda h: self.lap.get(h, h), raising=False)
+        monkeypatch.setattr(D, "_uia_read", lambda h: uia.get(h), raising=False)
+        monkeypatch.setattr(D, "_uia_invoke", lambda h, name: self.invoked.append((h, name)) or True, raising=False)
+        return self
+
+
+def _vs(desk: _Desk, main_enabled: bool) -> int:
+    """The shell's main window (WPF) and the windows that are always there: four glow windows around it (layered,
+    click-through, never activated) and a hidden helper window."""
+    m = desk.top(10, WPF, "Project15 - TcXaeShell", enabled=main_enabled)
+    for i in range(4):
+        desk.top(20 + i, "VisualStudioGlowWindow", owner=m, ex=0x08000020 | 0x80000)
+    desk.top(30, "GDI+ Window", visible=False)
+    return m
+
+
+def test_n173_a_disabled_main_window_names_its_modal_window_of_any_class(monkeypatch):
+    """A8: the main window disabled + an owned window of class HwndWrapper (WPF About), WindowsForms10.* or #32770 →
+    that window is the dialog, with hwnd, title, class and the buttons UI Automation reads (or buttons unknown)."""
+    desk = _Desk()
+    main = _vs(desk, main_enabled=False)
+    desk.top(40, WPF, "About Microsoft Visual Studio", owner=main)
+    desk.install(monkeypatch, uia={40: (["OK", "Copy Info"], ["Microsoft Visual Studio 2022", "TwinCAT XAE Shell"])})
+    ds = D.list_dialogs(100)
+    assert [(d.hwnd, d.title, getattr(d, "cls", None)) for d in ds] == [(40, "About Microsoft Visual Studio", WPF)], ds
+    dd = ds[0].to_dict()
+    assert dd["buttons"] == ["OK", "Copy Info"] and dd["class"] == WPF and "TwinCAT XAE Shell" in dd["text"], dd
+    assert "buttons_note" not in dd and ds[0].awaits_answer()
+    # the same window when UI Automation cannot read it: still reported — buttons unknown, never dropped
+    desk.install(monkeypatch, uia={})
+    dd = D.list_dialogs(100)[0].to_dict()
+    assert dd["hwnd"] == 40 and dd["buttons"] is None and dd["buttons_note"] == "not a standard dialog — buttons unknown"
+    assert D.list_dialogs(100)[0].awaits_answer()              # unknown buttons: taken as waiting for an answer
+    # a WinForms window, and a #32770 one (read from its child controls, listed once)
+    desk.w[40]["cls"] = WINFORMS
+    desk.install(monkeypatch, uia={40: (["Close"], [])})
+    assert [(d.hwnd, d.cls, d.captions()) for d in D.list_dialogs(100)] == [(40, WINFORMS, ["Close"])]
+    del desk.w[40]
+    desk.top(41, "#32770", "Microsoft Visual Studio", owner=main)
+    desk.child(41, 42, "Static", "Save changes to the following items?")
+    desk.child(41, 43, "Button", "&Yes", style=0x1)
+    desk.child(41, 44, "Button", "&No")
+    desk.install(monkeypatch)
+    ds = D.list_dialogs(100)
+    assert [(d.hwnd, d.cls, d.captions(), d.text) for d in ds] == [
+        (41, "#32770", ["Yes", "No"], "Save changes to the following items?")], ds
+
+
+def test_n173_no_dialog_while_the_main_window_is_enabled(monkeypatch):
+    """A8 / A6: a floating tool window, the Error List torn off as its own window, a splash or progress window while the
+    main window stays enabled are not dialogs — a visible extra window alone is never one."""
+    desk = _Desk()
+    main = _vs(desk, main_enabled=True)
+    desk.top(50, WPF, "Error List", owner=main)                       # torn off
+    desk.top(51, WPF, "Solution Explorer", owner=main, ex=0x80)       # floating tool window
+    desk.top(52, "SplashWindow", "TcXaeShell")                        # unowned splash
+    desk.top(53, WPF, "Building…", owner=main)                        # progress window, main enabled
+    desk.install(monkeypatch, uia={50: (["Clear"], []), 53: (["Cancel"], [])})
+    assert D.list_dialogs(100) == []
+    # windows of another process are never this shell's, whatever their state
+    desk.top(60, "#32770", "System Properties", pid=999)
+    desk.top(61, WPF, "Other app", pid=999, enabled=False)
+    desk.top(62, WPF, "Its dialog", pid=999, owner=61)
+    desk.install(monkeypatch, uia={62: (["OK"], [])})
+    assert D.list_dialogs(100) == []
+
+
+def test_n173_the_modal_window_among_other_windows_and_when_none_can_be_named(monkeypatch):
+    """A8: with the main window disabled, the window that holds it is the one its owner last activated (not a floating
+    tool window that stays enabled, not a glow window); a dialog opened from a dialog is the one that waits; a main
+    window disabled with no window to name is said, with the main window's hwnd and class."""
+    desk = _Desk()
+    main = _vs(desk, main_enabled=False)
+    desk.top(51, WPF, "Solution Explorer", owner=main)                # floating tool window, still enabled
+    desk.top(70, WPF, "Options", owner=main, enabled=False)           # VS Options, itself held by …
+    desk.top(71, WINFORMS, "TwinCAT Settings", owner=70)               # … a dialog it opened
+    desk.lap[main] = 71
+    desk.install(monkeypatch, uia={51: (["Close"], []), 70: (["OK", "Cancel"], []), 71: (["OK", "Cancel"], [])})
+    assert [(d.hwnd, d.title) for d in D.list_dialogs(100)] == [(71, "TwinCAT Settings")]
+    # nothing that can take input is left: XAE is modal, but the window cannot be named
+    for h in (51, 70, 71):
+        del desk.w[h]
+    desk.lap.clear()
+    desk.install(monkeypatch)
+    ds = D.list_dialogs(100)
+    assert len(ds) == 1 and not ds[0].identified and ds[0].hwnd == main and ds[0].cls == WPF, ds
+    dd = ds[0].to_dict()
+    assert dd["unidentified"] is True and dd["buttons"] is None and D.label(dd).startswith(
+        "XAE's main window is disabled (a modal window is open) but it could not be identified"), dd
+    assert f"hwnd {main}" in D.label(dd) and WPF in D.label(dd)
+
+
+def test_n173_the_main_window_the_shell_names_is_the_one_watched(monkeypatch):
+    """A8: with DTE.MainWindow.HWnd known (set_main_window at attach), that window decides — an unowned window of the
+    same process that is disabled (a floating document window) is not taken for the main window."""
+    desk = _Desk()
+    main = _vs(desk, main_enabled=True)
+    desk.top(80, WPF, "MAIN.TcPOU", enabled=False)                    # an unowned floating document window, disabled
+    desk.install(monkeypatch)
+    monkeypatch.setattr(D, "_MAIN_WINDOWS", {}, raising=False)
+    D.set_main_window(100, main)
+    assert D.list_dialogs(100) == []
+    desk.w[main]["enabled"] = False                                    # the main window held by the About box
+    desk.top(40, WPF, "About Microsoft Visual Studio", owner=main)
+    desk.install(monkeypatch, uia={40: (["OK"], [])})
+    assert [(d.hwnd, d.captions()) for d in D.list_dialogs(100)] == [(40, ["OK"])]
+    D.set_main_window(100, None)
+    assert D._MAIN_WINDOWS == {}
+
+
+def test_review_0815_a_hidden_main_window_still_decides(monkeypatch):
+    """Review of 0.8.15 (N173): with xae.visible=false the shell's main window is hidden — only the visible windows
+    were looked at, so the main window was never checked and a modal window it owns (a WPF box) went unseen. The
+    recorded main window decides while it is a window of the process, visible or not."""
+    desk = _Desk()
+    main = desk.top(10, WPF, "Project15 - TcXaeShell", enabled=False, visible=False)
+    desk.top(40, WPF, "Options", owner=main)
+    desk.install(monkeypatch, uia={40: (["OK", "Cancel"], [])})
+    monkeypatch.setattr(D, "_MAIN_WINDOWS", {}, raising=False)
+    D.set_main_window(100, main)
+    assert [(d.hwnd, d.captions()) for d in D.list_dialogs(100)] == [(40, ["OK", "Cancel"])]
+    desk.w[main]["enabled"] = True                                     # nothing modal: the visible window is no dialog
+    assert D.list_dialogs(100) == []
+    D.set_main_window(100, None)
+
+
+def test_n173_resolve_presses_ui_automation_buttons_and_refuses_unknown_ones(monkeypatch):
+    """Spec 1.3.6 / 1.3.8: a non-#32770 window's button is pressed through UI Automation (Invoke); a window whose buttons
+    are unknown is refused — 'close it in XAE' — and nothing is sent to it (no WM_CLOSE, no Escape); an auto-answer
+    rule never fires on such a window; remember=true on a window whose buttons were read adds a rule as for #32770."""
+    desk = _Desk()
+    main = _vs(desk, main_enabled=False)
+    desk.top(40, WPF, "About Microsoft Visual Studio", owner=main)
+    desk.install(monkeypatch, uia={40: (["OK", "Copy Info"], [])})
+    wd = D.DialogWatchdog([])
+    wd.pid = 100
+    r = wd.resolve("ok", remember=True)
+    assert r["resolved"] and desk.invoked == [(40, "OK")] and desk.posted == [] and r["remembered"], r
+    assert wd.rules == [{"title_contains": "About Microsoft Visual Studio", "button": "ok"}]
+    desk.invoked.clear()
+    assert wd.poll() == [] and desk.invoked == [(40, "OK")]           # the remembered rule answers it next time
+    # buttons unknown: refused, nothing sent, and the rule (matching on the title) does not fire
+    desk.install(monkeypatch, uia={})
+    desk.invoked.clear()
+    left = wd.poll()
+    assert [d.hwnd for d in left] == [40] and desk.invoked == [] and desk.posted == []
+    r = wd.resolve("OK")
+    assert not r["resolved"] and "buttons can't be pressed by the tool — close it in XAE" in r["reason"], r
+    assert desk.invoked == [] and desk.posted == []
+    # the main window disabled, nothing to name: refused the same way
+    del desk.w[40]
+    desk.install(monkeypatch)
+    r = wd.resolve("OK")
+    assert not r["resolved"] and "close it in XAE" in r["reason"] and desk.posted == [], r
+
+
+def test_n173_a_call_the_shell_rejects_names_the_modal_window_of_any_class(monkeypatch):
+    """A7: the About box opened by hand, then a call — the shell rejects COM while it is modal; after a second the
+    rejected call names the window (BLOCKED BY DIALOG 'About …', class, buttons) instead of retrying for com_retry_s.
+    A progress window that offers only Cancel is no reason to stop: the call is asked again."""
+    from twincat_mcp import xae_backend as X
+    from twincat_mcp.config import XaeConfig
+    desk = _Desk()
+    main = _vs(desk, main_enabled=False)
+    desk.top(40, WPF, "About Microsoft Visual Studio", owner=main)
+    desk.install(monkeypatch, uia={40: (["OK"], [])})
+    be = X.XaeBackend(XaeConfig(com_retry_s=6))
+    be.pid = 100
+
+    class Rejected(Exception):
+        hresult = X.RPC_E_CALL_REJECTED
+
+    def rejected():
+        raise Rejected("Call was rejected by callee.")
+    t0 = time.monotonic()
+    with pytest.raises(X.XaeError, match=r"LookupTreeItem TIPC: BLOCKED BY DIALOG 'About Microsoft Visual Studio' — "
+                                         r"buttons \['OK'\].*\"class\": \"HwndWrapper"):
+        be._retry(rejected, "LookupTreeItem TIPC")
+    assert time.monotonic() - t0 < 5.0
+    # a progress window (Cancel only) holds the shell: asked again until com_retry_s, then 'busy'
+    desk.install(monkeypatch, uia={40: (["Cancel"], [])})
+    be.cfg.com_retry_s = 1.5
+    with pytest.raises(X.XaeError, match=r"XAE is busy \(call rejected, 0x80010001\) and did not run this call"):
+        be._retry(rejected, "LookupTreeItem TIPC")
+
+
+@pytest.mark.anyio
+async def test_n173_a_call_held_by_a_non_standard_modal_window_is_blocked_within_seconds(monkeypatch, project_dir):
+    """A1 / A2: xae_command Help.About opened the About box (WPF); the call hung 120 s and ended 'XAE call timed out; a
+    modal dialog in the shell is the usual cause', xae_dialogs listed nothing. Now BLOCKED BY DIALOG within ≤ 5 s with
+    hwnd, title, class and buttons, and xae_dialogs lists it (live) with the same hwnd."""
+    desk = _Desk()
+    main = _vs(desk, main_enabled=True)
+    desk.install(monkeypatch, uia={40: (["OK"], ["Microsoft Visual Studio"])})
+    app = App(mk_cfg(project_dir))
+    app.xae.pid = 100
+    release = threading.Event()
+
+    def command():                         # what ExecuteCommand('Help.About') does: the shell is modal until it closes
+        desk.w[main]["enabled"] = False
+        desk.top(40, WPF, "About Microsoft Visual Studio", owner=main)
+        release.wait(20)
+        return {"executed": "Help.About"}
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(ToolError, match=r"command: BLOCKED BY DIALOG 'About Microsoft Visual Studio'.*blocked_by_dialog: "
+                                            r"\{\"hwnd\": 40, \"title\": \"About Microsoft Visual Studio\", \"class\": "
+                                            r"\"HwndWrapper.*\"buttons\": \[\"OK\"\]"):
+            await app.xae_call(command, timeout=8)
+        assert time.monotonic() - t0 <= 5.0
+        live = app.dialogs_now()
+        assert [d["hwnd"] for d in live] == [40] and live[0]["class"] == WPF
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+async def test_n173_a_timeout_names_the_modal_state_found_at_that_moment(monkeypatch, project_dir):
+    """Spec 1.3.5: a call that still times out enumerates again at that moment: the main window disabled and no window
+    to name → it says so with the main window's hwnd/class (not 'a modal dialog is the usual cause'); nothing modal →
+    it says that no modal window is open."""
+    desk = _Desk()
+    main = _vs(desk, main_enabled=False)                  # modal before the call (not the call's own dialog)
+    desk.install(monkeypatch)
+    app = App(mk_cfg(project_dir))
+    app.xae.pid = 100
+    gate = threading.Event()
+
+    def hangs():
+        gate.wait(10)
+        return {}
+    try:
+        with pytest.raises(ToolError) as ei:
+            await app.xae_call(hangs, timeout=1.5)
+        msg = str(ei.value)
+        assert "XAE's main window is disabled (a modal window is open) but it could not be identified" in msg, msg
+        assert f"hwnd {main}" in msg and "usual cause" not in msg, msg
+    finally:
+        gate.set()
+    await asyncio.sleep(0.3)
+    desk.w[main]["enabled"] = True
+    gate.clear()
+    try:
+        with pytest.raises(ToolError) as ei:
+            await app.xae_call(hangs, timeout=1.5)
+        assert "no modal window is open in XAE" in str(ei.value) and "usual cause" not in str(ei.value), str(ei.value)
+    finally:
+        gate.set()
+
+
+# --------------------------------------------------------------------------- N173: UI Automation through COM vtables
+import ctypes as _ct
+
+
+class _FakeCom:
+    """A COM object in memory as UI Automation hands one out: a pointer to a table of function pointers (IUnknown's
+    Release at slot 2, the methods at their slots). slots: {slot: (argtypes, python function)}."""
+
+    def __init__(self, slots, **attrs):
+        self.released = 0
+        self.__dict__.update(attrs)
+        self._keep = []
+        table = (_ct.c_void_p * (max(list(slots) + [2]) + 1))()
+        rel = _ct.CFUNCTYPE(_ct.c_ulong, _ct.c_void_p)(self._release)
+        self._keep.append(rel)
+        table[2] = _ct.cast(rel, _ct.c_void_p).value
+        for slot, (argtypes, fn) in slots.items():
+            cb = _ct.CFUNCTYPE(_ct.c_long, _ct.c_void_p, *argtypes)(fn)
+            self._keep.append(cb)
+            table[slot] = _ct.cast(cb, _ct.c_void_p).value
+        self._table = table
+        self._obj = _ct.c_void_p(_ct.addressof(table))
+        self.addr = _ct.addressof(self._obj)
+
+    def _release(self, this):
+        self.released += 1
+        return 0
+
+
+def _fake_uia(names_by_type, fail_element=False):
+    """IUIAutomation → window element → FindAll(ControlType == …) → element arrays → elements with names; the Invoke
+    pattern of a button. Returns (create, objects, record)."""
+    PP = _ct.POINTER(_ct.c_void_p)
+    rec = {"invoked": [], "freed": [], "conditions": [], "patterns": []}
+    bstrs = {}
+
+    def element(name):
+        buf = _ct.create_unicode_buffer(name)
+        bstrs[_ct.addressof(buf)] = buf
+
+        def get_name(this, out):
+            out[0] = _ct.addressof(buf)
+            return 0
+        pat = _FakeCom({3: ((), lambda this: rec["invoked"].append(name) or 0)})
+
+        def pattern_as(this, pid, iid, out):
+            rec["patterns"].append((pid, bytes(iid.contents)))
+            out[0] = pat.addr
+            return 0
+        return _FakeCom({23: ((PP,), get_name), 14: ((_ct.c_int, _ct.POINTER(D._GUID), PP), pattern_as)}, name=name,
+                        pattern=pat)
+    elems = {ct: [element(n) for n in names] for ct, names in names_by_type.items()}
+
+    def array(items):
+        def length(this, out):
+            out[0] = len(items)
+            return 0
+
+        def get(this, i, out):
+            out[0] = items[i].addr
+            return 0
+        return _FakeCom({3: ((_ct.POINTER(_ct.c_int),), length), 4: ((_ct.c_int, PP), get)}, items=items)
+    arrays = {ct: array(items) for ct, items in elems.items()}
+    conds: dict = {}
+
+    def find_all(this, scope, cond, out):
+        assert scope == D.TreeScope_Descendants
+        out[0] = arrays[conds[cond]].addr
+        return 0
+    window = _FakeCom({6: ((_ct.c_int, _ct.c_void_p, PP), find_all)})
+
+    def from_handle(this, hwnd, out):
+        if fail_element:
+            return -2147467259                       # E_FAIL
+        rec["hwnd"] = hwnd
+        out[0] = window.addr
+        return 0
+
+    def condition(this, prop, v, out):
+        rec["conditions"].append((prop, v.vt, v.v.lVal))
+        c = _FakeCom({})
+        conds[c.addr] = v.v.lVal
+        rec.setdefault("cond_objs", []).append(c)
+        out[0] = c.addr
+        return 0
+    auto = _FakeCom({6: ((_ct.c_void_p, PP), from_handle), 23: ((_ct.c_int, D._VARIANT, PP), condition)})
+    calls = D._UiaCalls(_ct.CFUNCTYPE, lambda: auto.addr, lambda b: _ct.wstring_at(b),
+                        lambda b: rec["freed"].append(b))
+    return calls, {"auto": auto, "window": window, "arrays": arrays, "elems": elems}, rec
+
+
+def test_n173_ui_automation_reads_and_presses_a_button_through_the_vtables():
+    """N173: a non-#32770 window is read through UI Automation — pywin32 has no IUIAutomation and comtypes is no
+    dependency, so dialogs.py calls the COM vtables with ctypes. Against fake COM objects: ElementFromHandle(hwnd),
+    CreatePropertyCondition(ControlType == Button / Text, VT_I4), FindAll(TreeScope_Descendants), the names, Invoke
+    through GetCurrentPatternAs(Invoke, IID_IUIAutomationInvokePattern) — and every object released, every BSTR freed."""
+    calls, objs, rec = _fake_uia({D.UIA_ButtonControlTypeId: ["OK", "Copy &Info"],
+                                  D.UIA_TextControlTypeId: ["Microsoft Visual Studio", "TwinCAT XAE Shell"]})
+    assert calls.read(0x1234) == (["OK", "Copy &Info"], ["Microsoft Visual Studio", "TwinCAT XAE Shell"])
+    assert rec["hwnd"] == 0x1234
+    assert rec["conditions"] == [(30003, 3, 50000), (30003, 3, 50020)]          # ControlType == Button, then Text
+    assert len(rec["freed"]) == 4 and objs["window"].released == 1
+    assert all(c.released == 1 for c in rec["cond_objs"]) and all(a.released == 1 for a in objs["arrays"].values())
+    assert all(e.released == 1 for es in objs["elems"].values() for e in es)
+    assert calls.invoke(0x1234, "Copy Info") is True and rec["invoked"] == ["Copy &Info"]
+    iid = D._guid(D.IID_IUIAutomationInvokePattern)
+    assert rec["patterns"] == [(D.UIA_InvokePatternId, bytes(iid))]
+    assert objs["elems"][D.UIA_ButtonControlTypeId][1].pattern.released == 1
+    assert calls.invoke(0x1234, "Cancel") is False and rec["invoked"] == ["Copy &Info"]
+    # a failing call is an error (buttons unknown upstream), not a crash
+    bad, _o, _r = _fake_uia({}, fail_element=True)
+    with pytest.raises(OSError, match="0x80004005"):
+        bad.read(0x1234)
+    # the worker: a window that does not answer in time gives None now and its answer on a later scan
+    gate = threading.Event()
+
+    class Slow:
+        def read(self, hwnd):
+            gate.wait(5)
+            return (["OK"], [])
+    w = D._UiaWorker(lambda: Slow())
+    assert w.read(7, 0.2) is None
+    gate.set()
+    for _ in range(50):
+        if w.read(7, 0.2) is not None:
+            break
+        time.sleep(0.05)
+    assert w.read(7, 0.2) == (["OK"], []) and w._reads[7]["keep"]
+    w.forget({8})
+    assert 7 not in w._reads
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a real window and UI Automation need Windows")
+def test_n173_windows_a_real_owned_window_is_found_read_and_pressed():  # pragma: no cover - Windows CI
+    """N173 on Windows (CI): a real top-level window of this process, disabled, owning an enabled window that is not a
+    #32770 dialog and holds a push button → list_dialogs finds it by modality, reads its button through UI
+    Automation (the real vtables), and xae_dialog_resolve's click presses it (BM_CLICK reaches the window)."""
+    import win32api
+    import win32con
+    import win32gui
+    clicked = threading.Event()
+    made: dict = {}
+    ready = threading.Event()
+
+    def wndproc(hwnd, msg, wp, lp):
+        if msg == win32con.WM_COMMAND and (wp >> 16) == win32con.BN_CLICKED:
+            clicked.set()
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wp, lp)
+
+    def ui():
+        wc = win32gui.WNDCLASS()
+        wc.lpfnWndProc = wndproc
+        wc.lpszClassName = "TcMcpN173Test"
+        wc.hInstance = win32api.GetModuleHandle(None)
+        win32gui.RegisterClass(wc)
+        main = win32gui.CreateWindowEx(0, "TcMcpN173Test", "Shell", win32con.WS_OVERLAPPEDWINDOW | win32con.WS_VISIBLE,
+                                       0, 0, 400, 300, 0, 0, wc.hInstance, None)
+        modal = win32gui.CreateWindowEx(0, "TcMcpN173Test", "About Test Shell",
+                                        win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_VISIBLE,
+                                        50, 50, 300, 200, main, 0, wc.hInstance, None)
+        win32gui.CreateWindowEx(0, "Button", "OK", win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+                                10, 10, 80, 30, modal, 1, wc.hInstance, None)
+        win32gui.EnableWindow(main, False)
+        made.update(main=main, modal=modal)
+        ready.set()
+        win32gui.PumpMessages()
+    t = threading.Thread(target=ui, daemon=True)
+    t.start()
+    assert ready.wait(10)
+    try:
+        # the vtable calls themselves, without the scan's 1 s budget (the first UI Automation call loads its proxies)
+        try:
+            read = D._uia_worker().submit(lambda c: c.read(made["modal"])).result(timeout=20)
+        except OSError as exc:
+            if "CoCreateInstance" in str(exc):
+                pytest.skip(f"UI Automation is not available in this session: {exc}")
+            raise
+        assert read[0] == ["OK"], read
+        D.set_main_window(os.getpid(), made["main"])
+        ds = [d for d in D.list_dialogs(os.getpid()) if d.hwnd == made["modal"]]
+        assert len(ds) == 1 and ds[0].title == "About Test Shell" and ds[0].cls == "TcMcpN173Test", ds
+        assert ds[0].captions() == ["OK"] and ds[0].via == "uia", ds[0].to_dict()
+        assert D.click(ds[0], "ok") and clicked.wait(5)
+        win32gui.EnableWindow(made["main"], True)                       # not modal any more: nothing is listed
+        assert [d for d in D.list_dialogs(os.getpid()) if d.hwnd == made["modal"]] == []
+    finally:
+        D.set_main_window(os.getpid(), None)
+        try:
+            win32api.PostThreadMessage(t.native_id, win32con.WM_QUIT, 0, 0)
+        except Exception:  # noqa: BLE001
+            pass
