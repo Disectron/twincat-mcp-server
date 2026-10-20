@@ -53,7 +53,7 @@ from .docsearch import title_words
 # _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
 # re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
 # changes without a bump.
-INDEXER_VERSION = 5          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
+INDEXER_VERSION = 6          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
                              #    Methods / Properties tables as their own lists (N74)
                              # 4: everything a reader used to repair is stored repaired (docs/KNOWLEDGE_BASE.md rule 4):
                              #    no invisible marks, image placeholders or empty links; links resolved to page URLs
@@ -65,6 +65,9 @@ INDEXER_VERSION = 5          # 3: code without non-breaking spaces; the return v
                              #    as a heading 'FUNCTION MEMCPY : UDINT' / 'MEMSET FUNCTION: UDINT', the 'Return value'
                              #    table); IEC headers in capitals only; a sentence title documents no symbol (N101:
                              #    'Attribute 'linkalways'' is a Page); the declaration's name is the symbol
+                             # 6: each page's place in the Help Viewer contents (Microsoft.Help.TOCParent → parent URL,
+                             #    N126: an FB's method pages titled 'Call' could not be tied to their FB); a page that is
+                             #    not UTF-8 decoded in its own charset (N138: Windows-1252 pages kept U+FFFD)
 
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
@@ -575,7 +578,11 @@ def _guess_lang(code: str) -> str:
 def html_to_doc(raw: bytes | str, base_url: str | None = None, package: bool = False) -> HtmlDoc:
     """A page as stored: Markdown with every link a page address where it can be one (base_url: the page's URL;
     package: a Help Viewer package page, whose relative links follow the package layout)."""
-    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    if isinstance(raw, bytes):
+        from .helpviewer import decode_page
+        text = decode_page(raw)
+    else:
+        text = raw
     w = _MdWalker(base_url, package)
     w.feed(text)
     w.close()
@@ -685,13 +692,14 @@ def same_documents(rows: list[Any]) -> list[list[Any]]:
             i = parent[i]
         return i
 
-    def union(i: int, j: int) -> bool:
+    def union(i: int, j: int, same_source: bool = False) -> bool:
         # a copy is in another book: two pages of one book are never one document (review 0.8.12 — two FBs'
-        # methods of one name and signature, both titled 'Reset', are two answers, not a page and its copy)
+        # methods of one name and signature, both titled 'Reset', are two answers, not a page and its copy) — unless
+        # they are one Beckhoff source page placed twice (same_source: the page id before '_', N99b)
         a, b = find(i), find(j)
         if a == b:
             return True
-        if books[a] & books[b]:
+        if books[a] & books[b] and not same_source:
             return False
         parent[b] = a
         books[a] |= books[b]
@@ -703,10 +711,13 @@ def same_documents(rows: list[Any]) -> list[list[Any]]:
     # declaration or text match must not take a book a true copy needs — second review 0.8.12)
     for i, r in enumerate(rows):
         if r["pid"]:
-            for j in seen.get(("pid", r["pid"]), []):
-                if union(j, i):
+            # N99b (0.8.13 retest): '374277003_30131813' and '374277003_2750866' are Beckhoff's page 374277003 placed
+            # twice in one book (the 4 'ADS Return Codes' of tf6500, byte-identical) — one page, merged like its copies
+            base = str(r["pid"]).split("_", 1)[0]
+            for j in seen.get(("pid", base), []):
+                if union(j, i, same_source=True):
                     break
-            seen.setdefault(("pid", r["pid"]), []).append(i)
+            seen.setdefault(("pid", base), []).append(i)
     for i, r in enumerate(rows):
         keys = []
         d = _decl_text(r["decl"])
@@ -774,6 +785,17 @@ def symbol_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = N
         if r is not None:
             rows[r["rid"]] = r
     cands = [r for r in rows.values() if keep is None or keep(r)]
+    if "." in s and has_parents(con):
+        # N126 (format 6): 'FB_X.Call' — Beckhoff titles a method page with its bare name; the pages below FB_X's page
+        # in the contents are FB_X's members (a page titled 'FB_X.Call' itself stays a candidate)
+        owner, member = s.rsplit(".", 1)
+        bare = [r for r in con.execute(f"SELECT {DOC_COLS} FROM pages WHERE title = ? COLLATE NOCASE AND kind != 'Page'",
+                                       (member,)) if keep is None or keep(r)]
+        owned = _owned_by(con, bare, owner)
+        if owned:
+            exact = [r for r in cands if " ".join((r["title"] or "").split()).lower() == s.lower()]
+            ids = {r["rid"] for r in exact}
+            cands = exact + [r for r in owned if r["rid"] not in ids]
     return same_documents(cands)
 
 
@@ -786,6 +808,45 @@ def title_documents(con: Any, title: str, keep: Callable[[Any], bool] | None = N
     rows = [r for r in con.execute(f"SELECT {DOC_COLS} FROM pages WHERE title = ? COLLATE NOCASE",
                                    (" ".join(title.split()),)) if keep is None or keep(r)]
     return same_documents(rows)
+
+
+def has_parents(con: Any) -> bool:
+    """Format 6: the pages know their parent in the Help Viewer contents."""
+    try:
+        return any(r[1] == "parent" for r in con.execute("PRAGMA table_info(pages)"))
+    except sqlite3.Error:
+        return False
+
+
+def page_family(con: Any, url: str, limit: int = 60) -> dict[str, Any]:
+    """N126: {"parent": {title, url}, "children": [{title, url, kind}], "children_count"} of a page — what the Help
+    Viewer contents put above and below it (an FB → its methods and properties). {} without parent data."""
+    if not has_parents(con):
+        return {}
+    out: dict[str, Any] = {}
+    r = con.execute("SELECT q.title, q.url FROM pages p JOIN pages q ON q.url = p.parent WHERE p.url = ?",
+                    (url,)).fetchone()
+    if r is not None:
+        out["parent"] = {"title": r[0], "url": r[1]}
+    kids = con.execute("SELECT title, url, kind FROM pages WHERE parent = ? ORDER BY title COLLATE NOCASE, url",
+                       (url,)).fetchall()
+    if kids:
+        out["children"] = [{"title": k[0], "url": k[1], "kind": k[2]} for k in kids[:limit]]
+        if len(kids) > limit:
+            out["children_count"] = len(kids)
+    return out
+
+
+def _owned_by(con: Any, rows: list[Any], owner: str) -> list[Any]:
+    """The candidate pages whose parent in the contents documents `owner` (FB_WG_ComboFilter.Call → the 'Call' page
+    below FB_WG_ComboFilter's page)."""
+    out = []
+    for r in rows:
+        p = con.execute("SELECT q.title FROM pages p JOIN pages q ON q.url = p.parent WHERE p.rowid = ?",
+                        (r["rid"],)).fetchone()
+        if p is not None and names_symbol(p[0], owner):
+            out.append(r)
+    return out
 
 
 # -- searching the index: one search for every reader (N99, N105) ---------------------------------------------------
@@ -824,7 +885,10 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
         ordered = DS.title_order(rows, query, "title", "library")
         if defined:
             ids = {r["rid"] for r in defined}
-            ordered = defined + [r for r in ordered if r["rid"] not in ids]
+            # N99b: of the pages whose table defines the code, those whose title says they are a code table ('ADS
+            # Return Codes') first — an event-class struct that lists the codes too (ST_TcGeneralAdsEventClass) after
+            tables = sorted(defined, key=lambda r: not _CODE_TITLE.search(str(r["title"] or "")))
+            ordered = tables + [r for r in ordered if r["rid"] not in ids]
         out = _one_per_document(con, ordered, copies)
         seen["documents"] = len(out)
         return out
@@ -863,6 +927,10 @@ def code_note(res: dict[str, Any]) -> str | None:
     return f"no indexed table holds {c['hex'][0]} and {c['dec']} in one row: these pages mention the code"
 
 
+_CODE_TITLE = re.compile(r"\b(?:return|error|result|status)\s+codes?\b|\berror\s*(?:codes?|numbers?|messages?)\b|\bcodes\b",
+                         re.I)
+
+
 def _one_per_document(con: Any, rows: list[Any], copies: dict[int, list[tuple[str, str]]]) -> list[Any]:
     """The hits with each document once, at the place of its best hit (same_documents: the same page id, or the same
     library and declaration / text), shown as the document's representative (a page that names its library, the
@@ -883,7 +951,10 @@ def _one_per_document(con: Any, rows: list[Any], copies: dict[int, list[tuple[st
                 continue
             best = min(pos[x["rid"]] for x in g)
             rep = g[0]["rid"]                  # same_documents puts the representative first
-            place[best] = rows[pos[rep]]
+            shown = dict(rows[pos[rep]])
+            if "r" in shown:
+                shown["r"] = rows[best]["r"]   # N99b: the document's place and score are its best hit's
+            place[best] = shown
             copies[rep] = [(x["book"], x["pid"]) for x in g[1:]]
             drop.update(pos[x["rid"]] for x in g if pos[x["rid"]] != best)
     return [place.get(i, r) for i, r in enumerate(rows) if i not in drop]
@@ -1511,9 +1582,11 @@ class InfosysIndex:
                 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             """)
             cols = {r["name"] for r in con.execute("PRAGMA table_info(pages)")}
-            for c in ("version", "crumb", "words"):  # version, crumb: the Help Viewer source; words: format 5 (N105)
+            # version, crumb: the Help Viewer source; words: format 5 (N105); toc_parent, parent: format 6 (N126)
+            for c in ("version", "crumb", "words", "toc_parent", "parent"):
                 if c not in cols:
                     con.execute(f"ALTER TABLE pages ADD COLUMN {c} TEXT")
+            con.execute("CREATE INDEX IF NOT EXISTS pages_parent ON pages(parent)")
             if "words" not in cols:
                 con.executemany("UPDATE pages SET words = ? WHERE rowid = ?",
                                 [(title_words(r[1]), r[0]) for r in con.execute("SELECT rowid, title FROM pages")])
@@ -1648,6 +1721,8 @@ class InfosysIndex:
         has_decl = kind != "Page" and decl["declaration"] is not None
         version = _doc_version(doc.meta.get("Microsoft.Help.DisplayVersion"))
         words = title_words(title)              # the title's identifiers as words (format 5, N105)
+        # the page's parent in the Help Viewer contents (format 6, N126): its help id now, its URL once every page is in
+        toc_parent = (doc.meta.get("Microsoft.Help.TOCParent") or "").strip().lower() or None
         old = con.execute("SELECT rowid, url, title, text, code, words FROM pages WHERE url = ?", (url,)).fetchone()
         if old is not None:
             if self._fts:   # external content: the index entry is removed with the values it was built from
@@ -1655,10 +1730,10 @@ class InfosysIndex:
                             "VALUES ('delete', ?, ?, ?, ?, ?, ?)", (old[0], old[1], old[2], old[3], old[4], old[5]))
             con.execute("DELETE FROM pages WHERE rowid = ?", (old[0],))
         cur = con.execute("INSERT INTO pages(url, book, page_id, lastmod, title, kind, library, markdown, text, code, "
-                          "decl, fetched, version, crumb, words) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          "decl, fetched, version, crumb, words, toc_parent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                           (url, bk[0], bk[1], lastmod, title, kind, library, doc.markdown, text, code,
                            json.dumps(decl) if has_decl or kind != "Page" else None, time.time(), version,
-                           doc.crumb or None, words))
+                           doc.crumb or None, words, toc_parent))
         if self._fts:
             con.execute("INSERT INTO pages_fts(rowid, url, title, text, code, words) VALUES (?,?,?,?,?,?)",
                         (cur.lastrowid, url, title, text, code, words))
@@ -2094,12 +2169,20 @@ class InfosysIndex:
                "markdown": md[:max_chars], "truncated": len(md) > max_chars, "chars": len(md)}
         if not indexed:
             out["indexed"] = False
+        if indexed:
+            out.update(self._family(url))
         if self.local is not None:
             out["lastmod"] = None
             out["version"] = row["version"]
             out["breadcrumb"] = row["crumb"]
             out.update(self._answer_meta())
         return out
+
+    def _family(self, url: str, limit: int = 60) -> dict[str, Any]:
+        """N126 (format 6): the page's parent in the Help Viewer contents and its child pages — an FB's page lists its
+        method / property pages, a method page names its FB. {} for an index of an older format."""
+        with self._db() as con:
+            return page_family(con, url, limit)
 
     def declaration(self, symbol: str, library: str | None = None) -> dict[str, Any]:
         s = " ".join(symbol.split())
@@ -2138,6 +2221,10 @@ class InfosysIndex:
         row = docs[0][0]
         decl = json.loads(row["decl"]) if row["decl"] else {"name": row["title"], "kind": row["kind"], "declaration": None}
         decl.update({"url": row["url"], "library": row["library"]})
+        with self._db() as con:
+            fam = page_family(con, row["url"], limit=0)
+        if fam.get("parent"):
+            decl["parent"] = fam["parent"]                # N126: a method's FB, from the contents (format 6)
         chosen = {r["rid"] for r in docs[0]}
         mine = (row["library"] or "").lower()
         others: dict[str, str] = {}
@@ -2149,7 +2236,7 @@ class InfosysIndex:
             decl["also_in"] = sorted(others.values())     # the other libraries with a symbol of this name
         copies = [r["book"] for r in docs[0][1:]]
         if copies:
-            decl["same_page_in"] = copies                 # the same document in other books (N100)
+            decl["same_page_in"] = list(dict.fromkeys(copies))   # the same document in other books (N100)
         if self.local is not None:
             with self._db() as con:
                 v = con.execute("SELECT version FROM pages WHERE url = ?", (row["url"],)).fetchone()
@@ -2196,9 +2283,13 @@ class InfosysIndex:
                     con.execute("INSERT INTO pages_fts(rowid, url, title, text, code, words) VALUES (?,?,?,?,?,?)",
                                 (r["rowid"], r["url"], r["title"], text, r["code"], r["words"]))
                 pages += 1
+            # N126 (format 6): each page's parent in the contents, by the help id its TOCParent names
+            con.execute("UPDATE pages SET parent = (SELECT h.url FROM helpids h WHERE h.help_id = pages.toc_parent) "
+                        "WHERE toc_parent IS NOT NULL")
+            parents = con.execute("SELECT COUNT(*) FROM pages WHERE parent IS NOT NULL").fetchone()[0]
             con.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)",
-                            [("links", str(found)), ("links_resolved", str(resolved))])
-        return {"pages": pages, "links": found, "resolved": resolved, "help_ids": len(ids),
+                            [("links", str(found)), ("links_resolved", str(resolved)), ("parents", str(parents))])
+        return {"pages": pages, "links": found, "resolved": resolved, "help_ids": len(ids), "parents": parents,
                 "seconds": round(time.time() - t0, 1)}
 
     def _xhelp_url(self, hid: str) -> str | None:
@@ -2301,7 +2392,7 @@ class InfosysIndex:
                   **({"version": r["version"]} if r["version"] else {}),
                   "excerpt": r["s"], "score": round(-r["r"], 3)}
             if r["rid"] in res["copies"]:
-                it["same_page_in"] = [b for b, _pid in res["copies"][r["rid"]]]
+                it["same_page_in"] = list(dict.fromkeys(b for b, _pid in res["copies"][r["rid"]]))   # a book once
             out.append(it)
         return out, res
 

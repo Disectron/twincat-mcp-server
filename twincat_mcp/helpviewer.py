@@ -170,9 +170,29 @@ class HelpViewerSource:
         return d
 
 
+_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([\w-]+)""", re.I)
+
+
+def decode_page(raw: bytes) -> str:
+    """A package page's text. UTF-8 — the packages' encoding — strictly; a page that is not valid UTF-8 is decoded in
+    the charset its <meta> declares, else Windows-1252 (N138 retest: tf5200 pages written in Windows-1252 kept their
+    curly quotes and dashes as U+FFFD — 'Use of the parameter \ufffdrt_cycles.enable\ufffd')."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    m = _CHARSET.search(raw[:4096])
+    for enc in ([m.group(1).decode("ascii", "replace")] if m else []) + ["cp1252"]:
+        try:
+            return raw.decode(enc, errors="replace")
+        except LookupError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def page_meta(raw: bytes | str, limit: int = 8000) -> dict[str, str]:
     """<meta name=… content=…> of a package page (first occurrence wins)."""
-    text = raw[:limit].decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw[:limit]
+    text = decode_page(raw)[:limit] if isinstance(raw, bytes) else raw[:limit]
     out: dict[str, str] = {}
     for k, v in _META.findall(text):
         out.setdefault(k, v)
@@ -186,7 +206,7 @@ _CRUMB = re.compile(r"<ol[^>]*class\s*=\s*[\"'][^\"']*breadcrumb[^\"']*[\"'][^>]
 def body_html(raw: bytes) -> tuple[str, str]:
     """(html to convert, breadcrumb text). Keeps <head> (title/meta) + the <article> when there is one, drops the
     breadcrumb list so it does not end up as the first lines of every page."""
-    text = raw.decode("utf-8", errors="replace")
+    text = decode_page(raw)
     crumb = ""
     m = _CRUMB.search(text)
     if m:

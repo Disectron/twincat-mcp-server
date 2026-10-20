@@ -425,3 +425,26 @@ def test_kbv_pages_whose_id_is_not_a_number(kbdir):
     assert rc == 0 and r["ref"] == "tcplclib_tc2_mc2/6778772363_70094731", r
     rc, r = run(kbdir, "docs_page", "ref=tcplclib_tc2_system/30866571")             # ADSREAD links T_AmsNetID
     assert rc == 0 and {"text": "T_AmsNetID", "ref": "tcplclib_tc2_system/index"} in r["links"], r.get("links")
+
+
+def test_n103b_n126_the_skill_gives_the_stored_members_and_the_contents_family(kbdir):
+    """N103b narrowed (0.8.13 retest): docs_declaration gave kind / return type / declaration only — not the inputs,
+    outputs, methods, enum values the index stores and infosys_declaration gives. N126: docs_page names the page's
+    parent and child pages in the Help Viewer contents (Infosys format 6), as refs docs_page opens."""
+    import sqlite3
+    rc, r = run(kbdir, "docs_declaration", "symbol=ADSREAD", "book=tcplclib_tc2_system")
+    assert rc == 0 and [x["name"] for x in r["inputs"]] == ["NETID", "PORT", "READ"], r.get("inputs")
+    assert [x["name"] for x in r["outputs"]] == ["BUSY", "ERR", "ERRID"]
+    db = kbdir / "index" / "infosys-1033.db"
+    con = sqlite3.connect(db)
+    with con:
+        con.execute("UPDATE pages SET parent = (SELECT url FROM pages WHERE title = 'ADSREAD' AND book = "
+                    "'tcplclib_tc2_system') WHERE title IN ('T_AmsNetID', 'ADSWRITE')")
+    con.close()
+    rc, r = run(kbdir, "docs_page", "ref=tcplclib_tc2_system/30866571")
+    assert rc == 0 and [(c["title"], c["ref"]) for c in r["children"]] == [
+        ("ADSWRITE", "tcplclib_tc2_system/30866572"), ("T_AmsNetID", "tcplclib_tc2_system/31059723")], r.get("children")
+    rc, r = run(kbdir, "docs_page", "ref=tcplclib_tc2_system/31059723")
+    assert r["parent"] == {"title": "ADSREAD", "ref": "tcplclib_tc2_system/30866571"}
+    rc, r = run(kbdir, "docs_declaration", "symbol=T_AmsNetID")
+    assert r["parent"]["ref"] == "tcplclib_tc2_system/30866571"

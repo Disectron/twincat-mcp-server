@@ -635,3 +635,80 @@ def test_kbv_book_slash_id_for_ids_that_are_not_numbers(kb_copy):
     con.close()
     url = InfosysIndex(db_file=db, read_only=True, web_fallback=False).get_page("tc3_ads.net/35409035")["url"]
     assert url == "https://infosys.beckhoff.com/content/1033/tc3_ads.net/35409035.html"
+
+
+def _store_with(idx, ref, title, body, help_id, parent=None):
+    d = _page(title, body)
+    d.meta = {"Microsoft.Help.Id": help_id, **({"Microsoft.Help.TOCParent": parent} if parent else {})}
+    with idx._db() as con:
+        idx._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", d)
+
+
+_CALL = ("<p>Calls the filter.</p><pre>METHOD Call : BOOL\nVAR_INPUT\n    pIn : PVOID;\n    nSizeIn : UDINT;\n"
+         "{more}END_VAR</pre>")
+
+
+def test_n126_an_fbs_methods_are_tied_to_it_through_the_contents(idx):
+    """N126 (0.8.13 retest, S3): Beckhoff titles a method page with its bare name — 'Call' of FB_WG_ComboFilter and
+    'Call' of FB_WG_Weighing could not be told apart, and the FB's page linked only one of its methods. Format 6 stores
+    each page's parent in the Help Viewer contents (Microsoft.Help.TOCParent): the FB lists its children, a method
+    names its FB, and 'FB_WG_ComboFilter.Call' finds the Call below FB_WG_ComboFilter."""
+    assert inf.INDEXER_VERSION == 6
+    W = "tf3685_tc3_weighing_library"
+    _store_with(idx, f"{W}/15084337291", "FB_WG_ComboFilter", "<pre>FUNCTION_BLOCK FB_WG_ComboFilter\nVAR_INPUT\n"
+                "    stConfig : ST_WG_ComboFilter;\nEND_VAR</pre>", "beckhoff-combo")
+    _store_with(idx, f"{W}/15084337299", "FB_WG_Weighing", "<pre>FUNCTION_BLOCK FB_WG_Weighing\nVAR_INPUT\n"
+                "    bEnable : BOOL;\nEND_VAR</pre>", "beckhoff-weigh")
+    _store_with(idx, f"{W}/15098183435_25253189", "Call", _CALL.format(more="    pOut : PVOID;\n"), "beckhoff-call-1",
+                parent="beckhoff-combo")
+    _store_with(idx, f"{W}/15098183435_25253190", "Reset", "<pre>METHOD Reset : BOOL</pre>", "beckhoff-reset-1",
+                parent="beckhoff-combo")
+    _store_with(idx, f"{W}/15112951947", "Call", _CALL.format(more=""), "beckhoff-call-2", parent="beckhoff-weigh")
+    r = idx.resolve_help_links()
+    assert r["parents"] == 3
+    C = "https://infosys.beckhoff.com/content/1033/"
+    fb = idx.get_page(f"{W}/15084337291")
+    assert [(c["title"], c["url"]) for c in fb["children"]] == [("Call", f"{C}{W}/15098183435_25253189.html"),
+                                                                 ("Reset", f"{C}{W}/15098183435_25253190.html")]
+    assert idx.get_page(f"{W}/15112951947")["parent"] == {"title": "FB_WG_Weighing", "url": f"{C}{W}/15084337299.html"}
+    d = idx.declaration("FB_WG_ComboFilter.Call")
+    assert d["url"] == f"{C}{W}/15098183435_25253189.html" and d["parent"]["title"] == "FB_WG_ComboFilter"
+    assert [x["name"] for x in d["inputs"]] == ["pIn", "nSizeIn", "pOut"]
+    assert idx.declaration("FB_WG_Weighing.Call")["url"] == f"{C}{W}/15112951947.html"
+    with pytest.raises(InfosysError, match="ambiguous"):
+        idx.declaration("Call")                                   # the bare name: still two answers, nothing picked
+
+
+def test_n138_a_page_that_is_not_utf8_keeps_its_characters():
+    """N138 (0.8.13 retest): the stored text of 4 tf5200 pages had U+FFFD for Beckhoff's curly quotes — the package
+    page was Windows-1252, read as UTF-8 with errors replaced. (The ADS return-code table itself stores its dashes:
+    '–', U+2013; a U+FFFD seen there comes from the console that printed it.)"""
+    from twincat_mcp.helpviewer import decode_page
+    raw = "<p>Use of the parameter “rt_cycles.enable” – as of V3.1</p>".encode("cp1252")
+    assert decode_page(raw) == "<p>Use of the parameter “rt_cycles.enable” – as of V3.1</p>"
+    assert decode_page("<p>– utf-8 ü</p>".encode("utf-8")) == "<p>– utf-8 ü</p>"
+    latin = '<meta charset="iso-8859-1"><p>Müller</p>'.encode("latin-1")
+    assert "Müller" in decode_page(latin)
+    assert "�" not in html_to_doc(raw).markdown
+
+
+def test_n99b_one_source_page_placed_twice_in_a_book_is_one_hit_and_code_tables_come_first(idx):
+    """N99b (0.8.13 retest, S4): '0x745' listed the 4 'ADS Return Codes' pages of tf6500 separately — ids
+    374277003_30131813 / _2750866 …, Beckhoff's page 374277003 placed several times in one book — and an event-class
+    struct that also lists the code ranked before the table. One source page is one hit (the others in same_page_in);
+    of the defining pages a code table comes first; a merged hit's score is its best page's."""
+    tbl = ("<p>Return codes of ADS.</p><table><tr><th>Hex</th><th>Dec</th><th>Name</th></tr>"
+           "<tr><td>0x745</td><td>1861</td><td>ADSERR_CLIENT_SYNCTIMEOUT</td></tr></table>")
+    with idx._db() as con:
+        for ref in ("tf6500_tc3_iec60870_5_10x/374277003_30131813", "tf6500_tc3_iec60870_5_10x/374277003_2750866",
+                    "tcplclib_tc2_system/374277003"):
+            idx._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "", _page("ADS Return Codes", tbl))
+        idx._store(con, "https://infosys.beckhoff.com/content/1033/tf6510_tc3_iec61850/1.html", "",
+                   _page("ST_TcGeneralAdsEventClass", "<table><tr><th>Hex</th><th>Dec</th><th>Name</th></tr>"
+                         "<tr><td>0x745</td><td>1861</td><td>ClientSyncTimeout</td></tr></table>"))
+    r = idx.search("0x745")
+    titles = [i["title"] for i in r["items"]]
+    assert titles == ["ADS Return Codes", "ST_TcGeneralAdsEventClass"], r["items"]
+    first = r["items"][0]
+    assert first["url"].endswith("/tcplclib_tc2_system/374277003.html")          # the library's own book shown
+    assert first["same_page_in"] == ["tf6500_tc3_iec60870_5_10x"], first          # its two placements: one book

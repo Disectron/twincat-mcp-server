@@ -37,7 +37,11 @@ def test_code_forms_and_where_a_code_is_defined():
     assert D.code_forms("ADS error 1861")["hex"][0] == "0x745" and D.code_forms("16#745")["value"] == 1861
     assert D.code_forms("error 7") is None and D.code_forms("0x745 1861") is None and D.code_forms("ADSREAD") is None
     # a decimal number is a code only when a word says so (review 0.8.12): a port or a build is none
-    assert D.code_forms("1861") is None and D.code_forms("ADS port 851") is None and D.code_forms("build 4024") is None
+    assert D.code_forms("ADS port 851") is None and D.code_forms("build 4024") is None
+    # N122 (0.8.13 retest): a number that is the whole query is a code ('1861' listed Tc3_Vision pages first)
+    assert D.code_forms("1861")["value"] == 1861 and D.code_forms(" 1861 ")["value"] == 1861
+    assert D.code_forms("ADS error on port 851") is None                                 # N121: not next to 'error'
+    assert D.code_forms("7") is None                                                     # one digit: no code
     table = "| Hex | Dec | Name |\n|---|---|---|\n| 0x745 | 1861 | ADSERR_CLIENT_SYNCTIMEOUT |"
     assert D.definition_score(table, 1861) == 2
     assert D.definition_score("| Code |\n| 0x00000745 |", 1861) == 1

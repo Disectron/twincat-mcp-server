@@ -4202,8 +4202,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         initial value) of an FB, plus the ST declaration text and the page URL. The thing to call
         before writing code against an FB you have not used before. A name documented by different pages (two
         libraries, two methods of one name) is refused as ambiguous with the candidates — pass library=; one page in
-        several books is one answer (same_page_in); also_in names the other libraries. The twincat-docs skill's
-        docs_declaration resolves names by the same rule."""
+        several books is one answer (same_page_in); also_in names the other libraries. A member as '<FB>.<name>'
+        (FB_WG_ComboFilter.Call): the page below that FB in the Help Viewer contents (Beckhoff titles a method page with
+        its bare name); parent names the FB of a member. The twincat-docs skill's docs_declaration resolves names by
+        the same rule."""
         return await app.docs_call("declaration", symbol, library, timeout=1800)
 
     @mcp.tool(annotations=READ)
@@ -4212,8 +4214,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]); "quoted phrases"
         stay together, limit 1..50. A question in words falls back in tiers (query_mode, words_used); identifiers
         count as their words (FB_SocketConnect: socket, connect); titles that name the query come first; an error
-        code (0x745, 1861) lists the pages whose table defines it first (code_note); one page in several books is
-        listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
+        code (0x745, 1861 alone, 'error 1861') lists the pages whose table defines it first, code tables before other
+        pages (code_note); one page in several books — or placed twice in one — is listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
         so), results carry the page's doc version and the package date. docs.source='web': when the index has nothing,
         a DuckDuckGo site: query verified against the sitemap; the 'backend' field says which path answered."""
         return await app.docs_call("search", query, library, limit, web_fallback, timeout=300)
@@ -4232,7 +4234,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def infosys_get_page(ref: str, refresh: bool = False, max_chars: int = 60000) -> dict[str, Any]:
         """A documentation page as Markdown (headings, tables, fenced code). ref: full Infosys URL, 'book/pageid', a
         bare page id, or a symbol name ('ADSREAD'). Read from the local Help Viewer package (any page in it, indexed or
-        not; doc version + breadcrumb included) or, with docs.source='web', fetched live. Use max_chars to keep it short."""
+        not; doc version + breadcrumb included) or, with docs.source='web', fetched live. Use max_chars to keep it short.
+        parent / children: the page's place in the Help Viewer contents — an FB's page lists its method and property
+        pages, a method page names its FB."""
         return await app.docs_call("get_page", ref, refresh, max_chars, timeout=600)
 
     # ======================================================================

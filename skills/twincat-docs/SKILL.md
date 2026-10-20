@@ -46,9 +46,11 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 ## Rules
 1. Documentation → this skill. Live PLC values and types → the ads_* tools.
 2. Symbol known → `docs_declaration`. Unknown → `docs_search` → take a `ref` → `docs_page section=`.
-   `docs_declaration` gives `kind`, `return_type` (function, method, property) and `declaration` with its header
-   as the index parsed them — the same answer as `infosys_declaration`; `declaration_blocks` are the page's own
-   code blocks, which often lack the header (`FUNCTION MEMCPY : UDINT` is a heading on the page).
+   `docs_declaration` gives `kind`, `return_type` (function, method, property), `declaration` with its header and
+   the members (`inputs`, `outputs`, `in_out`, `members`, `enum_values`, `methods`, `properties`) as the index parsed
+   them — the same answer as `infosys_declaration`; `declaration_blocks` are the page's own code blocks, which often
+   lack the header (`FUNCTION MEMCPY : UDINT` is a heading on the page). A method or property of an FB:
+   `symbol=FB_WG_ComboFilter.Call` (Beckhoff titles the page `Call`; the Help Viewer contents tie it to its FB).
 3. `ambiguous` = the name is documented by different pages (Tc2_MC2 vs Tc3_DriveMotionControl, or two methods of
    that name in one library). Nothing was chosen for you. Find the library the project uses (`proj_libraries` of the
    twincat server, or ask), call again with `book=` or `ref=`, and say in the answer which library you used. Never
@@ -58,7 +60,8 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 4. `also_in` lists the other pages of that title or symbol (`same_document: true` = the same page or declaration).
    Mention it when the library matters.
 5. Every item has `ref` (book/pageid). Any `ref`, Infosys URL or `ms-xhelp:///?Id=…` link opens with `docs_page`. Follow a
-   page's `links` (`text`, `ref`) with `docs_page ref=…`.
+   page's `links` (`text`, `ref`) with `docs_page ref=…`. `parent` / `children` (each with `ref`) are the page's place in
+   the Help Viewer contents: an FB's page lists its method and property pages, a method page names its FB.
 6. Cite `ref` and `url` in the answer.
 7. Queries are FTS5: words are ANDed, `"exact phrase"`, `OR`, `NOT`, `prefix*`. Code with punctuation is fine —
    invalid syntax is retried as a phrase, and `query_mode` says so. A question in plain words falls back step by step

@@ -372,15 +372,18 @@ result hresult adserr adserror fehler fehlercode fehlernummer""".split())
 def code_forms(query: str) -> dict[str, Any] | None:
     """An error / return code in the query, in the forms the code tables write it (N99): '0x745' → value 1861, hex
     0x745 / 0x0745 / 0x00000745, decimal 1861. One code token in the query: hex (0x…, 16#…, #x…), or a decimal number
-    of two digits or more next to a word that says it is a code ('error 1861', 'ADS return code 1861' — 'ADS port
-    851' or 'build 4024' is no code, review 0.8.12); else None."""
+    of two digits or more that is the whole query ('1861', N122) or stands next to a word that says it is a code
+    ('error 1861', 'ADS return code 1861' — 'ADS port 851' or 'build 4024' is no code, review 0.8.12); else None."""
     q = query_text(query)
     toks = list(re.finditer(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", q))
     if len(toks) != 1:
         return None
     t = toks[0].group(0)
     m = _HEX.match(t)
-    if not m and not _next_to_code_word(q, toks[0].start(), toks[0].end()):
+    # N122 (0.8.13 retest): a number that IS the query ('1861') is a code too, as the tool describes it — only inside
+    # other words does it need a code word next to it ('error 1861'; 'ADS error on port 851' is no code 851, N121)
+    whole = q.strip() == t
+    if not m and not whole and not _next_to_code_word(q, toks[0].start(), toks[0].end()):
         return None
     try:
         value = int(m.group(1).replace("_", ""), 16) if m else int(t)
