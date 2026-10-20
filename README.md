@@ -431,34 +431,6 @@ source `books` (indexed first), `exclude_books` (regexes), `tc3_only`, `max_work
 `max_index_pages`, `sitemap_ttl_days`, `web_fallback` — the local index holds every TwinCAT 3 book whatever they
 say. The `infosys_*` tools are read-only class; `kb_rebuild` is control class and always asks for approval.
 
-### Checking the knowledge base offline: `scripts\kb_verify.py`
-
-One script asks the indexes of the knowledge folder every main kind of question the tools and the skill answer,
-through the plugin's own code, and checks each answer against the index itself — every book and page of the
-Infosys index, every manual and page, every ESI device type, product code, CoE object, diagnosis text and module,
-every unit of the indexed projects — plus questions whose right answer the field retests checked against
-Beckhoff's pages. No server, no TwinCAT, no network; Python 3.12+ and nothing else (the plugin's venv Python works):
-
-```powershell
-$p = "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.14"
-python "$p\scripts\kb_verify.py"                      # quick: up to 20 pages per book / manual (≈ 5 min)
-python "$p\scripts\kb_verify.py" --mode full          # every page and object (≈ 1 h on 51,655 pages)
-python "$p\scripts\kb_verify.py" --only manuals,esi --kb D:\TwinCAT-MCP\knowledge
-```
-
-The knowledge folder is found as the skill finds it (`--kb` to name one). The report goes to
-`%USERPROFILE%\.twincat_mcp\kb_verify\<time>\` — `report.md` (summary per check, failures with the query and what
-came back), `results.json` (everything), `failures.csv` — never into the knowledge folder (refused). It is
-read-only: databases are opened read-only, nothing is built or fetched, and the run proves at its end that no file
-of `index\` and `manuals\` changed (SQLite's `-shm` coordination file, which every reader updates, excepted). Per
-check: **pass**, **fail** (a wrong answer, or an exception of the plugin's code — the run goes on), **warning**
-(the index is outdated, a PDF is not indexed, a link leads to a page outside the package, a declaration Beckhoff's
-page gives the parser no hold on), **not judged** (the question cannot be decided on this index: its book is not
-indexed, its format is older, or more items share the answer than a search lists). An index that does not exist is
-named, not failed. Exit code 0 no failure, 1 failures, 2 could not start, 130 interrupted (the partial report is
-written). `--sample`, `--top`, `--seed` (a re-run tests the same pages), `--package`, `--plugin` (the plugin whose
-code is tested: by default the one the script is part of).
-
 ## A debugging session
 
 ```
