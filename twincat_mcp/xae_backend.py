@@ -227,6 +227,14 @@ class XaeBackend:
                         finally:
                             self._reattaching = False
                     raise XaeError(f"{what}: XAE shell disconnected (closed or crashed). Re-run xae_attach.") from exc
+                if self._stale_sysman(exc) and once:
+                    # re-review of 0.8.14: E_POINTER is also a NullReferenceException TwinCAT's managed code throws
+                    # AFTER acting — an action is never repeated on it. (_on_sm / _on_item refresh a stale System
+                    # Manager with a read before the action, so a reopened solution does not end up here.)
+                    self.sysman = None
+                    raise XaeExplained(
+                        f"{what}: failed with {_com_msg(exc)} — whether it acted is unknown, so it is not repeated. "
+                        "Check xae_status / the XAE tree before you run it again.") from exc
                 if self._stale_sysman(exc) and not getattr(self, "_refreshing_sm", False):
                     # N9: the solution was closed and reopened; the cached ITcSysManager belongs to the old one
                     self._refreshing_sm = True
@@ -355,15 +363,24 @@ class XaeBackend:
             self._find_sysman()
         return self.sysman
 
+    def _live_sm(self) -> None:
+        """Before an action that must not run twice: a read through _retry, which replaces a stale System Manager (a
+        solution reopened in the same shell, N120) — so the action itself is not the call that finds it stale."""
+        self._retry(lambda: self._cur_sm().GetTargetNetId(), "ITcSysManager check")
+
     def _on_sm(self, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(System Manager) through _retry, the System Manager taken in every attempt."""
         self._sm()                         # N116: the bound solution, checked once per call
+        if once:
+            self._live_sm()
         return self._retry(lambda: op(self._cur_sm()), what, once)
 
     def _on_item(self, path: str, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(tree item at path) through _retry, the item looked up in every attempt — a refreshed System Manager or a
         re-attached shell gives a live item, never the stale one of the first attempt."""
         self._sm()
+        if once:
+            self._live_sm()
         return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what, once)
 
     def _on_dte(self, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
@@ -1524,6 +1541,11 @@ class XaeBackend:
                     acc_info = [str(lang)] if kind_l == "property" else None
                     ach = self._create_child(child, acc.capitalize(), _ACCESSOR_SUBTYPE[(kind_l, acc)], "", acc_info)
                     made.append(self._item_dict(ach).get("PathName") or f"{path}^{acc.capitalize()}")
+            except XaeExplained as exc:
+                # re-review of 0.8.14: the shell went away during an accessor (or it may have acted): no clean-up on a
+                # re-attached shell, where the unsaved property is normally gone — say what is not known
+                raise XaeExplained(f"{kind_l} {name}: creating its {acc.capitalize()} accessor — {exc} The {kind_l} "
+                                   f"{path} this call created may be left without accessors: check the XAE tree.") from exc
             except XaeError as exc:
                 # all or nothing: the property this call made goes again rather than stay without accessors
                 try:

@@ -188,13 +188,20 @@ def decode_page(raw: bytes) -> str:
     named = m.group(1).decode("ascii", "replace").lower() if m else ""
     if named and not re.match(r"utf-?(8|16|32)", named):
         try:
-            return raw.decode(named)
-        except (LookupError, UnicodeDecodeError):
+            return raw.decode(named, errors="replace")      # a legacy charset the page declares (gb2312 …)
+        except LookupError:
             pass
-    # UTF-8 with a few bad bytes keeps its good characters; bytes without one UTF-8 sequence are Windows-1252
-    if re.search(rb"[\xc2-\xdf][\x80-\xbf]|[\xe0-\xef][\x80-\xbf]{2}|[\xf0-\xf4][\x80-\xbf]{3}", raw):
-        return raw.decode("utf-8", errors="replace")
-    return raw.decode("cp1252", errors="replace")
+    return raw.decode("utf-8", errors="replace") if utf8_majority(raw) else raw.decode("cp1252", errors="replace")
+
+
+def utf8_majority(raw: bytes) -> bool:
+    """Bytes that are not valid UTF-8: UTF-8 with a few bad bytes (more valid multi-byte characters than bad bytes),
+    or text of a single-byte code page (re-review of 0.8.14: one valid-looking pair such as 'ß“' = DF 93 in a
+    Windows-1252 file is not UTF-8 — counting decides, not the first sequence found)."""
+    text = raw.decode("utf-8", errors="replace")
+    bad = text.count("\ufffd")
+    good = sum(1 for c in text if ord(c) > 0x7F and c != "\ufffd")
+    return good > bad
 
 
 def page_meta(raw: bytes | str, limit: int = 8000) -> dict[str, str]:

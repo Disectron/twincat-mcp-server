@@ -1304,3 +1304,27 @@ def test_review_0814_an_online_command_or_action_is_never_sent_twice(xae, monkey
             raise ComError(X.RPC_E_DISCONNECTED)
         return "ok"
     assert be._retry(dead_once, "GetTargetNetId") == "ok" and n["k"] == 2
+
+
+def test_rereview_0814_a_stale_object_error_never_repeats_an_action(xae, monkeypatch):
+    """Re-review of 0.8.14: the stale-System-Manager branch retried every call — E_POINTER is also the .NET
+    NullReferenceException TwinCAT's managed code throws after acting, so a ConsumeXml / import ran twice. An action is
+    not repeated on it; before an action a read refreshes a stale System Manager (a reopened solution, N120)."""
+    be, dte, sm = xae
+    be.attach()
+    n = {"k": 0}
+
+    def act():
+        n["k"] += 1
+        raise ComError(X.E_POINTER)
+    with pytest.raises(X.XaeExplained, match="whether it acted is unknown, so it is not repeated"):
+        be._retry(act, "ConsumeXml StartCmd", once=True)
+    assert n["k"] == 1
+    reads = {"k": 0}
+
+    def read():
+        reads["k"] += 1
+        if reads["k"] == 1:
+            raise ComError(X.E_POINTER)
+        return "5.1.2.3.1.1"
+    assert be._retry(read, "GetTargetNetId") == "5.1.2.3.1.1" and reads["k"] == 2      # a read still retries

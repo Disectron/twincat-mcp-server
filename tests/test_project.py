@@ -689,3 +689,28 @@ def test_review_0814_a_port_means_its_plc_project_also_without_shared_names(tmp_
         p.resolve_symbol("PRG_B.n", 851)
     v = p.variables()
     assert sorted(v["roots"]) == ["MAIN", "PRG_B"] and "2 PLC projects and no ADS port was given" in v["note"], v
+
+
+def test_review_0814_a_pin_and_a_file_linked_into_two_plc_projects(tmp_path):
+    """Re-review of 0.8.14: variables('Plc2@MAIN', port=851) was refused (the port-bound lookup ignored the pin); a file
+    linked into both PLC projects (..\\Common\\GVL_Common.TcGVL) had one owner — the last .plcproj — and vanished from
+    the other port's variables and symbol resolution."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    common = tmp_path / "Common"
+    common.mkdir()
+    (common / "GVL_Common.TcGVL").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><GVL Name="GVL_Common"><Declaration><![CDATA[VAR_GLOBAL\n'
+        "  nShared : INT;\nEND_VAR]]></Declaration></GVL></TcPlcObject>", encoding="utf-8")
+    for plc in ("Plc1", "Plc2"):
+        pp = tmp_path / plc / f"{plc}.plcproj"
+        pp.write_text(pp.read_text().replace("</Project>", '<ItemGroup><Compile Include="..\\Common\\GVL_Common.TcGVL">'
+                                              "<SubType>Code</SubType></Compile></ItemGroup></Project>"))
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    assert "n + 2" in p.get_unit("Plc2@MAIN").implementation
+    assert p.variables("Plc2@MAIN", port=851)["items"][0]["path"] == "MAIN.n"
+    for port in (851, 852):
+        assert "GVL_Common" in p.variables(port=port)["roots"], port
+        assert p.resolve_symbol("GVL_Common.nShared", port)["resolved"], port
+    assert "gvl_common" in p.plc_units(p.plc_project(port=852))[0] and "gvl_common" not in p.duplicates

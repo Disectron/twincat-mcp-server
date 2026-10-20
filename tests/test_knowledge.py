@@ -907,6 +907,9 @@ def test_n132_unreadable_files_are_named_utf16_read_and_no_text_cut(kb, project_
     assert t.startswith("<a>Größe") and enc == "utf-8"
     t, enc, bom, note = decode_source(b"<a>Gr\xf6\xdfe \x96</a>")
     assert t == "<a>Größe –</a>" and enc == "cp1252" and "Windows-1252" in note
+    # re-review: one valid-looking pair ('ß“' = DF 93) does not make a Windows-1252 file UTF-8
+    t, enc, bom, note = decode_source("<a>Größe: „Maß“ – Öl</a>".encode("cp1252"))
+    assert t == "<a>Größe: „Maß“ – Öl</a>" and enc == "cp1252", t
 
 
 def test_n133_a_changed_renamed_or_deleted_folder_is_reported(kb, project_dir, tmp_path):
@@ -1029,6 +1032,11 @@ def test_n129_n130_error_messages_keep_their_names_and_known_errors_need_their_c
     # … and words of the code are not: identifiers beginning with ERR_ / err_, numbers, model numbers, sentences
     for q in ("ERR_TIMEOUT", "err_count reset", "851", "16#FF", "C6015", "the unknown type of data", "1861"):
         assert not K.is_error_message(q), q
+    # re-review of 0.8.14: pyads' text with parentheses of its own, 'error no. N', and ST's 16# numbers
+    assert K._ads_codes("ADSError: invalid parameter value(s) (1798). ") == [1798]
+    assert K.is_error_message("ADSError: invalid parameter value(s) (1798). ")
+    assert K.known_error("Error No.: 1808")["code"].endswith("ADSERR_DEVICE_SYMBOLNOTFOUND")
+    assert K._ads_codes("ADS: nErrId := 16#745") == [1861] and K._ads_codes("error 16#745 at offset 3") == [1861]
     assert K.known_error("the unknown type of data") is None and K.known_error("identifier is not defined") is None
     assert K.known_error("TIPC^Plc1^Plc1 Project is not logged in — start acts on the online session") is None
     assert K.known_error("ADSError 1796: reading or writing not permitted")["code"].endswith("ADSERR_DEVICE_INVALIDACCESS")

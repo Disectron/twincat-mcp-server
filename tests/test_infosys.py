@@ -703,6 +703,10 @@ def test_n138_a_page_that_is_not_utf8_keeps_its_characters():
     for meta in ('<meta charset="utf-8">', '<meta http-equiv="Content-Type" content="text/html; charset=utf-16">'):
         assert decode_page((meta + "<p>“x” – y</p>").encode("cp1252")) == meta + "<p>“x” – y</p>"
     assert decode_page("<p>Größe ".encode("utf-8") + b"\x96</p>") == "<p>Größe \ufffd</p>"
+    # re-review of 0.8.14: a legacy charset the page declares is followed even with a byte it lacks (GB2312 + GBK)
+    gb = '<meta charset="gb2312"><p>功能块的输入参数</p>'.encode("gbk") + "\u7881".encode("gbk")
+    assert "功能块的输入参数" in decode_page(gb)
+    assert decode_page("<p>Größe: „Maß“ – Öl</p>".encode("cp1252")) == "<p>Größe: „Maß“ – Öl</p>"
 
 
 def test_n99b_one_source_page_placed_twice_in_a_book_is_one_hit_and_code_tables_come_first(idx):

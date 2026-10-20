@@ -204,26 +204,29 @@ def unit_words(name: str, declaration: str, implementation: str) -> tuple[str, s
 
 
 # a code word right before the number: 'error 1861', 'error code 7', 'nErrId := 1808', 'error number 1861'
-_CODE_WORD = r"(?:error|fehler|err|errid|nerrid|errorid|nerrorid|errorcode|nerrorcode)(?:[\s_-]*(?:code|number|id|no\.?))?"
-_ADS_CODE = re.compile(r"\bads[\s_-]*(?:error|fehler|err)\b[\s:#=-]*(?:code[\s:#=-]*)?(0x[0-9a-f]+|\d+)"
-                       r"|\b" + _CODE_WORD + r"\b[\s:#=-]*(0x[0-9a-f]+|\d+)\b"
-                       r"|\badserror\b\s*:[^\n()]{0,160}\((\d+)\)", re.I)          # pyads: 'ADSError: … (1808).' 
+_CODE_WORD = (r"(?:error|fehler|err|errid|nerrid|errorid|nerrorid|errorcode|nerrorcode)\b"
+              r"(?:[\s_-]*(?:code|number|id|no|nr)\b\.?)?")      # 'error no. 1808' (the \b before the '.')
+# a number as a message writes a code: 0x745, 16#745 (ST), 1861 — never the '16' of '16#745'
+_CODE_NUM = r"(0x[0-9a-f]+|16#[0-9a-f_]+|\d+)(?![#\w])"
+_ADS_CODE = re.compile(r"\bads[\s_-]*(?:error|fehler|err)\b[\s:#=-]*(?:code[\s:#=-]*)?" + _CODE_NUM +
+                       r"|\b" + _CODE_WORD + r"[\s:#=-]*" + _CODE_NUM +
+                       # pyads: 'ADSError: symbol not found (1808).', 'ADSError: invalid parameter value(s) (1798).'
+                       r"|\badserror\b\s*:[^\n]{0,200}?\((\d+)\)", re.I)
 _HEX = re.compile(r"\b0x([0-9a-f]{1,8})\b", re.I)
 _ADS_WORD = re.compile(r"\bads(?:\b|error|err\b|fehler)", re.I)      # 'ADS', 'ADSError' — not 'ads_write_raw'
 _ADS_HRESULT = re.compile(r"\b0x9811([0-9a-f]{4})\b", re.I)            # the ADS facility of an HRESULT
 _SYMBOL = re.compile(r"\bADSERR_[A-Z0-9_]+\b|\bERR_[A-Z]+NOTFOUND\b")    # case as Beckhoff writes them
-_NUMBER = r"(?:0x[0-9a-f]+|16#[0-9a-f_]+|\d+)"
+_NUMBER = r"(?:0x[0-9a-f]+|16#[0-9a-f_]+|\d+)(?![#\w])"
 # N129 / N130: what makes a query an error message — a code in a notation that says so, a code word right next to a
-# number, an HRESULT, an ADS symbol, a compiler message (its number or its text), or a number that is the whole query.
-# Not the word 'error' alone ('error handler' is a search in code), not a bare hex number anywhere ('nCycleCount 0x705')
+# number, an HRESULT, an ADS symbol, a compiler message (its number or its text), or a 0x number that is the whole query.
 # Not the word 'error' alone ('error handler' is a search in code), not a bare hex number anywhere ('nCycleCount
 # 0x705'), not a decimal or 16# number alone ('851', '16#FF' are literals of the code), not an identifier that begins
 # with err_ / ERR_ (review: 'ERR_TIMEOUT' of an enum, 'err_count'), not a Beckhoff model number ('C6015': compiler
 # messages are C0xxx)
 _ERROR_MESSAGE = re.compile(
     r"\bads[\s_-]*(?:error|err|fehler)\b[\s:#=-]*" + _NUMBER +
-    r"|\b(?:" + _CODE_WORD + r"|code)\b[\s:#=-]*" + _NUMBER + r"\b"
-    r"|\badserror\b\s*:[^\n()]{0,160}\(\d+\)"
+    r"|\b(?:" + _CODE_WORD + r"|code\b)[\s:#=-]*" + _NUMBER +
+    r"|\badserror\b\s*:[^\n]{0,200}?\(\d+\)"
     r"|\b0x[89a-f][0-9a-f]{7}\b|\bC0\d{3}\b"
     r"|identifier\s+'[^']+'\s+(?:is\s+)?not\s+defined|identifier\s+(?!(?:is|was|not)\b)[A-Za-z_][\w.]*\s+(?:is\s+)?not\s+defined"
     r"|cannot convert type\s+'|unknown type:?\s*'|unknown type:\s*[A-Za-z_]"
@@ -289,8 +292,8 @@ def _ads_codes(msg: str) -> list[int]:
         any(t in _ADS_SYMBOLS for t in _SYMBOL.findall(msg))
     codes: list[int] = []
     for m in _ADS_CODE.finditer(msg):
-        v = m.group(1) or m.group(2) or m.group(3)
-        n = int(v, 16) if v.lower().startswith("0x") else int(v)
+        v = (m.group(1) or m.group(2) or m.group(3)).lower().replace("_", "")
+        n = int(v[2:], 16) if v.startswith("0x") else int(v[3:], 16) if v.startswith("16#") else int(v)
         if m.group(2) is not None and not ads and not 0x700 <= n <= 0x7FF:
             continue                                  # 'exited with error code 7' is not an ADS error; 1861 is
         codes.append(n)
@@ -729,7 +732,7 @@ class Knowledge:
         with self._db_read() as con:
             out["database"] = str(db_file)
             out["projects"] = self._project_rows(con)
-            out["fts5"] = bool(self._fts)
+            out["fts5"] = bool(self._fts) if db_file.is_file() else None      # not known before the database exists
             old_esi = con.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('esi', 'esi_files')").fetchall()
         dup: dict[str, list[str]] = {}
         for pr in out["projects"]:
