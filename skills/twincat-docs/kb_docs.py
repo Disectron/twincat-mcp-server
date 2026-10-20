@@ -87,8 +87,12 @@ RULES = [
     "Cite ref + url in the answer.",
     "Queries are FTS5: words ANDed, \"exact phrase\", OR, NOT, prefix*. Invalid syntax is retried once as a phrase "
     "(query_mode says so).",
-    "Ranges are checked, not clamped: limit 1-50, max_chars 200-20000, offset >= 0, depth 1-6, at most 21 pages.",
-    "Long pages: section= first (outline lists them), then offset=next_offset.",
+    "Ranges are checked, not clamped: limit 1-50, max_chars 200-20000, offset >= 0, depth 1-6, at most 21 pages. "
+    "manual_search's limit above 50 is used as 50 (clamped: true says so); its hits page with offset=next_offset.",
+    "Long pages: section= first (outline lists them), then offset=next_offset. A manual's pages: manual_page "
+    "pages=<next_pages> offset=<next_offset>, as `next` names them.",
+    "manual_search: a hex number or CoE index (0x8000, #x8000, 16#8000, 8000:11) is found in any notation, a unit "
+    "symbol (°C, mV/V, mA, µs) as written on the page; `terms` says how each was searched.",
     "Nothing found -> say so. A missing manual -> the user copies the PDF into <kb>\\manuals\\ and runs "
     "manuals_db.py update (or approves kb_rebuild(index='manuals')).",
     "source.state other than 'complete' (rebuild_needed, outdated) -> say so: the answer comes from that index as it "
@@ -113,15 +117,20 @@ class Err(Exception):
 
 # ---------------------------------------------------------------------------------------------- arguments
 class P:
-    """One parameter: kind 'str' | 'int', required, default, (lo, hi) for ints."""
+    """One parameter: kind 'str' | 'int', required, default, (lo, hi) for ints. clamp: a value above hi is used as hi
+    (bind records it in '_clamped'; the command says so) instead of being refused. route: how to read on, named in
+    the refusal of an out-of-range value (N169)."""
 
     def __init__(self, kind: str = "str", required: bool = False, default: Any = None, lo: int | None = None,
-                 hi: int | None = None, doc: str = ""):
+                 hi: int | None = None, doc: str = "", clamp: bool = False, route: str = ""):
         self.kind, self.required, self.default, self.lo, self.hi, self.doc = kind, required, default, lo, hi, doc
+        self.clamp, self.route = clamp, route
 
     def describe(self) -> str:
         s = self.doc or self.kind
-        if self.lo is not None:
+        if self.lo is not None and self.clamp and self.hi is not None:
+            s += f" ({self.lo}-{self.hi}; above {self.hi}: {self.hi} is used)"
+        elif self.lo is not None:
             s += f" ({self.lo}-{self.hi})" if self.hi is not None else f" (>= {self.lo})"
         if self.required:
             s += ", required"
@@ -200,9 +209,13 @@ def bind(spec: dict[str, P], kv: dict[str, str]) -> dict[str, Any]:
                 v = int(raw.strip())
             except ValueError:
                 raise Err("bad_param", f"{name} must be a whole number, got {raw!r}") from None
+            if p.clamp and p.hi is not None and v > p.hi:      # N167: used as the maximum, and said so
+                out.setdefault("_clamped", {})[name] = (v, p.lo, p.hi)
+                v = p.hi
             if (p.lo is not None and v < p.lo) or (p.hi is not None and v > p.hi):
                 rng = f"{p.lo}-{p.hi}" if p.hi is not None else f">= {p.lo}"
-                raise Err("bad_param", f"{name} must be {rng} (got {v}) — out-of-range values are refused, not clamped")
+                raise Err("bad_param", f"{name} must be {rng} (got {v}) — out-of-range values are refused, not clamped"
+                          + (f"; {p.route}" if p.route else ""))
             out[name] = v
         else:
             if p.required and not raw.strip():
@@ -867,6 +880,92 @@ def _msource(ctx: Ctx) -> dict[str, Any]:
     return ctx.source("manuals")
 
 
+# N164 / N165 (0.8.14 retest): terms of a manual query that the index cannot hold as written. Its tokenizer (unicode61)
+# keeps letters and digits only, so every notation of one hex number is another term — '0x8000' is the token 0x8000,
+# '#x8000' the token x8000, '16#8000' and the sub-index row '8000:11' the tokens 16 8000 / 8000 11 — and one notation
+# never found the others ('8000:11' 1 hit, '0x8000:11' 4); the degree sign is no character of the index at all, so
+# '°C' was the letter C (C++, C:\ first). Such a term is searched as every form the index holds (fts, ANDed with the
+# query's other words in each step of the search) and the page text must hold the term itself in one of its
+# notations (rx, checked on the stored text): the term is found, not its tokens. A query written in FTS5 syntax
+# (quotes, operators, prefix*, parentheses) runs as written.
+_FTS_WRITTEN = re.compile(r'["*()^]|\b(?:AND|OR|NOT|NEAR)\b')
+_HEX_TERM = re.compile(r"(?<![\w#])(?:0x|#x|16#)([0-9a-f]{1,8})(?::(?:0x)?(0*[0-9a-f]{1,2}))?(?![\w#:])", re.I)
+_SUB_TERM = re.compile(r"(?<![\w#:])([0-9a-f]{4}):(?:0x)?(0*[0-9a-f]{1,2})(?![\w#:])", re.I)
+_MICRO = "\u00b5\u03bc"             # micro sign, Greek mu — PDFs use either
+_OHM = "\u03a9\u2126"               # Greek capital omega, ohm sign
+_DEG_C, _DEG_F = "\u2103", "\u2109"  # the one-character degree Celsius / Fahrenheit signs
+_PREFIX = f"[pn{_MICRO}mkMG]"
+_UNIT_ONE = f"{_PREFIX}?(?:Hz|Wh|VA|bar|Pa|min|V|A|W|[{_OHM}]|s|m|g|K|h)"
+# a unit symbol: degrees, a unit per unit (mV/V), a prefixed unit (mA, µs, kΩ, MHz), Hz / Ω — a plain letter (V, A,
+# s, m) is a word of the query, not a unit; digits may stand right before it (60°C), letters may not
+_UNIT_TERM = re.compile(rf"(?<![^\W\d_])(?:°\s?[CF]|{_DEG_C}|{_DEG_F}|{_UNIT_ONE}/{_UNIT_ONE}"
+                        rf"|{_PREFIX}(?:Hz|Wh|VA|bar|Pa|V|A|W|[{_OHM}]|s)|Hz|[{_OHM}])(?![^\W\d_])")
+
+
+def _hex_term(text: str, digits: str, sub: str | None) -> dict[str, Any]:
+    d = digits.lower()
+    idx = len(d) == 4            # a CoE index: its sub-index rows are written without a prefix ('8000:11')
+    alts = [f'"0x{d}"', f'"x{d}"'] + ([f'"{d}"'] if idx else [f'"16 {d}"'])
+    pre = rf"(?<![0-9a-z])(?:0x|#x|16#){d}"
+    D = d.upper()
+    if sub is None:
+        rx = pre + r"(?![0-9a-z])"
+        forms = [f"0x{D}", f"#x{D}", f"16#{D}"]
+        if idx:
+            rx += rf"|(?<![0-9a-z#:]){d}:(?:0x)?[0-9a-f]{{1,2}}(?![0-9a-z])"
+            forms.append(f"{D}:<sub-index>")
+    else:
+        s = int(sub, 16)
+        tail = rf":(?:0x)?0*{s:x}(?![0-9a-z])"
+        rx = (rf"(?:{pre}|(?<![0-9a-z#:]){d})" if idx else pre) + tail
+        S = f"{s:02X}"
+        forms = [f"0x{D}:{S}", f"#x{D}:{S}", f"16#{D}:{S}"] + ([f"{D}:{S}"] if idx else [])
+    return {"term": text, "fts": "(" + " OR ".join(alts) + ")", "rx": "(?i)" + rx,
+            "searched_as": f"{text} in any notation: {', '.join(forms)}"}
+
+
+def _unit_term(text: str) -> dict[str, Any]:
+    u = re.sub(r"\s+", "", text).replace(_DEG_C, "°C").replace(_DEG_F, "°F")
+    parts = []
+    for ch in u:
+        parts.append(f"[{_MICRO}]" if ch in _MICRO else f"[{_OHM}]" if ch in _OHM else r"\s?/\s?" if ch == "/"
+                     else r"°\s?" if ch == "°" else re.escape(ch))
+    core = "".join(parts)
+    if u in ("°C", "°F"):
+        core = f"(?:{core}|{_DEG_C if u == '°C' else _DEG_F})"
+    letters = " ".join(re.findall(r"[^\W_]+", u))
+    return {"term": text, "fts": '"' + u + '"', "rx": rf"(?<![^\W\d_]){core}(?![^\W\d_])",
+            "searched_as": f"the unit {u} as written on the page (the index keeps only its letters: {letters})"}
+
+
+def _manual_terms(q: str) -> tuple[list[dict[str, Any]], str]:
+    """-> (the hex numbers / CoE indexes and unit symbols of the query, in their order; the query without them)."""
+    if _FTS_WRITTEN.search(q):
+        return [], q
+    found: list[tuple[int, dict[str, Any]]] = []
+    for pat, make in ((_HEX_TERM, lambda m: _hex_term(m.group(0), m.group(1), m.group(2))),
+                      (_SUB_TERM, lambda m: _hex_term(m.group(0), m.group(1), m.group(2))),
+                      (_UNIT_TERM, lambda m: _unit_term(m.group(0)))):
+        def take(m: re.Match, make=make) -> str:
+            found.append((m.start(), make(m)))
+            return " " * len(m.group(0))           # the places of the other terms stay where they are
+        q = pat.sub(take, q)
+    return [t for _pos, t in sorted(found, key=lambda x: x[0])], " ".join(q.split())
+
+
+def _holds(text: str | None, rx: str) -> int:
+    return 1 if _compiled(rx).search(text or "") else 0
+
+
+_RX_CACHE: dict[str, re.Pattern] = {}
+
+
+def _compiled(rx: str) -> re.Pattern:
+    if rx not in _RX_CACHE:
+        _RX_CACHE[rx] = re.compile(rx)
+    return _RX_CACHE[rx]
+
+
 def cmd_manual_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("manuals")
     names = {r["id"]: r["name"] for r in con.execute("SELECT id, name FROM doc")}
@@ -877,10 +976,39 @@ def cmd_manual_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
             _one_doc(con, a["doc"])                    # raises not_found with the list
         where += f" AND doc IN ({','.join('?' * len(ids))})"
         extra = ids
-    rows, total, mode, expr, info = search_tiers(
-        con, "SELECT fts.rowid AS rid, doc, page, section, snippet(fts, 0, '[', ']', '…', 16) AS s, "
-             f"bm25(fts, 1.0, 4.0) AS r FROM fts WHERE {where} ORDER BY r LIMIT ?",
-        f"SELECT COUNT(*) FROM fts WHERE {where}", a["query"], extra, a["limit"])
+    terms, rest = _manual_terms(query_text(a["query"]))
+    if terms:                                          # N164 / N165: the page text holds each term as written
+        con.create_function("manual_holds", 2, _holds, deterministic=True)
+        for t in terms:
+            where += " AND manual_holds(fts.text, ?)"
+            extra = extra + [t["rx"]]
+    exact = " AND ".join(t["fts"] for t in terms)
+    # N167 (0.8.14 retest): paging — the hits up to offset + limit are read, the page of them is shown (the rowid
+    # makes the order of equal scores fixed, so pages neither repeat nor skip a hit)
+    off, fetch = a["offset"], a["offset"] + a["limit"]
+
+    def sql(w: str) -> tuple[str, str]:
+        return ("SELECT fts.rowid AS rid, doc, page, section, snippet(fts, 0, '[', ']', '…', 16) AS s, "
+                f"bm25(fts, 1.0, 4.0) AS r FROM fts WHERE {w} ORDER BY r, fts.rowid LIMIT ?",
+                f"SELECT COUNT(*) FROM fts WHERE {w}")
+    if terms and not has_words(rest):                  # nothing but such terms
+        s, c = sql(where)
+        try:
+            rows = con.execute(s, [exact, *extra, fetch]).fetchall()
+            total = con.execute(c, [exact, *extra]).fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            raise Err("internal", f"search of {[t['term'] for t in terms]} failed: {exc}") from None
+        mode, info = "exact terms", {"words_used": [t["term"] for t in terms]}
+    else:
+        if terms:                                      # the other words fall back in steps; the terms stay in each
+            where += " AND fts.rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?)"
+            extra = extra + [exact]
+        s, c = sql(where)
+        rows, total, mode, _expr, info = search_tiers(con, s, c, rest if terms else a["query"], extra, fetch)
+    if off and off >= total and total:
+        raise Err("bad_param", f"offset {off} is past the last hit ({total} hits) — offset=0 for the first ones")
+    rows = rows[off:off + a["limit"]]
+    nxt = off + len(rows) if off + len(rows) < total else None
     items = []
     for r in rows:
         it = {"doc": names.get(r["doc"], r["doc"]), "doc_id": r["doc"], "page": r["page"], "section": r["section"] or None,
@@ -888,10 +1016,20 @@ def cmd_manual_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         if mode.startswith("some words"):
             it["matched"] = matched_words(con, r["rid"], info.get("words_used") or [])
         items.append(it)
-    out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info, "count": len(items), "total": total,
-                           "truncated": total > len(items), "items": items, "source": _msource(ctx)}
+    out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info}
+    if terms:
+        out["terms"] = [{"term": t["term"], "searched_as": t["searched_as"]} for t in terms]
+    out.update({"count": len(items), "total": total, "offset": off, "next_offset": nxt, "truncated": nxt is not None,
+                "items": items})
+    for name, (asked, lo, hi) in (a.get("_clamped") or {}).items():
+        out["clamped"] = True
+        out["clamped_note"] = (f"{name} {asked} is above the maximum ({lo}-{hi}): {hi} used"
+                               + (f" — the next hits: offset={nxt}" if nxt is not None else ""))
+    out["source"] = _msource(ctx)
     if not items:
-        out["hint"] = "no indexed manual page contains these words; a manual that is not indexed yet: " + BUILD_MANUALS
+        out["hint"] = ("no indexed manual page contains these words"
+                       + (" with " + ", ".join(t["term"] for t in terms) + " as written" if terms else "")
+                       + "; a manual that is not indexed yet: " + BUILD_MANUALS)
     return out
 
 
@@ -913,10 +1051,46 @@ def cmd_manual_product(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
             out["matched_as"] = f"base product {base.group(1)} (no manual names the variant {code})"
     items = [{"doc": r["name"], "doc_id": r["doc"], "mentions": r["hits"],
               "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})} for r in rows]
+    if not items:
+        # N163 (0.8.14 retest): the product table is what the builder took for a product code — an index built by an
+        # older builder lacks whole families (ED2008: 'copy the PDF manuals' although its manual was indexed). The
+        # page text is the evidence: a code it names is answered from it, and said so; only a code on no indexed
+        # page sends the user to add a manual
+        items = _code_in_text(con, code, a["limit"])
+        via = None
+        if not items and base:
+            items, via = _code_in_text(con, base.group(1), a["limit"]), base.group(1)
+        if items:
+            out["matched_as"] = "page text" + (f": base product {via} (no page names the variant {code})" if via else "")
+            fmt = (con.execute("SELECT value FROM meta WHERE key = 'text_format'").fetchone() or ["1"])[0]
+            out["note"] = (f"{via or code} is not in this index's product-code table, but the page text names it — "
+                           + (f"the index was written with page text format {fmt} by an older builder, whose "
+                              f"product-code rule missed it; the rebuild (format {MANUALS_TEXT_FORMAT}) lists it once "
+                              "approved: kb_rebuild(index='manuals'), or tools\\manuals_db.py update"
+                              if fmt != MANUALS_TEXT_FORMAT else
+                              "the product-code rule (a family's letters and four digits) does not take this form"))
     out.update({"count": len(items), "items": items, "source": _msource(ctx)})
     if not items:
         out["hint"] = f"{code} is in no indexed manual — " + BUILD_MANUALS
     return out
+
+
+def _code_in_text(con: sqlite3.Connection, code: str, limit: int) -> list[dict[str, Any]]:
+    """The manuals whose page text names the product code (or a variant of it, CODE-dddd), most mentions first."""
+    toks = re.findall(r"[^\W_]+", code)
+    if not toks:
+        return []
+    rx = re.compile(r"(?<![A-Za-z0-9])" + re.escape(code) + (r"(?:-\d{4})?" if "-" not in code else "")
+                    + r"(?![A-Za-z0-9])", re.I)
+    per: dict[int, dict[int, int]] = {}
+    for r in con.execute("SELECT doc, page, text FROM fts WHERE fts MATCH ?", ('"' + " ".join(toks) + '"',)):
+        n = len(rx.findall(r["text"] or ""))
+        if n:
+            per.setdefault(r["doc"], {})[r["page"]] = n
+    names = {r["id"]: r["name"] for r in con.execute("SELECT id, name FROM doc")}
+    items = [{"doc": names.get(d, d), "doc_id": d, "mentions": sum(pg.values()), "pages": sorted(pg)}
+             for d, pg in per.items()]
+    return sorted(items, key=lambda it: (-it["mentions"], it["doc"]))[:limit]
 
 
 def cmd_manual_toc(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
@@ -944,21 +1118,31 @@ def cmd_manual_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     d = _one_doc(con, a["doc"])
     if hi > (d["pages"] or 0):
         raise Err("bad_param", f"{d['name']} has {d['pages']} pages (asked for {lo}-{hi})")
-    out_pages, used, cut = [], 0, None
+    # N169 (0.8.14 retest): offset = the characters of page N (the first page asked) already read. `next` repeated the
+    # same call when the first page alone was longer than max_chars (pages=N-M again, cut at the same place); it
+    # names the offset now, so the route a max_chars refusal names exists
+    out_pages, used, cut, cut_at = [], 0, None, 0
     for r in con.execute("SELECT page, section, text FROM page WHERE doc = ? AND page BETWEEN ? AND ? ORDER BY page",
                          (d["id"], lo, hi)):
         t = r["text"] or ""
+        start = a["offset"] if r["page"] == lo else 0
+        if start and start >= len(t):
+            raise Err("bad_param", f"offset {start} is past the end of page {lo} ({len(t)} chars)")
+        t = t[start:]
+        at = {"offset": start} if start else {}
         if used + len(t) > a["max_chars"]:
             t = t[:max(0, a["max_chars"] - used)]
-            out_pages.append({"page": r["page"], "section": r["section"] or None, "text": t, "cut": True})
-            cut = r["page"]
+            out_pages.append({"page": r["page"], "section": r["section"] or None, **at, "text": t, "cut": True})
+            cut, cut_at = r["page"], start + len(t)
             break
-        out_pages.append({"page": r["page"], "section": r["section"] or None, "text": t})
+        out_pages.append({"page": r["page"], "section": r["section"] or None, **at, "text": t})
         used += len(t)
     out: dict[str, Any] = {"doc": d["name"], "doc_id": d["id"], "title": d["title"], "path": d["path"],
                            "pages": out_pages, "truncated": cut is not None, "source": _msource(ctx)}
     if cut is not None:
-        out["next"] = f"cut at max_chars {a['max_chars']} on page {cut}: manual_page doc={d['name']} pages={cut}-{hi}"
+        out["next"] = (f"cut at max_chars {a['max_chars']} on page {cut}: manual_page doc={d['name']} "
+                       f"pages={cut}-{hi} offset={cut_at}")
+        out["next_pages"], out["next_offset"] = f"{cut}-{hi}", cut_at
     return out
 
 
@@ -1055,17 +1239,28 @@ COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[
                                   "offset": P("int", default=0, lo=0), "max_chars": P("int", default=4000, lo=200, hi=20000)},
                   "a page as text: outline, one section, paging with next_offset"),
     "docs_books": (cmd_docs_books, {"filter": P(doc="glob on the book slug")}, "Infosys books with page counts"),
-    "manual_search": (cmd_manual_search, {"query": P(required=True, doc="FTS5 query"), "doc": P(doc="manual: file name, glob or id"),
-                                          "limit": P("int", default=10, lo=1, hi=50)},
-                      "PDF manuals full text: doc, page, section, excerpt"),
+    # N167 / N169 (0.8.14 retest): the search pages (offset / next_offset) and clamps its limit; each refusal of a
+    # range names the way to read on
+    "manual_search": (cmd_manual_search, {"query": P(required=True, doc="FTS5 query; 0x8000:11 / #x8000 / °C / mV/V are "
+                                                                        "searched in any notation, as written"),
+                                          "doc": P(doc="manual: file name, glob or id"),
+                                          "limit": P("int", default=10, lo=1, hi=50, clamp=True, doc="hits shown"),
+                                          "offset": P("int", default=0, lo=0, doc="hits skipped: the next ones are "
+                                                                                   "offset=<next_offset>")},
+                      "PDF manuals full text: doc, page, section, excerpt; paging with next_offset"),
     "manual_product": (cmd_manual_product, {"code": P(required=True, doc="product code, e.g. EL3102 (also EL3102-xxxx)"),
-                                            "limit": P("int", default=20, lo=1, hi=50)},
+                                            "limit": P("int", default=20, lo=1, hi=50, doc="manuals shown")},
                        "which manuals mention a product code, on which pages"),
-    "manual_toc": (cmd_manual_toc, {"doc": P(required=True, doc="file name, glob or id"), "depth": P("int", default=2, lo=1, hi=6)},
+    "manual_toc": (cmd_manual_toc, {"doc": P(required=True, doc="file name, glob or id"),
+                                    "depth": P("int", default=2, lo=1, hi=6, doc="bookmark levels")},
                    "a manual's chapters with page numbers"),
     "manual_page": (cmd_manual_page, {"doc": P(required=True, doc="file name, glob or id"), "pages": P(required=True, doc="N or N-M (<= 21 pages)"),
-                                      "max_chars": P("int", default=4000, lo=200, hi=20000)},
-                    "page text of a manual with the section of each page"),
+                                      "max_chars": P("int", default=4000, lo=200, hi=20000, doc="characters shown",
+                                                     route="read a long text in parts: pages=N-M offset=<next_offset> "
+                                                           "as `next` names them"),
+                                      "offset": P("int", default=0, lo=0, doc="characters of page N already read: "
+                                                                               "offset=<next_offset> with pages=<next_pages>")},
+                    "page text of a manual with the section of each page; paging with next_pages / next_offset"),
     "manual_docs": (cmd_manual_docs, {"filter": P(doc="file name / title glob or word")}, "the indexed manuals"),
     "hw_lookup": (cmd_hw_lookup, {"query": P(required=True, doc="type / order code, part of a name, or product code "
                                                                "#x… / 0x… / decimal"),

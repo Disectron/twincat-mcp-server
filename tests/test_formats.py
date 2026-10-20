@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # (format version, fingerprint of the code that produces it)
 INFOSYS_FINGERPRINT = (7, "b37714b81cc534b9")   # 0.8.15: kinds from the page's own evidence (N150 N151 N157 N172),
 #                                                    symbols inside pages (N170)
-MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
+MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes of every family (N163)
 ESI_FINGERPRINT = ("2", "684a8ed1534e8857")    # index\\esi.db (esi_index.py): format 2 — modules found by their
 #                                                 devices (N156, 0.8.14 retest); format 1 since 0.8.12
 

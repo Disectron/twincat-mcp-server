@@ -117,9 +117,9 @@ page URL), `books`, `meta`. `meta.indexer_version` is the format (`infosys.INDEX
 
 ```
 python manuals_db.py [--kb PATH | --db PATH] update  [--dir PATH] [--force]
-python manuals_db.py search  QUERY [--doc GLOB] [--limit 10]
+python manuals_db.py search  QUERY [--doc GLOB] [--limit 10] [--offset 0]
 python manuals_db.py product CODE [--limit 20]
-python manuals_db.py show    DOC PAGE[-PAGE] [--max 4000]
+python manuals_db.py show    DOC PAGE[-PAGE] [--max 4000] [--offset 0]
 python manuals_db.py toc     DOC [--depth 2]
 python manuals_db.py docs    [--filter GLOB]
 python manuals_db.py stats   [--json] [--dir PATH]
@@ -134,11 +134,16 @@ python manuals_db.py product CX9020
 python manuals_db.py search "watchdog OR UPS" --doc CX9020 --limit 5
 python manuals_db.py toc CX9020 --depth 1
 python manuals_db.py show CX9020 52-53 --max 3000
+python manuals_db.py show CX9020 52-53 --max 3000 --offset 3000
 python manuals_db.py stats --json
 ```
 
 - PDFs are read from `<kb>\manuals\` (recursive, `*.pdf`, case-insensitive) unless `--dir` is given.
-- `search --doc` filters inside the query, before the row limit. `(N of TOTAL hits)` when cut.
+- `search --doc` filters inside the query, before the row limit. `(N of TOTAL hits; --offset X for the next ones)`
+  when more hits follow; `--offset X` shows them (N167).
+- Ranges (N169, also in `-h`): `--limit` 1 or more (search default 10, product 20), `--max` 1 or more (default 4000),
+  `--offset` 0 or more (default 0), `--depth` 1 or more (default 2). A value out of range is refused, naming the way
+  on (`--offset`).
 - `show` and `toc` take DOC as a numeric id, a file name or glob, or a plain word (`*word*`, matched against name and title).
   The match must be exactly one manual.
 
@@ -160,7 +165,8 @@ python manuals_db.py stats --json
    (`N added, N updated, N removed, N unchanged, N failed`) and `meta.text_format` are written.
 6. **Swap.** The copy replaces `manuals.db` (`os.replace`, retried for 60 s while a reader has it open on Windows).
    If it still fails, the command says so and nothing is replaced; run `update` again once the readers are closed.
-7. **Page text format.** `TEXT_FORMAT` (currently `4`) names the page text and toc rules below. An index whose
+7. **Page text format.** `TEXT_FORMAT` (currently `6`: product codes of every family, N163) names the page text,
+   toc and product-code rules below. An index whose
    `meta.text_format` differs (a version 1 or 2 database has none: format `1`) is reported as `rebuild_needed` and
    used as it is; the next `update` reads every manual again (`page text format 3 -> 4: every manual is read again`).
    A re-read in which a manual failed (that manual keeps its old rows) leaves the old format in `meta`, so the next
@@ -218,8 +224,10 @@ python manuals_db.py stats --json
      continuation is dropped (`Brücken-` + `kapazität`).
 - Section per page: the label is the **last two levels** active at the end of the page (`10 Error handling > 10.1 Diagnostic LEDs`).
   When two headings start on one page, the page carries the later one.
-- Product codes: regex over each page's text, counted per page:
-  `\b((EL|ELM|ELX|ES|EK|EP|EPP|EPI|ER|EQ|EM|EJ|EZ|EX|KL|KM|KS|BK|BC|BX|CX|CP|CU|C6|C7|AX|AMP|AM|AG|AT|FC|IP|IL|IE|LC|TF|TE|TC|ZB|ZK|ZS)\d{3,5}(-\d{4})?)\b`
+- Product codes (format 6, N163): regex over each page's text, counted per page — a Beckhoff order code is the
+  family's capital letters and four digits, optionally a variant: `\b([A-Z]{1,4}\d{4}(?:-\d{4})?)\b` (EL3356-0010,
+  ED2008, ELM3704, C6030, AL2006, PS2001 …). Up to format 5 it was a list of prefixes, and the families not on it
+  (ED, AL, AA, PS, ERI …) were never stored.
 - Pages with no text are stored. A PDF with no text at all is flagged `no text layer (scanned?)`. OCR is not included.
 
 ### Schema (version 5; tables unchanged since version 2)
@@ -242,9 +250,9 @@ A version-1 database has no `meta` table; the next `update` creates it.
 
 | Command | Logic | Output |
 |---|---|---|
-| `search QUERY [--doc GLOB] [--limit 10]` | FTS5 `MATCH`, ranked by `bm25(fts, 1.0, 4.0)` (section heading weighs 4× text). `--doc` resolves to document ids first and adds `doc IN (…)` to the query, so the limit applies after the filter | `file \| p<page> \| section \| snippet` (16 tokens, hits in `[ ]`) |
+| `search QUERY [--doc GLOB] [--limit 10] [--offset 0]` | FTS5 `MATCH`, ranked by `bm25(fts, 1.0, 4.0)` (section heading weighs 4× text). `--doc` resolves to document ids first and adds `doc IN (…)` to the query, so the limit applies after the filter; `--offset` skips hits (order: score, then rowid) | `file \| p<page> \| section \| snippet` (16 tokens, hits in `[ ]`) |
 | `product CODE [--limit 20]` | exact code or `CODE-xxxx` variants, grouped per manual, sorted by mentions | `file \| N mentions \| pages 1,3,4 …` (first 15 pages) |
-| `show DOC PAGE[-PAGE] [--max 4000]` | one manual (section 3 matching), page range, cut at `--max` | header (`file \| title \| pages \| path`) + `--- p<n> \| section` blocks |
+| `show DOC PAGE[-PAGE] [--max 4000] [--offset 0]` | one manual (section 3 matching), page range, `--max` characters of its text from `--offset` on | header (`file \| title \| pages \| path`) + `--- p<n> \| section` blocks; when cut: `… [N more chars; --offset X]` |
 | `toc DOC [--depth 2]` | chapters up to the depth, indented by level | `title  p<page>` |
 | `docs [--filter GLOB]` | overview | id, file, pages, text pages, title |
 | `stats [--json]` | state from `manuals_state` (section 4) | counts, DB size, the state message; `--json` gives the full object |

@@ -33,8 +33,8 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 | Concept, how-to, error text, error code, anything else in Infosys | `docs_search query=… [book=glob] [limit=1-50]` → `ref` → `docs_page ref=… section=…` (the plugin's infosys_search: identifiers count as their words, titles that name the query first, an error code's defining table first — `code_note` —, one page in several books once — `same_page_in`) |
 | A page or a link from an answer | `docs_page ref=<book/pageid, Infosys URL, page id, exact title, ms-xhelp link> [section=] [offset=] [max_chars=200-20000]` |
 | Which books exist | `docs_books filter=tcplclib_tc2_*` |
-| Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so) |
-| Hardware: LEDs, wiring, diagnostics, error codes | `manual_search query=… [doc=CX9020]` → `manual_page doc=… pages=N-M` (≤ 21 pages) |
+| Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so; a code the index's product table lacks but its page text names is answered from the text: `matched_as: page text`, `note` says why) |
+| Hardware: LEDs, wiring, diagnostics, error codes | `manual_search query=… [doc=CX9020] [limit=1-50] [offset=]` → `manual_page doc=… pages=N-M [offset=]` (≤ 21 pages; `next` / `next_pages` + `next_offset` read on) |
 | Chapters of a manual | `manual_toc doc=CX9020 [depth=1-6]` |
 | Which manuals are indexed | `manual_docs [filter=…]` |
 | EtherCAT device from its ESI: PDOs and entries, PDO assignments, DC modes, slots, CoE object list, the indexed manuals that name it | `hw_lookup query=EL3356-0010 [revision=#x…] [detail=newest\|summary\|full] [limit=1-30]` (a product code `#x0d1c3052` / `0x0d1c3052` / decimal `219951186`, or part of a name works too; a revision that is not indexed: `note` + `revisions_available`) |
@@ -69,9 +69,15 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    3 letters and words on no page are dropped first (`words_ignored` gives the reason), and in the some-words step a
    word on more than 20 % of the pages does not pick pages (`words_too_common`); each hit then lists the words it holds
    (`matched`). Nothing informative left → no hits: say so instead of reading unrelated pages.
-8. Ranges are refused, not clamped. Read the `message` and correct the call. Do not retry it unchanged.
+   `manual_search`: a hex number or CoE index (`0x8000`, `#x8000`, `16#8000`, `8000:11`) is found in any of these
+   notations, and a unit symbol (`°C`, `mV/V`, `mA`, `µs`, `kΩ`) as written on the page, not as its letters; `terms`
+   says how each was searched.
+8. Ranges are refused, not clamped. Read the `message` and correct the call. Do not retry it unchanged. One
+   exception: `manual_search` uses a `limit` above 50 as 50 (`clamped: true`, `clamped_note`); its further hits come
+   with `offset=<next_offset>`.
 9. Long pages: `section=` first (the `outline` lists the headings), then `offset=<next_offset>`. Never page through
-   a whole book.
+   a whole book. A manual's pages cut at `max_chars`: `manual_page pages=<next_pages> offset=<next_offset>` (`next`
+   names the call).
 10. Nothing found → say so. Then try the twincat server's `infosys_*` tools. A manual that is not indexed: the user
     copies the PDF into `<kb>\manuals\` and runs `manuals_db.py update` (`hint` names the command).
 11. Read-only: the script never changes the databases.
