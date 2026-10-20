@@ -2246,9 +2246,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def kb_set_location(path: str | None = None, use_fallback: bool = False) -> dict[str, Any]:
         """Choose the folder for the knowledge database — ONLY with a path the user gave you (or use_fallback=true
-        once the user agreed to D:\\TwinCAT-MCP\\knowledge). The folder is checked: local fixed drive (no network
-        share / mapped drive / USB), not inside OneDrive/Dropbox/Google Drive/iCloud, not inside the plugin folder,
-        writable, >= 1 GB free — a failing condition is named and nothing is changed. An existing database is never
+        once the user agreed to D:\\TwinCAT-MCP\\knowledge; not both). The folder is checked: a folder (not a file, not a
+        drive root) on a local fixed drive (no network share / mapped drive / USB), not inside OneDrive/Dropbox/Google
+        Drive/iCloud/Box, not inside the plugin folder, writable, >= 1 GB free — a failing condition is named and
+        nothing is changed. An existing database is never
         moved or deleted. Without arguments it returns the current location (and changes nothing). A change is
         refused in readonly mode and audited, as every EDIT tool (N127)."""
         if not path and not use_fallback:                    # R38: a question, not a change — no gate, no audit

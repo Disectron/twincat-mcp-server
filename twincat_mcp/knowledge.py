@@ -29,11 +29,9 @@ does not exist yet starts by itself.
 """
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import re
-import unicodedata
 import shutil
 import sqlite3
 import threading
@@ -69,7 +67,8 @@ KIND_ALIASES = {"FB": ("FUNCTION_BLOCK",), "DUT": ("DUT", "STRUCT", "UNION", "EN
 
 LOCATION_CONDITIONS = [
     "a folder on a local fixed drive of this PC (not a network share, mapped drive, NAS or USB stick — SQLite "
-    "corrupts databases on network file systems, and a removable drive takes the database with it)",
+    "corrupts databases on network file systems, and a removable drive takes the database with it), not the drive's "
+    "root itself",
     "not inside a cloud-synced folder (OneDrive, Dropbox, Google Drive, iCloud, Box) — the sync client locks and "
     "corrupts open database files",
     "not inside the Claude plugins folder (~/.claude/plugins/…: cache, data, marketplaces) or the server's install "
@@ -285,16 +284,47 @@ class KnowledgeError(RuntimeError):
 _SYNC_MARKERS = ("onedrive", "dropbox", "google drive", "googledrive", "icloud", "icloud drive", "iclouddrive", "box sync", "box drive")
 
 
-def check_location(path: str | Path, plugin_dirs: list[Path] | None = None, probe: bool = True,
+def strip_long_prefix(path: str) -> str:
+    """N136: a Windows extended-length / device path names the same folder without its prefix: '\\\\?\\C:\\x' is
+    'C:\\x', '\\\\?\\UNC\\srv\\share' is the UNC path '\\\\srv\\share' ('\\\\?\\C:\\…' was reported as a network path)."""
+    s = str(path)
+    if s[:4] in ("\\\\?\\", "\\\\.\\", "//?/", "//./"):
+        rest = s[4:]
+        return "\\\\" + rest[4:] if rest[:4].upper() in ("UNC\\", "UNC/") else rest
+    return s
+
+
+def plugin_dirs(extra: list[Path] | None = None) -> list[Path]:
+    """The plugin's folders: the whole ~/.claude/plugins tree (R33), this installation, the plugin root/data folders
+    Claude Code names — replaced on every update, and holding the plugin's own test projects (N128)."""
+    out = list(extra or []) + [Path.home() / ".claude" / "plugins", Path(__file__).resolve().parents[1]]
+    out += [Path(os.environ[e]) for e in ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA") if os.environ.get(e)]
+    return out
+
+
+def is_within(child: str | Path, parent: str | Path) -> bool:
+    """child is parent or below it — by path components in the file system's spelling (norm_path), never by a
+    string prefix ('C:\\OneDriveOld' is not inside 'C:\\OneDrive')."""
+    c, p = norm_path(child), norm_path(parent)
+    return c == p or c.startswith(p.rstrip("\\/") + os.sep)
+
+
+def _sync_folder(part: str) -> bool:
+    """A path component that is a cloud client's folder: 'OneDrive', 'OneDrive - Contoso', 'Dropbox (Personal)',
+    'Google Drive' … — the whole name or the name followed by its suffix; N136: 'Toolbox Drive' is none."""
+    low = part.lower()
+    return any(low == m or low.startswith((m + " ", m + "(", m + "-")) for m in _SYNC_MARKERS)
+
+
+def check_location(path: str | Path, plugin_dirs_: list[Path] | None = None, probe: bool = True,
                    space: bool = True) -> list[str]:
     """Every condition the folder fails, as plain sentences (empty list = usable). probe=False skips the write test
     (R34: read-only calls must not write; parallel calls raced on one probe file), space=False the free-space test."""
     problems: list[str] = []
-    p = Path(path).expanduser()
+    p = Path(strip_long_prefix(str(path))).expanduser()
     if not p.is_absolute():
         return [f"{path!r} is not an absolute path"]
     s = str(p)
-    low = s.lower()
     if s.startswith("\\\\") or s.startswith("//"):
         problems.append("it is a network (UNC) path")
     elif os.name == "nt":
@@ -314,23 +344,29 @@ def check_location(path: str | Path, plugin_dirs: list[Path] | None = None, prob
         fs = _posix_fstype(p)
         if fs and any(x in fs for x in ("nfs", "cifs", "smb", "sshfs", "fuse.s3", "9p")):
             problems.append(f"it is on a network file system ({fs})")
-    parts = {x.lower() for x in p.parts}
-    if any(m in part for part in parts for m in _SYNC_MARKERS):
+    if p.parent == p:
+        problems.append(f"{p} is a drive root: the knowledge folder gets index\\, manuals\\, sop\\ and tools\\ of its "
+                        f"own — give a folder on it (e.g. {Path(p, 'TwinCAT-MCP', 'knowledge')})")
+    if any(_sync_folder(part) for part in p.parts):
         problems.append("it is inside a cloud-synced folder")
     for env in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
         od = os.environ.get(env)
-        if od and low.startswith(od.lower().rstrip("\\/")):
+        if od and is_within(p, od):
             problems.append(f"it is inside the OneDrive folder ({od})")
     # R33: the whole plugins tree — the data folder (~/.claude/plugins/data/…) was accepted while only cache/ was blocked
-    plugin_dirs = list(plugin_dirs or []) + [Path.home() / ".claude" / "plugins", Path(__file__).resolve().parents[1]]
-    plugin_dirs += [Path(os.environ[e]) for e in ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA") if os.environ.get(e)]
-    for d in plugin_dirs:
+    for d in plugin_dirs(plugin_dirs_):
         try:
             if p.resolve() == d.resolve() or d.resolve() in p.resolve().parents:
                 problems.append(f"it is inside the plugin/install folder {d} (replaced on every update)")
                 break
         except OSError:
             continue
+    # N136: a file where the folder should be — said as such, not as 'not writable ([WinError 183])'
+    for a in (p, *p.parents):
+        if a.exists():
+            if not a.is_dir():
+                problems.append("it is a file, not a folder" if a == p else f"{a} is a file, not a folder")
+            break
     if not problems and probe:
         try:
             p.mkdir(parents=True, exist_ok=True)
@@ -453,6 +489,10 @@ class Knowledge:
                           "once they agree." if fb else "This PC has no D: drive, so there is no fallback: a folder is required."))
 
     def set_location(self, path: str | None, use_fallback: bool = False) -> dict[str, Any]:
+        if use_fallback and path and norm_path(strip_long_prefix(path)) != norm_path(FALLBACK_LOCATION):
+            # N136: use_fallback replaced a given path without a word
+            raise KnowledgeError(f"give either path=… or use_fallback=true, not both: {path} is not the fallback "
+                                 f"{FALLBACK_LOCATION} — nothing was changed")
         if use_fallback:
             if not (os.name == "nt" and Path("D:\\").exists()):
                 raise KnowledgeError("no D: drive on this PC — the fallback location does not exist; give a folder path")
@@ -465,9 +505,9 @@ class Knowledge:
             return {"location": str(cur), "database": str(L.locate(cur, "knowledge")), "source": src, "changed": False,
                     "note": "the location is unchanged — pass path=… (a folder the user named) to choose another one",
                     "docs": self.docs_layout(cur, brief=True)}
-        if not Path(path).expanduser().is_absolute():
+        if not Path(strip_long_prefix(path)).expanduser().is_absolute():
             raise KnowledgeError(f"{path!r} is not an absolute path — give the full folder path the user named")
-        p = Path(display_path(path))
+        p = Path(display_path(strip_long_prefix(path)))
         problems = check_location(p)
         if problems:
             raise KnowledgeError(f"{p} cannot hold the knowledge base: {'; '.join(problems)}. Conditions: "
@@ -667,14 +707,44 @@ class Knowledge:
     def _project_list(con: sqlite3.Connection) -> list[str]:
         return [f"{r['label']} ({r['path']})" for r in con.execute("SELECT path, label FROM projects ORDER BY path")]
 
+    def _refuse_project_folder(self, p: Path) -> None:
+        """N128: folders that are no project of the user's — the plugin's folders (their test projects were indexed
+        and outranked the real MAIN), and the knowledge folder itself."""
+        for d in plugin_dirs():
+            if is_within(p, d):
+                raise KnowledgeError(f"{p} is inside the plugin folder {d}: its files are the plugin's (test projects), "
+                                     "not a project of yours — give the folder of your TwinCAT project")
+            if is_within(d, p) and d.exists():
+                raise KnowledgeError(f"{p} contains the plugin folder {d}: the plugin's test projects would be indexed "
+                                     "with yours — give the folder of your TwinCAT project")
+        loc = self.location()[0]
+        if loc is not None and is_within(p, loc):
+            raise KnowledgeError(f"{p} is {'the knowledge folder' if norm_path(p) == norm_path(loc) else 'inside the knowledge folder'} "
+                                 f"({loc}): it holds the indexes and manuals, not a project — give the folder of your "
+                                 "TwinCAT project")
+
+    def _refuse_overlap(self, con: sqlite3.Connection, p: Path) -> None:
+        """N128: a folder inside, or around, one already indexed — every unit of the inner one would be there twice."""
+        for r in con.execute("SELECT path, label FROM projects ORDER BY path"):
+            if norm_path(r["path"]) == norm_path(p):
+                continue                                   # the same folder: re-indexed, not added twice (R35)
+            if is_within(p, r["path"]):
+                raise KnowledgeError(f"{p} is inside the indexed folder {r['path']} ({r['label']}): its units are "
+                                     f"already in the knowledge base — kb_reindex {r['label']!r} updates them")
+            if is_within(r["path"], p):
+                raise KnowledgeError(f"{p} contains the indexed folder {r['path']} ({r['label']}): its units would be "
+                                     f"there twice — kb_remove_project {r['path']!r} first, then add {p}")
+
     def add_project(self, path: str, label: str | None = None) -> dict[str, Any]:
         if not path or not Path(path).expanduser().is_absolute():
             raise KnowledgeError(f"{path!r} is not an existing absolute folder")
         p = Path(display_path(path))
         if not p.is_dir():
             raise KnowledgeError(f"{path!r} is not an existing absolute folder")
+        self._refuse_project_folder(p)
         merged: list[str] = []
         with self._db() as con:
+            self._refuse_overlap(con, p)
             same = self._match_projects(con, str(p))
             same = [r for r in same if norm_path(r["path"]) == norm_path(p)]       # a label is no folder match here
             if same:

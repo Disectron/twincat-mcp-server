@@ -755,3 +755,49 @@ def test_review_0812_phrases_only_and_code_hits_beyond_the_window(kb, tmp_path):
     assert {h["unit"] for h in r["hits"][:2]} == {"FB_Valve", "FB_Both"}, r      # name / identifier bResetValve
     assert r["hits"][0]["unit"] == "FB_Valve"                                   # the name names it
     assert all(h.get("match_in") == "comments" for h in r["hits"][2:]) and len(r["hits"]) == 5, r
+
+
+def test_n128_project_folders_that_are_not_projects_or_overlap_are_refused(kb, project_dir, tmp_path, monkeypatch):
+    """N128 (0.8.13 retest): kb_add_project took the plugin folder (its test fixture's MAIN then ranked above P15's
+    MAIN), the knowledge folder itself (0 units, no warning) and a child of an indexed folder (every unit twice)."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    plugin = Path(K.__file__).resolve().parents[1]
+    with pytest.raises(K.KnowledgeError, match="inside the plugin folder"):
+        k.add_project(str(plugin / "tests"))
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path / "around" / "plugin-data"))
+    (tmp_path / "around" / "plugin-data").mkdir(parents=True)
+    with pytest.raises(K.KnowledgeError, match="contains the plugin folder"):
+        k.add_project(str(tmp_path / "around"))
+    monkeypatch.delenv("CLAUDE_PLUGIN_DATA")
+    with pytest.raises(K.KnowledgeError, match="is the knowledge folder"):
+        k.add_project(str(tmp / "kbdata"))
+    with pytest.raises(K.KnowledgeError, match="inside the knowledge folder"):
+        k.add_project(str(tmp / "kbdata" / "index"))
+    k.add_project(str(project_dir), "p")
+    with pytest.raises(K.KnowledgeError, match=r"inside the indexed folder .*kb_reindex 'p'"):
+        k.add_project(str(project_dir / "Plc"))
+    with pytest.raises(K.KnowledgeError, match="contains the indexed folder .*kb_remove_project"):
+        k.add_project(str(project_dir.parent))
+    assert [p["path"] for p in k.status()["projects"]] == [str(project_dir)]
+    assert k.add_project(str(project_dir) + "/")["note"].startswith(str(project_dir))      # same folder: re-indexed
+
+
+def test_n136_location_messages_long_paths_sync_names_drive_root_and_fallback(kb, tmp_path):
+    """N136 (0.8.13 retest): a file → 'not writable ([WinError 183])'; '\\\\?\\C:\\…' treated as UNC; 'D:\\Toolbox
+    Drive' refused as Box Drive (substring); a drive root accepted; use_fallback silently replaced a given path."""
+    k, tmp = kb
+    f = tmp / "a_file.txt"
+    f.write_text("x")
+    assert K.check_location(f) == ["it is a file, not a folder"]
+    assert K.check_location(f / "kb") == [f"{f} is a file, not a folder"]
+    assert K.strip_long_prefix("\\\\?\\C:\\TwinCAT-MCP\\knowledge") == "C:\\TwinCAT-MCP\\knowledge"
+    assert K.strip_long_prefix("\\\\?\\UNC\\srv\\share\\kb") == "\\\\srv\\share\\kb"
+    assert K.strip_long_prefix("D:\\kb") == "D:\\kb"
+    assert K.check_location(tmp / "Toolbox Drive" / "kb") == []
+    for synced in ("OneDrive - Contoso", "Dropbox (Personal)", "Google Drive", "iCloudDrive", "Box Sync"):
+        assert "it is inside a cloud-synced folder" in K.check_location(tmp / synced / "kb"), synced
+    assert any("drive root" in p for p in K.check_location(Path(tmp.anchor)))
+    with pytest.raises(K.KnowledgeError, match="either path=… or use_fallback=true, not both"):
+        k.set_location(str(tmp / "kbdata"), use_fallback=True)
+    assert k.location()[0] is None
