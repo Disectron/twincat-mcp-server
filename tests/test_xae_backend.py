@@ -1667,3 +1667,110 @@ def test_n174_a_shell_that_stays_busy_is_said_never_a_raw_error(name, monkeypatc
     with pytest.raises(X.XaeError) as ei:
         _PUBLIC_XAE[name](be, sm, tmp_path)
     assert "XAE is busy (call rejected, 0x80010001)" in str(ei.value) and "did not run" in str(ei.value), str(ei.value)
+
+
+# ------------------------------------------------------------------------------------------------ GetLastErrorMessages
+class _MsgSysMan(FakeSysMan):
+    """ITcSysManager2::GetLastErrorMessages as TE1000's current page describes it: the error and warning messages of the
+    internal buffer, the buffer cleared by the read (clears=False: a build where the read leaves it)."""
+
+    def __init__(self, clears=True):
+        super().__init__()
+        self.buffer, self.clears, self.reads = "", clears, 0
+
+    def GetLastErrorMessages(self):
+        self.reads += 1
+        b = self.buffer
+        if self.clears:
+            self.buffer = ""
+        return b
+
+    def ActivateConfiguration(self):
+        self.buffer += "Warning: Init4\\Activate Configuration: the license expires in 3 days\n"
+        super().ActivateConfiguration()
+
+
+def _xae_with(monkeypatch, sm):
+    be = X.XaeBackend(XaeConfig(com_retry_s=0.3))
+    dte = FakeDTE(sm)
+    monkeypatch.setattr(be, "_require_win", lambda: None)
+    monkeypatch.setattr(be, "_rot_candidates", lambda: [{"progid": "TcXaeShell.DTE.17.0", "moniker": "!TcXaeShell.DTE.17.0:1",
+                                                         "dte": dte, "solution": dte.Solution.FullName}])
+    monkeypatch.setattr(be, "_dte2", lambda: None)
+    be.attach()
+    return be, dte, sm
+
+
+WARN = "Warning: Init4\\Activate Configuration: the license expires in 3 days"
+
+
+def test_glem_an_action_records_what_the_system_manager_logged_apart_from_earlier_steps(monkeypatch):
+    """0.8.16: GetLastErrorMessages — 'many methods log additional diagnostic messages here, even if their HRESULT is
+    S_OK' (TE1000). A successful action records its messages; what the buffer held before it came from earlier steps
+    and is kept apart, labelled so."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+    sm.buffer = "Error: an earlier step\n"
+    assert be.activate_configuration()["activated"] is True
+    assert be.messages == [{"action": "ActivateConfiguration", "earlier_messages": "Error: an earlier step",
+                            "earlier_note": "in the buffer before this action: logged by earlier steps, not by it",
+                            "messages": WARN, "lines": [WARN]}], be.messages
+    be.messages = []
+    be.tree_delete_child("TIPC^Plc", "Old")                  # an action that logs nothing: no record
+    assert be.messages == [] and sm.reads >= 4
+
+
+def test_glem_a_failed_action_carries_its_messages(monkeypatch):
+    """A failure's error carries what the System Manager logged during the action (the HRESULT alone says 'E_FAIL');
+    the record is there too."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+
+    def fail():
+        sm.buffer += "Error: Init4\\Activate Configuration: ADS error 0x745 (1861)\nError: target not reachable\n"
+        raise ComError(-2147467259, "Unspecified error")
+    sm.ActivateConfiguration = fail
+    with pytest.raises(X.XaeError, match=r"Unspecified error \(HRESULT 0x80004005\) — XAE messages \(ActivateConfiguration\): Error: Init4"
+                                         r"\\Activate Configuration: ADS error 0x745 \(1861\)\nError: target not"):
+        be.activate_configuration()
+    assert be.messages[0]["lines"] == ["Error: Init4\\Activate Configuration: ADS error 0x745 (1861)",
+                                       "Error: target not reachable"], be.messages
+
+
+def test_glem_a_buffer_the_read_does_not_clear_gives_only_the_new_part(monkeypatch):
+    """The TwinCAT 2.11 page says only 'returns the last error messages': on a build whose read leaves the buffer, what
+    it held before the action is history — only what the action added is its messages, and nothing is 'earlier'."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan(clears=False))
+    sm.buffer = "Error: an old step\n"
+    be.activate_configuration()
+    assert be.messages == [{"action": "ActivateConfiguration", "messages": WARN, "lines": [WARN]}], be.messages
+
+
+def test_glem_without_the_member_or_on_a_busy_read_the_action_runs_as_before(monkeypatch):
+    """No ITcSysManager2 (FakeSysMan has no GetLastErrorMessages): no messages, the action unchanged. A read the shell
+    keeps rejecting is left out — never the reason an action fails."""
+    be, _dte, sm = _xae_with(monkeypatch, FakeSysMan())
+    assert be.activate_configuration()["activated"] is True and be.messages == [] and sm.activated == 1
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+
+    def busy():
+        raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+    sm.GetLastErrorMessages = busy
+    monkeypatch.setattr(be, "_modal_dialogs", lambda: [])
+    assert be.activate_configuration()["activated"] is True and be.messages == [] and sm.activated == 1
+
+
+def test_glem_create_child_on_a_new_item_and_an_import_are_read_too(monkeypatch):
+    """Every action that must not run twice is read: CreateChild (also on an item this call just created), DeleteChild,
+    PlcOpenImport, GenerateBootProject — through the one place they run (_on_item / _on_sm / _create_child)."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+    parent = sm.items["TIPC^Plc^Plc Project^POUs"]
+    orig = parent.CreateChild
+
+    def create(name, subtype, before="", info=None):
+        sm.buffer += f"Info: {name} created\n"
+        return orig(name, subtype, before, info)
+    parent.CreateChild = create
+    be.tree_create_child("TIPC^Plc^Plc Project^POUs", "FB_New", 604)
+    child = be._create_child(parent, "Sub", 604, "", None)
+    assert child.Name == "Sub"
+    assert [(r["action"], r["messages"]) for r in be.messages] == [("CreateChild", "Info: FB_New created"),
+                                                                    ("CreateChild", "Info: Sub created")], be.messages

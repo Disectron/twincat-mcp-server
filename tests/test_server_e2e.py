@@ -1690,3 +1690,34 @@ async def test_n162_the_connection_instructions_say_when_they_were_read_and_wher
     assert "format 3" not in srv._lowlevel_server.instructions
     fresh = srv._lowlevel_server.create_initialization_options().instructions
     assert "check kb_status first" in fresh and "kb_rebuild(index='infosys')" in fresh, fresh
+
+
+@pytest.mark.anyio
+async def test_glem_xae_call_adds_the_call_s_messages_with_their_documented_codes(tmp_path):
+    """0.8.16: an XAE call's result carries what the System Manager logged during its actions (xae_messages), each line
+    that names a code looked up in the errors index (Beckhoff's text and page, or documented=false) — only this call's:
+    the record is emptied before every call."""
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(tmp_path)
+    cfg.knowledge.location = str(kb)
+    app = App(cfg)
+    app.dialogs_now = lambda: []
+    app.xae.messages = [{"action": "earlier call", "messages": "x", "lines": ["x"]}]
+
+    def activate():
+        app.xae.messages.append({"action": "ActivateConfiguration", "messages": "Error: ADS error 0x745\nInfo: done",
+                                 "lines": ["Error: ADS error 0x745", "Info: done", "Error: C0373 in MAIN"]})
+        return {"activated": True}
+    res = await app.xae_call(activate)
+    m = res["xae_messages"]
+    assert [r["action"] for r in m] == ["ActivateConfiguration"] and res["activated"] is True, res
+    assert m[0]["codes"][0] == {"line": 0, "read_as": ["0x745"], "documented": True, "matches": [
+        {"domain": "ads", "hex": "0x745", "symbol": "ADSERR_CLIENT_SYNCTIMEOUT",
+         "text": m[0]["codes"][0]["matches"][0]["text"], "ref": m[0]["codes"][0]["matches"][0]["ref"]}]}, m
+    assert m[0]["codes"][1]["line"] == 2 and m[0]["codes"][1]["documented"] is False, m
+    assert len(m[0]["codes"]) == 2
+    res = await app.xae_call(lambda: {"ok": True})
+    assert "xae_messages" not in res and app.xae.messages == [], res

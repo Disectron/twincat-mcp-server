@@ -788,15 +788,13 @@ class App:
         return (f"{msg} [documented: {r['domain']} {r['hex']}" + (f" {r['symbol']}" if r.get("symbol") else "")
                 + f": {r.get('text') or ''} ({r['ref']})]")
 
-    def log_codes(self, log: dict[str, Any] | None) -> dict[str, Any] | None:
-        """N125: the codes in the Scope View log's error lines (0xA2, HRESULTs) looked up in the errors index —
-        documented (domain, symbol, text, ref) or documented=false; an entry per error line that names a code."""
-        if not log or not log.get("errors"):
-            return log
+    def line_codes(self, lines: list[str], key: str) -> list[dict[str, Any]]:
+        """N125: the codes message lines name (0xA2, HRESULTs, ADS error 1861, C0xxx) looked up in the errors index —
+        documented (domain, symbol, text, ref) or documented=false; an entry per line that names a code, {key: index}."""
         loc = self.kb.location()[0]
         from . import errors_index as X
         codes = []
-        for i, e in enumerate(log["errors"]):
+        for i, e in enumerate(lines):
             read = X.read_query(e)
             if not read["codes"] and not read["names"] and not read["ids"]:
                 continue
@@ -804,13 +802,29 @@ class App:
                 r = X.err_lookup(e, kb=loc, limit=3, fulltext=False)
             except X.ErrError:
                 continue
-            codes.append({"error": i, "read_as": [c["token"] for c in r["read_as"]] + r.get("names", [])
+            codes.append({key: i, "read_as": [c["token"] for c in r["read_as"]] + r.get("names", [])
                           + [m["token"] for m in r.get("message_ids", [])],
                           "documented": r.get("documented"),
                           "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref") if m.get(k)}
                                       for m in r.get("matches") or []],
                           **({"note": r["note"]} if r.get("note") else {})})
+        return codes
+
+    def log_codes(self, log: dict[str, Any] | None) -> dict[str, Any] | None:
+        """N125: the codes in the Scope View log's error lines (line_codes); an entry per error line that names one."""
+        if not log or not log.get("errors"):
+            return log
+        codes = self.line_codes(log["errors"], "error")
         return {**log, "codes": codes} if codes else log
+
+    def xae_messages(self, recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """What the System Manager logged during the call's actions (ITcSysManager2::GetLastErrorMessages), with the
+        codes its lines name looked up (line_codes) — Beckhoff's messages, labelled as such."""
+        out = []
+        for r in recs:
+            codes = self.line_codes(r.get("lines") or [], "line")
+            out.append({**r, **({"codes": codes} if codes else {})})
+        return out
 
     def code_lookup(self, query: str) -> list[dict[str, Any]] | None:
         """infosys_search: where the errors index documents the code of the query (the skill's docs_search adds the
@@ -1041,8 +1055,14 @@ class App:
                 if now - t >= 2.0 and running_s >= 2.0:
                     return _BlockedByDialog(job, d)
             return None
+        def run(*a2: Any, **kw2: Any) -> Any:
+            # the System Manager's messages of this call's actions only (XaeBackend._sm_messages_of)
+            if isinstance(getattr(self.xae, "messages", None), list):
+                self.xae.messages = []
+            return fn(*a2, **kw2)
+        run.__name__ = job                 # the worker names the job (busy / timeout messages) by it
         try:
-            res = await self.xae_worker.run_watched(fn, *a, timeout=timeout or self.cfg.xae.build_timeout_s + 60,
+            res = await self.xae_worker.run_watched(run, *a, timeout=timeout or self.cfg.xae.build_timeout_s + 60,
                                                     watch=watch, **kw)
         except _BlockedByDialog as b:
             self._hold(job, b.dialog, b.job_future)  # type: ignore[attr-defined]
@@ -1080,6 +1100,9 @@ class App:
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError(f"{job}: XAE call timed out — " + await asyncio.to_thread(self._timeout_cause)) from exc
         if isinstance(res, dict):
+            msgs = getattr(self.xae, "messages", None)
+            if isinstance(msgs, list) and msgs:
+                res = {**res, "xae_messages": await asyncio.to_thread(self.xae_messages, list(msgs))}
             live = self.dialogs_now()
             if live:                       # N87: the call ran, but the shell has a dialog waiting — say so
                 res = {**res, "open_dialogs": [_dialog_fields(d) for d in live[:5]]}

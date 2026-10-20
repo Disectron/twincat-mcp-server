@@ -57,6 +57,13 @@ previous batch's ids. Check `ads_task_stats` once with the profile live; thin it
 A window with `buttons: null` (not a standard dialog, buttons unreadable) cannot be pressed by the tool: ask the user to
 close it in XAE. "XAE is busy (call rejected …) and did not run this call" → nothing ran: repeat the call.
 
+## XAE messages
+An action's result (activate, restart, build, create / delete, ConsumeXml, import, boot project, online commands) can
+carry `xae_messages`: what TwinCAT's System Manager logged during it (GetLastErrorMessages) — TwinCAT's text, also on
+success (warnings). `codes` = the codes its lines name, looked up in the errors index. `earlier_messages` were in the
+buffer before the action: earlier steps, not this one. A failed action's error ends with "XAE messages (…)": quote them
+as the cause before guessing one.
+
 ## Library FB / type you have not used
 The twincat-docs skill first (`docs_declaration`, offline, every book). Fallback when its database is missing:
 `infosys_declaration <FB|ST_|E_>` (inputs/outputs with descriptions, struct members, enum values) →

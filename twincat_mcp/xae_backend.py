@@ -158,6 +158,9 @@ class XaeBackend:
     def __init__(self, cfg: XaeConfig):
         self.cfg = cfg
         self.dte: Any = None
+        # what the System Manager logged during the actions of the current call (_sm_messages_of; the server empties it
+        # before each XAE call and adds it to the result as xae_messages)
+        self.messages: list[dict[str, Any]] = []
         self.sysman: Any = None
         self.progid: str | None = None
         self.attached_at: float | None = None
@@ -429,19 +432,82 @@ class XaeBackend:
         self._retry(lambda: self._cur_sm().GetTargetNetId(), "ITcSysManager check")
 
     def _on_sm(self, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
-        """op(System Manager) through _retry, the System Manager taken in every attempt."""
+        """op(System Manager) through _retry, the System Manager taken in every attempt. An action (once) is read for
+        the System Manager's messages (_sm_messages_of)."""
         self._sm()                         # N116: the bound solution, checked once per call
-        if once:
-            self._live_sm()
-        return self._retry(lambda: op(self._cur_sm()), what, once)
+        if not once:
+            return self._retry(lambda: op(self._cur_sm()), what, once)
+        self._live_sm()
+        with self._sm_messages_of(what):
+            return self._retry(lambda: op(self._cur_sm()), what, once)
 
     def _on_item(self, path: str, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(tree item at path) through _retry, the item looked up in every attempt — a refreshed System Manager or a
-        re-attached shell gives a live item, never the stale one of the first attempt."""
+        re-attached shell gives a live item, never the stale one of the first attempt. An action (once) is read for
+        the System Manager's messages (_sm_messages_of)."""
         self._sm()
-        if once:
-            self._live_sm()
-        return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what, once)
+        if not once:
+            return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what, once)
+        self._live_sm()
+        with self._sm_messages_of(what):
+            return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what, once)
+
+    # TE1000 ITcSysManager2::GetLastErrorMessages: "Returns the error and warning messages accumulated in the internal
+    # buffer and then clears the buffer. Many methods log additional diagnostic messages here, even if their HRESULT is
+    # S_OK" (the current page; the TwinCAT 2.11 page says only "returns the last error messages"). Whether a build's
+    # read clears it is not assumed: a buffer that does not clear starts with what the read before the action gave.
+    MESSAGES_MAX = 4000                    # characters of one action's messages kept (the lines: 50)
+
+    def _sm_messages(self) -> str | None:
+        """The System Manager's message buffer now ('' when empty); None when it can't be read — no System Manager, no
+        ITcSysManager2, a shell that stays busy: the messages are an addition to an action, never why it fails."""
+        if self.sysman is None:
+            return None
+        try:
+            if not self._has(self._cur_sm(), "GetLastErrorMessages"):
+                return None
+            return str(self._retry(lambda: _com_call(self._cur_sm(), "GetLastErrorMessages"), "GetLastErrorMessages",
+                                   retry_s=2.0) or "")
+        except XaeError:
+            return None
+
+    @contextlib.contextmanager
+    def _sm_messages_of(self, what: str) -> Iterator[None]:
+        """What the System Manager logged during one action (activate, restart, ConsumeXml, CreateChild, DeleteChild,
+        PlcOpenImport, GenerateBootProject, an online command, the build): the buffer is read before the action — what
+        it held came from earlier steps — and after it, on success as on failure. A success records them (self.messages
+        → the result's xae_messages); a failure's error carries them. A call the shell rejected (XaeBusy) or a shell
+        that went away (XaeGone) ran nothing that could be read."""
+        before = self._sm_messages()
+        try:
+            yield
+        except (XaeBusy, XaeGone):
+            raise
+        except XaeError as exc:
+            rec = self._sm_messages_after(what, before)
+            if rec and rec.get("messages"):
+                raise type(exc)(f"{exc} — XAE messages ({what}): {rec['messages'][:1500]}") from exc
+            raise
+        self._sm_messages_after(what, before)
+
+    def _sm_messages_after(self, what: str, before: str | None) -> dict[str, Any] | None:
+        after = self._sm_messages()
+        if after is None:
+            return None
+        rec: dict[str, Any] = {"action": what}
+        if before and after.startswith(before):
+            after = after[len(before):]      # the read did not clear the buffer: what it held before is history
+        elif before and before.strip():
+            rec["earlier_messages"] = before.strip()[:self.MESSAGES_MAX]
+            rec["earlier_note"] = "in the buffer before this action: logged by earlier steps, not by it"
+        after = after.strip()
+        if after:
+            rec["messages"] = after[:self.MESSAGES_MAX]
+            rec["lines"] = [ln.strip() for ln in after.splitlines() if ln.strip()][:50]
+        if len(rec) == 1:
+            return None
+        self.messages.append(rec)
+        return rec
 
     def _on_dte(self, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(DTE) through _retry, the DTE taken in every attempt (a dead proxy is replaced by _retry's re-attach)."""
@@ -772,7 +838,8 @@ class XaeBackend:
             self._on_dte(lambda dte: dte.Solution.SolutionBuild.Clean(True), "SolutionBuild.Clean")
         if rebuild:
             self._on_dte(lambda dte: dte.Solution.SolutionBuild.Clean(True), "SolutionBuild.Clean")
-        self._on_dte(lambda dte: dte.Solution.SolutionBuild.Build(True), "SolutionBuild.Build")
+        with self._sm_messages_of("SolutionBuild.Build"):
+            self._on_dte(lambda dte: dte.Solution.SolutionBuild.Build(True), "SolutionBuild.Build")
         # N174 (0.8.14 retest): `self.dte.Solution.SolutionBuild` was read here outside _retry — right after a build the
         # shell rejects calls, and the rejection left xae_build / xae_deploy as an 'internal error' (crash 4ee44bfb,
         # 388c3b88). Every read goes through _retry; the build itself is not repeated.
@@ -1472,7 +1539,8 @@ class XaeBackend:
         def run(op: Callable[[Any], Any], what: str) -> Any:
             if isinstance(parent, str):
                 return self._on_item(parent, op, what, once=True)
-            return self._retry(lambda: op(parent), what, once=True)
+            with self._sm_messages_of(what):
+                return self._retry(lambda: op(parent), what, once=True)
         if info is None:
             return run(lambda p: p.CreateChild(name, subtype, before), "CreateChild")
         try:
