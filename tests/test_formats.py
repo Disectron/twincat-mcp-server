@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
 INFOSYS_FINGERPRINT = (6, "be63695fc32e063d")   # 0.8.14: TOC parents (N126), page charset (N138)
-MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
+MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes of every family (N163)
 ESI_FINGERPRINT = ("1", "12f26f31cd9afc7d")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
 
 EXCLUDE = frozenset({
