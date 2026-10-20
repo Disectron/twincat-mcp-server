@@ -15,7 +15,8 @@ the run checks at its end that no file of index\\ and manuals\\ changed. The rep
 %USERPROFILE%\\.twincat_mcp\\kb_verify\\<time>\\ (report.md, results.json, failures.csv) — never into the knowledge
 folder. Exit code: 0 no failure, 1 failures found (or a file changed), 2 the run could not start, 130 interrupted
 (Ctrl+C: the report of what ran is written).
-Needs Python 3.12+ and nothing else (the plugin's own modules, next to this script).
+Needs Python 3.12+ and nothing else: the plugin's own modules — of the plugin this script is part of, else the
+newest installed twincat-mcp, or --plugin <folder>.
 """
 from __future__ import annotations
 
@@ -41,6 +42,7 @@ import traceback  # noqa: E402
 from collections import Counter, defaultdict  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any, Callable, Iterable  # noqa: E402
+
 
 def _version_key(p: Path) -> tuple[int, ...]:
     return tuple(int(x) if x.isdigit() else -1 for x in re.split(r"[.\-]", p.name))
@@ -154,11 +156,11 @@ class Verifier:
         self.args, self.kb, self.kb_source, self.out = args, kb, kb_source, out
         self.full = args.mode == "full"
         self.top = args.top
-        self.rng = random.Random(args.seed)
         self.checks: dict[str, Check] = {}
         self.meta: dict[str, Any] = {}
         self.areas_done: list[str] = []
         self.untested: list[str] = []      # areas whose index does not exist
+        self.esi_parity: Check | None = None
         self.ctx = KD.Ctx(kb, kb_source)
         self.docs_config, self.config_source = load_docs_config(args.config)
         self._last_progress = 0.0
@@ -184,11 +186,12 @@ class Verifier:
         sys.stdout.write(text + "\n")
         sys.stdout.flush()
 
-    def pick(self, items: list[Any], k: int) -> list[Any]:
-        """Quick mode: k of the items (seeded, so a re-run tests the same ones); full mode: all."""
+    def pick(self, items: list[Any], k: int, key: str) -> list[Any]:
+        """Quick mode: k of the items, drawn by the seed and the group's key (a book, a manual, a check) — a re-run
+        tests the same items, whichever areas run; full mode: all."""
         if self.full or len(items) <= k:
             return list(items)
-        return self.rng.sample(items, k)
+        return random.Random(f"{self.args.seed}|{key}").sample(items, k)
 
     def skill(self, name: str, **kv: Any) -> dict[str, Any]:
         """A twincat-docs skill command, with its arguments bound and checked exactly as on the command line."""
@@ -420,7 +423,7 @@ def infosys_checks(v: Verifier) -> None:
     by_book: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for p in pages:
         by_book[p["book"]].append(p)
-    chosen = [p for b in books for p in v.pick(by_book[b], v.args.sample)]
+    chosen = [p for b in books for p in v.pick(by_book[b], v.args.sample, b)]
     v.meta["infosys"]["pages_tested"] = len(chosen)
     v.meta["infosys"]["books_tested"] = len(books)
     url_set = {p["url"] for p in pages}
@@ -595,6 +598,8 @@ def _i6_title_search(v: Verifier, con: sqlite3.Connection, chosen: list[dict], p
     c = v.check("I6", "Infosys", "search by the page's own title", f"infosys_search / docs_search (one code) with the "
                 f"title as query: the page, a copy of it or a page of the same title in the top {v.top} — not judged "
                 f"when more than {v.top} pages share the title")
+    cp = v.check("I6b", "Infosys", "docs_search = infosys_search", "the skill's docs_search (its argument binding, "
+                 "its output) lists the same pages in the same order as infosys_search — every 5th title of I6")
     same_title = Counter(title_key(p["title"]) for p in pages)
     c.planned = len(chosen)
     for i, p in enumerate(chosen, 1):
@@ -605,6 +610,16 @@ def _i6_title_search(v: Verifier, con: sqlite3.Connection, chosen: list[dict], p
             continue
         try:
             res = c.timed(q, INF.search_index, con, q, v.top)
+            if i % 5 == 1:
+                try:
+                    sk = cp.timed(q, v.skill, "docs_search", query=q, limit=v.top)
+                    a, b = [x["url"] for x in res["rows"]], [x["url"] for x in sk["items"]]
+                    cp.add(PASS if a == b and sk["total"] == res["total"] else FAIL, q,
+                           "" if a == b and sk["total"] == res["total"] else
+                           f"infosys_search {len(a)} hit(s) of {res['total']}, docs_search {len(b)} of {sk['total']}; "
+                           f"first differing: {next(((x, y) for x, y in zip(a, b) if x != y), None)}")
+                except KD.Err as exc:
+                    cp.add(FAIL, q, f"docs_search: {exc.code}: {exc.message}"[:300])
             rank = _rank_in(res, p)
             if rank is not None:
                 c.add(PASS, p["url"])
@@ -1003,7 +1018,7 @@ def _i12_error_codes(v: Verifier, con: sqlite3.Connection, fmt: int) -> None:
     if not codes:
         c.add(SKIP, "codes", "no page titled 'ADS Return Codes' with hex/decimal rows")
         return
-    todo = v.pick(sorted(codes.items()), max(20, v.args.sample * 3))
+    todo = v.pick(sorted(codes.items()), max(20, v.args.sample * 3), "I12")
     c.planned = len(todo)
     for i, (dec, h) in enumerate(todo, 1):
         for q in (f"0x{h}", f"error {dec}"):
@@ -1108,7 +1123,7 @@ def manuals_checks(v: Verifier) -> None:
     by_doc: dict[int, list[dict]] = defaultdict(list)
     for r in rows:
         by_doc[r["doc"]].append(r)
-    chosen = [r for d in docs for r in v.pick(by_doc[d["id"]], v.args.sample)]
+    chosen = [r for d in docs for r in v.pick(by_doc[d["id"]], v.args.sample, d["name"])]
     v.meta["manuals"]["pages_tested"] = len(chosen)
 
     c3 = v.check("M3", "Manuals", "every page (manual_page)", "each page opens by the manual's name with the stored "
@@ -1173,7 +1188,7 @@ def manuals_checks(v: Verifier) -> None:
     prod: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
     for code, doc, page in con.execute("SELECT p.code, d.name, p.page FROM product p JOIN doc d ON d.id = p.doc"):
         prod[code][doc].add(int(page))
-    codes = v.pick(sorted(prod), max(30, v.args.sample * 5))
+    codes = v.pick(sorted(prod), max(30, v.args.sample * 5), "M5")
     c5.planned = len(codes)
     for i, code in enumerate(codes, 1):
         try:
@@ -1268,6 +1283,23 @@ def _esi_files(v: Verifier, con: sqlite3.Connection, db: Path) -> None:
         c.crash("ESI folders", exc)
 
 
+def _same_answer(v: Verifier, c: Check, subject: str, plugin: dict[str, Any], skill: str, **kw: Any) -> None:
+    """The skill's hw_* command answers as the plugin's reader (the same esi_index call; the skill adds 'source')."""
+    try:
+        out = c.timed(subject, v.skill, skill, **kw)
+    except KD.Err as exc:
+        c.add(FAIL, subject, f"{skill}: {exc.code}: {exc.message}"[:300])
+        return
+    out = {k: val for k, val in out.items() if k != "source"}
+    a = json.dumps(plugin, sort_keys=True, default=str)
+    b = json.dumps(out, sort_keys=True, default=str)
+    c.add(PASS if a == b else FAIL, subject, "" if a == b else f"{skill} answers differently from the plugin's "
+                                                               f"reader ({len(b)} vs {len(a)} characters of JSON)")
+
+
+PARITY_EVERY = 10          # the skill's hw_* answers are compared for every 10th item of E2 / E3 / E5 / E6 / E7
+
+
 def rev_int(value: Any) -> int | None:
     """A revision as hw_* write it ('#x00100000', a number, or None for a device without RevisionNo) as a number."""
     if value is None or value == "":
@@ -1287,15 +1319,20 @@ def _esi_devices(v: Verifier, E: Any, con: sqlite3.Connection) -> None:
                 "index holds; the newest in full has as many PDO entries and CoE objects as counted")
     c3 = v.check("E3", "ESI", "device by product code (hw_lookup #x…)", "every product code finds its device type(s)")
     c4 = v.check("E4", "ESI", "ESI full-text search (hw_search)", "the device type as a phrase finds the device")
+    cp = v.check("E8", "ESI", "skill hw_* = plugin", f"the skill's hw_lookup / hw_search / hw_object / hw_diag / "
+                 f"hw_module give the plugin reader's answer — every {PARITY_EVERY}th item of E2–E7")
+    v.esi_parity = cp
     revs: dict[str, list[dict]] = defaultdict(list)
     for r in con.execute("SELECT type, revision, product_code, pdo_entries, pdo_count, objects, dict_id FROM devices"):
         revs[r["type"].lower()].append(dict(r))
-    types = v.pick(sorted(revs), max(50, v.args.sample * 15))
+    types = v.pick(sorted(revs), max(50, v.args.sample * 15), "E2")
     c.planned = len(types)
     for i, t in enumerate(types, 1):
         name = revs[t][0]["type"]
         try:
             r = c.timed(name, E.lookup, name, 30, None, "summary")
+            if i % PARITY_EVERY == 1:
+                _same_answer(v, cp, name, r, "hw_lookup", query=name, limit=30, detail="summary")
             bad = []
             want = {x["revision"] for x in revs[t]}
             got = {rev_int(d.get("revision")) for d in r["devices"] if d["type"].lower() == t}
@@ -1324,6 +1361,8 @@ def _esi_devices(v: Verifier, E: Any, con: sqlite3.Connection) -> None:
         try:
             q = '"' + " ".join(_TOKEN.findall(name)) + '"'
             s = c4.timed(q, E.search, q, ["device"], 50)
+            if i % PARITY_EVERY == 1:
+                _same_answer(v, cp, q, s, "hw_search", query=q, kinds="device", limit=50)
             refs = json.dumps(s, default=str).lower()
             c4.add(PASS if name.lower() in refs else FAIL, name, "" if name.lower() in refs else f"{q}: not found")
         except ESI.EsiError as exc:
@@ -1334,12 +1373,14 @@ def _esi_devices(v: Verifier, E: Any, con: sqlite3.Connection) -> None:
     codes: dict[int, set[str]] = defaultdict(set)
     for row in con.execute("SELECT product_code, type FROM devices"):
         codes[row["product_code"]].add(row["type"].lower())
-    pcs = v.pick(sorted(k for k in codes if k is not None), max(50, v.args.sample * 15))
+    pcs = v.pick(sorted(k for k in codes if k is not None), max(50, v.args.sample * 15), "E3")
     c3.planned = len(pcs)
     for i, pc in enumerate(pcs, 1):
         q = f"#x{pc:08X}"
         try:
             r = c3.timed(q, E.lookup, q, 30, None, "summary")
+            if i % PARITY_EVERY == 1:
+                _same_answer(v, v.esi_parity, q, r, "hw_lookup", query=q, limit=30, detail="summary")
             got = {d["type"].lower() for d in r["devices"]} | {x.lower() for x in r.get("types") or []}
             want = {x for x in codes[pc] if x}
             c3.add(PASS if want <= got or r["matches"] > 30 else FAIL, q,
@@ -1358,13 +1399,16 @@ def _esi_objects(v: Verifier, E: Any, con: sqlite3.Connection) -> None:
         "SELECT o.obj_id, o.idx, ob.name, (SELECT d.type FROM devices d WHERE d.dict_id = o.dict_id ORDER BY d.revision "
         "DESC LIMIT 1) AS type, (SELECT d.revision FROM devices d WHERE d.dict_id = o.dict_id ORDER BY d.revision DESC "
         "LIMIT 1) AS revision FROM dict_obj o JOIN obj ob ON ob.id = o.obj_id GROUP BY o.obj_id").fetchall()
-    todo = v.pick([dict(r) for r in rows if r["type"]], max(200, v.args.sample * 50))
+    todo = v.pick([dict(r) for r in rows if r["type"]], max(200, v.args.sample * 50), "E5")
     c.planned = len(todo)
     for i, r in enumerate(todo, 1):
         idx = f"#x{r['idx']:04X}"
         subj = f"{r['type']} {idx}"
         try:
             out = c.timed(subj, E.object, r["type"], idx, rev_arg(r["revision"]))
+            if i % PARITY_EVERY == 1:
+                _same_answer(v, v.esi_parity, subj, out, "hw_object", device=r["type"], index=idx,
+                             revision=rev_arg(r["revision"]))
             bad = []
             if str(out.get("index", "")).upper() != idx.upper():
                 bad.append(f"index {out.get('index')}")
@@ -1385,13 +1429,16 @@ def _esi_diag(v: Verifier, E: Any, con: sqlite3.Connection) -> None:
         "SELECT m.set_id, m.text_id, g.message, (SELECT d.type FROM devices d WHERE d.diag_set = m.set_id ORDER BY "
         "d.revision DESC LIMIT 1) AS type, (SELECT d.revision FROM devices d WHERE d.diag_set = m.set_id ORDER BY "
         "d.revision DESC LIMIT 1) AS revision FROM diag_msg m JOIN msg g ON g.id = m.msg_id").fetchall()
-    todo = v.pick([dict(r) for r in rows if r["type"]], max(200, v.args.sample * 50))
+    todo = v.pick([dict(r) for r in rows if r["type"]], max(200, v.args.sample * 50), "E6")
     c.planned = len(todo)
     for i, r in enumerate(todo, 1):
         code = f"#x{r['text_id']:04X}"
         subj = f"{r['type']} {code}"
         try:
             out = c.timed(subj, E.diag, code, r["type"], rev_arg(r["revision"]))
+            if i % PARITY_EVERY == 1:
+                _same_answer(v, v.esi_parity, subj, out, "hw_diag", code=code, device=r["type"],
+                             revision=rev_arg(r["revision"]))
             msgs = [m.get("message") for m in out.get("messages") or []]
             ok = out.get("found", 0) >= 1 and (r["message"] in msgs or not r["message"])
             c.add(PASS if ok else FAIL, subj, "" if ok else f"found {out.get('found')}, messages {msgs[:3]}, "
@@ -1409,12 +1456,14 @@ def _esi_modules(v: Verifier, E: Any, con: sqlite3.Connection) -> None:
     for r in con.execute("SELECT ident, type FROM modules"):
         if r["ident"] is not None:
             idents[r["ident"]].add((r["type"] or "").lower())
-    todo = v.pick(sorted(idents), max(100, v.args.sample * 10))
+    todo = v.pick(sorted(idents), max(100, v.args.sample * 10), "E7")
     c.planned = len(todo)
     for i, ident in enumerate(todo, 1):
         q = f"#x{ident:08X}"
         try:
             out = c.timed(q, E.module, q)
+            if i % PARITY_EVERY == 1:
+                _same_answer(v, v.esi_parity, q, out, "hw_module", ident=q)
             got = {(m.get("type") or "").lower() for m in out.get("modules") or []}
             ok = out.get("found", 0) >= 1 and idents[ident] <= got
             c.add(PASS if ok else FAIL, q, "" if ok else f"found {out.get('found')}, types {sorted(got)[:5]}, "
@@ -1466,7 +1515,7 @@ def projects_checks(v: Verifier) -> None:
     kb = _ROKnowledge(v.kb, v.out)
     c1 = v.check("P1", "Projects", "unit by its name (kb_search)", f"every unit: kb_search with its name, limited to its "
                  f"project, lists it in the top {max(v.top, 20)}")
-    todo = v.pick(units, max(100, v.args.sample * 10))
+    todo = v.pick(units, max(100, v.args.sample * 10), "P1")
     c1.planned = len(todo)
     for i, u in enumerate(todo, 1):
         subj = f"{u['name']} ({Path(u['file']).name})"
@@ -1484,6 +1533,25 @@ def projects_checks(v: Verifier) -> None:
     for q in KNOWN_ERROR_SAMPLES:
         k = K.known_error(q)
         c2.add(PASS if k else FAIL, q, "" if k else "not recognised")
+
+
+def status_check(v: Verifier) -> None:
+    """The skill's status command: it answers, and names each index's state as the checks above found it."""
+    c = v.check("S0", "Skill", "status (skill)", "the skill's status command answers and reports each index in the "
+                "state the readers report")
+    try:
+        r = c.timed("status", v.skill, "status")
+    except Exception as exc:  # noqa: BLE001
+        c.crash("status", exc)
+        return
+    for which in ("infosys", "manuals", "esi"):
+        got = (r.get(which + "_state") or {}).get("state")
+        want = (v.meta.get(which) or {}).get("state")
+        if want is None:
+            c.add(PASS if got else FAIL, which, "" if got else "no state reported")
+        else:
+            c.add(PASS if got == want else FAIL, which, "" if got == want else f"status says {got!r}, the index's "
+                                                                            f"reader says {want!r}")
 
 
 # ====================================================================================================== report
@@ -1665,6 +1733,7 @@ def main(argv: list[str] | None = None) -> int:
                 v.check(f"{a[:1].upper()}!", a, "could not run", "the area stopped").crash(a, exc)
             v.areas_done.append(a)
             v.say(f"  {a} done in {time.time() - t:.0f} s")
+        status_check(v)
     except KeyboardInterrupt:
         interrupted = True
         v.say("\n  interrupted — writing the partial report")

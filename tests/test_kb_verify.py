@@ -93,7 +93,7 @@ def test_every_check_runs_and_passes_on_correct_indexes(KV, full_kb, tmp_path, m
     assert res["not_tested"] == [] and res["interrupted"] is False
     by = _checks(res)
     for cid in ("I0", "I1", "I2", "I3", "I4", "I5", "I6", "I7", "I7b", "I8", "I9", "I10", "I11", "M0", "M1", "M2",
-                "M3", "M4", "M5", "E0", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "P0", "P1", "P2"):
+                "M3", "M4", "M5", "E0", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "P0", "P1", "P2", "I6b", "E8", "S0"):
         assert by[cid]["counts"]["pass"] > 0, (cid, by[cid])
     assert by["I2"]["counts"]["pass"] == 9 and by["M3"]["counts"]["pass"] == 4      # every page in full mode
     assert by["I11"]["counts"]["pass"] >= 5                    # ADSREAD, MC_MoveAbsolute ×2, MEMCPY, 0x745 …
@@ -166,7 +166,8 @@ def test_quick_mode_samples_with_a_seed(KV, kb_copy, tmp_path, monkeypatch):
     assert [c["counts"] for c in res["checks"]] == [c["counts"] for c in res2["checks"]]
     v = KV.Verifier(KV.parse_args(["--seed", "7"]), kb_copy, "--kb", tmp_path / "c")
     w = KV.Verifier(KV.parse_args(["--seed", "7"]), kb_copy, "--kb", tmp_path / "c")
-    assert v.pick(list(range(100)), 5) == w.pick(list(range(100)), 5) != list(range(5))
+    assert v.pick(list(range(100)), 5, "book") == w.pick(list(range(100)), 5, "book") != list(range(5))
+    assert v.pick(list(range(100)), 5, "book") != v.pick(list(range(100)), 5, "other book")
 
 
 def test_refusals_before_anything_runs(KV, kb_copy, tmp_path, capsys):
