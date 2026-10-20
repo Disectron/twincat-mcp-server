@@ -2007,8 +2007,14 @@ class XaeBackend:
         meth, args = calls[action]
         if args and not path:
             raise XaeError(f"{action} needs a path")
+        before = None
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+            try:
+                st0 = Path(path).stat()
+                before = (st0.st_size, st0.st_mtime_ns)
+            except OSError:
+                before = None
         t0 = time.monotonic()
         tries = {"n": 0}
 
@@ -2023,10 +2029,15 @@ class XaeBackend:
         if path:
             p = Path(path)
             out["path"] = str(p)
-            out["written"] = p.is_file() and p.stat().st_size > 0
+            st = p.stat() if p.is_file() else None
+            # a file that was there before and is unchanged is not written by this call (scope audit, 0.8.13: a stale
+            # CSV counted as written)
+            out["written"] = st is not None and st.st_size > 0 and (before is None or (st.st_size, st.st_mtime_ns) != before)
             if not out["written"]:
-                raise XaeError(f"Scope {meth}({path!r}) returned {rc} but no file was written — is there recorded data "
-                               "(stop the recording first)?")
+                raise XaeError(f"Scope {meth}({path!r}) returned {rc} but "
+                               + ("the file that was there is unchanged" if before is not None and st is not None else
+                                  "no file was written")
+                               + " — is there recorded data (stop the recording first)?")
         # R11: IMeasurementScope declares `int StartRecord()` etc. without saying what the int means (Beckhoff's own
         # sample ignores it); on 4026 StartRecord returns 1 and StopRecord 0 while both work. Only a negative value
         # (an HRESULT error) is a warning; success shows in the file written / scope_status.

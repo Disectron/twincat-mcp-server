@@ -2756,8 +2756,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         (default 'auto': native when installed). The response says which engine ran and why. After stopping: rec_verify.
         also_scope: also run the TwinCAT Scope configuration open in XAE (scope = its name when several are open) —
         StartRecord now; at rec_stop StopRecord and SaveSVD into <recordings>/scope/<id>.svdx, the CSV <id>.scope.csv
-        exported from that file with Beckhoff's export tool (XAE's ExportCSV only without it, flagged), a signed link
-        file, and the Scope View log's new ERROR lines (scope_view_log). What Scope records (channels, sample time) is set in that configuration. With
+        exported from that file with Beckhoff's export tool (XAE's ExportCSV only without it, flagged), XAE's ExportCSV of
+        what Scope holds in memory beside it (<id>.scope.xae.csv) with both row counts compared (cross_check — a saved
+        .svdx shorter than memory, or the reverse, is a warning), a signed link file, and the Scope View log's new
+        ERROR / FATAL lines (scope_view_log). A .svdx still being written 15 s after SaveSVD is not exported. What Scope records (channels, sample time) is set in that configuration. With
         recorder.also_scope = 'ask' (default) and a Scope configuration open, leaving also_scope unset asks the user
         (prompt, or an error that tells you to ask and call again with true/false)."""
         # R6: arguments that can never work are refused here, before the call queues behind a long job on the worker
@@ -2833,7 +2835,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def _scope_save(name: str | None, svdx: Path, csv: Path, overwrite: bool = False) -> dict[str, Any]:
         """SaveSVD, then the CSV FROM THE SAVED FILE with Beckhoff's export tool (N117: XAE's ExportCSV right after
         SaveSVD wrote a CSV that lacked the end of the .svdx — 600 ms, and 3 rows of a 58 s recording; exported from the
-        .svdx, the CSV holds what the file holds). XAE's ExportCSV only when the tool is missing or fails, flagged."""
+        .svdx, the CSV holds what the file holds). XAE's ExportCSV only when the tool is missing or fails, flagged.
+        N117 (0.8.13 retest): on another recording the saved .svdx was 34 rows SHORTER than what Scope still had in
+        memory — so both are compared every time: XAE's ExportCSV of the in-memory data is written beside it
+        (<name>.xae.csv) and the row counts are reported (cross_check), whichever is longer."""
         from . import scope as S
         out: dict[str, Any] = {}
         try:
@@ -2842,7 +2847,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         except ToolError as exc:
             out["save_svd"] = {"error": str(exc)}
             return out
-        out["save_svd"]["size_watch"] = await asyncio.to_thread(_settled, svdx)
+        watch = await asyncio.to_thread(_settled, svdx)
+        out["save_svd"]["size_watch"] = watch
+        if watch.get("still_growing_after_s") or "note" in watch:
+            # scope audit (0.8.13): the export ran on a file still being written — its CSV could lack the end
+            out["export_csv"] = {"skipped": "the saved .svdx " + ("was still being written after "
+                                 f"{watch.get('still_growing_after_s')} s" if watch.get("still_growing_after_s") else
+                                 "could not be watched") + " — nothing was exported from it; export it when it is "
+                                 f"complete: scope_export(svd_path={str(svdx)!r})"}
+            return out
         tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
         failed = None
         if tool is not None:
@@ -2852,9 +2865,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 out["export_csv"] = {"path": e["file"], "via": "TC3ScopeExportTool.exe from the saved .svdx",
                                      "lines": e["lines"], "provenance": e["provenance"],
                                      **{k: e[k] for k in ("warning", "exported_from_copy") if k in e}}
+                out["cross_check"] = await _scope_cross_check(name, csv, e["lines"], overwrite)
                 return out
             except S.ScopeError as exc:
                 failed = str(exc)
+        if csv.exists() and not overwrite:
+            # scope audit (0.8.13): the fallback wrote over an existing CSV (or counted the stale one as written)
+            out["export_csv"] = {"error": f"{csv.name} exists — XAE's ExportCSV was not run over it (overwrite=true "
+                                          "replaces it)", "export_tool": failed}
+            return out
         try:
             r = await app.xae_call(app.xae.scope_action, "export_csv", name, str(csv), timeout=600)
             out["export_csv"] = {**{k: r[k] for k in ("result_code", "path", "warning", "result_note") if k in r},
@@ -2866,6 +2885,32 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         out["export_csv"]["export_tool"] = failed or ("TC3ScopeExportTool.exe not found — "
                                                       + S.status(app.cfg.scope.export_tool)["note"])
         return out
+
+    def _csv_rows(p: Path) -> int:
+        with open(p, "rb") as fh:
+            return sum(1 for _ in fh)
+
+    async def _scope_cross_check(name: str | None, csv: Path, svdx_lines: int, overwrite: bool) -> dict[str, Any]:
+        """N117: XAE's ExportCSV of what Scope holds in memory, beside the CSV of the saved .svdx, and how their row
+        counts compare — evidence either way (0.8.12: the in-memory CSV lacked the end; 0.8.13: the .svdx did)."""
+        xcsv = csv.with_name(csv.name[:-4] + ".xae.csv") if csv.name.lower().endswith(".csv") else csv.with_suffix(".xae.csv")
+        if xcsv.exists() and not overwrite:
+            return {"skipped": f"{xcsv.name} exists (overwrite=true replaces it)"}
+        try:
+            await app.xae_call(app.xae.scope_action, "export_csv", name, str(xcsv), timeout=600)
+            xl = await asyncio.to_thread(_csv_rows, xcsv)
+        except (ToolError, OSError) as exc:
+            return {"error": f"XAE's ExportCSV of the in-memory data failed: {exc}"}
+        d: dict[str, Any] = {"svdx_export_lines": svdx_lines, "xae_export": str(xcsv), "xae_export_lines": xl,
+                             "differ_by": xl - svdx_lines}
+        if xl != svdx_lines:
+            d["warning"] = (f"the CSV of the saved .svdx has {abs(xl - svdx_lines)} line(s) "
+                            + ("fewer" if xl > svdx_lines else "more")
+                            + " than XAE's ExportCSV of what Scope held in memory — "
+                            + ("the saved file may lack the end of the recording" if xl > svdx_lines else
+                               "the in-memory export lacks part of what was saved")
+                            + " (N117); both files are kept")
+        return d
 
     def _settled(p: Path, quiet_s: float = 0.5, limit_s: float = 15.0) -> dict[str, Any]:
         """Whether SaveSVD's file still grew after the call returned (not documented either way): its size watched
@@ -2921,7 +2966,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         import os as _os
         import stat as _stat
         files = {}
-        for p in (svdx, csv):
+        xcsv = csv.with_name(csv.name[:-4] + ".xae.csv")
+        for p in (svdx, csv, xcsv):
             if p.is_file():
                 sha, n = file_sha256(p)
                 files[p.name] = {"sha256": sha, "bytes": n}
@@ -2932,7 +2978,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             link["hmac"] = _manifest_sig(app.rec.key, link)
         lp = svdx.with_name(f"{rid}.scope.json")
         lp.write_text(json.dumps(link, indent=1) + "\n", encoding="utf-8")
-        for p in (svdx, csv, lp):
+        for p in (svdx, csv, xcsv, lp):
             if p.is_file():
                 try:
                     _os.chmod(p, p.stat().st_mode & ~(_stat.S_IWUSR | _stat.S_IWGRP | _stat.S_IWOTH))
@@ -3369,7 +3415,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def scope_record(action: str, scope: str | None = None, path: str | None = None) -> dict[str, Any]:
         """Drive a Scope configuration open in XAE (Automation Interface IMeasurementScope): action = start | stop |
         save (SaveSVD → <recordings>/scope/<scope>-<time>.svdx, or path=<file>.svdx; the .csv exported from that file
-        with Beckhoff's export tool — XAE's ExportCSV only without it, flagged; the Scope View log's new ERROR lines).
+        with Beckhoff's export tool — XAE's ExportCSV only without it, flagged, and never over an existing CSV; XAE's
+        ExportCSV of the in-memory data beside it, <name>.xae.csv, row counts compared in cross_check; the Scope View
+        log's new ERROR / FATAL lines).
         scope = its name when several are open. Affects only the Scope recording, not the PLC."""
         if action in ("start", "stop"):
             r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
