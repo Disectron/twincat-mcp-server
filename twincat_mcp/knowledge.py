@@ -104,7 +104,7 @@ def _convert_fix(a: str, b: str) -> str:
 KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [(re.compile(p, re.I), c, f) for p, c, f in [
     # N70: the TwinCAT compiler's messages, by their text (the C-numbers differ between builds; the text does not).
     # First: their quoted names may contain anything the broader patterns below look for ('bLicenseOk')
-    (r"identifier '([^']+)' (?:is )?not defined",
+    (r"identifier '([^']+)' (?:is )?not defined|identifier ([A-Za-z_][\w.]*) (?:is )?not defined",
      "'{1}' is not declared where it is used: a typo, a variable declared in another POU or GVL without the "
      "qualifier, a library that is not referenced, or a namespace / qualified_only GVL ('GVL.{1}')",
      "proj_search {1} (this project) / kb_search {1} (added folders) show where it is declared; declare it, qualify "
@@ -112,7 +112,7 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [(re.compile(p, re.I), c,
     (r"cannot convert type '([^']+)' to type '([^']+)'",
      "IEC 61131-3 has no implicit conversion from {1} to {2} here",
      _convert_fix),
-    (r"unknown type:? '([^']+)'",
+    (r"unknown type:? '([^']+)'|unknown type:? ([A-Za-z_][\w.]*)",
      "the type '{1}' is not known to the compiler: a typo, a DUT not in the project, or a library not referenced",
      "kb_search {1} / infosys_declaration {1} shows where it comes from; add the DUT or the library"),
     (r"0x98110724|2551252772|\blicen[cs]es?\b",
@@ -127,41 +127,50 @@ KNOWN_ERRORS: list[tuple[re.Pattern[str], str, Any]] = [(re.compile(p, re.I), c,
     (r"logged into|logged in",
      "XAE is logged in to the PLC; the project cannot be changed online",
      "xae_plc('logout'), make the change, build, log in again"),
-    (r"rpc call .*(adserror 1797\b|0x705\b|parameter size not correct)",
-     "the RPC parameter block does not match the method's signature: an input missing or extra, a wrong base type, "
-     "or outputs / return_type that differ from the declaration",
-     "pass every VAR_INPUT in declaration order with its exact base type (inputs=[{type, value}, …]), every "
-     "VAR_OUTPUT in outputs and the method's return type in return_type; check the method in proj_interface"),
-    (r"adserror 1797\b|0x705\b|parameter size not correct",
-     "the value does not fit the variable (string too long, wrong array length or type size)",
-     "check the declared type (ads_symbol_info); write elements by index for arrays"),
-    (r"adserror 1808\b|0x710\b|symbol not found",
-     "the symbol is not in the runtime: typo, not downloaded yet, or optimised away (unused, not referenced)",
-     "ads_list_symbols pattern=…; after a code change: build + download / online change"),
-    (r"adserror 1861\b|0x745\b|timeout elapsed",
-     "the target did not answer in time: missing/broken route, firewall (TCP 48898), target busy or stopped",
-     "ads_ping; ads_routes; check the route on both sides and the Windows firewall"),
-    (r"adserror 6\b|0x6\b.*port|target port not found",
-     "nothing listens on that AMS port: TwinCAT is in CONFIG (PLC runtimes exist only in RUN), no PLC project is "
-     "activated on it, or the port number is wrong (851 = first PLC runtime, 852 = second …)",
-     "ads_status port=10000 shows RUN/CONFIG; ads_system_mode run, or activate the PLC project"),
-    (r"adserror 7\b|target machine not found",
-     "no route to that AMS NetId",
-     "ads_add_route_to_plc / XAE → Choose Target → Search; check ams_net_id in the config"),
-    (r"adserror 1793\b|0x701\b|service is not supported",
-     "the target/port does not offer this ADS service (e.g. sum commands, file access on this OS)",
-     "use the non-sum variant or another port; for files check that the target OS supports the System Service file API"),
-    (r"adserror 1799\b|0x707\b|device not ready",
-     "the runtime is not running (TwinCAT in CONFIG, or the PLC stopped)",
-     "ads_status; switch to RUN (ads_system_mode run) / start the PLC (ads_plc_state run)"),
-    (r"adserror 1796\b|0x704\b|not permitted",
-     "reading/writing this index group/offset is not permitted (read-only area or protected symbol)",
-     "write a writable symbol instead; check READONLY flags with ads_symbol_info"),
 ]]
-KNOWN_ERRORS_COVERED = ("ADS errors 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation (ADSError 1861, "
-                        "ADS error 1861, ADS-Error: 1861, 0x745, 0x00000745); license; XAE busy / modal dialog / "
-                        "disconnected; logged in; compiler: identifier not defined (C0046), cannot convert type "
-                        "(C0032), unknown type")
+# The ADS return codes the plugin has a note for. Symbol and Beckhoff's text (what pyads / the ADS router put in a
+# message) as the local Infosys "ADS Return Codes" table has them (tcplclib_tc2_system/374277003, checked 2026-10-20);
+# cause and fix are the plugin's own. A text counts only in a message about ADS (N130: 'not permitted' of any program
+# was ADS 1796); the code in any notation: ADSError 1796, ADS error 1796, 0x704 next to ADS, 0x98110704, the symbol.
+ADS_NOTES: dict[int, tuple[str, str, str, str]] = {
+    6: ("ERR_TARGETPORTNOTFOUND", r"target port not found",
+        "nothing listens on that AMS port: TwinCAT is in CONFIG (PLC runtimes exist only in RUN), no PLC project is "
+        "activated on it, or the port number is wrong (851 = first PLC runtime, 852 = second …)",
+        "ads_status port=10000 shows RUN/CONFIG; ads_system_mode run, or activate the PLC project"),
+    7: ("ERR_TARGETMACHINENOTFOUND", r"target (?:machine|computer) not found",
+        "no route to that AMS NetId",
+        "ads_add_route_to_plc / XAE → Choose Target → Search; check ams_net_id in the config"),
+    0x701: ("ADSERR_DEVICE_SRVNOTSUPP", r"service is not supported",
+            "the target/port does not offer this ADS service (e.g. sum commands, file access on this OS)",
+            "use the non-sum variant or another port; for files check that the target OS supports the System Service "
+            "file API"),
+    0x704: ("ADSERR_DEVICE_INVALIDACCESS", r"not permitted",
+            "reading/writing this index group/offset is not permitted (read-only area or protected symbol)",
+            "write a writable symbol instead; check READONLY flags with ads_symbol_info"),
+    0x705: ("ADSERR_DEVICE_INVALIDSIZE", r"parameter size not correct",
+            "the value does not fit the variable (string too long, wrong array length or type size)",
+            "check the declared type (ads_symbol_info); write elements by index for arrays"),
+    0x707: ("ADSERR_DEVICE_NOTREADY", r"device (?:is )?not ready",
+            "the runtime is not running (TwinCAT in CONFIG, or the PLC stopped)",
+            "ads_status; switch to RUN (ads_system_mode run) / start the PLC (ads_plc_state run)"),
+    0x710: ("ADSERR_DEVICE_SYMBOLNOTFOUND", r"symbol not found",
+            "the symbol is not in the runtime: typo, not downloaded yet, or optimised away (unused, not referenced)",
+            "ads_list_symbols pattern=…; after a code change: build + download / online change"),
+    0x745: ("ADSERR_CLIENT_SYNCTIMEOUT", r"timeout (?:elapsed|has occurred)",
+            "the target did not answer in time: missing/broken route, firewall (TCP 48898), target busy or stopped",
+            "ads_ping; ads_routes; check the route on both sides and the Windows firewall"),
+}
+# an RPC method call that fails with 0x705: the parameter block, not a variable's size
+_RPC_SIZE = ("the RPC parameter block does not match the method's signature: an input missing or extra, a wrong base "
+             "type, or outputs / return_type that differ from the declaration",
+             "pass every VAR_INPUT in declaration order with its exact base type (inputs=[{type, value}, …]), every "
+             "VAR_OUTPUT in outputs and the method's return type in return_type; check the method in proj_interface")
+_ADS_SYMBOLS = {sym: code for code, (sym, *_r) in ADS_NOTES.items()}
+KNOWN_ERRORS_COVERED = ("ADS return codes 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation (ADSError 1861, "
+                        "ADS error 1861, ADS-Error: 0x745, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT; a bare hex number "
+                        "only in a message about ADS); license; XAE busy / modal dialog / disconnected; logged in; "
+                        "compiler messages by their text: identifier '…' not defined, cannot convert type '…' to type "
+                        "'…', unknown type '…' (a C-number alone is not documented locally)")
 # N71: the words of a sentence around the names: the one list of every search (docsearch)
 STOP_WORDS = DS.STOP_WORDS
 COMMON_SHARE = 0.2          # some-words tier: a word in more than this share of the units (≥ 25 units) is not used
@@ -198,8 +207,49 @@ _ADS_CODE = re.compile(r"\bads[\s_-]*(?:error|fehler|err)\b[\s:#=-]*(?:code[\s:#
                        r"|\berror[\s_-]*code[\s:#=-]*(0x[0-9a-f]+|\d+)", re.I)
 _HEX = re.compile(r"\b0x([0-9a-f]{1,8})\b", re.I)
 _ADS_WORD = re.compile(r"\bads(?:\b|error|err\b|fehler)", re.I)      # 'ADS', 'ADSError' — not 'ads_write_raw'
-# an error message, not a search in words: quoted names, an ADS code, a hex number, a compiler number
-_ERROR_MARKER = re.compile(r"'[A-Za-z_][\w.]*'|\b0x[0-9a-f]+\b|\bC\d{4}\b|\bads[\s_-]*(?:error|err|fehler)\b", re.I)
+_ADS_HRESULT = re.compile(r"\b0x9811([0-9a-f]{4})\b", re.I)            # the ADS facility of an HRESULT
+_SYMBOL = re.compile(r"\b(?:ADSERR|ERR)_[A-Z0-9_]+\b")
+_NUMBER = r"(?:0x[0-9a-f]+|16#[0-9a-f_]+|\d+)"
+# N129 / N130: what makes a query an error message — a code in a notation that says so, a code word right next to a
+# number, an HRESULT, an ADS symbol, a compiler message (its number or its text), or a number that is the whole query.
+# Not the word 'error' alone ('error handler' is a search in code), not a bare hex number anywhere ('nCycleCount 0x705')
+_ERROR_MESSAGE = re.compile(
+    r"\bads[\s_-]*(?:error|err|fehler)\b[\s:#=-]*" + _NUMBER +
+    r"|\b(?:error|fehler|err|errid|nerrid|errorid|errorcode|code)\b[\s:#=-]*" + _NUMBER + r"\b"
+    r"|\b0x[89a-f][0-9a-f]{7}\b|\b(?:ADSERR|ERR)_[A-Z0-9_]+\b|\bC\d{4}\b"
+    r"|identifier\s+'?[A-Za-z_][\w.]*'?\s+(?:is\s+)?not\s+defined|cannot convert type|unknown type"
+    r"|^\s*" + _NUMBER + r"\s*$", re.I)
+
+
+def message_names(q: str) -> list[str]:
+    """N129: the names of the code an error message holds — quoted ('nFoo', 'MAIN.fbX'), and unquoted ones that can
+    be no word of the message's sentence: a lower-case prefix before an upper-case letter (fbCounter, nCycleCount),
+    '_' between letters or digits (FB_Valve, MAX_ALARMS), a dotted path (MAIN.fbCounter), letters with digits (Plc2).
+    Not: IEC keywords and elementary types, ADS symbols (ADSERR_…, the code itself), compiler numbers, hex numbers."""
+    out = [t for t in re.findall(r"'([A-Za-z_][\w.]*)'", q) if t.upper() not in IEC_WORDS]
+    rest = re.sub(r"'[^']*'", " ", q)
+    for t in re.findall(r"(?<![\w#.])[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", rest):
+        if t.upper() in IEC_WORDS or _SYMBOL.fullmatch(t) or re.fullmatch(r"C\d{4}|0x[0-9a-f]+", t, re.I):
+            continue
+        if ("." in t or re.match(r"[a-z]+[A-Z0-9]", t) or re.search(r"[A-Za-z0-9]_[A-Za-z0-9]", t)
+                or (re.search(r"\d", t) and re.search(r"[A-Za-z]{2}", t))):
+            out.append(t)
+    return list(dict.fromkeys(out))
+
+
+def is_error_message(q: str) -> bool:
+    """kb_search: is the query an error message (its cause / fix in known_error, only its names searched in the code)
+    rather than words of the code?"""
+    return bool(_ERROR_MESSAGE.search(q or "")) or _hresult_dec(q or "") is not None
+
+
+def _hresult_dec(msg: str) -> int | None:
+    """An ADS HRESULT written in decimal (2551252772 = 0x98110724) — its ADS code."""
+    for m in re.finditer(r"\b(25512\d{5})\b", msg):
+        v = int(m.group(1))
+        if v >> 16 == 0x9811:
+            return v & 0xFFFF
+    return None
 
 
 def ads6_context(port: int | None, mode: str | None) -> dict[str, str]:
@@ -219,12 +269,14 @@ def ads6_context(port: int | None, mode: str | None) -> dict[str, str]:
     return {"cause": f"nothing listens on AMS port {p} (TwinCAT is in {mode})", "fix": "check the port number"}
 
 
-def _ads_codes(msg: str, bare_hex: bool) -> list[int]:
-    """ADS error codes a message names. Explicit notations: 'ADSError 1861' (pyads), 'ADS error 1861', 'ADS-Error:
-    0x745', and 'error code 1861' when the message is about ADS (N70: only the first and the hex form were known).
-    bare_hex: also bare hex numbers — when the message mentions ADS or the number is an ADS device error (0x700–0x7FF);
-    not every HRESULT, offset or address is an ADS code."""
-    ads = _ADS_WORD.search(msg) is not None
+def _ads_codes(msg: str) -> list[int]:
+    """The ADS return codes a message names, the most explicit first: 'ADSError 1861' (pyads), 'ADS error 1861',
+    'ADS-Error: 0x745', 'error code 1861' (about ADS, or an ADS device error 0x700–0x7FF), an ADS HRESULT
+    (0x98110745, or in decimal), an ADS symbol (ADSERR_CLIENT_SYNCTIMEOUT), a number that is the whole message; then
+    — only in a message about ADS — Beckhoff's text of the code ('symbol not found') and bare hex numbers.
+    N129: a bare hex number of 0x700–0x7FF in any text was an ADS code ('nCycleCount 0x705' → 1797)."""
+    ads = _ADS_WORD.search(msg) is not None or _ADS_HRESULT.search(msg) is not None or \
+        any(t in _ADS_SYMBOLS for t in _SYMBOL.findall(msg))
     codes: list[int] = []
     for m in _ADS_CODE.finditer(msg):
         v = m.group(1) or m.group(2)
@@ -232,40 +284,60 @@ def _ads_codes(msg: str, bare_hex: bool) -> list[int]:
         if m.group(2) is not None and not ads and not 0x700 <= n <= 0x7FF:
             continue                                  # 'exited with error code 7' is not an ADS error; 1861 is
         codes.append(n)
-    if bare_hex:
-        for m in _HEX.finditer(msg):
-            v = int(m.group(1), 16)
-            if ads or 0x700 <= v <= 0x7FF:
-                codes.append(v)
+    codes += [int(m.group(1), 16) for m in _ADS_HRESULT.finditer(msg)]
+    dec = _hresult_dec(msg)
+    if dec is not None:
+        codes.append(dec)
+    codes += [_ADS_SYMBOLS[t] for t in _SYMBOL.findall(msg) if t in _ADS_SYMBOLS]
+    whole = re.fullmatch(r"\s*(0x[0-9a-f]+|16#[0-9a-f_]+|\d+)\s*", msg, re.I)
+    if whole:
+        v = whole.group(1).lower().replace("_", "")
+        codes.append(int(v[2:], 16) if v.startswith("0x") else int(v[3:], 16) if v.startswith("16#") else int(v))
+    if ads:
+        low = msg.lower()
+        codes += [c for c, (_sym, text, *_r) in ADS_NOTES.items() if re.search(text, low)]
+        codes += [int(m.group(1), 16) for m in _HEX.finditer(msg)]
     return list(dict.fromkeys(codes))
 
 
-def _match_known(msg: str) -> tuple[str, str, str] | None:
-    """(cause, fix, fix template) of the first table entry the message matches — first with the codes it names in an
-    explicit notation, then also with bare hex numbers ('ADSError 1796 at offset 0x7' is 1796, not 7)."""
-    for bare in (False, True):
-        codes = _ads_codes(msg, bare)
-        text = msg + "".join(f" adserror {c}" for c in codes)
-        for pat, cause, fix in KNOWN_ERRORS:
-            m = pat.search(text)
-            if not m:
-                continue
-            groups = [""] + [g or "" for g in m.groups()]
+def _fill(t: str, groups: list[str]) -> str:
+    """{1}, {2}: the pattern's groups (other braces are text: {type, value})."""
+    return re.sub(r"\{(\d)\}", lambda g: groups[int(g.group(1))] if int(g.group(1)) < len(groups) else g.group(0), t)
 
-            def fill(t: str) -> str:            # {1}, {2}: the pattern's groups (other braces are text: {type, value})
-                return re.sub(r"\{(\d)\}", lambda g: groups[int(g.group(1))] if int(g.group(1)) < len(groups)
-                              else g.group(0), t)
-            if callable(fix):
-                return fill(cause), fix(*groups[1:]), ""
-            return fill(cause), fill(fix), fix
-        if not any(_HEX.finditer(msg)):
-            break
+
+def _match_known(msg: str) -> tuple[str, str, str, str | None] | None:
+    """(cause, fix, fix template, the ADS code it is) of the first note that fits: the general table (compiler messages by their text,
+    license, XAE), then the ADS return codes the message names (_ads_codes, most explicit first: 'ADSError 1796 at
+    offset 0x7' is 1796, not 7)."""
+    for pat, cause, fix in KNOWN_ERRORS:
+        m = pat.search(msg)
+        if not m:
+            continue
+        got = [g for g in m.groups() if g]
+        groups = [""] + got + [""] * (pat.groups - len(got))      # alternatives: their filled groups, in order
+        if callable(fix):
+            return _fill(cause, groups), fix(*groups[1:]), "", None
+        return _fill(cause, groups), _fill(fix, groups), fix, None
+    for code in _ads_codes(msg):
+        if code not in ADS_NOTES:
+            continue
+        sym, _text, cause, fix = ADS_NOTES[code]
+        if code == 0x705 and re.search(r"\brpc call\b", msg, re.I):
+            cause, fix = _RPC_SIZE
+        return cause, fix, fix, f"ADS return code 0x{code:X} ({code}) {sym}"
     return None
 
 
 def known_error(msg: str) -> dict[str, str] | None:
+    """The plugin's note on an error message: cause and fix (its own words, not Beckhoff's), and for an ADS return code
+    which one it is (code, symbol)."""
     k = _match_known(msg or "")
-    return None if k is None else {"cause": k[0], "fix": k[1]}
+    if k is None:
+        return None
+    out = {"cause": k[0], "fix": k[1]}
+    if k[3]:
+        out["code"] = k[3]
+    return out
 
 
 def annotate(msg: str) -> str:
@@ -980,19 +1052,22 @@ class Knowledge:
                 informative.append(w)
         if not informative and not phrases and len(words) == 1:
             informative, ignored = list(words), {}       # one word ('WHILE', 'On', 'i'): searched as written
-        err = known_error(q)
-        if err and _ERROR_MARKER.search(q):
-            # N71: an error message: its words ('Cannot convert type … to type …') are not code words — they matched
-            # every unit with TYPE or 'to' in it. In the code only the names it quotes mean something ('nFoo'), not
-            # the elementary types and keywords it quotes ('BOOL', 'INT')
-            quoted = [t for t in re.findall(r"'([A-Za-z_]\w*(?:\.\w+)*)'", q) if t.upper() not in IEC_WORDS]
+        # N71: an error message: its words ('Cannot convert type … to type …') are not code words — they matched every
+        # unit with TYPE or 'to' in it. N129 / N130: whether it is one is decided by the message (a code in a notation
+        # that says so, an HRESULT, a compiler message …), not by whether the plugin has a note on it — 'Ads-Error 0xA2'
+        # was searched as words ('Error' listed 16 units), 'License' got the licence note; and the names of the code it
+        # holds are searched, quoted or not ('ADS error 1808 fbCounter' searched nothing)
+        error_msg = is_error_message(q)
+        err = known_error(q) if error_msg else None
+        if error_msg:
+            names = message_names(q)
             for w in informative:
-                ignored.setdefault(w, "error message text (the cause / fix is in known_error)")
-            informative = [w for t in quoted for w in re.findall(r"\w+", t)]
+                ignored.setdefault(w, "error message text (not a name of the code)")
+            informative = list(dict.fromkeys(w for t in names for w in re.findall(r"\w+", t) if re.search(r"[^\W_]", w)))
             for w in informative:
                 ignored.pop(w, None)
             phrases = []
-        if not phrases and not informative and not err:
+        if not phrases and not informative and not error_msg:
             raise KnowledgeError(f"the query {q!r} has only stop words ({', '.join(ignored)}): kb_search looks for the "
                                  "names and words of the code — give a unit or variable name, or specific words")
         with self._db_read() as con:
@@ -1047,13 +1122,14 @@ class Knowledge:
         elif nproj and not hits and (phrases or informative):
             out["note"] = (f"no unit contains {', '.join(phrases + informative)} (name, declaration, code, comments of "
                            f"the {nproj} indexed folder(s))")
-        elif err and not informative and not phrases:
-            out["note"] = "an error message without a name to look for in the code: known_error has its cause and fix"
-        if err:
+        elif error_msg and not informative and not phrases:
+            out["note"] = ("an error message without a name to look for in the code: known_error has its cause and fix"
+                           if err else "an error message without a name to look for in the code, and not one the "
+                           "plugin has a note on (known_errors_covered) — its words are not searched")
+        if error_msg:
             out["known_error"] = err
-        elif re.search(r"\b(?:error|fehler|exception)\b|\b0x[0-9a-f]+\b|\bC\d{4}\b", q, re.I):
-            out["known_error"] = None
-            out["known_errors_covered"] = KNOWN_ERRORS_COVERED
+            if err is None:
+                out["known_errors_covered"] = KNOWN_ERRORS_COVERED
         if not nproj:
             out["note"] = "no project folders in the knowledge base yet — kb_add_project(path) with a folder the user names"
         elif self._fts and not self._fts_words:

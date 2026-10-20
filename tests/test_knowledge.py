@@ -585,7 +585,8 @@ def test_review_known_errors_and_kb_search_edge_cases(kb, project_dir, tmp_path)
     k.set_location(str(tmp / "kbdata"))
     k.add_project(str(project_dir), "sample")
     r = k.search("Valve license")
-    assert r["known_error"] and r["hits"] and r["hits"][0]["unit"].startswith("FB_Valve"), r
+    # N130 (0.8.13 retest): searched — and no licence note: words of the code are no error message
+    assert "known_error" not in r and r["hits"] and r["hits"][0]["unit"].startswith("FB_Valve"), r
     assert isinstance(k.search("WHILE")["hits"], list)                   # searched as written, not refused
     # every word common in a big project: the least common one still picks units (the tier was empty)
     big = tmp_path / "big" / "POUs"
@@ -945,3 +946,47 @@ def test_n131_n134_n135_declaring_unit_first_kind_pou_and_query_handling(kb, tmp
     r = k.search('"rising edge"')
     labels = {h["unit"]: h.get("match_in") for h in r["hits"]}
     assert labels == {"FB_Edge": "string literals or comments", "FB_Edge2": "comments"}, r
+
+
+def test_n129_n130_error_messages_keep_their_names_and_known_errors_need_their_context(kb, tmp_path):
+    """N129 (0.8.13 retest): 'ADS error 1808 fbCounter' searched nothing ('fbCounter' was "error message text");
+    'nCycleCount 0x705' got the ADS 1797 note (any bare 0x700–0x7FF was ADS) and 0 hits. N130: 'License' got the
+    licence note; 'Ads-Error 0xA2' (no note) was searched as words — 'Error' listed 16 units; '0x6 port', 'not
+    permitted', 'timeout elapsed', 'logged in' in plain text matched; ADSERR_* names and unquoted identifiers were
+    not recognised; a bare C0046 was claimed as covered."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "err"
+    _pou(src, "PRG_Machine", "PROGRAM PRG_Machine\nVAR\n    fbCounter : FB_Counter;\n    nCycleCount : UDINT;\nEND_VAR",
+         "fbCounter(bEnable := TRUE);\nnCycleCount := nCycleCount + 1;\n// error handling below")
+    _pou(src, "FB_Counter", "FUNCTION_BLOCK FB_Counter\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR")
+    _pou(src, "FB_ErrorHandler", "FUNCTION_BLOCK FB_ErrorHandler\nVAR\n    nError : UDINT;\nEND_VAR")
+    k.add_project(str(src), "err")
+    r = k.search("ADS error 1808 fbCounter")
+    assert r["known_error"]["code"] == "ADS return code 0x710 (1808) ADSERR_DEVICE_SYMBOLNOTFOUND", r
+    assert [h["unit"] for h in r["hits"]] == ["PRG_Machine"], r
+    r = k.search("nCycleCount 0x705")
+    assert "known_error" not in r and r["hits"][0]["unit"] == "PRG_Machine", r
+    assert K.known_error("nCycleCount 0x705") is None
+    assert "known_error" not in k.search("License")
+    r = k.search("Ads-Error 0xA2")
+    assert r["known_error"] is None and r["hits"] == [] and "not searched" in r["note"], r
+    assert "1861" in r["known_errors_covered"], r
+    r = k.search("error handler")                                          # words of the code: searched as such
+    assert "known_error" not in r and r["hits"][0]["unit"] == "FB_ErrorHandler", r
+    for plain in ("0x6 port 3", "Operation not permitted", "timeout elapsed while waiting"):
+        assert K.known_error(plain) is None, plain
+    assert "known_error" not in k.search("logged in") and "known_error" not in k.search("timeout elapsed")
+    assert K.annotate("PermissionError: [Errno 1] Operation not permitted") == \
+        "PermissionError: [Errno 1] Operation not permitted"
+    # the code in every notation the local ADS return-code table gives — and pyads' text, in a message about ADS
+    for q in ("ADSERR_CLIENT_SYNCTIMEOUT", "0x98110745", "ADS-Error: 0x745", "ADSError 1861", "1861", "0x745",
+              "ADSError: timeout elapsed"):
+        assert K.known_error(q)["code"].startswith("ADS return code 0x745 (1861)"), q
+    assert K.known_error("ADSError 1796: reading or writing not permitted")["code"].endswith("ADSERR_DEVICE_INVALIDACCESS")
+    assert K.known_error("Target port not found – ADS server is not started (ADS)")["code"].endswith("ERR_TARGETPORTNOTFOUND")
+    assert "'nFoo' is not declared" in K.known_error("identifier nFoo not defined")["cause"]
+    r = k.search("C0046: identifier fbCounter not defined")
+    assert r["known_error"] and r["hits"][0]["unit"] == "PRG_Machine", r
+    r = k.search("C0046")
+    assert r["known_error"] is None and "C-number alone is not documented locally" in r["known_errors_covered"], r

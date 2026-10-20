@@ -2305,10 +2305,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         name it was copied from. "quoted text" is a phrase. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
         POU (= those three), METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …;
         project = the folder (any spelling) or its label; limit 1–200. `stale`: folders changed, renamed or deleted
-        since they were indexed — their hits are those of the last indexing (kb_reindex). An error message gives
-        its known cause/fix (ADS errors 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation — ADSError 1861,
-        ADS error 1861, 0x745 —, license, XAE busy / dialog / disconnected, logged in, compiler: identifier not
-        defined, cannot convert type, unknown type) and is searched only for the names it quotes.
+        since they were indexed — their hits are those of the last indexing (kb_reindex). An error message — a code in
+        a notation that says so (ADSError 1861, ADS error 1861, error 1861, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT), a
+        compiler message, or a number alone; not the word 'error' or a hex number anywhere — gets the plugin's note
+        in known_error (ADS return codes 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 with code and symbol, license, XAE
+        busy / dialog / disconnected, logged in, compiler: identifier not defined, cannot convert type, unknown type;
+        null + known_errors_covered when it has none) and is searched only for the names of the code it holds
+        (quoted, or identifiers such as fbCounter, FB_Valve, MAIN.fbX).
         Beckhoff documentation is not here: the twincat-docs skill."""
         return await app.kb_call(app.kb.search, query, kinds, project, limit)
 
