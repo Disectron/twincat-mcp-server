@@ -47,12 +47,15 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 ## Rules
 1. Documentation → this skill. Live PLC values and types → the ads_* tools.
    **An error code → `err_lookup` first.** A number counts as a code only as the whole query or next to a word that
-   says so (`error 1861`, `nErrId := 1808`) — `ADS error on port 851` holds no code. A number of several domains is
+   says so (`error 1861`, `nErrId := 1808`) — `ADS error on port 851` holds no code; a hex number also right after a
+   domain's name (`AL status 0x0011`), and `C0373` is read as a compiler message. A number of several domains is
    listed in all of them, ranked by the message's words; a message that names a domain (`ADS error 6`) is answered for
    it and the same number elsewhere comes in `other_domains` — never pick one silently. `documented: false` = not in
    the local documentation (CoE SDO abort codes and the compiler's C0xxx messages have no local source at all —
    `no_local_source`): say so, never guess a meaning; `fulltext` hits only mention the code. `plugin_note` is the
-   plugin's own cause / fix, not Beckhoff's text: say so when you use it.
+   plugin's own cause / fix, not Beckhoff's text: say so when you use it. An AL status code from a manual that gives
+   each code its own section carries that section's fields in `detail` (description, current / resulting state,
+   solution) — Beckhoff's text, cite its `ref` page.
 2. Symbol known → `docs_declaration`. Unknown → `docs_search` → take a `ref` → `docs_page section=`.
    `docs_declaration` gives `kind`, `return_type` (function, method, property), `declaration` with its header and
    the members (`inputs`, `outputs`, `in_out`, `members`, `enum_values`, `methods`, `properties`) as the index parsed

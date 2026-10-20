@@ -391,6 +391,130 @@ def test_al_status_codes_rows_where_the_table_parses_else_page_links():
     assert "only 1 line" in X.parse_al_page("AL status\n0x0011 Invalid requested state change")["reason"]
 
 
+# the EtherCAT system documentation's layout (8.2.1 EtherCAT AL Status Codes, its real text): one section per code with
+# labelled fields, sections running on over page breaks, the next numbered heading ending the last one
+AL_SECTIONS = [
+    (307, """8.2 EtherCAT Diagnosis
+8.2.1 EtherCAT AL Status Codes
+8.2.1.1 Error Code 0x0000
+Meaning
+No error
+Description
+No error
+Current State (or state change)
+Any
+Resulting state
+Current state
+Solution
+n/a
+8.2.1.2 Error Code 0x0001
+Meaning
+Unspecified error
+Description
+No error code is defined for occurred error"""),
+    (308, """Current State (or state change)
+Any
+Resulting state
+Any + E
+Solution
+Read user manual or contact device manufacturer
+8.2.1.5 Error Code 0x0011
+Meaning
+Invalid requested state change
+Description
+The EtherCAT State Machine (ESM) defines which state changes are allowed. All other state changes are
+not allowed
+Current State (or state change)
+P→S, I→O, P→O
+Resulting state
+Current State + E"""),
+    (309, """Solution
+Go step-by-step from the original state to the desired state.
+8.3 Training
+Beckhoff offers trainings.""")]
+AL_SYSTEM_DOC = "Documentation Introduction, Mounting, Wiring, Configuration, Operation, Diagnosis.pdf"
+
+
+def test_al_status_codes_one_section_per_code_over_page_breaks():
+    """Real data (0.8.16): the EtherCAT system documentation gives each AL status code a section of labelled fields —
+    the table parser read none of its 52 codes. Each code: its Meaning as the text, the other fields as detail (n/a
+    left out), the page its section starts on; a field running on over a page break is one field; the next numbered
+    heading ends the last section. Fewer than three sections, a section without a Meaning or codes out of order: none."""
+    r = X.parse_al_sections(AL_SECTIONS)
+    assert [(x["value"], x["text"], x["page"]) for x in r["rows"]] == [
+        (0, "No error", 307), (1, "Unspecified error", 307), (0x11, "Invalid requested state change", 308)], r
+    assert r["rows"][0]["detail"] == {"description": "No error", "current_state": "Any",
+                                      "resulting_state": "Current state"}, r["rows"][0]
+    assert r["rows"][1]["detail"] == {"description": "No error code is defined for occurred error",
+                                      "current_state": "Any", "resulting_state": "Any + E",
+                                      "solution": "Read user manual or contact device manufacturer"}, r["rows"][1]
+    d = r["rows"][2]["detail"]
+    assert d["description"].endswith("All other state changes are not allowed"), d
+    assert d["solution"] == "Go step-by-step from the original state to the desired state.", d
+    assert r["rows"][2]["hex"] == "0x0011" and r["rows"][2]["kind"] == "AL status code"
+    assert r["pages"] == [307, 308, 309]
+    assert X.parse_al_sections(AL_SECTIONS[:1])["rows"] == []                       # two sections only
+    swapped = [(307, AL_SECTIONS[0][1].replace("0x0001", "0x0021"))] + AL_SECTIONS[1:]
+    assert X.parse_al_sections(swapped)["rows"] == []                               # 0x0021 before 0x0011
+    no_meaning = [(307, AL_SECTIONS[0][1].replace("Meaning\nUnspecified error\n", ""))] + AL_SECTIONS[1:]
+    assert X.parse_al_sections(no_meaning)["rows"] == []
+    assert X.parse_al_page(AL_SECTIONS[1][1])["rows"] == []                         # what the table parser made of it
+
+
+def test_the_section_layout_is_indexed_with_its_fields_and_pages(tmp_path):
+    """The system documentation's AL codes in errors.db: one row per code with its own page as ref and its fields as
+    detail — and its pages are not also turned into page links."""
+    k = make_kb(tmp_path, manuals=False)
+    db = L.index_file(k, "manuals")
+    write_manuals(db)
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM page WHERE doc IN (SELECT id FROM doc WHERE name = 'EtherCAT_System_Documentation.pdf')")
+    con.execute("DELETE FROM doc WHERE name = 'EtherCAT_System_Documentation.pdf'")
+    con.execute("INSERT INTO doc VALUES (9,?,?,?,?,?,?,?,?,?,?)", (f"C:/kb/manuals/{AL_SYSTEM_DOC}", AL_SYSTEM_DOC,
+                                                                 1000, 1, "sha9", None, 400, 400, "2026-10-20", "pymupdf"))
+    for page, text in AL_SECTIONS:
+        con.execute("INSERT INTO page VALUES (9,?,?,?)", (page, "8 Appendix > 8.2 EtherCAT Diagnosis", text))
+    con.commit()
+    con.close()
+    assert build(k)["result"] == "built"
+    r = lookup(k, "AL status 0x0011")
+    m = r["matches"][0]
+    assert r["documented"] is True and m["domain"] == "ethercat_al" and m["text"] == "Invalid requested state change"
+    assert m["ref"] == f"{AL_SYSTEM_DOC}#p308" and m["detail"]["resulting_state"] == "Current State + E", m
+    assert m["detail"]["solution"].startswith("Go step-by-step"), m
+    m = lookup(k, "AL status code 0x0001")["matches"][0]
+    assert m["ref"] == f"{AL_SYSTEM_DOC}#p307" and m["detail"]["solution"].startswith("Read user manual"), m
+    assert "detail" not in lookup(k, "0x745")["matches"][0]
+    con = X.connect_ro(L.index_file(k, "errors"))
+    try:
+        assert con.execute("SELECT COUNT(*) FROM link WHERE domain = 'ethercat_al' AND ref LIKE ?",
+                           (f"{AL_SYSTEM_DOC}#%",)).fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM code WHERE domain = 'ethercat_al' AND book = ?",
+                           (AL_SYSTEM_DOC,)).fetchone()[0] == 3
+    finally:
+        con.close()
+
+
+def test_a_hex_number_after_a_domain_name_is_a_code_and_c0xxx_a_compiler_message(kb):
+    """0.8.16 acceptance on real data: 'AL status 0x0011' was read as no code ('status' is no code word) and 'C0373' as
+    no code at all. A hex number right after a domain's name is that domain's code; a decimal one still needs a code
+    word ('ADS 851' is no code — N121). C0xxx is a compiler message: not documented locally, said so for the compiler
+    alone; C6015 (an IPC) is none."""
+    assert [c["token"] for c in X.read_query("AL status 0x0011")["codes"]] == ["0x0011"]
+    assert [c["token"] for c in X.read_query("ADS 0x745")["codes"]] == ["0x745"]
+    assert X.read_query("ADS 851")["codes"] == [] and X.read_query("CoE index 0x1018")["codes"] == []
+    assert X.read_query("Error C0373: …")["ids"] == [{"token": "C0373", "domain": "compiler"}]
+    assert X.read_query("C6015 fan error")["ids"] == []
+    r = lookup(kb, "AlStatus 0x0011")
+    assert r["documented"] is True and r["matches"][0]["domain"] == "ethercat_al", r
+    r = lookup(kb, "C0373")
+    assert r["documented"] is False and r["domain_named"] == ["compiler"] and r["matches"] == [], r
+    assert list(r["no_local_source"]) == ["compiler"] and r["note"].startswith("C0373: not in the local"), r
+    assert "text" not in r["ranking"] and "searched_words" not in r, r
+    r = lookup(kb, "ADS 851")
+    assert r["documented"] is False and "no_local_source" not in r, r      # the compiler's gap is not the answer
+
+
 # ------------------------------------------------------------------------------------------------ §8 acceptance
 def test_acceptance_1_every_notation_is_one_ads_row_with_its_page(kb):
     """N125 §8.1: 0x745, 1861, 16#745, 0x00000745, 0x98110745, ADSERR_CLIENT_SYNCTIMEOUT, 'ADSError 1861 (0x745): Timeout'

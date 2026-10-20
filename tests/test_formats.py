@@ -30,7 +30,8 @@ MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes
 ESI_FINGERPRINT = ("2", "49f0ad9346541e7b")    # index\\esi.db (esi_index.py): format 2 — modules found by their
 #                                                 devices (N156, 0.8.14 retest), one object per index of a dictionary
 #                                                 (EL6653, kb_verify E2; format 2 is not released yet); 1 since 0.8.12
-ERRORS_FINGERPRINT = ("1", "5442b5ad3b7b4454")  # index\\errors.db (errors_index.py): format 1 — 0.8.16 (N125)
+ERRORS_FINGERPRINT = ("1", "74420f2ba67d1700")  # index\\errors.db (errors_index.py): format 1 — 0.8.16 (N125), not
+#                                                  released yet: AL codes by section with their fields (code.detail)
 
 EXCLUDE = frozenset({
     "_db", "_Conn", "_file_sig", "_probe", "_writable", "missing_text", "ro_uri", "source", "has_fts", "_bump_gen",
@@ -191,7 +192,7 @@ def test_the_errors_closure_reaches_the_parser_and_the_checks():
     for name in ("parse_table", "cell_numbers", "header_meaning", "_HEADER", "_RANGE", "_RESIDUE", "_same_num",
                  "page_tables", "_md_tables", "_md_cell", "parse_al_page", "AL_PAGE", "CODE_PAGE", "API_PAGE",
                  "ALIAS_PAGES", "DOMAINS", "_Build", "golden", "GOLDEN_SYMBOLS", "GOLDEN_MIN_CODES", "SCHEMA",
-                 "MAIN_ORDER", "_ann_sha"):
+                 "MAIN_ORDER", "_ann_sha", "parse_al_sections", "_AL_SECTION", "_AL_FIELDS", "_AL_ORDER"):
         assert name in found or f"_Build.{name}" in found, name
     assert "ANNOTATIONS" not in found and "FIX_FUNCTIONS" not in found
 

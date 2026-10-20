@@ -798,13 +798,14 @@ class App:
         codes = []
         for i, e in enumerate(log["errors"]):
             read = X.read_query(e)
-            if not read["codes"] and not read["names"]:
+            if not read["codes"] and not read["names"] and not read["ids"]:
                 continue
             try:
                 r = X.err_lookup(e, kb=loc, limit=3, fulltext=False)
             except X.ErrError:
                 continue
-            codes.append({"error": i, "read_as": [c["token"] for c in r["read_as"]] + r.get("names", []),
+            codes.append({"error": i, "read_as": [c["token"] for c in r["read_as"]] + r.get("names", [])
+                          + [m["token"] for m in r.get("message_ids", [])],
                           "documented": r.get("documented"),
                           "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref") if m.get(k)}
                                       for m in r.get("matches") or []],
@@ -2769,10 +2770,12 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         notation (0x745, 1861, 16#745, 0x00000745, an HRESULT 0x98110745 or its decimal), a symbol
         (ADSERR_CLIENT_SYNCTIMEOUT, ERROR_INVALID_HANDLE, the .NET name TargetPortNotFound) or the message ('ADSError
         1861 (0x745): …', 'Ads-Error 0xA2', 'nErrId := 1808'). A number is a code only as the whole query or next to a
-        word that says so ('ADS error on port 851' has no code 851). Each match: domain (ads, win32, hresult, nc,
+        word that says so ('ADS error on port 851' has no code 851); a hex number also right after a domain's name
+        ('AL status 0x0011', 'ADS 0x745'); C0xxx is read as a compiler message. Each match: domain (ads, win32, hresult, nc,
         labview, ethercat_al, ethercat_diag, or a library's code page: book/page id), hex / dec / HRESULT, symbol,
         Beckhoff's text — every text when the copies of the table differ (texts, with their books; main = the text of
-        the most books) and the copies that lack it (missing_in) — ref + url of the page, and the plugin's own note
+        the most books) and the copies that lack it (missing_in), an AL status code's section fields (detail: description,
+        current_state, resulting_state, solution) — ref + url of the page, and the plugin's own note
         (plugin_note: labelled, never Beckhoff's text). A number documented in several domains lists all, ranked by the
         message's words; a message that names a domain ('ADS error 6') is answered for it and the same number elsewhere
         is listed apart (other_domains); `ranking` says why. Not documented: documented=false, the domains searched,

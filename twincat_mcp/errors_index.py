@@ -53,7 +53,7 @@ from . import docsearch as DS
 from . import kb_layout as L
 from . import kb_lock
 
-FORMAT = "1"            # 1: 0.8.16 (N125) — first version
+FORMAT = "1"            # 1: 0.8.16 (N125) — first version (code.detail: the labelled fields of a code's section)
 SIDE = ("-journal", "-wal", "-shm")
 SWAP_WAIT_S = 60.0
 LIMIT_MAX = 20
@@ -243,10 +243,12 @@ DOMAINS: dict[str, dict[str, Any]] = {
                       "names": ("sdo", "sdo abort", "abort code", "abortcode"), "hints": ("coe", "canopen", "mailbox"),
                       "note": "no local source documents them: not in the Infosys index, the PDF manuals or the ESI "
                               "files of this PC"},
+    # id_form: the number a message of the domain carries ('C0373') — read as that domain's message whatever words
+    # stand around it (0.8.16 acceptance: 'C0373' was read as no code at all). C0 only: C5xxx-C9xxx are IPC models
     "compiler": {"title": "TwinCAT compiler messages (C0xxx)", "origin": "none", "priority": 8,
-                 "names": ("compiler",), "hints": ("build", "compile"),
-                 "note": "the compiler's messages are not in the local Infosys index — the plugin has notes on some of "
-                         "them by their text"},
+                 "names": ("compiler",), "hints": ("build", "compile"), "id_form": r"(?<![\w-])[Cc]0\d{3}(?![\w-])",
+                 "note": "the compiler's messages are not in the local Infosys index (its pages only mention a few "
+                         "C-numbers) — the plugin has notes on some of them by their text: give the whole message"},
     "xae": {"title": "XAE shell states", "origin": "plugin", "priority": 9, "names": (), "hints": ("xae", "logged"),
             "note": "the plugin's own notes on states of the XAE shell"},
 }
@@ -568,13 +570,70 @@ def parse_al_page(text: str) -> dict[str, Any]:
                      for r in rows]}
 
 
+_AL_SECTION = re.compile(r"^\s*(?:[\d.]+\s+)?Error Code (0x[0-9A-Fa-f]{4})\s*$")
+_AL_FIELDS = {"meaning": "meaning", "description": "description", "current state (or state change)": "current_state",
+              "current state": "current_state", "resulting state": "resulting_state", "solution": "solution"}
+# the fields in the order a section gives them: a line is a field's label only after the fields before it — the value
+# of 'Resulting state' is often 'Current state', which is no new field (0x0000 lost its resulting state)
+_AL_ORDER = ("meaning", "description", "current_state", "resulting_state", "solution")
+
+
+def parse_al_sections(pages: list[tuple[int, str]]) -> dict[str, Any]:
+    """The AL status codes a manual documents one section per code — the EtherCAT system documentation's '8.2.1 EtherCAT
+    AL Status Codes': 'Error Code 0x0014' followed by labelled fields (Meaning, Description, Current State (or state
+    change), Resulting state, Solution), sections running on over page breaks. Third review of 0.8.16's base: the table
+    parser (parse_al_page) read none of its 52 codes — the document became 7 page links. pages: (page, text) of one
+    document in page order -> {'rows': [...], 'pages': [pages the sections are on]} — a row's text is its Meaning, the
+    other fields its detail; rows only when at least three sections parse, each with a Meaning, codes ascending."""
+    rows: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    field: str | None = None
+    on: list[int] = []
+    for page, text in pages:
+        for ln in (text or "").splitlines():
+            m = _AL_SECTION.match(ln)
+            if m:
+                cur = {"value": int(m.group(1), 16), "page": page, "fields": {}}
+                rows.append(cur)
+                field = None
+                if page not in on:
+                    on.append(page)
+                continue
+            if cur is None:
+                continue
+            key = _AL_FIELDS.get(ln.strip().lower())
+            if key is not None and (field is None or _AL_ORDER.index(key) > _AL_ORDER.index(field)):
+                field = key
+                cur["fields"].setdefault(key, [])
+                if page not in on:
+                    on.append(page)
+                continue
+            if field is not None and ln.strip():
+                if re.match(r"^\s*\d+(?:\.\d+)+\s+\S", ln):     # the next numbered heading ends the section
+                    cur, field = None, None
+                    continue
+                cur["fields"][field].append(ln.strip())
+    out = []
+    for r in rows:
+        f = {k: " ".join(v).strip() for k, v in r["fields"].items() if " ".join(v).strip()}
+        meaning = f.pop("meaning", "")
+        out.append({"value": r["value"], "hex": f"0x{r['value']:04X}", "dec": str(r["value"]), "hresult": None,
+                    "symbol": None, "text": meaning, "kind": "AL status code", "page": r["page"],
+                    "detail": {k: v for k, v in f.items() if v.lower() not in ("n/a", "")} or None})
+    vals = [r["value"] for r in out]
+    if len(out) < _AL_MIN_ROWS or any(not r["text"] for r in out) or vals != sorted(set(vals)):
+        return {"rows": [], "pages": on}
+    return {"rows": out, "pages": on}
+
+
 # --------------------------------------------------------------------------------------------- the database
 SCHEMA = """
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE domain (id TEXT PRIMARY KEY, title TEXT, origin TEXT, priority INTEGER, names TEXT, hints TEXT,
   documents INTEGER, codes INTEGER, rows INTEGER, variants INTEGER, links INTEGER, note TEXT);
 CREATE TABLE code (id INTEGER PRIMARY KEY, domain TEXT, value_int INTEGER, hex TEXT, dec TEXT, hresult TEXT,
-  symbol TEXT, text TEXT, kind TEXT, source_ref TEXT, book TEXT, page_id TEXT, url TEXT, variant TEXT, document TEXT);
+  symbol TEXT, text TEXT, kind TEXT, source_ref TEXT, book TEXT, page_id TEXT, url TEXT, variant TEXT, document TEXT,
+  detail TEXT);
 CREATE INDEX code_value ON code (value_int);
 CREATE INDEX code_domain ON code (domain, value_int);
 CREATE TABLE variant (domain TEXT, variant TEXT, document TEXT, sha TEXT, books TEXT, books_n INTEGER, refs TEXT,
@@ -869,9 +928,11 @@ class _Build:
                     continue
                 seen.add(k)
                 self.con.execute("INSERT INTO code (domain, value_int, hex, dec, hresult, symbol, text, kind, "
-                                 "source_ref, book, page_id, url, variant, document) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                 "source_ref, book, page_id, url, variant, document, detail) "
+                                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                  (did, x["value"], x["hex"], x["dec"], x["hresult"], x["symbol"], x["text"], x["kind"],
-                                  rep[0], rep[1], rep[2], rep[3], vid, document))
+                                  x.get("ref") or rep[0], rep[1], rep[2], rep[3], vid, document,
+                                  json.dumps(x["detail"], ensure_ascii=False) if x.get("detail") else None))
 
     def _aliases(self, src: sqlite3.Connection, alias_pages: list[sqlite3.Row]) -> int:
         """The names of every code (its symbol, its HRESULT) and the members of the .NET enumerations of ALIAS_PAGES
@@ -919,8 +980,29 @@ class _Build:
                                 "ORDER BY d.name, p.page").fetchall()
             per: list[tuple] = []
             links = 0
+            # a document that gives each code its own section (the EtherCAT system documentation): its sections, over
+            # page breaks, before the page-by-page tables
+            by_doc: dict[str, list[sqlite3.Row]] = {}
             for r in pages:
-                if not AL_PAGE.search(r["text"] or ""):
+                by_doc.setdefault(r["name"], []).append(r)
+            in_sections: set[tuple[str, int]] = set()
+            for name, prs in by_doc.items():
+                if not any(_AL_SECTION.match(ln) for r in prs for ln in (r["text"] or "").splitlines()):
+                    continue
+                res = parse_al_sections([(r["page"], r["text"]) for r in prs])
+                if not res["rows"]:
+                    continue
+                first = res["pages"][0]
+                sec = next((r["section"] for r in prs if r["page"] == first), None)
+                for x in res["rows"]:
+                    x["ref"] = f"{name}#p{x['page']}"
+                per.append((f"{name}#p{first}", name, str(first), None, None, res["rows"], "al_sections", sec))
+                self.report.append(("manuals", f"{name}#p{first}", sec, name, "al_status", "ethercat_al", 1, 1,
+                                    len(res["rows"]), 0, 0, "al_sections", "rows",
+                                    f"one section per code on pages {res['pages'][0]}-{res['pages'][-1]}"))
+                in_sections |= {(name, pg) for pg in res["pages"]}
+            for r in pages:
+                if not AL_PAGE.search(r["text"] or "") or (r["name"], r["page"]) in in_sections:
                     continue
                 ref = f"{r['name']}#p{r['page']}"
                 res = parse_al_page(r["text"])
@@ -1322,13 +1404,26 @@ _NAME_TOKEN = re.compile(r"(?<![\w#])[A-Za-z_][A-Za-z0-9_]{2,}(?![\w#])")
 _PYADS = re.compile(r"\badserror\b\s*:[^\n]{0,200}?\((-?\d+)\)", re.I)        # pyads: 'ADSError: symbol not found (1808).'
 
 
+def _after_domain_name(q: str, start: int) -> bool:
+    """The token at q[start:] stands right after a domain's name ('AL status 0x0011', 'ADS 0x745', 'NC 0x4221')."""
+    pre = q[:start]
+    if not re.search(r"[\s:=#(]$", pre):
+        return False
+    nw = _norm_words(pre)
+    return any(nw.endswith(f" {n} ") for d in DOMAINS.values() for n in d.get("names", ()))
+
+
 def read_query(q: str) -> dict[str, Any]:
     """What a query names: codes by docsearch's code-form rules (a number is a code when it is the whole query or
-    stands next to a word that says so — N121 / N122; a hex number too: not anywhere), pyads' 'ADSError: … (1808)', and
-    the names that can be a code's symbol (identifiers with '_', inner capitals or digits: ADSERR_CLIENT_SYNCTIMEOUT,
-    TargetPortNotFound)."""
-    toks = DS.code_tokens(q, min_digits=1, hex_anywhere=False)
-    codes = [{"token": t["token"], "value": t["value"], "how": t["how"]} for t in toks]
+    stands next to a word that says so — N121 / N122; a hex number too: not anywhere), a hex number right after a
+    domain's name ('AL status 0x0011' — 0.8.16 acceptance: 'status' is no code word, the domain's name says it all the
+    same; a decimal number needs a code word: 'ADS 851' stays no code), pyads' 'ADSError: … (1808)', the names that can
+    be a code's symbol (identifiers with '_', inner capitals or digits: ADSERR_CLIENT_SYNCTIMEOUT, TargetPortNotFound)
+    and the message ids of a domain's id_form ('C0373': a compiler message)."""
+    qt = DS.query_text(q)
+    toks = DS.code_tokens(qt, min_digits=1, hex_anywhere=True)
+    codes = [{"token": t["token"], "value": t["value"], "how": t["how"]} for t in toks
+             if t["how"] == "dec" or t["whole"] or t["next_to_code_word"] or _after_domain_name(qt, t["start"])]
     for m in _PYADS.finditer(q):
         if all(c["value"] != int(m.group(1)) for c in codes):
             codes.append({"token": m.group(1), "value": int(m.group(1)), "how": "dec"})
@@ -1338,7 +1433,9 @@ def read_query(q: str) -> dict[str, Any]:
         if "_" in t.strip("_") or re.search(r"[a-z][A-Z]", t) or (re.search(r"\d", t) and re.search(r"[A-Za-z]{2}", t)):
             if not DS._HEX.match(t) and t.upper() not in ("ADSERROR",):
                 names.append(t)
-    return {"codes": codes, "names": list(dict.fromkeys(names))}
+    ids = [{"token": m.group(0), "domain": did} for did, spec in DOMAINS.items() if spec.get("id_form")
+           for m in re.finditer(spec["id_form"], qt)]
+    return {"codes": codes, "names": list(dict.fromkeys(names)), "ids": ids}
 
 
 def _forms(v: int) -> set[int]:
@@ -1420,7 +1517,8 @@ def _row_out(con: sqlite3.Connection, did: str, value: int, rows: list[sqlite3.R
         g = groups.setdefault((r["symbol"], r["text"]), {"symbol": r["symbol"], "text": r["text"], "books": set(),
                                                         "refs": [], "row": r, "main": False})
         g["books"] |= set(_jl(v["books"], []) if v is not None else [r["book"]])
-        g["refs"].append(v["ref"] if v is not None else r["source_ref"])
+        # the row's own page (a code's section in a manual: the page it is on), the variant's otherwise
+        g["refs"].append(r["source_ref"] or (v["ref"] if v is not None else None))
         g["main"] = g["main"] or bool(v is not None and v["main"])
     # the text of the most books first (said so); between equals, a main variant's
     ordered = sorted(groups.values(), key=lambda g: (-len(g["books"]), not g["main"], g["refs"][0]))
@@ -1434,6 +1532,9 @@ def _row_out(con: sqlite3.Connection, did: str, value: int, rows: list[sqlite3.R
     out["text"] = main["text"]
     if main["kind"]:
         out["kind"] = main["kind"]
+    detail = _jl(main["detail"], {})        # the labelled fields of the code's section (AL status codes)
+    if detail:
+        out["detail"] = detail
     out["matched_by"] = how
     out["ref"] = ordered[0]["refs"][0]
     if main["url"]:
@@ -1538,6 +1639,8 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
     out: dict[str, Any] = {"query": q, "read_as": read["codes"]}
     if read["names"]:
         out["names"] = read["names"]
+    if read["ids"]:
+        out["message_ids"] = read["ids"]
     pn = pattern_note(q)
     notes: list[dict[str, Any]] = []
     if db is None or not db.is_file():
@@ -1559,7 +1662,7 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
     with ErrIndex(db).con() as con:
         doms = _domains(con)
         want = _domain_filter(domain, doms)
-        named = _named(qn, doms)
+        named = list(dict.fromkeys(_named(qn, doms) + [i["domain"] for i in read["ids"] if i["domain"] in doms]))
         found: list[tuple[str, int, list[sqlite3.Row], str]] = []
         links: list[tuple[str, int, int]] = []
         values = [c["value"] for c in read["codes"]]
@@ -1593,7 +1696,7 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
                 # (ADSERR_CLIENT_SYNCTIMEOUT is ads 0x745; the LabVIEW table numbers the same symbol its own way —
                 # listed apart, in other_domains)
                 sym_domains.add(min(hit, key=lambda d: (doms.get(d, {}).get("priority", 10), d)))
-        text_search = not read["codes"] and not found
+        text_search = not read["codes"] and not found and not read["ids"]
         if text_search:
             # the words that can pick a text: not 'error' / 'code' / a domain's name ('ADS error on port 851' → port)
             dom_words = {w for x in doms.values() for n in x["names"] for w in n.split()}
@@ -1654,16 +1757,20 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         miss = set(_jl(read_meta(db).get("missing_sources"), []))
         gaps.update({d: f"not indexed: {SOURCE_NAMES[doms[d]['origin']]} was missing when the errors index was built"
                      for d in searched if doms[d].get("origin") in miss and not doms[d].get("codes")})
-        if gaps and (not main or any(d in named_all for d in gaps)):
+        if named_all:          # the message names its domains: their gaps, not every domain's ('ADS 851': none)
+            gaps = {d: n for d, n in gaps.items() if d in named_all}
+        if gaps and (not main or named_all):
             out["no_local_source"] = gaps
         if main and text_search:
             out["note"] = (f"no code in the query: these are the documented codes whose text holds its words "
                            f"({', '.join(out.get('searched_words', []))}) — a number counts as a code when it is the "
                            "whole query or stands next to a word that says so (error 1861, nErrId := 1808)")
         if not main:
-            code_given = bool(read["codes"]) or any(e["matched_by"] in ("symbol", "dotnet name") for e in entries)
+            given = [c["token"] for c in read["codes"]] + read["names"] + [i["token"] for i in read["ids"]]
+            code_given = bool(read["codes"] or read["ids"]) or any(e["matched_by"] in ("symbol", "dotnet name")
+                                                                   for e in entries)
             if code_given or read["names"] and not text_search:
-                what = ", ".join([c["token"] for c in read["codes"]] + read["names"]) or q
+                what = ", ".join(given) or q
                 out["note"] = (f"{what}: not in the local Beckhoff documentation"
                                + (f" of {', '.join(named_all)}" if named_all else "")
                                + " — no meaning is given (the full-text hits, if any, only mention it)")
@@ -1676,7 +1783,7 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
                                "it is a code's symbol")
             ft = None if not fulltext else _fulltext(
                 kbp, infosys_db or (_jl(read_meta(db).get("sources"), {}).get("infosys") or {}).get("path"),
-                " ".join([c["token"] for c in read["codes"]] + read["names"]) or q)
+                " ".join(given) or q)
             if ft is not None:
                 out["fulltext"] = ft
         if pn and not any(e.get("plugin_note") for e in main):
