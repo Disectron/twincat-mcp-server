@@ -28,6 +28,11 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| 0.8.15 | Infosys format 7: approve `kb_rebuild(index='infosys')` | before approval the format-6 index answers and says `rebuild_needed`; after: the build log counts "symbols documented inside pages"; `docs_declaration symbol=RecipeManCommands.CreateRecipe` → Method, return DWORD, `section`; `symbol=ERR_RECIPE_NOT_FOUND` → Constant `16#4003`, note "reconstructed"; `symbol=FB_TcMessage.Send` → I_TcMessage's page, `defined_in`; `symbol=FB_ActuatorActuals` → the `ActualsActuator` page with `declared_as`; `symbol=F_TimeToSeconds()` → no declaration, `syntax_header_note` naming F_SecondsToTime's page; `infosys_search "THIS pointer"` → THIS first; `infosys_search ADS limit=5 offset=5` → the next five, none repeated |
+| 0.8.15 | ESI format 2: approve `kb_rebuild(index='esi')` | `hw_lookup EL6653` and `EL6653-0010` → `coe_count` equals the length of `coe_objects` (17); `hw_object device=EL3356-0010 index=8000:11` → that one sub-index (17); `hw_search query=Ch limit=100` → under a second, `next_offset` set |
+| 0.8.15 | manuals format 6: approve `kb_rebuild(index='manuals')` | `manual_product code=ED2008` (or an AL / PS code) → its manual, no "copy its PDF"; `manual_search query=0x8000:11` and `query=°C` → hits |
+| 0.8.15 | N173 / N174: open Help → About (then Tools → Options) in XAE, then any `xae_*` call; again with `xae.visible=false` | the call says a modal window blocks XAE and names it; a call XAE rejects → "XAE is busy … did not run this call"; a server crash leaves its traceback in `~\.twincat_mcp\logs\server.log` |
+| 0.8.15 | N162: reconnect the MCP server after a knowledge-folder change | the connection instructions say when they were read and point to `kb_status` |
 | 0.8.14 | Infosys format 6: approve `kb_rebuild(index='infosys')` | before approval the format-5 index answers and says `rebuild_needed`; after: `docs_page FB_WG_ComboFilter` → `children` Configure / Call / Reset with refs; `docs_declaration FB_WG_ComboFilter.Call` → the Call page, `parent` FB_WG_ComboFilter; the 4 tf5200 pages without U+FFFD; `docs_search 0x745` → the ADS return-code table first, tf6500's copies in `same_page_in`; `Tc3_EventLogger` `EqualsTo` of two FBs stays two answers |
 | 0.8.14 | N127 / N128 / N136: `tc_set_mode readonly`, then `kb_reindex`, `kb_add_project`, `kb_rebuild index=esi force=true` | all refused "readonly mode", each a `refused` line in `tc_audit_tail`; in guarded: `kb_reindex` audited ok; `kb_add_project` of the plugin folder, the knowledge folder, `…\Project15\Plc` (inside an indexed folder) refused with the reason; `kb_set_location` on a file → "a file, not a folder" |
 | 0.8.14 | N129–N135 on P15: `kb_search "ADS error 1808 fbCounter"`, `"nCycleCount 0x705"`, `"License"`, `"Ads-Error 0xA2"`, `"MAX_ALARMS"`, `"nErrorCode"`, `"bEnable OR bReset"`, `kinds=["POU"]` | fbCounter's unit + known_error 0x710 with code; nCycleCount hits, no known_error; no licence note; `known_error: null` + covered, no word search; GVL_Param / ST_ModuleStatus first with `declares`; `operators_note`; POUs listed |
@@ -84,9 +89,16 @@ tool wishlist (2026-10-18).
 - `D:\TwinCAT-MCP\knowledge\sop\scope\ScopeAI.cs` — the real property names, before `scope_add_channel` /
   `scope_set_axis` / `scope_set_sample_time` can be built (W, N16, #44).
 - One raw page HTML from the `.mshc` if the 0.8.3 parse checks above fail.
+- Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
+  Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
+  trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library
+  version check against `proj_libraries`, re-deriving declarations instead of a rebuild, declarations checked
+  against the libraries through XAE, one provenance field, a test that the standard-library-only modules import
+  nothing else); N173's 1 s UI Automation budget needs a live check.
 - Retest of 0.8.14 (the 0.8.14 rows above; approve the Infosys rebuild to format 6). Not in 0.8.14: the error index
   (`twincat-mcp-error-index-spec.md`, N125) — AL status codes as page links when it is built; the ESI count of
-  EL6653 (19 vs 17: duplicate #x1C32/#x1C33 in Beckhoff's EL66xx.xml) needs a decision (an ESI format change).
+  EL6653 (19 vs 17: duplicate #x1C32/#x1C33 in Beckhoff's EL66xx.xml) needs a decision (an ESI format change) —
+  decided in 0.8.15: one object per index (ESI format 2).
 - Retest of 0.8.12 (the 0.8.12 rows above; approve the Infosys and manuals rebuilds to format 5).
 - Retest of 0.8.11 (the 0.8.11 rows above; the format-4 rebuilds are superseded by format 5; delete
   `helpviewer\infosys_en.db` when you like).
