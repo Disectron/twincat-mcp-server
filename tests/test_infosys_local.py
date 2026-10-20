@@ -487,6 +487,10 @@ def test_n170_symbols_documented_inside_one_page_are_built_and_answered(tmp_path
     for q in ("ADSSTATE_INVALID", "ADS_E_ERROR", "NO_SYNCH", "SM_POWEROFF"):
         with pytest.raises(InfosysError, match="no symbol page"):
             ix.declaration(q)
+    # infosys_get_page by a method's name opens its section of the page (as the skill's docs_page)
+    g = ix.get_page("CreateRecipe")
+    assert g["url"] == page and g["section"] == "Method CreateRecipe" and g["markdown"].startswith("## Method CreateRecipe")
+    assert "Method GetRecipeNames" not in g["markdown"] and "Method GetRecipeNames" in g["outline"]
     # a name no page and no section documents, but one title has as a word: that page, with its outline (§3.2.6)
     t = ix.declaration("AlarmCommands")
     assert (t["kind"], t["match"], t["url"]) == ("Page", "title", C + "tc3_plc_intro/2525822000.html"), t

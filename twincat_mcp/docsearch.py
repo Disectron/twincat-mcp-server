@@ -215,8 +215,8 @@ def infosys_rank(con: sqlite3.Connection) -> str:
 
 def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, extra: list[Any],
                  limit: int, title_key: str | None = None, fts: str = "fts",
-                 arrange: Callable[[list[Any]], list[Any]] | None = None, title_col: str | None = None,
-                 title_sql: str | None = None) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
+                 arrange: Callable[..., list[Any]] | None = None, title_col: str | None = None,
+                 title_sql: str | None = None, skip: int = 0) -> tuple[list[sqlite3.Row], int, str, str, dict[str, Any]]:
     """N36/N65: a question in words falls back in steps, and only on words that can pick a page:
       1. every word as written (stop words included: a precise query stays precise);
       2. every informative word that occurs in the index — stop words, 1-2 letter words and words on no page dropped;
@@ -229,25 +229,31 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
     the title are read as well (title_hits), not only the best by bm25: a page titled as the query is ordered by its
     title wherever bm25 ranks it. FTS5 syntax or code punctuation
     runs as written (run_fts, with the phrase retry). Needs vocab(con, fts) for the term statistics.
+    skip (N167, paging): the hits up to skip + limit are returned, the caller shows those after `skip`. The title order
+    sees the same hits whatever the page — the best _fetch(limit) by bm25 and their title hits — and the hits after
+    those follow in bm25 order (arrange(rows, tail)): a page never repeats or skips a hit of another.
     -> (rows, total, mode, expression, info: words used / ignored with the reason)."""
     # N149 (0.8.14 retest): ST's dereference 'THIS^' / 'pRef^' is no FTS5 initial-token operator ('^word'); the
     # index has no punctuation — it is the word
     q = re.sub(r"(?<=\w)\^+", "", query_text(query)).strip()
+    ordered = title_key or arrange
+    head_n = _fetch(limit, ordered)                # the hits the title order sees: the same for every page (N167)
+    want = head_n + (skip + limit) * 3 if skip and ordered else max(head_n, skip + limit)
     if not natural(q):
-        rows, mode, expr = run_fts(con, sql, q, extra + [_fetch(limit, title_key or arrange)])
+        rows, mode, expr = run_fts(con, sql, q, extra + [want])
         if not rows:
             # N149 (0.8.14 retest): 'THIS^ SUPER^' / 'set reset S= R=' — as written (a phrase) nothing, and nothing
             # else was tried: its words are searched as a question in words
             plain = re.sub(r'[^\w\s]|\b(?:AND|OR|NOT|NEAR)\b', " ", q)
             if has_words(plain) and plain.split() != q.split():
                 got = search_tiers(con, sql, count_sql, plain, extra, limit, title_key, fts, arrange, title_col,
-                                   title_sql)
+                                   title_sql, skip)
                 if got[0]:
                     info = dict(got[4])
                     info["as_written"] = f"{q!r} as written ({mode}) found nothing — its words were searched"
                     return got[0], got[1], f"words of the query ({got[2]})", got[3], info
-        rows = _arranged(rows, q, title_key, arrange)
-        return rows[:limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr, {}
+        rows = _arranged(rows[:head_n] if ordered else rows, q, title_key, arrange, rows[head_n:] if ordered else [])
+        return rows[:skip + limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], mode, expr, {}
     words = [w for w in re.findall(r"[^\W_]+(?:_[^\W_]+)*", q)]
     if not words:
         raise SearchError("empty_query", f"the query {query!r} has no searchable word (punctuation is not indexed)")
@@ -287,13 +293,17 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
         some = [w for w in pref if w not in common or w in kws] or pref
         tiers.append(("some words (no page has all of them)", " OR ".join(ph(w) + "*" for w in some), some))
     for label, expr, used in tiers:
-        rows = con.execute(sql, [expr, *extra, _fetch(limit, title_key or arrange)]).fetchall()
-        if rows and title_col and title_sql and (title_key or arrange):
+        rows = con.execute(sql, [expr, *extra, want]).fetchall()
+        tail = rows[head_n:] if ordered else []
+        rows = rows[:head_n] if ordered else rows
+        if rows and title_col and title_sql and ordered:
             rows = rows + title_hits(con, title_sql, expr, used,
                                      label.endswith("(as prefixes)") or label.startswith("some"), extra, title_col,
                                      {r[0] for r in rows}, q, [w for w in kws if w in used])
+            have = {r[0] for r in rows}
+            tail = [r for r in tail if r[0] not in have]
         if rows:
-            rows = _arranged(rows, q, title_key, arrange)
+            rows = _arranged(rows, q, title_key, arrange, tail)
             info: dict[str, Any] = {"words_used": used}
             # N166 (0.8.14 retest): the first tier searches every word as written — a word it used is not ignored
             # ('AL status codes': words_used AL and words_ignored AL 'shorter than 3 letters')
@@ -302,7 +312,7 @@ def search_tiers(con: sqlite3.Connection, sql: str, count_sql: str, query: str, 
                 info["words_ignored"] = left
             if label.startswith("some words") and common and set(used) != set(pref):
                 info["words_too_common"] = sorted(common)
-            return rows[:limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], label, expr, info
+            return rows[:skip + limit], con.execute(count_sql, [expr, *extra]).fetchone()[0], label, expr, info
     info = {"words_used": []}
     if ignored:
         info["words_ignored"] = ignored
@@ -353,10 +363,13 @@ def _fetch(limit: int, ordered: Any) -> int:
     return min(max(limit * 3, 150), 300) if ordered else limit
 
 
-def _arranged(rows: list[Any], q: str, title_key: str | None, arrange: Callable[[list[Any]], list[Any]] | None) -> list[Any]:
+def _arranged(rows: list[Any], q: str, title_key: str | None, arrange: Callable[..., list[Any]] | None,
+              tail: list[Any] | None = None) -> list[Any]:
+    """The hits in their order: `rows` by their titles (or arrange), then `tail` (the hits after those the title
+    order sees, N167) in bm25 order — arrange(rows, tail) also merges the tail's copies."""
     if arrange is not None:
-        return arrange(rows)
-    return title_order(rows, q, title_key) if title_key else rows
+        return arrange(rows, tail or [])
+    return (title_order(rows, q, title_key) if title_key else rows) + list(tail or [])
 
 
 def matched_words(con: sqlite3.Connection, rowid: int, words: list[str], fts: str = "fts") -> list[str]:

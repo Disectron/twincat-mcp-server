@@ -11,8 +11,8 @@ runs it.
 usage:
   python infosys_local.py index  [--lang en|de] [--mshc PATH] [--kb PATH | --db PATH] [--force]
   python infosys_local.py stats  [--json]                                  the real state of the index
-  python infosys_local.py search QUERY [--book GLOB] [--limit 10]          ranked hits, one line each
-  python infosys_local.py show   REF [--max 4000] [--section NAME]         page as text (REF: id, book/id, title)
+  python infosys_local.py search QUERY [--book GLOB] [--limit 10] [--offset 0]   ranked hits, one line each
+  python infosys_local.py show   REF [--max 4000] [--section NAME] [--offset 0]  page as text (REF: id, book/id, title)
   python infosys_local.py decl   SYMBOL [--book GLOB]                      declaration code + requirements
   python infosys_local.py books  [--filter GLOB]                           books with page counts
 
@@ -166,25 +166,32 @@ def _head(out: dict) -> str:
 
 
 def cmd_search(args) -> int:
-    got = _run(args, "docs_search", {"query": args.query, "book": args.book, "limit": args.limit})
+    got = _run(args, "docs_search", {"query": args.query, "book": args.book, "limit": args.limit,
+                                     "offset": args.offset})
     if got is None:
         return 1
     _kd, out = got
     for it in out["items"]:
         print(f"{it['title']} | {it['ref']} | {it['excerpt']}")
+    if out.get("clamped_note"):
+        print(f"({out['clamped_note']})")
     if not out["items"]:
         print("no hits" + (f" in books {args.book}" if args.book else ""))
-    elif out["total"] > len(out["items"]):
-        print(f"({len(out['items'])} of {out['total']} hits; --limit for more)")
+    elif out.get("next_offset") is not None:
+        # N167 (0.8.14 retest): hits 51… could not be reached ('--limit for more', and --limit 300 was refused)
+        print(f"({len(out['items'])} of {out['total']} hits; --offset {out['next_offset']} for the next ones)")
     return 0
 
 
 def cmd_show(args) -> int:
-    got = _run(args, "docs_page", {"ref": args.ref, "book": args.book, "section": args.section, "max_chars": args.max})
+    got = _run(args, "docs_page", {"ref": args.ref, "book": args.book, "section": args.section, "max_chars": args.max,
+                                   "offset": args.offset})
     if got is None:
         return 1
     _kd, out = got
-    tail = f"\n… [{out['chars'] - len(out['text'])} more chars; --max or --section]" if out.get("truncated") else ""
+    # N168 (0.8.14 retest): a page past --max could not be read on — the cut marker names the offset that does
+    tail = (f"\n… [{out['chars'] - out['next_offset']} more chars; --offset {out['next_offset']}]"
+            if out.get("truncated") else "")
     print(_head(out) + "\n" + out["text"] + tail + _links(out))
     return 0
 
@@ -242,9 +249,19 @@ def main() -> int:
     sub.add_parser = lambda *a, **kw: _sub(*a, parents=[common], **kw)  # type: ignore[method-assign]
     s = sub.add_parser("index"); s.add_argument("--mshc"); s.add_argument("--force", action="store_true")
     s.add_argument("--built-by", dest="built_by", help=argparse.SUPPRESS)
-    s = sub.add_parser("search"); s.add_argument("query"); s.add_argument("--book"); s.add_argument("--limit", type=int, default=10)
-    s = sub.add_parser("show"); s.add_argument("ref"); s.add_argument("--max", type=int, default=4000)
-    s.add_argument("--section"); s.add_argument("--book")
+    # N169 (0.8.14 retest): every range and default in -h (they were visible only when refused)
+    s = sub.add_parser("search"); s.add_argument("query"); s.add_argument("--book", help="glob on the book slug")
+    s.add_argument("--limit", type=int, default=10, metavar="N", help="hits shown, 1-50; a larger one is used as 50 "
+                                                                      "(default 10)")
+    s.add_argument("--offset", type=int, default=0, metavar="N", help="hits skipped: the footer names the next "
+                                                                      "--offset (default 0)")
+    s = sub.add_parser("show"); s.add_argument("ref")
+    s.add_argument("--max", type=int, default=4000, metavar="N", help="characters shown, 200-60000 (default 4000); a "
+                                                                      "longer page: --section or --offset")
+    s.add_argument("--offset", type=int, default=0, metavar="N", help="characters already read: the cut marker names "
+                                                                      "the next --offset (default 0)")
+    s.add_argument("--section", help="a heading of the page (one named exactly, else every one that contains it)")
+    s.add_argument("--book", help="glob, narrows a title or page id")
     s = sub.add_parser("decl"); s.add_argument("symbol"); s.add_argument("--book")
     s = sub.add_parser("books"); s.add_argument("--filter")
     s = sub.add_parser("stats"); s.add_argument("--json", action="store_true")
@@ -253,7 +270,9 @@ def main() -> int:
         if not hasattr(args, k):
             setattr(args, k, v)
     if getattr(args, "limit", 1) < 1:
-        ap.error("--limit must be 1 or more")
+        ap.error("--limit must be 1-50 (a larger one is used as 50)")
+    if getattr(args, "offset", 0) < 0:
+        ap.error("--offset must be 0 or more")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     return {"index": cmd_index, "search": cmd_search, "show": cmd_show, "decl": cmd_decl,

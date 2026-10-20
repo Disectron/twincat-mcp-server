@@ -1528,8 +1528,8 @@ class Knowledge:
         res.update(hw_manuals(self.location()[0], q, res.get("types")))
         return res
 
-    def hw_search(self, query: str, kinds: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
-        return self._hw("search", query, kinds, limit)
+    def hw_search(self, query: str, kinds: list[str] | None = None, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+        return self._hw("search", query, kinds, limit, offset)
 
     def hw_object(self, device: str, index: str | int, revision: int | str | None = None) -> dict[str, Any]:
         return self._hw("object", device, index, revision)
@@ -2035,20 +2035,36 @@ def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
         return {"manuals_note": f"no manuals database at {db} — PDF manuals copied into {loc / 'manuals'} and indexed "
                                 "with manuals_db.py update show up here (and in the twincat-docs skill)"}
     found: dict[str, list[dict[str, Any]]] = {}
+    notes: list[str] = []
+    # N163 (0.8.14 retest): manual_product's rule (kb_docs.product_manuals: the product table, else the page text) —
+    # this said 'copy its PDF' for a code whose manual is indexed but missing from an older builder's product table
+    kd = kb_docs_module()
     try:
         con = _ro(db)
         try:
             for code in codes[:3]:
                 c = code.strip().upper()
-                rows, via = _product_rows(con, c, 5)
-                if rows:
-                    found[c] = [{"doc": r["name"], "doc_id": r["id"], "mentions": r["hits"],
-                                 "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})[:20],
-                                 **({"matched_as": via} if via else {})} for r in rows]
+                if kd is not None:
+                    got = kd.product_manuals(con, c, 5)
+                    via = got.get("matched_as")
+                    items = [{**it, "pages": it["pages"][:20], **({"matched_as": via} if via else {})}
+                             for it in got["items"]]
+                    if got.get("note"):
+                        notes.append(got["note"])
+                else:
+                    rows, via = _product_rows(con, c, 5)
+                    items = [{"doc": r["name"], "doc_id": r["id"], "mentions": r["hits"],
+                              "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})[:20],
+                              **({"matched_as": via} if via else {})} for r in rows]
+                if items:
+                    found[c] = items
         finally:
             con.close()
     except sqlite3.Error as exc:
         return {"manuals_note": f"manuals database not readable: {exc}"}
+    if found and notes:
+        return {"manuals": found, "manuals_more": "twincat-docs skill: manual_search query=… doc=… / manual_page",
+                "manuals_note": " ".join(dict.fromkeys(notes))}
     if not found:
         return {"manuals_note": f"no indexed manual mentions {', '.join(codes[:3])} — copy its PDF into "
                                 f"{loc / 'manuals'} and run manuals_db.py update"}

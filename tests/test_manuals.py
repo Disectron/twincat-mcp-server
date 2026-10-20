@@ -142,6 +142,13 @@ def test_n163_a_code_in_the_text_is_never_sent_to_copy_an_indexed_manual(mkb_cop
     assert rc == 0 and r["items"][0]["pages"] == [3] and "ED2809" in r["matched_as"]
     rc, r = kbdocs(mkb_copy, "manual_product", "code=EL9999")
     assert rc == 0 and r["count"] == 0 and "copy the PDF manuals" in r["hint"]
+    # hw_lookup's manuals block (knowledge.manuals_for) said 'copy its PDF' for ED2008 too: one rule for both
+    from twincat_mcp.knowledge import manuals_for
+    m = manuals_for(mkb_copy, ["ED2008"])
+    assert m["manuals"]["ED2008"][0]["doc"] == "ED2008.pdf" and m["manuals"]["ED2008"][0]["pages"] == [1, 2], m
+    assert m["manuals"]["ED2008"][0]["matched_as"].startswith("page text") and "rebuild" in m["manuals_note"], m
+    assert "copy" not in json.dumps(m).lower()
+    assert "copy its PDF" in manuals_for(mkb_copy, ["EL9999"])["manuals_note"]
 
 
 # ---------------------------------------------------------------------------------------------- N164

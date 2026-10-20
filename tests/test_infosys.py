@@ -199,7 +199,7 @@ def test_get_page_resolution_forms(idx):
         idx.get_page("https://example.com/x.html")
     with pytest.raises(InfosysError, match="404"):
         idx.get_page("tcplclib_tc2_system/1")
-    assert idx.get_page("ADSREAD", max_chars=50)["truncated"] is True
+    assert idx.get_page("ADSREAD", max_chars=200)["truncated"] is True          # N160: 200-60000, as the skill
 
 
 def test_fetcher_host_allowlist():
@@ -341,8 +341,12 @@ def test_r27_r28_r29_r31_infosys_queries(idx):
     for bad in (dict(limit=-1), dict(limit=0), dict(limit=1000)):
         with pytest.raises(InfosysError, match="limit"):
             idx.search_symbols("ADSREAD", auto_index=False, **bad)
+    for bad in (dict(limit=-1), dict(limit=0)):
         with pytest.raises(InfosysError, match="limit"):
             idx.search("ADSREAD", **bad)
+    # N167 (0.8.14 retest): a search's limit above 50 is used as 50 and said so — refusing it left hits 51… unreachable
+    r = idx.search("ADSREAD", limit=1000)
+    assert r["clamped"] is True and r["clamped_note"].startswith("limit 1000 is above the maximum (1-50): 50 used"), r
     with pytest.raises(InfosysError, match="category 'bogus' unknown"):
         idx.books(category="bogus")
     with pytest.raises(InfosysError, match="max_pages"):
@@ -630,10 +634,10 @@ def test_kbv_book_slash_id_for_ids_that_are_not_numbers(kb_copy):
                     " WHERE title = 'MEMCPY'")
     con.close()
     ix = InfosysIndex(db_file=db, read_only=True, web_fallback=False)
-    assert ix.get_page("tcplclib_tc2_system/index", max_chars=50)["title"] == "T_AmsNetID"
-    assert ix.get_page("tcplclib_tc2_system/index.html", max_chars=50)["url"] == new
-    assert ix.get_page("Send/Receive", max_chars=50)["title"] == "Send/Receive"       # a title with a slash
-    assert ix.get_page("tcplclib_tc2_system/beckhoff-0cad-46d4", max_chars=50)["title"] == "MEMCPY"
+    assert ix.get_page("tcplclib_tc2_system/index", max_chars=200)["title"] == "T_AmsNetID"
+    assert ix.get_page("tcplclib_tc2_system/index.html", max_chars=200)["url"] == new
+    assert ix.get_page("Send/Receive", max_chars=200)["title"] == "Send/Receive"       # a title with a slash
+    assert ix.get_page("tcplclib_tc2_system/beckhoff-0cad-46d4", max_chars=200)["title"] == "MEMCPY"
     # book slugs with '.' and '-' (tc3_ads.net, tf5110-tf5113_tc3_kinematic_transformation) were refused too
     con = sqlite3.connect(db)
     with con:
@@ -1007,3 +1011,61 @@ def test_n158_n159_a_member_defined_elsewhere_and_what_is_near(idx):
         assert near[:3] == ["FB_TcMessage", "FB_TcEventBase", "I_TcMessage"] and "FB_DALI_Osram_Coupler_HF_G2" not in near, near
         near = [r["title"] for r in inf.near_symbols(con, "TcMessage Send")]
         assert "FB_DALI_Osram_Coupler_HF_G2" not in near, near        # the title, not the text
+
+
+def _visu_pages(n: int = 200):
+    """n pages with 'Visu' — every 3rd in its title (the title order moves those up), the others in their text."""
+    out = []
+    for i in range(n):
+        title = f"VisuElem{i:03d}" if i % 3 == 0 else f"Element {i:03d}"
+        out.append((f"tc3_plc_intro/{9000000 + i}", title, f"<p>The Visu element number {i}. " + "Visu text. " * (i % 7)
+                    + "</p>"))
+    return out
+
+
+def test_n167_n160_the_search_pages_through_every_hit_once(idx):
+    """N167 (S3, 0.8.14 retest): 'search Visu* --limit 300' was refused and there was no offset — hits 51… could not
+    be reached at all. A limit above 50 is used as 50 and said so (clamped); offset / next_offset page through the
+    hits, every page cut from one order: no hit twice, none skipped — also past the hits the title order sees (150)."""
+    _store_pages(idx, _visu_pages(200))
+    idx.sync_derived()
+    seen, off, pages = [], 0, 0
+    while off is not None:
+        r = idx.search("Visu", limit=50, offset=off)
+        assert r["offset"] == off and r["total"] == 200 and r["count"] == len(r["items"]) <= 50, r
+        seen += [i["url"] for i in r["items"]]
+        off, pages = r["next_offset"], pages + 1
+        assert pages <= 5
+    assert len(seen) == 200 and len(set(seen)) == 200, (len(seen), len(set(seen)))
+    first = idx.search("Visu", limit=10)
+    assert [i["url"] for i in first["items"]] == seen[:10] and first["next_offset"] == 10       # one order
+    assert first["items"][0]["title"].startswith("VisuElem")                                   # titles still first
+    r = idx.search("Visu", limit=300)
+    assert r["count"] == 50 and r["clamped"] is True and "offset=50" in r["clamped_note"], r
+    with pytest.raises(InfosysError, match="past the last hit"):
+        idx.search("Visu", offset=200)
+    with pytest.raises(InfosysError, match="offset"):
+        idx.search("Visu", offset=-1)
+
+
+def test_n160_get_page_reads_a_part_as_the_skill_does_and_not_found_says_how_on(idx):
+    """N160 (S3, 0.8.14 retest): infosys_get_page had no section and no offset (the skill's docs_page has both), took
+    max_chars=50 where the skill refused below 200, and a name that is not found was a bare error — the skill names
+    what is near and how to search. One reader of a page part (page_part), one range (200-60000) for both."""
+    p = idx.get_page("ADSREAD", max_chars=200)
+    assert p["truncated"] is True and p["next_offset"] == 200 and p["outline"] and p["offset"] == 0, p
+    q = idx.get_page("ADSREAD", max_chars=200, offset=200)
+    assert q["offset"] == 200 and q["markdown"] and q["markdown"] != p["markdown"]
+    head = p["outline"][1] if len(p["outline"]) > 1 else p["outline"][0]
+    s = idx.get_page("ADSREAD", section=head)
+    assert s["section"] == head and s["markdown"].lstrip("#").strip().startswith(head), s["markdown"][:80]
+    for bad in (dict(max_chars=199), dict(max_chars=60001), dict(offset=-1)):
+        with pytest.raises(InfosysError, match="max_chars|offset") as e:
+            idx.get_page("ADSREAD", **bad)
+        assert "section=" in str(e.value) or "next_offset" in str(e.value)       # N169: the way to read on
+    with pytest.raises(InfosysError, match="no section heading contains"):
+        idx.get_page("ADSREAD", section="Bogus heading")
+    with pytest.raises(InfosysError, match=r"infosys_search\(query='NoSuchSymbolXyz'\) finds pages by their text"):
+        idx.declaration("NoSuchSymbolXyz")
+    with pytest.raises(InfosysError, match=r"infosys_search\(query='NoSuchSymbolXyz'\)"):
+        idx.get_page("NoSuchSymbolXyz")

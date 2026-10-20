@@ -825,3 +825,28 @@ def test_n170_the_skill_and_the_cli_answer_symbols_documented_inside_a_page(kb, 
     assert "Method — section 'Method CreateRecipe'" in p.stdout, p.stdout
     p = run("infosys_local.py", "--kb", str(kb), "decl", "ERR_RECIPE_NOT_FOUND")
     assert "ERR_RECIPE_NOT_FOUND : UDINT := 16#4003;" in p.stdout and "Value: 16#4003 (GVL ReturnValues)" in p.stdout, p.stdout
+
+
+def test_n167_n168_n169_the_cli_pages_reads_on_and_shows_its_ranges(kb, tmp_path):
+    """N167 / N168 / N169 (0.8.14 retest): `search … --limit 300` was refused and had no --offset; `show` had no
+    --offset ('… [N more chars; --max or --section]', and --max 40000 was refused); -h showed `--limit LIMIT` /
+    `--max MAX` with no range or default. The CLI pages like the skill, its cut marker and footer name the next
+    --offset, and -h gives every range."""
+    from tests.test_infosys_local import RECIPE_PAGES
+    p = build(kb, mshc(tmp_path / "BKINFOSYS3_VS_100_EN-US.2.mshc", RECIPE_PAGES))
+    assert p.returncode == 0, p.stdout + p.stderr
+    a = run("infosys_local.py", "--kb", str(kb), "search", "recipe", "--limit", "1")
+    assert a.returncode == 0 and "--offset 1 for the next ones" in a.stdout, a.stdout
+    b = run("infosys_local.py", "--kb", str(kb), "search", "recipe", "--limit", "1", "--offset", "1")
+    assert b.returncode == 0 and b.stdout.splitlines()[0] != a.stdout.splitlines()[0], (a.stdout, b.stdout)
+    c = run("infosys_local.py", "--kb", str(kb), "search", "recipe", "--limit", "300")
+    assert c.returncode == 0 and "limit 300 is above the maximum (1-50): 50 used" in c.stdout, c.stdout + c.stderr
+    s = run("infosys_local.py", "--kb", str(kb), "show", "tc3_plc_intro/2525821323", "--max", "300")
+    assert s.returncode == 0 and "more chars; --offset 300]" in s.stdout, s.stdout
+    t = run("infosys_local.py", "--kb", str(kb), "show", "tc3_plc_intro/2525821323", "--max", "300", "--offset", "300")
+    assert t.returncode == 0 and "--offset 600]" in t.stdout and t.stdout != s.stdout, t.stdout
+    big = run("infosys_local.py", "--kb", str(kb), "show", "tc3_plc_intro/2525821323", "--max", "40000")
+    assert big.returncode == 0 and "more chars" not in big.stdout, big.stdout + big.stderr
+    for cmd, want in (("search", ["1-50", "default 10", "--offset"]), ("show", ["200-60000", "default 4000", "--offset"])):
+        h = run("infosys_local.py", cmd, "-h")
+        assert all(w in " ".join(h.stdout.split()) for w in want), (cmd, h.stdout)

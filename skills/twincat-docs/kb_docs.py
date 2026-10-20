@@ -87,8 +87,10 @@ RULES = [
     "Cite ref + url in the answer.",
     "Queries are FTS5: words ANDed, \"exact phrase\", OR, NOT, prefix*. Invalid syntax is retried once as a phrase "
     "(query_mode says so).",
-    "Ranges are checked, not clamped: limit 1-50, max_chars 200-20000, offset >= 0, depth 1-6, at most 21 pages. "
-    "manual_search's limit above 50 is used as 50 (clamped: true says so); its hits page with offset=next_offset.",
+    "Ranges are checked: max_chars 200-60000 (docs_page, as infosys_get_page) / 200-20000 (manual_page), offset >= 0, "
+    "depth 1-6, at most 21 pages; a refusal names the way to read on. The searches page: docs_search / manual_search "
+    "limit 1-50, hw_search 1-100 — a larger limit is used as the maximum (clamped: true says so), the next hits are "
+    "offset=next_offset.",
     "Long pages: section= first (outline lists them), then offset=next_offset. A manual's pages: manual_page "
     "pages=<next_pages> offset=<next_offset>, as `next` names them.",
     "manual_search: a hex number or CoE index (0x8000, #x8000, 16#8000, 8000:11) is found in any notation, a unit "
@@ -508,6 +510,29 @@ def _check_book_glob(con: sqlite3.Connection, pattern: str | None) -> None:
                   "or tcplclib_tc2_*)", near=near, hint="docs_books filter=... lists the books")
 
 
+def _check_library(con: sqlite3.Connection, library: str | None) -> None:
+    """N160 (0.8.14 retest): library= as infosys_* take it — a library name ('Tc2_System') or a book slug; one that no
+    page has is refused with the names that are close."""
+    if not library:
+        return
+    if con.execute("SELECT 1 FROM pages WHERE library = ? COLLATE NOCASE OR book = ? COLLATE NOCASE LIMIT 1",
+                   (library, library)).fetchone() is None:
+        libs = [r[0] for r in con.execute("SELECT DISTINCT library FROM pages WHERE library IS NOT NULL")]
+        raise Err("not_found", f"no indexed page belongs to library {library!r} (a library name like Tc2_System, or a "
+                  "book slug)", near=difflib.get_close_matches(library, libs, n=6, cutoff=0.5),
+                  hint="docs_books lists the books; book= takes a glob on the book slug")
+
+
+def _keep(book: str | None, library: str | None = None) -> Callable[[Any], bool] | None:
+    """The filter of book= (a glob on the book slug) and library= (a library name or a book slug, as infosys_* take
+    it — N160)."""
+    if not book and not library:
+        return None
+    lib = (library or "").lower()
+    return lambda r: ((not book or fnmatch.fnmatch(r["book"].lower(), book.lower()))
+                      and (not lib or (r["library"] or "").lower() == lib or (r["book"] or "").lower() == lib))
+
+
 def _cand(ctx: Ctx, r: sqlite3.Row) -> dict[str, Any]:
     return {"ref": f"{r['book']}/{r['pid']}", "book": r["book"], "title": r["title"], "version": r["version"] or None}
 
@@ -517,7 +542,7 @@ def _order(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
     return sorted(rows, key=lambda c: (not c["book"].startswith("tcplclib_"), len(c["book"]), c["book"], c["pid"]))
 
 
-def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref") -> tuple[sqlite3.Row, str]:
+def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref", library: str | None = None) -> tuple[sqlite3.Row, str]:
     """Page for a reference: ms-xhelp id → Infosys URL → book/pid → bare pid → exact title (case-insensitive).
     -> (row, how it was resolved). Several pages → Err('ambiguous') with candidates (rule 3)."""
     con = ctx.con("infosys")
@@ -545,12 +570,12 @@ def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref") -> tuple[sq
         if rows or p.isdigit():
             return _pick(ctx, rows, ref, None, "book/pageid", what)
         # not book/pageid: a title with a slash ('Send/Receive') — go on to the title lookup
+    keep = _keep(book, library)
     if s.isdigit():
-        rows = [r for r in con.execute(f"{_PAGE} WHERE page_id = ?", (s,)).fetchall()
-                if not book or fnmatch.fnmatch(r["book"].lower(), book.lower())]
-        return _pick(ctx, rows, ref, book, "page id", what)
+        rows = [r for r in con.execute(f"{_PAGE} WHERE page_id = ?", (s,)).fetchall() if keep is None or keep(r)]
+        return _pick(ctx, rows, ref, book, "page id", what, keep)
     _check_book_glob(con, book)
-    keep = (lambda r: fnmatch.fnmatch(r["book"].lower(), book.lower())) if book else None
+    _check_library(con, library)
     # N100: the plugin's rule — a symbol is documented by its symbol pages (a C++ 'AdsRead' page is no ADSREAD), one
     # page in several books is one page; a page asked for by name: the symbol's page, else the pages of that title
     docs = (INF.symbol_documents if what == "symbol" else INF.title_documents)(con, s, keep)
@@ -564,10 +589,11 @@ def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref") -> tuple[sq
         titled = INF.title_word_documents(con, s, keep)
         if len(titled) == 1:
             return con.execute(f"{_PAGE} WHERE rowid = ?", (titled[0][0]["rid"],)).fetchone(), "title word"
-    return _pick(ctx, rows, ref, book, "symbol" if what == "symbol" else "title", what)
+    return _pick(ctx, rows, ref, book, "symbol" if what == "symbol" else "title", what, keep)
 
 
-def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: str, what: str) -> tuple[sqlite3.Row, str]:
+def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: str, what: str,
+          keep: Callable[[Any], bool] | None = None) -> tuple[sqlite3.Row, str]:
     # N100: the same page in several books (T_MaxString) is one answer; kb_verify I13: a member only below one symbol
     docs = INF.same_documents(rows, ctx.con("infosys"))
     if len(docs) == 1:
@@ -579,7 +605,6 @@ def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: st
         if how in ("title", "symbol") and len(word) >= 3 and has_words(word):
             # N35: the FTS title column, not a LIKE scan over every page body; N159 (0.8.14 retest): the plugin's one
             # near list — the title filter on every word (it applied to the first only), the owner of 'FB.Method'
-            keep = (lambda r: fnmatch.fnmatch(r["book"].lower(), book.lower())) if book else None
             near = [_cand(ctx, r) for r in INF.near_symbols(con, word, keep)]
         raise Err("not_found", f"no page for {what} {ref!r}" + (f" in books {book!r}" if book else "") + f" (looked up as {how})",
                   near=near, hint=f"docs_search query={word!r} finds pages by their text")
@@ -637,11 +662,18 @@ def _page_head(ctx: Ctx, r: sqlite3.Row) -> dict[str, Any]:
 def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
     _check_book_glob(con, a["book"])
-    try:   # the plugin's one search of this index (infosys_search answers with it too): N99, N105
-        res = INF.search_index(con, a["query"], a["limit"], where="fnm(p.book, ?)" if a["book"] else "",
-                               extra=[a["book"]] if a["book"] else [])
+    _check_library(con, a["library"])
+    where = [w for w, v in (("fnm(p.book, ?)", a["book"]),
+                            ("(p.library = ? COLLATE NOCASE OR p.book = ? COLLATE NOCASE)", a["library"])) if v]
+    extra = ([a["book"]] if a["book"] else []) + ([a["library"], a["library"]] if a["library"] else [])
+    try:   # the plugin's one search of this index (infosys_search answers with it too): N99, N105, N167 (paging)
+        res = INF.search_index(con, a["query"], a["limit"], where=" AND ".join(where), extra=extra,
+                               offset=a["offset"])
     except DS.SearchError as exc:
         raise _err(exc) from None
+    if not res["rows"] and a["offset"] and res["total"]:
+        raise Err("bad_param", f"offset {a['offset']} is past the last hit ({res['total']} pages match) — offset=0 for "
+                               "the first ones")
     rows, total, mode, info = res["rows"], res["total"], res["mode"], res["info"]
     items = []
     for r in rows:
@@ -655,28 +687,23 @@ def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         items.append(it)
     # total: the pages that match (a page in several books once per book; copies are one item, same_page_in)
     out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info, "count": len(items), "total": total,
-                           "truncated": res["more"], "items": items, "source": ctx.source("infosys")}
+                           "offset": res["offset"], "next_offset": res["next_offset"], "truncated": res["more"],
+                           "items": items, "source": ctx.source("infosys")}
+    for name, (asked, lo, hi) in (a.get("_clamped") or {}).items():
+        out["clamped"] = True
+        out["clamped_note"] = (f"{name} {asked} is above the maximum ({lo}-{hi}): {hi} used"
+                               + (f" — the next hits: offset={res['next_offset']}" if res["next_offset"] else ""))
     if res["code"]:
         out["code"] = {k: res["code"][k] for k in ("value", "hex", "dec")}
         out["code_note"] = INF.code_note(res)
     if not items:
         out["hint"] = ("no page contains these words" + (f" in books {a['book']!r}" if a["book"] else "")
-                       + " — try fewer or other words, OR, prefix*")
+                       + (f" of library {a['library']!r}" if a["library"] else "") + " — try fewer or other words, OR, prefix*")
     return out
 
 
 def _sections(body: str) -> list[tuple[str, str]]:
-    """[(heading text, block text incl. the heading line)]; text before the first heading has heading ''. A '# '
-    line inside a ``` block is code, not a heading."""
-    out: list[tuple[str, list[str]]] = [("", [])]
-    fence = False
-    for ln in body.splitlines(keepends=True):
-        if ln.startswith("```"):
-            fence = not fence
-        elif not fence and re.match(r"#{1,4} ", ln):
-            out.append((ln.lstrip("#").strip(), []))
-        out[-1][1].append(ln)
-    return [(h, "".join(b)) for h, b in out if h or "".join(b).strip()]
+    return INF.page_sections(body)
 
 
 def _intro(body: str) -> str:
@@ -748,7 +775,7 @@ def _family(con: sqlite3.Connection, r: sqlite3.Row) -> dict[str, Any]:
 
 def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
-    r, how = resolve(ctx, a["symbol"], a["book"], what="symbol")
+    r, how = resolve(ctx, a["symbol"], a["book"], what="symbol", library=a["library"])
     body = r["body"] or ""
     blocks = [b.strip("\n") for b in re.findall(r"```[^\n`]*\n(.*?)\n```", body, re.S)]
     samples = 0
@@ -795,40 +822,20 @@ def cmd_docs_declaration(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 
 def cmd_docs_page(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     con = ctx.con("infosys")
-    r, how = resolve(ctx, a["ref"], a["book"])
+    r, how = resolve(ctx, a["ref"], a["book"], library=a["library"])
     if INF.is_symbol_row(r):
         # N170: a symbol documented in a section of a page — the page, at that section unless one is asked for
         if not a["section"] and r["section"]:
             a = {**a, "section": r["section"]}
         r = con.execute(f"{_PAGE} WHERE url = ?", (r["url"],)).fetchone()
-    body = r["body"] or ""
-    secs = _sections(body)
-    outline = [h for h, _ in secs if h]
-    text, section = body, None
-    if a["section"]:
-        want = a["section"].lower()
-        # N170: a heading that IS the one asked for wins — 'Method CreateRecipe' is not also 'Method CreateRecipeNoSave'
-        exact = any(h.lower() == want for h, _ in secs)
-        on, keep = False, []
-        for h, block in secs:
-            if h:
-                on = h.lower() == want if exact else want in h.lower()
-            if on:
-                keep.append(block)
-        if not keep:
-            raise Err("not_found", f"no section heading contains {a['section']!r}", outline=outline,
-                      hint="pick one of the outline headings, or leave section out")
-        text, section = "".join(keep).strip(), a["section"]
-    n = len(text)
-    off, mx = a["offset"], a["max_chars"]
-    if off and off >= n:
-        raise Err("bad_param", f"offset {off} is past the end of the text ({n} chars)")
-    part = text[off:off + mx]
-    nxt = off + mx if off + mx < n else None
+    # N160 (0.8.14 retest): the plugin's one page reader (infosys_get_page reads the same part of the same page)
+    try:
+        got = INF.page_part(r["body"] or "", a["section"], a["offset"], a["max_chars"])
+    except INF.PageError as exc:
+        raise Err(exc.code, str(exc), **({"outline": exc.outline} if exc.code == "not_found" else {})) from None
     out = _page_head(ctx, r)
-    out.update({"resolved_by": how, "breadcrumb": r["crumb"] or None, "outline": outline, "section": section,
-                "text": part, "chars": n, "offset": off, "next_offset": nxt, "truncated": nxt is not None})
-    lk = _links(con, part)
+    out.update({"resolved_by": how, "breadcrumb": r["crumb"] or None, **got})
+    lk = _links(con, got["text"])
     if lk:
         out["links"] = lk
     also = _also_in(con, r)
@@ -1033,17 +1040,22 @@ def cmd_manual_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def cmd_manual_product(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
-    con = ctx.con("manuals")
-    code = a["code"].strip().upper()
-    if not code:
-        raise Err("bad_param", "code is empty (e.g. EL3102, CX9020)")
+def product_manuals(con: sqlite3.Connection, code: str, limit: int) -> dict[str, Any]:
+    """Which indexed manuals name a product code — the one rule of manual_product and of hw_lookup's manuals block
+    (knowledge.manuals_for loads this module, as for manuals_state): the product-code table (the code or a variant
+    CODE-dddd; N67: a variant no manual names → the base product), else the page text. N163 (0.8.14 retest): the
+    product table is what the builder took for a product code — an index built by an older builder lacks whole
+    families (ED2008: 'copy the PDF manuals' although its manual was indexed; hw_lookup's manuals_note said the
+    same). The page text is the evidence: a code it names is answered from it, and said so; only a code on no
+    indexed page sends the user to add a manual. -> {items, matched_as?, note?}"""
+    code = code.strip().upper()
+
     def q(c: str) -> list[sqlite3.Row]:
         return con.execute("SELECT d.name, p.doc, GROUP_CONCAT(p.page) AS pages, SUM(p.n) AS hits FROM product p "
                            "JOIN doc d ON d.id = p.doc WHERE p.code = ? OR p.code LIKE ? ESCAPE '\\' GROUP BY p.doc "
-                           "ORDER BY hits DESC LIMIT ?", (c, like_escape(c) + "-%", a["limit"])).fetchall()
+                           "ORDER BY hits DESC LIMIT ?", (c, like_escape(c) + "-%", limit)).fetchall()
     rows = q(code)
-    out: dict[str, Any] = {"code": code}
+    out: dict[str, Any] = {}
     base = re.fullmatch(r"([A-Z]{1,4}\d{3,5})-\d{4}", code)
     if not rows and base:            # N67: a variant no manual names -> the base product the manual is written for
         rows = q(base.group(1))
@@ -1052,14 +1064,10 @@ def cmd_manual_product(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     items = [{"doc": r["name"], "doc_id": r["doc"], "mentions": r["hits"],
               "pages": sorted({int(x) for x in (r["pages"] or "").split(",") if x})} for r in rows]
     if not items:
-        # N163 (0.8.14 retest): the product table is what the builder took for a product code — an index built by an
-        # older builder lacks whole families (ED2008: 'copy the PDF manuals' although its manual was indexed). The
-        # page text is the evidence: a code it names is answered from it, and said so; only a code on no indexed
-        # page sends the user to add a manual
-        items = _code_in_text(con, code, a["limit"])
+        items = _code_in_text(con, code, limit)
         via = None
         if not items and base:
-            items, via = _code_in_text(con, base.group(1), a["limit"]), base.group(1)
+            items, via = _code_in_text(con, base.group(1), limit), base.group(1)
         if items:
             out["matched_as"] = "page text" + (f": base product {via} (no page names the variant {code})" if via else "")
             fmt = (con.execute("SELECT value FROM meta WHERE key = 'text_format'").fetchone() or ["1"])[0]
@@ -1069,6 +1077,18 @@ def cmd_manual_product(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
                               "approved: kb_rebuild(index='manuals'), or tools\\manuals_db.py update"
                               if fmt != MANUALS_TEXT_FORMAT else
                               "the product-code rule (a family's letters and four digits) does not take this form"))
+    out["items"] = items
+    return out
+
+
+def cmd_manual_product(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
+    con = ctx.con("manuals")
+    code = a["code"].strip().upper()
+    if not code:
+        raise Err("bad_param", "code is empty (e.g. EL3102, CX9020)")
+    got = product_manuals(con, code, a["limit"])
+    items = got.pop("items")
+    out: dict[str, Any] = {"code": code, **got}
     out.update({"count": len(items), "items": items, "source": _msource(ctx)})
     if not items:
         out["hint"] = f"{code} is in no indexed manual — " + BUILD_MANUALS
@@ -1212,7 +1232,10 @@ def cmd_hw_lookup(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 
 def cmd_hw_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     kinds = [k.strip() for k in a["kinds"].split(",") if k.strip()] if a["kinds"] else None
-    return _esi(ctx, "search", a["query"], kinds, a["limit"])
+    # N167: a limit above the maximum goes to esi_index as asked — it is used as the maximum and said so there (the
+    # server's hw_search gives the same clamped_note)
+    limit = (a.get("_clamped") or {}).get("limit", (a["limit"],))[0]
+    return _esi(ctx, "search", a["query"], kinds, limit, a["offset"])
 
 
 def cmd_hw_object(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
@@ -1228,15 +1251,28 @@ def cmd_hw_module(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
 
 
 COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[str, P], str]] = {
+    # N160 / N167 / N169 (0.8.14 retest): library= as infosys_* take it; the search pages (offset / next_offset) and
+    # clamps its limit; the ranges are in the help
     "docs_search": (cmd_docs_search, {"query": P(required=True, doc="FTS5 query"), "book": P(doc="glob on the book slug"),
-                                      "limit": P("int", default=10, lo=1, hi=50)},
-                    "Infosys full text: ranked pages with ref, title, book, version, excerpt, url"),
+                                      "library": P(doc="library name (Tc2_System) or book slug, as infosys_* take it"),
+                                      "limit": P("int", default=10, lo=1, hi=50, clamp=True, doc="hits shown"),
+                                      "offset": P("int", default=0, lo=0, doc="hits skipped: the next ones are "
+                                                                               "offset=<next_offset>")},
+                    "Infosys full text: ranked pages with ref, title, book, version, excerpt, url; paging with next_offset"),
     "docs_declaration": (cmd_docs_declaration, {"symbol": P(required=True, doc="FB/function/struct/enum name or a ref"),
-                                                "book": P(doc="glob on the book slug")},
+                                                "book": P(doc="glob on the book slug"),
+                                                "library": P(doc="library name (Tc2_System) or book slug, as "
+                                                                 "infosys_declaration takes it")},
                          "a library symbol's page: intro, every declaration block, requirements, also_in"),
     "docs_page": (cmd_docs_page, {"ref": P(required=True, doc="book/pageid, Infosys URL, page id, exact title or ms-xhelp link"),
-                                  "book": P(doc="glob, narrows a title or page id"), "section": P(doc="heading text"),
-                                  "offset": P("int", default=0, lo=0), "max_chars": P("int", default=4000, lo=200, hi=20000)},
+                                  "book": P(doc="glob, narrows a title or page id"),
+                                  "library": P(doc="library name (Tc2_System) or book slug, narrows a title or page id"),
+                                  "section": P(doc="heading text"),
+                                  "offset": P("int", default=0, lo=0, doc="characters already read: offset=<next_offset>"),
+                                  # N160 / N169: infosys_get_page's range; a refusal names the way to read on
+                                  "max_chars": P("int", default=4000, lo=INF.PAGE_CHARS[0], hi=INF.PAGE_CHARS[1],
+                                                 doc="characters shown", route="read a long page in parts: "
+                                                 "section=<a heading of the outline> or offset=<next_offset>")},
                   "a page as text: outline, one section, paging with next_offset"),
     "docs_books": (cmd_docs_books, {"filter": P(doc="glob on the book slug")}, "Infosys books with page counts"),
     # N167 / N169 (0.8.14 retest): the search pages (offset / next_offset) and clamps its limit; each refusal of a
@@ -1271,8 +1307,10 @@ COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[
                   "list; the indexed manuals that name it"),
     "hw_search": (cmd_hw_search, {"query": P(required=True, doc="FTS5 query"),
                                   "kinds": P(doc="comma list of device, object, diag, module"),
-                                  "limit": P("int", default=20, lo=1, hi=100)},
-                  "ESI full text: devices, CoE objects, diagnosis messages, modules"),
+                                  "limit": P("int", default=20, lo=1, hi=100, clamp=True, doc="items shown"),
+                                  "offset": P("int", default=0, lo=0, doc="items skipped: the next ones are "
+                                                                           "offset=<next_offset>")},
+                  "ESI full text: devices, CoE objects, diagnosis messages, modules; paging with next_offset"),
     "hw_object": (cmd_hw_object, {"device": P(required=True, doc="exact type, e.g. EL3356-0010"),
                                   "index": P(required=True, doc="#x8000 / 0x8000 / 8000; one sub-index: 8000:11 (CoE "
                                                                 "notation, sub-index hex: 8000:11 = sub-index 17)"),

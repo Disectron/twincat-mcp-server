@@ -243,6 +243,24 @@ async def test_nothing_is_advertised_that_is_never_published(monkeypatch, projec
 
 
 @pytest.mark.anyio
+async def test_n169_the_ranges_are_in_the_tool_schemas(monkeypatch, project_dir):
+    """N169 (S4, 0.8.14 retest): ranges were invisible until a call was refused. The schemas carry them: max_chars
+    200-60000 (refused outside, with the way to read on), offset >= 0, a search's limit >= 1 (above its maximum it is
+    used as the maximum, N167 — so no maximum in the schema, the description says it)."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    async with Client(srv) as c:
+        tools = {t.name: t.input_schema["properties"] for t in (await c.list_tools()).tools}
+    page = tools["infosys_get_page"]
+    assert (page["max_chars"]["minimum"], page["max_chars"]["maximum"]) == (200, 60000), page["max_chars"]
+    assert page["offset"]["minimum"] == 0 and "section" in page
+    for name, hi in (("infosys_search", "50"), ("hw_search", "100")):
+        lim = tools[name]["limit"]
+        assert lim["minimum"] == 1 and "maximum" not in lim and f"1-{hi}" in lim["description"], (name, lim)
+        assert tools[name]["offset"]["minimum"] == 0
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("source", ["local", "web"])
 async def test_r30_infosys_tools_describe_the_configured_source(monkeypatch, project_dir, source):
     install(monkeypatch)

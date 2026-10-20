@@ -31,7 +31,7 @@ import sqlite3
 import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Annotated, Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -119,6 +119,19 @@ EDIT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 DESTR = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False)
 CONTROL = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)   # changes the server's own state under confirmation
+
+
+# N169 (0.8.14 retest): ranges are in the tool schemas, not only in the refusal. A search's limit has no maximum in
+# the schema: a larger one is used as the maximum and said so (N167, clamped); max_chars is refused out of range, with
+# the way to read on — so the bounds are the schema's, the check (and its message) the tool's
+PageLimit = Annotated[int, Field(json_schema_extra={"minimum": 1}, description="hits per page, 1-50; a larger limit is "
+                                 "used as 50 (clamped: true)")]
+HwLimit = Annotated[int, Field(json_schema_extra={"minimum": 1}, description="items per page, 1-100; a larger limit is "
+                               "used as 100 (clamped: true)")]
+Offset = Annotated[int, Field(json_schema_extra={"minimum": 0}, description="skipped first: the next page is "
+                              "offset=<next_offset>")]
+PageChars = Annotated[int, Field(json_schema_extra={"minimum": 200, "maximum": 60000},
+                                 description="characters shown, 200-60000; read on with section= or offset=")]
 
 
 class ConfirmSchema(BaseModel):
@@ -1971,10 +1984,16 @@ def connection_instructions(app: "App") -> str:
         ds = app.kb.docs_status()
     except Exception as exc:  # noqa: BLE001 — never block the start
         return INSTRUCTIONS + f"\nOffline documentation: state not readable at this connection ({type(exc).__name__}: {exc}).\n"
-    line = f"\nOffline documentation, state at this connection ({ds.get('knowledge_folder', 'no folder')}): {ds['summary']}"
+    # N162 (0.8.14 retest): this text is sent once, when the client connects, and never again — a rebuild finished
+    # later in the session left it saying 'REBUILD is due — format 5' about a format-6 index, and agents asked the
+    # user for a rebuild nobody needed. It says when it was read, and that kb_status is the current state
+    line = (f"\nOffline documentation, state at this connection ({ds.get('knowledge_folder', 'no folder')}; read "
+            f"{time.strftime('%Y-%m-%d %H:%M')}, not refreshed while the session runs — kb_status gives the current "
+            f"state): {ds['summary']}")
     if not ds.get("ok") and ds.get("infosys_command"):
-        line += (" An index that exists is rebuilt only when the user approves it (docs/KNOWLEDGE_BASE.md): tell the user, "
-                 "and on approval kb_rebuild(index='infosys') — or the user runs " + ds["infosys_command"] + ".")
+        line += (" An index that exists is rebuilt only when the user approves it (docs/KNOWLEDGE_BASE.md): check "
+                 "kb_status first (a rebuild may have finished since this was read), then tell the user, and on "
+                 "approval kb_rebuild(index='infosys') — or the user runs " + ds["infosys_command"] + ".")
     return INSTRUCTIONS + line + "\n"
 
 
@@ -2154,6 +2173,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                       subscriptions=False)
     mcp.xae_flags = app.xae_flags
     mcp.dialog_hint = app._dialog_hint
+    # N162: the instructions are read again whenever a connection is initialised (a transport that serves several
+    # sessions from one process asks for them per session), not only when the process started
+    low = mcp._lowlevel_server
+    _init_options = low.create_initialization_options
+
+    def _fresh_init_options(*a: Any, **kw: Any) -> Any:
+        low.instructions = connection_instructions(app)
+        return _init_options(*a, **kw)
+    low.create_initialization_options = _fresh_init_options  # type: ignore[method-assign]
 
     # ======================================================================
     # tc_* meta
@@ -2524,15 +2552,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return res
 
     @mcp.tool(annotations=READ)
-    async def hw_search(query: str, kinds: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
+    async def hw_search(query: str, kinds: list[str] | None = None, limit: HwLimit = 20,
+                        offset: Offset = 0) -> dict[str, Any]:
         """Full-text search of the ESI index: devices (names, PDOs and their entries, PDO assignments), CoE objects
         (names, descriptions, sub-index names), diagnosis messages (text, description, causes, remedies) and modules.
         kinds: any of 'device', 'object', 'diag', 'module' (default all; a module is found by its own name and PDOs
         and by the devices whose slots take it — type, name, group). FTS5 syntax (words ANDed, "phrase", prefix*);
         other text is searched as one phrase. Hits with the same title (revisions of one type, one text in several
-        catalogues) are one item with `variants`; objects and messages name the device types that have them."""
+        catalogues) are one item with `variants`; objects and messages name the device types that have them. Pages:
+        total items, offset / next_offset; a limit above 100 is used as 100 (clamped)."""
         first = await asyncio.to_thread(app.esi_first_build)
-        res = await app.kb_call(app.kb.hw_search, query, kinds, limit, timeout=120)
+        res = await app.kb_call(app.kb.hw_search, query, kinds, limit, offset, timeout=120)
         if first:
             res["esi_first_build"] = first
         return res
@@ -4448,10 +4478,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await app.docs_call("declaration", symbol, library, timeout=1800)
 
     @mcp.tool(annotations=READ)
-    async def infosys_search(query: str, library: str | None = None, limit: int = 10,
-                             web_fallback: bool | None = None) -> dict[str, Any]:
+    async def infosys_search(query: str, library: str | None = None, limit: PageLimit = 10,
+                             web_fallback: bool | None = None, offset: Offset = 0) -> dict[str, Any]:
         """Full-text search over the indexed Infosys pages (FTS5, bm25-ranked, excerpt with [hits]); "quoted phrases"
-        stay together, limit 1..50. A question in words falls back in tiers (query_mode, words_used); identifiers
+        stay together. Pages: limit 1..50 (a larger one is used as 50, clamped), offset / next_offset for the next
+        hits. A question in words falls back in tiers (query_mode, words_used); identifiers
         count as their words (FB_SocketConnect: socket, connect); a word in capitals is a keyword or acronym and always
         searched (FOR, BY, THIS, ST, AL — in lower case 'for', 'this' are English stop words), and a title that has it
         comes first ('ST instruction FOR'); code punctuation that finds nothing as written is searched as its words
@@ -4460,7 +4491,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         pages (code_note); one page in several books — or placed twice in one — is listed once (same_page_in). The twincat-docs skill's docs_search is the same search. Local Help Viewer package (default): no network (web_fallback is ignored and said
         so), results carry the page's doc version and the package date. docs.source='web': when the index has nothing,
         a DuckDuckGo site: query verified against the sitemap; the 'backend' field says which path answered."""
-        return await app.docs_call("search", query, library, limit, web_fallback, timeout=300)
+        return await app.docs_call("search", query, library, limit, web_fallback, offset, timeout=300)
 
     @mcp.tool(annotations=READ)
     async def infosys_search_code(query: str, language: str | None = None, limit: int = 10,
@@ -4473,13 +4504,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return await app.docs_call("search_code", query, language, limit, ignore_spacing, timeout=120)
 
     @mcp.tool(annotations=READ)
-    async def infosys_get_page(ref: str, refresh: bool = False, max_chars: int = 60000) -> dict[str, Any]:
+    async def infosys_get_page(ref: str, refresh: bool = False, max_chars: PageChars = 60000,
+                               section: str | None = None, offset: Offset = 0) -> dict[str, Any]:
         """A documentation page as Markdown (headings, tables, fenced code). ref: full Infosys URL, 'book/pageid', a
-        bare page id, or a symbol name ('ADSREAD'). Read from the local Help Viewer package (any page in it, indexed or
-        not; doc version + breadcrumb included) or, with docs.source='web', fetched live. Use max_chars to keep it short.
+        bare page id, or a symbol name ('ADSREAD'; a method documented in a section of its FB's page opens at that
+        section). Read from the local Help Viewer package (any page in it, indexed or not; doc version + breadcrumb
+        included) or, with docs.source='web', fetched live. outline lists the headings; section= gives the part under
+        one heading (one named exactly wins, else every heading that contains it); max_chars (200-60000) of it from
+        offset, next_offset when more follows — as the twincat-docs skill's docs_page.
         parent / children: the page's place in the Help Viewer contents — an FB's page lists its method and property
         pages, a method page names its FB."""
-        return await app.docs_call("get_page", ref, refresh, max_chars, timeout=600)
+        return await app.docs_call("get_page", ref, refresh, max_chars, section, offset, timeout=600)
 
     # ======================================================================
     # exports for MES / HMI code, snapshots apply, XML validation, reports

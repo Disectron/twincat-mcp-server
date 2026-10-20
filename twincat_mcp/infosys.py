@@ -96,6 +96,9 @@ def _like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+SEARCH_LIMIT = 50             # hits per page of a search (N167: a larger limit is used as this, offset pages on)
+
+
 def _check_limit(limit: Any, hi: int = 50, name: str = "limit") -> int:
     """R31: limit=-1 dropped the last item, limit=0 returned one, limit=1000 had no cap."""
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= hi:
@@ -1069,6 +1072,73 @@ def page_family(con: Any, url: str, limit: int = 60) -> dict[str, Any]:
     return out
 
 
+# N160 (0.8.14 retest): infosys_get_page and the skill's docs_page read a page alike — one range for max_chars (the
+# MCP took 50, the skill refused below 200), a section and an offset on both (the MCP had neither)
+PAGE_CHARS = (200, 60_000)
+
+
+class PageError(InfosysError):
+    """A page part that cannot be given: code 'not_found' (no such section; outline lists them) or 'bad_param'."""
+
+    def __init__(self, code: str, message: str, outline: list[str] | None = None):
+        super().__init__(message)
+        self.code, self.outline = code, outline or []
+
+
+def page_sections(body: str) -> list[tuple[str, str]]:
+    """[(heading text, block text incl. the heading line)] of a page's Markdown; text before the first heading has
+    heading ''. A '#' line inside a ``` block is code, not a heading."""
+    out: list[tuple[str, list[str]]] = [("", [])]
+    fence = False
+    for ln in body.splitlines(keepends=True):
+        if ln.startswith("```"):
+            fence = not fence
+        elif not fence and re.match(r"#{1,4} ", ln):
+            out.append((ln.lstrip("#").strip(), []))
+        out[-1][1].append(ln)
+    return [(h, "".join(b)) for h, b in out if h or "".join(b).strip()]
+
+
+def part_ranges(offset: Any, max_chars: Any) -> None:
+    """The ranges of a page part (N160 / N169: the refusal names the way to read on). Raises PageError."""
+    lo, hi = PAGE_CHARS
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or not lo <= max_chars <= hi:
+        raise PageError("bad_param", f"max_chars must be {lo}-{hi} (got {max_chars!r}) — read a long page in parts: "
+                                     "section=<a heading of the outline> or offset=<next_offset>")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise PageError("bad_param", f"offset must be >= 0 (got {offset!r}) — 0 is the start, next_offset the next part")
+
+
+def page_part(body: str, section: str | None = None, offset: int = 0, max_chars: int = 4000) -> dict[str, Any]:
+    """The part of a page a reader shows: its outline; one section (a heading that IS the one asked for wins — N170:
+    'Method CreateRecipe' is not also 'Method CreateRecipeNoSave' — else every heading that contains it); max_chars
+    of it from offset, with next_offset when more follows. -> {outline, section, text, chars, offset, next_offset,
+    truncated}. Raises PageError."""
+    part_ranges(offset, max_chars)
+    secs = page_sections(body)
+    outline = [h for h, _ in secs if h]
+    text = body
+    if section:
+        want = section.lower()
+        exact = any(h.lower() == want for h, _ in secs)
+        on, keep = False, []
+        for h, block in secs:
+            if h:
+                on = h.lower() == want if exact else want in h.lower()
+            if on:
+                keep.append(block)
+        if not keep:
+            raise PageError("not_found", f"no section heading contains {section!r} — pick one of the outline headings, "
+                                         "or leave section out", outline)
+        text = "".join(keep).strip()
+    n = len(text)
+    if offset and offset >= n:
+        raise PageError("bad_param", f"offset {offset} is past the end of the text ({n} chars) — offset=0 for the start")
+    nxt = offset + max_chars if offset + max_chars < n else None
+    return {"outline": outline, "section": section or None, "text": text[offset:offset + max_chars], "chars": n,
+            "offset": offset, "next_offset": nxt, "truncated": nxt is not None}
+
+
 def _owned_by(con: Any, rows: list[Any], owner: str) -> list[Any]:
     """The candidate pages (each with "rid") whose parent in the contents documents `owner` (FB_WG_ComboFilter.Call →
     the 'Call' page below FB_WG_ComboFilter's page) — the parent itself, or the first symbol page above topic pages
@@ -1083,14 +1153,16 @@ def _owned_by(con: Any, rows: list[Any], owner: str) -> list[Any]:
 
 # -- searching the index: one search for every reader (N99, N105) ---------------------------------------------------
 def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[Any] | None = None,
-                 snippet_tokens: int = 18) -> dict[str, Any]:
+                 snippet_tokens: int = 18, offset: int = 0) -> dict[str, Any]:
     """The Infosys search of infosys_search and of the twincat-docs skill's docs_search (they ranked differently):
     docsearch.search_tiers over pages_fts with the column weights of docsearch.infosys_rank, then
       - an error code (docsearch.code_forms): the pages whose table defines it (hex and decimal in one row) first;
       - the hits ordered by their titles (docsearch.title_order);
       - one page in several books once (same_documents): its copies are named in `copies` — the ADS return-code
         table is in some 30 books.
-    where / extra: a filter on the pages (alias p) and its parameters. Raises docsearch.SearchError.
+    where / extra: a filter on the pages (alias p) and its parameters. offset (N167): the documents skipped — the
+    next page of hits is offset=next_offset; every page is cut from one order (search_tiers' skip). Raises
+    docsearch.SearchError.
     -> {rows (rid, url, book, pid, title, version, kind, library, s = excerpt, r = bm25), total, mode, expr, info,
         code (code_forms or None), copies {rid: [(book, page id), …]}}"""
     from . import docsearch as DS
@@ -1112,9 +1184,9 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
     copies: dict[int, list[tuple[str, str]]] = {}
     seen = {"read": 0, "documents": 0}
 
-    def arrange(rows: list[Any]) -> list[Any]:
-        seen["read"] = len(rows)
-        ordered = DS.title_order(rows, query, "title", "library")
+    def arrange(rows: list[Any], tail: list[Any] = ()) -> list[Any]:
+        seen["read"] = len(rows) + len(tail)
+        ordered = DS.title_order(rows, query, "title", "library") + list(tail)
         if defined:
             ids = {r["rid"] for r in defined}
             # N99b: of the pages whose table defines the code, those whose title says they are a code table ('ADS
@@ -1126,10 +1198,10 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
         return out
 
     rows, total, mode, expr, info = DS.search_tiers(con, sql, count_sql, query, extra, limit, fts="pages_fts",
-                                                    arrange=arrange, title_col="title", title_sql=title_sql)
+                                                    arrange=arrange, title_col="title", title_sql=title_sql, skip=offset)
     outside = 0                                 # defining pages without the tier's words: listed, so counted
     if not rows and defined:                    # the code's table, though no tier found the query's other words
-        rows, total, mode = arrange([])[:limit], 0, "the code's table (no page has the other words)"
+        rows, total, mode = arrange([])[:offset + limit], 0, "the code's table (no page has the other words)"
         outside = len(defined)
     elif defined and expr:
         for r in defined:
@@ -1140,10 +1212,12 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
             outside += 0 if hit else 1
     total += outside
     ids = {r["rid"] for r in defined}
-    # more: hits not shown — more documents than `limit` among those read, or pages that were not read. `total`
-    # counts pages: a page in several books once per book (copies are listed once, with same_page_in)
+    # more: hits not shown — more documents than shown up to this page among those read, or pages that were not
+    # read. `total` counts pages: a page in several books once per book (copies are listed once, with same_page_in)
     more = seen["documents"] > len(rows) or total > seen["read"] + outside
+    rows = rows[offset:offset + limit]                                     # N167: this page of the hits
     return {"rows": rows, "total": total, "more": more, "mode": mode, "expr": expr, "info": info, "code": forms,
+            "offset": offset, "next_offset": offset + len(rows) if more and rows else None,
             "defined": sum(1 for r in rows if r["rid"] in ids),
             "copies": {r["rid"]: copies[r["rid"]] for r in rows if r["rid"] in copies}}
 
@@ -2674,14 +2748,27 @@ class InfosysIndex:
                               "infosys_index(book=...) adds one; infosys_search(...) also tries the web fallback."))
         return res
 
-    def search(self, query: str, library: str | None = None, limit: int = 10, web_fallback: bool | None = None) -> dict[str, Any]:
+    def search(self, query: str, library: str | None = None, limit: int = 10, web_fallback: bool | None = None,
+               offset: int = 0) -> dict[str, Any]:
         q = query.strip()
         if not q:
             raise InfosysError("empty query")
-        _check_limit(limit)
+        # N167 (0.8.14 retest): hits 51… could not be reached — 'limit 300' was refused and there was no offset. A
+        # limit above 50 is used as 50 and said so; offset pages through the hits (next_offset)
+        clamped = None
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > SEARCH_LIMIT:
+            clamped, limit = limit, SEARCH_LIMIT
+        _check_limit(limit, SEARCH_LIMIT)
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise InfosysError(f"offset {offset!r} must be >= 0 — 0 is the first hit, next_offset the next page")
         last: dict[str, Any] | None = None
         if self._fts:
-            items, last = self._fts_run(q, library, limit)
+            items, last = self._fts_run(q, library, limit, offset)
+            if not items and offset and last["total"]:
+                raise InfosysError(f"offset {offset} is past the last hit ({last['total']} pages match) — offset=0 for "
+                                   "the first ones")
+        elif offset:
+            raise InfosysError("offset needs the full-text index (FTS5), which this index has not")
         else:
             items = self._like_search(q, library, limit)
         backend = "local-fts5" if self._fts else "local-like"
@@ -2695,6 +2782,11 @@ class InfosysIndex:
             res["query_mode"] = last["mode"]
             res["total"] = last["total"]              # pages; a page in several books once per book
             res["truncated"] = last["more"]
+            res["offset"], res["next_offset"] = offset, last["next_offset"]
+            if clamped is not None:
+                res["clamped"] = True
+                res["clamped_note"] = (f"limit {clamped} is above the maximum (1-{SEARCH_LIMIT}): {SEARCH_LIMIT} used"
+                                       + (f" — the next hits: offset={last['next_offset']}" if last["next_offset"] else ""))
             for k in ("words_used", "words_ignored", "words_too_common"):
                 if last["info"].get(k):
                     res[k] = last["info"][k]
@@ -2786,10 +2878,12 @@ class InfosysIndex:
         with self._db() as con:
             return {r[0]: r[1] for r in con.execute("SELECT lang, COUNT(*) FROM code_blocks GROUP BY lang")}
 
-    def get_page(self, ref: str, refresh: bool = False, max_chars: int = 60_000) -> dict[str, Any]:
-        if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:          # R31
-            raise InfosysError(f"max_chars {max_chars!r} must be ≥ 1")
-        url = self.resolve(ref)
+    def get_page(self, ref: str, refresh: bool = False, max_chars: int = 60_000, section: str | None = None,
+                 offset: int = 0) -> dict[str, Any]:
+        part_ranges(offset, max_chars)                    # R31 / N160: the ranges, before anything is read
+        url, sym_section = self._resolve_part(ref)
+        if section is None and sym_section:
+            section = sym_section                          # N170: a method documented in a section of its FB's page
         try:
             sm = self.sitemap()
         except InfosysError:
@@ -2820,10 +2914,11 @@ class InfosysIndex:
                 self._store(con, url, lastmod, doc)
                 _bump_gen(con)
                 row = con.execute("SELECT * FROM pages WHERE url = ?", (url,)).fetchone()
-        md = row["markdown"] or ""
+        # N160 (0.8.14 retest): the skill's docs_page reads the same part — an outline, one section, an offset
+        got = page_part(row["markdown"] or "", section, offset, max_chars)
         out = {"url": url, "title": row["title"], "kind": row["kind"], "library": row["library"], "book": row["book"],
-               "lastmod": row["lastmod"] or None, "in_sitemap": url in sm,
-               "markdown": md[:max_chars], "truncated": len(md) > max_chars, "chars": len(md)}
+               "lastmod": row["lastmod"] or None, "in_sitemap": url in sm, "markdown": got["text"],
+               **{k: got[k] for k in ("truncated", "chars", "offset", "next_offset", "section", "outline")}}
         if not indexed:
             out["indexed"] = False
         if indexed:
@@ -2871,7 +2966,9 @@ class InfosysIndex:
             near += [it["name"] for it in found["items"] if not any(it["url"] == r["url"] for r in close)]
             raise InfosysError(f"no symbol page titled {s!r}" + (f" in {library}" if library else "") +
                                (f"; near: {near}" if near else
-                                (" in the complete index" if complete else "; " + self._not_indexed_hint())))
+                                (" in the complete index" if complete else "; " + self._not_indexed_hint()))
+                               # N160 (0.8.14 retest): the way on, as the skill's not_found gives it
+                               + f" — infosys_search(query={s!r}) finds pages by their text")
         if len(docs) > 1:
             # R23 (0.8.8 retest): MC_MoveAbsolute exists in Tc2_MC2 and Tc3_DriveMotionControl with different
             # parameters — returning the first one let code be written against the wrong FB. Nothing is chosen. One
@@ -3009,6 +3106,21 @@ class InfosysIndex:
         return _XHELP.sub(sub, md)
 
     # -- resolution ----------------------------------------------------------------
+    def _resolve_part(self, ref: str) -> tuple[str, str | None]:
+        """resolve(), and the section of the page when the name is a symbol documented in one (N170)."""
+        url = self.resolve(ref)
+        r = " ".join(ref.split())
+        if re.fullmatch(r"[A-Za-z_][\w.]*", r) and self.db_file.is_file():
+            try:
+                with self._db() as con:
+                    if not con.execute("SELECT 1 FROM pages WHERE url = ? AND title = ? COLLATE NOCASE", (url, r)).fetchone():
+                        for x in symbol_rows(con, r):
+                            if x["url"] == url and x["section"]:
+                                return url, x["section"]
+            except (sqlite3.Error, InfosysError):
+                pass
+        return url, None
+
     def resolve(self, ref: str) -> str:
         r = ref.strip()
         if r.lower().startswith("ms-xhelp:"):
@@ -3058,15 +3170,21 @@ class InfosysIndex:
             raise InfosysError(f"ambiguous: {len(docs)} different pages are titled {r!r}: "
                                f"{[g[0]['url'] for g in docs][:20]} — nothing was chosen; pass the URL or 'book/id' of "
                                "the one meant (for a symbol: the library the project uses, proj_libraries)")
+        # N160 (0.8.14 retest): the skill's not_found names what is near and how to search; this said less
+        with self._db() as con:
+            close = near_symbols(con, r) if re.fullmatch(r"[A-Za-z_][\w.]*", r) else []
         found = self.search_symbols(r, limit=3)
-        raise InfosysError(f"{ref!r} is neither an Infosys URL, 'book/id', a page id nor an indexed symbol name"
-                           + (f"; near: {[it['name'] for it in found['items']]}" if found["items"] else ""))
+        near = [f"{x['title']} ({x['url']})" for x in close]
+        near += [it["name"] for it in found["items"] if not any(it["url"] == x["url"] for x in close)]
+        raise InfosysError(f"{ref!r} is neither an Infosys URL, 'book/id', a page id nor an indexed symbol name or "
+                           "page title" + (f"; near: {near}" if near else "")
+                           + f" — infosys_search(query={r!r}) finds pages by their text")
 
     # -- internals -------------------------------------------------------------------
     def _fts_search(self, q: str, library: str | None, limit: int) -> list[dict[str, Any]]:
         return self._fts_run(q, library, limit)[0]
 
-    def _fts_run(self, q: str, library: str | None, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _fts_run(self, q: str, library: str | None, limit: int, offset: int = 0) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """The index's one search (search_index — the twincat-docs skill's docs_search is the same): tiers for a
         question in words, "quoted phrases" kept (R29), identifiers as words, titles first, an error code's table
         first, a page in several books once. -> (items, search_index's answer)."""
@@ -3074,7 +3192,8 @@ class InfosysIndex:
         try:
             with self._db() as con:
                 res = search_index(con, q, limit, where="p.library = ? COLLATE NOCASE OR p.book = ? COLLATE NOCASE"
-                                   if library else "", extra=[library, library] if library else [], snippet_tokens=24)
+                                   if library else "", extra=[library, library] if library else [], snippet_tokens=24,
+                                   offset=offset)
         except DS.SearchError as exc:
             if exc.code == "empty_query":
                 raise InfosysError(exc.message) from None

@@ -62,10 +62,10 @@ def test_docs_search_ranking_total_and_phrase_retry(kbdir):
 
 @pytest.mark.parametrize("args, code, text", [
     (["query=x", "limit=0"], "bad_param", "limit must be 1-50 (got 0)"),
-    (["query=x", "limit=51"], "bad_param", "refused, not clamped"),
+    (["query=x", "offset=-1"], "bad_param", "refused, not clamped"),       # N167: limit=51 is clamped now
     (["query=  "], "empty_query", "empty"),
     (["query=:="], "empty_query", "no searchable word"),
-    (["query=ADSREAD", "bogus=1"], "bad_param", "allowed: query, book, limit"),
+    (["query=ADSREAD", "bogus=1"], "bad_param", "allowed: query, book, library, limit, offset"),
     (["query=ADSREAD", "book=nosuch*"], "not_found", "no book matches"),
     ([], "bad_param", "query is required"),
 ])
@@ -133,7 +133,7 @@ def test_docs_page_refs_sections_and_paging(kbdir):
     assert rc == 1 and r["error"] == "bad_param" and "past the end" in r["message"]
     rc, r = run(kbdir, "docs_page", "ref=tcplclib_tc2_system/30866571", "section=Bogus")
     assert rc == 1 and r["error"] == "not_found" and r["outline"][0] == "ADSREAD"
-    for bad in ("max_chars=199", "max_chars=20001", "offset=-1"):
+    for bad in ("max_chars=199", "max_chars=60001", "offset=-1"):      # N160: infosys_get_page's range, 200-60000
         rc, r = run(kbdir, "docs_page", "ref=30866571", bad)
         assert rc == 1 and r["error"] == "bad_param", bad
 
@@ -507,6 +507,47 @@ def test_n158_n159_the_skill_follows_a_member_to_where_it_is_defined(kbdir):
     assert rc == 1 and r["error"] == "not_found", r
     near = [c["title"] for c in r["near"]]
     assert near[:3] == ["FB_TcMessage", "FB_TcEventBase", "I_TcMessage"] and not any("DALI" in t for t in near), near
+
+
+def test_n167_n160_docs_search_pages_takes_library_and_answers_as_infosys_search(kbdir):
+    """N167 (0.8.14 retest): docs_search limit=300 was refused and there was no offset — hits 51… unreachable. N160:
+    library= was refused by the skill (infosys_* take it); docs_search and infosys_search page alike, one order."""
+    from tests.test_infosys import _visu_pages
+    from twincat_mcp.infosys import InfosysIndex, html_to_doc, _bump_gen
+    ix = InfosysIndex(db_file=kbdir / "index" / "infosys-1033.db")
+    with ix._db() as con:
+        for ref, title, body in _visu_pages(200):
+            ix._store(con, f"https://infosys.beckhoff.com/content/1033/{ref}.html", "",
+                      html_to_doc(f"<html><body><h1>{title}</h1>{body}</body></html>"))
+        _bump_gen(con)
+    ix.sync_derived()
+    mcp = []
+    off = 0
+    while off is not None:
+        r = ix.search("Visu", limit=50, offset=off)
+        mcp += [i["url"] for i in r["items"]]
+        off = r["next_offset"]
+    del ix
+    skill, off = [], 0
+    while off is not None:
+        rc, r = run(kbdir, "docs_search", "query=Visu", "limit=50", f"offset={off}")
+        assert rc == 0 and r["total"] == 200 and r["offset"] == off, r
+        skill += [i["url"] for i in r["items"]]
+        off = r["next_offset"]
+    assert skill == mcp and len(set(skill)) == 200
+    rc, r = run(kbdir, "docs_search", "query=Visu", "limit=300")
+    assert rc == 0 and r["count"] == 50 and r["clamped"] is True and "offset=50" in r["clamped_note"], r
+    rc, r = run(kbdir, "docs_search", "query=Visu", "offset=200")
+    assert rc == 1 and r["error"] == "bad_param" and "past the last hit" in r["message"], r
+    # library= as infosys_* take it: a library name or a book slug
+    rc, r = run(kbdir, "docs_search", "query=ADSREAD", "library=Tc2_System")
+    assert rc == 0 and r["count"] and all(i["book"].startswith("tcplclib_tc2_system") for i in r["items"]), r
+    rc, r = run(kbdir, "docs_declaration", "symbol=ADSREAD", "library=tcplclib_tc2_system")
+    assert rc == 0 and r["ref"] == "tcplclib_tc2_system/30866571", r
+    rc, r = run(kbdir, "docs_page", "ref=ADSREAD", "library=Tc2_System", "max_chars=60000")
+    assert rc == 0 and r["ref"] == "tcplclib_tc2_system/30866571", r
+    rc, r = run(kbdir, "docs_search", "query=ADSREAD", "library=Tc2_Sytem")
+    assert rc == 1 and r["error"] == "not_found" and "Tc2_System" in r["near"], r
 
 
 def test_kbv_pages_whose_id_is_not_a_number(kbdir):

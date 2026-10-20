@@ -434,6 +434,7 @@ def test_search_groups_and_names_the_users(esi_kb):
         x.search("x", kinds=["devices"])
     with pytest.raises(E.EsiError, match="limit must be 1…100"):
         x.search("x", limit=0)
+    assert x.search("Underrange", limit=500)["clamped"] is True            # N167: a larger limit is used as 100
     with pytest.raises(E.EsiError) as ei:
         x.search("  ")
     assert ei.value.code == "empty_query"
@@ -920,3 +921,26 @@ def test_n156_a_module_is_found_by_its_device(esi_kb):
     con.close()
     assert "AX8206-0210-0107" in body["DeviceMain 0107"] and "AX8206-0210-0107" not in body["DeviceMain 0106"], body
     assert E.FORMAT == "2" and E.state(db, kb, [tc], twincat=False)["format"] == "2"
+
+
+def test_n167_hw_search_pages_through_every_item_once(esi_kb):
+    """N167 (S3, 0.8.14 retest): hw_search had a limit (1-100) and no offset — items past the limit could not be
+    reached, and a larger limit was refused. offset / next_offset page through the items (one per title, in rank
+    order, counted over the index: total); a limit above 100 is used as 100 and said so."""
+    _build(esi_kb)
+    x = E.EsiIndex(esi_kb[2])
+    whole = x.search("S*", limit=100)
+    assert whole["total"] == whole["count"] == 11 and whole["next_offset"] is None and whole["offset"] == 0, whole
+    got, off = [], 0
+    while off is not None:
+        r = x.search("S*", limit=3, offset=off)
+        assert r["count"] <= 3 and r["total"] == 11
+        got += [(i["kind"], i["title"]) for i in r["items"]]
+        off = r["next_offset"]
+    assert got == [(i["kind"], i["title"]) for i in whole["items"]]           # one order, nothing twice or skipped
+    r = x.search("S*", limit=1000)
+    assert r["count"] == 11 and r["clamped"] is True and r["clamped_note"].startswith("limit 1000 is above the maximum")
+    with pytest.raises(E.EsiError, match="past the last hit"):
+        x.search("S*", offset=11)
+    with pytest.raises(E.EsiError, match="offset must be >= 0"):
+        x.search("S*", offset=-1)

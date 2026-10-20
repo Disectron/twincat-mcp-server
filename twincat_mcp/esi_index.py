@@ -1476,6 +1476,7 @@ def message(s: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------------------------- reading
 DETAILS = ("newest", "summary", "full")
 _KINDS = ("device", "object", "diag", "module")
+SEARCH_LIMIT = 100           # items per page of hw_search (N167: a larger limit is used as this, offset pages on)
 # N152 / N154 (0.8.14 retest): the forms every hw_* reader takes a number in — '#x' / '0x' hex, else decimal; an
 # object index, a text id and a ModuleIdent also as 4 hex digits alone (8000 = #x8000) — named when a value is none
 FORMS = {
@@ -1858,10 +1859,11 @@ class EsiIndex:
             out["modules"] = {"count": len(mods), "first": mods[:8]}   # a module's catalogue (AX8000 …)
         return out
 
-    def search(self, query: str, kinds: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
+    def search(self, query: str, kinds: list[str] | None = None, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         """Full-text search over devices (names, PDOs and their entries, PDO assignments), CoE objects (names,
         descriptions, sub-indices), diagnosis messages (text, description, causes, remedies) and modules. FTS5:
-        words are ANDed, "a phrase", prefix*."""
+        words are ANDed, "a phrase", prefix*. N167 (0.8.14 retest): the hits page — offset skips items (one item per
+        title), next_offset is the next page; a limit above 100 is used as 100 and said so (clamped)."""
         q = (query or "").strip()
         if not q:
             raise EsiError("empty query", "empty_query")
@@ -1869,15 +1871,20 @@ class EsiIndex:
         bad = [k for k in want if k not in _KINDS]
         if bad:
             raise EsiError(f"kinds must be of {list(_KINDS)} (got {bad})")
-        if not 1 <= int(limit) <= 100:
-            raise EsiError(f"limit must be 1…100 (got {limit})")
+        clamped = None
+        if int(limit) > SEARCH_LIMIT:
+            clamped, limit = int(limit), SEARCH_LIMIT
+        if not 1 <= int(limit) <= SEARCH_LIMIT:
+            raise EsiError(f"limit must be 1…{SEARCH_LIMIT} (got {limit}); a larger one is used as {SEARCH_LIMIT}")
+        if int(offset) < 0:
+            raise EsiError(f"offset must be >= 0 (got {offset}) — 0 is the first hit, next_offset the next page")
         if read_meta(self.db).get("fts") == "0":
             raise EsiError("this index was built by an SQLite without FTS5: no full-text search (hw_lookup works)",
                            "no_index")
         with self._con() as con:
             sql = (f"SELECT kind, ref, title, snippet(search, 3, '[', ']', '…', 12) AS snip FROM search WHERE search "
                    f"MATCH ? AND kind IN ({','.join('?' * len(want))}) ORDER BY rank LIMIT ?")
-            fetch = int(limit) * 8                     # hits of one device type / one text are shown as one
+            fetch = (int(offset) + int(limit)) * 8     # hits of one device type / one text are shown as one
             try:
                 rows = con.execute(sql, [q, *want, fetch]).fetchall()
                 how = "fts"
@@ -1885,12 +1892,20 @@ class EsiIndex:
                 # not FTS5 syntax (an order code with '-', a '#x…'): the words as one phrase
                 rows = con.execute(sql, ['"' + q.replace('"', '""') + '"', *want, fetch]).fetchall()
                 how = "phrase"
+            expr = q if how == "fts" else '"' + q.replace('"', '""') + '"'
+            # N167: the items in rank order (one per title, at its best hit), counted over the whole index
+            total = con.execute(f"SELECT COUNT(*) FROM (SELECT DISTINCT kind, title FROM search WHERE search MATCH ? "
+                                f"AND kind IN ({','.join('?' * len(want))}))", [expr, *want]).fetchone()[0]
+            firsts: dict[tuple, Any] = {}
+            for r in rows:
+                firsts.setdefault((r["kind"], r["title"]), r)
+            page = list(firsts.values())[int(offset):int(offset) + int(limit)]
+            if not page and int(offset) and total:
+                raise EsiError(f"offset {offset} is past the last hit ({total} items) — offset=0 for the first ones")
             items: list[dict[str, Any]] = []
             groups: dict[tuple, dict[str, Any]] = {}
-            for r in rows:
+            for r in page:
                 key = (r["kind"], r["title"])
-                if key in groups or len(items) >= int(limit):
-                    continue
                 ref = int(r["ref"])
                 it: dict[str, Any] = {"kind": r["kind"], "title": r["title"]}
                 groups[key] = it
@@ -1911,13 +1926,18 @@ class EsiIndex:
                     it.update(module=m["type"], ident=_hx(m["ident"], 8))
                 items.append(it)
             # variants: every hit with that title, counted over the whole index (not only the rows read)
-            expr = q if how == "fts" else '"' + q.replace('"', '""') + '"'
             for (kind, title), it in groups.items():
                 n = con.execute("SELECT COUNT(*) FROM search WHERE search MATCH ? AND kind = ? AND title = ?",
                                 (expr, kind, title)).fetchone()[0]
                 if n > 1:
                     it["variants"] = n
-        out: dict[str, Any] = {"query": q, "kinds": want, "count": len(items), "items": items}
+        nxt = int(offset) + len(items) if int(offset) + len(items) < total else None
+        out: dict[str, Any] = {"query": q, "kinds": want, "count": len(items), "total": total, "offset": int(offset),
+                               "next_offset": nxt, "truncated": nxt is not None, "items": items}
+        if clamped is not None:
+            out["clamped"] = True
+            out["clamped_note"] = (f"limit {clamped} is above the maximum (1-{SEARCH_LIMIT}): {SEARCH_LIMIT} used"
+                                   + (f" — the next hits: offset={nxt}" if nxt is not None else ""))
         if any(i.get("variants") for i in items):
             out["variants_note"] = ("variants: that many hits with the same title (revisions of one device type, or the "
                                     "same text in several catalogues) shown as one — hw_lookup / hw_diag(device=…) "
