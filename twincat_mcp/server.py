@@ -1561,19 +1561,24 @@ class App:
 
     # --- safety ------------------------------------------------------------
     async def permit(self, ctx: Context | None, op: OpClass, action: str, target: str = "",
-                     confirm_token: str | None = None, mode_gate: bool = True) -> None:
+                     confirm_token: str | None = None, mode_gate: bool = True, always_confirm: bool = False) -> None:
         """Check the guard; for CONTROL/DESTRUCTIVE without a token, try to
         ask the human through elicitation before failing. ``mode_gate=False`` skips the
         readonly/guarded gating and only demands the confirmation — for tc_set_mode, which must be
-        able to leave readonly mode with a human's consent."""
+        able to leave readonly mode with a human's consent. ``always_confirm``: readonly refuses it like any other
+        change, and every other mode demands the confirmation (kb_rebuild: the user approves every rebuild, rule 6 —
+        N127: it ran in readonly because it skipped the mode gate to get that)."""
         scope = self.scope(action)
         if op is OpClass.EDIT and action in CODE_EDIT_ACTIONS and self.cfg.safety.edit_requires_config_mode:
             await self._require_config_mode(action, target)
         try:
-            if mode_gate:
-                self.guard.check(op, action=action, target=target, confirm_token=confirm_token, scope=scope)
-            else:
+            if not mode_gate:
                 self.guard.consume_token(confirm_token, action, target, scope)
+            elif always_confirm:
+                self.guard.check_mode(op, action)
+                self.guard.consume_token(confirm_token, action, target, scope)
+            else:
+                self.guard.check(op, action=action, target=target, confirm_token=confirm_token, scope=scope)
             return
         except SafetyError as exc:
             # elicitation only replaces a *missing* token; a wrong/stale/foreign token is a hard error
@@ -2223,10 +2228,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                        "esi": app.spawn_esi_build}[idx], force, dry_run=True)
         if not pre.get("would_start"):
             if pre.get("stale_work_file"):          # not a rebuild: the left work file is discarded, the index unchanged
+                await app.permit(None, OpClass.EDIT, "kb_rebuild", idx)          # N127: a change — not in readonly
                 pre = await asyncio.to_thread(app.spawn_esi_build, force)
             app.audit("kb_rebuild", {"index": idx, "force": force}, OpClass.CONTROL, "not-started", pre)
             return pre
-        await app.permit(ctx, OpClass.CONTROL, "kb_rebuild", idx, confirm_token, mode_gate=False)
+        await app.permit(ctx, OpClass.CONTROL, "kb_rebuild", idx, confirm_token, always_confirm=True)
         if idx == "infosys":
             res = await asyncio.to_thread(app.spawn_infosys_build, force)
         elif idx == "manuals":
@@ -2243,33 +2249,45 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         once the user agreed to D:\\TwinCAT-MCP\\knowledge). The folder is checked: local fixed drive (no network
         share / mapped drive / USB), not inside OneDrive/Dropbox/Google Drive/iCloud, not inside the plugin folder,
         writable, >= 1 GB free — a failing condition is named and nothing is changed. An existing database is never
-        moved or deleted. Without arguments it returns the current location (and changes nothing)."""
-        res = await app.kb_call(app.kb.set_location, path, use_fallback)
-        moved = await asyncio.to_thread(app.docs_retarget)
-        if moved:
-            res["infosys_index"] = moved
-        app.audit("kb_set_location", {"path": path, "use_fallback": use_fallback}, OpClass.EDIT, "ok", res)
-        return res
+        moved or deleted. Without arguments it returns the current location (and changes nothing). A change is
+        refused in readonly mode and audited, as every EDIT tool (N127)."""
+        if not path and not use_fallback:                    # R38: a question, not a change — no gate, no audit
+            return await app.kb_call(app.kb.set_location, None, False)
+        args = {"path": path, "use_fallback": use_fallback}
+        await app.permit(None, OpClass.EDIT, "kb_set_location", path or "fallback")
+
+        async def body() -> dict[str, Any]:
+            res = await app.kb_call(app.kb.set_location, path, use_fallback)
+            moved = await asyncio.to_thread(app.docs_retarget)
+            if moved:
+                res["infosys_index"] = moved
+            return res
+        return await app.confirmed("kb_set_location", args, OpClass.EDIT, body())
 
     @mcp.tool(annotations=EDIT)
     async def kb_add_project(path: str, label: str | None = None) -> dict[str, Any]:
         """Index a project folder for kb_search (cross-project pattern search) — ONLY a folder the user named. Reads
-        .TcPOU/.TcDUT/.TcGVL/.TcIO beneath it into the knowledge database; nothing is indexed by default."""
-        res = await app.kb_call(app.kb.add_project, path, label)
-        app.audit("kb_add_project", {"path": path}, OpClass.EDIT, "ok", res)
-        return res
+        .TcPOU/.TcDUT/.TcGVL/.TcIO beneath it into the knowledge database; nothing is indexed by default. Refused: the
+        plugin's folders, the knowledge folder, a folder inside or around one already indexed (its units would be
+        there twice). The answer names the files that could not be read (`parse_errors`) and the files no PLC project
+        compiles (`not_in_project`). Refused in readonly mode; audited (N127)."""
+        await app.permit(None, OpClass.EDIT, "kb_add_project", path)
+        return await app.confirmed("kb_add_project", {"path": path, "label": label}, OpClass.EDIT,
+                                   app.kb_call(app.kb.add_project, path, label))
 
     @mcp.tool(annotations=EDIT)
     async def kb_remove_project(path: str) -> dict[str, Any]:
-        """Remove a project folder from the knowledge base (index entries only; the files are untouched)."""
-        res = await app.kb_call(app.kb.remove_project, path)
-        app.audit("kb_remove_project", {"path": path}, OpClass.EDIT, "ok", res)
-        return res
+        """Remove a project folder from the knowledge base (index entries only; the files are untouched). Refused in
+        readonly mode; audited (N127)."""
+        await app.permit(None, OpClass.EDIT, "kb_remove_project", path)
+        return await app.confirmed("kb_remove_project", {"path": path}, OpClass.EDIT,
+                                   app.kb_call(app.kb.remove_project, path))
 
     @mcp.tool(annotations=EDIT)
     async def kb_reindex(path: str | None = None) -> dict[str, Any]:
-        """Re-index one project folder (or every changed one) after edits."""
-        return await app.kb_call(app.kb.reindex, path)
+        """Re-index one project folder (or every changed one) after edits. Refused in readonly mode; audited (N127)."""
+        await app.permit(None, OpClass.EDIT, "kb_reindex", path or "every changed folder")
+        return await app.confirmed("kb_reindex", {"path": path}, OpClass.EDIT, app.kb_call(app.kb.reindex, path))
 
     @mcp.tool(annotations=READ)
     async def kb_search(query: str, kinds: list[str] | None = None, project: str | None = None, limit: int = 20) -> dict[str, Any]:

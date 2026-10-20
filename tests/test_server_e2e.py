@@ -1526,3 +1526,43 @@ def test_n42_an_xae_token_is_bound_to_the_machine_not_the_ads_port(tmp_path):
     assert app.scope("ads_write") == "192.168.1.5.1.1:851" and app.scope() == "192.168.1.5.1.1:851"
     tok = app.guard.request_token("xae_plc", "download:TIPC^Plc2^Plc2 Project@192.168.1.5.1.1", app.scope("xae_plc"))
     assert ":851" not in tok["scope"] and ":851" not in tok["note"]
+
+
+@pytest.mark.anyio
+async def test_n127_kb_changes_are_gated_by_the_mode_and_audited(monkeypatch, project_dir, tmp_path):
+    """N127 (0.8.13 retest, S1): kb_set_location / kb_add_project / kb_remove_project / kb_reindex are EDIT tools but
+    never asked the guard — kb_reindex rewrote 47 units in readonly while xae_pou_set was refused — and kb_reindex
+    left no audit record; kb_rebuild skipped the mode gate (to always ask) and so was not blocked by readonly."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="readonly", max_mode="guarded")
+    cfg.knowledge.location = str(tmp_path / "kb")
+    from tests.test_knowledge import ESI
+    (tmp_path / "esi").mkdir()
+    (tmp_path / "esi" / "Beckhoff EL2xxx.xml").write_text(ESI, encoding="utf-8")
+    cfg.knowledge.esi_dirs = [str(tmp_path / "esi")]
+    async with client_for(build_server(cfg)) as s:
+        r = payload(await s.call_tool("kb_set_location", {}))           # a question: answered in readonly
+        assert r["changed"] is False
+        for tool, args in (("kb_add_project", {"path": str(project_dir)}), ("kb_reindex", {}),
+                           ("kb_remove_project", {"path": str(project_dir)}),
+                           ("kb_set_location", {"path": str(tmp_path / "kb2")}),
+                           ("kb_rebuild", {"index": "esi", "force": True})):
+            res = await s.call_tool(tool, args)
+            assert res.is_error and "readonly mode" in text(res), (tool, text(res))
+        assert not (tmp_path / "kb2").exists()
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 20}))
+        refused = {a["tool"] for a in audit if a["outcome"] == "refused"}
+        assert {"kb_add_project", "kb_reindex", "kb_remove_project", "kb_set_location", "kb_rebuild"} <= refused, audit
+    cfg.safety.mode = "guarded"
+    async with client_for(build_server(cfg)) as s:
+        r = payload(await s.call_tool("kb_add_project", {"path": str(project_dir), "label": "p"}))
+        assert r["reindexed"][0]["units"] >= 8
+        payload(await s.call_tool("kb_reindex", {"path": "p"}))
+        payload(await s.call_tool("kb_remove_project", {"path": "p"}))
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 20}))
+        ok = [(a["tool"], a["outcome"]) for a in audit if a["tool"].startswith("kb_")]
+        assert ("kb_add_project", "ok") in ok and ("kb_reindex", "ok") in ok and ("kb_remove_project", "ok") in ok, ok
+        res = await s.call_tool("kb_reindex", {"path": "nothing-like-this"})
+        assert res.is_error
+        audit = payload(await s.call_tool("tc_audit_tail", {"n": 3}))
+        assert audit[-1]["tool"] == "kb_reindex" and audit[-1]["outcome"] == "error", audit
