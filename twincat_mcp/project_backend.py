@@ -501,11 +501,13 @@ class ProjectIndex:
         solutions = [str(p) for p in self.root.rglob("*.sln")]
         tsproj_files, ts_ignored = _solution_tsproj([Path(x) for x in solutions], list(self.root.rglob("*.tsproj")))
         ts = [_parse_tsproj(p) for p in tsproj_files]
-        plcproj, left_out, plc_note = _in_project(ts, [self._parse_plcproj(pp) for pp in self.root.rglob("*.plcproj")])
+        # sorted: the order of a directory walk is the file system's (NTFS by name, ext4 not) — the PLC projects' order
+        # decides the first owner of a linked file and the order names are given in, the same on every machine
+        plcproj, left_out, plc_note = _in_project(ts, [self._parse_plcproj(pp) for pp in sorted(self.root.rglob("*.plcproj"))])
         members = _compiled_files(plcproj)
         n_files = 0
         outside: list[str] = []
-        for p in self.root.rglob("*"):
+        for p in sorted(self.root.rglob("*")):        # sorted: which of two files of one name is indexed last
             if p.suffix.lower() in SRC_EXT and p.is_file():
                 if "_Boot" in p.parts or "_CompileInfo" in p.parts or "_Libraries" in p.parts:
                     continue
@@ -898,7 +900,7 @@ class ProjectIndex:
             cands = [x for f, us in self._by_file.items() if match(f) for k, x in us.items() if k == key]
             if len(cands) != 1:
                 raise ProjectError(f"'{pin}@{name}' ({what}) matches {len(cands)} units"
-                                   + (f"; the PLC projects: {self.plc_names()}" if not cands else ""))
+                                   + (f"; the PLC projects: {sorted(self.plc_names())}" if not cands else ""))
             return cands[0]
         u = self.units.get(key)
         if u is None and not exact:
@@ -1140,7 +1142,7 @@ class ProjectIndex:
                 if u0 is None:
                     raise ProjectError(f"{scope!r} is not declared in PLC project {Path(on_port).stem} (ADS port {port})"
                                        f"{' — or twice in it' if scope.strip().lower() in self.plc_units(on_port)[1] else ''}"
-                                       f"; the PLC projects: {self.plc_names()}")
+                                       f"; the PLC projects: {sorted(self.plc_names())}")
             else:
                 u0 = self.named(scope, port) if scope.strip().lower() in self.duplicates else None
             roots = [u0 if u0 is not None else self.get_unit(scope)]
