@@ -2298,10 +2298,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         FB_CounterModule); a unit whose code holds the words before one that has them only in comments
         (match_in='comments'); only when none has them all, units with some words
         (match='some words', with the words each unit holds; words on no unit or on most units are not used and
-        are listed). Stop words ('how', 'to', 'the') are not searched; a query of stop words only is refused. A copy
-        name (PRG_X_9) that no unit has falls back to the name it was copied from. "quoted text" is a phrase. kinds
-        (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION, METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT
-        (= every data type) …; project = the folder (any spelling) or its label; limit 1–200. An error message gives
+        are listed). A unit that declares the name (variable, constant, member, enum value, its own name) comes first
+        (`declares`). Stop words ('how', 'to', 'the') and, in a query of several words, single characters are not
+        searched; a query of stop words only is refused. There are no query operators: OR / AND / NOT / NEAR, '-',
+        '^', '*' are not read as such (`operators_note`). A copy name (PRG_X_9) that no unit has falls back to the
+        name it was copied from. "quoted text" is a phrase. kinds (checked): PROGRAM, FUNCTION_BLOCK/FB, FUNCTION,
+        POU (= those three), METHOD, PROPERTY, ACTION, INTERFACE, STRUCT, ENUM, GVL, DUT (= every data type) …;
+        project = the folder (any spelling) or its label; limit 1–200. `stale`: folders changed, renamed or deleted
+        since they were indexed — their hits are those of the last indexing (kb_reindex). An error message gives
         its known cause/fix (ADS errors 6, 7, 1793, 1796, 1797, 1799, 1808, 1861 in any notation — ADSError 1861,
         ADS error 1861, 0x745 —, license, XAE busy / dialog / disconnected, logged in, compiler: identifier not
         defined, cannot convert type, unknown type) and is searched only for the names it quotes.

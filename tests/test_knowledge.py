@@ -898,3 +898,50 @@ def test_n133_a_changed_renamed_or_deleted_folder_is_reported(kb, project_dir, t
     r = k.search("FB_Valve")
     assert r["hits"] and r["stale"][0]["state"].startswith("folder not found"), r
     assert k.status()["projects"][0]["state"].startswith("folder not found")
+
+
+def test_n131_n134_n135_declaring_unit_first_kind_pou_and_query_handling(kb, tmp_path):
+    """N131: the declaring unit was not preferred (MAX_ALARMS → GVL_Param 6th of 7, nErrorCode → its struct last).
+    N134: kinds=['POU'] never matched a parsed unit. N135: 'OR' silently meant AND; 'alarm OR NEAR(state) -reset* ^x'
+    searched only 'x'; single letters were search words; '_' was 'no unit contains _'; a phrase in a string literal
+    was labelled match_in 'comments'."""
+    k, tmp = kb
+    k.set_location(str(tmp / "kbdata"))
+    src = tmp_path / "decl"
+    gvl = src / "GVL_Param.TcGVL"
+    src.mkdir(parents=True)
+    gvl.write_text('<?xml version="1.0" encoding="utf-8"?><TcPlcObject><GVL Name="GVL_Param"><Declaration><![CDATA['
+                   "VAR_GLOBAL CONSTANT\n    MAX_ALARMS : INT := 10;\nEND_VAR]]></Declaration></GVL></TcPlcObject>",
+                   encoding="utf-8")
+    for i in range(6):
+        _pou(src, f"FB_User{i}", f"FUNCTION_BLOCK FB_User{i}\nVAR\n    aList : ARRAY[1..GVL_Param.MAX_ALARMS] OF INT;\n"
+             "    stStatus : ST_ModuleStatus;\nEND_VAR",
+             "IF stStatus.nErrorCode > MAX_ALARMS THEN stStatus.nErrorCode := 0; END_IF")
+    (src / "ST_ModuleStatus.TcDUT").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><DUT Name="ST_ModuleStatus"><Declaration><![CDATA['
+        "TYPE ST_ModuleStatus :\nSTRUCT\n    bBusy : BOOL;\n    nErrorCode : DINT;\nEND_STRUCT\nEND_TYPE]]>"
+        "</Declaration></DUT></TcPlcObject>", encoding="utf-8")
+    _pou(src, "FB_Edge", "FUNCTION_BLOCK FB_Edge\nVAR\n    sMsg : STRING := 'rising edge seen';\nEND_VAR",
+         "bReset := bEnable;")
+    _pou(src, "FB_Edge2", "FUNCTION_BLOCK FB_Edge2\nVAR\nEND_VAR", "// on a rising edge\n;")
+    k.add_project(str(src), "decl")
+    r = k.search("MAX_ALARMS")
+    assert r["hits"][0]["unit"] == "GVL_Param" and r["hits"][0]["declares"], [h["unit"] for h in r["hits"]]
+    r = k.search("nErrorCode")
+    assert r["hits"][0]["unit"] == "ST_ModuleStatus" and r["hits"][0]["declares"], [h["unit"] for h in r["hits"]]
+    assert len(r["hits"]) == 7 and not any(h.get("declares") for h in r["hits"][1:]), r
+    # N134
+    assert {h["unit"] for h in k.search("nErrorCode", kinds=["POU"])["hits"]} == {f"FB_User{i}" for i in range(6)}
+    assert [h["unit"] for h in k.search("nErrorCode", kinds=["STRUCT"])["hits"]] == ["ST_ModuleStatus"]
+    # N135
+    r = k.search("bEnable OR bReset")
+    assert "not a search operator" in r["words_ignored"]["OR"] and "operators_note" in r, r
+    assert [h["unit"] for h in r["hits"]] == ["FB_Edge"], r
+    r = k.search("MAX_ALARMS OR NEAR(nErrorCode) -bBusy* ^x")
+    assert "single character" in r["words_ignored"]["x"] and "x" not in r.get("words_used", []), r
+    assert r["operators_note"].startswith("kb_search has no query operators"), r
+    with pytest.raises(K.KnowledgeError, match="no searchable word"):
+        k.search("_")
+    r = k.search('"rising edge"')
+    labels = {h["unit"]: h.get("match_in") for h in r["hits"]}
+    assert labels == {"FB_Edge": "string literals or comments", "FB_Edge2": "comments"}, r

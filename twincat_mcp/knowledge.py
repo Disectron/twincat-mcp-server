@@ -64,7 +64,12 @@ def docs_skill_path() -> Path | None:
 # project unit kinds kb_search can filter on (aliases: DUT = every data type, FB = FUNCTION_BLOCK)
 UNIT_KINDS = ("PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "METHOD", "PROPERTY", "GET", "SET", "ACTION", "TRANSITION",
               "INTERFACE", "STRUCT", "UNION", "ENUM", "ALIAS", "GVL", "POU", "DUT")
-KIND_ALIASES = {"FB": ("FUNCTION_BLOCK",), "DUT": ("DUT", "STRUCT", "UNION", "ENUM", "ALIAS"), "ITF": ("INTERFACE",)}
+# N134: 'POU' — the IEC program organisation units; the kind POU itself is only a POU file whose header did not parse
+KIND_ALIASES = {"FB": ("FUNCTION_BLOCK",), "DUT": ("DUT", "STRUCT", "UNION", "ENUM", "ALIAS"), "ITF": ("INTERFACE",),
+                "POU": ("PROGRAM", "FUNCTION_BLOCK", "FUNCTION", "POU")}
+# N135: what a search engine's query language would read as operators — kb_search has none
+_OPERATOR_WORDS = frozenset({"OR", "AND", "NOT", "NEAR"})
+_OPERATOR_SYNTAX = re.compile(r"(?:^|\s)[-+^](?=\w)|(?<=\w)\*|\bNEAR\s*\(|(?<![\w])(?:OR|AND|NOT)(?![\w])")
 
 LOCATION_CONDITIONS = [
     "a folder on a local fixed drive of this PC (not a network share, mapped drive, NAS or USB stick — SQLite "
@@ -937,8 +942,9 @@ class Knowledge:
         q = (query or "").strip()
         if not q:
             raise KnowledgeError("empty query — give words from the code, a unit name or an error message")
-        phrases = [x for x in re.findall(r'"([^"]+)"', q) if re.search(r"\w", x)]
-        words = [w for w in re.findall(r"\w+", re.sub(r'"[^"]*"', " ", q))]
+        phrases = [x for x in re.findall(r'"([^"]+)"', q) if re.search(r"[^\W_]", x)]
+        bare = re.sub(r'"[^"]*"', " ", q)
+        words = [w for w in re.findall(r"\w+", bare) if re.search(r"[^\W_]", w)]     # N135: '_' alone is no word
         if not phrases and not words:
             # R37: ':=' used to reach FTS as MATCH '' and fail with an empty message
             raise KnowledgeError(f"the query {q!r} has no searchable word: kb_search matches whole words and word "
@@ -955,18 +961,25 @@ class Knowledge:
                 want_kinds.append(ku)
             else:
                 raise KnowledgeError(f"unknown kind {k!r}; kinds: {', '.join(UNIT_KINDS)} (FB = FUNCTION_BLOCK, "
-                                     "DUT = every data type)")                                       # R39
+                                     "DUT = every data type, POU = PROGRAM / FUNCTION_BLOCK / FUNCTION)")  # R39
         # N71: words of the sentence around the names ('how', 'to', 'the', 'cannot') pick nothing in code: they are
         # not searched for. A query of nothing else is refused (it matched every unit with 'to' in a comment)
         ignored: dict[str, str] = {}
         informative: list[str] = []
         for w in words:
-            if _fold(w) in STOP_WORDS:
+            if w in _OPERATOR_WORDS:
+                # N135: 'bEnable OR bReset' was searched as bEnable AND bReset with 'OR' listed as a stop word
+                ignored[w] = ("not a search operator — kb_search lists the units with EVERY other word (in code "
+                              f"{w} is an ST keyword); for either of two words, run one search per word")
+            elif _fold(w) in STOP_WORDS:
                 ignored[w] = "stop word"
+            elif len(w) == 1:
+                ignored[w] = "a single character — not searched in a query of several words (as a prefix it is in "\
+                             "nearly every unit)"                                          # N135: 'x', 'ü'
             else:
                 informative.append(w)
         if not informative and not phrases and len(words) == 1:
-            informative, ignored = list(words), {}       # one word ('WHILE', 'On'): searched as written
+            informative, ignored = list(words), {}       # one word ('WHILE', 'On', 'i'): searched as written
         err = known_error(q)
         if err and _ERROR_MARKER.search(q):
             # N71: an error message: its words ('Cannot convert type … to type …') are not code words — they matched
@@ -1014,6 +1027,10 @@ class Knowledge:
                             base_note = (f"no unit contains {', '.join(bases)}; these contain the name it is a copy "
                                          f"of ({', '.join(bases.values())}) — TwinCAT names copies <name>_<n>")
         out: dict[str, Any] = {"query": q, "hits": hits, "projects_indexed": nproj}
+        if _OPERATOR_SYNTAX.search(bare):
+            out["operators_note"] = ("kb_search has no query operators: OR / AND / NOT / NEAR(…), '-', '+', '^' and "
+                                     "'*' are not read as such — every other word is searched, as a word and as a word "
+                                     "prefix, and a unit must hold all of them (\"quoted text\" is a phrase)")
         if stale:
             out["stale"] = stale
         if ignored or info.get("ignored"):
@@ -1061,9 +1078,11 @@ class Knowledge:
         if kinds:
             where_extra += f" AND kind IN ({','.join('?' * len(kinds))})"
             params_extra += kinds
+        def pre(w: str) -> str:            # N135: a one-character prefix is in nearly every unit — that word exact
+            return ph(w) + ("*" if len(w) > 1 else "")
         info: dict[str, Any] = {}
         exact = [ph(t) for t in phrases + words]
-        prefix = [ph(t) for t in phrases] + [ph(w) + "*" for w in words]
+        prefix = [ph(t) for t in phrases] + [pre(w) for w in words]
         tiers = [("all words", " AND ".join(exact), phrases + words)]
         if words:
             tiers.append(("all words (as prefixes)", " AND ".join(prefix), phrases + words))
@@ -1072,7 +1091,7 @@ class Knowledge:
             used, ignored, common = [], {}, []
             dfs: dict[str, int] = {}
             for t in phrases + words:
-                df = dfs[t] = self._count(con, (ph(t) if t in phrases else ph(t) + "*"), where_extra, params_extra, t)
+                df = dfs[t] = self._count(con, (ph(t) if t in phrases else pre(t)), where_extra, params_extra, t)
                 if df == 0:
                     ignored[t] = "on no unit"
                 elif total >= 25 and df > COMMON_SHARE * total:
@@ -1086,7 +1105,7 @@ class Knowledge:
                 common = [t for t in common if t not in used]
             info.update(ignored=ignored, too_common=common, used=used)
             if used:
-                tiers.append(("some words", " OR ".join(ph(t) if t in phrases else ph(t) + "*" for t in used), used))
+                tiers.append(("some words", " OR ".join(ph(t) if t in phrases else pre(t) for t in used), used))
         hits: list[dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
         words_cols = self._fts and self._fts_words
@@ -1143,15 +1162,20 @@ class Knowledge:
             return hits, info
         info["tier"] = tiers[min(tier_of.values())][0]
         in_code: set[int] | None = None
+        in_comments: set[int] = set()
         if code_cols:
             # N102: a unit whose code holds the words before one that has them only in its comments
             try:
                 in_code = {x[0] for x in con.execute(f"SELECT rowid FROM units_fts WHERE units_fts MATCH ?{where_extra}",
                                                      [f"{code_cols} : ({used_expr})", *params_extra])}
+                in_comments = {x[0] for x in con.execute(f"SELECT rowid FROM units_fts WHERE units_fts MATCH ?{where_extra}",
+                                                         [f"{{comments}} : ({used_expr})", *params_extra])}
             except sqlite3.OperationalError:
                 in_code = None
+        declares = self._declaring(con, rows, words)
         order = {id(r): k for k, r in enumerate(DS.title_order(rows, " ".join(phrases + words), "name"))}
-        rows = sorted(rows, key=lambda r: (in_code is not None and r["rid"] not in in_code, tier_of[r["rid"]], order[id(r)]))
+        rows = sorted(rows, key=lambda r: (in_code is not None and r["rid"] not in in_code, -declares.get(r["rid"], 0),
+                                           tier_of[r["rid"]], order[id(r)]))
         for r in rows:
             key = (r["project"], r["name"], r["file"])
             if key in seen:
@@ -1161,13 +1185,41 @@ class Knowledge:
             h = {"project": r["project"], "unit": r["name"], "kind": r["kind"], "file": r["file"],
                  "declaration": r["decl"], "code": r["impl"], "match": label}
             if in_code is not None and r["rid"] not in in_code:
-                h["match_in"] = "comments"         # the words are there, not every one in the code
+                # the words are there, not every one in the code — N135: in a string literal is not 'comments'
+                h["match_in"] = "comments" if r["rid"] in in_comments else "string literals or comments"
+            if declares.get(r["rid"]):
+                h["declares"] = True
             if label == "some words":
                 h["matched"] = [t for t in terms if self._row_has(con, r["rid"], t, t in phrases)]
             hits.append(h)
             if len(hits) >= limit:
                 break
         return hits, info
+
+    def _declaring(self, con: sqlite3.Connection, rows: list[sqlite3.Row], words: list[str]) -> dict[int, int]:
+        """N131: how many of the query's identifiers each unit declares — its name, a variable / constant / member /
+        parameter of its declaration (MAX_ALARMS : INT := 10), an enum value of an ENUM — so that the declaring unit
+        comes first ('MAX_ALARMS' listed GVL_Param 6th of 7, 'nErrorCode' its struct last)."""
+        idents = [w for w in words if re.fullmatch(r"[A-Za-z_]\w*", w)]
+        if not idents or not rows:
+            return {}
+        tbl = "units_fts" if self._fts else "units"
+        pats = [(w.lower(), re.compile(rf"(?<![\w.]){re.escape(w)}\s*(?:,\s*[A-Za-z_]\w*\s*)*(?:AT\s+%[\w.*]+\s*)?:(?!=)",
+                                       re.I),
+                 re.compile(rf"(?<![\w.]){re.escape(w)}\s*(?::=\s*[^,;)]+)?\s*[,)]", re.I)) for w in idents]
+        out: dict[int, int] = {}
+        rids = [r["rid"] for r in rows]
+        for i in range(0, len(rids), 500):
+            part = rids[i:i + 500]
+            for rid, name, kind, decl in con.execute(f"SELECT rowid, name, kind, declaration FROM {tbl} "
+                                                     f"WHERE rowid IN ({','.join('?' * len(part))})", part):
+                body = _COMMENT_OR_STRING.sub(" ", decl or "")
+                short = (name or "").rsplit(".", 1)[-1].lower()
+                n = sum(1 for w, var, enum in pats
+                        if short == w or var.search(body) or (kind == "ENUM" and enum.search(body)))
+                if n:
+                    out[rid] = n
+        return out
 
     _LIKE_ONE = ("(name LIKE ? ESCAPE '\\' OR declaration LIKE ? ESCAPE '\\' OR implementation LIKE ? ESCAPE '\\' "
                  "OR comments LIKE ? ESCAPE '\\')")
