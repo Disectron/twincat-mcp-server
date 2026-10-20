@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import contextlib
+import json
 import os
 import re
 import sys
@@ -112,6 +113,19 @@ class XaeExplained(XaeError):
     of 0.8.14: '… the project is logged in, application …' got 'XAE is logged in … log out first' appended)."""
 
 
+class XaeBusy(XaeError):
+    """N174: the shell rejected the call (RPC_E_CALL_REJECTED / RPC_E_SERVERCALL_RETRYLATER) for all of com_retry_s,
+    or a dialog holds it — the call did not run. Never read as 'no value' by a read that has a fallback (_get)."""
+
+
+class XaeGone(XaeError):
+    """N174: the shell went away (closed, crashed) and could not be reached again."""
+
+
+_BUSY_HR = (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER)
+_GONE_HR = (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE)
+
+
 class _ActedUnconfirmed(XaeExplained):
     """A PLC online command was accepted but its state was not read back: it may have acted — never retried elsewhere."""
 
@@ -163,34 +177,51 @@ class XaeBackend:
             raise XaeError("XAE backend needs Windows with TwinCAT XAE and pywin32 installed "
                            "(pip install pywin32). This process is running on " + sys.platform)
 
-    def _retry(self, fn: Callable[[], Any], what: str = "COM call", once: bool = False) -> Any:
+    def _retry(self, fn: Callable[[], Any], what: str = "COM call", once: bool = False,
+               retry_s: float | None = None) -> Any:
         """Retry COM calls while the shell is busy (a rejected call ran nothing). once=True: an action that must not
         run twice (activate, restart, an online command, create / delete / import, a shell command): when the shell
         goes away DURING it, whether it acted is unknown — the server re-attaches, but the call is not repeated on
-        the new shell (review of 0.8.14: the retry, which now reaches the live shell, could run it a second time)."""
+        the new shell (review of 0.8.14: the retry, which now reaches the live shell, could run it a second time).
+        retry_s: how long a busy shell is asked again (default xae.com_retry_s)."""
+        window = self.cfg.com_retry_s if retry_s is None else retry_s
         t_start = time.time()
-        deadline = t_start + self.cfg.com_retry_s
+        deadline = t_start + window
         delay = 0.25
+        reattached = refreshed = False
         while True:
             try:
                 return fn()
             except Exception as exc:  # noqa: BLE001
                 hr = getattr(exc, "hresult", None)
-                if hr in (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER) and time.time() - t_start > min(1.0, self.cfg.com_retry_s / 2):
+                if hr in _BUSY_HR and time.time() - t_start > min(1.0, window / 2):
                     # busy for more than a second: if a modal dialog has the shell, retrying for a minute is pointless
+                    # (N173: a modal window of any class; one that waits for an answer — a progress window that
+                    # offers only Cancel goes away by itself, so the call is asked again)
                     dlg = self._modal_dialogs()
                     if dlg:
+                        from . import dialogs as _dlg
                         d = dlg[0]
-                        raise XaeError(
-                            f"{what}: BLOCKED BY DIALOG '{d.get('title')}' — buttons {d.get('buttons')}; text: "
+                        raise XaeBusy(
+                            f"{what}: BLOCKED BY DIALOG {_dlg.label(d)} — {_dlg.buttons_text(d)}; text: "
                             f"{str(d.get('text', ''))[:300]!r}. The shell is waiting for an answer, so whether the action ran "
-                            "is unknown until the dialog is answered (xae_dialog_resolve(button=...)), then check the result."
+                            "is unknown until the dialog is answered (xae_dialog_resolve(button=...)"
+                            + ("" if d.get("buttons") is not None else "; its buttons can't be pressed by the tool — "
+                               "close it in XAE") + "), then check the result. blocked_by_dialog: "
+                            + json.dumps({k: d.get(k) for k in ("hwnd", "title", "class", "buttons", "buttons_note")
+                                          if k in d}, default=str)
                         ) from exc
-                if hr in (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER) and time.time() < deadline:
+                if hr in _BUSY_HR and time.time() < deadline:
                     time.sleep(delay)
                     delay = min(delay * 1.5, 2.0)
                     continue
-                if hr in (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE) and once:
+                if hr in _BUSY_HR:
+                    # N174: a rejected call ran nothing — said as that, never as a defect or a missing value
+                    raise XaeBusy(
+                        f"{what}: XAE is busy (call rejected, 0x{hr & 0xFFFFFFFF:08X}) and did not run this call — it "
+                        f"was asked again for {window:g} s; repeat it. If it keeps happening, a modal "
+                        "window or a long build holds the shell (xae_dialogs)") from exc
+                if hr in _GONE_HR and once:
                     self.dte = self.sysman = None
                     where = "the server could not re-attach yet"
                     if not getattr(self, "_reattaching", False):
@@ -208,25 +239,29 @@ class XaeBackend:
                         f"{what}: the XAE shell went away during the call (closed or crashed, 0x{hr & 0xFFFFFFFF:08X}) — "
                         f"whether it acted is unknown, so it is not repeated ({where}). Check xae_status / ads_status "
                         "before you run it again.") from exc
-                if hr in (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE):
+                if hr in _GONE_HR:
                     self.dte = self.sysman = None
-                    if not getattr(self, "_reattaching", False):
-                        # the solution was closed and reopened (or the shell restarted): find the live shell and retry once
-                        self._reattaching = True
-                        try:
-                            self.attach(_internal=True)
-                            log.warning("%s: DTE proxy was dead (0x%08X); re-attached to the running shell and retrying", what, hr & 0xFFFFFFFF)
-                            self.reattach_note = (f"the XAE shell this server was attached to went away (closed or "
-                                                  f"restarted); re-attached to {self.bound_solution or 'the running shell'}"
-                                                  + (f" (pid {self.pid})" if self.pid else ""))
-                            return fn()
-                        except Exception as exc2:  # noqa: BLE001
-                            self.dte = self.sysman = None
-                            raise XaeError(f"{what}: XAE shell disconnected (closed or restarted); re-attach did not help: "
-                                           f"{_com_msg(exc2) if hasattr(exc2, 'hresult') else exc2}. Re-run xae_attach.") from exc2
-                        finally:
-                            self._reattaching = False
-                    raise XaeError(f"{what}: XAE shell disconnected (closed or crashed). Re-run xae_attach.") from exc
+                    if reattached:
+                        raise XaeGone(f"{what}: XAE shell disconnected (closed or restarted); re-attach did not help: "
+                                      f"{_com_msg(exc)}. Re-run xae_attach.") from exc
+                    if getattr(self, "_reattaching", False):
+                        raise XaeGone(f"{what}: XAE shell disconnected (closed or crashed). Re-run xae_attach.") from exc
+                    # the solution was closed and reopened (or the shell restarted): find the live shell and retry once
+                    self._reattaching = True
+                    try:
+                        self.attach(_internal=True)
+                    except Exception as exc2:  # noqa: BLE001
+                        self.dte = self.sysman = None
+                        raise XaeGone(f"{what}: XAE shell disconnected (closed or restarted); re-attach did not help: "
+                                      f"{_com_msg(exc2) if hasattr(exc2, 'hresult') else exc2}. Re-run xae_attach.") from exc2
+                    finally:
+                        self._reattaching = False
+                    log.warning("%s: DTE proxy was dead (0x%08X); re-attached to the running shell and retrying", what, hr & 0xFFFFFFFF)
+                    self.reattach_note = (f"the XAE shell this server was attached to went away (closed or "
+                                          f"restarted); re-attached to {self.bound_solution or 'the running shell'}"
+                                          + (f" (pid {self.pid})" if self.pid else ""))
+                    reattached = True
+                    continue        # N174: the call on the live shell is retried here too (it rejected it: busy)
                 if self._stale_sysman(exc) and once:
                     # re-review of 0.8.14: E_POINTER is also a NullReferenceException TwinCAT's managed code throws
                     # AFTER acting — an action is never repeated on it. (_on_sm / _on_item refresh a stale System
@@ -235,27 +270,45 @@ class XaeBackend:
                     raise XaeExplained(
                         f"{what}: failed with {_com_msg(exc)} — whether it acted is unknown, so it is not repeated. "
                         "Check xae_status / the XAE tree before you run it again.") from exc
-                if self._stale_sysman(exc) and not getattr(self, "_refreshing_sm", False):
+                if self._stale_sysman(exc) and not refreshed and not getattr(self, "_refreshing_sm", False):
                     # N9: the solution was closed and reopened; the cached ITcSysManager belongs to the old one
                     self._refreshing_sm = True
                     try:
                         self.sysman = None
                         self._find_sysman()
-                        log.warning("%s: System Manager object was stale (solution reopened); refreshed and retrying", what)
-                        return fn()
+                        refreshed = True
+                    except (XaeBusy, XaeGone):
+                        raise
                     except Exception:  # noqa: BLE001
                         pass
                     finally:
                         self._refreshing_sm = False
+                    if refreshed:
+                        log.warning("%s: System Manager object was stale (solution reopened); refreshed and retrying", what)
+                        continue    # N174: through this loop (a busy shell is asked again)
                 msg = _com_msg(exc)
                 if re.search(r"(?<!not )(?<!n't )logged in(?:to)?\b", msg, re.I):     # not 'is not logged in'
                     msg += " — XAE is logged in to the PLC; the project cannot be changed online. Log out first: xae_plc('logout')."
                 raise XaeError(f"{what}: {msg}") from exc
 
+    def _get(self, fn: Callable[[], Any], what: str, default: Any = None) -> Any:
+        """N174 (0.8.14 retest): a COM read that has a fallback. A member the object does not have (or another failure of
+        that object) gives `default`, as the bare try/except around it did — but a busy shell is asked again (_retry),
+        and a shell that stays busy, a dialog that holds it or a shell that went away raises: never read as 'no value'
+        (a missing tree item, no solution, an empty Error List)."""
+        try:
+            return self._retry(fn, what)
+        except (XaeBusy, XaeGone):
+            raise
+        except XaeError:
+            return default
+
     def _modal_dialogs(self) -> list[dict[str, Any]]:
+        """The shell's modal windows that wait for an answer (N173: of any class; a progress window that offers only
+        Cancel goes away by itself — the call is asked again until com_retry_s)."""
         try:
             from . import dialogs as _dlg
-            return [d.to_dict() for d in _dlg.list_dialogs(self.pid)]
+            return [d for d in (x.to_dict() for x in _dlg.list_dialogs(self.pid)) if _dlg.awaits(d)]
         except Exception:  # noqa: BLE001 — no dialog enumeration (non-Windows, no pid)
             return []
 
@@ -318,15 +371,25 @@ class XaeBackend:
                 self.pid = int(pick["moniker"].rsplit(":", 1)[1])
             except ValueError:
                 self.pid = None
-        if self.pid is None and sys.platform == "win32":
+        # N173: the shell's main window — its being disabled is what says a modal window holds the shell (any class);
+        # N174: read through _retry like every COM access (a hint only: a busy shell is asked for 5 s, not com_retry_s)
+        try:
+            hwnd: int | None = int(self._retry(lambda: self.dte.MainWindow.HWnd, "DTE.MainWindow.HWnd", retry_s=5)) or None
+        except (XaeError, TypeError, ValueError) as exc:
+            hwnd = None
+            log.info("XAE main window unknown (%s): its visible unowned windows stand for it", exc)
+        if self.pid is None and hwnd and sys.platform == "win32":
             # launched via Dispatch (no ROT moniker): take the pid from the shell's main window, so the
             # dialog watchdog has a process scope — without one it deliberately watches nothing
             try:
                 import win32process  # type: ignore
-                hwnd = int(self.dte.MainWindow.HWnd)
                 self.pid = int(win32process.GetWindowThreadProcessId(hwnd)[1]) or None
             except Exception as exc:  # noqa: BLE001
                 log.warning("XAE pid unknown (%s); dialog watchdog disabled until re-attach", exc)
+        elif self.pid is None and sys.platform == "win32":
+            log.warning("XAE pid unknown; dialog watchdog disabled until re-attach")
+        from . import dialogs as _dlg
+        _dlg.set_main_window(self.pid, hwnd)
         if self.cfg.dialog_watchdog:
             self.watchdog.start(self.pid)
 
@@ -343,11 +406,8 @@ class XaeBackend:
             self._find_sysman()
         else:
             # N9: a solution closed and reopened behind us leaves the cached System Manager stale — compare the
-            # solution that is open now with the one the cached object came from
-            try:
-                cur = self.dte.Solution.FullName if self.dte is not None else None
-            except Exception:  # noqa: BLE001
-                cur = None
+            # solution that is open now with the one the cached object came from (N174: through _retry)
+            cur = self._get(lambda: self.dte.Solution.FullName, "Solution.FullName") if self.dte is not None else None
             if cur is not None and getattr(self, "_sysman_solution", None) not in (None, cur):
                 self.sysman = None
                 self._find_sysman()
@@ -418,8 +478,9 @@ class XaeBackend:
                 dte = win32com.client.Dispatch(obj.QueryInterface(pythoncom.IID_IDispatch))
                 sol = ""
                 try:
-                    sol = dte.Solution.FullName
-                except Exception:  # noqa: BLE001
+                    # N174: a busy shell is asked again — its solution read as '' chose another shell or none
+                    sol = self._retry(lambda: dte.Solution.FullName, f"{name}: Solution.FullName")
+                except XaeError:
                     pass
                 out.append({"progid": progid, "moniker": name, "dte": dte, "solution": sol})
             except Exception:  # noqa: BLE001
@@ -495,12 +556,14 @@ class XaeBackend:
                 raise XaeError(f"could not launch any of {list(self.cfg.progids)}: {last}")
         self._take(pick)
         if launched:
-            try:
-                self.dte.SuppressUI = False
-                self.dte.MainWindow.Visible = bool(self.cfg.visible)
-                self.dte.UserControl = True  # keep alive when we release
-            except Exception:  # noqa: BLE001
-                pass
+            # N174: through _retry — a shell that is still starting rejects calls, and these were then never set
+            for what, op in (("SuppressUI", lambda: setattr(self.dte, "SuppressUI", False)),
+                             ("MainWindow.Visible", lambda: setattr(self.dte.MainWindow, "Visible", bool(self.cfg.visible))),
+                             ("UserControl", lambda: setattr(self.dte, "UserControl", True))):   # keep alive when we release
+                try:
+                    self._retry(op, what)
+                except XaeError as exc:
+                    log.warning("launched shell: %s not set (%s)", what, exc)
         if want_sol:
             self.bound_solution = want_sol
             if launched and not _for_open:
@@ -544,16 +607,22 @@ class XaeBackend:
         except XaeError as exc:
             d["dte_error"] = str(exc)
         try:
-            sol = self.dte.Solution
-            d["solution"] = sol.FullName
-            d["solution_open"] = bool(sol.IsOpen)
+            # N174: every read through _retry — a rejected one gave solution_error and then 'no solution open'
+            d["solution"] = self._retry(lambda: self.dte.Solution.FullName, "Solution.FullName")
+            d["solution_open"] = bool(self._retry(lambda: self.dte.Solution.IsOpen, "Solution.IsOpen"))
             prjs = []
-            for i in range(1, sol.Projects.Count + 1):
-                p = sol.Projects.Item(i)
-                prjs.append({"name": p.Name, "file": getattr(p, "FullName", ""), "kind": getattr(p, "Kind", "")})
+            n = int(self._retry(lambda: self.dte.Solution.Projects.Count, "Solution.Projects.Count"))
+            for i in range(1, n + 1):
+                p = self._retry(lambda i=i: self.dte.Solution.Projects.Item(i), f"Solution.Projects.Item({i})")
+                prjs.append({"name": self._retry(lambda p=p: p.Name, f"Project {i} Name"),
+                             "file": self._get(lambda p=p: p.FullName, f"Project {i} FullName", ""),
+                             "kind": self._get(lambda p=p: p.Kind, f"Project {i} Kind", "")})
             d["projects"] = prjs
-        except Exception as exc:  # noqa: BLE001
-            d["solution_error"] = _com_msg(exc)
+        except (XaeBusy, XaeGone) as exc:
+            d["solution_error"] = str(exc)               # busy / gone: nothing is said about the solution
+            return d
+        except XaeError as exc:
+            d["solution_error"] = str(exc)
         if not d.get("solution_open") or not str(d.get("solution") or "").strip():
             # no solution (IsOpen false, or the shell's empty start state with FullName ""): say so instead of a
             # stale project name and a raw COM exception (retest 0.7.1, 0.8.3)
@@ -569,6 +638,8 @@ class XaeBackend:
             d["target_net_id"] = self._on_sm(lambda sm: sm.GetTargetNetId(), "GetTargetNetId")
             d["twincat_project"] = self._sysman_project_name
             d["twincat_started"] = bool(self._on_sm(lambda sm: sm.IsTwinCATStarted(), "IsTwinCATStarted"))
+        except (XaeBusy, XaeGone) as exc:
+            d["twincat_error"] = str(exc)[:400]          # N174: busy is not 'no TwinCAT project'
         except Exception as exc:  # noqa: BLE001
             if not any("tsproj" in str(p.get("file", "")).lower() or p.get("name") for p in d.get("projects") or []):
                 d["note"] = "the open solution has no TwinCAT project"
@@ -579,24 +650,21 @@ class XaeBackend:
 
     def _find_sysman(self) -> None:
         self._need()
+        # N174: every read through _retry — a rejected p.Object was skipped as 'not a TwinCAT project', and the raw
+        # Solution / Projects.Item reads let the rejection escape
         n = self._retry(lambda: self.dte.Solution.Projects.Count, "Projects.Count")
-        sol = self.dte.Solution
+        _no = object()
         for i in range(1, n + 1):
-            p = sol.Projects.Item(i)
-            try:
-                obj = p.Object
-                if obj is None:
-                    continue
-                obj.GetTargetNetId()  # proves it's an ITcSysManager
-                self.sysman = obj
-                self._sysman_project_name = p.Name
-                try:
-                    self._sysman_solution = sol.FullName
-                except Exception:  # noqa: BLE001
-                    self._sysman_solution = None
-                return
-            except Exception:  # noqa: BLE001
+            p = self._retry(lambda i=i: self.dte.Solution.Projects.Item(i), f"Projects.Item({i})")
+            obj = self._get(lambda p=p: p.Object, f"Project {i} Object")
+            if obj is None:
                 continue
+            if self._get(lambda o=obj: o.GetTargetNetId(), f"Project {i} GetTargetNetId", _no) is _no:
+                continue                     # not an ITcSysManager
+            self.sysman = obj
+            self._sysman_project_name = self._get(lambda p=p: p.Name, f"Project {i} Name")
+            self._sysman_solution = self._get(lambda: self.dte.Solution.FullName, "Solution.FullName")
+            return
         raise XaeError("no TwinCAT (ITcSysManager) project found in the open solution")
 
     # ------------------------------------------------------------ solution
@@ -605,15 +673,15 @@ class XaeBackend:
             raise XaeError(f"solution not found: {path}")
         if self.dte is None:
             self.attach(solution_path=path, _for_open=True)
-        dte = self.dte
-        if _norm_sol(str(dte.Solution.FullName or "")) != _norm_sol(path):
+        # N174: through _retry (a raw read let a rejection escape)
+        if _norm_sol(str(self._retry(lambda: self.dte.Solution.FullName, "Solution.FullName") or "")) != _norm_sol(path):
             self._retry(lambda: self.dte.Solution.Open(path), "Solution.Open")
         self.bound_solution = path                        # N116: the solution asked for is the one worked on
         self.sysman = None
-        # wait for projects to load
+        # wait for projects to load (a rejected read is a shell still loading: asked again in the next round)
         for _ in range(120):
             try:
-                if dte.Solution.Projects.Count > 0:
+                if self.dte.Solution.Projects.Count > 0:
                     break
             except Exception:  # noqa: BLE001
                 pass
@@ -623,74 +691,60 @@ class XaeBackend:
     def _dirty(self, save: bool = False) -> list[str]:
         """Unsaved documents and projects the shell reports (Document.Saved / Project.Saved == False); with
         ``save`` each one is saved on its own (the second route when File.SaveAll left some, D44)."""
-        dte = self._need()
+        self._need()
         out: list[str] = []
+        get = self._get          # N174: every read through _retry — a rejected Saved read counted as 'saved' (D44)
 
         def name_of(x: Any) -> str:
             for a in ("FullName", "UniqueName", "Name"):
-                try:
-                    v = str(getattr(x, a))
-                    if v:
-                        return v
-                except Exception:  # noqa: BLE001
-                    continue
+                v = str(get(lambda a=a: getattr(x, a), f"unsaved item {a}", "") or "")
+                if v:
+                    return v
             return "?"
 
         def check(x: Any) -> None:
-            try:
-                if bool(x.Saved):
-                    return
-            except Exception:  # noqa: BLE001
-                return
+            saved = get(lambda: bool(x.Saved), "Saved")
+            if saved is None or saved:
+                return                                    # no Saved property (as before), or saved
             if save:
                 try:
-                    x.Save()
-                    if bool(x.Saved):
+                    self._retry(lambda: x.Save(), "Save")
+                    if get(lambda: bool(x.Saved), "Saved"):
                         return
-                except Exception:  # noqa: BLE001
+                except (XaeBusy, XaeGone):
+                    raise
+                except XaeError:
                     pass
             out.append(name_of(x))
-        try:
-            docs = dte.Documents
-            for i in range(1, int(docs.Count) + 1):
-                try:
-                    check(docs.Item(i))
-                except Exception:  # noqa: BLE001
-                    continue
-        except Exception:  # noqa: BLE001
-            pass
+        docs = get(lambda: self.dte.Documents, "DTE.Documents")
+        if docs is not None:
+            for i in range(1, int(get(lambda: docs.Count, "Documents.Count", 0) or 0) + 1):
+                d = get(lambda i=i: docs.Item(i), f"Documents.Item({i})")
+                if d is not None:
+                    check(d)
 
         budget = [3000]                                   # COM calls are slow: cap the walk
 
         def walk(coll: Any, depth: int) -> None:
-            try:
-                n = int(coll.Count)
-            except Exception:  # noqa: BLE001
-                return
-            for i in range(1, n + 1):
+            n = get(lambda: int(coll.Count), "Count")
+            for i in range(1, (n or 0) + 1):
                 if budget[0] <= 0:
                     return
                 budget[0] -= 1
-                try:
-                    x = coll.Item(i)
-                except Exception:  # noqa: BLE001
+                x = get(lambda i=i: coll.Item(i), f"Item({i})")
+                if x is None:
                     continue
                 check(x)                                  # Project or ProjectItem (both have Saved)
-                try:
-                    sub = x.SubProject                    # a nested project (the PLC project in a .tsproj)
-                except Exception:  # noqa: BLE001
-                    sub = None
+                sub = get(lambda: x.SubProject, "SubProject")       # a nested project (the PLC project in a .tsproj)
                 if sub is not None:
                     check(sub)
                 if depth < 6:
-                    try:
-                        walk((sub or x).ProjectItems, depth + 1)
-                    except Exception:  # noqa: BLE001
-                        pass
-        try:
-            walk(dte.Solution.Projects, 0)
-        except Exception:  # noqa: BLE001
-            pass
+                    items = get(lambda: (sub or x).ProjectItems, "ProjectItems")
+                    if items is not None:
+                        walk(items, depth + 1)
+        projs = get(lambda: self.dte.Solution.Projects, "Solution.Projects")
+        if projs is not None:
+            walk(projs, 0)
         return list(dict.fromkeys(out))
 
     def save_all(self) -> dict[str, Any]:
@@ -719,21 +773,17 @@ class XaeBackend:
         if rebuild:
             self._on_dte(lambda dte: dte.Solution.SolutionBuild.Clean(True), "SolutionBuild.Clean")
         self._on_dte(lambda dte: dte.Solution.SolutionBuild.Build(True), "SolutionBuild.Build")
-        sb = self.dte.Solution.SolutionBuild
+        # N174 (0.8.14 retest): `self.dte.Solution.SolutionBuild` was read here outside _retry — right after a build the
+        # shell rejects calls, and the rejection left xae_build / xae_deploy as an 'internal error' (crash 4ee44bfb,
+        # 388c3b88). Every read goes through _retry; the build itself is not repeated.
         # Build(True) waits, but belt and braces: poll BuildState (3 = done)
         deadline = time.time() + (timeout_s or self.cfg.build_timeout_s)
         while time.time() < deadline:
-            try:
-                if int(sb.BuildState) != 2:  # vsBuildStateInProgress == 2 (NotStarted=1, Done=3)
-                    break
-            except Exception:  # noqa: BLE001
+            state = self._get(lambda: int(self.dte.Solution.SolutionBuild.BuildState), "SolutionBuild.BuildState")
+            if state != 2:                   # vsBuildStateInProgress == 2 (NotStarted=1, Done=3); None: not readable
                 break
             time.sleep(0.5)
-        failed = None
-        try:
-            failed = int(sb.LastBuildInfo)
-        except Exception:  # noqa: BLE001
-            pass
+        failed = self._get(lambda: int(self.dte.Solution.SolutionBuild.LastBuildInfo), "SolutionBuild.LastBuildInfo")
         errs = self.errors()
         out_tail = self.build_output(tail_lines=80)
         n_err = sum(1 for e in errs["items"] if e["level"] == "error")
@@ -750,10 +800,8 @@ class XaeBackend:
         }
 
     def _clear_error_list(self) -> None:
-        try:
-            self.dte.ExecuteCommand("OtherContextMenus.ErrorList.Clear")
-        except Exception:  # noqa: BLE001
-            pass
+        # N174: through _retry — a rejected Clear left the last build's entries in this build's result (N82)
+        self._get(lambda: self.dte.ExecuteCommand("OtherContextMenus.ErrorList.Clear"), "ErrorList.Clear")
 
     def _dte2(self) -> Any:  # pragma: no cover
         """Best effort DTE -> DTE2 (needed for ToolWindows)."""
@@ -771,7 +819,7 @@ class XaeBackend:
         the ErrorList window object, and when those report nothing a copy of the Error List view itself (its
         TwinCAT entries — Scope, Measurement, system messages — are not always in ErrorItems). The Build output
         pane is parsed as well and merged in, so a source that misses items does not hide them."""
-        dte = self._need()
+        self._need()
         lvl = {1: "error", 2: "warning", 3: "message", 4: "message"}
         found: list[dict[str, Any]] = []
         used: list[str] = []
@@ -786,10 +834,10 @@ class XaeBackend:
         got = False
         for name, get in (("DTE2.ToolWindows", lambda: self._dte2_late().ToolWindows.ErrorList.ErrorItems),
                           ("DTE2.gen_py", lambda: self._dte2().ToolWindows.ErrorList.ErrorItems),
-                          ("Windows.ErrorList", lambda: dte.Windows.Item(VS_WINDOW_ERRORLIST).Object.ErrorItems)):
-            try:
-                items = enum(get())
-            except Exception:  # noqa: BLE001
+                          ("Windows.ErrorList", lambda: self.dte.Windows.Item(VS_WINDOW_ERRORLIST).Object.ErrorItems)):
+            # N174: each route through _retry — a rejected read moved on to the next route (or to none)
+            items = self._get(lambda get=get: enum(get()), f"Error List ({name})")
+            if items is None:
                 continue
             take(items, name)
             got = got or bool(items)
@@ -798,6 +846,8 @@ class XaeBackend:
         if not got and view_copy:              # moves the focus to the Error List: only when diagnostics ask for it
             try:
                 take(self._error_list_copy(), "ErrorList(view copy)")
+            except (XaeBusy, XaeGone):
+                raise
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -810,6 +860,8 @@ class XaeBackend:
             else:
                 text = self.build_output(tail_lines=2000)["text"]
             out = _parse_build_output(text)
+        except (XaeBusy, XaeGone):
+            raise
         except Exception:  # noqa: BLE001
             out = []
         seen = {(i.get("description", "").strip(), str(i.get("file", "")).lower(), int(i.get("line") or 0)) for i in found}
@@ -825,7 +877,7 @@ class XaeBackend:
     def _error_list_copy(self) -> list[dict[str, Any]]:  # pragma: no cover — needs the shell and a clipboard
         """Select all in the Error List and copy it (tab-separated, header row); the user's clipboard text is put back."""
         import win32clipboard  # type: ignore
-        dte = self._need()
+        self._need()
         saved = None
         try:
             win32clipboard.OpenClipboard()
@@ -839,9 +891,10 @@ class XaeBackend:
             except Exception:  # noqa: BLE001
                 pass
         try:
-            dte.Windows.Item(VS_WINDOW_ERRORLIST).Activate()
-            dte.ExecuteCommand("Edit.SelectAll")
-            dte.ExecuteCommand("Edit.Copy")
+            # N174: through _retry
+            self._retry(lambda: self.dte.Windows.Item(VS_WINDOW_ERRORLIST).Activate(), "Error List Activate")
+            self._retry(lambda: self.dte.ExecuteCommand("Edit.SelectAll"), "Edit.SelectAll")
+            self._retry(lambda: self.dte.ExecuteCommand("Edit.Copy"), "Edit.Copy")
             time.sleep(0.2)
             win32clipboard.OpenClipboard()
             try:
@@ -858,13 +911,9 @@ class XaeBackend:
                     win32clipboard.CloseClipboard()
         return _parse_error_list_copy(text or "")
 
-    @staticmethod
-    def _error_item(it: Any, lvl: dict[int, str]) -> dict[str, Any]:
+    def _error_item(self, it: Any, lvl: dict[int, str]) -> dict[str, Any]:
         def g(name: str, default: Any = "") -> Any:
-            try:
-                return getattr(it, name)
-            except Exception:  # noqa: BLE001
-                return default
+            return self._get(lambda: getattr(it, name), f"ErrorItem.{name}", default)     # N174
         return {
             "level": lvl.get(int(g("ErrorLevel", 3) or 3), "message"),
             "description": g("Description"),
@@ -882,26 +931,30 @@ class XaeBackend:
         """The Build output pane's whole text now (the marker: what a command adds comes after it); None unreadable."""
         try:
             return self._build_pane()
+        except (XaeBusy, XaeGone):
+            raise                          # N174: a busy shell is not 'no pane'
         except Exception:  # noqa: BLE001
             return None
 
     def _build_pane(self) -> str:
-        dte = self._need()
-        win = dte.Windows.Item(VS_WINDOW_OUTPUT)
-        ow = win.Object
-        pane = ow.OutputWindowPanes.Item("Build")
-        doc = pane.TextDocument
-        sel = doc.Selection
-        sel.StartOfDocument(False)
-        sel.EndOfDocument(True)
-        return sel.Text or ""
+        self._need()
+
+        def read() -> str:
+            pane = self.dte.Windows.Item(VS_WINDOW_OUTPUT).Object.OutputWindowPanes.Item("Build")
+            sel = pane.TextDocument.Selection
+            sel.StartOfDocument(False)
+            sel.EndOfDocument(True)
+            return sel.Text or ""
+        return self._retry(read, "Output window, Build pane")              # N174
 
     def build_output(self, tail_lines: int = 200) -> dict[str, Any]:
         self._need()                       # not attached: an error, as before — only the pane's own failure is a result
         try:
             text = self._build_pane()
+        except (XaeBusy, XaeGone):
+            raise                          # N174: a busy shell is said, not an empty pane
         except Exception as exc:  # noqa: BLE001
-            return {"text": "", "error": _com_msg(exc)}
+            return {"text": "", "error": _com_msg(exc.__cause__ or exc)}
         lines = text.splitlines()
         return {"text": "\n".join(lines[-tail_lines:]), "total_lines": len(lines)}
 
@@ -911,17 +964,14 @@ class XaeBackend:
         return {"executed": name, "args": args}
 
     def list_commands(self, contains: str, limit: int = 200) -> dict[str, Any]:
-        dte = self._need()
-        cmds = dte.Commands
+        self._need()
+        # N174: through _retry (Commands / Count were read raw; a rejected item was skipped as if it had no name)
+        cmds = self._retry(lambda: self.dte.Commands, "DTE.Commands")
         needle = contains.lower()
         out = []
-        n = cmds.Count
+        n = int(self._retry(lambda: cmds.Count, "Commands.Count"))
         for i in range(1, n + 1):
-            try:
-                c = cmds.Item(i)
-                nm = c.Name
-            except Exception:  # noqa: BLE001
-                continue
+            nm = self._get(lambda i=i: cmds.Item(i).Name, f"Commands.Item({i}).Name")
             if nm and needle in nm.lower():
                 out.append(nm)
                 if len(out) >= limit:
@@ -954,8 +1004,9 @@ class XaeBackend:
         Solution Explorer nests it as Solution → <TwinCAT project> → PLC → <PLC> → '<PLC> Project'; the node is
         found by walking the UI hierarchy (fixed paths missed the TwinCAT project level — retest #10). N41: the
         project is the one the call is for, never simply the first one listed."""
+        get, retry = self._get, self._retry        # N174: every UI hierarchy access through _retry
         try:
-            dte = self._need()
+            self._need()
             if project_name:
                 pname = project_name.removesuffix(" Project")
             else:
@@ -965,42 +1016,45 @@ class XaeBackend:
                 pname = str(projs[0].get("name") or "").removesuffix(" Project")
             # #10: the cached 7.0 gen_py DTE wrapper has no ToolWindows (D20) — late-bound first, then the window object
             se = None
-            for get in (lambda: self._dte2_late().ToolWindows.SolutionExplorer,
-                        lambda: dte.ToolWindows.SolutionExplorer,
-                        lambda: dte.Windows.Item(VS_WINDOW_SOLUTION_EXPLORER).Object):
-                try:
-                    se = get()
-                    se.UIHierarchyItems.Count
+            for route in (lambda: self._dte2_late().ToolWindows.SolutionExplorer,
+                          lambda: self.dte.ToolWindows.SolutionExplorer,
+                          lambda: self.dte.Windows.Item(VS_WINDOW_SOLUTION_EXPLORER).Object):
+                se = get(route, "Solution Explorer")
+                if se is not None and get(lambda: se.UIHierarchyItems.Count, "Solution Explorer items") is not None:
                     break
-                except Exception:  # noqa: BLE001
-                    se = None
+                se = None
             if se is None:
                 return None
 
             def walk(items, depth: int, trail: list[str]):
                 if depth > 7:
                     return None
-                for i in range(1, items.Count + 1):
-                    it = items.Item(i)
-                    name = str(it.Name)
+                for i in range(1, int(retry(lambda: items.Count, "UIHierarchyItems.Count")) + 1):
+                    it = retry(lambda i=i: items.Item(i), f"UIHierarchyItems.Item({i})")
+                    name = str(retry(lambda: it.Name, "UIHierarchyItem.Name"))
                     if name.lower() == f"{pname} Project".lower():
                         return it, trail + [name]
-                    try:
-                        was = it.UIHierarchyItems.Expanded
-                        it.UIHierarchyItems.Expanded = True
-                        hit = walk(it.UIHierarchyItems, depth + 1, trail + [name])
-                        if hit is None:
-                            it.UIHierarchyItems.Expanded = was
-                        if hit is not None:
-                            return hit
-                    except Exception:  # noqa: BLE001
+                    sub = get(lambda: it.UIHierarchyItems, "UIHierarchyItems")
+                    if sub is None:
                         continue
+                    was = get(lambda: sub.Expanded, "UIHierarchyItems.Expanded")
+                    try:
+                        retry(lambda: setattr(sub, "Expanded", True), "UIHierarchyItems.Expanded")
+                    except (XaeBusy, XaeGone):
+                        raise
+                    except XaeError:
+                        continue
+                    hit = walk(sub, depth + 1, trail + [name])
+                    if hit is not None:
+                        return hit
+                    if was is not None:
+                        get(lambda: setattr(sub, "Expanded", was), "UIHierarchyItems.Expanded")
                 return None
-            hit = walk(se.UIHierarchyItems, 0, [])
+            hit = walk(retry(lambda: se.UIHierarchyItems, "Solution Explorer items"), 0, [])
             if hit is None:
                 return None
             item, trail = hit
-            item.Select(1)   # vsUISelectionTypeSelect
+            retry(lambda: item.Select(1), "UIHierarchyItem.Select")   # vsUISelectionTypeSelect
             # and, where the shell offers it, the explicit 'Set as Active PLC Project' on the selected node
             for c in self.list_commands("active", 100).get("commands", []):
                 if re.search(r"set\s*as\s*active\s*plc\s*project|setactiveplcproject", c, re.I):
@@ -1011,6 +1065,8 @@ class XaeBackend:
                         pass
                     break
             return "\\".join(trail)
+        except (XaeBusy, XaeGone):
+            raise                              # N174: a busy shell is said, not 'the node could not be selected'
         except Exception:  # noqa: BLE001
             return None
 
@@ -1025,35 +1081,46 @@ class XaeBackend:
         note: dict[str, Any] = {}
         settings = prev = None
         if self.cfg.silent_mode and self.dte is not None:
+            # N174: through _retry — a rejected read left silent mode off for the command (its dialogs then open);
+            # a shell that stays busy stops here, before the command
             try:
-                settings = self.dte.GetObject("TcAutomationSettings")
-                prev = bool(settings.SilentMode)
-                settings.SilentMode = True
+                settings = self._retry(lambda: self.dte.GetObject("TcAutomationSettings"), "TcAutomationSettings")
+                prev = bool(self._retry(lambda: settings.SilentMode, "SilentMode"))
+                self._retry(lambda: setattr(settings, "SilentMode", True), "SilentMode")
                 note["silent_mode"] = True
-            except Exception as exc:  # noqa: BLE001
+            except (XaeBusy, XaeGone):
+                raise
+            except XaeError as exc:
                 settings = None
-                note["silent_mode"] = f"not available ({_com_msg(exc) if hasattr(exc, 'hresult') else exc})"
+                cause = exc.__cause__ or exc
+                note["silent_mode"] = f"not available ({_com_msg(cause) if hasattr(cause, 'hresult') else cause})"
         try:
             yield note
         finally:
             if settings is not None:
                 try:
-                    settings.SilentMode = prev
+                    self._retry(lambda: setattr(settings, "SilentMode", prev), "SilentMode")
                 except Exception as exc:  # noqa: BLE001
                     log.warning("%s: SilentMode could not be switched back to %s: %s", what, prev, exc)
 
     ONLINE_STATE_WAIT_S = 5.0      # how long the state an ITcPlcOnline command leads to is awaited
 
     def _online_state(self, it: Any) -> dict[str, Any]:
-        st = _try(lambda: int(it.OnlineApplicationState))
-        return {"logged_in": _try(lambda: bool(it.IsLoggedIn)),
+        # N174: through _retry — a rejected read gave 'state unknown' (and Start / Stop went on as if logged in)
+        st = self._get(lambda: int(it.OnlineApplicationState), "OnlineApplicationState")
+        return {"logged_in": self._get(lambda: bool(it.IsLoggedIn), "IsLoggedIn"),
                 "application_state": _APP_STATE.get(st, st) if st is not None else None}
+
+    def _has(self, obj: Any, name: str) -> bool:
+        """N174: does the late-bound object offer `name` — asked through _retry (a rejected GetIDsOfNames read as 'no
+        such member', and the ITcPlcOnline route was skipped on a busy shell)."""
+        return bool(self._retry(lambda: _has_prop(obj, name), f"{name}?"))
 
     def _plc_online(self, target: str, action: str) -> dict[str, Any] | None:
         """ITcPlcOnline on the nested project (TE1000): Login(flags) / Logoff / Start / Stop / Reset(type), the state
         read back after it. None when the project does not offer it (older XAE) — the other routes then apply."""
         it = self._item(target)
-        if not _has_prop(it, "IsLoggedIn"):
+        if not self._has(it, "IsLoggedIn"):
             return None
         before = self._online_state(it)
         if before["logged_in"] is False and (action in ("start", "stop") or action in _RESET_TYPE):
@@ -1280,14 +1347,14 @@ class XaeBackend:
         except Exception:  # noqa: BLE001
             return None
 
-    @staticmethod
-    def _item_dict(it: Any) -> dict[str, Any]:
+    def _item_dict(self, it: Any) -> dict[str, Any]:
         d: dict[str, Any] = {}
+        _no = object()
         for prop in ("Name", "PathName", "ItemType", "ItemSubType", "ChildCount", "Comment", "Disabled"):
-            try:
-                d[prop] = getattr(it, prop)
-            except Exception:  # noqa: BLE001
-                pass
+            # N174: through _retry — a rejected read left the property out (a tree item without its PathName)
+            v = self._get(lambda prop=prop: getattr(it, prop), prop, _no)
+            if v is not _no:
+                d[prop] = v
         return d
 
     def tree_item(self, path: str) -> dict[str, Any]:
@@ -1297,53 +1364,47 @@ class XaeBackend:
         root = self._item(path)
         out: list[dict[str, Any]] = []
         unreadable: list[dict[str, Any]] = []
+        get = self._get
+        # N174 / N44 (0.8.14 retest): every read through _retry. A rejected ChildCount was read as 'no children' and a
+        # rejected Name / lookup as 'nothing there', so the listing of a busy shell looked complete — the snapshot a
+        # 'replace' import relies on (plcopen_import) missed objects instead of failing. A shell that stays busy, a
+        # dialog or a shell that went away now raises: the listing failed, it is not a smaller tree.
 
         def _name(x: Any) -> str:
-            try:
-                return str(x.Name)
-            except Exception:  # noqa: BLE001
-                return ""
+            return str(get(lambda: x.Name, "Name", "") or "")
 
         def walk(it: Any, lvl: int) -> None:
             if lvl > depth or len(out) >= max_items:
                 return
             children: list[Any] = []
-            try:
-                ipath = str(it.PathName)
-            except Exception:  # noqa: BLE001
-                ipath = ""
-            try:
-                n = int(it.ChildCount)
-                for i in range(1, n + 1):
-                    try:
-                        children.append(it.Child(i))
-                    except Exception as exc:  # noqa: BLE001
-                        unreadable.append({"parent": ipath, "index": i, "error": str(exc)[:160]})
-            except Exception:  # noqa: BLE001
-                n = 0
+            ipath = str(get(lambda: it.PathName, "PathName", "") or "")
+            n = get(lambda: int(it.ChildCount), f"{ipath or path} ChildCount", 0) or 0
+            for i in range(1, n + 1):
+                try:
+                    children.append(self._retry(lambda i=i: it.Child(i), f"{ipath} Child({i})"))
+                except (XaeBusy, XaeGone):
+                    raise
+                except XaeError as exc:
+                    unreadable.append({"parent": ipath, "index": i, "error": str(exc)[:160]})
             # #17: the PLC container 'TIPC^<Name>' enumerates '<Name> Instance' but not its nested '<Name> Project'
             # (the item users need most); that one is reachable by path
             if ipath.upper().startswith("TIPC^") and ipath.count("^") == 1:
                 want = f"{_name(it)} Project"
                 if want.strip() != "Project" and want not in {_name(c) for c in children}:
-                    try:
-                        children.insert(0, self._sm().LookupTreeItem(f"{ipath}^{want}"))
-                    except Exception:  # noqa: BLE001
-                        pass
+                    x = get(lambda: self._cur_sm().LookupTreeItem(f"{ipath}^{want}"), f"LookupTreeItem {ipath}^{want}")
+                    if x is not None:
+                        children.insert(0, x)
             if not children:
                 # the nested PLC project node (ItemType 56) does not enumerate its children through ChildCount;
                 # its folders are reachable by path
-                try:
-                    ptype = str(it.ItemType)
-                    ppath = str(it.PathName)
-                except Exception:  # noqa: BLE001
-                    ptype, ppath = "", ""
-                if ptype == str(TREEITEMTYPE_PLCAPP) or str(getattr(it, "Name", "")).endswith(" Project"):
+                ptype = str(get(lambda: it.ItemType, "ItemType", "") or "")
+                ppath = str(get(lambda: it.PathName, "PathName", "") or "")
+                if ptype == str(TREEITEMTYPE_PLCAPP) or _name(it).endswith(" Project"):
                     for sub in PLC_PROJECT_FOLDERS:
-                        try:
-                            children.append(self._sm().LookupTreeItem(f"{ppath}^{sub}"))
-                        except Exception:  # noqa: BLE001
-                            continue
+                        x = get(lambda sub=sub: self._cur_sm().LookupTreeItem(f"{ppath}^{sub}"),
+                                f"LookupTreeItem {ppath}^{sub}")
+                        if x is not None:
+                            children.append(x)
             for ch in children:
                 d = self._item_dict(ch)
                 d["depth"] = lvl
@@ -1370,9 +1431,13 @@ class XaeBackend:
         except XaeExplained:
             raise
         except XaeError as exc:
-            it = _try(lambda: self._item(path))
-            detail = (_try(lambda: str(_com_call(it, "GetLastXmlError") or ""))
-                      if it is not None and _has_member(it, "GetLastXmlError") else None)
+            # N174: the detail is read through _retry too (on a busy shell it was simply left out)
+            try:
+                it = self._item(path)
+                detail = (self._get(lambda: str(_com_call(it, "GetLastXmlError") or ""), "GetLastXmlError")
+                          if self._has(it, "GetLastXmlError") else None)
+            except XaeError:
+                detail = None
             if detail:
                 raise XaeError(f"{exc} — GetLastXmlError: {detail[:600]}") from exc
             raise
@@ -1412,8 +1477,9 @@ class XaeBackend:
             return run(lambda p: p.CreateChild(name, subtype, before), "CreateChild")
         try:
             return run(lambda p: p.CreateChild(name, subtype, before, info), "CreateChild")
-        except XaeExplained:
-            raise                          # the shell went away during it: not created a second time
+        except (XaeExplained, XaeBusy):
+            raise                          # the shell went away during it: not created a second time (N174: nor
+                                           # with another argument form while it is busy or held by a dialog)
         except XaeError:
             if isinstance(info, list) and IS_WIN:  # pragma: no cover - retry as SAFEARRAY of BSTR
                 variant = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_BSTR, [str(x) for x in info])
@@ -1456,20 +1522,20 @@ class XaeBackend:
     def pou_get(self, path: str, include_subitems: bool = True) -> dict[str, Any]:
         it = self._item(path)
         d = self._item_dict(it)
-        d["declaration"] = _try(lambda: it.DeclarationText)
-        d["implementation"] = _try(lambda: it.ImplementationText)
-        d["language"] = _try(lambda: it.Language)
+        get = self._get              # N174: through _retry — a rejected read gave declaration / implementation None
+        d["declaration"] = get(lambda: it.DeclarationText, f"{path} DeclarationText")
+        d["implementation"] = get(lambda: it.ImplementationText, f"{path} ImplementationText")
+        d["language"] = get(lambda: it.Language, f"{path} Language")
         if include_subitems:
             subs = []
-            try:
-                for i in range(1, int(it.ChildCount) + 1):
-                    ch = it.Child(i)
-                    sd = self._item_dict(ch)
-                    sd["declaration"] = _try(lambda: ch.DeclarationText)
-                    sd["implementation"] = _try(lambda: ch.ImplementationText)
-                    subs.append(sd)
-            except Exception:  # noqa: BLE001
-                pass
+            for i in range(1, int(get(lambda: it.ChildCount, f"{path} ChildCount", 0) or 0) + 1):
+                ch = get(lambda i=i: it.Child(i), f"{path} Child({i})")
+                if ch is None:
+                    break                    # as before: the sub items read up to the first that failed
+                sd = self._item_dict(ch)
+                sd["declaration"] = get(lambda: ch.DeclarationText, f"{path} Child({i}) DeclarationText")
+                sd["implementation"] = get(lambda: ch.ImplementationText, f"{path} Child({i}) ImplementationText")
+                subs.append(sd)
             d["subitems"] = subs
         return d
 
@@ -1574,7 +1640,7 @@ class XaeBackend:
 
     def _import_options(self, it: Any) -> tuple[dict[str, int], str]:
         """PLCIMPORTOPTIONS as the live type library defines them; else the TE1000 enum page (see _DOC_IMPORT_OPTIONS)."""
-        vals = _typelib_enum(it, "PLCIMPORTOPTIONS")
+        vals = self._get(lambda: _typelib_enum(it, "PLCIMPORTOPTIONS"), "PLCIMPORTOPTIONS")     # N174: through _retry
         if vals:
             m = {k.upper().removeprefix("PLCIMPORTOPTIONS_").lower(): int(v) for k, v in vals.items()}
             m = {k: v for k, v in m.items() if k in _DOC_IMPORT_OPTIONS}
@@ -1604,6 +1670,10 @@ class XaeBackend:
                 return None
             return {str(x.get("PathName")): str(x.get("Name")) for x in tc["items"] if x.get("PathName")}
         before = snapshot()
+        # N44 (0.8.14 retest): the replace needs this listing (originals, copies, removed objects), so a listing that
+        # failed refuses it before anything is imported. tree_children now fails on a shell that stays busy instead of
+        # reading a rejected ChildCount as 'no children' (a listing that looked complete let the import run and left
+        # its copies). The other options import what was asked and say what could not be checked (warning below).
         if before is None and option == "replace":
             raise XaeError(f"the objects of {plc_project_path} could not be listed completely, so the result of a 'replace' "
                            "import could not be checked for duplicate copies — nothing was imported. Retry when XAE is idle.")
@@ -1617,8 +1687,9 @@ class XaeBackend:
         try:
             self._on_item(plc_project_path, lambda x: x.PlcOpenImport(xml_file, value, "", True), "PlcOpenImport",
                           once=True)
-        except XaeExplained:
-            raise                          # the shell went away during it: not imported a second time
+        except (XaeExplained, XaeBusy):
+            raise                          # the shell went away during it / N174: busy or held by a dialog — the
+                                           # older two-argument signature is no answer to that: not imported again
         except XaeError:
             self._on_item(plc_project_path, lambda x: x.PlcOpenImport(xml_file, value), "PlcOpenImport", once=True)
         after = snapshot()
@@ -1636,8 +1707,8 @@ class XaeBackend:
                            f"{[n + '_1' for n in names][:5]} …")
         if before is None or after is None:
             res["warning"] = ("the project's objects could not be listed completely "
-                              f"{'before' if before is None else 'after'} the import: the objects added (and any "
-                              "renamed copies such as PRG_X_1) are not known — check the tree (xae_tree)")
+                              f"{'before' if before is None else 'after'} the import: the objects added or removed (and "
+                              "any renamed copies such as PRG_X_1) are not known — check the tree (xae_tree)")
             return res
         added = {p: n for p, n in after.items() if p not in before}
         res["added"] = sorted(added)[:200]
@@ -1770,6 +1841,7 @@ class XaeBackend:
             raise _ReplaceError("the copy's declaration header could not be parsed — nothing written")
         # 2. the XML is the oracle
         checked = "name"
+        not_in_xml: list[str] = []
         if xml is not None:
             graphic = _non_text_body(xml, orig_path)
             if graphic:
@@ -1778,7 +1850,9 @@ class XaeBackend:
             bad = _oracle_mismatch(want, xml, orig_path)
             if bad:
                 raise _ReplaceError(f"the copy differs from the imported XML at {bad} — nothing written")
-            checked = "xml"
+            # N175: 'xml' when texts were compared; the parts the XML holds no text for are named, not implied checked
+            compared, not_in_xml = _oracle_coverage(want, xml, orig_path)
+            checked = "xml" if compared else "name"
         stray = _name_occurrences(want, copy_name, xml)
         if stray:
             raise _ReplaceError(f"the copy's name {copy_name!r} also occurs in {', '.join(stray)}, which the XML does not hold — "
@@ -1795,7 +1869,15 @@ class XaeBackend:
                 if h is None or h[1].lower() != orig_name.lower():
                     raise XaeError(f"after writing, the declaration names {h[1] if h else 'nothing'!r}, the object in "
                                    f"the tree is {orig_name!r}")
-            return {"object": orig_path, "from_copy": copy_path, "checked_against": checked, "header_renamed": renamed}
+            rec = {"object": orig_path, "from_copy": copy_path, "checked_against": checked, "header_renamed": renamed}
+            if not_in_xml:
+                rec["not_in_xml"] = not_in_xml[:50]
+                rec["not_in_xml_note"] = (
+                    "the PLCopen file holds no plain text for these parts (TwinCAT exports an interface's methods and "
+                    "properties with their declarations, but not the INTERFACE header), so they were not compared with "
+                    "it — only the declared name was checked (header renamed back, read back, name equal to the "
+                    "object's)")
+            return rec
         except XaeError as exc:
             err = str(exc)
         # 4. back to the kept texts
@@ -1834,17 +1916,18 @@ class XaeBackend:
                 out["kids"][nm] = self._text_tree(c, f"{where}^{nm}", depth + 1)
         return out
 
-    @staticmethod
-    def _non_st_language(tree: dict[str, Any], where: str) -> str | None:
+    def _non_st_language(self, tree: dict[str, Any], where: str) -> str | None:
         """'<path> (CFC)' for the first object of a text tree whose ITcPlcImplementation.Language is neither none nor
         ST, or None (also when the property is not offered)."""
         it = tree.get("_it")
-        lang = _try(lambda: int(it.Language)) if it is not None and _has_prop(it, "Language") else None
+        # N174: through _retry — on a busy shell the language read as 'not offered' and a graphical body passed
+        lang = (self._get(lambda: int(it.Language), f"{where} Language")
+                if it is not None and self._has(it, "Language") else None)
         if lang not in (None, 0, 1):
             names = {v: k.upper() for k, v in IEC_LANG.items()}
             return f"{where} ({names.get(lang, 'UML' if lang in (7, 8, 9) else f'language {lang}')})"
         for nm, sub in (tree.get("kids") or {}).items():
-            m = XaeBackend._non_st_language(sub, f"{where}^{nm}")
+            m = self._non_st_language(sub, f"{where}^{nm}")
             if m:
                 return m
         return None
@@ -1882,7 +1965,8 @@ class XaeBackend:
             self._on_item(plc_project_path, lambda x: x.GenerateBootProject(bool(activate_after_generate)),
                           "GenerateBootProject", once=True)
             res["boot_project_generated"] = True
-        res["current_autostart"] = _try(lambda: bool(self._item(plc_project_path).BootProjectAutostart))
+        res["current_autostart"] = self._get(lambda: bool(self._cur_sm().LookupTreeItem(plc_project_path).BootProjectAutostart),
+                                             "BootProjectAutostart")                       # N174: through _retry
         return res
 
     def io_disable(self, disable: bool = True, only: list[str] | None = None) -> dict[str, Any]:
@@ -1890,17 +1974,21 @@ class XaeBackend:
         lets a configuration activate on a PC/target without the hardware (TcUnit runs)."""
         root = self._item("TIID")
         changed = []
-        n = int(root.ChildCount)
+        # N174: every access through _retry (ChildCount / Child were read raw: a rejection escaped)
+        n = int(self._retry(lambda: root.ChildCount, "TIID ChildCount"))
         for i in range(1, n + 1):
-            dev = root.Child(i)
-            name = _try(lambda: dev.Name) or f"device {i}"
+            dev = self._retry(lambda i=i: root.Child(i), f"TIID Child({i})")
+            name = self._get(lambda: dev.Name, f"TIID Child({i}) Name") or f"device {i}"
             if only and name not in only:
                 continue
             try:
-                dev.Disabled = 1 if disable else 0   # SMDS_DISABLED / SMDS_NOT_DISABLED
+                self._retry(lambda: setattr(dev, "Disabled", 1 if disable else 0),   # SMDS_DISABLED / SMDS_NOT_DISABLED
+                            f"{name} Disabled")
                 changed.append({"device": name, "disabled": bool(disable)})
-            except Exception as exc:  # noqa: BLE001
-                changed.append({"device": name, "error": _com_msg(exc)})
+            except XaeError as exc:
+                cause = exc.__cause__
+                changed.append({"device": name, "error": _com_msg(cause) if cause is not None and not isinstance(exc, XaeBusy)
+                                else str(exc)})
         return {"devices": changed, "note": "takes effect on the next ActivateConfiguration"}
 
     def links(self, plc_project_path: str) -> dict[str, Any]:
@@ -1911,14 +1999,20 @@ class XaeBackend:
         inst = self._item(inst_path)
         groups = []
         unlinked = []
-        n = int(inst.ChildCount)
+        # N174: every access through _retry (ChildCount / Child were read raw: a rejection escaped)
+        n = int(self._retry(lambda: inst.ChildCount, f"{inst_path} ChildCount"))
         for i in range(1, n + 1):
-            grp = inst.Child(i)
-            gname = _try(lambda: grp.Name) or f"group {i}"
+            grp = self._retry(lambda i=i: inst.Child(i), f"{inst_path} Child({i})")
+            gname = self._get(lambda: grp.Name, f"{inst_path} Child({i}) Name") or f"group {i}"
             try:
-                xml = grp.ProduceXml(False)
+                xml = self._retry(lambda: grp.ProduceXml(False), f"{gname} ProduceXml")
                 root = ET.fromstring(xml)
-            except Exception as exc:  # noqa: BLE001
+            except (XaeBusy, XaeGone):
+                raise
+            except XaeError as exc:
+                groups.append({"group": gname, "error": _com_msg(exc.__cause__ or exc)})
+                continue
+            except Exception as exc:  # noqa: BLE001 — XML the parser does not take
                 groups.append({"group": gname, "error": _com_msg(exc)})
                 continue
             vars_ = []
@@ -2021,27 +2115,30 @@ class XaeBackend:
         def visit(p: Any, depth: int) -> None:
             if depth > 3:
                 return
-            fn = str(_try(lambda: p.FullName) or "")
-            items = _try(lambda: p.ProjectItems)
+            # N174: every read through _retry — on a busy shell a Scope configuration was read as 'none there'
+            fn = str(get(lambda: p.FullName, "Project FullName") or "")
+            items = get(lambda: p.ProjectItems, "ProjectItems")
             if items is None:
                 return
-            for j in range(1, (_try(lambda: items.Count) or 0) + 1):
-                it = _try(lambda: items.Item(j))
+            for j in range(1, (get(lambda: items.Count, "ProjectItems.Count") or 0) + 1):
+                it = get(lambda j=j: items.Item(j), f"ProjectItems.Item({j})")
                 if it is None:
                     continue
-                sub = _try(lambda: it.SubProject)          # projects inside solution folders
+                sub = get(lambda: it.SubProject, "SubProject")          # projects inside solution folders
                 if sub is not None:
                     visit(sub, depth + 1)
                     continue
-                obj = _try(lambda: it.Object)
-                ms = _measurement_scope(obj) if fn.lower().endswith(".tcmproj") and obj is not None else None
+                obj = get(lambda: it.Object, "ProjectItem Object")
+                ms = (get(lambda: _measurement_scope(obj), "IMeasurementScope")
+                      if fn.lower().endswith(".tcmproj") and obj is not None else None)
                 if ms is not None:
-                    found.append({"name": str(it.Name), "project": str(_try(lambda: p.Name) or ""), "file": fn,
-                                  "_obj": ms})
+                    found.append({"name": str(self._retry(lambda: it.Name, "ProjectItem Name")),
+                                  "project": str(get(lambda: p.Name, "Project Name") or ""), "file": fn, "_obj": ms})
 
+        get = self._get
         projs = self._retry(lambda: self.dte.Solution.Projects, "Solution.Projects")
-        for i in range(1, projs.Count + 1):
-            visit(projs.Item(i), 0)
+        for i in range(1, int(self._retry(lambda: projs.Count, "Solution.Projects.Count")) + 1):
+            visit(self._retry(lambda i=i: projs.Item(i), f"Solution.Projects.Item({i})"), 0)
         return found
 
     def scope_list(self) -> dict[str, Any]:
@@ -2193,7 +2290,9 @@ def _measurement_scope(obj: Any) -> Any:
         import win32com.client  # type: ignore
         disp = obj._oleobj_.QueryInterface(pywintypes.IID(IID_IMEASUREMENT_SCOPE), pythoncom.IID_IDispatch)
         ms = win32com.client.Dispatch(disp)
-    except Exception:  # noqa: BLE001 — not a Scope node (data pool, chart, …) or no pywin32
+    except Exception as exc:  # noqa: BLE001 — not a Scope node (data pool, chart, …) or no pywin32
+        if getattr(exc, "hresult", None) in _BUSY_HR + _GONE_HR:
+            raise                  # N174: asked again by the caller's _retry
         return None
     return ms if _has_member(ms, "StartRecord") else None
 
@@ -2228,7 +2327,9 @@ def _typelib_enum(obj: Any, enum_name: str) -> dict[str, int] | None:
                 vd = ti.GetVarDesc(j)
                 out[str(ti.GetNames(field(vd, 0, "memid"))[0])] = int(field(vd, 1, "value"))   # VARDESC: memid, value
             return out
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "hresult", None) in _BUSY_HR + _GONE_HR:
+            raise                  # N174: asked again by the caller's _retry, not read as 'no type library'
         return None
     return None
 
@@ -2248,7 +2349,9 @@ def _has_member(obj: Any, name: str) -> bool:
     try:
         ole.GetIDsOfNames(name)
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "hresult", None) in _BUSY_HR + _GONE_HR:
+            raise                  # N174: a busy (or gone) shell is not 'no such member' — the caller's _retry asks again
         return False
 
 
@@ -2512,9 +2615,36 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
     for el in root.iter():
         if el.tag in ("pou", "dataType", "globalVars", "Interface") and el.get("name"):
             n = node(el)
-            if n["decl"] is not None or n["impl"] is not None or _non_text_body(n, ""):
+            # N175 (0.8.14 retest): an object counts when ANY part of it carries text — an interface's export holds its
+            # methods' / properties' declarations but no plain text of the INTERFACE header, and was left out (its
+            # replace then reported checked_against 'name' and its method texts were never compared)
+            if _xml_has_text(n) or _non_text_body(n, ""):
                 out.setdefault(str(el.get("name")).lower(), n)
     return out
+
+
+def _xml_has_text(n: dict[str, Any]) -> bool:
+    return (n.get("decl") is not None or n.get("impl") is not None
+            or any(_xml_has_text(k) for k in (n.get("kids") or {}).values()))
+
+
+def _oracle_coverage(want: dict[str, Any], xml: dict[str, Any] | None, where: str) -> tuple[int, list[str]]:
+    """(texts compared with the XML, parts whose text the XML does not hold) of an intended text tree: what
+    _oracle_mismatch could check and what it could not (N175). An empty text needs no check."""
+    compared, missing = 0, []
+    for key in ("decl", "impl"):
+        if not (_norm_text(want.get(key)) or ""):
+            continue
+        if xml is not None and xml.get(key) is not None:
+            compared += 1
+        else:
+            missing.append(f"{where} ({'declaration' if key == 'decl' else 'implementation'})")
+    xk = (xml or {}).get("kids") or {}
+    for k, sub in (want.get("kids") or {}).items():
+        c, m = _oracle_coverage(sub, xk.get(k.lower()), f"{where}^{k}")
+        compared += c
+        missing += m
+    return compared, missing
 
 
 def _non_text_body(xml: dict[str, Any], where: str) -> str | None:
@@ -2528,13 +2658,6 @@ def _non_text_body(xml: dict[str, Any], where: str) -> str | None:
         if m:
             return m
     return None
-
-
-def _try(fn: Callable[[], Any]) -> Any:
-    try:
-        return fn()
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def _com_msg(exc: BaseException) -> str:

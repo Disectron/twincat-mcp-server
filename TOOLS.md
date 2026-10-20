@@ -100,8 +100,8 @@
 
 ## XAE Automation Interface (28)
 
-- `xae_dialogs` [R] — Modal dialogs currently open in the attached XAE shell (title, text, buttons), the watchdog's auto-answer rules and its recent log. A pending dialog blocks every COM call.
-- `xae_dialog_resolve` [C/D] — Click a button on an open XAE dialog ('OK', 'Yes', 'No', 'Cancel'…). remember=true adds an auto-answer rule for that title (never for machine-affecting prompts). Control-class; machine-affecting prompts (activate/run/download/login/delete/safety) are destructive-class.
+- `xae_dialogs` [R] — Modal dialogs currently open in the attached XAE shell (title, class, text, buttons), the watchdog's auto-answer rules and its recent log. A pending dialog blocks every COM call. Any window that holds the shell modal (its main window disabled) is listed, whatever its class (WPF About / Options, WinForms): its buttons…
+- `xae_dialog_resolve` [C/D] — Click a button on an open XAE dialog ('OK', 'Yes', 'No', 'Cancel'…). remember=true adds an auto-answer rule for that title (never for machine-affecting prompts). Control-class; machine-affecting prompts (activate/run/download/login/delete/safety) are destructive-class. A window that is not a standard dialog is…
 - `xae_io_disable` [E] — Set/clear the Disabled flag on I/O devices under TIID (all, or the named ones) so a configuration activates without the hardware present — TcUnit on a PC, dry runs.
 - `xae_links` [R] — Variable links of the PLC instance: every AT %I*/%Q* variable with its link target; lists the unlinked ones (the usual reason an output never moves).
 - `xae_attach` [E] — Attach to the running XAE shell / Visual Studio (Running Object Table) that has the solution: solution_path when given (from then on every xae_* tool works on it — flagged solution_mismatch when it is not xae.solution_path), else xae.solution_path. A solution no shell has open is never replaced by another one…

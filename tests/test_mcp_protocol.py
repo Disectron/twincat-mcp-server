@@ -148,6 +148,88 @@ async def test_errors_keep_their_text_and_a_defect_is_logged(caplog):
     assert any(cid in rec.getMessage() and rec.exc_info for rec in caplog.records)
 
 
+class _ComError(Exception):
+    """What pywintypes.com_error carries: args (hresult, text, excepinfo, argerror) and the same as attributes."""
+
+    def __init__(self, hresult, text, excepinfo=None):
+        super().__init__(hresult, text, excepinfo, None)
+        self.hresult, self.strerror, self.excepinfo = hresult, text, excepinfo
+
+
+@pytest.mark.anyio
+async def test_n174_a_rejected_com_call_is_busy_and_a_defect_is_in_server_log(monkeypatch, project_dir, tmp_path):
+    """N174 (0.8.14 retest): xae_build / xae_deploy failed with "internal error … com_error (-2147418111, 'Call was
+    rejected by callee.') — a defect in twincat-mcp … crash 4ee44bfb", and that traceback was in no log the user could
+    find. B2 at the tool boundary: a rejected COM call (RPC_E_CALL_REJECTED / RETRYLATER) that reaches it is "XAE is
+    busy … did not run this call — repeat it" with what is open in the shell, logged at WARNING with its id; another
+    COM error stays an internal error naming the HRESULT in hex and the COM source; B5: the internal-error message names
+    ~/.twincat_mcp/logs/server.log and the crash id is in that file with its traceback."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    srv.dialog_hint = lambda: " Open dialog(s): 'About Microsoft Visual Studio' [buttons ['OK']] — answer it."
+
+    @srv.tool()
+    async def rejected() -> dict:
+        raise _ComError(-2147418111, "Call was rejected by callee.")
+
+    @srv.tool()
+    async def retry_later() -> dict:
+        raise _ComError(-2147417846, "The message filter indicated that the application is busy.")
+
+    @srv.tool()
+    async def com_fails() -> dict:
+        raise _ComError(-2147467259, "Unspecified error", (0, "TcXaeShell", "the project file is locked", None, 0,
+                                                           -2147467259))
+
+    @srv.tool()
+    async def crashes() -> dict:
+        return {}["missing"]
+
+    async with Client(srv) as c:
+        r1 = await c.call_tool("rejected", {})
+        r1b = await c.call_tool("retry_later", {})
+        r2 = await c.call_tool("com_fails", {})
+        r3 = await c.call_tool("crashes", {})
+    t1, t1b, t2, t3 = text(r1), text(r1b), text(r2), text(r3)
+    assert r1.is_error and ("rejected: XAE is busy (call rejected, 0x80010001) and did not run this call "
+                                         "— repeat it; if it keeps happening, a modal window or a long build holds the "
+                                         "shell (xae_dialogs)") in t1, t1
+    assert "internal error" not in t1 and "'About Microsoft Visual Studio'" in t1, t1
+    assert "retry_later: XAE is busy (call rejected, 0x8001010A)" in t1b and "internal error" not in t1b, t1b
+    assert r2.is_error and ("internal error in com_fails (_ComError 0x80004005 'Unspecified error', source "
+                            "'TcXaeShell': the project file is locked)") in t2, t2
+    server_log = tmp_path / "home" / "logs" / "server.log"
+    assert f"traceback: {server_log}, crash " in t3 and f"traceback: {server_log}, crash " in t2, t3
+    body = server_log.read_text(encoding="utf-8")
+    cid = t3.rsplit("crash ", 1)[1].strip()
+    after = body.split(f"crash {cid}", 1)[1]
+    assert "Traceback (most recent call last)" in after and "KeyError: 'missing'" in after, body[-2000:]
+    bid = t1.rsplit("(logged as ", 1)[1].rstrip(")")
+    assert any("WARNING" in ln and f"crash {bid}" in ln for ln in body.splitlines()), body[-2000:]
+
+
+@pytest.mark.anyio
+async def test_n174_a_shell_that_stays_busy_is_said_through_xae_call(monkeypatch, project_dir):
+    """N174 B2 at the tool level: a call the shell rejects for all of com_retry_s ends as "XAE is busy (call rejected,
+    0x80010001) and did not run this call" with what is open in the shell — not an internal error, not a raw
+    com_error text."""
+    from mcp.server.mcpserver.exceptions import ToolError
+    from twincat_mcp.server import App
+    install(monkeypatch)
+    app = App(mk_cfg(project_dir))
+    app.xae.cfg.com_retry_s = 0.6
+
+    def build():
+        return app.xae._retry(lambda: (_ for _ in ()).throw(_ComError(-2147418111, "Call was rejected by callee.")),
+                              "SolutionBuild.Build")
+    with pytest.raises(ToolError) as ei:
+        await app.xae_call(build, timeout=30)
+    msg = str(ei.value)
+    assert msg.startswith("SolutionBuild.Build: XAE is busy (call rejected, 0x80010001) and did not run this call — it "
+                          "was asked again for 0.6 s; repeat it"), msg
+    assert "internal error" not in msg and "No dialog is visible in the shell" in msg, msg
+
+
 @pytest.mark.anyio
 async def test_nothing_is_advertised_that_is_never_published(monkeypatch, project_dir):
     install(monkeypatch)
