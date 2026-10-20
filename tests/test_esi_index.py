@@ -944,3 +944,28 @@ def test_n167_hw_search_pages_through_every_item_once(esi_kb):
         x.search("S*", offset=11)
     with pytest.raises(E.EsiError, match="offset must be >= 0"):
         x.search("S*", offset=-1)
+
+
+def test_an_object_defined_twice_in_one_dictionary_is_one_object(esi_kb):
+    """kb_verify E2 on the user's ESI set (0.8.14 full run): EL6653-0010 rev #x0010000A — '17 CoE objects listed,
+    counted 19'. Beckhoff's EL66xx.xml defines #x1C32 and #x1C33 twice in that device's dictionary, byte-identical.
+    The list kept one per index, the count took both. An index defined again identically is the same object, kept
+    once and counted once; defined again differently, the first definition is the object and it says so
+    (defined_again_differs) — nothing is dropped silently."""
+    kb, tc, db = esi_kb
+    p = kb / "manuals" / "Beckhoff_EtherCAT_XML" / "Beckhoff EL33xx.xml"
+    s = p.read_text(encoding="utf-8")
+    ident = ('<Object><Index>#x1018</Index><Name>Identity</Name><Type>UDINT</Type><BitSize>32</BitSize>\n'
+             '                <Info><DefaultData>52301c0d</DefaultData></Info><Flags><Access>ro</Access></Flags></Object>')
+    assert s.count(ident) == 1
+    other = ('<Object><Index>#x1c12</Index><Name>RxPDO assign (2nd)</Name><Type>UDINT</Type><BitSize>32</BitSize>'
+             '<Flags><Access>ro</Access></Flags></Object>')
+    p.write_text(s.replace("</Objects>", ident + other + "</Objects>", 1), encoding="utf-8")
+    _build(esi_kb)
+    x = E.EsiIndex(db)
+    d = x.lookup("EL3356-0010", 1, None, "newest")["devices"][0]
+    idx = [o["index"] for o in d["coe_objects"]]
+    assert idx == ["#x1018", "#x1C12", "#x8000"] and d["coe_count"] == 3, (idx, d["coe_count"])
+    o = x.object("EL3356-0010", "#x1c12")
+    assert o["name"] == "RxPDO assign" and o["defined_again_differs"] == 1, o
+    assert "defined_again_differs" not in x.object("EL3356-0010", "#x1018")

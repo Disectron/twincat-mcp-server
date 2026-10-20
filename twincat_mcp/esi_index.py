@@ -58,7 +58,8 @@ from typing import Any, Callable, Iterable, Iterator
 
 from . import kb_lock
 
-FORMAT = "2"            # 1: 0.8.12; 2: a module's search text holds the devices whose slots take it (N156, 0.8.14 retest)
+FORMAT = "2"            # 1: 0.8.12; 2: a module's search text holds the devices whose slots take it (N156, 0.8.14 retest);
+                        #    an object index defined twice in one dictionary is one object (EL6653-0010, kb_verify E2)
 ROOT_KINDS = {"EtherCATInfo": "info", "EtherCATModule": "module", "EtherCATDict": "dict", "EtherCATDiag": "diag"}
 SIDE = ("-journal", "-wal", "-shm")
 SWAP_WAIT_S = 60.0
@@ -381,6 +382,7 @@ def parse_dictionary(dic: Any) -> list[dict[str, Any]] | None:
         return out
 
     objects = []
+    seen: dict[int, dict[str, Any]] = {}
     for o in _kids(_kid(dic, "Objects"), "Object"):
         idx = _num(_txt(_kid(o, "Index")))
         if idx is None:
@@ -411,6 +413,15 @@ def parse_dictionary(dic: Any) -> list[dict[str, Any]] | None:
                     row["enum"] = e
                 rows.append(row)
             obj["subitems"] = rows
+        first = seen.get(idx)
+        if first is not None:
+            # kb_verify E2 (0.8.14 full run): Beckhoff's EL66xx.xml defines #x1C32 / #x1C33 of EL6653-0010 twice, the
+            # same bytes — the device listed 17 objects and counted 19. An index defined again is one object: the
+            # same definition is dropped, another one leaves the first in place and is said (never silently lost)
+            if obj != {k: v for k, v in first.items() if k != "defined_again_differs"}:
+                first["defined_again_differs"] = first.get("defined_again_differs", 0) + 1
+            continue
+        seen[idx] = obj
         objects.append(obj)
     return objects
 

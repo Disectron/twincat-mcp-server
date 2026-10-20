@@ -27,8 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 INFOSYS_FINGERPRINT = (7, "b37714b81cc534b9")   # 0.8.15: kinds from the page's own evidence (N150 N151 N157 N172),
 #                                                    symbols inside pages (N170)
 MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes of every family (N163)
-ESI_FINGERPRINT = ("2", "684a8ed1534e8857")    # index\\esi.db (esi_index.py): format 2 — modules found by their
-#                                                 devices (N156, 0.8.14 retest); format 1 since 0.8.12
+ESI_FINGERPRINT = ("2", "90374d1987a8c788")    # index\\esi.db (esi_index.py): format 2 — modules found by their
+#                                                 devices (N156, 0.8.14 retest), one object per index of a dictionary
+#                                                 (EL6653, kb_verify E2; format 2 is not released yet); 1 since 0.8.12
 
 EXCLUDE = frozenset({
     "_db", "_Conn", "_file_sig", "_probe", "_writable", "missing_text", "ro_uri", "source", "has_fts", "_bump_gen",
