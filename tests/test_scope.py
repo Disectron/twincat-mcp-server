@@ -200,7 +200,7 @@ def test_n140_the_logs_nul_padding_is_no_text(tmp_path):
     where the text ends, so an entry written over trailing padding (in place, below the file's size) is still read."""
     log = tmp_path / "TcScopeView.log"
     pad = "\x00" * 600
-    log.write_text("t [ INFO  ] before\n" + pad, encoding="utf-8")
+    log.write_bytes(("t [ INFO  ] before\n" + pad).encode("utf-8"))          # bytes: no '\r\n' on Windows
     mark = S.log_mark(log)
     assert mark["size"] == len("t [ INFO  ] before\n")
     with open(log, "r+b") as fh:                              # written in place, over the padding
