@@ -714,3 +714,81 @@ def test_review_0814_a_pin_and_a_file_linked_into_two_plc_projects(tmp_path):
         assert "GVL_Common" in p.variables(port=port)["roots"], port
         assert p.resolve_symbol("GVL_Common.nShared", port)["resolved"], port
     assert "gvl_common" in p.plc_units(p.plc_project(port=852))[0] and "gvl_common" not in p.duplicates
+
+
+def test_n141_a_name_of_another_plc_project_says_where_it_is(tmp_path):
+    """N141 (0.8.14 retest, S4): proj_resolve_symbol PRG_B.nBValue on port 851 said "no program/GVL/FB named 'PRG_B'"
+    — PRG_B is Plc2's (port 852). Like proj_variables: not in the PLC project of that port, and where it is."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000, prog="PRG_B")
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    with pytest.raises(ProjectError) as e:
+        p.resolve_symbol("PRG_B.n", 851)
+    assert "not declared in PLC project Plc1 (ADS port 851)" in str(e.value) and "['Plc2']" in str(e.value), e.value
+    with pytest.raises(ProjectError, match="not declared in PLC project Plc1 — it is in PLC project"):
+        p.resolve_symbol("PRG_B.n", plc=p.plc_project(name="Plc1"))
+    with pytest.raises(ProjectError, match="no program/GVL/FB named 'PRG_X' in PLC project Plc1 \\(ADS port 851\\)"):
+        p.resolve_symbol("PRG_X.n", 851)
+    with pytest.raises(ProjectError, match="^no program/GVL/FB named 'PRG_X'; try proj_search$"):
+        p.resolve_symbol("PRG_X.n")
+
+
+def test_n142_a_pin_names_one_plc_project_of_a_shared_file(tmp_path):
+    """N142 (0.8.14 retest, S3): a file both PLC projects compile — 'PlcA@GVL_Common' gave both PLC projects, so the
+    pin the refusal asked for was refused the same way. A PLC-project pin is that PLC project."""
+    from twincat_mcp.project_backend import declaring
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    common = tmp_path / "Common"
+    common.mkdir()
+    (common / "GVL_Common.TcGVL").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><GVL Name="GVL_Common"><Declaration><![CDATA[VAR_GLOBAL\n'
+        "  nShared : INT;\nEND_VAR]]></Declaration></GVL></TcPlcObject>", encoding="utf-8")
+    for plc in ("Plc1", "Plc2"):
+        pp = tmp_path / plc / f"{plc}.plcproj"
+        pp.write_text(pp.read_text().replace("</Project>", '<ItemGroup><Compile Include="..\\Common\\GVL_Common.TcGVL">'
+                                              "<SubType>Code</SubType></Compile></ItemGroup></Project>"))
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    plcs, files = declaring(p, "GVL_Common")
+    assert [Path(x).stem for x in plcs] == ["Plc1", "Plc2"] and len(files) == 1
+    assert [Path(x).stem for x in declaring(p, "Plc2@GVL_Common")[0]] == ["Plc2"]
+    assert [Path(x).stem for x in declaring(p, "Common@GVL_Common")[0]] == ["Plc1", "Plc2"]     # a folder pin: its files
+    assert declaring(p, "Plc1@MAIN")[1] == [str(tmp_path / "Plc1" / "POUs" / "MAIN.TcPOU")]
+
+
+def test_s4_0814_a_shared_file_is_walked_with_the_types_of_its_plc_project(tmp_path):
+    """S4 (0.8.14 retest): proj_variables did not name the PLC project it walked — and a file both PLC projects compile
+    (GVL_Common) was walked with the types of the first one also on the other's port: ST_Data of Plc1 for port 852."""
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000)
+    for plc, member in (("Plc1", "nOne : INT;"), ("Plc2", "bTwo : BOOL;")):
+        (tmp_path / plc / "DUTs").mkdir()
+        (tmp_path / plc / "DUTs" / "ST_Data.TcDUT").write_text(
+            '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><DUT Name="ST_Data"><Declaration><![CDATA[TYPE ST_Data :\n'
+            f"STRUCT\n  {member}\nEND_STRUCT\nEND_TYPE]]></Declaration></DUT></TcPlcObject>", encoding="utf-8")
+        register_sources(tmp_path / plc / f"{plc}.plcproj")
+    common = tmp_path / "Common"
+    common.mkdir()
+    (common / "GVL_Common.TcGVL").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><TcPlcObject><GVL Name="GVL_Common"><Declaration><![CDATA[VAR_GLOBAL\n'
+        "  stData : ST_Data;\nEND_VAR]]></Declaration></GVL></TcPlcObject>", encoding="utf-8")
+    for plc in ("Plc1", "Plc2"):
+        pp = tmp_path / plc / f"{plc}.plcproj"
+        pp.write_text(pp.read_text().replace("</Project>", '<ItemGroup><Compile Include="..\\Common\\GVL_Common.TcGVL">'
+                                              "<SubType>Code</SubType></Compile></ItemGroup></Project>"))
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    for port, plc, path in ((851, "Plc1", "GVL_Common.stData.nOne"), (852, "Plc2", "GVL_Common.stData.bTwo")):
+        v = p.variables("GVL_Common", port=port)
+        assert [i["path"] for i in v["items"]] == [path] and Path(v["plc_project"]).stem == plc, (port, v)
+    v = p.variables("Plc2@GVL_Common", port=851)
+    assert [i["path"] for i in v["items"]] == ["GVL_Common.stData.bTwo"] and Path(v["plc_project"]).stem == "Plc2"
+    v = p.variables("GVL_Common")                                   # no port: both PLC projects compile it, said so
+    assert [Path(x).stem for x in v["plc_projects"]] == ["Plc1", "Plc2"], v
+    for port, member in ((851, "nOne"), (852, "bTwo")):             # the symbol resolved with that PLC project's types
+        r = p.resolve_symbol(f"GVL_Common.stData.{member}", port)
+        assert r["resolved"] and r["hops"][-1]["declared_in"] == "ST_Data", (port, r)
+        assert Path(r["hops"][-1]["file"]).parts[-3] == ("Plc1" if port == 851 else "Plc2")
+    assert not p.resolve_symbol("GVL_Common.stData.bTwo", 851)["resolved"]

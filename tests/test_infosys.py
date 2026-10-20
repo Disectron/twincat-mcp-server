@@ -686,6 +686,74 @@ def test_n126_an_fbs_methods_are_tied_to_it_through_the_contents(idx):
         idx.declaration("Call")                                   # the bare name: still two answers, nothing picked
 
 
+def test_kbv_i13_a_member_page_titled_with_brackets_or_a_version(idx):
+    """kb_verify I13 (0.8.14, format 6): 'FB_CammingLookUp.LookUp', 'FB_AppMessage.SendAlarm', 'FB_TrendHmi.Append'
+    were not found — Beckhoff titles those method pages 'LookUp()', 'SendAlarm()', 'Append()' and only a page titled
+    exactly 'LookUp' was looked for below the FB. 'FB_Module.GetHMI' answered the 'GetHMI' page alone: the
+    'GetHMI (4.1)' page below the other FB_Module page (tf3550) was never a candidate — two pages, nothing is chosen."""
+    P = "tf8560_plastic_technology_functions"
+    _store_with(idx, f"{P}/16232286603", "FB_CammingLookUp", "<pre>FUNCTION_BLOCK FB_CammingLookUp\nVAR_INPUT\n"
+                "    bEnable : BOOL;\nEND_VAR</pre>", "camming")
+    _store_with(idx, f"{P}/16233574155", "LookUp()", "<pre>METHOD LookUp : BOOL\nVAR_INPUT\n    fMaster : LREAL;\n"
+                "END_VAR</pre>", "camming-lookup", parent="camming")
+    A = "tf3550_tc3_analytics_runtime"
+    gethmi = "<pre>METHOD GetHMI : BOOL\nVAR_INPUT\n    nContent : DINT;\n    pContent : PVOID;\nEND_VAR</pre>"
+    _store_with(idx, f"{A}/10356579979", "FB_Module", "<pre>FUNCTION_BLOCK FB_Module\nVAR_INPUT\n    nOld : INT;\n"
+                "END_VAR</pre>", "module-41")
+    _store_with(idx, f"{A}/14385293579", "FB_Module", "<pre>FUNCTION_BLOCK FB_Module\nVAR_INPUT\n    nNew : INT;\n"
+                "END_VAR</pre>", "module")
+    _store_with(idx, f"{A}/14383837835", "GetHMI (4.1)", gethmi, "gethmi-41", parent="module-41")
+    _store_with(idx, f"{A}/14385303307", "GetHMI", gethmi, "gethmi", parent="module")
+    _store_with(idx, f"{A}/14385303399", "FB_Other.Run()", "<pre>METHOD Run : BOOL</pre>", "other-run")
+    idx.resolve_help_links()
+    C = "https://infosys.beckhoff.com/content/1033/"
+    d = idx.declaration("FB_CammingLookUp.LookUp")
+    assert d["url"] == f"{C}{P}/16233574155.html" and d["parent"]["title"] == "FB_CammingLookUp", d
+    with pytest.raises(InfosysError, match="ambiguous") as e:
+        idx.declaration("FB_Module.GetHMI")
+    assert f"{A}/14383837835" in str(e.value) and f"{A}/14385303307" in str(e.value)
+    assert idx.declaration("FB_Other.Run")["url"] == f"{C}{A}/14385303399.html"     # a dotted title with brackets
+
+
+_ADDKEY = "<pre>METHOD AddKey\nVAR_IN_OUT CONSTANT\n    key : STRING;\nEND_VAR</pre>"
+_JSON_MEMBERS = {   # book: (FB_JsonSaxWriter page, its AddKey, FB_JsonSaxPrettyWriter page, its AddKey) — real page ids
+    "tf6701_tc3_iot_communication_mqtt": ("4220481035_1", "4220504971_62687", "4220481035_2", "4220504971_564191"),
+    "tf6760_tc3_iot_https_rest": ("4220481035_3", "4220504971_2530563", "4220481035_4", "4220504971_22775067"),
+    "tcplclib_tc3_jsonxml": ("4220481035", "4220504971_57616766", "4220481099", "4220504971_48788849"),
+}
+
+
+def store_json_members(store) -> None:
+    """Two FBs with an AddKey method of one declaration, in 3 books (the 6 real 'AddKey' pages of the index): in the
+    product books' order the PrettyWriter's tf6760 copy comes right after the SaxWriter's tf6701 copy."""
+    order = [("tf6701_tc3_iot_communication_mqtt", 0), ("tf6760_tc3_iot_https_rest", 2), ("tcplclib_tc3_jsonxml", 0),
+             ("tf6701_tc3_iot_communication_mqtt", 2), ("tf6760_tc3_iot_https_rest", 0), ("tcplclib_tc3_jsonxml", 2)]
+    for book, i in order:
+        fb = ("FB_JsonSaxWriter", "FB_JsonSaxPrettyWriter")[i // 2]
+        pids = _JSON_MEMBERS[book]
+        store(f"{book}/{pids[i]}", fb, f"<pre>FUNCTION_BLOCK {fb}\nVAR_INPUT\n    bX : BOOL;\nEND_VAR</pre>",
+              f"{book}-{fb}")
+        store(f"{book}/{pids[i + 1]}", "AddKey", _ADDKEY, f"{book}-{fb}-addkey", f"{book}-{fb}")
+
+
+def test_kbv_i13_methods_of_two_fbs_are_never_one_document(idx):
+    """kb_verify I13 (0.8.14, format 6): FB_JsonSaxWriter.AddKey and FB_JsonSaxPrettyWriter.AddKey have one
+    declaration, and each is in 3 books. The copies were grouped by library and declaration only — the PrettyWriter's
+    tf6760 page was taken as the SaxWriter's copy (also_in / same_document, the documents of 'AddKey'). Member pages
+    below different symbols are two answers; a member is the same document only below the same symbol."""
+    store_json_members(lambda ref, title, body, hid, parent=None: _store_with(idx, ref, title, body, hid, parent))
+    idx.resolve_help_links()
+    with idx._db() as con:
+        docs = inf.symbol_documents(con, "AddKey")
+        owners = [{con.execute("SELECT q.title FROM pages p JOIN pages q ON q.url = p.parent WHERE p.rowid = ?",
+                               (r["rid"],)).fetchone()[0] for r in g} for g in docs]
+    assert sorted(len(g) for g in docs) == [3, 3] and all(len(o) == 1 for o in owners), owners
+    C = "https://infosys.beckhoff.com/content/1033/"
+    d = idx.declaration("FB_JsonSaxPrettyWriter.AddKey")
+    assert d["url"] == f"{C}tcplclib_tc3_jsonxml/4220504971_48788849.html"
+    assert sorted(d["same_page_in"]) == ["tf6701_tc3_iot_communication_mqtt", "tf6760_tc3_iot_https_rest"]
+
+
 def test_n138_a_page_that_is_not_utf8_keeps_its_characters():
     """N138 (0.8.13 retest): the stored text of 4 tf5200 pages had U+FFFD for Beckhoff's curly quotes — the package
     page was Windows-1252, read as UTF-8 with errors replaced. (The ADS return-code table itself stores its dashes:

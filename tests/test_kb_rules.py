@@ -186,3 +186,40 @@ def test_a_finished_build_in_wal_mode_is_swapped_in_whole(tmp_path):
     assert not building.exists() and not any(final.parent.glob("*-wal"))
     assert [r[0] for r in sqlite3.connect(final).execute("SELECT v FROM t")] == ["last commit", "complete"]
     assert sqlite3.connect(final).execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_s4_0814_kb_rebuild_gives_the_builds_own_pid(tmp_path):
+    """S4 (0.8.14 retest): kb_status showed build pids other than the ones kb_rebuild returned — on Windows a venv's
+    python.exe is a launcher that starts the interpreter as its child, and the child takes the lock. kb_rebuild gives
+    the pid in the build's lock (the launcher's as launcher_pid); a process that ends before taking it: its own pid."""
+    from twincat_mcp.server import _builder_pid
+    lock = tmp_path / "x.db.lock"
+    code = textwrap.dedent(f"""
+        import sys, time
+        sys.path.insert(0, {str(ROOT)!r})
+        from twincat_mcp import kb_lock
+        time.sleep(0.3)
+        with kb_lock.IndexLock(__import__('pathlib').Path({str(lock)!r})):
+            time.sleep(30)
+    """)
+    launcher = subprocess.Popen([sys.executable, "-c", f"import subprocess, sys; subprocess.run([sys.executable, '-c', {code!r}])"])
+    got: dict = {}
+    try:
+        got = _builder_pid(launcher, lock, wait_s=20)
+        assert got["launcher_pid"] == launcher.pid and got["pid"] != launcher.pid, got
+        assert kb_lock.read(lock)[0]["pid"] == got["pid"]
+    finally:
+        import signal
+        if got.get("pid") not in (None, launcher.pid):
+            os.kill(got["pid"], signal.SIGTERM)              # the 'build' the launcher started
+        launcher.kill()
+        launcher.wait(30)
+    direct = subprocess.Popen([sys.executable, "-c", code])
+    try:
+        assert _builder_pid(direct, lock, wait_s=20) == {"pid": direct.pid}
+    finally:
+        direct.kill()
+        direct.wait(30)
+    quick = subprocess.Popen([sys.executable, "-c", "pass"])
+    got = _builder_pid(quick, tmp_path / "never.lock", wait_s=20)
+    assert got["pid"] == quick.pid and "pid_note" in got

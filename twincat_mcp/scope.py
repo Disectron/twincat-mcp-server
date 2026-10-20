@@ -89,13 +89,30 @@ def view_log_path(configured: str | None = None) -> Path:
         "TE130X-Scope-View" / "TcScopeView.log"
 
 
+def _content_end(path: Path, size: int) -> int:
+    """The byte offset after the log's last byte that is not NUL. N140 (0.8.14 retest): TcScopeView.log carries NUL
+    padding; a writer that fills such padding in place writes below the file's size — the mark is where the text
+    ends, so what is written there later is read."""
+    with open(path, "rb") as fh:
+        pos = size
+        while pos > 0:
+            n = min(1 << 16, pos)
+            fh.seek(pos - n)
+            kept = fh.read(n).rstrip(b"\x00")
+            if kept:
+                return pos - n + len(kept)
+            pos -= n
+    return 0
+
+
 def log_mark(path: Path | None) -> dict[str, Any]:
-    """Where the Scope View log ends now ({"path", "size"}): size 0 when there is no log yet (all of a log written
-    later is new); "error" when it exists but cannot be read (nothing can be compared then)."""
+    """Where the Scope View log's text ends now ({"path", "size"}; trailing NUL padding not counted, N140): size 0 when
+    there is no log yet (all of a log written later is new); "error" when it exists but cannot be read (nothing can be
+    compared then)."""
     if path is None:
         return {"path": None, "size": None}
     try:
-        return {"path": str(path), "size": path.stat().st_size}
+        return {"path": str(path), "size": _content_end(path, path.stat().st_size)}
     except FileNotFoundError:
         return {"path": str(path), "size": 0}
     except OSError as exc:
@@ -130,12 +147,13 @@ def _new_lines(path: Path, start: int, end: int) -> Iterator[str]:
             if not raw:
                 break
             left -= len(raw)
-            text = rest + dec.decode(raw)
+            # N140 (0.8.14 retest): the log's NUL padding is no text — each error string carried hundreds of U+0000
+            text = rest + dec.decode(raw).replace("\x00", "")
             lines = text.splitlines(keepends=True)
             rest = lines.pop() if lines and not lines[-1].endswith(("\n", "\r")) else ""
             for ln in lines:
                 yield ln.lstrip("\ufeff").rstrip("\r\n")
-    tail = rest + dec.decode(b"", final=True)
+    tail = rest + dec.decode(b"", final=True).replace("\x00", "")
     if tail:
         yield tail.lstrip("\ufeff")
 

@@ -546,7 +546,8 @@ def resolve(ctx: Ctx, ref: str, book: str | None, what: str = "ref") -> tuple[sq
 
 
 def _pick(ctx: Ctx, rows: list[sqlite3.Row], ref: str, book: str | None, how: str, what: str) -> tuple[sqlite3.Row, str]:
-    docs = INF.same_documents(rows)          # N100: the same page in several books (T_MaxString) is one answer
+    # N100: the same page in several books (T_MaxString) is one answer; kb_verify I13: a member only below one symbol
+    docs = INF.same_documents(rows, ctx.con("infosys"))
     if len(docs) == 1:
         return docs[0][0], how
     if not rows:
@@ -584,7 +585,7 @@ def _also_in(con: sqlite3.Connection, r: sqlite3.Row) -> list[dict[str, Any]]:
         for x in g:
             rows.setdefault(x["rid"], x)
     rows.setdefault(r["rid"], r)
-    mine = next(g for g in INF.same_documents(list(rows.values())) if any(x["rid"] == r["rid"] for x in g))
+    mine = next(g for g in INF.same_documents(list(rows.values()), con) if any(x["rid"] == r["rid"] for x in g))
     same = {x["rid"] for x in mine}
     return [{"ref": f"{x['book']}/{x['pid']}", "book": x["book"], "version": x["version"] or None,
              **({"same_document": True} if x["rid"] in same else {})}

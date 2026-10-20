@@ -679,15 +679,36 @@ def _doc_order(r: Any) -> tuple:
 _MEMBER_KINDS = frozenset({"Method", "Property", "Action", "Transition"})
 
 
-def same_documents(rows: list[Any]) -> list[list[Any]]:
+def member_owners(con: Any, rows: list[Any]) -> dict[int, str]:
+    """{rid: the symbol its parent page documents (lower case)} of the member pages (method, property, action,
+    transition) among rows (DOC_COLS) whose parent in the Help Viewer contents is a symbol page — format 6 stores the
+    parent; a member below a topic page ('Methods') or with no parent has no owner here."""
+    if con is None or not has_parents(con):
+        return {}
+    out: dict[int, str] = {}
+    for r in rows:
+        if r["kind"] in _MEMBER_KINDS:
+            p = con.execute("SELECT q.title, q.kind FROM pages p JOIN pages q ON q.url = p.parent WHERE p.rowid = ?",
+                            (r["rid"],)).fetchone()
+            name = symbol_name(p[0]) if p is not None and p[1] != "Page" else None
+            if name:
+                out[r["rid"]] = name.lower()
+    return out
+
+
+def same_documents(rows: list[Any], con: Any = None) -> list[list[Any]]:
     """Rows (DOC_COLS) grouped into documents. Two pages are one document when they have the same page id (one
     Beckhoff page in several books: T_MaxString 31062795 in tcplclib_tc2_system and tf6510_tc3_iec61850), or the
     same library — compared without case, the books spell it both ways (Tc2_EtherCAT, Tc2_Ethercat) — and the same
     stored declaration (a page with none: the same text, link targets aside) — the answer is the same whichever is
     read; a page that names no library, with the declaration of exactly one library's page, is that page's copy. A
-    document has at most one page per book (a copy is in another book). Groups and their rows in _doc_order."""
+    document has at most one page per book (a copy is in another book). con (format 6): a member page is one document
+    only with pages below the same symbol — the AddKey of FB_JsonSaxWriter and of FB_JsonSaxPrettyWriter have one
+    declaration and are two answers (kb_verify I13, 0.8.14). Groups and their rows in _doc_order."""
     parent = list(range(len(rows)))
     books = [{str(r["book"] or "").lower()} for r in rows]       # per group: the books it has a page of
+    of = member_owners(con, rows)
+    owners = [{of[r["rid"]]} if r["rid"] in of else set() for r in rows]    # per group: the symbol its members are of
 
     def find(i: int) -> int:
         while parent[i] != i:
@@ -704,8 +725,11 @@ def same_documents(rows: list[Any]) -> list[list[Any]]:
             return True
         if books[a] & books[b] and not same_source:
             return False
+        if owners[a] and owners[b] and owners[a] != owners[b]:
+            return False                        # members of two symbols (format 6): two answers, whatever the text
         parent[b] = a
         books[a] |= books[b]
+        owners[a] |= owners[b]
         return True
 
     seen: dict[tuple, list[int]] = {}
@@ -791,27 +815,32 @@ def symbol_documents(con: Any, name: str, keep: Callable[[Any], bool] | None = N
                                              "AND kind != 'Page'", (s,))}
     has_catalog = con.execute("SELECT 1 FROM sqlite_master WHERE name = 'catalog'").fetchone() is not None
     src = "catalog" if has_catalog else "pages"
-    pat = "%" + _like(s.rsplit(".", 1)[-1]) + "%"
-    more = [r[0] for r in con.execute(f"SELECT rowid, title FROM {src} WHERE kind != 'Page' AND title LIKE ? "
-                                      "ESCAPE '\\' COLLATE NOCASE", (pat,))
-            if r[0] not in rows and names_symbol(r[1], s)]
-    for rid in more:
-        r = con.execute(f"SELECT {DOC_COLS} FROM pages WHERE rowid = ? AND kind != 'Page'", (rid,)).fetchone()
-        if r is not None:
-            rows[r["rid"]] = r
+    owner, member = s.rsplit(".", 1) if "." in s else ("", s)
+    members = "." in s and has_parents(con)
+    pat = "%" + _like(member) + "%"
+    more, bare = [], []
+    for rid, title in con.execute(f"SELECT rowid, title FROM {src} WHERE kind != 'Page' AND title LIKE ? "
+                                  "ESCAPE '\\' COLLATE NOCASE", (pat,)):
+        if rid not in rows and names_symbol(title, s):
+            more.append(rid)
+        elif members and names_symbol(title, member):
+            bare.append(rid)
+
+    def fetch(rids: list[int]) -> list[Any]:
+        got = (con.execute(f"SELECT {DOC_COLS} FROM pages WHERE rowid = ? AND kind != 'Page'", (rid,)).fetchone()
+               for rid in rids)
+        return [r for r in got if r is not None]
+    for r in fetch(more):
+        rows[r["rid"]] = r
     cands = [r for r in rows.values() if keep is None or keep(r)]
-    if "." in s and has_parents(con):
+    if members:
         # N126 (format 6): 'FB_X.Call' — Beckhoff titles a method page with its bare name; the pages below FB_X's page
-        # in the contents are FB_X's members (a page titled 'FB_X.Call' itself stays a candidate)
-        owner, member = s.rsplit(".", 1)
-        bare = [r for r in con.execute(f"SELECT {DOC_COLS} FROM pages WHERE title = ? COLLATE NOCASE AND kind != 'Page'",
-                                       (member,)) if keep is None or keep(r)]
-        owned = _owned_by(con, bare, owner)
-        if owned:
-            exact = [r for r in cands if " ".join((r["title"] or "").split()).lower() == s.lower()]
-            ids = {r["rid"] for r in exact}
-            cands = exact + [r for r in owned if r["rid"] not in ids]
-    return same_documents(cands)
+        # in the contents are FB_X's members (a page titled 'FB_X.Call' itself stays a candidate). kb_verify I13
+        # (0.8.14): the bare name as a title writes it — 'LookUp()', 'GetHMI (4.1)' (names_symbol), not only 'LookUp'
+        owned = _owned_by(con, [r for r in fetch(bare) if keep is None or keep(r)], owner)
+        ids = {r["rid"] for r in cands}
+        cands += [r for r in owned if r["rid"] not in ids]
+    return same_documents(cands, con)
 
 
 def title_documents(con: Any, title: str, keep: Callable[[Any], bool] | None = None) -> list[list[Any]]:
@@ -822,7 +851,7 @@ def title_documents(con: Any, title: str, keep: Callable[[Any], bool] | None = N
         return docs
     rows = [r for r in con.execute(f"SELECT {DOC_COLS} FROM pages WHERE title = ? COLLATE NOCASE",
                                    (" ".join(title.split()),)) if keep is None or keep(r)]
-    return same_documents(rows)
+    return same_documents(rows, con)
 
 
 def has_parents(con: Any) -> bool:
@@ -961,7 +990,7 @@ def _one_per_document(con: Any, rows: list[Any], copies: dict[int, list[tuple[st
         if len(same) < 2:
             continue
         full = [con.execute(f"SELECT {DOC_COLS} FROM pages WHERE rowid = ?", (r["rid"],)).fetchone() for r in same]
-        for g in same_documents([f for f in full if f is not None]):
+        for g in same_documents([f for f in full if f is not None], con):
             if len(g) < 2:
                 continue
             best = min(pos[x["rid"]] for x in g)
