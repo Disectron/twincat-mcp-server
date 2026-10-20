@@ -1925,6 +1925,9 @@ def _deliberate(exc: BaseException) -> bool:
             or isinstance(exc, (OSError, sqlite3.Error, ValueError, pyads.ADSError)))
 
 
+# how SaveSVD's file is watched after the call returned: unchanged for (seconds), given up after (seconds)
+SCOPE_SETTLE_S = (0.5, 15.0)
+
 # set by every XAE call of the tool invocation running in this task: its result then carries the binding's flags
 _XAE_USED: contextvars.ContextVar[bool] = contextvars.ContextVar("tcmcp_xae_used", default=False)
 
@@ -2928,7 +2931,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             out["export_csv"] = {"skipped": "the saved .svdx " + ("was still being written after "
                                  f"{watch.get('still_growing_after_s')} s" if watch.get("still_growing_after_s") else
                                  "could not be watched") + " — nothing was exported from it; export it when it is "
-                                 f"complete: scope_export(svd_path={str(svdx)!r})"}
+                                 f"complete: scope_export(svd={str(svdx)!r})"}
+            out["svdx_incomplete"] = out["export_csv"]["skipped"]
             return out
         tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
         failed = None
@@ -2986,10 +2990,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                             + " (N117); both files are kept")
         return d
 
-    def _settled(p: Path, quiet_s: float = 0.5, limit_s: float = 15.0) -> dict[str, Any]:
+    def _settled(p: Path) -> dict[str, Any]:
         """Whether SaveSVD's file still grew after the call returned (not documented either way): its size watched
         until it stayed the same for quiet_s — what that shows, no more (an unchanged size is not proof the writer is
         done)."""
+        quiet_s, limit_s = SCOPE_SETTLE_S
         t0 = time.monotonic()
         try:
             last = p.stat().st_size
@@ -3026,33 +3031,37 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
         else:
             out.update(await _scope_save(run["name"], svdx, csv))
-            out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv)
+            out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv, out.get("svdx_incomplete"))
             app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
                       OpClass.EDIT, "ok")
         if run.get("log_mark"):
             out["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, run["log_mark"])
         return out
 
-    def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path) -> dict[str, Any]:
+    def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path, incomplete: str | None = None) -> dict[str, Any]:
         """Signed <id>.scope.json tying the ADS recording to the Scope files (SHA-256 each); the files are set
-        read-only like the recording (R9)."""
+        read-only like the recording (R9). incomplete: the .svdx was still being written — review of 0.8.14: it was
+        hashed and set read-only as it was; now it is neither, and the link says why."""
         from .recorder import _manifest_sig, file_sha256
         import os as _os
         import stat as _stat
         files = {}
         xcsv = csv.with_name(csv.name[:-4] + ".xae.csv")
-        for p in (svdx, csv, xcsv):
+        sealed = [p for p in (csv, xcsv) if not incomplete] + ([] if incomplete else [svdx])
+        for p in sealed:
             if p.is_file():
                 sha, n = file_sha256(p)
                 files[p.name] = {"sha256": sha, "bytes": n}
         link: dict[str, Any] = {"_scope_link": 1, "recording": rid, "scope": run["scope"], "started": run["started"],
                                 "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "files": files,
                                 "recorder": f"twincat-mcp {__version__}"}
+        if incomplete:
+            link["not_sealed"] = {"file": svdx.name, "why": incomplete}
         if app.rec.key:
             link["hmac"] = _manifest_sig(app.rec.key, link)
         lp = svdx.with_name(f"{rid}.scope.json")
         lp.write_text(json.dumps(link, indent=1) + "\n", encoding="utf-8")
-        for p in (svdx, csv, xcsv, lp):
+        for p in sealed + [lp]:
             if p.is_file():
                 try:
                     _os.chmod(p, p.stat().st_mode & ~(_stat.S_IWUSR | _stat.S_IWGRP | _stat.S_IWOTH))

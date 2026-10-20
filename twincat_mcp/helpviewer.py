@@ -181,13 +181,20 @@ def decode_page(raw: bytes) -> str:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         pass
+    # review of 0.8.14: a page that is not valid UTF-8 but declares utf-8 was decoded as UTF-8 with replacement — the
+    # cp1252 fallback was never reached. A declaration these bytes contradict is not followed: not UTF-8 (just
+    # failed), not UTF-16/32 (the <meta> was found as ASCII bytes); another one is tried strictly
     m = _CHARSET.search(raw[:4096])
-    for enc in ([m.group(1).decode("ascii", "replace")] if m else []) + ["cp1252"]:
+    named = m.group(1).decode("ascii", "replace").lower() if m else ""
+    if named and not re.match(r"utf-?(8|16|32)", named):
         try:
-            return raw.decode(enc, errors="replace")
-        except LookupError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+            return raw.decode(named)
+        except (LookupError, UnicodeDecodeError):
+            pass
+    # UTF-8 with a few bad bytes keeps its good characters; bytes without one UTF-8 sequence are Windows-1252
+    if re.search(rb"[\xc2-\xdf][\x80-\xbf]|[\xe0-\xef][\x80-\xbf]{2}|[\xf0-\xf4][\x80-\xbf]{3}", raw):
+        return raw.decode("utf-8", errors="replace")
+    return raw.decode("cp1252", errors="replace")
 
 
 def page_meta(raw: bytes | str, limit: int = 8000) -> dict[str, str]:

@@ -35,7 +35,13 @@ def test_code_forms_and_where_a_code_is_defined():
     f = D.code_forms("ADS return codes 0x745")
     assert (f["value"], f["dec"], f["hex"]) == (1861, "1861", ["0x745", "0x0745", "0x00000745"])
     assert D.code_forms("ADS error 1861")["hex"][0] == "0x745" and D.code_forms("16#745")["value"] == 1861
-    assert D.code_forms("error 7") is None and D.code_forms("0x745 1861") is None and D.code_forms("ADSREAD") is None
+    assert D.code_forms("error 7") is None and D.code_forms("ADSREAD") is None
+    # review of 0.8.14: other numbers of the query do not cancel the code; two different codes are none
+    assert D.code_forms("0x745 1861")["value"] == 1861 and D.code_forms("ADS error 0x745 (1861)")["value"] == 1861
+    assert D.code_forms("ADS error 1861 on port 851")["value"] == 1861 and D.code_forms("0x745 0x710") is None
+    assert D.code_forms("nErrId := 1861")["value"] == 1861 and D.code_forms("nErrorID := 1861")["value"] == 1861
+    assert D.code_forms("error number 1861")["value"] == 1861 and D.code_forms("error ID 1861")["value"] == 1861
+    assert D.code_forms("part number 1861") is None
     # a decimal number is a code only when a word says so (review 0.8.12): a port or a build is none
     assert D.code_forms("ADS port 851") is None and D.code_forms("build 4024") is None
     # N122 (0.8.13 retest): a number that is the whole query is a code ('1861' listed Tc3_Vision pages first)

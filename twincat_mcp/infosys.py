@@ -676,6 +676,9 @@ def _doc_order(r: Any) -> tuple:
             r["book"] or "", r["pid"] or "")
 
 
+_MEMBER_KINDS = frozenset({"Method", "Property", "Action", "Transition"})
+
+
 def same_documents(rows: list[Any]) -> list[list[Any]]:
     """Rows (DOC_COLS) grouped into documents. Two pages are one document when they have the same page id (one
     Beckhoff page in several books: T_MaxString 31062795 in tcplclib_tc2_system and tf6510_tc3_iec61850), or the
@@ -712,10 +715,22 @@ def same_documents(rows: list[Any]) -> list[list[Any]]:
     for i, r in enumerate(rows):
         if r["pid"]:
             # N99b (0.8.13 retest): '374277003_30131813' and '374277003_2750866' are Beckhoff's page 374277003 placed
-            # twice in one book (the 4 'ADS Return Codes' of tf6500, byte-identical) — one page, merged like its copies
-            base = str(r["pid"]).split("_", 1)[0]
+            # twice in one book (the 4 'ADS Return Codes' of tf6500, byte-identical) — one page, merged like its copies.
+            # Review of 0.8.14: a shared id prefix alone is not that — two FBs' 'EqualsTo' (5002755467_60885635 /
+            # _11099805) and 8 prefixes whose pages differ were merged. One source page: the same text, and no member
+            # page (a method / property of two FBs is two answers, whatever its text)
+            pid = str(r["pid"])
+            base = pid.split("_", 1)[0]
             for j in seen.get(("pid", base), []):
-                if union(j, i, same_source=True):
+                rj = rows[j]
+                if str(rj["pid"]) == pid:
+                    joined = union(j, i)                    # the same page id: a copy in another book
+                elif (r["kind"] not in _MEMBER_KINDS and rj["kind"] not in _MEMBER_KINDS
+                      and _body_text(r) and _body_text(r) == _body_text(rj)):
+                    joined = union(j, i, same_source=True)
+                else:
+                    continue
+                if joined:
                     break
             seen.setdefault(("pid", base), []).append(i)
     for i, r in enumerate(rows):

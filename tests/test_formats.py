@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (6, "07c45cfac497dfb8")   # 0.8.14: TOC parents (N126), page charset (N138)
+INFOSYS_FINGERPRINT = (6, "ab659652eaeda2ee")   # 0.8.14: TOC parents (N126), page charset (N138)
 MANUALS_FINGERPRINT = ("5", "e101b15235e0b5fc")
 ESI_FINGERPRINT = ("1", "12f26f31cd9afc7d")    # index\\esi.db (esi_index.py), format 1 since 0.8.12
 
@@ -73,6 +73,17 @@ def _closure(roots: list, modules: list) -> dict[str, str]:
         g = obj.__globals__ if inspect.isfunction(obj) else sys.modules[obj.__module__].__dict__
         cls = owner(obj) if inspect.isfunction(obj) else None
         for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.ImportFrom):
+                # review of 0.8.14: a name imported inside a function (html_to_doc's `from .helpviewer import
+                # decode_page`) is on the path too — the closure did not see it
+                try:
+                    modname = importlib.util.resolve_name("." * node.level + (node.module or ""), obj.__module__
+                                                          .rpartition(".")[0]) if node.level else node.module
+                except (ImportError, ValueError):
+                    modname = None
+                if modname in mods:
+                    for a in node.names:
+                        value(a.asname or a.name, getattr(sys.modules[modname], a.name, None))
             if isinstance(node, ast.Name) and node.id in g:
                 value(node.id, g[node.id])
             elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
@@ -156,7 +167,7 @@ def test_the_closure_reaches_what_decides_stored_content():
     for name in ("_SKIP", "_PREFIX_KIND", "_BLOCK", "_HEAD_RE", "_SECTION_RE", "_VARLINE_RE", "_STRUCT_RE", "_ENUM_RE",
                  "_IDENT", "_TABLE_MARK", "_VERSIONISH", "CODE_SEP", "_ident_matches", "book_of", "library_from_book",
                  "InfosysIndex.book_allowed", "is_tc2_book", "TC2_BOOK_RES", "_MdWalker", "_type_refs",
-                 "InfosysIndex.sitemap", "HelpViewerSource"):
+                 "InfosysIndex.sitemap", "HelpViewerSource", "decode_page", "_CHARSET"):
         assert name in found, name
     for name in EXCLUDE:
         assert name not in found and f"InfosysIndex.{name}" not in found, name

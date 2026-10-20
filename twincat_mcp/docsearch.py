@@ -365,8 +365,10 @@ def title_order(rows: list[Any], query: str, title_key: str = "title", library_k
 # ------------------------------------------------------------------------------------------- error codes (N99)
 _HEX = re.compile(r"^(?:0x|16#|#x)([0-9a-f_]+)$", re.I)
 # words that make a decimal number of the query an error / return code
-_CODE_WORDS = frozenset("""error errors err errid nerrid errorid errorcode errcode errno code codes return returncode
-result hresult adserr adserror fehler fehlercode fehlernummer""".split())
+_CODE_WORDS = frozenset("""error errors err errid nerrid errorid nerrorid errorcode nerrorcode errcode errno errnum
+code codes return returncode result hresult adserr adserror fehler fehlercode fehlernummer""".split())
+# 'error number 1861', 'error ID 1861', 'Fehler Nr. 1861': a code word followed by one of these right before the number
+_CODE_WORD_SUFFIX = frozenset("number id no nr code nummer".split())
 
 
 def code_forms(query: str) -> dict[str, Any] | None:
@@ -376,19 +378,23 @@ def code_forms(query: str) -> dict[str, Any] | None:
     ('error 1861', 'ADS return code 1861' — 'ADS port 851' or 'build 4024' is no code, review 0.8.12); else None."""
     q = query_text(query)
     toks = list(re.finditer(r"(?:0x|16#|#x)[0-9a-fA-F_]+|\b\d{2,}\b", q))
-    if len(toks) != 1:
+    # N122 (0.8.13 retest): a number that IS the query ('1861') is a code too, as the tool describes it — inside other
+    # words a decimal needs a code word next to it ('error 1861'; 'ADS error on port 851' is no code 851, N121); a hex
+    # number is a code. Review of 0.8.14: the query's other numbers do not cancel it ('ADS error 1861 on port 851',
+    # 'ADS error 0x745 (1861)' — one code, written twice); two different codes are none
+    cands: list[tuple[str, int]] = []
+    for tk in toks:
+        t = tk.group(0)
+        m = _HEX.match(t)
+        if not m and q.strip() != t and not _next_to_code_word(q, tk.start(), tk.end()):
+            continue
+        try:
+            cands.append((t, int(m.group(1).replace("_", ""), 16) if m else int(t)))
+        except ValueError:
+            continue
+    if len({v for _t, v in cands}) != 1:
         return None
-    t = toks[0].group(0)
-    m = _HEX.match(t)
-    # N122 (0.8.13 retest): a number that IS the query ('1861') is a code too, as the tool describes it — only inside
-    # other words does it need a code word next to it ('error 1861'; 'ADS error on port 851' is no code 851, N121)
-    whole = q.strip() == t
-    if not m and not whole and not _next_to_code_word(q, toks[0].start(), toks[0].end()):
-        return None
-    try:
-        value = int(m.group(1).replace("_", ""), 16) if m else int(t)
-    except ValueError:
-        return None
+    t, value = cands[0]
     if value < 16:
         return None
     h = f"{value:x}"
@@ -401,9 +407,12 @@ def _next_to_code_word(q: str, start: int, end: int) -> bool:
     right before or after it says it is a code ('error 1861', 'nErrId = 1861', '1861 error')."""
     if re.search(r"[\w-]$", q[:start]) or re.match(r"[\w-]", q[end:]):
         return False
-    before = re.search(r"([^\W\d_]+)[\s:=#(]{1,3}$", q[:start])
+    before = re.search(r"([^\W\d_]+)[\s:=#(]{1,6}$", q[:start])        # 'nErrId := 1861' (ST's ' := ')
     after = re.match(r"[\s:)]{1,3}([^\W\d_]+)", q[end:])
-    return any(x is not None and fold(x.group(1)) in _CODE_WORDS for x in (before, after))
+    if any(x is not None and fold(x.group(1)) in _CODE_WORDS for x in (before, after)):
+        return True
+    two = re.search(r"([^\W\d_]+)\s+([^\W\d_]+)\.?[\s:=#(]{1,6}$", q[:start])
+    return bool(two and fold(two.group(1)) in _CODE_WORDS and fold(two.group(2)) in _CODE_WORD_SUFFIX)
 
 
 def _cell_value(cell: str) -> tuple[str, int] | None:

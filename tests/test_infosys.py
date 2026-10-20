@@ -592,6 +592,13 @@ def test_n100_one_page_in_two_books_is_one_answer_and_every_reader_agrees(idx):
     for lib in (None, "Tc3_JsonXml"):
         with pytest.raises(InfosysError, match=r"ambiguous: IsBase64 is documented by 2 different pages.*infosys_get_page"):
             idx.declaration("IsBase64", library=lib)
+    # review of 0.8.14: two FBs' methods whose page ids share a prefix (5002755467_60885635 / _11099805) stay two
+    put("tcplclib_tc3_eventlogger", "5002755467_60885635", "EqualsTo", "Method", "Tc3_EventLogger",
+        "METHOD EqualsTo : BOOL VAR_INPUT ipOther : I_TcEventBase; END_VAR")
+    put("tcplclib_tc3_eventlogger", "5002755467_11099805", "EqualsTo", "Method", "Tc3_EventLogger",
+        "METHOD EqualsTo : BOOL VAR_INPUT ipOther : I_TcEventBase; END_VAR")
+    with idx._db() as con:
+        assert len(symbol_documents(con, "equalsto")) == 2
     # a title that writes the keyword or the call: the same symbol
     put("tcplclib_tc2_utilities", "99", "FUNCTION F_GetVersionTcUtilities", "Function", "Tc2_Utilities", "FUNCTION F_GetVersionTcUtilities : UINT")
     assert idx.declaration("F_GetVersionTcUtilities")["url"] == f"{C}tcplclib_tc2_utilities/99.html"
@@ -690,6 +697,12 @@ def test_n138_a_page_that_is_not_utf8_keeps_its_characters():
     latin = '<meta charset="iso-8859-1"><p>Müller</p>'.encode("latin-1")
     assert "Müller" in decode_page(latin)
     assert "�" not in html_to_doc(raw).markdown
+    # review of 0.8.14: the usual <meta charset=utf-8> on a page that is not UTF-8 is not followed (it was decoded as
+    # UTF-8 with replacement); a UTF-16 declaration on ASCII-compatible bytes neither; UTF-8 with one bad byte keeps
+    # its good characters
+    for meta in ('<meta charset="utf-8">', '<meta http-equiv="Content-Type" content="text/html; charset=utf-16">'):
+        assert decode_page((meta + "<p>“x” – y</p>").encode("cp1252")) == meta + "<p>“x” – y</p>"
+    assert decode_page("<p>Größe ".encode("utf-8") + b"\x96</p>") == "<p>Größe \ufffd</p>"
 
 
 def test_n99b_one_source_page_placed_twice_in_a_book_is_one_hit_and_code_tables_come_first(idx):
