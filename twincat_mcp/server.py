@@ -31,10 +31,11 @@ import sqlite3
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
+import contextvars
 import functools
 import secrets
 
@@ -816,7 +817,21 @@ class App:
                             f"{d.get('buttons')}; text {str(d.get('text', ''))[:200]!r}). Answer it first "
                             f"(xae_dialog_resolve(button=...)), then retry. {done}")
 
+    def xae_flags(self) -> dict[str, Any]:
+        """N116: what the result of a tool that used the XAE shell says about the binding — bound to another solution
+        than xae.solution_path (every time), re-attached since the last such result (once)."""
+        out: dict[str, Any] = {}
+        note = getattr(self.xae, "mismatch_note", lambda: None)()
+        if note:
+            out.update(solution_mismatch=True, solution_note=note)
+        again = getattr(self.xae, "reattach_note", None)
+        if again:
+            out["reattached"] = again
+            self.xae.reattach_note = None
+        return out
+
     async def xae_call(self, fn, *a, timeout: float | None = None, **kw) -> Any:
+        _XAE_USED.set(True)
         job = getattr(fn, "__name__", "XAE call")
         self._held_check(job)
         before = {d.get("hwnd") for d in self.dialogs_now()}
@@ -873,16 +888,7 @@ class App:
             if live:                       # N87: the call ran, but the shell has a dialog waiting — say so
                 res = {**res, "open_dialogs": [{k: d.get(k) for k in ("hwnd", "title", "text", "buttons")}
                                                for d in live[:5]]}
-            # N116 (0.8.13 retest): bound to another solution than xae.solution_path — said in every result, not only
-            # in xae_attach's; a re-attach the call made (the shell went away) as well
-            note = getattr(self.xae, "mismatch_note", lambda: None)()
-            if note and "solution_mismatch" not in res:
-                res = {**res, "solution_mismatch": True, "solution_note": note}
-            again = getattr(self.xae, "reattach_note", None)
-            if again and "reattached" not in res:
-                res = {**res, "reattached": again}
-                self.xae.reattach_note = None
-        return res
+        return res              # N116: the binding's flags are added to the tool's own result (_tool_boundary)
 
     def guard_safety_path(self, path: str, action: str) -> None:
         """TwinSAFE (TISC / Safety) projects are never edited unless explicitly enabled."""
@@ -1919,7 +1925,11 @@ def _deliberate(exc: BaseException) -> bool:
             or isinstance(exc, (OSError, sqlite3.Error, ValueError, pyads.ADSError)))
 
 
-def _tool_boundary(fn: Any) -> Any:
+# set by every XAE call of the tool invocation running in this task: its result then carries the binding's flags
+_XAE_USED: contextvars.ContextVar[bool] = contextvars.ContextVar("tcmcp_xae_used", default=False)
+
+
+def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]] | None] = lambda: None) -> Any:
     """What leaves a tool. mcp >= 2.1 passes only a ToolError's text to the client — any other exception arrives as a
     bare "Error executing tool X" (R37: never an empty error): a deliberate error keeps its text; a defect says its
     type and message and is logged with its traceback under a crash id. A question for the user (prompting.AskUser)
@@ -1928,8 +1938,15 @@ def _tool_boundary(fn: Any) -> Any:
 
     @functools.wraps(fn)
     async def run(*args: Any, **kwargs: Any) -> Any:
+        used = _XAE_USED.set(False)
         try:
-            return await fn(*args, **kwargs)
+            res = await fn(*args, **kwargs)
+            flags = xae_flags()
+            if _XAE_USED.get() and flags is not None and isinstance(res, dict):
+                # N116 / review of 0.8.14: the binding's flags go on the result the tool returns — not on the first
+                # XAE call's (a token-target lookup's result is thrown away, a Scope result copies only its own keys)
+                res = {**res, **{k: v for k, v in flags().items() if k not in res}}
+            return res
         except ASK.AskUser as ask:
             return ask.result
         except (ToolError, MCPError):
@@ -1942,6 +1959,8 @@ def _tool_boundary(fn: Any) -> Any:
             raise ToolError(f"internal error in {name} ({type(exc).__name__}: {str(exc)[:300] or 'no message'}) — a "
                             f"defect in twincat-mcp, not in the call; its traceback is in the server log as crash "
                             f"{cid}") from exc
+        finally:
+            _XAE_USED.reset(used)
     return run
 
 
@@ -1961,11 +1980,13 @@ def _dialog_awaits(d: dict[str, Any]) -> bool:
 class TcMcpServer(MCPServer):
     """MCPServer whose tools go through _tool_boundary."""
 
+    xae_flags: Callable[[], dict[str, Any]] | None = None     # App.xae_flags, set by build_server
+
     def tool(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
         register = super().tool(*args, **kwargs)
 
         def decorator(fn: Any) -> Any:
-            register(_tool_boundary(fn))
+            register(_tool_boundary(fn, lambda: self.xae_flags))
             return fn                     # the closure keeps the plain function (tools that call each other)
         return decorator
 
@@ -1977,6 +1998,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     # start), so subscribe / listChanged are not advertised (mcp 2.3)
     mcp = TcMcpServer("twincat-mcp", instructions=connection_instructions(app), version=__version__,
                       subscriptions=False)
+    mcp.xae_flags = app.xae_flags
 
     # ======================================================================
     # tc_* meta

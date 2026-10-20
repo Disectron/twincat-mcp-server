@@ -1258,3 +1258,49 @@ def test_n116_a_reattach_after_the_shell_went_away_is_said(xae):
     assert be._retry(dead_then_ok, "DTE.Version") == "ok"
     assert "went away" in be.reattach_note
     assert "went away" in be.status()["reattached"] and be.reattach_note is None
+
+
+def test_review_0814_an_online_command_or_action_is_never_sent_twice(xae, monkeypatch):
+    """Review of 0.8.14 (S1): after ITcPlcOnline.Login/Reset/Stop was sent, a busy shell during the state read-back
+    raised a plain XaeError and plc_action went on to ConsumeXml and PLC.Download — the command acted twice. And a
+    shell that went away DURING an action (activate, restart, delete …) had the action run again on the re-attached
+    shell, since the retry now reaches the live one."""
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    calls = []
+    proj.IsLoggedIn, proj.OnlineApplicationState = False, 2
+    proj.Login = lambda flags: calls.append(("Login", flags))
+    consumed = []
+    proj.ConsumeXml = lambda xml: consumed.append(xml)
+    real = be._item
+    sent = {"n": 0}
+
+    def busy_after_login(path):
+        if calls:
+            raise X.XaeError("LookupTreeItem: the shell is busy")
+        return real(path)
+    monkeypatch.setattr(be, "_item", busy_after_login)
+    with pytest.raises(X.XaeExplained, match=r"ITcPlcOnline.download on .* could not be read back .*may have acted.*not sent again"):
+        be.plc_action("download")
+    assert calls == [("Login", 4)] and consumed == [] and dte.commands == []
+    monkeypatch.setattr(be, "_item", real)
+    # an action during which the shell went away: re-attached, not repeated
+    be.attach()
+
+    def dies_during_activate():
+        sent["n"] += 1
+        raise ComError(X.RPC_E_DISCONNECTED)
+    monkeypatch.setattr(sm, "ActivateConfiguration", dies_during_activate)
+    with pytest.raises(X.XaeExplained, match=r"ActivateConfiguration: the XAE shell went away during the call.*"
+                                             r"not repeated \(re-attached"):
+        be.activate_configuration()
+    assert sent["n"] == 1 and "went away during ActivateConfiguration" in be.reattach_note
+    # a read is still retried on the re-attached shell
+    n = {"k": 0}
+
+    def dead_once():
+        n["k"] += 1
+        if n["k"] == 1:
+            raise ComError(X.RPC_E_DISCONNECTED)
+        return "ok"
+    assert be._retry(dead_once, "GetTargetNetId") == "ok" and n["k"] == 2

@@ -1590,3 +1590,27 @@ async def test_review_0814_plugin_composed_xae_errors_get_no_known_error_note(tm
     with pytest.raises(ToolError) as ei:
         await app.xae_call(raw)
     assert "known cause" not in str(ei.value), str(ei.value)
+
+
+@pytest.mark.anyio
+async def test_review_0814_the_binding_flags_are_on_the_tools_own_result(monkeypatch, project_dir):
+    """Review of 0.8.14: `reattached` went on the first XAE call of a tool — the token-target lookup, whose result is
+    thrown away — so xae_plc / xae_activate_configuration never said it; Scope results copied only their own keys."""
+    from twincat_mcp import xae_backend as X
+    install(monkeypatch)
+    lookups = {"n": 0}
+
+    def target_get(self):
+        lookups["n"] += 1
+        self.reattach_note = f"the XAE shell went away; re-attached (lookup {lookups['n']})"
+        return {"target_net_id": "5.1.2.3.1.1", "twincat_started": True}
+    monkeypatch.setattr(X.XaeBackend, "target_get", target_get)
+    monkeypatch.setattr(X.XaeBackend, "mismatch_note", lambda self: "bound to C:\\P\\Other.sln, not xae.solution_path")
+    monkeypatch.setattr(X.XaeBackend, "_nested_projects", lambda self, p=None: ["TIPC^Plc^Plc Project"])
+    monkeypatch.setattr(X.XaeBackend, "plc_action", lambda self, a, p=None: {"action": a, "ok": True})
+    async with client_for(build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))) as s:
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_plc", "args": {"action": "login"}}))
+        r = payload(await s.call_tool("xae_plc", {"action": "login", "confirm_token": tok["confirm_token"]}))
+        assert r["ok"] and r["solution_mismatch"] and "re-attached" in r["reattached"], r
+        r = payload(await s.call_tool("proj_scan", {}))                   # no XAE call: no XAE flags
+        assert "solution_mismatch" not in r and "reattached" not in r

@@ -163,8 +163,11 @@ class XaeBackend:
             raise XaeError("XAE backend needs Windows with TwinCAT XAE and pywin32 installed "
                            "(pip install pywin32). This process is running on " + sys.platform)
 
-    def _retry(self, fn: Callable[[], Any], what: str = "COM call") -> Any:
-        """Retry COM calls while the shell is busy."""
+    def _retry(self, fn: Callable[[], Any], what: str = "COM call", once: bool = False) -> Any:
+        """Retry COM calls while the shell is busy (a rejected call ran nothing). once=True: an action that must not
+        run twice (activate, restart, an online command, create / delete / import, a shell command): when the shell
+        goes away DURING it, whether it acted is unknown — the server re-attaches, but the call is not repeated on
+        the new shell (review of 0.8.14: the retry, which now reaches the live shell, could run it a second time)."""
         t_start = time.time()
         deadline = t_start + self.cfg.com_retry_s
         delay = 0.25
@@ -187,6 +190,24 @@ class XaeBackend:
                     time.sleep(delay)
                     delay = min(delay * 1.5, 2.0)
                     continue
+                if hr in (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE) and once:
+                    self.dte = self.sysman = None
+                    where = "the server could not re-attach yet"
+                    if not getattr(self, "_reattaching", False):
+                        self._reattaching = True
+                        try:
+                            self.attach(_internal=True)
+                            where = f"re-attached to {self.bound_solution or 'the running shell'}"
+                            self.reattach_note = (f"the XAE shell this server was attached to went away during {what}; "
+                                                  f"{where}" + (f" (pid {self.pid})" if self.pid else ""))
+                        except Exception:  # noqa: BLE001
+                            self.dte = self.sysman = None
+                        finally:
+                            self._reattaching = False
+                    raise XaeExplained(
+                        f"{what}: the XAE shell went away during the call (closed or crashed, 0x{hr & 0xFFFFFFFF:08X}) — "
+                        f"whether it acted is unknown, so it is not repeated ({where}). Check xae_status / ads_status "
+                        "before you run it again.") from exc
                 if hr in (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE):
                     self.dte = self.sysman = None
                     if not getattr(self, "_reattaching", False):
@@ -334,21 +355,21 @@ class XaeBackend:
             self._find_sysman()
         return self.sysman
 
-    def _on_sm(self, op: Callable[[Any], Any], what: str) -> Any:
+    def _on_sm(self, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(System Manager) through _retry, the System Manager taken in every attempt."""
         self._sm()                         # N116: the bound solution, checked once per call
-        return self._retry(lambda: op(self._cur_sm()), what)
+        return self._retry(lambda: op(self._cur_sm()), what, once)
 
-    def _on_item(self, path: str, op: Callable[[Any], Any], what: str) -> Any:
+    def _on_item(self, path: str, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(tree item at path) through _retry, the item looked up in every attempt — a refreshed System Manager or a
         re-attached shell gives a live item, never the stale one of the first attempt."""
         self._sm()
-        return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what)
+        return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what, once)
 
-    def _on_dte(self, op: Callable[[Any], Any], what: str) -> Any:
+    def _on_dte(self, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(DTE) through _retry, the DTE taken in every attempt (a dead proxy is replaced by _retry's re-attach)."""
         self._need()
-        return self._retry(lambda: op(self.dte), what)
+        return self._retry(lambda: op(self.dte), what, once)
 
     def mismatch_note(self) -> str | None:
         """N116: the solution the xae_* tools work on is not the configured xae.solution_path (xae_attach(solution_path=
@@ -667,7 +688,7 @@ class XaeBackend:
         return {"saved": not after, "dirty_before": before, "dirty_after": after}
 
     def close_solution(self, save: bool = True) -> dict[str, Any]:
-        self._on_dte(lambda dte: dte.Solution.Close(save), "Solution.Close")
+        self._on_dte(lambda dte: dte.Solution.Close(save), "Solution.Close", once=True)
         self.sysman = None
         return {"closed": True}
 
@@ -869,7 +890,7 @@ class XaeBackend:
 
     # ------------------------------------------------------------ commands
     def command(self, name: str, args: str = "") -> dict[str, Any]:
-        self._on_dte(lambda dte: dte.ExecuteCommand(name, args), f"ExecuteCommand {name}")
+        self._on_dte(lambda dte: dte.ExecuteCommand(name, args), f"ExecuteCommand {name}", once=True)
         return {"executed": name, "args": args}
 
     def list_commands(self, contains: str, limit: int = 200) -> dict[str, Any]:
@@ -1026,13 +1047,16 @@ class XaeBackend:
         if action in _LOGIN_FLAGS:
             if before["logged_in"] and action == "download":
                 return None              # logged in already: a download is the shell's PLC.Download (DTE route)
-            self._on_item(target, lambda x: _com_call(x, "Login", _LOGIN_FLAGS[action]), f"ITcPlcOnline.Login({action})")
+            self._on_item(target, lambda x: _com_call(x, "Login", _LOGIN_FLAGS[action]), f"ITcPlcOnline.Login({action})",
+                          once=True)
         elif action == "logout":
-            self._on_item(target, lambda x: _com_call(x, "Logoff"), "ITcPlcOnline.Logoff")
+            self._on_item(target, lambda x: _com_call(x, "Logoff"), "ITcPlcOnline.Logoff", once=True)
         elif action in ("start", "stop"):
-            self._on_item(target, lambda x: _com_call(x, action.capitalize()), f"ITcPlcOnline.{action.capitalize()}")
+            self._on_item(target, lambda x: _com_call(x, action.capitalize()), f"ITcPlcOnline.{action.capitalize()}",
+                          once=True)
         elif action in _RESET_TYPE:
-            self._on_item(target, lambda x: _com_call(x, "Reset", _RESET_TYPE[action]), f"ITcPlcOnline.Reset({action})")
+            self._on_item(target, lambda x: _com_call(x, "Reset", _RESET_TYPE[action]), f"ITcPlcOnline.Reset({action})",
+                          once=True)
         else:
             return None
         want_in = {"login": True, "online_change": True, "download": True, "logout": False}.get(action)
@@ -1041,12 +1065,20 @@ class XaeBackend:
         def reached(st: dict[str, Any]) -> bool:
             return not ((want_in is not None and st["logged_in"] is not None and st["logged_in"] != want_in)
                         or (want_state and st["application_state"] not in (None, want_state)))
-        # the state follows the call (Start is not yet RUN when it returns): read it again for a while
+        # the state follows the call (Start is not yet RUN when it returns): read it again for a while. The command was
+        # sent: whatever happens while reading it back, it is never sent again through another route (review of
+        # 0.8.14: a busy shell during the read-back raised a plain error and plc_action went on to PLC.Download)
         t_end = time.monotonic() + self.ONLINE_STATE_WAIT_S
-        after = self._online_state(self._item(target))
-        while not reached(after) and time.monotonic() < t_end:
-            time.sleep(0.25)
+        try:
             after = self._online_state(self._item(target))
+            while not reached(after) and time.monotonic() < t_end:
+                time.sleep(0.25)
+                after = self._online_state(self._item(target))
+        except Exception as exc:  # noqa: BLE001
+            raise _ActedUnconfirmed(
+                f"ITcPlcOnline.{action} on {target} returned, but its state could not be read back ({exc}) — the "
+                "command may have acted, so it is not sent again through another route; check xae_status / "
+                "ads_status") from exc
         if not reached(after):
             # the call was accepted: it may have acted. No other route runs it again — a second reset or download
             # would act twice (review of the TE1000 route)
@@ -1096,8 +1128,8 @@ class XaeBackend:
                 r = self._plc_online(target, action)
             if r is not None:
                 return {**r, **sn}
-        except (_ActedUnconfirmed, _NeedsLogin):
-            raise
+        except XaeExplained:
+            raise                          # may have acted / needs a login / the shell went away during it
         except XaeError as exc:
             ai_note = f"ITcPlcOnline on {target}: {str(exc)[:200]}"
         tag = self._PLC_ONLINE_XML.get(action)
@@ -1110,6 +1142,8 @@ class XaeBackend:
                 if ai_note:
                     out["automation_interface"] = ai_note
                 return out
+            except XaeExplained:
+                raise
             except XaeError as exc:
                 ai_note = (ai_note + "; " if ai_note else "") + f"ConsumeXml {tag} on {target}: {str(exc)[:200]}"
         key = _cmd_key(target_name)
@@ -1134,6 +1168,8 @@ class XaeBackend:
                     if ai_note:
                         out["automation_interface"] = ai_note
                     return out
+                except XaeExplained:
+                    raise
                 except XaeError as exc:
                     tried.append({"command": c, "error": str(exc)[:200]})
             break
@@ -1187,7 +1223,7 @@ class XaeBackend:
         self._sm()
         t0 = time.time()
         with self.silent("ActivateConfiguration") as sn:
-            self._on_sm(lambda sm: sm.ActivateConfiguration(), "ActivateConfiguration")
+            self._on_sm(lambda sm: sm.ActivateConfiguration(), "ActivateConfiguration", once=True)
         return {"activated": True, "target": self._on_sm(lambda sm: sm.GetTargetNetId(), "GetTargetNetId"), "duration_s": round(time.time() - t0, 1),
                 "note": "Configuration is on the target. Call xae_restart_twincat to switch it to RUN.", **sn}
 
@@ -1195,7 +1231,7 @@ class XaeBackend:
         self._sm()
         t0 = time.time()
         with self.silent("StartRestartTwinCAT"):      # TE1000: "in UI builds a confirmation dialog appears first"
-            self._on_sm(lambda sm: sm.StartRestartTwinCAT(), "StartRestartTwinCAT")
+            self._on_sm(lambda sm: sm.StartRestartTwinCAT(), "StartRestartTwinCAT", once=True)
         started = None
         for _ in range(60):
             try:
@@ -1313,7 +1349,9 @@ class XaeBackend:
     def _consume(self, path: str, xml: str, what: str) -> None:
         """ConsumeXml; a refusal carries ITcSmTreeItem.GetLastXmlError (TE1000), which says what in the XML failed."""
         try:
-            self._on_item(path, lambda it: it.ConsumeXml(xml), what)
+            self._on_item(path, lambda it: it.ConsumeXml(xml), what, once=True)
+        except XaeExplained:
+            raise
         except XaeError as exc:
             it = _try(lambda: self._item(path))
             detail = (_try(lambda: str(_com_call(it, "GetLastXmlError") or ""))
@@ -1351,12 +1389,14 @@ class XaeBackend:
         created (a property's accessors: it is live — nothing can reopen the solution in between)."""
         def run(op: Callable[[Any], Any], what: str) -> Any:
             if isinstance(parent, str):
-                return self._on_item(parent, op, what)
-            return self._retry(lambda: op(parent), what)
+                return self._on_item(parent, op, what, once=True)
+            return self._retry(lambda: op(parent), what, once=True)
         if info is None:
             return run(lambda p: p.CreateChild(name, subtype, before), "CreateChild")
         try:
             return run(lambda p: p.CreateChild(name, subtype, before, info), "CreateChild")
+        except XaeExplained:
+            raise                          # the shell went away during it: not created a second time
         except XaeError:
             if isinstance(info, list) and IS_WIN:  # pragma: no cover - retry as SAFEARRAY of BSTR
                 variant = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_BSTR, [str(x) for x in info])
@@ -1368,7 +1408,7 @@ class XaeBackend:
         return self._item_dict(self._create_child(parent_path, name, subtype, before, info))
 
     def tree_delete_child(self, parent_path: str, name: str) -> dict[str, Any]:
-        self._on_item(parent_path, lambda p: p.DeleteChild(name), f"DeleteChild {name}")
+        self._on_item(parent_path, lambda p: p.DeleteChild(name), f"DeleteChild {name}", once=True)
         return {"deleted": f"{parent_path}^{name}"}
 
     # ------------------------------------------------------------ PLC
@@ -1487,7 +1527,7 @@ class XaeBackend:
             except XaeError as exc:
                 # all or nothing: the property this call made goes again rather than stay without accessors
                 try:
-                    self._on_item(parent_path, lambda p: p.DeleteChild(name), f"DeleteChild {name}")
+                    self._on_item(parent_path, lambda p: p.DeleteChild(name), f"DeleteChild {name}", once=True)
                     undo = f"the property {path} this call created was deleted again"
                 except XaeError as exc2:
                     undo = f"the property {path} is left WITHOUT accessors (deleting it failed: {exc2}) — delete it"
@@ -1553,9 +1593,12 @@ class XaeBackend:
         value = opts["rename"] if option == "replace" else opts[option]
         # all four arguments: the folder structure from the XML is kept (bFolderStructure, default TRUE in the docs)
         try:
-            self._on_item(plc_project_path, lambda x: x.PlcOpenImport(xml_file, value, "", True), "PlcOpenImport")
+            self._on_item(plc_project_path, lambda x: x.PlcOpenImport(xml_file, value, "", True), "PlcOpenImport",
+                          once=True)
+        except XaeExplained:
+            raise                          # the shell went away during it: not imported a second time
         except XaeError:
-            self._on_item(plc_project_path, lambda x: x.PlcOpenImport(xml_file, value), "PlcOpenImport")
+            self._on_item(plc_project_path, lambda x: x.PlcOpenImport(xml_file, value), "PlcOpenImport", once=True)
         after = snapshot()
         ov: dict[str, Any] = {"value": value, "from": opt_src}
         if option == "replace":
@@ -1815,7 +1858,7 @@ class XaeBackend:
             res["autostart"] = bool(autostart)
         if generate:
             self._on_item(plc_project_path, lambda x: x.GenerateBootProject(bool(activate_after_generate)),
-                          "GenerateBootProject")
+                          "GenerateBootProject", once=True)
             res["boot_project_generated"] = True
         res["current_autostart"] = _try(lambda: bool(self._item(plc_project_path).BootProjectAutostart))
         return res
@@ -2028,7 +2071,7 @@ class XaeBackend:
             o = obj if tries["n"] == 0 else self._scope_pick(name)["_obj"]
             tries["n"] += 1
             return _com_call(o, meth, *args)
-        rc = self._retry(call, f"Scope {meth}")
+        rc = self._retry(call, f"Scope {meth}", once=True)
         out: dict[str, Any] = {"scope": f"{d['project']}\\{d['name']}", "action": action, "method": meth,
                                "result_code": rc, "elapsed_s": round(time.monotonic() - t0, 3)}
         if path:
