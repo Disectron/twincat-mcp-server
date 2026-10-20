@@ -2957,6 +2957,14 @@ class InfosysIndex:
             r = con.execute("SELECT value FROM meta WHERE key = 'source_stamp'").fetchone()
         return r["value"] if r else None
 
+    def _pages_gen(self) -> str:
+        """The pages table's generation (_bump_gen): a call that read the index and finds it changed reads again."""
+        if self.read_only and not self.db_file.is_file():
+            return ""
+        with self._db() as con:
+            r = con.execute("SELECT value FROM meta WHERE key = 'pages_gen'").fetchone()
+        return str(r[0]) if r is not None else "0"
+
     def indexed_books(self) -> list[str]:
         with self._db() as con:
             return [r["book"] for r in con.execute("SELECT book FROM books ORDER BY book")]
@@ -3232,10 +3240,13 @@ class InfosysIndex:
                     docs = symbol_documents(con, s, keep)
             return every, docs
 
+        gen = self._pages_gen()
         every, docs = documents()
         if not docs:
             found = self.search_symbols(s, library=library, limit=5)    # indexes the default books first (web cache)
-            if found.get("auto_indexed"):
+            if found.get("auto_indexed") or self._pages_gen() != gen:
+                # Windows CI of 5c6f30f: the server's background indexer finished the default books between the first
+                # read and search_symbols (which then indexed nothing) — the first, empty read was kept
                 every, docs = documents()
         if not docs:
             # N170 (0.8.14 retest): no page and no section documents the symbol — a page with the name as a word of
@@ -3445,9 +3456,11 @@ class InfosysIndex:
             raise InfosysError(f"no page id {r} in the " + ("local Help Viewer package" if self.local is not None
                                                              else "Infosys sitemap"))
         # a symbol name, else a page title — the rule of every reader (N100)
+        gen = self._pages_gen()
         with self._db() as con:
             docs = title_documents(con, r)
-        if not docs and self.search_symbols(r, limit=3).get("auto_indexed"):     # the default books, indexed first
+        if not docs and (self.search_symbols(r, limit=3).get("auto_indexed")     # the default books, indexed first
+                         or self._pages_gen() != gen):                         # or by the background indexer meanwhile
             with self._db() as con:
                 docs = title_documents(con, r)
         if len(docs) == 1:

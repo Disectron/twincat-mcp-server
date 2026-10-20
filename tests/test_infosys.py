@@ -1361,3 +1361,32 @@ def test_third_review_0815_a_derived_rebuild_is_one_transaction(idx, monkeypatch
     monkeypatch.setattr(I, "DERIVED_VERSION", I.DERIVED_VERSION + 1)
     assert idx.sync_derived()["changed"] is True
     assert before > 0 and seen and all(x == before for x in seen), (before, seen)
+
+
+def test_main_ci_0815_a_book_indexed_while_the_call_runs_is_read(idx, monkeypatch):
+    """Windows CI of main at 5c6f30f (web cache, fresh): the server's first documentation call starts indexing the
+    default books in a background thread, and infosys_declaration ADSREAD answered without `inputs`. declaration()
+    read the index (empty), asked search_symbols to index the defaults — the background indexer had finished
+    meanwhile, so nothing was indexed by this call (no `auto_indexed`) and the first, empty read was kept. A call
+    reads again whenever the index changed while it ran (pages_gen), not only when it indexed itself; get_page by
+    name likewise."""
+    real = idx.search_symbols
+
+    def background_indexer_finished_first(*a, **k):
+        idx.index_book("tcplclib_tc2_system")          # what the server's background thread did meanwhile
+        return real(*a, **k)
+    monkeypatch.setattr(idx, "search_symbols", background_indexer_finished_first)
+    d = idx.declaration("ADSREAD")
+    assert d["kind"] == "FunctionBlock" and d["inputs"][0]["name"] == "NETID", d
+
+
+def test_main_ci_0815_get_page_by_name_reads_a_book_indexed_meanwhile(tmp_path, monkeypatch):
+    """The same race in get_page(ref='ADSREAD'): the name was resolved from the first, empty read."""
+    ix = InfosysIndex(tmp_path / "docs", fetcher=FakeFetcher(), books=["tcplclib_tc2_system"], max_workers=2)
+    real = ix.search_symbols
+
+    def background_indexer_finished_first(*a, **k):
+        ix.index_book("tcplclib_tc2_system")
+        return real(*a, **k)
+    monkeypatch.setattr(ix, "search_symbols", background_indexer_finished_first)
+    assert ix.get_page("ADSREAD", max_chars=200)["title"] == "ADSREAD"
