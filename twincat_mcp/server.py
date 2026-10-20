@@ -399,6 +399,7 @@ class App:
         def _task_of(name: str, port: int | None = None) -> list[dict[str, Any]] | None:
             return self.proj.tasks_of(name, port)
         self.rec.task_of = _task_of
+        self.rec.task_reason = lambda name, port=None: self.proj.task_reason(name, port)
         self.bench = TestBench(self.ads, self.rec, Path(cfg.safety.audit_log).parent / "snapshots")
         self.hmi = HmiIndex()
         self.profiles = capture.ProfileStore(Path(cfg.safety.audit_log).parent / "profiles")
@@ -419,7 +420,6 @@ class App:
                 if cfg.docs.source == "local":
                     from . import helpviewer as HV
                     from . import infosys_build as IB
-                    from . import kb_layout as L
                     pk = HV.find_packages(cfg.docs.mshc)
                     if not pk:
                         where = cfg.docs.mshc or " / ".join(str(r) for r in HV.catalog_roots())
@@ -898,16 +898,18 @@ class App:
     # -- N113: the source analyses run inside ONE PLC project when names are declared in several ------------------
     def proj_views(self, name: str | None) -> list[ProjectIndex]:
         """The index itself when no name is declared twice; else the PLC project that declares `name` (several and no
-        'file@name' pin: refused, nothing is picked), or — no name — each PLC project in turn."""
+        '<PLC project>@name' pin: refused, nothing is picked), or — no name — each PLC project in turn."""
         p = self.proj
         p._ensure()
-        if not p.duplicates:
+        # multi-PLC audit (0.8.13): split only when names were declared twice — with two PLC projects a lint of the whole
+        # tree compared one project's declarations with the other's code. Several PLC projects: each in turn, always
+        if not p.duplicates and len(p.plcproj) <= 1:
             return [p]
         if name:
             plcs = plc_projects_declaring(p, name)
             if len(plcs) > 1:
                 raise ToolError(f"{name!r} is declared in several PLC projects {[x or '(files of no PLC project)' for x in plcs]} "
-                                f"— pin one: '<file-substring>@{name.split('@')[-1]}' (nothing was chosen)")
+                                f"— pin one: '<PLC project>@{name.split('@')[-1]}' (nothing was chosen)")
             return [PlcView(p, plcs[0])] if plcs else [p]       # not declared: the analysis says so itself
         return [PlcView(p, plc) for plc in sorted({p._plc_of(f) for f in p._by_file}, key=lambda x: x or "")]
 
@@ -918,7 +920,7 @@ class App:
         if p.root is None:
             return p
         p._ensure()
-        if not p.duplicates:
+        if not p.duplicates and len(p.plcproj) <= 1:
             return p
         plc = p.plc_project(port=port or self.ads.port)
         return PlcView(p, plc) if plc is not None else p
@@ -927,7 +929,7 @@ class App:
         """A function file -> the view of its PLC project, the views built once (in the worker thread that calls this)."""
         p = self.proj
         p._ensure()
-        if not p.duplicates:
+        if not p.duplicates and len(p.plcproj) <= 1:
             return lambda _f: p
         views: dict[str | None, ProjectIndex] = {}
 
@@ -1414,6 +1416,10 @@ class App:
                 # check cannot be made; guarded mode refuses (as without a project source)
                 return (f"{name!r}: {exc}. A write to a CONSTANT cannot be ruled out — guarded mode refuses it. Name "
                         "the PLC projects' ADS ports in the .tsproj (AmsPort), or switch to full mode.")
+            if "several PLC projects" in str(exc):
+                # full mode (0.8.13 retest, S3): the check was skipped silently. It is made in every PLC project that
+                # declares the name: a CONSTANT in any of them refuses the write (which one the target runs is unknown)
+                return self._constant_in_any_plc(name)
             return None                                 # unknown in source: the runtime check is all we have
         except Exception:  # noqa: BLE001
             return None
@@ -1422,6 +1428,23 @@ class App:
                 return (f"{name!r}: {h['segment']} is declared in a VAR ... CONSTANT block ({h.get('declared_in')}, "
                         f"{Path(h.get('file') or '').name}:{h.get('line')}). The runtime accepts the write, but a constant changed "
                         "at runtime desynchronises array bounds and code compiled against it — change it in source and download")
+        return None
+
+    def _constant_in_any_plc(self, name: str) -> str | None:
+        from .project_backend import plc_projects_declaring
+        head = re.split(r"\.(?![^\[]*\])", name.strip())[0]
+        for plc in plc_projects_declaring(self.proj, head):
+            try:
+                r = self.proj.resolve_symbol(name, plc=plc)
+            except ProjectError:
+                continue
+            for h in r.get("hops", []):
+                if h.get("constant"):
+                    return (f"{name!r}: {h['segment']} is declared in a VAR ... CONSTANT block in PLC project "
+                            f"{Path(plc).stem if plc else '(none)'} ({h.get('declared_in')}, {Path(h.get('file') or '').name}:"
+                            f"{h.get('line')}) — the name is declared in several PLC projects and which one the target "
+                            "runs is not known, so the write is refused (a constant changed at runtime desynchronises "
+                            "code compiled against it). Name the ADS ports in the .tsproj (AmsPort) to tell them apart.")
         return None
 
     async def write_preflight(self, name: str, value: Any, port: int | None = None) -> None:
@@ -3114,7 +3137,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             pv = await app.proj_call(app.proj.variables, scope, 64, 200_000, False, port=app.ads.port)
             if pv.get("note"):
                 raise ToolError(f"from_attributes: {pv['note']} — which PLC project's attributes to take is not known; "
-                                "connect to the PLC project's ADS port (ads_connect) or pass scope='<file-substring>@<name>'")
+                                "connect to the PLC project's ADS port (ads_connect) or pass scope='<PLC project>@<name>'")
             try:
                 found = capture.items_from_attributes(pv["items"], cycle_ms)
             except capture.ProfileError as exc:
@@ -3756,8 +3779,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Every variable the project source declares, flattened to runtime instance paths by
         walking programs and GVLs through FB/STRUCT definitions (MAIN.fbFill.fbValve.bOpen …).
         scope = one program/GVL/FB to walk instead of all. Library-typed variables stay as one
-        item with their type."""
-        return await app.proj_call(app.proj.variables, scope, max_array, max_items, include_temp)
+        item with their type. A name declared in several PLC projects is walked in the PLC project on the connected ADS
+        port (the .tsproj's AmsPort); pin another with '<PLC project>@<name>'."""
+        return await app.proj_call(app.proj.variables, scope, max_array, max_items, include_temp, port=app.ads.port)
 
     @mcp.tool(annotations=READ)
     async def proj_vs_runtime(scope: str | None = None, max_items: int = 200_000) -> dict[str, Any]:
@@ -4364,7 +4388,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         recs = app.guard.tail_audit(1000)
         since = time.strftime("%Y-%m-%dT%H:%M", time.localtime(app.started))
         mine = [r for r in recs if r.get("ts", "") >= since]
-        lines = [f"# twincat-mcp session report", f"- started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(app.started))}",
+        lines = ["# twincat-mcp session report", f"- started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(app.started))}",
                  f"- target: {app.scope()}", f"- mode now: {app.guard.mode}", "", "## Mutating calls"]
         for r in mine:
             if r.get("op") in ("write", "control", "destructive", "edit"):
