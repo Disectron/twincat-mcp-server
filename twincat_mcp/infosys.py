@@ -3548,30 +3548,33 @@ class InfosysIndex:
 
         def plain(h: str) -> str:
             return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", h))).strip()
-        titles = re.findall(r'<a\b[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*>(.*?)</a>', raw, re.S)
-        tags = re.findall(r'<a\b[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*>', raw)
-        snippets = re.findall(r'<(?:a|td|div)\b[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</(?:a|td|div)>',
-                              raw, re.S)
+        # one result block each (title link and its own snippet) — re-review of 0.8.16: paired by position, a result
+        # without a snippet gave every later one the snippet of the one before it
+        blocks = re.split(r'(?=<div\b[^>]*class="[^"]*\bresult\b)', raw)
         out: list[dict[str, Any]] = []
-        for i, tag in enumerate(tags):
-            m = re.search(r'href="([^"]+)"', tag)
+        for blk in blocks:
+            t = re.search(r'<a\b([^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*)>(.*?)</a>', blk, re.S)
+            if not t:
+                continue
+            m = re.search(r'href="([^"]+)"', t.group(1))
             if not m:
                 continue
             href = html.unescape(m.group(1))
             if "uddg=" in href:
                 href = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [""])[0])
-            if "infosys.beckhoff.com/content/" not in href:
-                continue
             href = re.sub(r"\?.*$", "", href.replace("http://", "https://").split("#", 1)[0])
+            # re-review of 0.8.16: a page of no known book (another language, TwinCAT 2's old '/html/…htm' form) passed —
+            # only English content pages of a book this server allows (tc3_only), as the sitemap check of _ddg does
+            if f"infosys.beckhoff.com/content/{LANG}/" not in href:
+                continue
             b = book_of(href)
-            if b and not self.book_allowed(b[0]):
+            if not b or not self.book_allowed(b[0]):
                 continue
             if any(o["url"] == href for o in out):
                 continue
-            out.append({"url": href, "title": plain(titles[i]) if i < len(titles) else None,
-                        "snippet": plain(snippets[i]) if i < len(snippets) else None,
-                        "book": b[0] if b else None, "in_local_package": href in local if self.local is not None
-                        else None})
+            sn = re.search(r'<(a|td|div)\b[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</\1>', blk, re.S)
+            out.append({"url": href, "title": plain(t.group(2)), "snippet": plain(sn.group(2)) if sn else None,
+                        "book": b[0], "in_local_package": href in local if self.local is not None else None})
             if len(out) >= limit:
                 break
         return out

@@ -518,8 +518,11 @@ class XaeBackend:
             rec["failed"] = True
         clears = getattr(self, "_msg_clears", None)
         if before and before.strip():
-            if clears is False or (clears is None and after.startswith(before)):
-                after = after[len(before):] if after.startswith(before) else after   # history: it stays in the buffer
+            # a buffer known not to clear: what the read before gave is history. Unknown (the second read was rejected):
+            # taken as TE1000 documents it — cleared; re-review of 0.8.16: the old 'starts with it' guess lost an action
+            # that logged the same text again
+            if clears is False and after.startswith(before):
+                after = after[len(before):]
             else:
                 rec["earlier_messages"] = before.strip()[:self.MESSAGES_MAX]
                 rec["earlier_note"] = "in the buffer before this action: logged by earlier steps, not by it"

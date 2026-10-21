@@ -1890,3 +1890,34 @@ def test_review_0816_the_build_finds_the_system_manager_to_read(monkeypatch):
     be.build()
     assert [(r["action"], r["messages"]) for r in be.messages] == [("SolutionBuild.Build",
                                                                      "Warning: the build logged this")], be.messages
+
+
+def test_rereview_0816_a_rejected_second_read_keeps_the_action_s_messages(monkeypatch):
+    """Re-review of 0.8.16 (12): when the read that learns whether the buffer clears was rejected (busy), the old
+    'starts with it' guess returned and an action that logged the same text again lost its messages. Unknown is taken
+    as TE1000 documents it: the read clears."""
+    sm = _MsgSysMan(clears=True)
+    be = _be_on(monkeypatch, [[_cand(FakeDTE(sm))]])
+    be.MESSAGES_READ_S = 0.2
+    sm.buffer = WARN + "\n"
+    calls = {"n": 0}
+    orig = sm.GetLastErrorMessages
+
+    def read():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+        return orig()
+    sm.GetLastErrorMessages = read
+    monkeypatch.setattr(be, "_retry", lambda fn, what="", once=False, retry_s=None: fn() if "GetLastErrorMessages"
+                        not in what or calls["n"] != 1 else _raise_busy(fn))
+    be.activate_configuration()
+    assert be._msg_clears is None
+    assert [(r.get("earlier_messages"), r.get("messages")) for r in be.messages] == [(WARN, WARN)], be.messages
+
+
+def _raise_busy(fn):
+    try:
+        return fn()
+    except ComError as exc:
+        raise X.XaeBusy("busy") from exc

@@ -794,7 +794,8 @@ def test_lookup_reads_codes_names_and_text_and_refuses_bad_input(kb):
     assert lookup(kb, "TargetPortNotFound")["matches"][0]["matched_by"] == "dotnet name"
     assert lookup(kb, "LabVIEW error 0xFFFFE504")["matches"][0]["value"] == -6908
     d = lookup(kb, "diag code #x4101")["matches"][0]
-    assert d["domain"] == "ethercat_diag" and d["messages"] == 2 and d["text"] == "Terminal-Overtemperature", d
+    # re-review of 0.8.16: two devices word #x4101 differently — no one text is its meaning (hw_diag with device=)
+    assert d["domain"] == "ethercat_diag" and d["messages"] == 2 and "text" not in d and d["texts"] == 2, d
     assert "hw_diag" in d["see"]
     al = lookup(kb, "AL status code 0x001B")["matches"][0]
     assert al["domain"] == "ethercat_al" and al["ref"] == "EtherCAT_System_Documentation.pdf#p123", al
@@ -914,23 +915,46 @@ def test_review_0816_an_esi_text_id_has_the_fields_of_any_documented_code(kb, tm
     """Review of 0.8.16 (1): the ESI match had no 'dec' and no 'ref' — doc_note (every XAE / ADS / rec error text) and
     kb_search raised KeyError instead of giving the error. Every match has the fields of a documented code."""
     from twincat_mcp import knowledge as K
-    m = lookup(kb, "EtherCAT diagnosis 0x4101")["matches"][0]
+    m = lookup(kb, "EtherCAT diagnosis 0x8001")["matches"][0]
     assert m["domain"] == "ethercat_diag" and {"value", "hex", "dec", "text", "ref"} <= set(m), m
     app = _app(tmp_path, kb)
-    note = app.doc_note("Init4: EtherCAT diagnosis 0x4101 on Term 3")
-    assert note.endswith("[documented: ethercat_diag #x4101: Terminal-Overtemperature (esi.db, text id #x4101)]"), note
+    note = app.doc_note("Init4: EtherCAT diagnosis 0x8001 on Term 3")
+    assert note.endswith("[documented: ethercat_diag #x8001: Supply voltage too low (esi.db, text id #x8001)]"), note
+    # re-review of 0.8.16: a text id whose devices word it differently is not annotated with one device's text
+    m = "Term 5 (EL3102): diag 0x4101 Overheated"
+    assert app.doc_note(m) == m
     r = K.Knowledge(tmp_path / "home", str(kb)).search("EtherCAT diagnosis code 0x4101")
     assert r["known_error"]["documented"][0]["domain"] == "ethercat_diag", r
 
 
-def test_review_0816_a_symbol_in_capitals_is_looked_up_by_its_name(kb):
+WINSOCK = "# Windows Socket Error Codes\n\n| Error code | Hex | Symbol | Description |\n|---|---|---|---|\n" + "\n".join(
+    f"| {10000 + i} | 0x{10000 + i:X} | WSAE{n} | Winsock fixture {n.lower()}. |" for i, n in enumerate(
+        ("INTR", "BADF", "ACCES", "FAULT", "INVAL", "MFILE", "WOULDBLOCK", "INPROGRESS", "ALREADY", "NOTSOCK",
+         "DESTADDRREQ", "MSGSIZE"), start=4)) + "\n"
+
+
+def winsock_kb(tmp_path: Path) -> Path:
+    """The fixture with Winsock's family of capitals-only symbols (WSAE…, as the real index has 54 of them)."""
+    k = tmp_path / "kbw"
+    write_infosys(L.index_file(k, "infosys"), _pages() + [("tcplclib_tc2_utilities", "391170000",
+                                                          "Windows Socket error codes", None, WINSOCK)])
+    write_manuals(L.index_file(k, "manuals"))
+    write_esi(L.index_file(k, "esi"))
+    assert build(k)["result"] == "built"
+    return k
+
+
+def test_review_0816_a_symbol_in_capitals_is_looked_up_by_its_name(kb, tmp_path):
     """Review of 0.8.16 (2): WSAETIMEDOUT / WSAECONNREFUSED (capitals, no '_') were read as words — the text search
     answered another code (WSAEHOSTDOWN) or nothing. A capitalised word is a name when the alias table has it; 'ERROR' in
     a log line is none."""
-    r = lookup(kb, "connect failed: WSAECONNREFUSED")
+    r = lookup(kb, "WSAECONNREFUSED")                          # the whole query: a name
     m = r["matches"][0]
     assert r["documented"] is True and (m["symbol"], m["matched_by"], m["value"]) == ("WSAECONNREFUSED", "symbol",
                                                                                        10061), r
+    kw = winsock_kb(tmp_path)                                    # inside a message: a member of a family of names
+    m = lookup(kw, "recv failed: WSAEINTR")["matches"][0]
+    assert (m["symbol"], m["matched_by"], m["value"]) == ("WSAEINTR", "symbol", 10004), m
     r = lookup(kb, "WSAETIMEDOUT")
     assert (r["matches"][0]["domain"], r["matches"][0]["value"], r["matches"][0]["matched_by"]) == ("ads", 10060,
                                                                                                     "symbol"), r
@@ -1015,11 +1039,11 @@ def test_review_0816_one_errors_build_at_a_time(kb, tmp_path, monkeypatch):
 def test_review_0816_line_codes_only_for_lines_that_name_a_code(kb, tmp_path):
     """Review of 0.8.16 (10): a capitalised word (EtherCAT, Init4, EK1100) made a line 'documented: false' — no code was
     in it. A line counts when it names a code: a number read as one, a message id, a code's symbol."""
-    app = _app(tmp_path, kb)
+    app = _app(tmp_path, winsock_kb(tmp_path))
     codes = app.line_codes(["Init4: EtherCAT state change aborted on EK1100", "Error: ADS error 0x745",
-                            "[ ERROR ] TIMEOUT", "socket: WSAECONNREFUSED"], "line")
+                            "[ ERROR ] TIMEOUT", "socket: WSAEINTR"], "line")
     assert [c["line"] for c in codes] == [1, 3], codes
-    assert codes[0]["matches"][0]["symbol"] == "ADSERR_CLIENT_SYNCTIMEOUT" and codes[1]["read_as"] == ["WSAECONNREFUSED"]
+    assert codes[0]["matches"][0]["symbol"] == "ADSERR_CLIENT_SYNCTIMEOUT" and codes[1]["read_as"] == ["WSAEINTR"]
 
 
 def test_review_0816_a_count_of_errors_is_no_code(kb):
@@ -1109,7 +1133,7 @@ def test_review_0816_codes_in_an_enum_code_block_are_indexed():
     r = X.parse_code_enums(ST_ENUM_PAGE)
     assert [(x["symbol"], x["value"], x["text"]) for x in r] == [
         ("MC_HOMINGERROR_DRIVETYPE", 0x4B90, "the drive type is not supported"),
-        ("MC_HOMINGERROR_DIRECTION", 0x4B91, "the direction is invalid"),
+        ("MC_HOMINGERROR_DIRECTION", 0x4B91, None),        # re-review: a comment line above is a heading, not its text
         ("MC_HOMINGERROR_SWITCHMODE", 0x4B92, None)], r
     assert X.parse_code_enums("```st\nnErr := 16#4B90;\nnA := 1;\nnB := 2;\n```") == []
 
@@ -1128,6 +1152,140 @@ def test_review_0816_an_automation_interface_hresult_is_documented(tmp_path):
         m = lookup(k, q)["matches"][0]
         assert (m["domain"], m["symbol"], m["text"]) == ("tcsysmanager", "TSM_E_ITEMNOTFOUND",
                                                          "ITcSmTreeItem not found!"), (q, m)
-    m = lookup(k, "MC_HOMINGERROR_DIRECTION")["matches"][0]
-    assert (m["value"], m["text"], m["ref"]) == (0x4B91, "the direction is invalid",
+    m = lookup(k, "MC_HOMINGERROR_DRIVETYPE")["matches"][0]
+    assert (m["value"], m["text"], m["ref"]) == (0x4B90, "the drive type is not supported",
                                                  "tcplclib_tc3_mc2_advancedhoming/645493643"), m
+
+
+# ------------------------------------------------------------------------------------------------ re-review of 0.8.16
+LIB_TIMEOUT = """# Error codes
+
+| Hex | Dec | Symbol | Description |
+|---|---|---|---|
+| 0x0001 | 1 | TIMEOUT | Device has a timeout. |
+| 0x0002 | 2 | INTERNAL | Internal error of the library. |
+| 0x0003 | 3 | NOMEMORY | No memory. |
+"""
+
+
+def test_rereview_0816_the_automation_interface_words_name_no_domain(kb, tmp_path):
+    """Re-review of 0.8.16 (1): the TE1000 HRESULT domain had the names 'automation interface' / 'system manager' /
+    'itcsysmanager' — words of nearly every XAE error — so such a message named it the only answer: 'ITcSysManager::…
+    failed: HRESULT 0x98110745' lost ADS 0x745, and the plugin's own XAE error texts lost their annotation."""
+    for q in ("ITcSysManager::ActivateConfiguration failed: HRESULT 0x98110745",
+              "the System Manager returned error 0x745", "Automation Interface error 0x98110745"):
+        r = lookup(kb, q)
+        assert r["documented"] is True and r["matches"][0]["symbol"] == "ADSERR_CLIENT_SYNCTIMEOUT", (q, r)
+    app = _app(tmp_path, kb)
+    m = "Check all objects did not run. Automation Interface: ExecuteCommand: com_error: failed (HRESULT 0x98110706)."
+    assert "[documented: ads 0x706" in app.doc_note(m), app.doc_note(m)
+
+
+def test_rereview_0816_a_one_word_library_symbol_in_a_log_line_is_no_code(tmp_path):
+    """Re-review of 0.8.16 (2): TIMEOUT / INTERNAL / NOMEMORY are symbols of library tables and words of every log line
+    — '[ ERROR ] TIMEOUT while waiting' answered a library's 0x0001. A capitals-only word is a name as the whole query
+    or as a member of a family of such names (Winsock's WSAE…)."""
+    k = tmp_path / "kbt"
+    write_infosys(L.index_file(k, "infosys"), _pages() + [("tf3600_tc3_condition_monitoring", "1162595595",
+                                                          "Error codes", None, LIB_TIMEOUT)])
+    write_manuals(L.index_file(k, "manuals"))
+    write_esi(L.index_file(k, "esi"))
+    assert build(k)["result"] == "built"
+    for q in ("[ ERROR ] TIMEOUT while waiting for the target", "ADS read: TIMEOUT", "INTERNAL ERROR in the compiler"):
+        r = lookup(k, q)
+        assert r["documented"] is False and not any(m.get("matched_by") == "symbol" for m in r["matches"]), (q, r)
+    r = lookup(k, "TIMEOUT")
+    assert r["documented"] is True and r["matches"][0]["symbol"] == "TIMEOUT", r
+
+
+def test_rereview_0816_kb_search_names_every_domain_of_a_code(kb, tmp_path):
+    """Re-review of 0.8.16 (4): kb_search's known_error.code named the first of several domains ('CreateFile failed:
+    error 6' → ads ERR_TARGETPORTNOTFOUND)."""
+    from twincat_mcp import knowledge as K
+    r = K.Knowledge(tmp_path / "home", str(kb)).search("CreateFile failed: error 6")
+    code = r["known_error"]["code"]
+    assert "documented in" in code and "ads" in code and "win32" in code, r["known_error"]
+
+
+def test_rereview_0816_the_first_build_waits_for_a_builder_this_server_started(tmp_path, monkeypatch):
+    """Re-review of 0.8.16 (5): a builder counts as being built only once its process holds the lock — the errors
+    index's first build, right after the ESI one was started, was built without esi.db (or gave up). A builder this
+    server started and that still runs is waited for."""
+    from twincat_mcp.server import App
+    k = make_kb(tmp_path)
+    started: list[int] = []
+    monkeypatch.setattr(App, "_errors_first_build_when_ready", lambda self: None)
+    monkeypatch.setattr(App, "_spawn_errors_build", lambda self, force=False, dry_run=False:
+                        started.append(1) or {"started": True})
+    app = _app(tmp_path, k)
+
+    class Proc:
+        def __init__(self, rc): self.rc = rc
+        def poll(self): return self.rc
+    app.esi_build_proc = Proc(None)                       # spawned, its lock not taken yet
+    assert app.errors_first_build() is None and started == [] and app.source_builders_running() == ["esi.db"]
+    app.esi_build_proc = Proc(0)                          # done
+    assert app.errors_first_build() == {"started": True} and started == [1]
+
+
+def test_rereview_0816_the_full_text_step_reads_the_folder_s_own_infosys_index(kb, tmp_path):
+    """Re-review of 0.8.16 (10): the full-text hits of an undocumented code read the Infosys index path the index
+    recorded — after the folder moved, none."""
+    import shutil
+    kb2 = tmp_path / "moved" / "kb"
+    shutil.copytree(kb, kb2)
+    shutil.rmtree(kb)
+    r = lookup(kb2, "Ads-Error 0xA2")
+    assert r["documented"] is False and r.get("fulltext") and r["fulltext"]["hits"], r
+
+
+def test_rereview_0816_more_counts_are_no_codes():
+    """Re-review of 0.8.16 (11): '1 error(s), 0 warning(s)', 'errors: 3', '3 Fehler' were read as codes."""
+    for q in ("1 error(s), 0 warning(s)", "Build errors: 3", "3 Fehler", "found 2 warnings"):
+        assert X.read_query(q)["codes"] == [], q
+    assert [c["value"] for c in X.read_query("Fehler 1861")["codes"]] == [1861]
+
+
+def test_rereview_0816_a_symbol_s_domain_is_said_as_chosen_by_the_symbol(kb):
+    """Re-review of 0.8.16 (14): 'WSAETIMEDOUT' said 'the message names ads' — the symbol chose it."""
+    r = lookup(kb, "WSAETIMEDOUT")
+    assert r["other_domains"] and r["other_domains_note"].startswith("the symbol is answered in ads"), r
+
+
+def test_rereview_0816_doc_note_reads_the_message_s_words(kb, tmp_path):
+    """Re-review of 0.8.16 (15): 'ADSError: symbol not found (1808)' got 'Symbol not found.' appended — the message says
+    it already, in other case and punctuation."""
+    app = _app(tmp_path, kb)
+    m = "ADSError: symbol not found (1808)"
+    assert app.doc_note(m) == m
+
+
+def test_rereview_0816_an_explicit_language_is_read(kb, tmp_path):
+    """Re-review of 0.8.16 (16): errors_db.py update --lcid was ignored once an index existed."""
+    import shutil
+    shutil.copy(L.index_file(kb, "infosys"), L.index_file(kb, "infosys", "1031"))
+    db = L.index_file(kb, "errors")
+    assert X.build(db, kb, lcid="1031", force=True, log=lambda m: None)["result"] == "built"
+    assert json.loads(X.read_meta(db)["sources"])["infosys"]["path"].endswith("infosys-1031.db")
+    assert X.build(db, kb, force=True, log=lambda m: None)["result"] == "built"          # none named: the recorded
+    assert json.loads(X.read_meta(db)["sources"])["infosys"]["path"].endswith("infosys-1031.db")
+
+
+def test_rereview_0816_a_negative_code_is_a_code_of_infosys_search(kb, tmp_path):
+    """Re-review of 0.8.16 (17): '-6908' (LabVIEW's 0xFFFFE504) gave no code_lookup."""
+    from twincat_mcp import docsearch as DS
+    f = DS.code_forms("-6908")
+    assert f is not None and f["value"] == -6908 and "0xffffe504" in f["hex"], f
+    assert [e["domain"] for e in _app(tmp_path, kb).code_lookup("-6908")] == ["labview"]
+
+
+def test_rereview_0816_an_enum_on_a_page_about_something_else_is_no_code_table():
+    """Re-review of 0.8.16 (18): a comment line above a member is a heading as often as its text, and an enum of a page
+    that is not about errors (UAHAUpdateStatusCode: a data value's quality) is no code table."""
+    md = "```st\nTYPE UAHAUpdateStatusCode :\n(\n    HistorianRaw := 0,\n    HistorianCalculated := 1,\n" \
+         "    HistorianInterpolated := 2\n) UDINT;\nEND_TYPE\n```"
+    assert X.parse_code_enums(md, "UAHAUpdateStatusCode") == []
+    md2 = "```st\nTYPE E_CamErr :\n(\n    (* Cam Table Error Codes *)\n    ERR_A := 16#4A00,\n" \
+          "    ERR_B := 16#4A01, (* table not found *)\n    ERR_C := 16#4A02\n) UDINT;\nEND_TYPE\n```"
+    assert [(r["symbol"], r["text"]) for r in X.parse_code_enums(md2, "E_CamErr")] == [
+        ("ERR_A", None), ("ERR_B", "table not found"), ("ERR_C", None)]

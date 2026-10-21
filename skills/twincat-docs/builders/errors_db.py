@@ -124,7 +124,8 @@ def main() -> int:
     sub.add_parser = lambda *a, **kw: _sub(*a, parents=[common], **kw)  # type: ignore[method-assign]
     s = sub.add_parser("update")
     s.add_argument("--force", action="store_true", help="build even when current; accept a domain with fewer codes")
-    s.add_argument("--lcid", default=L.DEFAULT_LCID, help="the Infosys index's language (default 1033)")
+    s.add_argument("--lcid", default=None, help="the Infosys index's language (default: the one the index in use was "
+                   "built from, else 1033)")
     s.add_argument("--infosys-db", default=None, help="the Infosys index to read (default: the one the index in use "
                    "was built from, else <kb>\\index\\infosys-<lcid>.db)")
     s = sub.add_parser("stats")

@@ -231,7 +231,10 @@ DOMAINS: dict[str, dict[str, Any]] = {
     # 0x98510001 …) — an enum in a code block of the TE1000 book, read by parse_code_enums
     "tcsysmanager": {"title": "Automation Interface HRESULTs (TSM_E_…)", "origin": "infosys", "priority": 3,
                      "books": ("tc3_automationinterface",),
-                     "names": ("automation interface", "tcsysmanager", "system manager", "itcsysmanager"),
+                     # re-review of 0.8.16: no names — 'Automation Interface' / 'System Manager' / 'ITcSysManager' are
+                     # in nearly every XAE error and named this domain the only answer ('ITcSysManager::Activate…
+                     # failed: HRESULT 0x98110745' lost ADS 0x745); its codes are found by value and by TSM_E_ symbol
+                     "names": (),
                      "hints": ("xae", "treeitem", "tree", "item", "consumexml", "lookuptreeitem")},
     "nc": {"title": "NC errors", "origin": "infosys", "priority": 3, "books": ("tc3ncerrcode",), "error_book": True,
            "names": ("nc", "ncerror", "ncerr"),
@@ -645,13 +648,20 @@ _NUMBER_ONLY = re.compile(r"^\s*(?:0x|16#)?[0-9A-Fa-f_]+\s*(?:hex|dec|h)?\s*$", 
 _COMMENT_LINE = re.compile(r"^\s*(?:\(\*\s*(.*?)\s*\*\)|//\s*(.*?))\s*$")
 
 
-def parse_code_enums(md: str) -> list[dict[str, Any]]:
+ERROR_ENUM = re.compile(r"err|fault|fail|hresult|abort", re.I)
+
+
+def parse_code_enums(md: str, title: str = "") -> list[dict[str, Any]]:
     """The members of the enumerations in a page's code blocks — symbol, value, and Beckhoff's text when the block gives
     one (an IDL helpstring's first, English, string; an ST comment on the member's line or the lines right above it). A
     block counts when it declares an enum (IDL 'enum … { }', ST 'TYPE x : ( … ) END_TYPE') of at least three members
     with distinct values — an assignment in a code example ('nErr := 16#1234;') is none."""
     out: list[dict[str, Any]] = []
     for block in _CODE_BLOCK.findall(md or ""):
+        # re-review of 0.8.16: an enum is of codes on a page about errors (its title or the enum's name says so) —
+        # 'E_DALIAlarmNumber', 'UAHAUpdateStatusCode' (a data value's quality) are none
+        if not (ERROR_ENUM.search(title) or ERROR_ENUM.search(block[:200])):
+            continue
         for body in [m.group(1) for m in _IDL_ENUM.finditer(block)] + [m.group(1) for m in _ST_ENUM.finditer(block)]:
             rows: list[dict[str, Any]] = []
             text: list[str] = []
@@ -662,7 +672,9 @@ def parse_code_enums(md: str) -> list[dict[str, Any]]:
                     continue
                 c = _COMMENT_LINE.match(ln)
                 if c and not _ENUM_MEMBER.match(ln):
-                    text.append((c.group(1) or c.group(2) or "").strip())
+                    # re-review of 0.8.16: a comment line above a member is a group heading as often as its meaning
+                    # ('(* Cam Table Error Codes *)') — an ST member's text is its own line's comment only
+                    text = []
                     continue
                 m = _ENUM_MEMBER.match(ln)
                 if not m:
@@ -933,7 +945,7 @@ class _Build:
                         by_dom.setdefault(tdom, []).extend(t["rows"])
                     found = sum(len(v) for v in by_dom.values())
                     if not found:
-                        enum_rows = parse_code_enums(md)
+                        enum_rows = parse_code_enums(md, r["title"] or "")
                         if enum_rows:
                             by_dom[did] = enum_rows
                             parsers.add("enum")
@@ -1253,7 +1265,7 @@ def sources_ready(ids: dict[str, dict[str, Any]], kb: Path, lcid: str = L.DEFAUL
     return True, ""
 
 
-def build(final: Path, kb: Path, lcid: str = L.DEFAULT_LCID, force: bool = False, built_by: str = "",
+def build(final: Path, kb: Path, lcid: str | None = None, force: bool = False, built_by: str = "",
           log: Callable[[str], None] = print, infosys_db: str | Path | None = None) -> dict[str, Any]:
     """Build <final> from the source indexes of the knowledge folder, into <final>.building, checked (golden) and
     swapped in when complete. Without force an index built from exactly these sources in this format is left as it is.
@@ -1261,7 +1273,12 @@ def build(final: Path, kb: Path, lcid: str = L.DEFAULT_LCID, force: bool = False
     final, kb = Path(final), Path(kb)
     building, lock = side_files(final)
     final.parent.mkdir(parents=True, exist_ok=True)
-    ids = identities(kb, lcid, infosys_db or recorded_infosys(final, kb))
+    # re-review of 0.8.16: --lcid was ignored once an index existed — a language named is read; without one, the
+    # language the index was built from (recorded_infosys), else the default
+    if infosys_db is None and lcid is None:
+        infosys_db = recorded_infosys(final, kb)
+    lcid = lcid or L.DEFAULT_LCID
+    ids = identities(kb, lcid, infosys_db)
     ok, why_not = sources_ready(ids, kb, lcid)
     if not ok:
         raise ErrError(why_not, "no_source")
@@ -1330,7 +1347,7 @@ def _int(v: Any) -> int | None:
 
 
 # --------------------------------------------------------------------------------------------- state
-def state(final: Path, kb: Path | None, lcid: str = L.DEFAULT_LCID, infosys_db: str | Path | None = None,
+def state(final: Path, kb: Path | None, lcid: str | None = None, infosys_db: str | Path | None = None,
           detail: bool = False) -> dict[str, Any]:
     """missing | complete | rebuild_needed (another format, never finished, or a source index rebuilt / added since —
     the reason names it), plus a build running / interrupted / incomplete (failed its checks: the failures) / waiting
@@ -1343,7 +1360,8 @@ def state(final: Path, kb: Path | None, lcid: str = L.DEFAULT_LCID, infosys_db: 
     rec = _jl(meta.get("sources"), {})
     now: dict[str, dict[str, Any]] = {}
     if kb is not None:
-        now = identities(Path(kb), lcid, infosys_db or recorded_infosys(final, Path(kb)))
+        now = identities(Path(kb), lcid or L.DEFAULT_LCID,
+                         infosys_db or (recorded_infosys(final, Path(kb)) if lcid is None else None))
     if not final.is_file() or not meta:
         out["state"] = "missing"
     elif meta.get("format") != FORMAT:
@@ -1585,6 +1603,23 @@ def _domain_filter(domain: str | None, doms: dict[str, dict[str, Any]]) -> list[
     return hit
 
 
+CAPS_FAMILY_MIN = 10        # capitals-only symbols sharing their first four letters in one domain: a family (WSAE…)
+
+
+def _caps_symbol(con: sqlite3.Connection, token: str, query: str) -> bool:
+    """A word in capitals without '_' (WSAETIMEDOUT) is a code's name when it is the whole query, or when it belongs to
+    a family of such symbols in one domain (Winsock's 54 WSAE… names) — not when it is a library's one-word symbol that
+    is also a word of any log line (TIMEOUT, INTERNAL, NOMEMORY)."""
+    if query.strip().upper() == token.upper():
+        return True
+    pre = token[:4].lower()
+    for (n,) in con.execute("SELECT MAX(c) FROM (SELECT domain, COUNT(DISTINCT form) AS c FROM alias WHERE kind = "
+                            "'symbol' AND form LIKE ? ESCAPE '\\' AND form NOT GLOB '*[^a-z]*' GROUP BY domain)",
+                            (pre.replace("_", "\\_") + "%",)):
+        return bool(n and n >= CAPS_FAMILY_MIN)
+    return False
+
+
 def _by_value(con: sqlite3.Connection, v: int) -> tuple[list[tuple[str, int, list[sqlite3.Row], str]],
                                                          list[tuple[str, int, int]]]:
     """Where a number is documented: in each of its 32-bit forms (-6908 = 0xFFFFE504), as the HRESULT of a code
@@ -1690,10 +1725,17 @@ def _diag_out(kb: Path | None, value: int, count: int) -> dict[str, Any]:
                 c = sqlite3.connect(ro_uri(p), uri=True, timeout=5)
                 try:
                     r = c.execute("SELECT message FROM msg WHERE text_id = ? ORDER BY id LIMIT 1", (value,)).fetchone()
+                    n = c.execute("SELECT COUNT(DISTINCT message) FROM msg WHERE text_id = ?", (value,)).fetchone()[0]
                 finally:
                     c.close()
-                if r:
+                if r and n == 1:
                     out["text"] = r[0]
+                elif r:
+                    # re-review of 0.8.16: 1473 of 3028 text ids have other texts on other devices (#x4101: 16) — the
+                    # first one annotated another device's error as the documented meaning
+                    out["texts"] = n
+                    out["texts_note"] = (f"{n} different texts on different devices — the device's own: "
+                                         f"hw_diag(code='#x{value:04X}', device=…)")
             except sqlite3.Error:
                 pass
     return out
@@ -1782,6 +1824,10 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         sym_domains: set[str] = set()
         known_caps = []
         for n in read["names"] + read["caps"]:
+            if n in read["caps"] and not _caps_symbol(con, n, q):
+                # re-review of 0.8.16: 'TIMEOUT', 'INTERNAL', 'NOMEMORY' are symbols of some library table and words of
+                # every log line ('[ ERROR ] TIMEOUT while waiting' answered LabVIEW 0xFFFFDDEB) — not a code's name
+                continue
             hit: list[str] = []
             for a in con.execute("SELECT DISTINCT domain, value_int, kind FROM alias WHERE form = ? AND kind IN "
                                  "('symbol', 'dotnet')", (n.lower(),)):
@@ -1855,8 +1901,14 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         if other:
             out["other_domains"] = [{k: e.get(k) for k in ("domain", "domain_title", "value", "hex", "symbol", "text",
                                                            "ref") if e.get(k) is not None} for e in other[:10]]
-            out["other_domains_note"] = (f"the message names {', '.join(named_all)}: the same number in other domains "
-                                         "is listed here, not as the answer")
+            if named:
+                out["other_domains_note"] = (f"the message names {', '.join(named_all)}: the same number in other "
+                                             "domains is listed here, not as the answer")
+            else:
+                # re-review of 0.8.16: 'WSAETIMEDOUT' said 'the message names ads' — the symbol chose it
+                out["other_domains_note"] = (f"the symbol is answered in {', '.join(named_all)} (of the domains that "
+                                             "have it, the general code space): the same symbol elsewhere is listed "
+                                             "here")
         out["ranking"] = _ranking(qn, named_all, entries, doms, text_search)
         searched = [d for d in sorted(doms, key=lambda d: (doms[d]["priority"], d)) if want is None or d in want]
         have = [d for d in searched if doms[d].get("codes") or doms[d].get("links")]
@@ -1884,6 +1936,9 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
                 out["note"] = (f"{what}: not in the local Beckhoff documentation"
                                + (f" of {', '.join(named_all)}" if named_all else "")
                                + " — no meaning is given (the full-text hits, if any, only mention it)")
+            elif out.get("text_matches") and read["names"]:
+                out["note"] = (f"{', '.join(read['names'])}: no documented code has this name — the codes whose text "
+                               "holds the query's words are in text_matches, not the answer")
             elif out.get("text_matches"):
                 out["note"] = ("no code or code name in the query: nothing is documented for it — the codes whose "
                                "text holds its words are in text_matches. A number counts as a code when it is the "
@@ -1897,8 +1952,7 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
                                "next to a word that says so (error 1861, nErrId := 1808, ADS error 0x745), a name when "
                                "it is a code's symbol")
             ft = None if not fulltext else _fulltext(
-                kbp, infosys_db or (_jl(read_meta(db).get("sources"), {}).get("infosys") or {}).get("path"),
-                " ".join(given) or q)
+                kbp, infosys_db or (recorded_infosys(db, kbp) if kbp is not None else None), " ".join(given) or q)
             if ft is not None:
                 out["fulltext"] = ft
         if pn and not any(e.get("plugin_note") for e in main):

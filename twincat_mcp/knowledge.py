@@ -1065,8 +1065,12 @@ class Knowledge:
             doc = self.documented(q)
             if doc:
                 d0 = doc[0]
-                err = dict(err) if err else {"code": f"{d0['domain']} {d0['hex']} ({d0['dec']}) {d0.get('symbol') or ''}"
-                                                     .strip()}
+                doms = list(dict.fromkeys(d["domain"] for d in doc))
+                # re-review of 0.8.16: the code of several domains was named as the first one's ('CreateFile failed:
+                # error 6' → ads ERR_TARGETPORTNOTFOUND) — never one picked silently: all of them, in documented
+                code = (f"{d0['domain']} {d0['hex']} ({d0['dec']}) {d0.get('symbol') or ''}".strip() if len(doms) == 1
+                        else f"{d0['hex']} ({d0['dec']}) — documented in {len(doms)} domains: {', '.join(doms)}")
+                err = dict(err) if err else {"code": code}
                 err["documented"] = doc
             names = message_names(q)
             for w in informative:

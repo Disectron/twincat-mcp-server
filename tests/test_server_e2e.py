@@ -1823,3 +1823,81 @@ def test_0816_the_online_step_is_a_labelled_site_search(tmp_path):
     assert items[0]["title"] == "ADS Return Codes" and items[0]["snippet"] == "0x745 Timeout has occurred", items
     assert len(items) == 1, items                         # tcplclibsystem: a TwinCAT 2 book (tc3_only)
     assert InfosysIndex(tmp_path / "d", fetcher=F(None)).web_search("x")[0]["error"].startswith("the online search")
+
+
+@pytest.mark.anyio
+async def test_rereview_0816_err_lookup_steps(monkeypatch, project_dir, tmp_path):
+    """Re-review of 0.8.16: (7) an error inside a result that succeeded (ads_read_many's per-name ADSError 1808) is an
+    error seen; (9) an unrelated older error does not keep the online step from running, and an unfound name is said
+    as a name; (8) without an errors index, both steps run as well."""
+    from tests.fake_ads import install
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App
+    install(monkeypatch)
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    async with client_for(build_server(cfg)) as s:
+        res = payload(await s.call_tool("ads_read_many", {"names": ["MAIN.doesNotExist"]}))
+        assert "1808" in json.dumps(res), res
+        r = payload(await s.call_tool("err_lookup", {"query": "why does reading MAIN.doesNotExist fail?"}))
+        e = r["from_error_log"]["entries"][0]
+        assert e["where"].startswith("ads_read_many ") and e["matches"][0]["symbol"] == "ADSERR_DEVICE_SYMBOLNOTFOUND", e
+        r = payload(await s.call_tool("err_lookup", {"query": "E_FAIL"}))
+        assert "online" in r and r["note"].startswith("E_FAIL: no documented code has this name"), r
+    monkeypatch.setattr(App, "errors_first_build", lambda self: None)
+    cfg2 = mk_cfg(project_dir)
+    cfg2.knowledge.location = str(make_kb(tmp_path / "noerr"))          # no errors.db
+    cfg2.docs.enabled = False
+    async with client_for(build_server(cfg2)) as s:
+        r = payload(await s.call_tool("err_lookup", {"query": "ADS error on port 851"}))
+        assert r["documented"] is None and "from_error_log" in r and "online" in r, r
+
+
+@pytest.mark.anyio
+async def test_rereview_0816_the_online_step_sends_no_project_names_and_gives_up(tmp_path):
+    """Re-review of 0.8.16: (privacy) the whole question went to the search engine, project symbols included — only
+    codes, symbol-like names and plain words are sent; (13) a search that does not answer gives up after
+    ONLINE_TIMEOUT_S, not 40 s."""
+    import time as _t
+    from twincat_mcp.server import App
+    assert App.online_terms("why does reading MAIN.doesNotExist fail with E_FAIL?") == \
+        "why does reading fail with E_FAIL"
+    assert App.online_terms("fbAxis.Execute: 0x4221", {"read_as": [{"token": "0x4221"}]}) == "0x4221"
+    cfg = mk_cfg(tmp_path)
+    cfg.docs.enabled = False
+    app = App(cfg)
+
+    class SlowDocs:
+        def web_search(self, q, limit=5):
+            _t.sleep(1.0)
+            return []
+    app.docs = SlowDocs()
+    app.cfg.docs.web_fallback = True
+    app.ONLINE_TIMEOUT_S = 0.2
+    t0 = _t.time()
+    r = await app.err_online("ADS error 0x4221")
+    assert _t.time() - t0 < 0.9 and r["items"][0]["error"].startswith("the online search did not answer"), r
+
+
+def test_rereview_0816_web_search_keeps_each_snippet_with_its_result_and_only_tc3_books(tmp_path):
+    """Re-review of 0.8.16 (6): a result without a snippet shifted every later snippet; pages of no known book (another
+    language, TwinCAT 2's old form) passed."""
+    from twincat_mcp.infosys import InfosysIndex
+
+    def res(url, title, snip=None):
+        return (f'<div class="result results_links"><a class="result__a" href="{url}">{title}</a>'
+                + (f'<a class="result__snippet" href="x">{snip}</a>' if snip else "") + "</div>")
+    page = (res("https://infosys.beckhoff.com/content/1033/tc3_ads_intro/1.html", "First")
+            + res("https://infosys.beckhoff.com/content/1033/tcplclibsystem/html/x.htm", "TC2 old form", "tc2")
+            + res("https://infosys.beckhoff.com/content/1031/tc3_ads_intro/1.html", "German", "de")
+            + res("https://infosys.beckhoff.com/content/1033/tc3_ads_intro/374277003.html", "ADS Return Codes",
+                  "0x745 Timeout"))
+
+    class F:
+        def get(self, url, allow_hosts=None):
+            return page.encode()
+    items = InfosysIndex(tmp_path / "c", fetcher=F()).web_search("0x745", 5)
+    assert [(i["title"], i["snippet"]) for i in items] == [("First", None), ("ADS Return Codes", "0x745 Timeout")], items

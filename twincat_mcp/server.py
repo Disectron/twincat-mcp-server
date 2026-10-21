@@ -776,9 +776,21 @@ class App:
         docs = getattr(self, "docs", None)
         if docs is not None and docs.local is not None and (infosys is None or not infosys.is_file()):
             return None                       # the Infosys index of the local package is coming: built from it then
-        if not X.sources_ready(X.identities(loc, infosys_db=infosys), loc)[0]:
+        if not X.sources_ready(X.identities(loc, infosys_db=infosys), loc)[0] or self.source_builders_running():
             return None
         return self.spawn_errors_build()
+
+    def source_builders_running(self) -> list[str]:
+        """The source-index builders this server started that still run — re-review of 0.8.16: a builder counts as
+        'being built' only once its process holds the lock, so the errors index's first build, started right after the
+        ESI / manuals one, was built without them (or gave up)."""
+        out = []
+        for name, attr in (("the Infosys index", "infosys_build_proc"), ("manuals.db", "manuals_update_proc"),
+                           ("esi.db", "esi_build_proc")):
+            p = getattr(self, attr, None)
+            if p is not None and p.poll() is None:
+                out.append(name)
+        return out
 
     ERRORS_FIRST_WAIT_S = 15.0             # how often a waiting first build of the errors index looks again
     ERRORS_FIRST_MAX_S = 6 * 3600.0
@@ -806,7 +818,7 @@ class App:
             if loc is None or self.kb.location()[0] != loc or L.index_file(loc, "errors").exists():
                 return None
             infosys = self.kb.infosys_db(loc)
-            busy = X.sources_building(X.identities(loc, infosys_db=infosys))
+            busy = X.sources_building(X.identities(loc, infosys_db=infosys)) + self.source_builders_running()
             coming = (getattr(self, "docs", None) is not None and self.docs.local is not None
                       and (infosys is None or not infosys.is_file()))     # its first build starts with the server
             if not busy and not coming or time.monotonic() - t0 > self.ERRORS_FIRST_MAX_S:
@@ -889,15 +901,45 @@ class App:
             out["xae_error_list"] = note
         return out
 
-    async def err_online(self, query: str) -> dict[str, Any]:
+    ONLINE_TIMEOUT_S = 12.0                # the online step of err_lookup gives up after this (no network: no 40 s wait)
+
+    @staticmethod
+    def online_terms(query: str, res: dict[str, Any] | None = None) -> str:
+        """What the online search is sent: the codes read, the message ids, symbol-like names (capitals, digits, '_')
+        and plain words — never the project's own names (MAIN.fbAxis, doesNotExist: mixed case or dotted). Re-review of
+        0.8.16: the whole question went to the search engine, project symbols included."""
+        res = res or {}
+        terms = [c["token"] for c in res.get("read_as") or []] + [m["token"] for m in res.get("message_ids") or []]
+        for t in re.findall(r"[^\s,;:()\[\]\"'`]+", query):
+            t = t.strip(".?!")
+            if not t or t in terms:
+                continue
+            if re.fullmatch(r"[A-Z0-9_]+", t) and re.search(r"[A-Z]", t):
+                terms.append(t)                      # ADSERR_…, E_FAIL, WSAETIMEDOUT, EL3102
+            elif re.fullmatch(r"[a-z]+", t) or re.fullmatch(r"[A-Z][a-z]+", t):
+                terms.append(t)                      # plain words
+            elif re.fullmatch(r"(?:0x|16#|#x)?[0-9A-Fa-f]+", t) and t not in terms:
+                terms.append(t)
+        return " ".join(terms)
+
+    async def err_online(self, query: str, res: dict[str, Any] | None = None) -> dict[str, Any]:
         """0.8.16 (user decision): when the local documentation has nothing — a site search of infosys.beckhoff.com on
-        the web (docs.web_fallback; off: said so). Pages that mention it, not a documented meaning."""
+        the web (docs.web_fallback; off: said so). Pages that mention it, not a documented meaning. Sent: online_terms
+        (never the project's own names); it gives up after ONLINE_TIMEOUT_S."""
         if getattr(self, "docs", None) is None:
             return {"skipped": "the docs index is off (docs.enabled = false): no online search"}
         if not self.cfg.docs.web_fallback:
             return {"skipped": "docs.web_fallback = false: no online search"}
-        items = await asyncio.to_thread(self.docs.web_search, query, 5)
+        terms = self.online_terms(query, res)
+        if not terms:
+            return {"skipped": "nothing to search for online: the question has no code and no word that is not a "
+                               "name of this project"}
+        try:
+            items = await asyncio.wait_for(asyncio.to_thread(self.docs.web_search, terms, 5), self.ONLINE_TIMEOUT_S)
+        except (TimeoutError, asyncio.TimeoutError):
+            items = [{"error": f"the online search did not answer within {self.ONLINE_TIMEOUT_S:g} s"}]
         return {"source": "online: a site search of infosys.beckhoff.com (DuckDuckGo) — not the local documentation",
+                "searched": terms,
                 "note": ("pages the search engine finds for it — they mention it; none is a documented meaning. "
                          "in_local_package: infosys_get_page opens it; otherwise only a browser"),
                 "items": items}
@@ -921,8 +963,17 @@ class App:
             rows = None
         if not rows:
             return msg
-        if any((r.get("symbol") and r["symbol"] in msg) or (r.get("text") and r["text"] in msg) for r in rows):
-            return msg                     # the message says it already (of one of the domains that have the code)
+        def words(t: str) -> str:
+            return " " + " ".join(re.findall(r"[a-z0-9]+", t.lower())) + " "
+        said = words(msg)
+        # the message says it already (one of the domains' symbol or text) — re-review of 0.8.16: compared as words,
+        # 'ADSError: symbol not found (1808)' got 'Symbol not found.' appended
+        if any((r.get("symbol") and words(r["symbol"]) in said) or (r.get("text") and words(r["text"]).strip()
+                                                                      and words(r["text"]) in said) for r in rows):
+            return msg
+        rows = [r for r in rows if r.get("text") or r.get("symbol")]      # an ESI text id of many texts: none
+        if not rows:
+            return msg
         if len({r["domain"] for r in rows}) > 1:
             # review of 0.8.16 (user decision): a code of several domains the message does not name is not annotated
             # with one of them — 'CreateFile failed: error 6' got ADS's 0x6 although it is Win32's (spec §6: never pick
@@ -2408,6 +2459,24 @@ def _com_detail(exc: BaseException, hr: int) -> str:
             + (f": {desc[:300]}" if desc else ""))
 
 
+def _result_errors(res: Any, depth: int = 0, out: list[str] | None = None) -> list[str]:
+    """The error texts inside a result ('error': '…' at any depth up to 3, at most 20) — per-item failures of a tool
+    that succeeded as a whole."""
+    out = [] if out is None else out
+    if depth > 3 or len(out) >= 20:
+        return out
+    if isinstance(res, dict):
+        for k, v in res.items():
+            if k == "error" and isinstance(v, str) and v:
+                out.append(v[:500])
+            elif k not in ("xae_messages", "items_raw") and isinstance(v, (dict, list)):
+                _result_errors(v, depth + 1, out)
+    elif isinstance(res, list):
+        for v in res[:200]:
+            _result_errors(v, depth + 1, out)
+    return out
+
+
 def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]] | None] = lambda: None,
                    dialog_hint: Callable[[], Callable[[], str] | None] = lambda: None,
                    note_error: Callable[[], Callable[..., None] | None] = lambda: None) -> Any:
@@ -2428,8 +2497,13 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
             if note is not None and name != "err_lookup":
                 note(name, error=str(exc))
             raise
-        if note is not None and isinstance(res, dict) and res.get("xae_messages"):
-            note(name, lines=[ln for m in res["xae_messages"] if isinstance(m, dict) for ln in m.get("lines") or []])
+        if note is not None and isinstance(res, dict) and name != "err_lookup":
+            lines = [ln for m in res.get("xae_messages") or [] if isinstance(m, dict) for ln in m.get("lines") or []]
+            # re-review of 0.8.16: an error inside a result that succeeded (ads_read_many's per-name ADSError 1808) is
+            # an error seen too
+            lines += _result_errors(res)
+            if lines:
+                note(name, lines=lines)
         return res
 
     async def _run(*args: Any, **kwargs: Any) -> Any:
@@ -2990,15 +3064,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         res = await app.kb_call(app.kb.err_lookup, query, domain, limit, timeout=60)
         if first:
             res["errors_first_build"] = first
-        if res.get("documented") is False:
+        if res.get("documented") is not True:
             # 0.8.16 (user decision): no code in the question → the code is looked for in the errors seen before; and
-            # when the local documentation has nothing → online
+            # when the local documentation has nothing → online. documented=None (no errors index): both as well
             if not res.get("read_as") and not res.get("message_ids"):   # a name nothing documents is no code read
                 logs = await app.err_from_logs(query)
                 if logs:
                     res["from_error_log"] = logs
-            if not any(e.get("documented") for e in (res.get("from_error_log") or {}).get("entries", [])):
-                res["online"] = await app.err_online(query)
+            # re-review of 0.8.16: only an error that shares the question's words answers it — an unrelated older one
+            # (shares_words 0) kept the online search from running
+            if not any(e.get("documented") and e.get("shares_words")
+                       for e in (res.get("from_error_log") or {}).get("entries", [])):
+                res["online"] = await app.err_online(query, res)
         return res
 
     async def tc_request_confirmation(action: str, target: str = "", args: dict[str, Any] | None = None) -> dict[str, Any]:

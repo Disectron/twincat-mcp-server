@@ -453,7 +453,8 @@ _CODE_WORDS = frozenset("""error errors err errid nerrid errorid nerrorid errorc
 code codes return returncode result hresult adserr adserror fehler fehlercode fehlernummer""".split())
 # 'error number 1861', 'error ID 1861', 'Fehler Nr. 1861': a code word followed by one of these right before the number
 _CODE_WORD_SUFFIX = frozenset("number id no nr code nummer".split())
-_COUNT_WORDS = frozenset("errors codes results".split())        # after a number: how many, not which one
+_COUNT_WORDS = frozenset("errors codes results warnings fehler".split())   # after a number: how many, not which one
+_COUNT_BEFORE = frozenset("errors".split())                                # 'errors: 3' — before it as well
 
 
 def code_tokens(query: str, min_digits: int = 2, hex_anywhere: bool = True) -> list[dict[str, Any]]:
@@ -490,13 +491,14 @@ def code_forms(query: str) -> dict[str, Any] | None:
     # words a decimal needs a code word next to it ('error 1861'; 'ADS error on port 851' is no code 851, N121); a hex
     # number is a code. Review of 0.8.14: the query's other numbers do not cancel it ('ADS error 1861 on port 851',
     # 'ADS error 0x745 (1861)' — one code, written twice); two different codes are none
-    cands = [(c["token"], c["value"]) for c in code_tokens(query) if not c["token"].startswith("-")]
+    # re-review of 0.8.16: a negative number that IS the query ('-6908', LabVIEW's 0xFFFFE504) is a code too
+    cands = [(c["token"], c["value"]) for c in code_tokens(query) if not c["token"].startswith("-") or c["whole"]]
     if len({v for _t, v in cands}) != 1:
         return None
     t, value = cands[0]
-    if value < 16:
+    if 0 <= value < 16:
         return None
-    h = f"{value:x}"
+    h = f"{value & 0xFFFFFFFF:x}"
     hexes = sorted({f"0x{h}", f"0x{h.zfill(4)}", f"0x{h.zfill(8)}"}, key=len)
     return {"token": t, "value": value, "hex": hexes, "dec": str(value)}
 
@@ -507,11 +509,13 @@ def _next_to_code_word(q: str, start: int, end: int) -> bool:
     if re.search(r"[\w-]$", q[:start]) or re.match(r"[\w-]", q[end:]):
         return False
     before = re.search(r"([^\W\d_]+)[\s:=#(]{1,6}$", q[:start])        # 'nErrId := 1861' (ST's ' := ')
-    after = re.match(r"[\s:)]{1,3}([^\W\d_]+)", q[end:])
-    # review of 0.8.16: a plural after the number counts ('Build: 3 errors, 0 warnings', 'found 0 errors') — it read as
-    # code 3; '1861 error' (singular) names one
-    if after is not None and fold(after.group(1)) in _COUNT_WORDS:
+    after = re.match(r"[\s:)]{1,3}([^\W\d_]+)(\(s\))?", q[end:])
+    # review of 0.8.16: a plural after the number counts ('Build: 3 errors, 0 warnings', 'found 0 errors', '1 error(s)',
+    # '3 Fehler') — it read as code 3; '1861 error' (singular) names one. 'errors: 3' (the plural before it) counts too
+    if after is not None and (fold(after.group(1)) in _COUNT_WORDS or after.group(2)):
         after = None
+    if before is not None and fold(before.group(1)) in _COUNT_BEFORE:
+        before = None
     if any(x is not None and fold(x.group(1)) in _CODE_WORDS for x in (before, after)):
         return True
     two = re.search(r"([^\W\d_]+)\s+([^\W\d_]+)\.?[\s:=#(]{1,6}$", q[:start])
