@@ -425,11 +425,49 @@ def _names_in(q: list[str], s: list[str]) -> bool:
     return n > 0 and any(all(_seg_match(q[i], s[k + i]) for i in range(n)) for k in range(len(s) - n + 1))
 
 
+# an XAE tree item with its type, as the tree names it: 'Term 4 (EL2008)', 'Device 1 (EtherCAT)', 'Box 1 (EK1100)',
+# 'Drive 3 (AX5206-0000-0200)' — its name and its type (user decision after the seventh review of 0.8.16: the error log
+# matches tree items too)
+_TREE_ITEM = re.compile(r"([A-Za-z][\w\-]*(?: [\w\-]+){0,3}?) \(([A-Za-z][\w.\- ]{0,40})\)")
+# a tree item an error text names without quotes: '<Word> <number> (<type>)'
+_TEXT_ITEM = re.compile(r"(?<![\w^'\"])([A-Z][A-Za-z]+ \d+ \([A-Za-z][\w.\-]{1,40}\))")
+# how a question names a tree item it has not seen in an error: 'Term 4 (EL2008)', 'Term 4', 'Device 1', 'Pump
+# (EL7041)' — capitalised as the tree writes it ('port 851' is no item; an item an error is of is matched whatever case)
+_QUESTION_ITEM = re.compile(r"(?<![\w^])(?:[A-Z][A-Za-z\-]+ \d+(?: ?\([A-Za-z][\w.\- ]{0,40}\))?"
+                            r"|[A-Za-z][\w\-]* \([A-Za-z]{1,4}\d{3,5}[\w.\-]{0,30}\))(?![\w])")
+
+
 def _is_subject(v: str) -> bool:
-    """A name an error can be of: a symbol path / identifier, or an XAE tree path (parts joined by '^')."""
+    """A name an error can be of: a symbol path / identifier, an XAE tree path (parts joined by '^'), or a tree item
+    with its type ('Term 4 (EL2008)')."""
     v = v.strip()
     return bool(v) and len(v) <= 300 and "\n" not in v and (
-        bool(_ST_PATH.fullmatch(v)) or ("^" in v and not v.startswith("^") and not re.search(r"[<>{}=;]", v)))
+        bool(_ST_PATH.fullmatch(v)) or bool(_TREE_ITEM.fullmatch(v))
+        or ("^" in v and not v.startswith("^") and not re.search(r"[<>{}=;]", v)))
+
+
+def _tree_items(subjects: list[str], text: str = "") -> list[str]:
+    """The tree items (with their type) an error is of: the typed parts of its tree paths ('TIID^Device 1
+    (EtherCAT)^Term 4 (EL2008)'), the typed items it quotes, and the '<Word> <number> (<type>)' items its text names."""
+    out: list[str] = []
+    for x in subjects:
+        out += [seg.strip() for seg in x.split("^") if _TREE_ITEM.fullmatch(seg.strip())]
+    out += _TEXT_ITEM.findall(text)
+    return list(dict.fromkeys(out))
+
+
+def _item_in(item: str, qn: str) -> bool:
+    """The question (lower case, single spaces) names the tree item: whole ('term 4 (el2008)') or by its name
+    ('term 4' — not 'term 41', not 'term 4 (el1008)', which names another type)."""
+    m = _TREE_ITEM.fullmatch(item.strip())
+    if not m:
+        return False
+    full = re.sub(r"\s+", " ", item.strip().lower())
+    if re.search(rf"(?<!\w){re.escape(full)}(?!\w)", qn):
+        return True
+    name = re.sub(r"\s+", " ", m.group(1).lower())
+    hit = re.search(rf"(?<!\w){re.escape(name)}(?!\w)( ?\()?", qn)
+    return bool(hit) and not hit.group(1)
 
 
 def _call_subjects(arguments: dict[str, Any]) -> list[str]:
@@ -981,9 +1019,15 @@ class App:
             doms = set(X.named_domains(" ".join(words))) if words else set()
             dom_words = {x for d in doms for n in X.DOMAINS[d].get("names", ()) for x in n.split()}
             kinds = {w.lower() for w in words if w.lower() in fams or w.lower() in dom_words}
-            unused = [w for w in words if w.lower() not in kinds]
+            unused = [w for w in words if w.lower() not in kinds and not w.isdigit()]   # 'the last 3 errors': a count
             names = [n for n in names if n.lower() not in kinds]
-        return {"names": names, "last": m is not None, "fams": fams, "doms": doms, "unused": unused}
+        rest = query if m is None else query[:m.start()] + " " + query[m.end():]
+        items = list(dict.fromkeys(_QUESTION_ITEM.findall(rest)))
+        # the type of a tree item the question names is part of that name ('Term 4 (EL2008)'), not a name of its own
+        types = {t.group(2).lower() for x in items for t in [_TREE_ITEM.search(x)] if t}
+        names = [n for n in names if n.lower() not in types]
+        return {"names": names, "items": items, "qn": re.sub(r"\s+", " ", query.lower()), "last": m is not None,
+                "fams": fams, "doms": doms, "unused": unused}
 
     def _code_entry(self, text: str, loc: Any) -> dict[str, Any] | None:
         """The code a text names, looked up (err_lookup's rules, at most 3 matches with 'more' and every domain said):
@@ -1035,6 +1079,9 @@ class App:
         last = q["last"] and ordered
         fams, doms = q["fams"], q["doms"]
 
+        def item_hits(t: dict[str, Any]) -> list[str]:
+            return [x for x in t.get("items") or [] if _item_in(x, q["qn"])] if by_names else []
+
         def kind_ok(t: dict[str, Any], c: dict[str, Any] | None) -> bool:
             if not (fams or doms):
                 return True
@@ -1044,9 +1091,11 @@ class App:
         def entry(t: dict[str, Any], c: dict[str, Any] | None, how: dict[str, Any]) -> dict[str, Any]:
             return {"source": source, "where": t["where"], "text": t["text"][:600], **(c or self._NO_CODE), **how}
         out: list[dict[str, Any]] = []
-        if names:
+        named = names or (by_names and (q["items"] or any(item_hits(t) for t in texts[:400])))
+        if named:
             for t in texts[:400]:
                 hits = [n for n, segs in names if any(_names_in(segs, _segments(x)) for x in t["subjects"])]
+                hits += [x for x in item_hits(t) if x not in hits]
                 if not hits:
                     continue
                 c = self._code_entry(t["text"], loc)
@@ -1092,6 +1141,8 @@ class App:
                 texts.append({"rec": k, "where": f"{r['tool']} {r['when']} (in its result)", "tool": r["tool"],
                               "text": e["text"],
                               "subjects": ([e["item"]] if e.get("item") else subj) + _quoted_subjects(e["text"])})
+        for t in texts:
+            t["items"] = _tree_items(t["subjects"], t["text"])
         return texts
 
     async def _error_list_texts(self) -> tuple[list[dict[str, Any]], str | None]:
@@ -1114,9 +1165,10 @@ class App:
             if not d:
                 continue
             f = PureWindowsPath(str(i.get("file") or ""))
+            subj = [x for x in (f.stem, str(i.get("project") or "")) if x] + _quoted_subjects(d)
             out.append({"rec": -1 - k, "where": f"XAE Error List ({i.get('level') or 'message'})"
                         + (f" {f.name}" if f.name else ""), "tool": "xae", "xae": True, "text": d,
-                        "subjects": [x for x in (f.stem, str(i.get("project") or "")) if x] + _quoted_subjects(d)})
+                        "subjects": subj, "items": _tree_items(subj, d)})
         return out, None
 
     async def err_from_logs(self, query: str) -> dict[str, Any] | None:
@@ -1125,27 +1177,32 @@ class App:
         names; a question about the last error: the newest error of the kind asked (names_not_found when its names
         match no error). None when the question names nothing and does not ask about the last error."""
         q = self._question(query)
-        if not q["names"] and not q["last"]:
-            return None
         texts = self._error_texts()
+        said = q["names"] + q["items"] + [x for t in texts for x in t["items"] if _item_in(x, q["qn"])
+                                          and x not in q["items"]]
+        if not said and not q["last"]:
+            return None
         entries = await asyncio.to_thread(self._err_log_entries, q, texts, "recent errors of this server")
         note = None
-        if q["names"] and not entries:
+        said = list(dict.fromkeys(said))
+        if said and not entries:
             items, note = await self._error_list_texts()
             if items:
                 entries = await asyncio.to_thread(self._err_log_entries, q, items, "XAE Error List", False)
         out: dict[str, Any] = {"entries": entries,
-                               "note": ("errors seen before that are of a name of the question (names: compared with the "
-                                        "names the call was made with and the names the error quotes, never its words), "
+                               "note": ("errors seen before that are of a name of the question (names: a variable, POU or "
+                                        "PLC project, or an XAE tree item 'Term 4 (EL2008)' / 'Term 4' — compared with "
+                                        "the names the call was made with and the names the error quotes or the tree "
+                                        "items it names, never its words), "
                                         "or the newest error for a question about the last error (newest) — a code is "
                                         "read from the error and looked up; an error without one is said so")}
-        if q["names"] and not entries and q["last"]:
+        if said and not entries and q["last"]:
             entries = await asyncio.to_thread(self._err_log_entries, q, texts, "recent errors of this server",
                                               True, False)
             if entries:
                 out["entries"] = entries
-                out["names_not_found"] = q["names"]
-                out["note"] = (f"no error seen before is of {', '.join(q['names'])}: the newest error is given "
+                out["names_not_found"] = said
+                out["note"] = (f"no error seen before is of {', '.join(said)}: the newest error is given "
                                "(newest) — it may be of something else")
         if q["unused"]:
             out["not_used"] = (f"'{' '.join(q['unused'])}' is not a kind err_lookup can tell (a tool family: "
@@ -1154,7 +1211,7 @@ class App:
         if not out["entries"]:
             kind = " ".join(sorted(q["fams"] | q["doms"]))
             out["note"] = ("no error was seen yet" if not texts else
-                           f"no error seen before is of {', '.join(q['names'])}" if q["names"] else
+                           f"no error seen before is of {', '.join(said)}" if said else
                            f"no {kind} error was seen" if kind else "no error was seen yet")
         if note:
             out["xae_error_list"] = note
@@ -3373,8 +3430,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         No code in the query ('ADS error on port 851'): documented=false — the codes whose text shares its words are
         text_matches, not the answer; from_error_log: the errors this server returned, the XAE messages of its calls
         and the errors inside its results that are of a name of the query (a variable MAIN.fbValve.bOpen / fbValve /
-        aValves[3], a POU, a PLC project — compared with the names the call was made with and the names the error
-        quotes, never its words), or the newest error for a question about the last error ('what does the last ADS
+        aValves[3], a POU, a PLC project, an XAE tree item 'Term 4 (EL2008)' or 'Term 4' — compared with the names the
+        call was made with, the names the error quotes and the tree items it names, never its words), or the newest error for a question about the last error ('what does the last ADS
         error mean?': of that kind; names_not_found when no error is of its names); then the XAE Error List
         (attached, not busy) for the query's names — the code read from the error and looked up, an error without
         one said so. online=true: a site search of

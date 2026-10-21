@@ -2241,3 +2241,38 @@ async def test_review7_0816_the_last_error_records_and_online(monkeypatch, proje
     ids = {"message_ids": [{"token": "C0815"}]}
     assert app.online_terms("why does machine C0815 at AcmeFoods fail?", ids) == ""
     assert app.online_terms("error C0815 in MAIN", ids) == "C0815" and app.online_terms("C0815", ids) == "C0815"
+
+
+@pytest.mark.anyio
+async def test_review7_0816_tree_items(monkeypatch, project_dir, tmp_path):
+    """User decision after the seventh review of 0.8.16: the error log matches XAE tree items — by the item a call was
+    made with (a tree path), the item an error quotes ('Term 1 (EK1100)') or names ('Box 2 (EK1100) lost'); the
+    question names it whole ('Term 4 (EL2008)'), by its name ('Term 4' — not 'Term 41', not 'Term 4 (EL1008)'), or by
+    its path. The type alone (EL2008) is no item: several terminals share one."""
+    import time as _t
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    app.note_error("xae_tree_set_values", error="xae_tree_set_values: ConsumeXml failed (0x98510004)",
+                   subjects=["TIID^Device 1 (EtherCAT)^Term 4 (EL2008)"])
+    _t.sleep(1.1)
+    app.note_error("xae_activate_configuration", lines=[
+        "'Term 1 (EK1100)' (1001): state change aborted — ADS error 0x745 (1861)",
+        "Box 2 (EK1100) lost: ADS error 0x6 (6)"])
+    for q, item in (("why does Term 4 (EL2008) fail?", "Term 4 (EL2008)"), ("why does Term 4 fail?", "Term 4 (EL2008)"),
+                    ("TIID^Device 1 (EtherCAT)^Term 4 (EL2008) does not take the value", "Term 4 (EL2008)"),
+                    ("what is wrong with Term 1?", "Term 1 (EK1100)"), ("is Box 2 lost?", "Box 2 (EK1100)")):
+        r = await app.err_from_logs(q)
+        assert r and r["entries"] and item in r["entries"][0]["names"], (q, r)
+    for q in ("why does Term 41 fail?", "why does Term 4 (EL1008) fail?", "why does EL2008 fail?"):
+        r = await app.err_from_logs(q)
+        assert r is None or r["entries"] == [], (q, r)
+    r = await app.err_from_logs("what does the last error of Term 4 mean?")
+    assert len(r["entries"]) == 1 and "0x98510004" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("what does the last error of Term 7 mean?")
+    assert r["names_not_found"] == ["Term 7"] and r["entries"][0]["newest"], r
