@@ -1390,3 +1390,54 @@ def test_main_ci_0815_get_page_by_name_reads_a_book_indexed_meanwhile(tmp_path, 
         return real(*a, **k)
     monkeypatch.setattr(ix, "search_symbols", background_indexer_finished_first)
     assert ix.get_page("ADSREAD", max_chars=200)["title"] == "ADSREAD"
+
+
+def test_n184_a_samples_language_is_guessed_from_its_code_csharp_before_cpp(idx):
+    """N184 (0.8.15 retest): infosys_search_code language='cpp' returned C# from tc3_ads.net ('private void
+    SymbolValueChanged()' matched C++'s 'void f(' before any C# rule; 278 samples there). Beckhoff's pages label no
+    code block — the language is this plugin's guess, said so (language_note); each language's signs are counted, and
+    an index built by an older rule is not read for it (the guess is made from the code when it is searched)."""
+    from twincat_mcp.infosys import _guess_lang, LANGUAGE_NOTE
+    cs = ("private void SymbolValueChanged()\n{\n    using (AdsClient client = new AdsClient())\n    {\n"
+          "    client.Connect(AmsNetId.Local, 851);\n    Symbol symbol = null;\n")
+    assert _guess_lang(cs) == "csharp"
+    assert _guess_lang("public void DeleteDeviceNotification(\n    int notificationHandle\n)") == "csharp"
+    assert _guess_lang("public static bool operator !=(\n    Route? o1,\n    Route? o2\n)") == "csharp"
+    assert _guess_lang("#include <stdio.h>\n#include <windows.h>\nint main() { return 0; }") == "cpp"
+    assert _guess_lang("HRESULTWriteControl(\n ADSSTATE adsState,\n long cbLen,\n byte* pData);") == "cpp"
+    assert _guess_lang("if ( m_spCyclicCaller ) {\nm_spCyclicCaller->RemoveModule(m_spCyclicCaller);\n}") == "cpp"
+    assert _guess_lang("nVar := nVar + 2;   // => SA0006") == "st"                     # ':=' after a space is ST
+    assert _guess_lang("bOut              : BOOL;\nbInvalidParameter : BOOL;") == "st"  # a declaration is ST
+    assert _guess_lang("bFBCompOutput1 => bVar1;") == ""                                 # one weak sign tells nothing
+    assert _guess_lang("<TreeItem><ItemName>Plc</ItemName></TreeItem>") == "xml"
+    idx.index_book("tcplclib_tc2_system")
+    idx.sync_derived()
+    with idx._db() as con:                     # what an index built by the old rule holds: this C# labelled 'cpp'
+        con.execute("INSERT INTO code_blocks(page_rowid, url, title, library, lang, code) VALUES (?,?,?,?,?,?)",
+                    (999999, "https://infosys.beckhoff.com/content/1033/tc3_ads.net/9407523595.html",
+                     "Use of ADS Notifications", None, "cpp", cs))
+        con.commit()
+    idx._langs = None
+    assert idx.code_languages().get("csharp") == 1 and "cpp" not in idx.code_languages()
+    r = idx.search_code("AdsClient", language="csharp")
+    assert r["count"] == 1 and r["items"][0]["language"] == "csharp" and r["language_note"] == LANGUAGE_NOTE
+    with pytest.raises(InfosysError, match="language 'cpp' does not occur.*guessed by this plugin"):
+        idx.search_code("AdsClient", language="cpp")
+    assert "Beckhoff's pages label no code block" in LANGUAGE_NOTE
+
+
+def test_n160b_a_typo_inside_a_word_has_its_symbol_near(idx):
+    """Idea of the 0.8.15 retest (N160b, withdrawn as a bug): infosys_get_page FB_FileOpn / ADSREED had no `near`
+    entry — prefixes and owners worked, a typo inside a word did not. The symbols one or two edits away (a letter
+    left out, added, changed, two swapped) are near, the closest first; a name of five letters or less: one edit."""
+    idx.index_book("tcplclib_tc2_system")
+    idx.sync_derived()
+    with idx._db() as con:
+        assert inf.typo_symbols(con, "ADSREED") == ["ADSREAD"]
+        assert inf.typo_symbols(con, "ADSRAED") == ["ADSREAD"]            # two letters swapped: one edit
+        assert inf.typo_symbols(con, "ADSREAD") == []                      # the name itself is no typo of it
+        assert inf.typo_symbols(con, "xyzqq") == []
+        assert "ADSREAD" in [r["title"] for r in inf.near_symbols(con, "ADSREED")]
+    with pytest.raises(InfosysError, match=r"near: \['ADSREAD \(https://"):
+        idx.get_page("ADSREED")
+    assert inf._edits("fb_fileopn", "fb_fileopen", 2) == 1 and inf._edits("abcdef", "uvwxyz", 2) == 3

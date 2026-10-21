@@ -55,7 +55,7 @@ from .docsearch import title_words
 # _store, the table layout). An index built by another INDEXER_VERSION is rebuilt once; otherwise nothing is
 # re-parsed unless the page's content changed. tests/test_infosys_local.py fingerprints that code and fails when it
 # changes without a bump.
-INDEXER_VERSION = 7          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
+INDEXER_VERSION = 8          # 3: code without non-breaking spaces; the return value parsed into the header (R24);
                              #    Methods / Properties tables as their own lists (N74)
                              # 4: everything a reader used to repair is stored repaired (docs/KNOWLEDGE_BASE.md rule 4):
                              #    no invisible marks, image placeholders or empty links; links resolved to page URLs
@@ -75,6 +75,10 @@ INDEXER_VERSION = 7          # 3: code without non-breaking spaces; the return v
                              #    a method page a Method; a function's 'returns TRUE/FALSE' is its BOOL return; the
                              #    header in a page's Syntax section, 'FUNCTION BLOCK X' read as a header; an operator's
                              #    syntax only under its label); the symbols documented inside pages (N170, `symbols`)
+                             # 8: a code sample's language label by the rule that counts each language's signs (0.8.15
+                             #    retest N184: C# was 'cpp', ST assignments were unlabelled) — in the page text's fences
+                             #    and the stored samples; infosys_search_code reads the label from the code at search
+                             #    time, so an index of format 7 answers by the new rule until its rebuild is approved
 
 INFOSYS = "https://infosys.beckhoff.com"
 LANG = "1033"
@@ -83,7 +87,10 @@ ALLOWED_HOSTS = {"infosys.beckhoff.com"}
 DDG_HOSTS = {"html.duckduckgo.com", "duckduckgo.com"}
 USER_AGENT = "twincat-mcp/0.6 (+https://github.com/; documentation lookup for an engineering tool)"
 CODE_SEP = "\n\x1e\n"
-DERIVED_VERSION = 3          # catalog / code_blocks / symbols layout and rules; a bump rebuilds them from the stored pages
+LANGUAGE_NOTE = ("language: guessed by this plugin from the code's text (st, cpp, csharp, xml; none = the code does "
+                 "not tell) — Beckhoff's pages label no code block; the page's headings say what a sample is for")
+DERIVED_VERSION = 4          # catalog / code_blocks / symbols layout and rules; a bump rebuilds them from the stored pages
+#                              (4: a sample's language guessed again from its code, N184)
                              # (3: the names pages declare under another title, declared_symbols)
                              # (no re-parse). 2: symbols — the methods and constants documented inside pages (N170)
 
@@ -573,17 +580,45 @@ def _mend_cell(cell: str, idents: set[str], type_column: bool) -> str:
     return " ".join(out)
 
 
+# N184 (0.8.15 retest): a code sample's language is the plugin's guess from the code's text — Beckhoff's pages label
+# no code block. The guess said C++ for C# ('private void SymbolValueChanged()' matched C++'s 'void f(' before any C#
+# rule was tried: 278 C# samples of tc3_ads.net were 'cpp'), and ':=' after a space (every ST assignment) was no ST.
+# Each language's signs now count, the one with more wins, two points at least — '' (not told) otherwise.
+_ST_WORDS = re.compile(r"\b(VAR_INPUT|VAR_OUTPUT|END_VAR|FUNCTION_BLOCK|END_STRUCT|END_TYPE|END_IF|END_FOR|END_WHILE|"
+                       r"END_CASE)\b|:=")
+_IEC_TYPES = ("ARRAY|POINTER|REFERENCE|BOOL|BYTE|WORD|DWORD|LWORD|SINT|INT|DINT|LINT|USINT|UINT|UDINT|ULINT|REAL|LREAL|"
+              "STRING|WSTRING|TIME|LTIME|DATE|TOD|DT|BIT")
+_ST_DECL = re.compile(rf"^\s*\w+\s*(?:AT\s+%\S+\s*)?:\s*(?:{_IEC_TYPES})\b[^;\n]*;", re.M)
+_CS_SIGNS = [(re.compile(p, re.M), w) for p, w in (
+    (r"^\s*using\s+System\b", 3), (r"\busing\s*\(", 2), (r"^\s*using\s+[A-Z]\w*(\.\w+)+\s*;", 2),
+    (r"\b(private|public|protected|internal)\s+((static|async|override|virtual|readonly|sealed|abstract|partial)\s+)*"
+     r"[\w<>\[\],.?]+\s+\w+(<[^>()]*>)?\s*[({;=]", 2),
+    (r"\b(public|private|internal)\s+(sealed\s+|static\s+|partial\s+|abstract\s+)*(class|interface|enum|struct)\s+\w+", 2),
+    (r"\b(public|private|internal|protected)\b[^;{]*\boperator\b", 2),
+    (r"\bvar\s+\w+\s*=", 2), (r"\bawait\s", 2), (r"\basync\s+Task\b", 2), (r"\bConsole\.\w+", 2),
+    (r"\bnamespace\s+\w+(\.\w+)+", 2), (r"\bAdsClient\b|\bTwinCAT\.Ads\b", 2), (r"\bget\s*;\s*set\s*;", 2),
+    (r"=>", 1), (r"\.Length\b", 1), (r"\bforeach\s*\(", 1), (r"\bstring\s+\w+\s*=", 1),
+    (r"\bnew\s+\w+(<[^>]*>)?\s*\[", 1))]
+_CPP_SIGNS = [(re.compile(p, re.M), w) for p, w in (
+    (r"^\s*#\s*include\b", 3), (r"\bstd::", 3), (r"^\s*#\s*(define|pragma|ifdef|ifndef|endif)\b", 2), (r"HRESULT", 2),
+    (r"->", 2), (r"\b(public|private|protected):", 2), (r"\w\*\s*\w|\w\s+\*\w", 2), (r"\btypedef\b", 2),
+    (r"\bnullptr\b", 1), (r"\w::\w", 1), (r"\bvoid\s+\w+\(", 1), (r"\b(unsigned|long|short)\s+(int|char|long)\b", 1),
+    (r"\bvirtual\s+\w+\s+\w+\s*\(.*\)\s*(=\s*0|override)?\s*;", 1), (r"\b(ULONG|PVOID|LPCSTR|LPVOID|HANDLE)\b", 1),
+    (r"\bstruct\s+\w+\s*\{", 1))]
+
+
 def _guess_lang(code: str) -> str:
-    up = code.upper()
-    if re.search(r"\b(VAR_INPUT|VAR_OUTPUT|END_VAR|FUNCTION_BLOCK|END_STRUCT|END_TYPE|END_IF|END_FOR|:=)", up) \
-            and "<" not in code[:1]:
+    """st / xml / csharp / cpp, '' when the code does not tell (see above)."""
+    if (_ST_WORDS.search(code.upper()) or _ST_DECL.search(code)) and "<" not in code[:1]:
         return "st"
     if code.lstrip().startswith("<"):
         return "xml"
-    if re.search(r"\b(#include|std::|HRESULT|void\s+\w+\()", code):
-        return "cpp"
-    if re.search(r"\b(using System|namespace\s+\w+|public\s+(class|void|static))", code):
+    cs = sum(w for rx, w in _CS_SIGNS if rx.search(code))
+    cpp = sum(w for rx, w in _CPP_SIGNS if rx.search(code))
+    if cs > cpp and cs >= 2:
         return "csharp"
+    if cpp > cs and cpp >= 2:
+        return "cpp"
     return ""
 
 
@@ -1090,7 +1125,51 @@ def near_symbols(con: Any, name: str, keep: Callable[[Any], bool] | None = None,
             add(same_documents([r for r in rows if r is not None and (keep is None or keep(r))], con))
             if len(out) >= limit or len(words) == 1:
                 break
+    # idea of the 0.8.15 retest (N160b): a typo inside a word (FB_FileOpn, ADSREED) had no near entry — the symbols
+    # the name is one or two edits from (a letter left out, added, changed or two swapped), the closest first
+    if len(out) < limit and "." not in s:
+        for cand in typo_symbols(con, s):
+            add(symbol_documents(con, cand, keep))
+            if len(out) >= limit:
+                break
     return out[:limit]
+
+
+def _edits(a: str, b: str, most: int) -> int:
+    """The optimal-string-alignment distance of a and b (a transposition is one edit), most + 1 when it is more."""
+    if abs(len(a) - len(b)) > most:
+        return most + 1
+    prev2: list[int] = []
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        if min(cur) > most:
+            return most + 1
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+def typo_symbols(con: Any, name: str, limit: int = 5) -> list[str]:
+    """The symbol names (titles of the symbol pages) one edit from `name` — two for a name of six letters and more —,
+    the closest first; the name itself (any case) is no typo of it."""
+    low = name.lower()
+    most = 2 if len(low) >= 6 else 1
+    found: dict[str, tuple[int, str]] = {}
+    for (title,) in con.execute("SELECT DISTINCT title FROM pages WHERE kind != 'Page' AND length(title) BETWEEN ? AND ?",
+                                (len(low) - most, len(low) + most)):
+        t = str(title or "")
+        tl = t.lower()
+        if tl == low or not re.fullmatch(r"[A-Za-z_]\w*", t):
+            continue
+        d = _edits(low, tl, most)
+        if d <= most and (tl not in found or d < found[tl][0]):
+            found[tl] = (d, t)
+    return [t for _d, t in sorted(found.values(), key=lambda x: (x[0], x[1].lower()))][:limit]
 
 
 def defined_in(asked: str, parent_title: str | None) -> dict[str, str] | None:
@@ -1357,10 +1436,13 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
     # read. `total` counts pages: a page in several books once per book (copies are listed once, with same_page_in)
     more = seen["documents"] > len(rows) or total > seen["read"] + outside
     rows = rows[offset:offset + limit]                                     # N167: this page of the hits
+    # N183 (0.8.15 retest): why a hit is where it is when its score did not place it — the code's table, or its title
+    placed = DS.title_ranks(rows, query, skip=ids)
     return {"rows": rows, "total": total, "more": more, "mode": mode, "expr": expr, "info": info, "code": forms,
             "offset": offset, "next_offset": offset + len(rows) if more and rows else None,
             "defined": sum(1 for r in rows if r["rid"] in ids),
-            "copies": {r["rid"]: copies[r["rid"]] for r in rows if r["rid"] in copies}}
+            "copies": {r["rid"]: copies[r["rid"]] for r in rows if r["rid"] in copies},
+            "title_match": placed}
 
 
 def code_note(res: dict[str, Any]) -> str | None:
@@ -2502,9 +2584,11 @@ class InfosysIndex:
                 for block in (row["code"] or "").split(CODE_SEP):
                     if not block.strip():
                         continue
-                    lang, _, code = block.partition("\n")
+                    _stored, _, code = block.partition("\n")
+                    # N184: the language guessed from the code by this plugin's rule (the page stored the guess of
+                    # the rule it was indexed with)
                     con.execute("INSERT INTO code_blocks(page_rowid, url, title, library, lang, code) VALUES (?,?,?,?,?,?)",
-                                (row["rowid"], row["url"], row["title"], row["library"], lang.strip(), code))
+                                (row["rowid"], row["url"], row["title"], row["library"], _guess_lang(code), code))
                     added += 1
                 con.execute("INSERT OR REPLACE INTO code_src VALUES (?, ?, ?)", (row["rowid"], row["url"], row["fetched"]))
             # N170: the symbols documented inside the pages (a page with no table documents none)
@@ -3082,6 +3166,8 @@ class InfosysIndex:
             res["total"] = last["total"]              # pages; a page in several books once per book
             res["truncated"] = last["more"]
             res["offset"], res["next_offset"] = offset, last["next_offset"]
+            from . import docsearch as DS
+            res["order"] = DS.ORDER_NOTE                  # N183
             if clamped is not None:
                 res["clamped"] = True
                 res["clamped_note"] = (f"limit {clamped} is above the maximum (1-{SEARCH_LIMIT}): {SEARCH_LIMIT} used"
@@ -3124,8 +3210,8 @@ class InfosysIndex:
                 lang = ""
             elif lang and lang.lower() not in {x.lower() for x in langs if x}:
                 raise InfosysError(f"language {language!r} does not occur in the index; languages: "
-                                   f"{sorted(x for x in langs if x)} ('' or 'none' = samples without a label: "
-                                   f"{langs.get('', 0)})")                                        # R22
+                                   f"{sorted(x for x in langs if x)} ('' or 'none' = samples whose code does not "
+                                   f"tell: {langs.get('', 0)}) — {LANGUAGE_NOTE}")               # R22, N184
         if ignore_spacing:
             parts = re.findall(r"\w+|\S", q)
             rx = re.compile(r"\s*".join(re.escape(x) for x in parts), re.I)
@@ -3136,12 +3222,15 @@ class InfosysIndex:
             needle = q
         where, params = [], []
         if lang is not None:
-            where.append("b.lang = ? COLLATE NOCASE")
-            params.append(lang)
+            # N184: the language this plugin's rule guesses from the code — an index built read-only by an older
+            # rule keeps that rule's labels in code_blocks.lang, so they are not read
+            where.append("code_lang(b.code) = ?")
+            params.append(lang.lower())
         with self._db() as con:
+            con.create_function("code_lang", 1, _guess_lang, deterministic=True)
             # one pass over the code samples only (not the page store); the language filter is part of the query
             like = "%" + (needle or q).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-            sql = ("SELECT b.url, b.title, b.library, b.lang, b.code FROM code_blocks b WHERE b.code LIKE ? ESCAPE '\\'"
+            sql = ("SELECT b.url, b.title, b.library, b.code FROM code_blocks b WHERE b.code LIKE ? ESCAPE '\\'"
                    + "".join(f" AND {w}" for w in where))
             rows = con.execute(sql, [like] + params)
             out: list[dict[str, Any]] = []
@@ -3155,11 +3244,12 @@ class InfosysIndex:
                     hit = next((n for n, ln in enumerate(lines) if rx.search(ln)), 0)
                     lo, hi = max(0, hit - 6), min(len(lines), hit + 10)
                     out.append({"url": r["url"], "title": r["title"], "library": r["library"],
-                                "language": r["lang"] or None, "line": hit + 1, "snippet": "\n".join(lines[lo:hi])})
+                                "language": _guess_lang(r["code"]) or None, "line": hit + 1,
+                                "snippet": "\n".join(lines[lo:hi])})
                 if total >= 2000:
                     break
         res = {"query": q, "count": len(out), "total_matches": total if total < 2000 else "2000+", "items": out,
-               **self._answer_meta()}
+               "language_note": LANGUAGE_NOTE, **self._answer_meta()}
         if language is not None:
             res["language"] = lang or "(unlabelled)"
         if not out:
@@ -3174,8 +3264,20 @@ class InfosysIndex:
         return res
 
     def code_languages(self) -> dict[str, int]:
+        """{language: samples} by this plugin's guess (N184) — counted once per state of the index."""
+        try:
+            st = self.db_file.stat()
+            sig: Any = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            sig = None
+        cached = getattr(self, "_langs", None)
+        if sig is not None and cached is not None and cached[0] == sig:
+            return dict(cached[1])
         with self._db() as con:
-            return {r[0]: r[1] for r in con.execute("SELECT lang, COUNT(*) FROM code_blocks GROUP BY lang")}
+            con.create_function("code_lang", 1, _guess_lang, deterministic=True)
+            langs = {r[0]: r[1] for r in con.execute("SELECT code_lang(code), COUNT(*) FROM code_blocks GROUP BY 1")}
+        self._langs = (sig, langs)
+        return dict(langs)
 
     def get_page(self, ref: str, refresh: bool = False, max_chars: int = 60_000, section: str | None = None,
                  offset: int = 0) -> dict[str, Any]:
@@ -3513,6 +3615,8 @@ class InfosysIndex:
             it = {"url": r["url"], "title": r["title"], "kind": r["kind"], "library": r["library"], "book": r["book"],
                   **({"version": r["version"]} if r["version"] else {}),
                   "excerpt": r["s"], "score": round(-r["r"], 3)}
+            if r["rid"] in res["title_match"]:            # N183: what placed it, when its score did not
+                it["title_rank"], it["title_match"] = res["title_match"][r["rid"]]
             if r["rid"] in res["copies"]:
                 it["same_page_in"] = list(dict.fromkeys(b for b, _pid in res["copies"][r["rid"]]))   # a book once
             out.append(it)

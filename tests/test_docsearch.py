@@ -232,3 +232,24 @@ def test_kbv_a_page_titled_as_the_query_is_found(idx):
     r = idx.search("Data type", limit=10)
     assert r["total"] == 321 and r["query_mode"] == "all words"          # the count is the tier's, unchanged
 
+
+
+def test_review10_0816_one_corpus_of_questions_and_the_codes_they_name():
+    """Tenth review of 0.8.16: each round's fix of one phrasing broke others — 'the 1861 error' (round 8), counts after
+    a comma (round 9: '1861 error, 3 times' lost 1861), hex after an item word ('axis 0x4650 error'), singular counts
+    read as codes again ('Build failed with 1 error'), a dash or a comma before the code ('error - 0x745 when
+    reading'). The rules are one set (docsearch, above code_tokens), held against one corpus of 370 questions."""
+    from pathlib import Path
+    from twincat_mcp import errors_index as X
+    rows = [ln.split("\t") for ln in (Path(__file__).parent / "fixtures" / "code_questions.tsv").read_text(
+        encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
+    assert len(rows) >= 360
+    wrong = []
+    for q, want in rows:
+        got = ",".join(c["token"] for c in X.read_query(q)["codes"]) or "-"
+        if got != want:
+            wrong.append((q, want, got))
+    assert not wrong, "\n".join(f"{q!r}: want {w}, got {g}" for q, w, g in wrong)
+    # the docs search reads the same rule (one code, decimal of two digits or more)
+    assert D.code_forms("1861 error, 3 times")["token"] == "1861"
+    assert D.code_forms("Build failed with 12 errors") is None and D.code_forms("axis 0x4650 error")["value"] == 0x4650

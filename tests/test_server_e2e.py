@@ -2404,3 +2404,48 @@ async def test_review9_0816_codes_paths_counts_builds(monkeypatch, project_dir, 
     assert app.online_terms("what does the last error mean?", log) == "C0046"
     note = app.doc_note("ADS error 1861 and ADS error 1808 and ADS error 6 and ADS error 7")
     assert all(h in note for h in ("0x745", "0x710", "0x6", "0x7")), note
+
+
+@pytest.mark.anyio
+async def test_review10_0816_the_whole_log_typed_and_untyped_items_and_counts(monkeypatch, project_dir, tmp_path):
+    """Tenth review of 0.8.16: (5) errors past the first 400 texts were 'never seen' though `said` read them all; (6) a
+    path ending in a typed item written by its name ('TIID^Device 1 (EtherCAT)^Term 4 fail?') found nothing; (8) 'Term
+    4(EL2008)' leaked the type as a name, 'Term 4 ( EL2008 )' missed the item; (9) an item a call created by an untyped
+    name ('Term 9') and the NC's 'Axis 1' were no items; (11) the comparison ran on the event loop; (12) 'the last 2
+    Term 4 errors' counted 1."""
+    import time as _t
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    app.note_error("xae_tree_set_values", error="xae_tree_set_values: ConsumeXml failed (0x98510004)",
+                   subjects=["TIID^Device 1 (EtherCAT)^Term 4 (EL2008)"])
+    app.note_error("ads_read", error="ads_read MAIN.fbValve.bOpen: ADSError 1808", subjects=["MAIN.fbValve.bOpen"])
+    app.note_error("xae_tree_create_child", error="xae_tree_create_child: CreateChild failed (0x98510004)",
+                   subjects=["TIID^Device 1 (EtherCAT)^Term 9"])
+    app.note_error("xae_tree_set_values", error="xae_tree_set_values: ConsumeXml failed (0x98510004)",
+                   subjects=["TINC^NC-Task 1 SAF^Axes^Axis 1"])
+    _t.sleep(1.1)
+    for k in range(8):                          # 8 x 50 XAE lines: the four errors above lie past the first 400 texts
+        app.note_error("xae_build", lines=[f"Build line {k}.{n}: warning C0373 something unused" for n in range(50)])
+    assert len(app._error_texts()) > 400
+    for q, want in (("why does MAIN.fbValve fail?", "1808"), ("what does the last Term 4 error mean?", "0x98510004"),
+                    ("why does TIID^Device 1 (EtherCAT)^Term 4 fail?", "ConsumeXml"),
+                    ("why does Device 1 (EtherCAT)^Term 4 fail?", "ConsumeXml"),
+                    ("is Term 4 ( EL2008 ) ok?", "ConsumeXml"), ("why does Term 9 fail?", "CreateChild"),
+                    ("why can't I add Term 9?", "CreateChild"), ("why does Axis 1 fail?", "ConsumeXml")):
+        r = await app.err_from_logs(q)
+        assert r and r["entries"] and want in r["entries"][0]["text"] and "names_not_found" not in r, (q, r)
+    r = await app.err_from_logs("is Term 4(EL2008) ok?")
+    assert r["entries"] and all("Term 4 (EL2008)" in " ".join(e["names"]) for e in r["entries"]), r
+    q = App._question("is Term 4(EL2008) ok?")
+    assert q["items"] == ["Term 4 (EL2008)"] and "EL2008" not in q["names"], q
+    for q in ("why does TIID^Device 1 (EtherCAT)^Term 4 (EL1008) fail?", "why does Term 41 fail?",
+              "why does TIID^Device 1 (EtherCAT)^Term 9^Channel 1 fail?"):
+        r = await app.err_from_logs(q)
+        assert r is None or r["entries"] == [], (q, r)
+    assert App._question("what do the last 2 Term 4 errors mean?")["count"] == 2

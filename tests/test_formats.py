@@ -24,8 +24,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (7, "522da891f1fbc1ee")   # 0.8.15: kinds from the page's own evidence (N150 N151 N157 N172),
-#                                                    symbols inside pages (N170)
+INFOSYS_FINGERPRINT = (8, "8fab192cec4104ce")   # 0.8.16: code sample languages by counted signs (N184); 7 (0.8.15):
+#                                                    kinds from the page's own evidence, symbols inside pages (N170)
 MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes of every family (N163)
 ESI_FINGERPRINT = ("2", "49f0ad9346541e7b")    # index\\esi.db (esi_index.py): format 2 — modules found by their
 #                                                 devices (N156, 0.8.14 retest), one object per index of a dictionary

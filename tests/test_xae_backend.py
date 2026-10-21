@@ -1921,3 +1921,59 @@ def _raise_busy(fn):
         return fn()
     except ComError as exc:
         raise X.XaeBusy("busy") from exc
+
+
+def test_n175_0815_twincat_interface_export_is_the_oracle(xae, tmp_path):
+    """N175 (0.8.15 retest): TwinCAT 3.1.4026 writes an interface as <Interface><Methods><Method> with
+    <InterfaceAsPlainText> as a direct child of each — the oracle looked only under addData and returned {} for the
+    real export, so the replace of I_Module said checked_against 'name' and a changed method was never compared.
+    Fixture: the shape of a TwinCAT 3.1.4026 export (productVersion 3.5.21.61) of the retest project's I_Module."""
+    from pathlib import Path
+    fx = Path(__file__).parent / "fixtures" / "plcopen"
+    o = X._plcopen_oracle(str(fx / "I_Module_orig.xml"))
+    assert o["i_module"]["decl"] == "INTERFACE I_Module\n", o
+    assert set(o["i_module"]["kids"]) == {"execute", "getstatus"}, o
+    assert o["i_module"]["kids"]["getstatus"]["decl"] == "METHOD GetStatus : ST_ModuleStatus\n", o
+    assert "METHOD Execute : BOOL" in o["i_module"]["kids"]["execute"]["decl"], o
+    m = X._plcopen_oracle(str(fx / "I_Module_mod.xml"))
+    assert m["i_module"]["kids"]["getstatus"]["decl"].startswith("// N175 retest marker\n"), m
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    xml = o["i_module"]
+    base = "TIPC^Plc^Plc Project^I_Module"
+    kids = []
+    for n in ("Execute", "GetStatus"):
+        k = FakeItem(n, f"{base}^{n}")
+        k.DeclarationText, k.ImplementationText = f"METHOD {n} : BOOL // old\n", None
+        kids.append(k)
+    orig = FakeItem("I_Module", base, kids)
+    orig.DeclarationText, orig.ImplementationText = "INTERFACE I_Module\n", None
+    proj._children.append(orig)
+    for it in [orig, *kids]:
+        sm.items[it.PathName] = it
+
+    def dup(getstatus=None):
+        cbase = "TIPC^Plc^Plc Project^I_Module_1"
+        ck = []
+        for n in ("Execute", "GetStatus"):
+            k = FakeItem(n, f"{cbase}^{n}")
+            k.DeclarationText = (getstatus if (n == "GetStatus" and getstatus) else xml["kids"][n.lower()]["decl"])
+            k.ImplementationText = None
+            ck.append(k)
+        c = FakeItem("I_Module_1", cbase, ck)
+        c.DeclarationText, c.ImplementationText = "INTERFACE I_Module_1\n", None
+        proj._children.append(c)
+        for it in [c, *ck]:
+            sm.items[it.PathName] = it
+    # B4: a copy whose method text differs from the XML is refused, nothing written, the copy kept
+    proj.on_import = lambda: dup("METHOD GetStatus : INT\n")
+    with pytest.raises(X.XaeError, match=r"differs from the imported XML at .*I_Module\^GetStatus"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(fx / "I_Module_orig.xml"), "replace")
+    assert kids[1].DeclarationText == "METHOD GetStatus : BOOL // old\n" and proj.deleted == []
+    proj._children = [c for c in proj._children if c.Name != "I_Module_1"]
+    # B2: the copy as the XML has it: checked against the XML, header and methods compared
+    proj.on_import = dup
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(fx / "I_Module_orig.xml"), "replace")
+    rec = r["replaced"][0]
+    assert rec["checked_against"] == "xml" and not rec.get("not_in_xml"), rec
+    assert kids[1].DeclarationText == "METHOD GetStatus : ST_ModuleStatus\n" and proj.deleted == ["I_Module_1"]

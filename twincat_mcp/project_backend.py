@@ -1040,10 +1040,13 @@ class ProjectIndex:
         if lim is None:
             return f"no program/GVL/FB named {name!r}; try proj_search"
         key = name.strip().lower()
-        where = sorted({self.plc_label(o) for u in self.all_units() if u.name.lower() == key
-                        for o in self.plcs_of_file(u.file) if o != lim}
-                       | {self.plc_label(o) for u in self.all_units() if u.kind.upper() == "GVL"
-                          for v in u.vars if v.name.lower() == key for o in self.plcs_of_file(u.file) if o != lim})
+        # N141b (0.8.15 retest): looked up through one PLC project's view (wf_debug_symbol: App.proj_for_port), the
+        # other PLC projects are not in the view — where the name is declared is looked up in the whole index
+        whole = getattr(self, "_parent", self)
+        where = sorted({whole.plc_label(o) for u in whole.all_units() if u.name.lower() == key
+                        for o in whole.plcs_of_file(u.file) if o != lim}
+                       | {whole.plc_label(o) for u in whole.all_units() if u.kind.upper() == "GVL"
+                          for v in u.vars if v.name.lower() == key for o in whole.plcs_of_file(u.file) if o != lim})
         here = f"PLC project {self.plc_label(lim)}" + (f" (ADS port {port})" if plc is None and port is not None else "")
         if not where:
             return f"no program/GVL/FB named {name!r} in {here}; try proj_search"

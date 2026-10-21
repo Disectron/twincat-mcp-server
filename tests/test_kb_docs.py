@@ -629,3 +629,37 @@ def test_rereview_0815_the_skill_finds_a_symbol_by_the_name_its_page_declares(kb
     assert rc == 1 and r["error"] == "not_found", r
     rc, r = run(kbdir, "docs_declaration", "symbol=SendMessageEx")
     assert rc == 0 and r["ref"] == "tcplclib_tc3_eventlogger/13724785000" and "declared_as" not in r, r
+
+
+def test_n183_the_order_of_the_hits_is_said_where_the_score_did_not_give_it(kbdir):
+    """N183 (0.8.15 retest): docs_search "ADSREAD xyzqq" listed ADSREAD 12.85, AdsRead 14.98, "Example with AdsRead"
+    13.91 — the symbol page first is intended (the title order), but the score shown is the text's bm25, which that
+    order does not follow. A hit its title placed says so: title_rank (1 = the closest title) and title_match (how);
+    the answer's `order` says the rule. infosys_search answers from the same search with the same fields."""
+    import sqlite3
+    from twincat_mcp import infosys as INF
+    from twincat_mcp import docsearch as DS
+    rc, r = run(kbdir, "docs_search", "query=ADSREAD xyzqq")
+    assert rc == 0 and r["order"] == DS.ORDER_NOTE and "title_rank" in r["order"], r
+    items = r["items"]
+    assert items[0]["title"] == "ADSREAD" and items[0]["title_rank"] == 1, items[0]
+    assert items[0]["title_match"] == "the title is the query's word", items[0]
+    ranked = [it["title_rank"] for it in items if "title_rank" in it]
+    # the ranked hits first, in their rank's order; the others after them, in score order
+    assert ranked == sorted(ranked) and all("title_rank" in it for it in items[:len(ranked)]), items
+    rest = [it["score"] for it in items[len(ranked):]]
+    assert rest == sorted(rest, reverse=True), items
+    # the live case (Ryan's index): AdsRead (two words) after ADSREAD (one) — the last rule is said
+    live = [{"rid": i, "title": t, "library": lib} for i, (t, lib) in enumerate(
+        (("ADSREAD", "Tc2_System"), ("AdsRead", None), ("Example with AdsRead function block", "Tc2_System"),
+         ("Functioning", None)))]
+    tr = DS.title_ranks(live, "ADSREAD xyzqq")
+    assert tr == {0: (1, "the title is the query's word"), 1: (2, "the title is the query's word; 1 of the title's 2 words"),
+                  2: (3, "the title names 1 of the query's 2 words; 1 of the title's 6 words")}, tr
+    from twincat_mcp import kb_layout as L
+    db = L.locate(kbdir, "infosys")
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    res = INF.search_index(con, "ADSREAD xyzqq", 10)
+    assert [r2["title"] for r2 in res["rows"]] == [it["title"] for it in items]
+    assert [res["title_match"].get(r2["rid"], (None, None))[0] for r2 in res["rows"]] == [it.get("title_rank") for it in items]

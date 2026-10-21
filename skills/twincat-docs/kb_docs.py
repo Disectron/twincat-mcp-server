@@ -100,7 +100,7 @@ RULES = [
     "offset=next_offset.",
     "Long pages: section= first (outline lists them), then offset=next_offset. A manual's pages: manual_page "
     "pages=<next_pages> offset=<next_offset>, as `next` names them.",
-    "manual_search: a hex number or CoE index (0x8000, #x8000, 16#8000, 8000:11) is found in any notation, a unit "
+    "manual_search: a hex number or CoE index (0x8000, #x8000, 16#8000, 8000:11, 8000h:11h) is found in any notation, a unit "
     "symbol (°C, mV/V, mA, µs) as written on the page; `terms` says how each was searched.",
     "Nothing found -> say so. A missing manual -> the user copies the PDF into <kb>\\manuals\\ and runs "
     "manuals_db.py update (or approves kb_rebuild(index='manuals')).",
@@ -693,6 +693,8 @@ def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
         it = {"ref": f"{r['book']}/{r['pid']}", "title": r["title"], "book": r["book"],
               "version": r["version"] or None, "excerpt": one_line(r["s"]),
               "url": WEB.format(lcid=ctx.lcid(), book=r["book"], pid=r["pid"]), "score": float(f"{-r['r']:.4g}")}
+        if r["rid"] in res["title_match"]:                # N183: what placed it, when its score did not
+            it["title_rank"], it["title_match"] = res["title_match"][r["rid"]]
         if r["rid"] in res["copies"]:
             it["same_page_in"] = [f"{b}/{pid}" for b, pid in res["copies"][r["rid"]]]
         if mode.startswith("some words"):
@@ -701,7 +703,7 @@ def cmd_docs_search(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
     # total: the pages that match (a page in several books once per book; copies are one item, same_page_in)
     out: dict[str, Any] = {"query": a["query"], "query_mode": mode, **info, "count": len(items), "total": total,
                            "offset": res["offset"], "next_offset": res["next_offset"], "truncated": res["more"],
-                           "items": items, "source": ctx.source("infosys")}
+                           "items": items, "order": DS.ORDER_NOTE, "source": ctx.source("infosys")}
     for name, (asked, lo, hi) in (a.get("_clamped") or {}).items():
         out["clamped"] = True
         out["clamped_note"] = (f"{name} {asked} is above the maximum ({lo}-{hi}): {hi} used"
@@ -918,6 +920,10 @@ def _msource(ctx: Ctx) -> dict[str, Any]:
 _FTS_WRITTEN = re.compile(r'["*()^]|\b(?:AND|OR|NOT|NEAR)\b')
 _HEX_TERM = re.compile(r"(?<![\w#])(?:0x|#x|16#)([0-9a-f]{1,8})(?::(?:0x)?(0*[0-9a-f]{1,2}))?(?![\w#:])", re.I)
 _SUB_TERM = re.compile(r"(?<![\w#:])([0-9a-f]{4}):(?:0x)?(0*[0-9a-f]{1,2})(?![\w#:])", re.I)
+# N177 (0.8.15 retest): the 'h' suffix some Beckhoff manuals write a CoE index in ('Index 8000h', '8000h:11h') — '8000h:11'
+# was the words 8000h and 11 (260 hits on '11 Appendix' and the like). Four hex digits with h, and a sub-index with or
+# without its own h, are the index in every notation — the h form among them
+_H_TERM = re.compile(r"(?<![\w#:])([0-9a-f]{4})h(?::(?:0x)?(0*[0-9a-f]{1,2})h?)?(?![\w#:])", re.I)
 _MICRO = "\u00b5\u03bc"             # micro sign, Greek mu — PDFs use either
 _OHM = "\u03a9\u2126"               # Greek capital omega, ohm sign
 _DEG_C, _DEG_F = "\u2103", "\u2109"  # the one-character degree Celsius / Fahrenheit signs
@@ -932,21 +938,23 @@ _UNIT_TERM = re.compile(rf"(?<![^\W\d_])(?:°\s?[CF]|{_DEG_C}|{_DEG_F}|{_UNIT_ON
 def _hex_term(text: str, digits: str, sub: str | None) -> dict[str, Any]:
     d = digits.lower()
     idx = len(d) == 4            # a CoE index: its sub-index rows are written without a prefix ('8000:11')
-    alts = [f'"0x{d}"', f'"x{d}"'] + ([f'"{d}"'] if idx else [f'"16 {d}"'])
+    # N177: and with the h suffix ('8000h', '8000h:11h') — its own token of the index
+    alts = [f'"0x{d}"', f'"x{d}"'] + ([f'"{d}"', f'"{d}h"'] if idx else [f'"16 {d}"'])
     pre = rf"(?<![0-9a-z])(?:0x|#x|16#){d}"
     D = d.upper()
     if sub is None:
         rx = pre + r"(?![0-9a-z])"
         forms = [f"0x{D}", f"#x{D}", f"16#{D}"]
         if idx:
-            rx += rf"|(?<![0-9a-z#:]){d}:(?:0x)?[0-9a-f]{{1,2}}(?![0-9a-z])"
-            forms.append(f"{D}:<sub-index>")
+            rx += (rf"|(?<![0-9a-z#:]){d}:(?:0x)?[0-9a-f]{{1,2}}h?(?![0-9a-z])"
+                   rf"|(?<![0-9a-z#:]){d}h(?![0-9a-z])")
+            forms += [f"{D}:<sub-index>", f"{D}h"]
     else:
         s = int(sub, 16)
-        tail = rf":(?:0x)?0*{s:x}(?![0-9a-z])"
-        rx = (rf"(?:{pre}|(?<![0-9a-z#:]){d})" if idx else pre) + tail
+        tail = rf":(?:0x)?0*{s:x}" + ("h?" if idx else "") + "(?![0-9a-z])"
+        rx = (rf"(?:{pre}|(?<![0-9a-z#:]){d}h?)" if idx else pre) + tail
         S = f"{s:02X}"
-        forms = [f"0x{D}:{S}", f"#x{D}:{S}", f"16#{D}:{S}"] + ([f"{D}:{S}"] if idx else [])
+        forms = [f"0x{D}:{S}", f"#x{D}:{S}", f"16#{D}:{S}"] + ([f"{D}:{S}", f"{D}h:{S}h"] if idx else [])
     return {"term": text, "fts": "(" + " OR ".join(alts) + ")", "rx": "(?i)" + rx,
             "searched_as": f"{text} in any notation: {', '.join(forms)}"}
 
@@ -970,7 +978,8 @@ def _manual_terms(q: str) -> tuple[list[dict[str, Any]], str]:
     if _FTS_WRITTEN.search(q):
         return [], q
     found: list[tuple[int, dict[str, Any]]] = []
-    for pat, make in ((_HEX_TERM, lambda m: _hex_term(m.group(0), m.group(1), m.group(2))),
+    for pat, make in ((_H_TERM, lambda m: _hex_term(m.group(0), m.group(1), m.group(2))),
+                      (_HEX_TERM, lambda m: _hex_term(m.group(0), m.group(1), m.group(2))),
                       (_SUB_TERM, lambda m: _hex_term(m.group(0), m.group(1), m.group(2))),
                       (_UNIT_TERM, lambda m: _unit_term(m.group(0)))):
         def take(m: re.Match, make=make) -> str:
@@ -1097,8 +1106,36 @@ def product_manuals(con: sqlite3.Connection, code: str, limit: int) -> dict[str,
                               "approved: kb_rebuild(index='manuals'), or tools\\manuals_db.py update"
                               if fmt != MANUALS_TEXT_FORMAT else
                               "the product-code rule (a family's letters and four digits) does not take this form"))
+    # idea of the 0.8.15 retest: EL3102 listed the EL28xx manual — its shared commissioning chapter uses EL3102 as the
+    # example. A manual is the product's when its file name, its title or its title pages name the product (or a
+    # family that holds it: EL31xx, ED280x); the others only mention it (an example, a list of products) and follow
+    for it in items:
+        it["kind"] = "product manual" if _written_for(con, it["doc_id"], code) else "mentions"
+    items.sort(key=lambda it: it["kind"] != "product manual")          # stable: most mentions first within a kind
     out["items"] = items
+    if any(it["kind"] == "mentions" for it in items):
+        out["kind_note"] = ("kind 'mentions': the manual is not written for this product (its name, title and title "
+                            "pages do not name it or its family) — it names it on its pages, e.g. as an example")
     return out
+
+
+_FAMILY = re.compile(r"\b([A-Z]{1,4})([0-9X]{4})(?:-(\d{4}))?\b")
+
+
+def _written_for(con: sqlite3.Connection, doc_id: int, code: str) -> bool:
+    """Whether the manual is the product's: its file name, title or first two pages name the code, its base product
+    or a family pattern that holds it (EL31xx, ED280x — an x stands for any digit)."""
+    d = con.execute("SELECT name, title FROM doc WHERE id = ?", (doc_id,)).fetchone()
+    head = " ".join(str(x or "") for x in (d or ("", ""))) + " " + " ".join(
+        str(r[0] or "") for r in con.execute("SELECT text FROM page WHERE doc = ? AND page <= 2", (doc_id,)))
+    m = re.fullmatch(r"([A-Z]{1,4})(\d{4})(?:-\d{4})?", code.upper())
+    if not m:
+        return code.upper() in head.upper()
+    fam, digits = m.groups()
+    for f in _FAMILY.finditer(re.sub(r"[_.]", " ", head.upper())):
+        if f.group(1) == fam and all(a in ("X", b) for a, b in zip(f.group(2), digits)):
+            return True
+    return False
 
 
 def cmd_manual_product(ctx: Ctx, a: dict[str, Any]) -> dict[str, Any]:
@@ -1308,8 +1345,8 @@ COMMANDS: dict[str, tuple[Callable[[Ctx, dict[str, Any]], dict[str, Any]], dict[
     "docs_books": (cmd_docs_books, {"filter": P(doc="glob on the book slug")}, "Infosys books with page counts"),
     # N167 / N169 (0.8.14 retest): the search pages (offset / next_offset) and clamps its limit; each refusal of a
     # range names the way to read on
-    "manual_search": (cmd_manual_search, {"query": P(required=True, doc="FTS5 query; 0x8000:11 / #x8000 / °C / mV/V are "
-                                                                        "searched in any notation, as written"),
+    "manual_search": (cmd_manual_search, {"query": P(required=True, doc="FTS5 query; 0x8000:11 / #x8000 / 8000h / °C / mV/V "
+                                                                        "are searched in any notation, as written"),
                                           "doc": P(doc="manual: file name, glob or id"),
                                           "limit": P("int", default=10, lo=1, hi=50, clamp=True, doc="hits shown"),
                                           "offset": P("int", default=0, lo=0, doc="hits skipped: the next ones are "

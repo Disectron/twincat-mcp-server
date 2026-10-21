@@ -1,0 +1,372 @@
+# What err_lookup / kb_search read as codes in everyday questions (errors_index.read_query; the rules above
+# docsearch.code_tokens). One corpus for every change of the rules: rounds 7-10 of the 0.8.16 review each fixed
+# some phrasings and broke others. Columns: the question, a TAB, the codes in the order of the question ('-': none).
+# Phrasings from the reviews' corpora (review10_0816/scripts/phrasings*.txt) and their findings.
+what does the 1861 error mean?	1861
+what does error 1861 mean?	1861
+what does ADS error 1861 mean	1861
+ADS error 1861	1861
+ADS 1861 error	1861
+1861	1861
+0x745	0x745
+error 1861	1861
+error code 1861	1861
+ads error code 1861	1861
+error number 1861	1861
+error no. 1861	1861
+error id 1861	1861
+ErrorID 1861	1861
+nErrorId = 1861	1861
+nErrId := 1861	1861
+I get error 1861 when reading MAIN.fbValve.bOpen	1861
+I get 1861 error when reading	1861
+I keep getting 1861 error	1861
+got 1861 error	1861
+getting a 1861 error on ads_read	1861
+an 1861 error	1861
+1861 error	1861
+1861 error code	1861
+the 1861 error	1861
+why 1808 error?	1808
+why do I get 1808?	-
+ads_read returns 1808	-
+ads_read returns 1808 error	1808
+ads_read returned error 1808	1808
+ads_read failed with 1808	-
+ads_read failed with error 1808	1808
+ads_read failed with code 1808	1808
+it fails with 1861	-
+fails with error 1861 on port 851	1861
+error 1861 on port 851	1861
+ADS error 1861 on port 851	1861
+Port 851: error 1808	1808
+Port 851 error 1808	1808
+Port 851 returns 1808 error	1808
+port 851 gives 1861 error	1861
+Term 4 error	-
+Term 4 error 1861	1861
+Term 4 has error 0x0011	0x0011
+Box 2 reports 1861 error	1861
+Drive 2 error, code 1861	1861
+Axis 1 error 4650	4650
+axis 1 has NC error 4650	4650
+NC error 4650	4650
+NC 4650 error	4650
+NC axis error 16#4650	16#4650
+error 16#4650 on axis 1	16#4650
+error 0x4650	0x4650
+what is 0x4650	-
+what is code 1861	1861
+what's 1861	-
+whats error 1861?	1861
+explain 1861	-
+explain error 1861	1861
+explain 1861 error	1861
+please explain 1808 error code	1808
+please explain error code 1808	1808
+meaning of 1861	-
+meaning of error 1861	1861
+meaning of the 1861 error	1861
+1861 meaning	-
+1861 error meaning	1861
+what does return code 1861 mean	1861
+what does hresult 0x98110745 mean	0x98110745
+HRESULT 0x98110745	0x98110745
+0x98110745	0x98110745
+-6908	-6908
+error -6908	-6908
+LabVIEW error -6908	-6908
+error - 1861	1861
+error - 1861 when reading	1861
+ADS error - 1861 on port 851	1861
+error: 1861	1861
+Error: 1861 (symbol not found)	1861
+error=1861	1861
+error #1861	1861
+error(1861)	1861
+error (1861)	1861
+error '1861'	1861
+ads error "1861"	1861
+Fehler 1861	1861
+Fehlercode 1861	1861
+Fehler Nr. 1861	1861
+1861 Fehler	1861
+was bedeutet Fehler 1861	1861
+was bedeutet der Fehler 1861?	1861
+AdsError 1861	1861
+ADSError: 1861	1861
+ADSError 1861 (symbol not found)	1861
+code 1861 from ads_read	1861
+returns code 1861	1861
+result 1861	1861
+return value 1861	1861
+the error is 1861	-
+the error was 1861	-
+error is 1861	-
+the code is 1861	-
+the error code is 1861	-
+error code was 1808	-
+I got an error, 1861	1861
+error, 1861	1861
+error; 1861	1861
+ADS error; 1861	1861
+got 1861 error, 2 times	1861
+got error 1861, 2 times today	1861
+1861 error, 3 retries	1861
+ADS 1861 error, then 1808 error	1861,1808
+1861 and 1808 errors	1861,1808
+errors 1861 and 1808	1861,1808
+error 1861 or 1808	1861,1808
+TwinCAT 3 error 1861	1861
+TwinCAT 3 1861 error	1861
+TC3 error 1861	1861
+build 4024 error 1861	1861
+Build: 1 error, 3 warnings	-
+Build: 3 errors, 0 warnings	-
+found 0 errors	-
+1 error(s)	-
+3 Fehler	-
+errors: 3	-
+errors: 0x745	0x745
+the last 3 errors	-
+step 3 error	-
+Line 34 error C0046	-
+MAIN.TcPOU(34): error C0046	-
+C0046	-
+error C0046	-
+compiler error C0046	-
+C0046 error	-
+what is C0046	-
+what does C0046 mean	-
+Task 1: ADSError 1861	1861
+Task 1 error 1861	1861
+Drive 2: error 1861	1861
+EL2008 error 1861	1861
+EL7041 error 0x4260	0x4260
+EL7041 0x4260	-
+EL7041 error 16#4260	16#4260
+EL7041 4260 error	4260
+AL status code 0x001b	0x001b
+AL status 0x001B	0x001B
+AL status code 27	27
+AL Status Code: '0x001b'	0x001b
+sync manager watchdog 0x001b	-
+win32 error 5	5
+win32 error 1223	1223
+Win32 error 1223	1223
+what is win32 error 1223	1223
+error 1223	1223
+error 5	5
+error 6	6
+ADS error 6	6
+ADS error 7	7
+ads error 18	18
+ADS error 1792	1792
+1792	1792
+1793 error	1793
+what does 1808 mean	-
+1808?	1808
+1808 ?	1808
+code: 1808	1808
+code=1808	1808
+error code: 0x745	0x745
+what does device error 0x4 mean	0x4
+the axis gives 4650	-
+my axis gives error 4650	4650
+my axis gives 4650 error	4650
+NC 0x4650	0x4650
+the drive shows error 0x2342	0x2342
+F2342	-
+E_FAIL	-
+what does E_FAIL mean	-
+ADSERR_DEVICE_SYMBOLNOTFOUND	-
+what is ADSERR_DEVICE_SYMBOLNOTFOUND	-
+TSM_E_NOTFOUND	-
+0x98510004	0x98510004
+ConsumeXml failed (0x98510004)	0x98510004
+xae_boot_project failed with 0x98510004	0x98510004
+item 3 error 1861	1861
+slot 2 error 1861	1861
+channel 1 error 0x0011	0x0011
+line 1861 error	-
+error in line 1861	-
+the error in line 34	-
+node 3 1861 error	1861
+station 5 1861 error	1861
+klemme 4 Fehler	-
+Achse 1 Fehler 4650	4650
+achse 1 fehler 4650	4650
+Zeile 34 Fehler	-
+2 errors	-
+the 2 errors	-
+had 2 errors	-
+had 1861 errors	-
+1861 errors	-
+1861 Errors	-
+1861 Error	1861
+1861 ERROR	1861
+ERROR 1861	1861
+Error 1861	1861
+1861 Error code	1861
+ADS 1861 Error	1861
+the ADS 1861 error	1861
+what does the ADS 1861 error mean?	1861
+an ADS 1861 error	1861
+why ADS 1861 error on Port 851	1861
+ADS 1861 error on port 851	1861
+ADS Port 851 1861 error	1861
+Port 851 1861 error	1861
+on port 851 I get 1861 error	1861
+on port 851, 1861 error	1861
+on axis 1, 4650 error	4650
+for axis 1: 4650 error	4650
+Axis 1: 4650 error	4650
+Axis 1 - 4650 error	4650
+Axis 1 – error 4650	4650
+Axis 1 — 4650	-
+error – 0x4260	0x4260
+error — 4650	4650
+Error - 2 axes not referenced	-
+error - 2	2
+error -2	-2
+ERROR -2	-2
+error-1861	-
+error_1861	-
+error1861	-
+1861error	-
+err 1861	1861
+errno 1861	1861
+errno=1861	1861
+nErrorID: 1861	1861
+nErrorID 1861	1861
+ErrorID: 16#745	16#745
+nErrId 16#0745	16#0745
+bError TRUE nErrorID 1861	1861
+the error id is 1861	-
+returned errorid 1861	1861
+fbRead.nErrId = 1861	1861
+MAIN.fbRead.nErrId 1861	1861
+MAIN.fbRead gives 1861 error	1861
+MAIN.fbRead gives error 1861	1861
+fbRead error 1861	1861
+fbRead 1861 error	1861
+FB_Read returns 1861	-
+FB_Read returns error 1861	1861
+GVL.nErr 1861	-
+1861 from ADS	-
+1861 from ads_read	-
+1861 on read	-
+1861 when writing	-
+1861 when I write MAIN.x	-
+1861 at MAIN.x	-
+1861 for MAIN.x	-
+1861 (0x745)	-
+0x745 (1861)	-
+error 0x745 (1861)	0x745
+error 1861 (0x745)	1861
+1861 / 0x745	-
+1861 = 0x745?	-
+is 1861 the same as 0x745?	-
+error 1861 vs 1808	1861,1808
+difference between 1861 and 1808	-
+difference between error 1861 and 1808	1861,1808
+1861 error, 3 times	1861
+ADS 1861 error, 2 axes stopped	1861
+getting 1861 error, 5 seconds after login	1861
+1808 error, 2 symbols not found	1808
+ads_read gives 1808 error, 4 of 10 symbols	1808
+I get the 1861 error, 2 times a day	1861
+ADS error 1861, 2 times a day	1861
+1861 error , 2 times	1861
+NC axis 4650 error	4650
+axis 4650 error	4650
+my axis 4650 error	4650
+the axis 4650 error	4650
+NC axis 0x4650 error	0x4650
+axis 0x4650 error	0x4650
+Axis 0x4650 error	0x4650
+the drive 0x2342 error	0x2342
+drive 2342 error	2342
+device 1861 error	1861
+ADS device 1861 error	1861
+task 1861 error	1861
+port 1861 error	-
+line 0x745 error	0x745
+step 0x745 error	0x745
+Term 4 0x0011 error	0x0011
+EL7041 axis 0x4260 error	0x4260
+NC axis error 0x4650	0x4650
+axis error 0x4650	0x4650
+axis error 4650	4650
+error 4650 axis 1	4650
+AL status 0x001b on Box 2	0x001b
+Box 2 AL status 0x001b	0x001b
+Box 2 0x001b	-
+Box 2 error 0x001b	0x001b
+Port 851 0x745	-
+port 851 0x745 error	0x745
+ADS 0x745 error	0x745
+ADS 0x745	0x745
+0x745 error	0x745
+the 0x745 error	0x745
+what is the 0x745 error	0x745
+what does 0x745 mean	-
+error - 0x745 when reading	0x745
+error, 0x745	0x745
+error; 0x745	0x745
+Build: 1 error and 3 warnings	-
+Build: 1 error / 3 warnings	-
+Compile complete -- 1 error, 0 warnings	-
+Compile complete -- 1 errors, 0 warnings	-
+Build failed with 1 error	-
+build has 1 error	-
+there is 1 error in FB_Dosing	-
+only 1 error left	-
+1 error	-
+2 error	-
+I have 2 error in my build	-
+1 error 3 warnings	-
+1 error, 3 warnings, 2 messages	-
+error - 2 axes	-
+ADS error - 2 retries	-
+error – 3 terminals in SAFEOP	-
+I got 1 error: C0046	-
+got 2 errors: C0046 and C0077	-
+Fehler - 2 Achsen nicht referenziert	-
+1 Fehler, 3 Warnungen	-
+1 error, 3 warning(s)	-
+1 error(s), 3 warning(s)	-
+errors: 1	-
+error count: 3	-
+error count 3	-
+3 error messages	-
+3 error codes	-
+the 3 error codes	-
+error code count: 3	-
+Error 1 of 3: ADS error 1861	1861
+Error 2: symbol not found	2
+error 2 of 5	-
+Step 3 of 5 error	-
+retry 3 error	-
+attempt 2 error 1861	1861
+attempt 2: error 1861	1861
+after 3 retries error 1861	1861
+0x745 error, 2 retries	0x745
+16#4650 error, 2 axes	16#4650
+Axis 1 error – 0x4260 after enable	0x4260
+Drive 2 error - 1861 on start	1861
+Error: 2 axes not referenced	-
+error 3 times	-
+ADS error 2 times	-
+error: 3 retries	-
+the last 2 Term 4 errors	-
+ADS error 1861 on port 851 and 852	1861
+error 1861 and 2 warnings	1861
+an error, 2 PLCs down	-
+Term 4 and Term 5 error 1861	1861
+error 1861, port 851	1861
+errors: 12	-
+error 18 occurs on axis 2	18
+ADS error 6 means	6
+ADS error 1861 at line 34	1861
+codes 1861, 1808 and 1792	1861,1808,1792

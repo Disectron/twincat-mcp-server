@@ -1488,3 +1488,22 @@ def test_review8_0816_locked_index_once_ending_build_and_two_codes(kb, tmp_path)
     assert r.get("up_to_date") and "already_running" not in r, r
     note = app.doc_note("ADS error 1861, then ADS error 1808")
     assert "0x745" in note and "0x710" in note, note
+
+
+def test_review10_0816_doc_note_keeps_the_message_s_order_and_kb_search_three_rows(kb, tmp_path, monkeypatch):
+    """Tenth review of 0.8.16 (#10): doc_note of a message with more than five codes listed them by value, so the
+    message's leading codes were the ones cut ('… 2 more code(s)'); kb_search's known_error.documented grew from 3
+    rows to 16-20 (every row of every domain) while its docstring said the first three."""
+    app = _app(tmp_path, kb)
+    m = ("ADS error 1861; ADS error 1808; ADS error 1797; ADS error 1796; ADS error 1793; ADS error 1794; "
+         "ADS error 1795")
+    note = app.doc_note(m)
+    shown = note.split("[documented: ", 1)[1]
+    assert shown.index("0x745") < shown.index("0x710") < shown.index("0x705") < shown.index("0x704"), note
+    assert "0x702" not in shown and "2 more code(s)" in note, note
+    real = app.kb.documented("CreateFile failed: error 6")
+    assert len(real["rows"]) == 3 and "documented_more" not in app.kb.search("CreateFile failed: error 6")["known_error"]
+    many = {"rows": [dict(real["rows"][0], domain=f"d{i}") for i in range(16)], "domains": [f"d{i}" for i in range(16)]}
+    monkeypatch.setattr(type(app.kb), "documented", lambda self, msg: many)      # a code of 16 domains (the real KB)
+    ke = app.kb.search("CreateFile failed: error 6")["known_error"]
+    assert len(ke["documented"]) == 3 and ke["documented_more"].startswith("13 more row(s)"), ke

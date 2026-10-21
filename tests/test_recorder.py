@@ -782,6 +782,14 @@ def test_python_recording_with_a_block_that_delivered_once_or_never_is_incomplet
     footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
     want = 31 if cc_samples == 0 else 29                  # whole window (end − origin) // 10 + 1, or the tail rule
     assert footer["label"] == "INCOMPLETE" and footer["missing_samples"] == want, footer
+    # 0.8.15 retest (minor): the native engine's footer fields, filled as it fills them — a stop on request waited for
+    # every block, so the engine's own verdict is FAIL; nothing was lost on this PC
+    assert footer["overflow_samples"] == 0 and "requested_s" in footer, footer
+    if footer.get("stop_on_request"):
+        assert footer["verdict_hint"] == "FAIL", footer
+    else:
+        assert "verdict_hint" not in footer, footer       # an end not waited for: rec_verify's tail rule decides
+    assert footer["missing_head"] + footer["missing_gaps"] + footer["missing_tail"] == want, footer
     v = rec.verify(st["id"])
     blk = {b["first"]: b for b in v["timeline"]["blocks"]}
     assert blk[CC]["missing_tail"] == want and "period_note" in blk[CC], blk
@@ -807,6 +815,9 @@ def test_python_stop_when_ends_at_the_firing_sample_and_waits_for_the_other_bloc
     footer = json.loads(Path(out["file"]).read_text(encoding="utf-8").splitlines()[-1])
     assert footer["window_end_ms"] == 200.0 and footer["stop_at"]["by"] == "stop_when", footer
     assert footer["label"] == "COMPLETE" and footer["missing_samples"] == 0, footer
+    # 0.8.15 retest (rec acea, minor): verdict_hint / overflow_samples were null in the Python engine's footer
+    assert footer["verdict_hint"] == "PASS" and footer["overflow_samples"] == 0, footer
+    assert (footer["missing_head"], footer["missing_gaps"], footer["missing_tail"]) == (0, 0, 0), footer
     assert footer["stop_reason"].startswith("stop_when")
     # every block up to 200 ms is in the file, nothing after it. How many of the counter block's later samples were
     # received before the notifications were removed (after_limit) depends on thread timing (0 on the Windows runner)

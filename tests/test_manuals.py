@@ -39,7 +39,10 @@ PAGES: list[tuple[str, list[str]]] = [
     ("9 Bridge", ["Bridge signal 2 mV/V nominal sensitivity"]),                                                # 11
     ("10 Ranges", ["Input range in mV, supply in V, the ambient temperature matters"]),                        # 12
 ] + [(f"11.{k} Widget {k}", [f"Widget number {k} of the paging test, {'with a longer line of text ' * 3}"])
-     for k in range(1, 61)]                                                                                    # 13-72
+     for k in range(1, 61)] + [                                                                                # 13-72
+    ("12 Index h", ["Index 8000h:11h holds the filter settings (h notation)."]),                              # 73
+    ("13 Appendix", ["Chapter 11 of the appendix lists 8000 words."]),                                         # 74
+]
 WIDGET_PAGES = list(range(13, 73))
 
 
@@ -107,6 +110,17 @@ def test_n163_product_codes_of_every_beckhoff_family_are_indexed(mkb):
         rc, r = kbdocs(mkb, "manual_product", f"code={code}")
         assert rc == 0 and r["count"] == 1 and r["items"][0]["pages"] == pages, (code, r)
         assert "hint" not in r and "matched_as" not in r
+    # idea of the 0.8.15 retest (EL3102 → the EL28xx manual's commissioning example): the manual's title page names
+    # ED2008 and the family ED280x — its manual; AL2006 / PS2001 … appear only on page 3 — it mentions them
+    for code in ("ED2008", "ED2809"):
+        rc, r = kbdocs(mkb, "manual_product", f"code={code}")
+        assert r["items"][0]["kind"] == "product manual" and "kind_note" not in r, (code, r)
+    for code in ("AL2006", "AA3023", "PS2001", "ERI2008"):
+        rc, r = kbdocs(mkb, "manual_product", f"code={code}")
+        assert r["items"][0]["kind"] == "mentions" and "e.g. as an example" in r["kind_note"], (code, r)
+    from twincat_mcp.knowledge import manuals_for
+    m = manuals_for(mkb, ["AL2006"])
+    assert m["manuals"]["AL2006"][0]["kind"] == "mentions" and "not written for this product" in m["manuals_note"], m
     rc, r = kbdocs(mkb, "manual_product", "code=ED2008-0022")                 # the variant, as written in the text
     assert rc == 0 and r["items"][0]["pages"] == [2] and "matched_as" not in r
     p = builder("product", "ED2809", "--kb", str(mkb))
@@ -156,20 +170,24 @@ def test_n164_a_hex_index_is_searched_in_all_its_notations(mkb):
     """N164 (0.8.14 retest): `manual_search "8000:11" doc=EL3356` 1 hit, `0x8000:11` 4; `#x8000` 1, `0x8000` 15 —
     each notation is another token of the index (0x8000 / x8000 / 8000), so one never found the others. 0x…, #x…,
     16#… and, for a CoE index, its sub-index rows (8000:11) are one term: found in any notation in one search."""
-    for q in ("8000:11", "0x8000:11", "#x8000:11", "16#8000:11", "0x8000:0x11", "8000:011"):
+    for q in ("8000:11", "0x8000:11", "#x8000:11", "16#8000:11", "0x8000:0x11", "8000:011", "8000h:11", "8000h:11h"):
         rc, r = kbdocs(mkb, "manual_search", f"query={q}")
-        assert rc == 0 and pages_of(r) == [4, 5] and r["total"] == 2, (q, r)
+        assert rc == 0 and pages_of(r) == [4, 5, 73] and r["total"] == 3, (q, r)      # N177: p73 '8000h:11h'
         assert r["terms"][0]["term"] == q and "8000:11" in r["terms"][0]["searched_as"]
-    for q in ("0x8000", "#x8000", "16#8000"):
+        assert "8000h:11h" in r["terms"][0]["searched_as"], r["terms"]
+    for q in ("0x8000", "#x8000", "16#8000", "8000h"):
         rc, r = kbdocs(mkb, "manual_search", f"query={q}")
-        assert rc == 0 and pages_of(r) == [4, 5, 6, 7], (q, r)                 # not 'Motor speed 8000 rpm' (p8)
+        assert rc == 0 and pages_of(r) == [4, 5, 6, 7, 73], (q, r)             # not 'Motor speed 8000 rpm' (p8)
+    # N177 (0.8.15 retest): '8000h:11' was the words 8000h and 11 — p74 ('Chapter 11 … 8000 words') is no hit
+    rc, r = kbdocs(mkb, "manual_search", "query=8000h:11")
+    assert 74 not in pages_of(r) and r["terms"][0]["term"] == "8000h:11", r
     # review of 0.8.15: the builder's CLI search was a second, raw FTS search ('8000:11' an FTS syntax error) — it
     # prints the skill's manual_search now
     p = builder("search", "8000:11", "--kb", str(mkb))
     hits = [ln for ln in p.stdout.splitlines() if " | p" in ln]
-    assert p.returncode == 0 and [int(ln.split(" | p")[1].split(" ")[0].split("|")[0]) for ln in hits] == [4, 5], p.stdout + p.stderr
+    assert p.returncode == 0 and sorted(int(ln.split(" | p")[1].split(" ")[0].split("|")[0]) for ln in hits) == [4, 5, 73], p.stdout + p.stderr
     rc, r = kbdocs(mkb, "manual_search", "query=0x8000 filter")               # with words: the index is one of them
-    assert rc == 0 and pages_of(r) == [4, 5] and r["words_used"] == ["filter"]
+    assert rc == 0 and pages_of(r) == [4, 5, 73] and r["words_used"] == ["filter"]
     # FTS5 syntax written by the user runs as written
     rc, r = kbdocs(mkb, "manual_search", 'query="0x8000" OR widget')
     assert rc == 0 and r["query_mode"] == "fts5" and "terms" not in r

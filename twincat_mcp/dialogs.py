@@ -262,6 +262,13 @@ def _modal_windows(pid: int, tops: list[int], listed: set[int]) -> list[Dialog]:
         return []
     cands = [h for h in tops if h not in held and _safe(win32gui.IsWindowEnabled, h, default=False)
              and _takes_input(h)]
+    # N176 (0.8.15 retest): the shell's own frame was logged as a dialog ("TwinCAT Project15 - TcXaeShell", class
+    # HwndWrapper, no buttons) when Options opened — a window with the main window's title and class, or the main
+    # window the shell names, is the shell, never the window that holds it
+    frames = {(str(_safe(win32gui.GetWindowText, r, default="") or ""), str(_safe(win32gui.GetClassName, r, default="")
+                                                                         or "")) for r in held}
+    cands = [h for h in cands if h != main and (str(_safe(win32gui.GetWindowText, h, default="") or ""),
+                                                 str(_safe(win32gui.GetClassName, h, default="") or "")) not in frames]
     owned = [h for h in cands if any(_owned_by(h, r) for r in held)]
     last = [p for p in (_safe(_last_active_popup, r) for r in held) if p in owned]
     picks = list(dict.fromkeys(last)) or owned or [h for h in cands if _owner(h) not in in_pid]

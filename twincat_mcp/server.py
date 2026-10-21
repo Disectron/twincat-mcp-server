@@ -36,6 +36,7 @@ from typing import Annotated, Any, Callable
 from pydantic import BaseModel, Field
 
 import contextvars
+import copy
 import functools
 import secrets
 
@@ -445,6 +446,8 @@ _TREE_PATH = re.compile(r"TI[A-Z]{1,5}(?:\^[^\^\n<>{}=;]{1,120})+")
 # TwinCAT's own names for new tree items — a question's 'Term 4' / 'Box 2' / 'Axis 1' is an item even before an error
 # names it; any other '<Word> <n>' ('Port 851', 'TwinCAT 3', 'Build 4024') is one only when an error is of it
 _TREE_WORDS = frozenset("term box device drive axis module channel coupler slot task image".split())
+# such an item without its type: 'Term 9', 'Axis 1'
+_UNTYPED_ITEM = re.compile(r"(?i)(?:term|box|device|drive|axis|module|channel|coupler|slot|task) \d+")
 
 
 def _is_subject(v: str, quoted: bool = False) -> bool:
@@ -459,7 +462,8 @@ def _is_subject(v: str, quoted: bool = False) -> bool:
 def _tnorm(text: str) -> str:
     """Text as tree items are compared: lower case, single spaces, one space before '(' — 'Term 4(EL2008)' is
     'term 4 (el2008)' (ninth review of 0.8.16)."""
-    return re.sub(r"\s*\(\s*", " (", re.sub(r"\s+", " ", text.strip().lower()))
+    # tenth review: 'Term 4 ( EL2008 )' too — no space inside the parentheses
+    return re.sub(r"\s+\)", ")", re.sub(r"\s*\(\s*", " (", re.sub(r"\s+", " ", text.strip().lower())))
 
 
 def _tree_segs(path: str) -> list[str]:
@@ -467,6 +471,7 @@ def _tree_segs(path: str) -> list[str]:
     return [_tnorm(x) for x in path.split("^")]
 
 
+@functools.lru_cache(maxsize=8192)
 def _path_in(path: str, qf: str) -> bool:
     """The question (_tnorm) names the error's tree path or an item on it: a run of its parts — from its root or from
     an item, at least two parts — that the question writes and does not continue below ('…^Plc1 Project fail?' names
@@ -478,6 +483,13 @@ def _path_in(path: str, qf: str) -> bool:
             run = "^".join(segs[j:k])
             if re.search(rf"(?<![\w^]){re.escape(run)}(?![\w^(])(?! \()", qf):
                 return True
+            # tenth review of 0.8.16: a run ending in a typed item, written by its name ('…^Device 1 (EtherCAT)^Term 4
+            # fail?' for …^Term 4 (EL2008)) — not with another type, not continued below
+            t = _TREE_ITEM.fullmatch(segs[k - 1])
+            if t:
+                named = "^".join(segs[j:k - 1] + [t.group(1)])
+                if re.search(rf"(?<![\w^]){re.escape(named)}(?![\w^(])(?! ?\()", qf):
+                    return True
     return False
 
 
@@ -516,22 +528,28 @@ def _tree_items(subjects: list[str], text: str = "") -> tuple[list[str], list[st
     loose: list[str] = []
     for x in subjects:
         if _TREE_PATH.fullmatch(x.strip()):
-            on_path += [seg.strip() for seg in x.split("^")[1:] if _TREE_ITEM.fullmatch(seg.strip())]
+            # tenth review of 0.8.16: an untyped part of TwinCAT's own item words ('Term 9' a call created, the NC's
+            # 'Axis 1') is an item too — its place is known
+            on_path += [seg.strip() for seg in x.split("^")[1:] if _TREE_ITEM.fullmatch(seg.strip())
+                        or _UNTYPED_ITEM.fullmatch(seg.strip())]
         elif _TREE_ITEM.fullmatch(x.strip()):
             loose.append(x.strip())                 # quoted in the error's text
     loose += _TEXT_ITEM.findall(text)
     return list(dict.fromkeys(on_path)), [x for x in dict.fromkeys(loose) if x not in on_path]
 
 
+@functools.lru_cache(maxsize=8192)
 def _item_in(item: str, qn: str, in_path: bool = True) -> bool:
     """The question (_tnorm) names the tree item: whole ('term 4 (el2008)') or by its name ('term 4' — not 'term 41',
     not 'term 4 (el1008)', which names another type) — and not as a parent of a deeper part ('device 1
     (ethercat)^term 9'). in_path false (an item whose place in the tree is known): not as the end of a question's
     path either — that path is compared as a path (_path_in)."""
     m = _TREE_ITEM.fullmatch(item.strip())
-    if not m:
-        return False
     before = r"(?<![\w^])" if not in_path else r"(?<!\w)"
+    if not m:
+        # an untyped item (_UNTYPED_ITEM): by its name; a type the question gives it is no other item's
+        return bool(_UNTYPED_ITEM.fullmatch(item.strip())) and \
+            bool(re.search(rf"{before}{re.escape(_tnorm(item))}(?!\w)(?! ?\^)", qn))
     if re.search(rf"{before}{re.escape(_tnorm(item))}(?!\w)(?! ?\^)", qn):
         return True
     hit = re.search(rf"{before}{re.escape(_tnorm(m.group(1)))}(?!\w)( ?\(| ?\^)?", qn)
@@ -629,6 +647,10 @@ class App:
         self.server_log = install_server_log(Path(cfg.safety.audit_log).parent / "logs" / "server.log")
         self.rec = Recorder(self.ads, Path(cfg.safety.audit_log).parent / "recordings")
         self.scope_runs: dict[str, dict[str, Any]] = {}     # recording id → Scope recording started with it
+        # N182 (0.8.15 retest): the Scope part of a recording is finished once — when the recording ends by itself
+        # (a watcher) or at rec_stop, whichever comes first; the result is kept for the other
+        self.scope_finishing: dict[str, Any] = {}           # recording id → the task finishing its Scope run
+        self.scope_results: dict[str, dict[str, Any]] = {}  # recording id → the finished Scope part
         self.rec.rcfg = cfg.recorder
 
         # N62: the recorder compares cycle_ms with the task that runs each recorded program (project task config)
@@ -1097,6 +1119,10 @@ class App:
         space the errors index names (ads, win32, nc, labview …: the code's domain); a name there stays a name ('the
         last MAIN.fbValve error'), a kind word is no name ('the last win32 error'), any other word is said not used."""
         from . import errors_index as X
+        # tenth review of 0.8.16: 'Term 4(EL2008)', 'Term 4 ( EL2008 )' — an item's type as the tree writes it, so the
+        # type is part of the item's name and no name of its own
+        query = re.sub(r"(?<=[\w\-])\((?=[A-Za-z][\w.\- ]{0,40}\))", " (",
+                       re.sub(r"\s+\)", ")", re.sub(r"\(\s+", "(", query)))
         names = cls.question_names(query)
         m = cls._LAST_SAID.search(query)
         fams: set[str] = set()
@@ -1112,7 +1138,8 @@ class App:
             # ninth review of 0.8.16: a count is a number of its own as the first word ('the last 3 errors') — not the
             # digit of a name ('the last fbValve2 error', 'aValves[3]', 'EL2008') nor an item's ('the last term 5 error')
             first = m.group("q").split()[:1]
-            count = max(1, min(int(first[0]), 10)) if first and first[0].isdigit() and not q_items else 1
+            # tenth review: 'the last 2 Term 4 errors' — a number as the first word is the count, items or not
+            count = max(1, min(int(first[0]), 10)) if first and first[0].isdigit() else 1
             words = [w for w in re.split(r"[\s-]+", m.group("q")) if w and w.strip("()").lower() not in item_words]
 
             def kind(w: str) -> bool:
@@ -1235,9 +1262,11 @@ class App:
         def entry(t: dict[str, Any], c: dict[str, Any] | None, how: dict[str, Any]) -> dict[str, Any]:
             return {"source": source, "where": t["where"], "text": t["text"][:600], **(c or self._NO_CODE), **how}
         out: list[dict[str, Any]] = []
-        named = names or (by_names and (q["items"] or qpaths or any(item_hits(t) for t in texts[:400])))
+        # tenth review of 0.8.16: every text the log holds — the first 400 were read while `said` read them all (an
+        # error past them was 'never seen'); the matches are memoized (_item_in, _path_in)
+        named = names or (by_names and (q["items"] or qpaths or any(item_hits(t) for t in texts)))
         if named:
-            for t in texts[:400]:
+            for t in texts:
                 hits = [n for n, segs in names if any(_names_in(segs, _segments(x)) for x in t["subjects"])]
                 hits += [x for x in item_hits(t) if x not in hits]
                 if not hits:
@@ -1329,10 +1358,14 @@ class App:
         match no error). None when the question names nothing and does not ask about the last error."""
         q = self._question(query)
         texts = self._error_texts()
-        said = q["names"] + q["items"] + q["paths"] + [
-            x for t in texts for x in (t.get("path_items") or []) + (t.get("items") or [])
-            if _item_in(x, q["qf"], in_path=x not in (t.get("path_items") or [])) and x not in q["items"]] + [
-            x for t in texts for x in t["subjects"] if _TREE_PATH.fullmatch(x) and _path_in(x, q["qf"])]
+
+        def what_is_said() -> list[str]:
+            return q["names"] + q["items"] + q["paths"] + [
+                x for t in texts for x in (t.get("path_items") or []) + (t.get("items") or [])
+                if _item_in(x, q["qf"], in_path=x not in (t.get("path_items") or [])) and x not in q["items"]] + [
+                x for t in texts for x in t["subjects"] if _TREE_PATH.fullmatch(x) and _path_in(x, q["qf"])]
+        # tenth review of 0.8.16: compared in a worker thread — a long pasted log held the event loop for seconds
+        said = await asyncio.to_thread(what_is_said)
         if not said and not q["last"]:
             return None
         entries = await asyncio.to_thread(self._err_log_entries, q, texts, "recent errors of this server")
@@ -1767,8 +1800,12 @@ class App:
             except XaeError as exc:
                 earlier = [m for m in (be.messages if keep else []) if not m.get("failed") and m.get("messages")]
                 if earlier:            # review of 0.8.16: what the call's earlier steps logged, not only the last one's
-                    raise type(exc)(f"{exc} — XAE messages of the steps before it: " + "; ".join(
-                        f"{m['action']}: {m['messages'][:500]}" for m in earlier)) from exc
+                    more = " — XAE messages of the steps before it: " + "; ".join(
+                        f"{m['action']}: {m['messages'][:500]}" for m in earlier)
+                    new = copy.copy(exc)               # keeps what the error carries (XaeBusy.dialog, N181)
+                    new.args = (f"{exc}{more}",)
+                    new.steps_note = getattr(exc, "steps_note", "") + more
+                    raise new from exc
                 raise
             if keep and be.messages and isinstance(res, dict):
                 res = {**res, "xae_messages": list(be.messages)}
@@ -1793,7 +1830,10 @@ class App:
         except XaeError as exc:
             msg = str(exc)
             low = msg.lower()
-            if "blocked by dialog" in low:
+            if isinstance(exc, XaeBusy) and exc.dialog is not None:
+                # N181 (0.8.15 retest): the backend named the dialog; what the refusal means depends on this tool
+                msg = XaeBusy.blocked_text(exc.what, exc.dialog, _READ_ONLY_CALL.get()) + getattr(exc, "steps_note", "")
+            elif "blocked by dialog" in low:
                 pass                                   # the backend already named the dialog
             elif isinstance(exc, XaeBusy):
                 msg += await asyncio.to_thread(self._dialog_hint)      # N174: it says busy itself; what is open
@@ -2908,6 +2948,8 @@ _XAE_USED: contextvars.ContextVar[bool] = contextvars.ContextVar("tcmcp_xae_used
 # the XAE messages of every XAE call of the tool invocation running in this task — seventh review of 0.8.16: xae_deploy
 # raised after an activation that logged ADS error 0x745 (a verify, a restart, a dialog) and only its error was recorded
 _XAE_LINES: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("tcmcp_xae_lines", default=None)
+# N181 (0.8.15 retest): the running tool is read-only (its readOnlyHint) — a call a dialog refused changed nothing
+_READ_ONLY_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar("tcmcp_read_only_call", default=False)
 
 
 # N174 (0.8.14 retest): a crash's traceback was in no file the user could find (the client's MCP log has only the tool
@@ -2916,6 +2958,41 @@ _XAE_LINES: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("t
 SERVER_LOG_BYTES = 5 * 1024 * 1024
 SERVER_LOG_FILES = 5
 _SERVER_LOG: dict[str, Any] = {"path": None, "handler": None}
+# loggers besides 'twincat_mcp' whose warnings belong in server.log — N178 (0.8.15 retest): the SDK logs why it
+# refused a confirmation round ('requestState rejected …: expired') on its own logger, which server.log did not get
+_SERVER_LOG_ALSO = ("mcp.server.request_state",)
+
+
+class _RoundRejected(logging.Handler):
+    """N178: an audit line when the SDK refuses a confirmation round (expired, or not this call's) — the audit showed
+    'asked' and nothing after it. The SDK offers no hook; its warning on mcp.server.request_state is the signal."""
+
+    def __init__(self, app: Any) -> None:
+        super().__init__(logging.WARNING)
+        self.app = app
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            if "rejected" not in msg:
+                return
+            why = msg.split(":", 1)[-1].strip()
+            # the class of a confirmation (CONTROL): an expiry is never a read that audit_reads=false drops
+            self.app.audit("confirmation", {"round": msg.split(":", 1)[0]}, OpClass.CONTROL,
+                           "expired" if "expir" in why.lower() else "rejected",
+                           f"the SDK refused the answer: {why} — nothing was done; the client was told "
+                           "'Invalid or expired requestState'")
+        except Exception:  # noqa: BLE001 — a log handler never raises
+            pass
+
+
+def _audit_rejected_rounds(app: Any) -> None:
+    lg = logging.getLogger("mcp.server.request_state")
+    for h in [h for h in lg.handlers if isinstance(h, _RoundRejected)]:
+        lg.removeHandler(h)                       # one per process: the newest server's App
+    lg.addHandler(_RoundRejected(app))
+    if lg.level == logging.NOTSET or lg.level > logging.WARNING:
+        lg.setLevel(logging.WARNING)
 
 
 def install_server_log(path: Path) -> Path | None:
@@ -2938,8 +3015,12 @@ def install_server_log(path: Path) -> Path | None:
     pkg = logging.getLogger("twincat_mcp")
     if cur is not None:
         pkg.removeHandler(cur)
+        for name in _SERVER_LOG_ALSO:
+            logging.getLogger(name).removeHandler(cur)
         cur.close()
     pkg.addHandler(h)
+    for name in _SERVER_LOG_ALSO:
+        logging.getLogger(name).addHandler(h)
     _SERVER_LOG.update(path=path, handler=h)
     return path
 
@@ -3017,7 +3098,8 @@ def _result_errors(res: Any, depth: int = 0, out: list[tuple[str | None, str]] |
 
 def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]] | None] = lambda: None,
                    dialog_hint: Callable[[], Callable[[], str] | None] = lambda: None,
-                   note_error: Callable[[], Callable[..., None] | None] = lambda: None) -> Any:
+                   note_error: Callable[[], Callable[..., None] | None] = lambda: None,
+                   read_only: bool = False) -> Any:
     """What leaves a tool. mcp >= 2.1 passes only a ToolError's text to the client — any other exception arrives as a
     bare "Error executing tool X" (R37: never an empty error): a deliberate error keeps its text; a defect says its
     type and message and is logged with its traceback under a crash id (N174: in server.log, which the message
@@ -3042,6 +3124,7 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
             subjects = _call_subjects(bound)
         sink: list[str] = []
         tok = _XAE_LINES.set(sink)
+        ro_tok = _READ_ONLY_CALL.set(read_only)
         try:
             res = await _run(*args, **kwargs)
         except ToolError as exc:
@@ -3050,6 +3133,7 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
                 note(name, error=str(exc), lines=list(dict.fromkeys(sink)), subjects=subjects)
             raise
         finally:
+            _READ_ONLY_CALL.reset(ro_tok)
             _XAE_LINES.reset(tok)
         if note is not None and isinstance(res, dict):
             lines = list(dict.fromkeys(sink + _xae_lines(res)))
@@ -3138,8 +3222,12 @@ class TcMcpServer(MCPServer):
     def tool(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
         register = super().tool(*args, **kwargs)
 
+        ann = kwargs.get("annotations")             # N181: the tool's readOnlyHint (mcp 2.x: read_only_hint)
+        ro = bool(getattr(ann, "read_only_hint", None) or getattr(ann, "readOnlyHint", None))
+
         def decorator(fn: Any) -> Any:
-            register(_tool_boundary(fn, lambda: self.xae_flags, lambda: self.dialog_hint, lambda: self.note_error))
+            register(_tool_boundary(fn, lambda: self.xae_flags, lambda: self.dialog_hint, lambda: self.note_error,
+                                    read_only=ro))
             return fn                     # the closure keeps the plain function (tools that call each other)
         return decorator
 
@@ -3149,8 +3237,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     app = App(cfg)
     # subscriptions=False: nothing here publishes a change (resources are read on demand, the tool list is fixed at
     # start), so subscribe / listChanged are not advertised (mcp 2.3)
+    # N178 (0.8.15 retest): the sealed confirmation round's lifetime is set here, not left to the SDK's default, so
+    # the question can say it (prompting.ROUND_TTL_S); an expired round is logged and audited (_RoundRejected)
+    from mcp.server.request_state import RequestStateSecurity
     mcp = TcMcpServer("twincat-mcp", instructions=connection_instructions(app), version=__version__,
-                      subscriptions=False)
+                      subscriptions=False,
+                      request_state_security=RequestStateSecurity.ephemeral(ttl=ASK.ROUND_TTL_S))
+    _audit_rejected_rounds(app)
     mcp.xae_flags = app.xae_flags
     mcp.dialog_hint = app._dialog_hint
     mcp.note_error = app.note_error
@@ -4129,10 +4222,79 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         app.scope_runs[rid] = {"scope": r["scope"], "name": name or None, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
                                "start_result": r.get("result_code"), "log_mark": mark}
         app.audit("scope_start", {"id": rid, "scope": r["scope"]}, OpClass.EDIT, "ok")
+        app.scope_runs[rid]["watcher"] = asyncio.ensure_future(_scope_watch(rid))
         return {"started": True, **r, "note": "Scope records independently (its own ADS acquisition and timestamps); "
-                                              "it is stopped, saved and exported at rec_stop"}
+                                              "it is stopped, saved and exported when the recording ends — by itself "
+                                              "(duration, stop_when, post_trigger, max_events …) or at rec_stop"}
 
-    async def _scope_save(name: str | None, svdx: Path, csv: Path, overwrite: bool = False) -> dict[str, Any]:
+    SCOPE_WATCH_S = 0.5
+
+    async def _scope_watch(rid: str) -> None:
+        """N182 (0.8.15 retest): a recording that ends by itself — duration_s, stop_when, post_trigger_s, max_events, a
+        program change, a stall — finishes its Scope run as rec_stop does. Scope ran on until a rec_stop came: the CSV
+        of a 5 s recording spanned 28 s, and without a rec_stop it never stopped."""
+        while rid in app.scope_runs and rid not in app.scope_finishing:
+            try:
+                st = await app.mem_call(app.rec.status, rid)
+            except Exception:  # noqa: BLE001 — the recording is gone (server restart, reaped): rec_stop finishes it
+                return
+            if not st.get("active"):
+                app.scope_runs.get(rid, {})["recording_ended"] = {
+                    "seen": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
+                    "stop_reason": st.get("stop_reason")}
+                try:
+                    await _scope_finish_once(rid, by=f"the recording ended by itself ({st.get('stop_reason')})")
+                except Exception:  # noqa: BLE001 — said in rec_status / rec_stop (the stored result)
+                    log.exception("Scope finish of %s at the recording's end failed", rid)
+                return
+            await asyncio.sleep(SCOPE_WATCH_S)
+
+    async def _scope_finish_once(rid: str, by: str = "rec_stop") -> dict[str, Any] | None:
+        """_scope_finish once per recording (N182): at its own end or at rec_stop, whichever comes first — StopRecord
+        is never sent twice; the second caller gets the stored result."""
+        if rid in app.scope_results:
+            return app.scope_results[rid]
+        t = app.scope_finishing.get(rid)
+        if t is None:
+            if rid not in app.scope_runs:
+                return None
+            run = app.scope_runs[rid]
+            run["finished_by"] = by
+            t = asyncio.ensure_future(_scope_finish(rid))
+            app.scope_finishing[rid] = t
+        try:
+            res = await asyncio.shield(t)
+        except Exception as exc:  # noqa: BLE001 — kept as the result: a second caller is not told something else
+            res = {"error": f"the Scope part failed ({type(exc).__name__}: {exc}) — the ADS recording {rid} is stopped "
+                            "and complete; stop / save the Scope configuration in XAE (scope_record)"}
+        if res is not None:
+            res.setdefault("finished_by", by)
+        app.scope_results[rid] = res
+        app.scope_finishing.pop(rid, None)
+        return res
+
+    def _scope_state(rid: str) -> dict[str, Any] | None:
+        """rec_status / rec_list: the Scope part of a recording — recording, finishing, finished (N182)."""
+        if rid in app.scope_results:
+            r = app.scope_results[rid] or {}
+            out: dict[str, Any] = {"state": "finished", "finished_by": r.get("finished_by")}
+            for k in ("scope", "error", "note"):
+                if r.get(k):
+                    out[k] = r[k]
+            if isinstance(r.get("link"), dict):
+                out["files"] = sorted((r["link"].get("files") or {}).keys())
+            if isinstance(r.get("scope_view_log"), dict):
+                out["scope_view_log_errors"] = r["scope_view_log"].get("error_count")
+            return out
+        if rid in app.scope_finishing:
+            return {"state": "finishing", "finished_by": (app.scope_runs.get(rid) or {}).get("finished_by")}
+        run = app.scope_runs.get(rid)
+        if run is not None:
+            return {"state": "recording", "scope": run.get("scope"), "started": run.get("started")}
+        return None
+
+    async def _scope_save(name: str | None, svdx: Path, csv: Path, overwrite: bool = False,
+                          mark: dict[str, Any] | None = None) -> dict[str, Any]:
         """SaveSVD, then the CSV FROM THE SAVED FILE with Beckhoff's export tool (N117: XAE's ExportCSV right after
         SaveSVD wrote a CSV that lacked the end of the .svdx — 600 ms, and 3 rows of a 58 s recording; exported from the
         .svdx, the CSV holds what the file holds). XAE's ExportCSV only when the tool is missing or fails, flagged.
@@ -4145,8 +4307,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             r = await app.xae_call(app.xae.scope_action, "save_svd", name, str(svdx), timeout=600)
             out["save_svd"] = {k: r[k] for k in ("result_code", "path", "warning", "result_note") if k in r}
         except ToolError as exc:
-            out["save_svd"] = {"error": str(exc)}
-            return out
+            st = re.search(r"Invalid\s+ScopeState!.*?actual:\s*([A-Za-z]+)", str(exc))
+            if st is None:
+                out["save_svd"] = {"error": str(exc)}
+                return out
+            return await _scope_reset(name, csv, overwrite, mark, st.group(1), str(exc))
         watch = await asyncio.to_thread(_settled, svdx)
         out["save_svd"]["size_watch"] = watch
         if watch.get("still_growing_after_s") or "note" in watch:
@@ -4186,6 +4351,51 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         out["export_csv"]["export_tool"] = failed or ("TC3ScopeExportTool.exe not found — "
                                                       + S.status(app.cfg.scope.export_tool)["note"])
         return out
+
+    async def _scope_reset(name: str | None, csv: Path, overwrite: bool, mark: dict[str, Any] | None, state: str,
+                           raw: str) -> dict[str, Any]:
+        """N180 (0.8.15 retest): after a TwinCAT RUN→CONFIG→RUN during the recording, SaveSVD answered 'Invalid
+        ScopeState! Reply requested, actual: Config (HRESULT 0x80020009)' — a raw COM text, no .svdx, no CSV. Said as
+        what it is (Scope was reset by the restart, at the time its log says), and XAE's ExportCSV of what Scope still
+        holds is tried: recovered (a CSV, no .svdx) or the run's Scope data is lost — never left unsaid."""
+        from . import scope as S
+        rx = re.compile(r"state changes from '[^']*' to '" + re.escape(state) + "'|ServerReset", re.I)
+        lines = await asyncio.to_thread(S.log_find_since, mark or {}, rx)
+        when = None
+        for _f, ln in lines:
+            t = re.match(r"\((\d{4}-\d\d-\d\d)-(\d\d:\d\d:\d\d)", ln)
+            if t:
+                when = f"{t.group(1)} {t.group(2)}"
+        out: dict[str, Any] = {"save_svd": {
+            "error": (f"Scope was reset to {state} by a TwinCAT restart"
+                      + (f" at {when} (Scope View log)" if when else " (no reset line found in the Scope View log)")
+                      + " — SaveSVD refused; nothing was saved as .svdx"),
+            "scope_state": state, "detail": raw[:500]}}
+        if csv.exists() and not overwrite:
+            out["export_csv"] = {"skipped": f"{csv.name} exists — not written over (overwrite=true)"}
+            return out
+        try:
+            r = await app.xae_call(app.xae.scope_action, "export_csv", name, str(csv), timeout=600)
+            rows = await asyncio.to_thread(_csv_samples, csv) if csv.is_file() else 0
+        except (ToolError, OSError) as exc:
+            out["export_csv"] = {"error": str(exc)[:300], "lost": (
+                f"the Scope data of this run is lost: Scope was reset to {state} and refused both SaveSVD and ExportCSV")}
+            return out
+        if rows > 0:
+            out["export_csv"] = {**{k: r[k] for k in ("result_code", "path") if k in r}, "via": "XAE ExportCSV",
+                                 "samples": rows, "recovered": (
+                                     f"what Scope still held in {state} state, exported by XAE's ExportCSV — no .svdx; "
+                                     "whether it covers the whole run (before the reset) is not known — compare its "
+                                     "time span with the recording")}
+        else:
+            out["export_csv"] = {"samples": 0, "lost": (f"the Scope data of this run is lost: in {state} state Scope "
+                                                        "exported no samples")}
+        return out
+
+    def _csv_samples(p: Path) -> int:
+        """The data rows of a Scope CSV: the lines that begin with a number (its header lines do not)."""
+        with open(p, "rb") as fh:
+            return sum(1 for ln in fh if re.match(rb"\s*-?\d", ln))
 
     def _csv_rows(p: Path) -> int:
         with open(p, "rb") as fh:
@@ -4253,13 +4463,16 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             out["stop"] = {"error": str(exc)}
             out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
         else:
-            out.update(await _scope_save(run["name"], svdx, csv))
+            out.update(await _scope_save(run["name"], svdx, csv, mark=run.get("log_mark")))
             out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv, out.get("svdx_incomplete"))
             app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
                       OpClass.EDIT, "ok")
         if run.get("log_mark"):
             out["scope_view_log"] = await asyncio.to_thread(
                 lambda: app.log_codes(S.log_errors_since(run["log_mark"])))       # N125: its codes looked up
+        if run.get("recording_ended"):
+            out["recording_ended"] = run["recording_ended"]
+        out["scope_stopped"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
         return out
 
     def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path, incomplete: str | None = None) -> dict[str, Any]:
@@ -4279,6 +4492,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         link: dict[str, Any] = {"_scope_link": 1, "recording": rid, "scope": run["scope"], "started": run["started"],
                                 "stopped": dt.datetime.now(dt.timezone.utc).isoformat(), "files": files,
                                 "recorder": f"twincat-mcp {__version__}"}
+        if run.get("finished_by"):
+            link["finished_by"] = run["finished_by"]          # N182: the recording's own end, or rec_stop
+        if run.get("recording_ended"):
+            link["recording_ended"] = run["recording_ended"]
         if incomplete:
             link["not_sealed"] = {"file": svdx.name, "why": incomplete}
         if app.rec.key:
@@ -4583,15 +4800,28 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def rec_list(limit: int = 30, offset: int = 0) -> dict[str, Any]:
         """Recordings of this session (compact status) and recording files on disk, newest first
-        (paged: limit/offset; on_disk_total says how many exist)."""
-        return await app.mem_call(app.rec.list, max(1, min(limit, 500)), max(0, offset))
+        (paged: limit/offset; on_disk_total says how many exist); a recording with Scope: its scope state."""
+        res = await app.mem_call(app.rec.list, max(1, min(limit, 500)), max(0, offset))
+        for r in (res.get("session") or []) if isinstance(res, dict) else []:
+            sc = _scope_state(str(r.get("id"))) if isinstance(r, dict) else None
+            if sc is not None:
+                r["scope"] = sc
+        return res
 
     @mcp.tool(annotations=READ)
     async def rec_status(id: str) -> dict[str, Any]:
         """Live status of one recording: samples, events, rate, missing_samples (holes in the PLC timeline, cycle
         mode), completeness, dropped (lost on this PC), backlog, stats_coverage, per-block report, warnings,
-        armed/triggered, last value per symbol."""
-        return await app.mem_call(app.rec.status, id)
+        armed/triggered, last value per symbol; with Scope: scope {state recording | finishing | finished} (N182)."""
+        res = await app.mem_call(app.rec.status, id)
+        sc = _scope_state(id)
+        if sc is not None:
+            if sc["state"] == "recording" and ((res.get("gap_markers") or 0) > 0 or (res.get("resubscriptions") or 0) > 0):
+                # N180: a TwinCAT restart resets Scope to Config — said while it records, not only at the save
+                sc["warning"] = ("the recording saw an outage (a TwinCAT restart re-subscribes it) — a TwinCAT restart "
+                                 "resets Scope to Config, and Scope may then refuse to save this run (SaveSVD)")
+            res["scope"] = sc
+        return res
 
     @mcp.tool(annotations=READ)
     async def rec_snapshot(id: str, last_n: int = 100, symbols: list[str] | None = None) -> dict[str, Any]:
@@ -4674,7 +4904,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         res = await app.rec_call(app.rec.stop, id, "manual (rec_stop)", timeout=60)
         app.audit("rec_stop", {"id": id, "events": res.get("events")}, OpClass.EDIT, "ok")
         try:
-            sc = await _scope_finish(id)
+            # N182: the Scope part runs once — a recording that ended by itself has it finished already (stored)
+            sc = await _scope_finish_once(id)
         except Exception as exc:  # noqa: BLE001 — the ADS recording is stopped and sealed: its result is kept
             log.exception("Scope finish of %s failed", id)
             sc = {"error": f"the Scope part failed ({type(exc).__name__}: {exc}) — the ADS recording {id} is stopped and "
@@ -4703,7 +4934,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         column and alignment of channels with different sample times follow the Scope project's export settings. A
         signed <csv>.provenance.json records the source file and SHA-256, the tool and its SHA-256, and the command.
         A read-only source (rec_stop seals its .svdx) is exported from a byte-identical writable copy. scope_view_log:
-        the ERROR lines the Scope View log (TcScopeView.log) got during the export."""
+        the ERROR lines the Scope View logs (TcScopeView.log and its numbered siblings, TcScopeView_1.log …) got during the export."""
         from . import scope as S
         tool = await asyncio.to_thread(S.find_tool, app.cfg.scope.export_tool)
         if tool is None:
@@ -5535,8 +5766,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def infosys_search_code(query: str, language: str | None = None, limit: Limit50 = 10,
                                   ignore_spacing: bool = False) -> dict[str, Any]:
         """Search the code examples of the indexed pages for a fragment — a call pattern, an attribute, a constant
-        (case-insensitive substring of the code as written; non-breaking spaces count as spaces). language: one
-        that occurs in the index (an unknown one is refused with the list), '' / 'none' = samples without a label.
+        (case-insensitive substring of the code as written; non-breaking spaces count as spaces). language: st, cpp,
+        csharp, xml — guessed by the plugin from each sample's code (Beckhoff's pages label none; an unknown one is
+        refused with the list), '' / 'none' = samples whose code does not tell.
         limit 1..50; total_matches says how many there are. ignore_spacing=true also matches when only the
         spacing around punctuation differs. Returns the matching lines with context and the page URL."""
         return await app.docs_call("search_code", query, language, limit, ignore_spacing, timeout=120)

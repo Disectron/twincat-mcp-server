@@ -166,7 +166,8 @@ class ScopeConfig:
     # the Scope configuration rec_start records alongside (name in the XAE solution); None = the only one open
     project: str | None = None
     # the Scope View's log, read for new errors by rec_stop(also_scope) / scope_record / scope_export; None =
-    # %ProgramData%\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\TcScopeView.log
+    # %ProgramData%\Beckhoff\TwinCAT\Functions\TE130X-Scope-View\TcScopeView.log — its numbered siblings
+    # (TcScopeView_1.log …, which TE130x writes to when a second XAE shell runs) are read as well (N179)
     view_log: str | None = None
 
 

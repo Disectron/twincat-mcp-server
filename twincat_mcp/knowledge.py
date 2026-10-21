@@ -1083,7 +1083,11 @@ class Knowledge:
                                                 f"in {len(doms)} domains ({', '.join(doms)}) and the message does not "
                                                 "say which")}
                 err = dict(err) if err else {"code": code}
-                err["documented"] = doc
+                # tenth review of 0.8.16: the first three rows (16 for a code of 16 domains made a 6 KB answer); the
+                # domains say where else it is documented, err_lookup gives every row
+                err["documented"] = doc[:3]
+                if len(doc) > 3:
+                    err["documented_more"] = f"{len(doc) - 3} more row(s) — err_lookup gives every one"
             if err and not doc and str(err.get("code") or "").startswith("ADS"):
                 other = [d for d in X.named_domains(q) if d != "ads"]
                 if other and "ads" not in X.named_domains(q):
@@ -1508,9 +1512,10 @@ class Knowledge:
 
     def documented(self, msg: str) -> dict[str, Any] | None:
         """kb_search / doc_note: what the errors index documents for the codes / code names of an error message —
-        {rows: the first three (Beckhoff's symbol, text, ref), domains: every domain that has it (sixth review of
-        0.8.16: the three rows read as the whole answer — 'documented in 3 domains' of 16)} — by value, HRESULT or
-        symbol, never by a text match; None without a readable index or a row."""
+        {rows: every documented row of every code it names (Beckhoff's symbol, text, ref), in the order the message
+        names the codes; domains: every domain that has them (sixth review of 0.8.16: three rows read as the whole
+        answer — 'documented in 3 domains' of 16)} — by value, HRESULT or symbol, never by a text match; None without
+        a readable index or a row. kb_search shows the first three (documented_more: the others)."""
         loc = self.location()[0]
         if loc is None or not L.index_file(loc, "errors").is_file():
             return None
@@ -1525,6 +1530,20 @@ class Knowledge:
                 for m in r.get("matches") or [] if m.get("matched_by") in by_code]
         if not rows:
             return None
+        # tenth review of 0.8.16: in the order the message names them — by value the leading codes of a message with
+        # more than five ('ADS error 1861, ADS error 1808, ADS error 6, 7, …') were the ones cut
+        low = msg.lower()
+        at: dict[int, int] = {}
+        for t in DS.code_tokens(msg, min_digits=1):
+            for v in X._forms(t["value"]):
+                at.setdefault(v, t["start"])
+
+        def place(row: dict[str, Any]) -> int:
+            if row.get("value") is not None and row["value"] in at:
+                return at[row["value"]]
+            k = low.find(str(row.get("symbol") or "\0").lower())
+            return k if k >= 0 else len(msg)
+        rows = [x for _i, x in sorted(enumerate(rows), key=lambda e: (place(e[1]), e[0]))]
         return {"rows": rows, "domains": r.get("match_domains") or list(dict.fromkeys(x["domain"] for x in rows))}
 
     HW_DETAILS = E.DETAILS
@@ -2079,6 +2098,8 @@ def manuals_for(loc: Path | None, codes: list[str]) -> dict[str, Any]:
                 items = [{**it, "pages": it["pages"][:20], **({"matched_as": via} if via else {})} for it in got["items"]]
                 if got.get("note"):
                     notes.append(got["note"])
+                if got.get("kind_note"):
+                    notes.append(got["kind_note"])
                 if items:
                     found[c] = items
         finally:

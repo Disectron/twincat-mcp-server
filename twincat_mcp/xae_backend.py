@@ -115,7 +115,35 @@ class XaeExplained(XaeError):
 
 class XaeBusy(XaeError):
     """N174: the shell rejected the call (RPC_E_CALL_REJECTED / RPC_E_SERVERCALL_RETRYLATER) for all of com_retry_s,
-    or a dialog holds it — the call did not run. Never read as 'no value' by a read that has a fallback (_get)."""
+    or a dialog holds it — the call did not run. Never read as 'no value' by a read that has a fallback (_get).
+    dialog: the modal window that holds the shell (BLOCKED BY DIALOG), else None."""
+
+    def __init__(self, msg: str, dialog: dict[str, Any] | None = None, what: str = "") -> None:
+        super().__init__(msg)
+        self.dialog = dialog
+        self.what = what
+
+    @classmethod
+    def blocked(cls, what: str, d: dict[str, Any]) -> "XaeBusy":
+        return cls(cls.blocked_text(what, d, None), d, what)
+
+    @staticmethod
+    def blocked_text(what: str, d: dict[str, Any], read_only: bool | None) -> str:
+        """N181 (0.8.15 retest): the refused COM call did not run — that is said as it is. What it means for the tool
+        that made it depends on the tool: a read-only one changed nothing (call it again once the dialog is
+        answered); any other may have run steps before the refused one, so its result is checked first. read_only
+        None: not known here (the backend alone) — said as the latter."""
+        from . import dialogs as _dlg
+        answer = ("answer it (xae_dialog_resolve(button=...))" if d.get("buttons") is not None else
+                  "close it in XAE (its buttons can't be pressed by the tool)")
+        then = ("Nothing was changed (a read-only call): " + answer + ", then call again." if read_only else
+                "Steps of this call before it may have run: " + answer + ", then check the result before calling "
+                "again.")
+        return (f"{what}: BLOCKED BY DIALOG {_dlg.label(d)} — {_dlg.buttons_text(d)}; text: "
+                f"{str(d.get('text', ''))[:300]!r}. The shell is waiting for an answer and refused this call — it did "
+                f"not run. {then} blocked_by_dialog: "
+                + json.dumps({k: d.get(k) for k in ("hwnd", "title", "class", "buttons", "buttons_note") if k in d},
+                             default=str))
 
 
 class XaeGone(XaeError):
@@ -203,17 +231,7 @@ class XaeBackend:
                     # offers only Cancel goes away by itself, so the call is asked again)
                     dlg = self._modal_dialogs()
                     if dlg:
-                        from . import dialogs as _dlg
-                        d = dlg[0]
-                        raise XaeBusy(
-                            f"{what}: BLOCKED BY DIALOG {_dlg.label(d)} — {_dlg.buttons_text(d)}; text: "
-                            f"{str(d.get('text', ''))[:300]!r}. The shell is waiting for an answer, so whether the action ran "
-                            "is unknown until the dialog is answered (xae_dialog_resolve(button=...)"
-                            + ("" if d.get("buttons") is not None else "; its buttons can't be pressed by the tool — "
-                               "close it in XAE") + "), then check the result. blocked_by_dialog: "
-                            + json.dumps({k: d.get(k) for k in ("hwnd", "title", "class", "buttons", "buttons_note")
-                                          if k in d}, default=str)
-                        ) from exc
+                        raise XaeBusy.blocked(what, dlg[0]) from exc
                 if hr in _BUSY_HR and time.time() < deadline:
                     time.sleep(delay)
                     delay = min(delay * 1.5, 2.0)
@@ -2663,6 +2681,11 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
             el.tag = el.tag.split("}", 1)[1]
 
     def plain(el: Any) -> str | None:
+        # N175 (0.8.15 retest): TwinCAT 3.1.4026 writes an interface's (and its methods' / properties') plain text as
+        # a direct child <InterfaceAsPlainText><xhtml> — not under addData; looked for first
+        x = el.find("./InterfaceAsPlainText/xhtml")
+        if x is not None:
+            return x.text or ""
         for d in el.findall("./interface/addData/data") + el.findall("./addData/data"):
             if str(d.get("name", "")).endswith("interfaceasplaintext"):
                 x = d.find("./InterfaceAsPlainText/xhtml")
@@ -2692,8 +2715,11 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
 
     def node(el: Any) -> dict[str, Any]:
         kids: dict[str, Any] = {}
-        for d in el.findall("./addData/data"):
-            nm = str(d.get("name", ""))
+        # N175 (0.8.15 retest): TwinCAT 3.1.4026's interface export holds its members as direct children —
+        # <Interface><Methods><Method>, <Properties><Property> — besides the addData/data[…/method] form of others
+        groups = [(str(d.get("name", "")), d) for d in el.findall("./addData/data")]
+        groups += [("/" + g[:-1].lower(), d) for g in ("Methods", "Properties", "Actions") for d in el.findall("./" + g)]
+        for nm, d in groups:
             for tag in ("Method", "Action", "Property", "Transition"):
                 if nm.endswith("/" + tag.lower()):
                     for c in d.findall("./" + tag):

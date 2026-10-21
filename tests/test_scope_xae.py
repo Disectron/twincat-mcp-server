@@ -253,3 +253,82 @@ async def test_review_0814_a_svdx_still_being_written_is_not_sealed(monkeypatch,
         assert svdx.name not in link["files"] and link["not_sealed"]["file"] == svdx.name, link
         assert not is_read_only(svdx)
     _t.sleep(2.2)                                    # let the writer thread finish before tmp_path goes
+
+
+@pytest.mark.anyio
+async def test_n182_scope_is_finished_when_the_recording_ends_by_itself(monkeypatch, project_dir, fake_xae):
+    """N182 (0.8.15 retest, S3): a recording with also_scope that ended by itself (duration 5 s) left Scope
+    recording until a rec_stop came ~25 s later (its CSV spanned 28 s), and rec_status showed no scope section. C1:
+    the end finishes Scope (stop, save, export, link) and rec_status says so; C3: a later rec_stop returns the same
+    result and StopRecord is not sent twice; C2: also for a recording that stops on max_events."""
+    import anyio
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        for extra in ({"mode": "change", "duration_s": 1}, {"mode": "poll", "cycle_ms": 50, "max_events": 3}):
+            fake_xae.calls.clear()
+            r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "also_scope": True, **extra}))
+            assert r["scope"]["started"], r
+            st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+            seen = [st.get("scope", {}).get("state")]
+            for _ in range(80):
+                if st.get("scope", {}).get("state") == "finished":
+                    break
+                await anyio.sleep(0.25)
+                st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+                seen.append(st.get("scope", {}).get("state"))
+            assert st["scope"]["state"] == "finished" and not st["active"], (extra, seen, st.get("scope"))
+            assert "ended by itself" in st["scope"]["finished_by"] and st["scope"]["files"], st["scope"]
+            assert fake_xae.calls == ["start", "stop", "save", "csv"], fake_xae.calls
+            out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+            assert fake_xae.calls == ["start", "stop", "save", "csv"], fake_xae.calls      # StopRecord once
+            assert "ended by itself" in out["scope"]["finished_by"] and out["scope"]["link"]["files"], out["scope"]
+            link = json.loads(Path(out["scope"]["link"]["file"]).read_text(encoding="utf-8"))
+            assert "ended by itself" in link["finished_by"] and link["recording_ended"]["stop_reason"], link
+            lst = payload(await s.call_tool("rec_list", {}))
+            mine = [x for x in lst["session"] if x.get("id") == r["id"]]
+            assert mine and mine[0]["scope"]["state"] == "finished", mine
+    audit = Path(cfg.safety.audit_log).read_text(encoding="utf-8")
+    assert audit.count('"scope_finish"') == 2, audit.count('"scope_finish"')          # one per recording
+
+
+@pytest.mark.anyio
+async def test_n180_save_after_a_twincat_restart_is_said_and_recovered_or_lost(monkeypatch, project_dir, fake_xae,
+                                                                               tmp_path):
+    """N180 (0.8.15 retest, S3): after a TwinCAT RUN→CONFIG→RUN during the recording, rec_stop's SaveSVD gave the raw
+    'com_error: Invalid ScopeState! Reply requested, actual: Config (HRESULT 0x80020009)', no .svdx, no CSV. D1: said
+    as the reset (with the time from the Scope View log), the raw text in detail; what ExportCSV still gets is kept
+    (recovered) — or the run's Scope data is said lost. D2 (no restart) is the existing also_scope test."""
+    install(monkeypatch)
+    log = tmp_path / "TE130X" / "TcScopeView.log"
+    log.parent.mkdir()
+    log.write_text("(2026-10-21-15:15:00:000)[ INFO  ] start\n", encoding="utf-8")
+
+    def refused(path):
+        fake_xae.calls.append("save")
+        raise RuntimeError("Invalid ScopeState! Reply requested, actual: Config")
+    monkeypatch.setattr(fake_xae, "SaveSVD", refused)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    cfg.scope.view_log = str(log)
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("(2026-10-21-15:16:25:123)[ INFO  ] Scope View: Scope Project state changes from 'ServerReset' "
+                     "to 'Config'\n")
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+        sv = out["scope"]["save_svd"]
+        assert sv["error"].startswith("Scope was reset to Config by a TwinCAT restart at 2026-10-21 15:16:25"), sv
+        assert "Invalid ScopeState" in sv["detail"] and "nothing was saved" in sv["error"], sv
+        ex = out["scope"]["export_csv"]
+        assert ex["samples"] == 1 and "no .svdx" in ex["recovered"], ex          # what Scope still held: kept
+        # ExportCSV refused as well: the run's Scope data is said lost
+        def no_csv(path):
+            fake_xae.calls.append("csv")
+            raise RuntimeError("Invalid ScopeState! Reply requested, actual: Config")
+        monkeypatch.setattr(fake_xae, "ExportCSV", no_csv)
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+        assert out["scope"]["save_svd"]["error"].startswith("Scope was reset to Config"), out["scope"]
+        assert "is lost" in out["scope"]["export_csv"]["lost"], out["scope"]

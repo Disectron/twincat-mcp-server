@@ -34,7 +34,7 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 | Concept, how-to, error text, anything else in Infosys | `docs_search query=… [book=glob] [library=] [limit=1-50] [offset=]` → `ref` → `docs_page ref=… section=…` (the plugin's infosys_search: identifiers count as their words, titles that name the query first, an error code's defining table first — `code_note`, and `code_lookup` from the error index —, one page in several books once — `same_page_in`) |
 | A page or a link from an answer | `docs_page ref=<book/pageid, Infosys URL, page id, exact title, ms-xhelp link> [section=] [offset=] [max_chars=200-60000]` |
 | Which books exist | `docs_books filter=tcplclib_tc2_*` |
-| Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so; a code the index's product table lacks but its page text names is answered from the text: `matched_as: page text`, `note` says why) |
+| Hardware: which manual covers a product | `manual_product code=EL3102` (also matches EL3102-xxxx; a variant no manual names, `CX9020-0130`, falls back to the base product — `matched_as` says so; a code the index's product table lacks but its page text names is answered from the text: `matched_as: page text`, `note` says why). Each manual has `kind`: `product manual` (its name, title or title pages name the product or its family, EL31xx) first, then `mentions` (it names the product on its pages, e.g. as an example — `kind_note`) |
 | Hardware: LEDs, wiring, diagnostics, error codes | `manual_search query=… [doc=CX9020] [limit=1-50] [offset=]` → `manual_page doc=… pages=N-M [offset=]` (≤ 21 pages; `next` / `next_pages` + `next_offset` read on) |
 | Chapters of a manual | `manual_toc doc=CX9020 [depth=1-6]` |
 | Which manuals are indexed | `manual_docs [filter=…]` |
@@ -103,8 +103,11 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    3 letters and words on no page are dropped first (`words_ignored` gives the reason), and in the some-words step a
    word on more than 20 % of the pages does not pick pages (`words_too_common`); each hit then lists the words it holds
    (`matched`). Nothing informative left → no hits: say so instead of reading unrelated pages.
-   `manual_search`: a hex number or CoE index (`0x8000`, `#x8000`, `16#8000`, `8000:11`) is found in any of these
-   notations, and a unit symbol (`°C`, `mV/V`, `mA`, `µs`, `kΩ`) as written on the page, not as its letters; `terms`
+   `docs_search` puts pages whose title matches the query first: those hits carry `title_rank` (1 = closest) and
+   `title_match` (how), so a `score` (bm25 of the text) lower than the next item's is no mistake — `order` says the
+   rule.
+   `manual_search`: a hex number or CoE index (`0x8000`, `#x8000`, `16#8000`, `8000:11`, `8000h:11h`) is found in any
+   of these notations, and a unit symbol (`°C`, `mV/V`, `mA`, `µs`, `kΩ`) as written on the page, not as its letters; `terms`
    says how each was searched.
 8. Ranges are refused — read the `message` (it names the way on) and correct the call; do not retry it unchanged.
    The searches are the exception: `docs_search` / `manual_search` use a `limit` above 50 as 50, `hw_search` above
