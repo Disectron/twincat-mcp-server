@@ -28,7 +28,7 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
-| 0.8.17 | Scope part with one owner: `rec_start(also_scope=true, duration_s=5)` and let it end; again with `rec_stop` cancelled (stop the client call) during its stop; `rec_delete` of a recording while Scope runs; a second `rec_start` while the first one ends | `rec_status` → `scope.state` recording → finishing → finished, `finished_by` "the recording ended by itself (duration …)" / "rec_stop" / "rec_stop (the call ended before its Scope part — finished after it)" / "rec_delete"; after `rec_delete` no .svdx / .scope.csv of that id in `<recordings>\scope`; Scope stops every time (`scope_list` / the Scope View) |
+| 0.8.17 | Scope part with one owner: `rec_start(also_scope=true, duration_s=5)` and let it end; again with `rec_stop` cancelled (stop the client call) during its stop; `rec_delete` of a recording while Scope runs; a second `rec_start` while the first one ends | `rec_status` → `scope.state` recording → finishing → finished, `finished_by` "the recording ended by itself (duration …)" / "rec_stop" / "rec_stop (the call ended before its Scope part — finished after it)" / "rec_delete"; `rec_delete` of a recording whose Scope still records → no .svdx / .scope.csv of that id in `<recordings>\scope`; of one whose Scope part was saved (it had ended) → the files stay, listed in `scope_files_kept`; Scope stops every time (`scope_list` / the Scope View) |
 | 0.8.17 | XAE busy or a dialog open when a recording with Scope ends: open Tools → Options in XAE, let the recording end, close Options, `rec_stop` | while Options is open `rec_status` → `scope.state: recording`, `stop_refused`, note "rec_stop asks again"; after closing it `rec_stop` stops and saves Scope; a dialog Scope itself opens during StopRecord → `state: stop_unknown`, StopRecord not sent again |
 | 0.8.16 | XAE messages (ITcSysManager2::GetLastErrorMessages): `xae_activate_configuration`, `xae_build` with an error, `xae_tree_consume_xml` with a wrong XML, `xae_deploy` | the results carry `xae_messages` (action, messages, lines) with TwinCAT's own text, also warnings on success; a failed action's error ends with "XAE messages (…)"; an `earlier_messages` block when the buffer held something before the action |
 | 0.8.16 | N175: `xae_plcopen_export` + `xae_plcopen_import` replace of an interface (I_Module) on TwinCAT 3.1.4026; then of an interface with a property | `checked_against: xml`; methods from the export's `InterfaceAsPlainText`; no refusal for a member that is there. The property shape (`<Properties><Property>` with `InterfaceAsPlainText`, `GetAccessor`) is tested on a constructed file, not yet on a real 4026 export — send the export if the property is refused or `not_in_xml` |
@@ -101,8 +101,19 @@ tool wishlist (2026-10-18).
   the error index and `err_lookup` (N125), the 0.8.15 retest's documentation items N177, N183, N184, typo-near
   symbols, manual kinds in `hw_lookup` — built and reviewed eleven rounds on branch `feat/0.8.16-errors-index`
   (Infosys format 8 there); the docs direct-access spec.
-  The fourteenth review's LOW findings are fixed in 0.8.17 (one owner per recording's Scope part). An in-depth
-  adversarial review comes after 0.8.17 (Ryan, 2026-10-21) — its stopping rules to be set before it starts.
+  The fourteenth review's LOW findings are fixed in 0.8.17 (one owner per recording's Scope part).
+- 0.8.17 adversarial review (Ryan, 2026-10-21: review before the release; at most 2 rounds, the 0.8.17 changes only,
+  HIGH / MEDIUM block, LOW to this list). Round 1: 4 HIGH + 1 MEDIUM fixed. LOW, left: an automatic finish takes the
+  one-time `reattached` note into the Scope result (rec_status does not show it, the next XAE tool no longer gets it);
+  "XAE refused StartRecord" is also said for the worker busy / XAE held by another call's dialog; `stop_refused` texts
+  name the job `scope_action`; the `stop_unknown` note advises `scope_record(save)` also for a deleted recording.
+  Older, outside the 0.8.17 change: at server shutdown (`atexit` stop_all, no event loop) no Scope part is finished;
+  StopRecord looks the Scope up by name — with `scope` unset and a second Scope configuration opened meanwhile the
+  lookup fails before StopRecord runs and the part is final; in `_scope_reset` an ExportCSV refused as busy is said
+  "lost"; a generic StopRecord failure still sets `scope_stopped`; a SaveSVD that timed out can be sealed while XAE
+  may still write it; two `also_scope` recordings on one Scope configuration — the first one's StopRecord stops the
+  second. Decision for Ryan: should `rec_delete` also delete the recording's Scope files (.svdx, .scope.csv,
+  .xae.csv, .scope.json)? It never has; it now lists them (`scope_files_kept`).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
   Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
   trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library

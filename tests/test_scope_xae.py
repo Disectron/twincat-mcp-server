@@ -703,7 +703,8 @@ async def test_review13_0816_a_stop_refused_after_the_end_is_no_step_of_rec_star
         state["busy"] = False                       # XAE answers again
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
     assert refused["stop"].get("not_run") and "earlier step" not in str(refused["stop"]), refused
-    assert st["scope"]["state"] == "recording" and "rec_stop asks again" in st["scope"]["note"], st["scope"]
+    assert st["scope"]["state"] == "recording" and f"rec_stop(id='{r['id']}') asks again" in st["scope"]["note"], \
+        st["scope"]
     assert not fake_xae.recording and fake_xae.calls[-3:] == ["stop", "save", "csv"], fake_xae.calls
     assert out["scope"]["finished_by"] == "rec_stop" and out["scope"]["save_svd"]["result_code"] == 0, out["scope"]
 
@@ -864,14 +865,19 @@ async def test_review13_0816_a_failed_rec_delete_still_finishes_scope(monkeypatc
 
 @pytest.mark.anyio
 async def test_review13_0816_rec_delete_with_stop_refused_names_scope_record(monkeypatch, project_dir, fake_xae):
-    """rec_delete, XAE refuses StopRecord: the recording is gone, so no rec_stop can ask again — the answer names
-    scope_record(action='stop'), and nothing is kept for a rec_stop."""
+    """rec_delete, XAE refuses StopRecord: the recording is gone — first review of 0.8.17: the part stays (a note no
+    tool could show left Scope recording with nothing to stop it); rec_list lists it, rec_status shows it, and
+    rec_stop(id) asks again once XAE is free — nothing is saved for the deleted recording."""
     install(monkeypatch)
+    orig = fake_xae.StopRecord
+    state = {"busy": True}
 
-    def busy():
-        fake_xae.calls.append("stop-rejected")
-        raise _R13Busy("call rejected")
-    monkeypatch.setattr(fake_xae, "StopRecord", busy)
+    def stop():
+        if state["busy"]:
+            fake_xae.calls.append("stop-rejected")
+            raise _R13Busy("call rejected")
+        return orig()
+    monkeypatch.setattr(fake_xae, "StopRecord", stop)
     cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
     cfg.xae.com_retry_s = 0.6
     srv = build_server(cfg)
@@ -880,10 +886,18 @@ async def test_review13_0816_rec_delete_with_stop_refused_names_scope_record(mon
         r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "rec_delete", "target": r["id"]}))
         d = payload(await s.call_tool("rec_delete", {"id": r["id"], "confirm_token": tok["confirm_token"]}))
+        lst = payload(await s.call_tool("rec_list", {}))
+        st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+        state["busy"] = False
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
     sc = d["scope"]
-    assert sc["stop"]["not_run"] and "scope_record(action='stop') stops Scope once XAE is free" in sc["note"], sc
-    assert "rec_stop asks again" not in sc["note"] and app.scope_parts[r["id"]].state == "finished", sc
-    assert "save" not in fake_xae.calls, fake_xae.calls
+    assert sc["stop"]["not_run"] and f"rec_stop(id='{r['id']}') asks again" in sc["note"], sc
+    assert "the recording was deleted: nothing will be saved" in sc["note"], sc
+    assert [o["id"] for o in lst.get("scope_without_recording") or []] == [r["id"]], lst.get("scope_without_recording")
+    assert st["scope"]["state"] == "recording" and st["scope"].get("stop_refused"), st
+    assert not fake_xae.recording and "save" not in fake_xae.calls, fake_xae.calls
+    assert out["scope"]["stop"]["result_code"] == 0 and "nothing was saved" in out["scope"]["note"], out["scope"]
+    assert app.scope_parts[r["id"]].state == "finished"
 
 
 # ---- fourteenth review of 0.8.16: an error of the status call is no end of the recording -----------------------------
@@ -1016,7 +1030,8 @@ async def test_0817_a_stop_refused_by_a_held_dialog_is_asked_again(monkeypatch, 
         st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
         fut.set_result({"done": True})                     # the dialog was answered: XAE is free
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
-    assert st["scope"]["state"] == "recording" and "rec_stop asks again" in st["scope"]["note"], st["scope"]
+    assert st["scope"]["state"] == "recording" and f"rec_stop(id='{r['id']}') asks again" in st["scope"]["note"], \
+        st["scope"]
     assert "NOT started: XAE is held by the dialog" in st["scope"]["stop_refused"], st["scope"]
     assert not fake_xae.recording and out["scope"]["finished_by"] == "rec_stop", (fake_xae.calls, out["scope"])
     assert out["scope"]["save_svd"]["result_code"] == 0
@@ -1111,14 +1126,14 @@ async def test_0817_a_stop_held_by_a_dialog_is_never_sent_again(monkeypatch, pro
     def stop():
         fake_xae.calls.append("stop-asked")
         st["dlg"] = True
-        _t12.sleep(3.0)
+        _t12.sleep(4.5)                                    # well past the 2 s a dialog needs to count as blocking
         st["dlg"] = False
         return orig()
     monkeypatch.setattr(fake_xae, "StopRecord", stop)
     async with client_for(srv) as s:
         r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
-        await _anyio12.sleep(2.0)
+        await _anyio12.sleep(3.0)
         again = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
         stt = payload(await s.call_tool("rec_status", {"id": r["id"]}))
     sc = out["scope"]
@@ -1178,3 +1193,7 @@ async def test_0817_rec_stop_and_rec_delete_together_stop_scope_once(monkeypatch
     assert part.state == "finished" and part.holds == 0, (part.state, part.holds)
     assert not outs["stop"].is_error and not outs["delete"].is_error, (text(outs["stop"]), text(outs["delete"]))
     assert payload(outs["stop"])["scope"] == payload(outs["delete"])["scope"], "one Scope part, one result"
+    # rec_stop came first: its Scope part is saved and linked; rec_delete then removes the ADS recording and says the
+    # Scope files stay (first review of 0.8.17)
+    d = payload(outs["delete"])
+    assert d["scope_files_kept"]["files"] == sorted(part.result["link"]["files"]), d
