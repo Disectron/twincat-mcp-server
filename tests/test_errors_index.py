@@ -1356,6 +1356,28 @@ def test_review3_0816_kb_search_keeps_the_device_pointer_and_says_the_plugin_not
     k = K.Knowledge(tmp_path / "home", str(kb))
     r = k.search("EtherCAT diagnosis code 0x4101")
     d = r["known_error"]["documented"][0]
-    assert d["device_texts"] == 2 and "hw_diag" in d["texts_note"], d
+    assert d["device_texts"] == 2 and "hw_diag" in d["device_texts_note"], d
     r = k.search("read failed: error 1808")
     assert "documented in" in r["known_error"].get("code_note", ""), r["known_error"]
+
+
+def test_review4_0816_an_hresult_is_of_a_facility_and_not_an_index_group_or_address(kb, tmp_path):
+    """Fourth review of 0.8.16 (3): 'an HRESULT-shaped number is a code anywhere' read index offsets, addresses and
+    index groups ('invalid index offset 0x80000000' answered an OPC UA status). An HRESULT is of a facility (ADS,
+    System Manager, Win32, COM), never 0x…0000, never right after an index-group / offset / address word."""
+    for q in ("invalid index offset 0x80000000", "Exception (Access violation) at address 0x8C2A1F00",
+              "read IG:0x80000001 failed", "TCMARK_STOP 0xC0000000"):
+        assert X.read_query(q)["codes"] == [], q
+    for q in ("ConsumeXml failed (0x98510004)", "call failed 0X98110745", "Activate failed with 0x80004005"):
+        assert X.read_query(q)["codes"], q
+
+
+def test_review4_0816_kb_search_says_when_the_plugin_note_is_of_another_code_space(kb, tmp_path):
+    """Fourth review of 0.8.16 (9): 'win32 error 1808' got the plugin's ADS note as if it were the code; and (6) the
+    table-copies note is not passed on without its list."""
+    from twincat_mcp import knowledge as K
+    k = K.Knowledge(tmp_path / "home", str(kb))
+    r = k.search("win32 error 1808")
+    assert "does not apply" in r["known_error"].get("code_note", ""), r["known_error"]
+    for d in k.search("ADS error 6 on port 851")["known_error"]["documented"]:
+        assert "texts_note" not in d, d

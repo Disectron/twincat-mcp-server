@@ -466,7 +466,8 @@ def code_tokens(query: str, min_digits: int = 2, hex_anywhere: bool = True) -> l
     how: 'hex' | 'dec', whole, next_to_code_word, start, end}] in the order of the query."""
     q = query_text(query)
     out: list[dict[str, Any]] = []
-    for tk in re.finditer(r"(?:0x|16#|#x)[0-9a-fA-F_]+|(?:(?<![\w.\-])-)?\b\d{%d,}\b" % max(1, int(min_digits)), q):
+    # fourth review of 0.8.16: '0X98110745' (a capital X) is a hex number too
+    for tk in re.finditer(r"(?:0[xX]|16#|#[xX])[0-9a-fA-F_]+|(?:(?<![\w.\-])-)?\b\d{%d,}\b" % max(1, int(min_digits)), q):
         t = tk.group(0)
         m = _HEX.match(t)
         whole = q.strip() == t

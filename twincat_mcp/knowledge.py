@@ -1070,7 +1070,12 @@ class Knowledge:
                 # error 6' → ads ERR_TARGETPORTNOTFOUND) — never one picked silently: all of them, in documented
                 code = (f"{d0['domain']} {d0['hex']} ({d0['dec']}) {d0.get('symbol') or ''}".strip() if len(doms) == 1
                         else f"{d0['hex']} ({d0['dec']}) — documented in {len(doms)} domains: {', '.join(doms)}")
-                if err and len(doms) > 1:
+                mine = "ads" if str((err or {}).get("code") or "").startswith("ADS") else None
+                if err and mine and mine not in doms:
+                    # fourth review of 0.8.16: 'win32 error 1808' got the plugin's ADS note as if it were the code
+                    err = {**err, "code_note": (f"the plugin's note is for {err.get('code')}; the documentation answers "
+                                                f"this code as {', '.join(doms)} — the note does not apply to it")}
+                elif err and len(doms) > 1:
                     # third review of 0.8.16: the plugin's note is of one code space; the documentation has the code in
                     # several, and the message does not say which — said, not picked
                     err = {**err, "code_note": (f"the plugin's note is for {err.get('code')}; the code is documented "
@@ -1503,7 +1508,7 @@ class Knowledge:
         except (X.ErrError, sqlite3.Error):
             return None
         rows = [{k: m[k] for k in ("domain", "value", "hex", "dec", "symbol", "text", "ref", "url", "device_texts",
-                                   "texts_note") if m.get(k) is not None}
+                                   "device_texts_note") if m.get(k) is not None}
                 for m in r.get("matches") or [] if m.get("matched_by") in ("value", "hresult", "symbol", "dotnet name")]
         return rows or None
 

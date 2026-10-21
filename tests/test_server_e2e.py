@@ -1942,9 +1942,13 @@ async def test_review3_0816_the_error_log_step(monkeypatch, project_dir, tmp_pat
     assert len(r["entries"]) == 1 and r["entries"][0]["newest"] and "1861" in r["entries"][0]["text"], r
     r = await app.err_from_logs("why does the axis not move?")
     assert r["entries"] == [], r
-    t = app.online_terms("TwinCAT error 0x80004005 in ConsumeXml on FB_DOSING_VALVE at STATE_WAIT_SETTLE with "
-                         "MC_MoveAbsolute and E_FAIL")
-    assert "TwinCAT" in t and "E_FAIL" in t and "FB_DOSING_VALVE" not in t and "STATE_WAIT_SETTLE" not in t, t
+    # the sample project's own names (FB_Valve, ST_Recipe, bEstop) stay home; products, protocols, COM names go
+    t = app.online_terms("TwinCAT error 0x80004005 in FB_Valve with ST_Recipe at bEstop and E_FAIL on EL3356 behind "
+                         "EK1100 at the CX9020")
+    for sent in ("TwinCAT", "E_FAIL", "EL3356", "EK1100", "CX9020", "0x80004005"):
+        assert sent in t.split(), (sent, t)
+    for kept in ("FB_Valve", "ST_Recipe", "bEstop"):
+        assert kept not in t.split(), (kept, t)
 
 
 def test_review3_0816_web_search_drops_twincat2_supplements(tmp_path):
@@ -1960,3 +1964,40 @@ def test_review3_0816_web_search_drops_twincat2_supplements(tmp_path):
         def get(self, url, allow_hosts=None):
             return page.encode()
     assert [i["title"] for i in InfosysIndex(tmp_path / "c", fetcher=F()).web_search("opc ua", 5)] == ["TC3 OPC UA"]
+
+
+@pytest.mark.anyio
+async def test_review4_0816_error_log_and_online_terms(monkeypatch, project_dir, tmp_path):
+    """Fourth review of 0.8.16: (2) an error inside a result names its item ('MAIN.fbValve.bOpen: ADSError 1793'), so
+    a question about the item finds it; (7) the tool's name counts (stems: 'activation' / activate), 'what does the
+    error mean?' is about the newest, and 'the last error' wins over a shared word; (8) the XAE Error List has no
+    newest; (1) product names are sent online (EK1100 alone too)."""
+    import time as _t
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App, _result_errors
+    assert _result_errors({"results": {"MAIN.fbValve.bOpen": {"error": "ADSError 1793 (0x701)"}}}) == \
+        ["MAIN.fbValve.bOpen: ADSError 1793 (0x701)"]
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    app.note_error("ads_read", error="ads_read MAIN.nOld: ADSError 1861 (0x745) timeout")
+    _t.sleep(1.1)
+    app.note_error("xae_activate_configuration", error="ActivateConfiguration: failed (HRESULT 0x98110745)")
+    _t.sleep(1.1)
+    app.note_error("ads_write_many", result_errors=_result_errors(
+        {"results": {"MAIN.fbValve.bOpen": {"error": "ADSError 1793 (0x701)"}}}))
+    r = await app.err_from_logs("why did writing MAIN.fbValve.bOpen fail?")
+    assert r["entries"][0]["text"].startswith("MAIN.fbValve.bOpen: ADSError 1793"), r
+    r = await app.err_from_logs("why does activation fail?")
+    assert r["entries"][0]["where"].startswith("xae_activate_configuration "), r
+    r = await app.err_from_logs("what does the error mean?")
+    assert len(r["entries"]) == 1 and r["entries"][0]["newest"] and "1793" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("is the last error a timeout?")
+    assert r["entries"][0]["newest"] and "1793" in r["entries"][0]["text"], r
+    items = [("XAE Error List (error)", "C0077: Unknown type: 'FB_X'"), ("XAE Error List (error)", "ADS error 1808")]
+    assert app._err_log_entries("what does the last error mean?", items, "XAE Error List", False) == []
+    assert app.online_terms("EK1100") == "EK1100"
+    assert app.online_terms("EL3356 shows weight 0 after CX9020 restart") == "EL3356 shows weight 0 after CX9020 restart"

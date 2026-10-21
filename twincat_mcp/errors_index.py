@@ -1516,7 +1516,12 @@ _PYADS = re.compile(r"\badserror\b\s*:[^\n]{0,200}?\((-?\d+)\)", re.I)        # 
 
 # an HRESULT written as one: 0x8…/0x9…/0xC… with 8 hex digits ('ConsumeXml failed (0x98510004)') — a code wherever it
 # stands (third review of 0.8.16); an address or an index is written otherwise
-_HRESULT_TOKEN = re.compile(r"0x[89ACac][0-9A-Fa-f]{7}")
+_HRESULT_TOKEN = re.compile(r"0[xX](?:98[0-9A-Fa-f]{2}|800[0-7]|8004)(?!0000)[0-9A-Fa-f]{4}")
+# fourth review of 0.8.16: 'invalid index offset 0x80000000', 'at address 0x8C2A1F00', 'IG:0x80000001' were read as
+# codes — an HRESULT is of a facility (0x9811 ADS, 0x9851 System Manager, 0x8007 Win32, 0x8000/0x8001/0x8004 COM),
+# never 0x…0000, and never right after a word that makes it an index group, an offset, an address or a handle
+_NOT_HRESULT_BEFORE = re.compile(r"\b(?:ig|igrp|group|indexgroup|offset|ioffs|io|address|addr|adr|at|pointer|ptr|"
+                                 r"handle|crc|checksum|mark)\W{0,3}$", re.I)
 
 
 def _after_domain_name(q: str, start: int) -> bool:
@@ -1540,7 +1545,7 @@ def read_query(q: str) -> dict[str, Any]:
     toks = DS.code_tokens(qt, min_digits=1, hex_anywhere=True)
     codes = [{"token": t["token"], "value": t["value"], "how": t["how"]} for t in toks
              if t["how"] == "dec" or t["whole"] or t["next_to_code_word"] or _after_domain_name(qt, t["start"])
-             or _HRESULT_TOKEN.fullmatch(t["token"])]
+             or (_HRESULT_TOKEN.fullmatch(t["token"]) and not _NOT_HRESULT_BEFORE.search(qt[:t["start"]]))]
     for m in _PYADS.finditer(q):
         if all(c["value"] != int(m.group(1)) for c in codes):
             codes.append({"token": m.group(1), "value": int(m.group(1)), "how": "dec"})
@@ -1761,7 +1766,7 @@ def _diag_out(kb: Path | None, value: int, count: int) -> dict[str, Any]:
                     # re-review of 0.8.16: 1473 of 3028 text ids have other texts on other devices (#x4101: 16) — the
                     # first one annotated another device's error as the documented meaning
                     out["device_texts"] = n
-                    out["texts_note"] = (f"{n} different texts on different devices — the device's own: "
+                    out["device_texts_note"] = (f"{n} different texts on different devices — the device's own: "
                                          f"hw_diag(code='#x{value:04X}', device=…)")
             except sqlite3.Error:
                 pass

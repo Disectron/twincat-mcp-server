@@ -844,11 +844,14 @@ class App:
     # words of every symbol path or error text: sharing one says nothing ('MAIN' in 'MAIN.nCounter' and 'MAIN.fbAxis')
     _WEAK_WORDS = frozenset("main gvl gvls prg program plc task instance fb fbs the a an of on in to is not why does do "
                             "did what when how fails failed fail failing error errors".split())
-    # a question about the newest error ('what does the last error mean?') — it shares no word with it
-    _LAST_ERROR = re.compile(r"\b(?:last|latest|previous|recent|newest|this|that|the same)\b[\w\s]{0,24}?"
-                             r"\b(?:error|errors|failure|fault|message|problem)\b", re.I)
+    # a question about the newest error: said ('the last error' — wins over a shared word) or meant ('what does the
+    # error mean?', 'why did that fail?' — when no error shares the question's words)
+    _LAST_SAID = re.compile(r"\b(?:last|latest|previous|newest|most recent)\b", re.I)
+    _LAST_ERROR = re.compile(r"\b(?:last|latest|previous|recent|newest|this|that|the|same|it)\b[\w\s]{0,24}?"
+                             r"\b(?:error|errors|failure|fault|message|problem|fail|failed|fails|mean)\b", re.I)
 
-    def _err_log_entries(self, query: str, texts: list[tuple[str, str]], source: str) -> list[dict[str, Any]]:
+    def _err_log_entries(self, query: str, texts: list[tuple[str, str]], source: str,
+                         ordered: bool = True) -> list[dict[str, Any]]:
         """The texts (newest first: (where, text)) that name a code and are about the question — they hold one of its
         names whole (MAIN.doesNotExist: 2 each) or one of its informative words (1 each, not 'main' / 'error' …); for a
         question about the last error the newest. Each looked up in the errors index (a code read from it, never a
@@ -859,17 +862,22 @@ class App:
         names = {n.lower() for n in re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\b\w*[a-z][A-Z]\w*\b|\b\w+_\w+\b", query)}
         words = [w for w in DS.informative_words(query) if not w.isdigit() and w not in X._GENERIC_WORDS
                  and w not in self._WEAK_WORDS]
-        last = bool(self._LAST_ERROR.search(query))
+        said = bool(self._LAST_SAID.search(query)) and ordered
+        last = bool(self._LAST_ERROR.search(query)) and ordered      # the XAE Error List has no time order
+
+        def has(w: str, low: str) -> bool:
+            # a word or its stem ('activation' / ActivateConfiguration: 'activ…') — fourth review of 0.8.16
+            return bool(re.search(rf"\b{re.escape(w[:5])}\w*" if len(w) >= 6 else rf"\b{re.escape(w)}\b", low))
         cands = []
         for k, (where, t) in enumerate(texts):
             read = X.read_query(t)
             if not (read["codes"] or read["names"] or read["caps"] or read["ids"]):
                 continue
-            low = t.lower()
-            score = 2 * sum(1 for n in names if n in low) + sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", low))
+            low = (t + " " + where.split(" ", 1)[0].replace("_", " ")).lower()     # the tool's name counts too
+            score = 2 * sum(1 for n in names if n in low) + sum(1 for w in words if has(w, low))
             cands.append((-score, k, where, t))
         shared = sorted(c for c in cands if c[0] < 0)
-        picked = shared[:self.ERR_LOG_PICK] or (cands[:1] if last else [])
+        picked = (cands[:1] if said else []) or shared[:self.ERR_LOG_PICK] or (cands[:1] if last else [])
         out = []
         for score, _k, where, t in picked:
             try:
@@ -884,7 +892,7 @@ class App:
                 continue
             out.append({"source": source, "where": where, "text": t[:600], "read_as": read_as,
                         "documented": bool(matches), "matches": matches,
-                        **({"shares_words": -score} if shared else {"newest": True})})
+                        **({"newest": True} if said or not shared else {"shares_words": -score})})
         return out
 
     async def err_from_logs(self, query: str) -> dict[str, Any] | None:
@@ -905,7 +913,7 @@ class App:
                     el = await self.xae_call(self.xae.errors, timeout=60)
                     items = [(f"XAE Error List ({i.get('level') or 'message'})", str(i.get("description") or ""))
                              for i in (el.get("items") or []) if i.get("description")]
-                    entries += await asyncio.to_thread(self._err_log_entries, query, items, "XAE Error List")
+                    entries += await asyncio.to_thread(self._err_log_entries, query, items, "XAE Error List", False)
                 except ToolError as exc:
                     note = f"the XAE Error List could not be read: {str(exc)[:200]}"
             else:
@@ -924,56 +932,97 @@ class App:
 
     ONLINE_TIMEOUT_S = 12.0                # the online step of err_lookup gives up after this (no network: no 40 s wait)
 
-    # public names a question may hold besides the documented ones: products and protocols, and the namespaces of
-    # error names everyone uses (COM / Win32 / Winsock / ADS / TwinCAT runtime)
+    # public names a question may hold besides the documented ones: products, protocols, states, the shell
     PUBLIC_TERMS = frozenset("twincat ethercat ads ams xae plc nc cnc coe soe foe eoe aoe voe tcp udp ip opc ua mqtt "
-                             "modbus profinet profibus canopen devicenet ethernet tcunit beckhoff".split())
-    PUBLIC_PREFIXES = ("E_", "S_", "RPC_E_", "CO_E_", "DISP_E_", "ERROR_", "WSA", "ADSERR_", "ERR_", "RTERR_",
-                       "TSM_E_")
+                             "modbus profinet profibus canopen devicenet ethernet tcunit beckhoff tcxaeshell init preop "
+                             "safeop op boot".split())
+    # COM's own error names (not in the local documentation) — a list: 'E_' alone is the project's enum convention
+    COM_NAMES = frozenset("E_FAIL E_POINTER E_INVALIDARG E_NOTIMPL E_NOINTERFACE E_UNEXPECTED E_ACCESSDENIED "
+                          "E_OUTOFMEMORY E_ABORT E_HANDLE E_PENDING S_OK S_FALSE".split())
+    COM_PREFIXES = ("RPC_E_", "CO_E_", "DISP_E_", "TYPE_E_", "STG_E_")
+    # Beckhoff product codes (EL3356, EK1100, CX9020, CP6606, AX5206, TF6250, C6015) and TwinCAT libraries (Tc2_MC2)
+    PRODUCT = re.compile(r"(?:E[LKPSRJMQB]|K[LSM]|B[KCX]|C[XPU]|A[XMGT]|T[FECS]|IL|IP|FC|C)\d{3,5}(?:-\d{4})*"
+                         r"|Tc[23]_\w+", re.I)
 
     def _public_name(self, t: str) -> bool:
-        """A name that is Beckhoff's or everyone's, never the project's own: a code's symbol in the errors index, a
-        symbol or a page title of the Infosys index, a product / protocol, an error name of a public namespace."""
-        if t.lower() in self.PUBLIC_TERMS or (t.isupper() and t.startswith(self.PUBLIC_PREFIXES)):
+        """A name that is Beckhoff's or everyone's: a product, protocol or library, a COM error name, a code's symbol in
+        the errors index, a symbol of the Infosys index, or a word of an Infosys page title written exactly so
+        (ConsumeXml in 'ITcSmTreeItem::ConsumeXml'; fbTimer is not 'FBTimer')."""
+        if t.lower() in self.PUBLIC_TERMS or t in self.COM_NAMES or t.startswith(self.COM_PREFIXES) \
+                or self.PRODUCT.fullmatch(t):
             return True
         loc = self.kb.location()[0]
         if loc is None:
             return False
         from . import errors_index as X
         from . import kb_layout as L
-        for db, sql in ((L.index_file(loc, "errors"), "SELECT 1 FROM alias WHERE form = ? LIMIT 1"),
-                        (self.kb.infosys_db(loc), "SELECT 1 FROM symbols WHERE name = ? COLLATE NOCASE LIMIT 1"),
-                        (self.kb.infosys_db(loc), "SELECT 1 FROM pages WHERE title = ? COLLATE NOCASE LIMIT 1")):
+        checks = ((L.index_file(loc, "errors"), "SELECT form FROM alias WHERE form = ? LIMIT 1", t.lower()),
+                  (self.kb.infosys_db(loc), "SELECT name FROM symbols WHERE name = ? LIMIT 1", t),
+                  (self.kb.infosys_db(loc), "SELECT title FROM pages_fts WHERE pages_fts MATCH ? LIMIT 20",
+                   'title:"' + t.replace('"', "") + '"'))
+        for db, sql, arg in checks:
             if db is None or not Path(db).is_file():
                 continue
             try:
                 con = X.connect_ro(Path(db))
                 try:
-                    if con.execute(sql, (t.lower() if "alias" in sql else t,)).fetchone():
-                        return True
+                    rows = con.execute(sql, (arg,)).fetchall()
                 finally:
                     con.close()
             except sqlite3.Error:
                 continue
+            if "pages_fts" in sql:
+                if any(re.search(rf"(?<![\w]){re.escape(t)}(?![\w])", str(r[0])) for r in rows):
+                    return True
+            elif rows:
+                return True
         return False
 
+    def _project_words(self) -> set[str] | None:
+        """Every name in the project's sources (POU / DUT / GVL names, variables, enum members, instances), lower case;
+        None when this server has no project index."""
+        try:
+            self.proj._ensure()
+            units = self.proj.all_units()
+        except Exception:  # noqa: BLE001 — no project root, or it cannot be read: the names are not known
+            return None
+        if not units:
+            return None
+        key = (getattr(self.proj, "scanned_at", None), len(units))
+        cached = getattr(self, "_proj_words_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        words: set[str] = set()
+        for u in units:
+            words.add(u.name.lower())
+            words.update(w.lower() for w in re.findall(r"[A-Za-z_]\w*", f"{u.declaration}\n{u.implementation}"))
+        self._proj_words_cache = (key, words)
+        return words
+
     def online_terms(self, query: str, res: dict[str, Any] | None = None) -> str:
-        """What the online search is sent: the codes read, the message ids, plain words, and names that are Beckhoff's
-        or public (_public_name) — never the project's own (MAIN.fbAxis, FB_DOSING_VALVE, STATE_WAIT_SETTLE: a name the
-        documentation does not know is the project's). Third review of 0.8.16: decided by a word's shape, project names
-        in capitals were sent and Beckhoff's (MC_MoveAbsolute, EtherCAT, ConsumeXml) dropped."""
+        """What the online search is sent: the codes read, the message ids, numbers, plain words, and names — a name
+        that is Beckhoff's or public (_public_name: EL3356, CX9020, MC_MoveAbsolute, EtherCAT, ConsumeXml, E_FAIL) is
+        sent; one in the project's sources is not (FB_DOSING_VALVE, E_VALVE_STATE, STATE_WAIT_SETTLE, fbTimer); an
+        unknown one is sent when the project's names are known, else not. A dotted path (MAIN.fbAxis) never.
+        Third / fourth review of 0.8.16: by a word's shape, project names in capitals were sent; by the documentation
+        alone, product and terminal names (EL3356, CX9020) were dropped."""
         res = res or {}
         terms = [c["token"] for c in res.get("read_as") or []] + [m["token"] for m in res.get("message_ids") or []]
+        project = self._project_words()
         for t in re.findall(r"[^\s,;:()\[\]\"'`]+", query):
             t = t.strip(".?!")
             if not t or t in terms:
                 continue
             if re.fullmatch(r"[A-Za-z][a-z]+", t) and t.lower() not in self.PUBLIC_TERMS:
                 terms.append(t)                      # a plain word (a capital at the start of a sentence)
-            elif re.fullmatch(r"(?:0x|16#|#x)?-?[0-9A-Fa-f]+", t) and re.search(r"\d", t):
+            elif re.fullmatch(r"(?:0x|16#|#x)?-?[0-9A-Fa-f]+", t) and re.search(r"\d", t) \
+                    and not self.PRODUCT.fullmatch(t):
                 terms.append(t)                      # a number
-            elif "." not in t and re.fullmatch(r"[A-Za-z_][\w]*", t) and self._public_name(t):
-                terms.append(t)                      # EtherCAT, MC_MoveAbsolute, ConsumeXml, E_FAIL, WSAETIMEDOUT
+            elif "." not in t and re.fullmatch(r"[A-Za-z_][\w-]*", t):
+                if self._public_name(t):
+                    terms.append(t)
+                elif project is not None and t.lower() not in project:
+                    terms.append(t)                  # in neither the documentation nor the project: a vendor's name
         return " ".join(terms)
 
     async def err_online(self, query: str, res: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -986,8 +1035,8 @@ class App:
             return {"skipped": "docs.web_fallback = false: no online search"}
         terms = await asyncio.to_thread(self.online_terms, query, res)
         if not terms:
-            return {"skipped": "nothing to search for online: the question has no code and no word that is not a "
-                               "name of this project"}
+            return {"skipped": "nothing to search for online: the question has no code and no word that may be sent "
+                               "(the project's own names and paths are not sent)"}
         try:
             # its own two threads: a network that drops traffic does not use up the pool every to_thread tool shares
             items = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(
@@ -1064,7 +1113,7 @@ class App:
                           + [m["token"] for m in r.get("message_ids", [])],
                           "documented": bool(matches) if r.get("documented") is not None else None,
                           "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref", "device_texts",
-                                                          "texts_note") if m.get(k)} for m in matches],
+                                                          "device_texts_note") if m.get(k)} for m in matches],
                           **({"note": r["note"]} if r.get("note") and not matches else {})})
         return codes
 
@@ -2522,7 +2571,7 @@ _ONLINE_POOL = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="tcmcp-o
 _ERROR_SOURCES = frozenset("ads rec scope snap ipc exp test tcunit wf xae hmi".split())
 
 
-def _result_errors(res: Any, depth: int = 0, out: list[str] | None = None) -> list[str]:
+def _result_errors(res: Any, depth: int = 0, out: list[str] | None = None, path: str = "") -> list[str]:
     """The error texts inside a result ('error': '…' at any depth up to 3, at most 20) — per-item failures of a tool
     that succeeded as a whole."""
     out = [] if out is None else out
@@ -2531,12 +2580,14 @@ def _result_errors(res: Any, depth: int = 0, out: list[str] | None = None) -> li
     if isinstance(res, dict):
         for k, v in res.items():
             if k == "error" and isinstance(v, str) and v:
-                out.append(v[:500])
+                # fourth review of 0.8.16: with the item it is of ('MAIN.fbValve.bOpen: ADSError 1793') — the backend's
+                # per-item text names none, and a question about the item never found it
+                out.append((f"{path}: " if path else "") + v[:500])
             elif k not in ("xae_messages", "items_raw") and isinstance(v, (dict, list)):
-                _result_errors(v, depth + 1, out)
+                _result_errors(v, depth + 1, out, k if isinstance(v, dict) else path)
     elif isinstance(res, list):
         for v in res[:200]:
-            _result_errors(v, depth + 1, out)
+            _result_errors(v, depth + 1, out, path)
     return out
 
 
