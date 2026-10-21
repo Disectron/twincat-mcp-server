@@ -741,8 +741,8 @@ def ro_uri(db: Path) -> str:
     return "file:" + quote(s, safe="/:") + "?mode=ro"
 
 
-def connect_ro(db: Path) -> sqlite3.Connection:
-    con = sqlite3.connect(ro_uri(db), uri=True, timeout=10)
+def connect_ro(db: Path, timeout: float = 10.0) -> sqlite3.Connection:
+    con = sqlite3.connect(ro_uri(db), uri=True, timeout=timeout)
     con.row_factory = sqlite3.Row
     return con
 
@@ -757,7 +757,7 @@ def read_meta(db: Path) -> dict[str, str]:
     if not Path(db).is_file():
         return {}
     try:
-        con = sqlite3.connect(ro_uri(Path(db)), uri=True, timeout=5)
+        con = sqlite3.connect(ro_uri(Path(db)), uri=True, timeout=READ_BUSY_S)
         try:
             return {str(r[0]): str(r[1]) for r in con.execute("SELECT k, v FROM meta")}
         finally:
@@ -766,12 +766,38 @@ def read_meta(db: Path) -> dict[str, str]:
         return {}
 
 
+# how long a read of errors.db waits for another program's write lock (seventh review of 0.8.16: 5 + 5 + 10 s per lookup,
+# 10 s of it in the ADS worker, while an SQLite browser held the file)
+READ_BUSY_S = 2.0
+
+
+def is_locked(reason: str | None) -> bool:
+    """A read failed because another program holds the file (not because the file is damaged)."""
+    return bool(reason) and bool(re.search(r"\b(?:locked|busy)\b", str(reason), re.I))
+
+
+def read_meta_checked(db: Path) -> tuple[dict[str, str], str | None]:
+    """meta of an errors index file and, when it gives none, why (meta_error's reasons) — one read: a locked file waits
+    READ_BUSY_S once, not once per question."""
+    if not Path(db).is_file():
+        return {}, None
+    try:
+        con = sqlite3.connect(ro_uri(Path(db)), uri=True, timeout=READ_BUSY_S)
+        try:
+            meta = {str(r[0]): str(r[1]) for r in con.execute("SELECT k, v FROM meta")}
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+    return meta, (None if meta else "its meta table is empty: not an index this plugin built")
+
+
 def meta_error(db: Path) -> str | None:
     """Why an errors index file that exists cannot be read (an empty or cut copy, a file another program locks, a schema
     this plugin does not know) — None when its meta table reads. Sixth review of 0.8.16: such a file was 'missing', and
     a lookup raised sqlite's error out of a tool whose action had run."""
     try:
-        con = sqlite3.connect(ro_uri(Path(db)), uri=True, timeout=5)
+        con = sqlite3.connect(ro_uri(Path(db)), uri=True, timeout=READ_BUSY_S)
         try:
             if not con.execute("SELECT k, v FROM meta").fetchall():
                 return "its meta table is empty: not an index this plugin built"
@@ -1263,12 +1289,12 @@ def _swap(building: Path, final: Path, wait_s: float = SWAP_WAIT_S) -> str | Non
 _INFOSYS_FILE = re.compile(r"infosys-(\d+)\.db$", re.I)
 
 
-def recorded_infosys(final: Path, kb: Path) -> Path | None:
+def recorded_infosys(final: Path, kb: Path, meta: dict[str, str] | None = None) -> Path | None:
     """The Infosys index a rebuild reads when none is named: this knowledge folder's, in the language the index in use
     was built from (infosys-<lcid>.db) — never the path it recorded. Review of 0.8.16: a copied folder rebuilt from the
     old folder's Infosys index (one index of two folders); a moved one found it 'missing' and a forced rebuild replaced
     5610 codes with 52. None: no record, or a file of no language (the folder's default is read)."""
-    rec = (_jl(read_meta(final).get("sources"), {}).get("infosys") or {}).get("path")
+    rec = (_jl((read_meta(final) if meta is None else meta).get("sources"), {}).get("infosys") or {}).get("path")
     m = _INFOSYS_FILE.search(str(rec or "").replace("\\", "/"))
     return L.locate(Path(kb), "infosys", m.group(1)) if m else None
 
@@ -1321,6 +1347,13 @@ def build(final: Path, kb: Path, lcid: str | None = None, force: bool = False, b
     try:
         stamp = sources_stamp(ids)
         meta = read_meta(final)
+        if final.is_file() and not meta:
+            why = meta_error(final)
+            if is_locked(why):
+                # seventh review of 0.8.16: a complete, current index another program held was rebuilt as 'format
+                # unknown' — a lock is not damage: nothing is built
+                raise ErrError(f"the errors index {final} is locked by another program ({why}) — close it; nothing "
+                               "was built", "busy")
         current = meta.get("format") == FORMAT and meta.get("state") == "complete"
         if not force and current and meta.get("sources_stamp") == stamp:
             log(f"up to date: {final} ({meta.get('codes')} codes in {meta.get('domains')} domains)")
@@ -1386,18 +1419,20 @@ def state(final: Path, kb: Path | None, lcid: str | None = None, infosys_db: str
     domains (codes, rows, variants), the sources with 0 rows (kb_status)."""
     final = Path(final)
     building, lock = side_files(final)
-    meta = read_meta(final)
+    meta, why = read_meta_checked(final)
     out: dict[str, Any] = {"database": str(final), "format_expected": FORMAT}
     rec = _jl(meta.get("sources"), {})
     now: dict[str, dict[str, Any]] = {}
     if kb is not None:
         now = identities(Path(kb), lcid or L.DEFAULT_LCID,
-                         infosys_db or (recorded_infosys(final, Path(kb)) if lcid is None else None))
+                         infosys_db or (recorded_infosys(final, Path(kb), meta) if lcid is None else None))
     if not final.is_file():
         out["state"] = "missing"
     elif not meta:
         out["state"] = "unreadable"
-        out["reason"] = meta_error(final) or "it could not be read"
+        out["reason"] = why or "it could not be read"
+        if is_locked(out["reason"]):
+            out["locked"] = True
     elif meta.get("format") != FORMAT:
         out["state"] = "rebuild_needed"
         out["reason"] = f"format {meta.get('format') or 'unknown'}, this plugin reads {FORMAT}"
@@ -1508,6 +1543,10 @@ def message(s: dict[str, Any]) -> str:
         tail = ""
     if st == "missing":
         return "no errors index yet — its first build starts by itself once a source index is there" + tail
+    if st == "unreadable" and s.get("locked"):
+        return (f"the errors index is locked by another program ({s.get('reason')}) — close that program (an SQLite "
+                "browser, a copy in progress); nothing documented can be named until then, and a rebuild does not help"
+                + tail)
     if st == "unreadable":
         return (f"the errors index cannot be read ({s.get('reason')}) — nothing documented can be named from it until "
                 "a rebuild replaces it, once approved: kb_rebuild(index='errors')" + tail)
@@ -1551,7 +1590,7 @@ _NOT_HRESULT_BEFORE = re.compile(r"\b(?:ig|igrp|group|indexgroup|offset|ioffs|io
 def _after_domain_name(q: str, start: int) -> bool:
     """The token at q[start:] stands right after a domain's name ('AL status 0x0011', 'ADS 0x745', 'NC 0x4221')."""
     pre = q[:start]
-    if not re.search(r"[\s:=#(]$", pre):
+    if not re.search(r"[\s:=#('\"‘“]$", pre):         # seventh review of 0.8.16: "AL Status '0x001b'" too
         return False
     nw = _norm_words(pre)
     return any(nw.endswith(f" {n} ") for d in DOMAINS.values() for n in tuple(d.get("names", ()))
@@ -1591,7 +1630,13 @@ def read_query(q: str) -> dict[str, Any]:
 
 
 def _forms(v: int) -> set[int]:
-    """The same number in 32 bits: -6908 is 0xFFFFE504, 0x80010001 is -2147418111."""
+    """The same number in 32 bits: -6908 is 0xFFFFE504, 0x80010001 is -2147418111; a 32-bit code printed as a 64-bit
+    signed number (0xFFFFFFFF80004005) is that code. A number no 32-bit code can be has no form — nothing is looked up
+    (seventh review of 0.8.16: 'ADSError 18446744073709551615' crashed sqlite's integer binding)."""
+    if (1 << 64) - (1 << 31) <= v < (1 << 64):
+        v -= 1 << 64
+    if not -(1 << 31) <= v < (1 << 32):
+        return set()
     out = {v}
     if v < 0 and v >= -(1 << 31):
         out.add(v & 0xFFFFFFFF)
@@ -1603,8 +1648,9 @@ def _forms(v: int) -> set[int]:
 class ErrIndex:
     """Read-only access to errors.db."""
 
-    def __init__(self, db: Path):
+    def __init__(self, db: Path, busy_s: float = READ_BUSY_S):
         self.db = Path(db)
+        self.busy_s = busy_s
 
     @contextlib.contextmanager
     def con(self) -> Iterator[sqlite3.Connection]:
@@ -1613,13 +1659,14 @@ class ErrIndex:
         # sixth review of 0.8.16: sqlite's own error (a locked or cut file) is this module's — every caller handles
         # ErrError; an sqlite3.Error escaped line_codes after an XAE action had run and made it look failed
         try:
-            c = connect_ro(self.db)
+            c = connect_ro(self.db, timeout=self.busy_s)
         except sqlite3.Error as exc:
             raise ErrError(f"the errors index cannot be read ({self.db}): {exc}", "unreadable") from exc
         try:
             yield c
-        except sqlite3.Error as exc:
-            raise ErrError(f"the errors index could not be read ({self.db}): {exc}", "unreadable") from exc
+        except (sqlite3.Error, OverflowError) as exc:
+            raise ErrError(f"the errors index could not be read ({self.db}): {type(exc).__name__}: {exc}",
+                           "unreadable") from exc
         finally:
             c.close()
 
@@ -2087,7 +2134,8 @@ def describe_code(kb: Path | str | None, domain: str, value: int) -> dict[str, A
     if not db.is_file():
         return None
     try:
-        with ErrIndex(db).con() as con:
+        # an annotation of an ADS error, in the ADS worker: it does not wait for another program's lock
+        with ErrIndex(db, busy_s=0.5).con() as con:
             r = con.execute("SELECT c.symbol, c.text, COALESCE(c.source_ref, x.ref) AS ref, c.hex FROM code c JOIN "
                             "variant x ON x.domain = c.domain "
                             f"AND x.variant = c.variant WHERE c.domain = ? AND c.value_int = ? ORDER BY {MAIN_ORDER} "

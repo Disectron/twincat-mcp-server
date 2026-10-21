@@ -1396,3 +1396,52 @@ def test_review5_0816_tccom_loader_codes_and_failed_at(kb, tmp_path):
     r = K.Knowledge(tmp_path / "home", str(kb)).search("LabVIEW error 1808")
     ke = r.get("known_error") or {}
     assert ke["code"].startswith("ADS return code 0x710") and "may not apply" in ke["code_note"], ke
+
+
+def test_review7_0816_item_numbers_quoted_codes_overflow_and_a_locked_index(kb, tmp_path):
+    """Seventh review of 0.8.16: (1) an item / line number before 'error' was read as the code ('Task 1: ADSError
+    1861' got ads 0x1); (2) a quoted AL status code was not read; (5) a number ≥ 2^63 crashed the lookup; (8) a locked
+    index waited 15 s per lookup, said to rebuild, and the builder rebuilt a current index."""
+    import sqlite3
+    import time as _t
+    for q, want in (("Task 1: ADSError 1861", ["1861"]), ("Drive 2: error 1861", ["1861"]),
+                    ("notification block 3: ADSError 1861 (0x745): timeout elapsed", ["1861"]),
+                    ("Axis 2: error 0x4260", ["0x4260"]), ("'Term 2 (EL1008)' (1002): error 0x001B", ["0x001B"]),
+                    ("MAIN.TcPOU(34): error C0046", []), ("Port 851: error 1808", ["1808"]),
+                    ("Task 1 error 1861", ["1861"]), ("1861 error", ["1861"]), ("error '1861'", ["1861"]),
+                    ("AL Status '0x001b' read and 'SAFEOP ERR' expected", ["0x001b"]),
+                    ("AL Status Code: '0x001b' - Invalid output configuration", ["0x001b"])):
+        assert [c["token"] for c in X.read_query(q)["codes"]] == want, q
+    app = _app(tmp_path, kb)
+    assert "ERR_INTERNAL" not in app.doc_note("Task 1: ADSError 1861")
+    assert lookup(kb, "AL Status Code: '0x001b' - Invalid output configuration")["matches"][0]["domain"] == "ethercat_al"
+    for q in ("TcCOM init failed, error 0xFFFFFFFF80004005", "ADSError 18446744073709551615", "error 0x1" + "0" * 30):
+        assert lookup(kb, q)["documented"] in (True, False), q
+    assert app.line_codes(["ADSError 18446744073709551615"], "line")[0]["documented"] is False
+    db = L.index_file(kb, "errors")
+    con = sqlite3.connect(db)
+    con.execute("BEGIN EXCLUSIVE")
+    try:
+        t0 = _t.monotonic()
+        st = X.state(db, kb)
+        assert st["state"] == "unreadable" and st["locked"] and "rebuild does not help" in st["message"], st
+        assert _t.monotonic() - t0 < 3.5, _t.monotonic() - t0
+        with pytest.raises(X.ErrError) as ei:
+            build(kb)
+        assert ei.value.code == "busy" and "nothing was built" in str(ei.value)
+        assert X.describe_code(kb, "ads", 1861) is None
+    finally:
+        con.rollback()
+        con.close()
+    assert X.state(db, kb)["state"] == "complete"
+    # damaged inside (its meta readable, a table gone): said, not silently nothing
+    bad = tmp_path / "bad"
+    import shutil
+    shutil.copytree(kb, bad / "kb")
+    c2 = sqlite3.connect(L.index_file(bad / "kb", "errors"))
+    c2.execute("DROP TABLE code")
+    c2.commit()
+    c2.close()
+    app2 = _app(tmp_path / "b", bad / "kb")
+    e = app2.line_codes(["Error: ADS error 0x745 (1861)"], "line")[0]
+    assert e["documented"] is None and "could not be read" in e["note"], e

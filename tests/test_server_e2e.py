@@ -1997,9 +1997,9 @@ async def test_review4_0816_error_log_and_online_terms(monkeypatch, project_dir,
     assert await app.err_from_logs("what does the error mean?") is None
     r = await app.err_from_logs("is the last error a timeout?")
     assert r["entries"][0]["newest"] and "1793" in r["entries"][0]["text"], r
-    items = [{"where": "XAE Error List (error)", "tool": "xae", "xae": True, "text": t, "subjects": []}
-             for t in ("C0077: Unknown type: 'FB_X'", "ADS error 1808")]
-    assert app._err_log_entries("what does the last error mean?", items, "XAE Error List", False) == []
+    items = [{"rec": -1 - k, "where": "XAE Error List (error)", "tool": "xae", "xae": True, "text": t, "subjects": []}
+             for k, t in enumerate(("C0077: Unknown type: 'FB_X'", "ADS error 1808"))]
+    assert app._err_log_entries(app._question("what does the last error mean?"), items, "XAE Error List", False) == []
     assert app.online_terms("EK1100") == "" and app.online_terms("EL3356 shows weight 0 after CX9020 restart") == ""
 
 
@@ -2093,14 +2093,20 @@ async def test_review6_0816_the_error_log_compares_names_with_what_an_error_is_o
     app.note_error("xae_import", error="ConsumeXml failed (0x98510004)", subjects=["TIPC^Plc1^Plc1 Project"])
     _t.sleep(1.1)
     app.note_error("ads_connect", error="ads_connect: the target did not answer")
+    # seventh review of 0.8.16: the last error is the newest error (record), with a code or said to have none
     r = await app.err_from_logs("what does the last ADS error mean, e.g. for the valve?")
-    assert [e["text"][:16] for e in r["entries"]] == ["ads_read MAIN.nC"] and r["entries"][0]["newest"], r
+    e = r["entries"][0]
+    assert len(r["entries"]) == 1 and e["text"].startswith("ads_connect") and e["read_as"] == [] and e["newest"], r
+    r = await app.err_from_logs("what does the last XAE error mean?")
+    assert "0x98510004" in r["entries"][0]["text"], r
     r = await app.err_from_logs("what does the last error in TwinCAT mean?")
-    assert r["names_not_found"] == ["TwinCAT"] and "0x98510004" in r["entries"][0]["text"], r
+    assert r["names_not_found"] == ["TwinCAT"] and r["entries"][0]["text"].startswith("ads_connect"), r
     r = await app.err_from_logs("what does the last error of MAIN.fbPump mean?")
     assert r["entries"][0]["names"] == ["MAIN.fbPump"] and "1793" in r["entries"][0]["text"], r
     r = await app.err_from_logs("is the last fatal error a timeout?")
-    assert "fatal" in r["not_used"] and "0x98510004" in r["entries"][0]["text"], r
+    assert "fatal" in r["not_used"] and r["entries"][0]["text"].startswith("ads_connect"), r
+    r = await app.err_from_logs("what does the last win32 error mean?")
+    assert "names_not_found" not in r and r["entries"] == [] and r["note"] == "no win32 error was seen", r
     r = await app.err_from_logs("why does Plc1 not import?")
     assert r["entries"][0]["names"] == ["Plc1"], r
     # the Error List is never waited for behind a running XAE job
@@ -2174,3 +2180,64 @@ async def test_review6_0816_nested_xae_messages_unreadable_index_and_online(monk
     assert app.docs is None
     r = await app.err_online("-6908", {"read_as": [{"token": "-6908"}]})
     assert r["searched"] == '"-6908"' and "%22-6908%22" in urls[0] and r["items"][0]["in_local_package"] is None, r
+
+
+@pytest.mark.anyio
+async def test_review7_0816_the_last_error_records_and_online(monkeypatch, project_dir, tmp_path):
+    """Seventh review of 0.8.16: (3) a composite XAE tool that raised after an activation lost the activation's XAE
+    messages; (6) 'the last error' skipped a newer error without a code; (7) stored history (exp_runs) and polling
+    flooded the log; (4) an apostrophe swallowed a quoted name; (9) the code the error log found was not sent online;
+    (10) 'the last ADS-error', 'the last win32 error'; (11) a machine number shaped like a compiler id went online."""
+    import time as _t
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App, ToolError, _quoted_subjects, _tool_boundary
+    assert _quoted_subjects("Couldn't create 'TIID^Device 1 (EtherCAT)^Term 4 (EL2008)'") == \
+        ["TIID^Device 1 (EtherCAT)^Term 4 (EL2008)"]
+    assert _quoted_subjects("the object's child 'FB_Dosing' can't be read") == ["FB_Dosing"]
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    seen: list = []
+
+    async def xae_deploy(plc_project_path: str = ""):
+        def activate():
+            app.xae.messages.append({"action": "ActivateConfiguration", "messages": "x",
+                                     "lines": ["Error: ADS error 0x745 (1861) on 'Term 1 (EK1100)'"]})
+            return {"activated": True}
+        await app.xae_call(activate)
+        raise ToolError("xae_deploy: activated and restarted, but the target is in CONFIG")
+    app.xae.messages = []
+    with pytest.raises(ToolError):
+        await _tool_boundary(xae_deploy, note_error=lambda: app.note_error)(plc_project_path="TIPC^Plc1^Plc1 Project")
+    r = await app.err_from_logs("what does the last error mean?")
+    assert [e["read_as"] for e in r["entries"]] == [["0x745"]] and "Term 1 (EK1100)" in r["entries"][0]["text"], r
+    # stored history is not an error seen; the same error again is one record
+    async def exp_runs():
+        return {"runs": [{"name": "run1", "error": "ADSError 1793 (0x701) last week"}]}
+    await _tool_boundary(exp_runs, note_error=lambda: (lambda *a, **k: seen.append((a, k))))()
+    assert seen == []
+    n = len(app.recent_errors)
+    for _ in range(3):
+        app.note_error("ads_status", error="ads_status: not connected")
+    assert len(app.recent_errors) == n + 1
+    # the last error is the newest one — said to name no code
+    app.note_error("ads_write", error="ads_write MAIN.bStart: refused by the write allowlist", subjects=["MAIN.bStart"])
+    r = await app.err_from_logs("what does the last error mean?")
+    assert r["entries"][0]["text"].startswith("ads_write") and r["entries"][0]["note"] == "this error names no code", r
+    r = await app.err_from_logs("what does the last error of MAIN.bStart mean?")
+    assert r["entries"][0]["names"] == ["MAIN.bStart"] and "names_not_found" not in r, r
+    r = await app.err_from_logs("what does the last ADS-error mean?")
+    assert r["entries"] and r["entries"][0]["text"].startswith("ads_write"), r
+    q = app._question("what does the last win32 error mean?")
+    assert q["names"] == [] and q["doms"] == {"win32"}, q
+    # online: the code the error log found; a compiler id only when the question says it is one
+    res = {"read_as": [], "from_error_log": {"entries": [{"read_as": ["0x98510123"], "matches": []},
+                                                         {"read_as": ["ADSERR_DEVICE_SYMBOLNOTFOUND"], "matches": [
+                                                             {"symbol": "ADSERR_DEVICE_SYMBOLNOTFOUND"}]}]}}
+    assert app.online_terms("why does Plc1 not import?", res) == "0x98510123 ADSERR_DEVICE_SYMBOLNOTFOUND"
+    ids = {"message_ids": [{"token": "C0815"}]}
+    assert app.online_terms("why does machine C0815 at AcmeFoods fail?", ids) == ""
+    assert app.online_terms("error C0815 in MAIN", ids) == "C0815" and app.online_terms("C0815", ids) == "C0815"

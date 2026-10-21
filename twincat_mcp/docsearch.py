@@ -510,8 +510,15 @@ def _next_to_code_word(q: str, start: int, end: int) -> bool:
     right before or after it says it is a code ('error 1861', 'nErrId = 1861', '1861 error')."""
     if re.search(r"[\w-]$", q[:start]) or re.match(r"[\w-]", q[end:]):
         return False
-    before = re.search(r"([^\W\d_]+)[\s:=#(]{1,6}$", q[:start])        # 'nErrId := 1861' (ST's ' := ')
-    after = re.match(r"[\s:)]{1,3}([^\W\d_]+)(\(s\))?", q[end:])
+    # 'nErrId := 1861' (ST's ' := '); seventh review of 0.8.16: a quoted code too ("AL Status Code: '0x001b'")
+    before = re.search(r"([^\W\d_]+)[\s:=#('\"‘“]{1,6}$", q[:start])
+    # seventh review of 0.8.16: 'Task 1: ADSError 1861', 'Drive 2: error 1861', 'MAIN.TcPOU(34): error C0046', 'Port
+    # 851: error 1808' read the item / line number as the code — a code word after the number counts only with a space
+    # between ('1861 error'), and only when it does not name a code of its own ('Task 1 error 1861': it is 1861's)
+    after = re.match(r"[ \t]{1,3}([^\W\d_]+)(\(s\))?", q[end:])
+    if after is not None and re.match(r"[\s:=#('\"‘“]{0,6}(?:0[xX][0-9a-fA-F]|16#[0-9a-fA-F]|#[xX][0-9a-fA-F]|-?\d|[A-Za-z]\d{3,})",
+                                      q[end + after.end():]):
+        after = None
     # review of 0.8.16: a plural after the number counts ('Build: 3 errors, 0 warnings', 'found 0 errors', '1 error(s)',
     # '3 Fehler') — it read as code 3; '1861 error' (singular) names one. 'errors: 3' (the plural before it) counts too
     counted = not _HEX.match(q[start:end])        # third review: 'errors: 0x745' is a code (a count is decimal)
