@@ -207,7 +207,7 @@ Also in the repo: `skills/twincat-mcp/SKILL.md` and `skills/twincat-docs/` (load
 | HMI files | `hmi_scan` / `hmi_bindings` / `hmi_vs_runtime` for TE2000 `%s%PLC1.X%/s%` bindings and TcVIS — broken bindings vs the live PLC and vs source | done |
 | TcUnit without hardware | `xae_io_disable`, `tcunit_run disable_io=true` | ITcSmTreeItem.Disabled, untested |
 | PLC discovery | `ads_discover` (UDP 48899 broadcast) | protocol per XAE broadcast search, untested |
-| variable links | `xae_links` — link target per AT %I*/%Q* variable, unlinked list | instance-tree XML, untested |
+| variable links | `xae_links` — link targets per AT %I*/%Q* variable, unlinked variables and array elements | instance XML (DataAreas) + ProduceMappingInfo; checked against a 3.1.4026 project's XML and mapping table |
 | event log | `ipc_eventlog` via wevtutil on Windows targets; CE7/TC-BSD: use the XAE error list | partial |
 | MES glue | `ads_export csharp` — explicit-offset structs/enums from the datatype table, `csharp_symbols` constants, TypeScript, JSON | done |
 | recipes | `snap_apply` — write a snapshot back, gated per symbol, dry-run first | done |

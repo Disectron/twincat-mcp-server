@@ -5032,8 +5032,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def xae_links(plc_project_path: str) -> dict[str, Any]:
-        """Variable links of the PLC instance: every AT %I*/%Q* variable with its link target;
-        lists the unlinked ones (the usual reason an output never moves)."""
+        """Variable links of the PLC instance: every AT %I*/%Q* variable (from the instance's XML) with its link
+        targets (the project's mapping table, ProduceMappingInfo); lists the unlinked ones — array elements too, the
+        usual reason an output never moves — and links whose variable is gone. plc_project_path: plc_path,
+        iec_project_path or instance_path. What could not be read is said (unlinked_count null), never counted as 0."""
         return await app.xae_call(app.xae.links, plc_project_path, timeout=300)
 
     @mcp.tool(annotations=READ)

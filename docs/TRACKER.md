@@ -140,6 +140,33 @@ tool wishlist (2026-10-18).
   log is on a host not reachable from the build session, and release.yml — unlike ci.yml — reported no failures as
   annotations: which test failed is unknown. Fixed: both workflows run one report script
   (`.github/scripts/pytest_failures.py`, annotations + job summary).
+- 0.8.17 retest (Ryan, 2026-10-22, bugs.md §37 / §37b). Passed live: N185, N186, N187, N188, N181b, N178 (token
+  half), a recording that ends by itself, `rec_delete` while Scope records and after its save, close / new / pause,
+  `stop_refused` with Options open, the export tool on "Scope Recordings"; smoke R7, N27. New:
+  N189 (S2) — two `also_scope` recordings at once: B's Scope part stops Scope at B's end and saves A's capture, A
+  saves the same capture again, both signed (A's covers 3.5 s of 10 s). Cause: `rec_start` never checks whether
+  another recording's part holds Scope — one owner per recording, none across recordings, one Scope. The 0.8.17
+  review listed it as LOW ("older, outside the change"); under its own rule (a false statement in a signed link =
+  HIGH) it should have blocked the release. N190 (S4) the disconnect question and its answer are not audited.
+  N191 (S4) a Scope span past (or short of) its recording is saved without a note. N192 (S3 in bugs.md; S2 by this
+  list's rule — "0 unlinked" reads as "all linked") `xae_links` on a 4026 project: the instance item has no tree
+  children; the variables are in its XML (`DataAreas`), the links only in the mapping table → `groups: []`,
+  `unlinked_count: 0`. N193 (S4) `xae_links` refuses the instance path that `xae_plc_projects` names. Not run: N179,
+  N180 (testable now), N178 (10-minute half), `rec_stop` cancelled during its Scope part.
+- TE1000 probe (Ryan, 2026-10-22; DrumFillingMachineV0, his XAE): `ITcSysManager15` — LinkVariables /
+  UnlinkVariables / ProduceMappingInfo (21 links) / ConsumeMappingInfo / GetTypeSystem / LookupTreeItemById present;
+  JsonCommand, BuildTargetPlatform absent. The References item's `_ITcPlcLibraryManager`: References (18, requested
+  and effective resolution), ScanLibraries (277), AddLibrary, RemoveReference, AddPlaceholder,
+  SetEffectiveResolution, FreezePlaceholder, ProduceLibrarySignatures present; `Repositories` items → E_NOINTERFACE
+  (another route needed); `GetLibraryIecDeclaration` offered by no object; a signature holds names, inputs /
+  outputs with types and comments only — no methods, struct members or constant values (Recipe Management: 1 of
+  29 FBs with an input). GetLastErrorMessages: the buffer was empty, clearing not decided (the code handles both).
+  Type system v1: 862 types, the project's own DUTs / FBs among them.
+- Decided by Ryan (2026-10-22): library part 1d (declarations compared with the docs) dropped. 0.8.18 = fixes only:
+  N189 – N193 and the findings of the in-depth review (Scope and recorder code changed in 0.8.16 – 0.8.17; at most 2
+  rounds, HIGH / MEDIUM block, LOW to this list, later fixes checked by tests + CI). Then libraries 0.8.19 (1a, 1b),
+  linking 0.8.20 (its read side comes with the N192 fix), EtherCAT 0.8.21, snapshots 0.8.22, tasks 0.8.23. The error
+  index (held) has no slot yet.
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
   Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
   trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library

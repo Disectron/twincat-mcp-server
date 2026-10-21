@@ -2043,3 +2043,95 @@ def test_n188_an_action_says_whether_its_message_buffer_was_read(monkeypatch):
     with pytest.raises(X.XaeError, match=r"XAE messages \(ActivateConfiguration\): not read: this System Manager has "
                                          r"no GetLastErrorMessages"):
         be.activate_configuration()
+
+
+# ------------------------------------------------------------------------------------------------ N192 / N193: links
+_INST_4026 = (
+    '<TreeItem><ItemName>Plc Instance</ItemName><ChildCount>0</ChildCount><TcModuleInstance><Module><DataAreas>'
+    '<DataArea><AreaNo AreaType="InputDst" CreateSymbols="true">0</AreaNo><Name>PlcTask Inputs</Name>'
+    '<ContextId>0</ContextId><ByteSize>4096</ByteSize>'
+    '<Symbol><Name>GVL_IO.abProx</Name><BitSize>16</BitSize><BaseType>BOOL</BaseType>'
+    '<ArrayInfo><LBound>1</LBound><Elements>2</Elements></ArrayInfo><BitOffs>0</BitOffs></Symbol>'
+    '<Symbol><Name>GVL_IO.bManual</Name><BitSize>8</BitSize><BaseType>BOOL</BaseType><BitOffs>16</BitOffs></Symbol>'
+    '<Symbol><Name>GVL_IO.stTerm</Name><BitSize>64</BitSize><BaseType>ST_Term</BaseType><BitOffs>32</BitOffs></Symbol>'
+    '</DataArea>'
+    '<DataArea><AreaNo AreaType="OutputSrc" CreateSymbols="true">1</AreaNo><Name>PlcTask Outputs</Name>'
+    '<Symbol><Name>GVL_IO.bPump</Name><BitSize>8</BitSize><BaseType>BOOL</BaseType><BitOffs>0</BitOffs></Symbol>'
+    '</DataArea>'
+    '<DataArea><AreaNo AreaType="Internal" CreateSymbols="true">3</AreaNo><Name>PlcTask Internal</Name>'
+    '<Symbol><Name>MAIN.nCount</Name><BitSize>32</BitSize><BaseType>DINT</BaseType><BitOffs>0</BitOffs></Symbol>'
+    '</DataArea></DataAreas></Module></TcModuleInstance></TreeItem>')
+
+_MAP_4026 = (
+    '<?xml version="1.0"?><VarLinks>'
+    '<OwnerA Name="TIPC^Plc^Plc Instance">'
+    '<OwnerB Name="TIID^Device 1 (EtherCAT)^Term 1 (EK1100)^Term 2 (EL1008)">'
+    '<Link VarA="PlcTask Inputs^GVL_IO.abProx[2]" VarB="Channel 3^Input"/>'
+    '<Link VarA="PlcTask Inputs^GVL_IO.stTerm.nState" VarB="InfoData^State"/>'
+    '<Link VarA="PlcTask Inputs^GVL_OLD.bGone" VarB="Channel 4^Input"/>'
+    '</OwnerB></OwnerA>'
+    '<OwnerA Name="TIID^Device 1 (EtherCAT)^Term 1 (EK1100)^Term 3 (EL2008)">'
+    '<OwnerB Name="TIPC^Plc^Plc Instance"><Link VarA="Channel 1^Output" VarB="PlcTask Outputs^GVL_IO.bPump"/></OwnerB>'
+    '</OwnerA>'
+    '<OwnerA Name="TIPC^Other^Other Instance"><OwnerB Name="TIID^X"><Link VarA="PlcTask Inputs^GVL_IO.bManual" '
+    'VarB="Channel 9^Input"/></OwnerB></OwnerA>'
+    '</VarLinks>')
+
+
+class _MapSysMan(FakeSysMan):
+    """ITcSysManager2::ProduceMappingInfo: the project's links as <VarLinks> (TE1000)."""
+
+    def __init__(self, mapping):
+        super().__init__()
+        self.mapping = mapping
+
+    def ProduceMappingInfo(self):
+        return self.mapping
+
+
+def test_n192_links_from_the_instance_xml_and_the_mapping_table(monkeypatch):
+    """0.8.17 retest (TwinCAT 3.1.4026): the instance item has no tree children; its I/O variables are in its XML
+    (DataAreas InputDst / OutputSrc) and the links only in the mapping table. xae_links said groups [] and
+    'unlinked_count 0' — read as 'everything is linked'."""
+    be, _dte, sm = _xae_with(monkeypatch, _MapSysMan(_MAP_4026))
+    sm.items["TIPC^Plc^Plc Instance"] = FakeItem("Plc Instance", "TIPC^Plc^Plc Instance", xml=_INST_4026)
+    r = be.links("TIPC^Plc")
+    assert r["variables_from"] == "the instance's XML (DataAreas)" and r["links_from"] == "ProduceMappingInfo"
+    assert [(g["group"], g["direction"], g["count"]) for g in r["groups"]] == [
+        ("PlcTask Inputs", "input", 3), ("PlcTask Outputs", "output", 1)]          # the Internal area is no I/O
+    inputs = {v["name"]: v for v in r["groups"][0]["variables"]}
+    assert inputs["GVL_IO.abProx"]["type"] == "ARRAY [1..2] OF BOOL"
+    assert inputs["GVL_IO.abProx"]["unlinked_elements"] == ["[1]"]
+    assert inputs["GVL_IO.stTerm"]["links"] == [{"part": ".nState", "to": "TIID^Device 1 (EtherCAT)^Term 1 (EK1100)^"
+                                                                          "Term 2 (EL1008)^InfoData^State"}]
+    assert r["groups"][1]["variables"][0]["linked_to"] == "TIID^Device 1 (EtherCAT)^Term 1 (EK1100)^Term 3 (EL2008)^Channel 1^Output"
+    assert r["unlinked"] == [{"group": "PlcTask Inputs", "name": "GVL_IO.abProx[1]", "type": "BOOL"},   # in the
+                             {"group": "PlcTask Inputs", "name": "GVL_IO.bManual", "type": "BOOL"}]     # declaration order
+    assert r["unlinked_count"] == 2 and r["links_total"] == 4 and r["links_read"] is True     # another instance's not
+    assert r["links_without_variable"] == [{"group": "PlcTask Inputs", "variable": "GVL_OLD.bGone",
+                                            "to": "TIID^Device 1 (EtherCAT)^Term 1 (EK1100)^Term 2 (EL1008)^Channel 4^Input"}]
+    assert "no longer has" in r["note"]
+    # N193: the instance path xae_plc_projects names, and the nested project path, are the same PLC project
+    assert be.links("TIPC^Plc^Plc Instance")["unlinked_count"] == 2
+    assert be.links("TIPC^Plc^Plc Project")["unlinked_count"] == 2
+
+
+def test_n192_what_cannot_be_read_is_said_never_counted_as_zero(monkeypatch):
+    """No I/O variables anywhere (a project the shell has not built), or no mapping table: unlinked_count null and a
+    note — never 'nothing unlinked'."""
+    be, _dte, sm = _xae_with(monkeypatch, _MapSysMan(_MAP_4026))
+    sm.items["TIPC^Plc^Plc Instance"] = FakeItem("Plc Instance", "TIPC^Plc^Plc Instance")      # '<TreeItem/>', no children
+    r = be.links("TIPC^Plc")
+    assert r["groups"] == [] and r["unlinked_count"] is None and r["variables_read"] is False
+    assert "links not checked" in r["note"] and "build it" in r["note"]
+    be2, _dte2, sm2 = _xae_with(monkeypatch, FakeSysMan())                  # no ProduceMappingInfo, no LinkedTo
+    sm2.items["TIPC^Plc^Plc Instance"] = FakeItem("Plc Instance", "TIPC^Plc^Plc Instance", xml=_INST_4026)
+    r = be2.links("TIPC^Plc")
+    assert r["links_read"] is False and r["unlinked"] is None and r["unlinked_count"] is None
+    assert "links not read" in r["note"] and "ProduceMappingInfo" in r["note"]
+    assert all(v["linked_to"] is None and v["links"] is None for g in r["groups"] for v in g["variables"])
+
+
+def test_n193_plc_split_takes_the_instance_path():
+    assert X._plc_split("TIPC^Plc^Plc Instance") == ("TIPC^Plc", "TIPC^Plc^Plc Project")
+    assert X._plc_split("TIPC^Plc^Plc Instance^PlcTask Inputs") == ("TIPC^Plc^Plc Instance^PlcTask Inputs",) * 2
