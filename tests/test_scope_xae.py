@@ -371,3 +371,173 @@ async def test_review11_0816_rec_stop_is_never_taken_for_an_end_of_its_own(monke
     assert out["scope"]["finished_by"] == "rec_stop" and "recording_ended" not in out["scope"], out["scope"]
     link = _json.loads(Path(out["scope"]["link"]["file"]).read_text(encoding="utf-8"))
     assert link.get("finished_by") == "rec_stop", link
+
+
+
+# ---- twelfth review of 0.8.16: the Scope part's bookkeeping (who finishes it, an interrupted rec_stop, an id prefix,
+# a failed part with two waiters), the cause of a refused save, scope_record's save after a reset
+import time as _t12
+import anyio as _anyio12
+from twincat_mcp.server import build_server
+from tests.fake_ads import install
+from tests.test_server_e2e import client_for, mk_cfg, payload, text
+@pytest.mark.anyio
+async def test_review12_0816_finishing_names_who_finishes(monkeypatch, project_dir, fake_xae):
+    install(monkeypatch)
+    orig = fake_xae.StopRecord
+
+    def slow_stop():
+        _t12.sleep(2.0)
+        return orig()
+    monkeypatch.setattr(fake_xae, "StopRecord", slow_stop)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "duration_s": 1,
+                                                     "also_scope": True}))
+        seen = []
+        for _ in range(40):
+            st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+            sc = st.get("scope") or {}
+            seen.append((sc.get("state"), sc.get("finished_by")))
+            if sc.get("state") == "finished":
+                break
+            await _anyio12.sleep(0.2)
+        assert ("finishing", None) not in seen and any(st == "finishing" and "ended by itself" in str(by)
+                                                       for st, by in seen), seen
+
+
+@pytest.mark.anyio
+async def test_review12_0816_rec_stop_by_an_id_prefix_finishes_its_scope(monkeypatch, project_dir, fake_xae):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        pre = r["id"][:-2]
+        st = payload(await s.call_tool("rec_status", {"id": pre}))
+        out = payload(await s.call_tool("rec_stop", {"id": pre}))
+        for _ in range(40):
+            st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+            if (st.get("scope") or {}).get("state") == "finished":
+                break
+            await _anyio12.sleep(0.2)
+        assert out["scope"]["finished_by"] == "rec_stop" and st["scope"]["finished_by"] == "rec_stop", (out, st)
+
+
+@pytest.mark.anyio
+async def test_review12_0816_rec_stop_cancelled_in_the_scope_part(monkeypatch, project_dir, fake_xae):
+    install(monkeypatch)
+    orig = fake_xae.SaveSVD
+
+    def slow_save(path):
+        _t12.sleep(2.0)
+        return orig(path)
+    monkeypatch.setattr(fake_xae, "SaveSVD", slow_save)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        with _anyio12.move_on_after(1.0):
+            await s.call_tool("rec_stop", {"id": r["id"]})
+        await _anyio12.sleep(6.0)                       # the Scope part has long finished (stop, save 2 s, csv)
+        st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+        assert (st.get("scope") or {}).get("state") == "finished", st.get("scope")
+
+
+@pytest.mark.anyio
+async def test_review12_0816_rec_stop_cancelled_in_the_ads_stop(monkeypatch, project_dir, fake_xae):
+    from twincat_mcp import recorder as R
+    install(monkeypatch)
+    orig = R.Recorder.stop
+
+    def slow_stop(self, rid, reason="requested"):
+        st = orig(self, rid, reason)
+        _t12.sleep(1.5)                      # sealing / stats of a large recording
+        return st
+    monkeypatch.setattr(R.Recorder, "stop", slow_stop)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        with _anyio12.move_on_after(0.5):
+            await s.call_tool("rec_stop", {"id": r["id"]})
+        for _ in range(40):
+            await _anyio12.sleep(0.25)
+            st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+            if (st.get("scope") or {}).get("state") == "finished":
+                break
+        assert st["scope"]["state"] == "finished" and st["scope"]["finished_by"].startswith(
+            "rec_stop (the call ended before its Scope part"), st.get("scope")
+
+
+@pytest.mark.anyio
+async def test_review12_0816_a_failed_scope_part_is_stored_once(monkeypatch, project_dir, fake_xae):
+    from twincat_mcp import scope as S
+    install(monkeypatch)
+    orig = fake_xae.StopRecord
+
+    def slow_stop():
+        _t12.sleep(2.0)
+        return orig()
+    monkeypatch.setattr(fake_xae, "StopRecord", slow_stop)
+
+    def boom(mark, limit=20):
+        raise RuntimeError("log unreadable")
+    monkeypatch.setattr(S, "log_errors_since", boom)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "duration_s": 1,
+                                                     "also_scope": True}))
+        for _ in range(40):
+            st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+            if (st.get("scope") or {}).get("state") == "finishing":
+                break
+            await _anyio12.sleep(0.2)
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+        st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+        assert "ended by itself" in str(out["scope"].get("finished_by")), out["scope"]
+        assert st["scope"]["finished_by"] == out["scope"]["finished_by"] and "check in XAE whether Scope stopped" in             out["scope"]["error"], (out["scope"], st["scope"])
+
+
+@pytest.mark.anyio
+async def test_review12_0816_the_start_transition_is_no_restart(monkeypatch, project_dir, fake_xae, tmp_path):
+    install(monkeypatch)
+    log = tmp_path / "TE130X" / "TcScopeView.log"
+    log.parent.mkdir()
+    log.write_text("(2026-10-21-15:15:00:000)[ INFO  ] start\n", encoding="utf-8")
+    orig_start = fake_xae.StartRecord
+
+    def start():
+        with open(log, "a", encoding="utf-8") as fh:     # what the Scope View logs when a recording starts (assumed)
+            fh.write("(2026-10-21-15:15:01:000)[ INFO  ] Scope View: Scope Project state changes from 'Reply' to 'Record'\n")
+        return orig_start()
+    monkeypatch.setattr(fake_xae, "StartRecord", start)
+
+    def record_state(path):
+        raise RuntimeError("Invalid ScopeState! Reply requested, actual: Record")
+    monkeypatch.setattr(fake_xae, "SaveSVD", record_state)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    cfg.scope.view_log = str(log)
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    assert "restart" not in out["scope"]["save_svd"]["error"] and out["scope"]["save_svd"]["error"].startswith(
+        "Scope is in state Record, not Reply — the Scope View log names no reset"), out["scope"]["save_svd"]
+
+
+@pytest.mark.anyio
+async def test_review12_0816_scope_record_save_in_config_state(monkeypatch, project_dir, fake_xae, tmp_path):
+    install(monkeypatch)
+
+    def refused(path):
+        fake_xae.calls.append("save")
+        raise RuntimeError("Invalid ScopeState! Reply requested, actual: Config")
+    monkeypatch.setattr(fake_xae, "SaveSVD", refused)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    cfg.scope.view_log = str(tmp_path / "nowhere" / "TcScopeView.log")
+    srv = build_server(cfg)
+    out = tmp_path / "home" / "recordings" / "manual.svdx"
+    async with client_for(srv) as s:
+        r = await s.call_tool("scope_record", {"action": "save", "path": str(out)})
+    csvp = tmp_path / "home" / "recordings" / "manual.csv"
+    t = text(r)
+    assert r.is_error and csvp.exists() and f"recovered as {csvp}" in t and "could not be read" in t, t
+    assert "since the recording began" not in t, t

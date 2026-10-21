@@ -2000,3 +2000,26 @@ END_VAR
     rec = r["replaced"][0]
     assert rec["checked_against"] == "xml" and not rec.get("not_in_xml"), rec
     assert kids[1].DeclarationText == "METHOD GetStatus : ST_ModuleStatus\n" and proj.deleted == ["I_Module_1"]
+
+
+def test_review12_0816_a_rejected_step_after_an_action_is_no_repeat_it(xae):
+    """Twelfth review of 0.8.16: boot_project ran GenerateBootProject, then its read of BootProjectAutostart was
+    rejected by a busy shell — 'did not run this call — repeat it' invited a second generate / activate. 'Repeat it' only
+    when nothing of the call ran before the rejected step; else the steps that ran are named."""
+    be, dte, sm = xae
+
+    class Rejected(Exception):
+        hresult = X.RPC_E_CALL_REJECTED
+    be.cfg.com_retry_s = 0.3
+
+    def rejected():
+        raise Rejected("Call was rejected by callee.")
+    be.acted = []
+    with pytest.raises(X.XaeBusy, match=r"did not run this call — it was asked again for 0.3 s; repeat it\."):
+        be._retry(rejected, "BootProjectAutostart")
+    be._retry(lambda: "ok", "GenerateBootProject", once=True)
+    with pytest.raises(X.XaeBusy) as ei:
+        be._retry(rejected, "BootProjectAutostart")
+    assert "this call's earlier step(s) ran (GenerateBootProject): check the result before calling again" in \
+        str(ei.value) and "repeat it" not in str(ei.value), str(ei.value)
+    assert ei.value.busy and ei.value.busy[1] == 0.3

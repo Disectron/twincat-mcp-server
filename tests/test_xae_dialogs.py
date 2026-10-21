@@ -673,6 +673,14 @@ def test_n176_the_shells_own_frame_is_never_a_dialog(monkeypatch):
     desk.install(monkeypatch, uia={90: ([], [])})
     ds = D.list_dialogs(100)
     assert len(ds) == 1 and not ds[0].identified and ds[0].hwnd == main, ds
+    # twelfth review of 0.8.16: the watchdog's log had that state as a 'seen' dialog titled like the shell — it is the
+    # shell's own frame, disabled, said as that (the N176 entry: 'Project15 - TcXaeShell', buttons null)
+    wd = D.DialogWatchdog([])
+    wd.pid = 100
+    wd.poll()
+    e = wd.log[-1]
+    assert e["event"] == "seen" and e["unidentified"] is True and "title" not in e and "buttons" not in e, e
+    assert e["note"] == D.UNIDENTIFIED and e["main_window_class"], e
 
 
 @pytest.mark.anyio

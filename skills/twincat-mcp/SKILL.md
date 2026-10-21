@@ -55,7 +55,8 @@ previous batch's ids. Check `ads_task_stats` once with the profile live; thin it
 ## When XAE stalls
 `xae_dialogs` → read title/buttons → `xae_dialog_resolve button=...` (machine-affecting prompts need confirmation).
 A window with `buttons: null` (not a standard dialog, buttons unreadable) cannot be pressed by the tool: ask the user to
-close it in XAE. "XAE is busy (call rejected …) and did not run this call" → nothing ran: repeat the call.
+close it in XAE. "XAE is busy (call rejected …) and did not run this call … repeat it" → that step did not run: repeat
+the call. "… this call's earlier step(s) ran (…)" → those did: check the result (xae_status) before repeating it.
 
 ## XAE messages
 An action's result (activate, restart, build, create / delete, ConsumeXml, import, boot project, online commands) can

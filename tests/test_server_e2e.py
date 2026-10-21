@@ -1760,3 +1760,113 @@ async def test_review_0816_each_xae_call_carries_only_its_own_messages(tmp_path)
         str(ei.value) and str(ei.value).count("Error: timeout") == 1, str(ei.value)
 
 
+
+
+
+# ---- twelfth review of 0.8.16: xae_deploy / xae_activate_configuration / xae_restart_twincat / tcunit_run make one
+# XAE call per step; a later step's error lost what the earlier steps logged (the round-7 fix lived in the held error
+# log). The tool's error carries them.
+R12_ACT = "Warning: ADS error 0x745 (timeout) while downloading the configuration to 192.168.1.5.1.1"
+
+
+def _r12_setup(monkeypatch, project_dir, restart_fails: bool, verified: bool):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    app = srv._tcmcp_app
+    app.dialogs_now = lambda: []
+
+    async def nothing(*a, **kw):
+        return None
+
+    async def tgt(*a, **kw):
+        return "192.168.1.5.1.1"
+
+    async def saved(*a, **kw):
+        return {"saved": True}
+
+    async def witness(*a, **kw):
+        return {"app_timestamp": None}
+
+    async def verify(*a, **kw):
+        return {"verified": verified, "target_mode": "RUN" if verified else "CONFIG", "dialogs": [], "polls": 3,
+                "modes_seen": ["CONFIG"], "hint": None}
+    for k, v in {"permit": nothing, "xae_target_for": tgt, "check_targets": nothing, "save_verified": saved,
+                 "restart_witness": witness, "verify_target_after": verify}.items():
+        monkeypatch.setattr(app, k, v)
+
+    def build(clean, rebuild):
+        return {"success": True, "errors": 0, "warnings": 0, "duration_s": 1.0, "items": []}
+
+    def activate():
+        app.xae.messages.append({"action": "ActivateConfiguration", "messages": R12_ACT, "lines": [R12_ACT]})
+        return {"activated": True}
+
+    def restart():
+        if restart_fails:
+            app.xae.messages.append({"action": "StartRestartTwinCAT", "failed": True, "messages": "Error: timeout",
+                                     "lines": ["Error: timeout"]})
+            from twincat_mcp.xae_backend import XaeError
+            raise XaeError("StartRestartTwinCAT: E_FAIL — XAE messages (StartRestartTwinCAT): Error: timeout")
+        return {"restarted": True}
+    monkeypatch.setattr(app.xae, "build", build)
+    monkeypatch.setattr(app.xae, "activate_configuration", activate)
+    monkeypatch.setattr(app.xae, "restart_twincat", restart)
+    return srv
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("restart_fails,verified", [(True, True), (False, False)])
+async def test_review12_0816_a_tool_that_fails_after_an_action_keeps_its_xae_messages(monkeypatch, project_dir, restart_fails, verified):
+    srv = _r12_setup(monkeypatch, project_dir, restart_fails, verified)
+    async with client_for(srv) as s:
+        r = await s.call_tool("xae_deploy", {})
+    t = text(r)
+    assert r.is_error and "0x745" in t and "XAE messages of this call's earlier steps: ActivateConfiguration" in t, t
+    assert t.count("Error: timeout") <= 1, t
+
+
+@pytest.mark.anyio
+async def test_review12_0816_activate_with_a_dialog_after_keeps_its_xae_messages(monkeypatch, project_dir):
+    srv = _r12_setup(monkeypatch, project_dir, False, True)
+    app = srv._tcmcp_app
+
+    async def verify(*a, **kw):
+        return {"verified": False, "target_mode": "CONFIG", "polls": 3, "modes_seen": ["CONFIG"], "hint": None,
+                "dialogs": [{"title": "TcXaeShell", "text": "Activation failed"}]}
+    app.verify_target_after = verify
+    async with client_for(srv) as s:
+        r = await s.call_tool("xae_activate_configuration", {})
+    t = text(r)
+    assert r.is_error and "0x745" in t, t
+
+
+@pytest.mark.anyio
+async def test_review12_0816_a_busy_step_after_an_earlier_action_is_no_repeat_it(tmp_path):
+    """Twelfth review of 0.8.16: a rejected step after an action that ran — in the same XAE call or in an earlier XAE
+    call of the same tool — said 'did not run this call — repeat it', inviting the action a second time."""
+    from twincat_mcp import xae_backend as X
+    from twincat_mcp.server import App, ToolError, _tool_boundary
+    app = App(mk_cfg(tmp_path))
+    app.dialogs_now = lambda: []
+    app._dialog_hint = lambda: ""
+
+    def generate():
+        app.xae.acted.append("GenerateBootProject")
+        return {"generated": True}
+
+    def read():
+        raise X.XaeBusy(X.XaeBusy.busy_text("BootProjectAutostart", X.RPC_E_CALL_REJECTED, 0.3, []),
+                        what="BootProjectAutostart", busy=(X.RPC_E_CALL_REJECTED, 0.3))
+
+    async def two_calls():
+        await app.xae_call(generate)
+        await app.xae_call(read)
+    with pytest.raises(ToolError) as ei:
+        await _tool_boundary(two_calls)()
+    t = str(ei.value)
+    assert "this call's earlier step(s) ran (GenerateBootProject)" in t and "repeat it" not in t, t
+
+    async def one_read():
+        await app.xae_call(read)
+    with pytest.raises(ToolError, match="repeat it"):
+        await _tool_boundary(one_read)()

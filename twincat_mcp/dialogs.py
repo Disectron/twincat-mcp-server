@@ -401,8 +401,16 @@ class DialogWatchdog:
         return left
 
     def _record(self, kind: str, d: Dialog, button: str | None, ok: bool | None) -> None:
-        self.log.append({"ts": time.strftime("%H:%M:%S"), "event": kind, "title": d.title, "class": d.cls,
-                         "text": d.text[:200], "buttons": d.captions(), "button": button, "ok": ok})
+        if not d.identified:
+            # twelfth review of 0.8.16 (N176): the modal state no window could be named for was logged as a dialog
+            # with the main window's title and class ('Project15 - TcXaeShell', buttons null) — it is the shell's
+            # own frame, disabled: said as that
+            self.log.append({"ts": time.strftime("%H:%M:%S"), "event": kind, "unidentified": True,
+                             "note": UNIDENTIFIED, "main_window_title": d.title, "main_window_class": d.cls,
+                             "button": button, "ok": ok})
+        else:
+            self.log.append({"ts": time.strftime("%H:%M:%S"), "event": kind, "title": d.title, "class": d.cls,
+                             "text": d.text[:200], "buttons": d.captions(), "button": button, "ok": ok})
         if len(self.log) > 200:
             del self.log[:50]
 

@@ -118,10 +118,23 @@ class XaeBusy(XaeError):
     or a dialog holds it — the call did not run. Never read as 'no value' by a read that has a fallback (_get).
     dialog: the modal window that holds the shell (BLOCKED BY DIALOG), else None."""
 
-    def __init__(self, msg: str, dialog: dict[str, Any] | None = None, what: str = "") -> None:
+    def __init__(self, msg: str, dialog: dict[str, Any] | None = None, what: str = "",
+                 busy: tuple[int, float] | None = None) -> None:
         super().__init__(msg)
         self.dialog = dialog
         self.what = what
+        self.busy = busy                   # (HRESULT, seconds asked again) of a rejected call, else None
+
+    @staticmethod
+    def busy_text(what: str, hr: int, window: float, acted: list[str] | None = None) -> str:
+        """N174: a rejected call ran nothing — said as that. Twelfth review of 0.8.16: 'repeat it' only when nothing of
+        the call ran before it; after an action of the same call ran (boot_project's GenerateBootProject, then a
+        rejected read), repeating the call runs that action again."""
+        then = (f"this call's earlier step(s) ran ({', '.join(dict.fromkeys(acted))}): check the result before calling "
+                "again (xae_status)" if acted else "repeat it")
+        return (f"{what}: XAE is busy (call rejected, 0x{hr & 0xFFFFFFFF:08X}) and did not run this call — it was asked "
+                f"again for {window:g} s; {then}. If it keeps happening, a modal window or a long build holds the shell "
+                "(xae_dialogs)")
 
     @classmethod
     def blocked(cls, what: str, d: dict[str, Any]) -> "XaeBusy":
@@ -189,6 +202,9 @@ class XaeBackend:
         # what the System Manager logged during the actions of the current call (_sm_messages_of; the server empties it
         # before each XAE call and adds it to the result as xae_messages)
         self.messages: list[dict[str, Any]] = []
+        # the actions (once=True) that ran in the current call — the server empties it before each XAE call (a
+        # rejected step after them is no 'repeat it', twelfth review of 0.8.16)
+        self.acted: list[str] = []
         self.sysman: Any = None
         self.progid: str | None = None
         self.attached_at: float | None = None
@@ -222,7 +238,10 @@ class XaeBackend:
         reattached = refreshed = False
         while True:
             try:
-                return fn()
+                res = fn()
+                if once and isinstance(getattr(self, "acted", None), list):
+                    self.acted.append(what)            # it ran: a rejected step after it is no 'repeat it'
+                return res
             except Exception as exc:  # noqa: BLE001
                 hr = getattr(exc, "hresult", None)
                 if hr in _BUSY_HR and time.time() - t_start > min(1.0, window / 2):
@@ -238,10 +257,8 @@ class XaeBackend:
                     continue
                 if hr in _BUSY_HR:
                     # N174: a rejected call ran nothing — said as that, never as a defect or a missing value
-                    raise XaeBusy(
-                        f"{what}: XAE is busy (call rejected, 0x{hr & 0xFFFFFFFF:08X}) and did not run this call — it "
-                        f"was asked again for {window:g} s; repeat it. If it keeps happening, a modal "
-                        "window or a long build holds the shell (xae_dialogs)") from exc
+                    raise XaeBusy(XaeBusy.busy_text(what, hr, window, getattr(self, "acted", None)), what=what,
+                                  busy=(hr, window)) from exc
                 if hr in _GONE_HR and once:
                     self.dte = self.sysman = None
                     where = "the server could not re-attach yet"
