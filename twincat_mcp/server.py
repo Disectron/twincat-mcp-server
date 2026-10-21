@@ -433,7 +433,8 @@ class App:
         # N182 (0.8.15 retest): the Scope part of a recording is finished once — when the recording ends by itself
         # (a watcher) or at rec_stop, whichever comes first; the result is kept for the other
         self.scope_finishing: dict[str, Any] = {}           # recording id → the task finishing its Scope run
-        self.scope_stop_asked: set[str] = set()             # recordings a rec_stop is stopping (their Scope is its)
+        # recordings a rec_stop / rec_delete is stopping (their Scope part is theirs): how many such calls run
+        self.scope_stop_asked: dict[str, int] = {}
         self.scope_results: dict[str, dict[str, Any]] = {}  # recording id → the finished Scope part
         self.scope_finished_by: dict[str, str] = {}         # recording id → what started its Scope finish
         self.rec.rcfg = cfg.recorder
@@ -969,7 +970,8 @@ class App:
             raise ToolError(f"{exc} — the XAE call was NOT started; the shell is still busy with the earlier call "
                             "(a build, an activation or a modal dialog — xae_dialogs).") from exc
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise ToolError(f"{job}: XAE call timed out — " + await asyncio.to_thread(self._timeout_cause)) from exc
+            raise ToolError(f"{job}: XAE call timed out — "
+                            + await asyncio.to_thread(self._timeout_cause, _READ_ONLY_CALL.get())) from exc
         steps = _XAE_STEPS.get()
         if steps is not None:
             steps.append({"job": job, "acted": list(box["acted"]),
@@ -981,7 +983,7 @@ class App:
                 res = {**res, "open_dialogs": [_dialog_fields(d) for d in live[:5]]}
         return res              # N116: the binding's flags are added to the tool's own result (_tool_boundary)
 
-    def _timeout_cause(self) -> str:
+    def _timeout_cause(self, read_only: bool = True) -> str:
         """N173 (0.8.14 retest): a timed-out call said 'a modal dialog in the shell is the usual cause' from the
         watchdog's last list, which never had a non-#32770 window. The shell is looked at again now: the modal window by
         name, a main window that is disabled with no window to name, or no modal window at all."""
@@ -991,8 +993,11 @@ class App:
                     "shell is the usual cause")
         live = self.dialogs_now()
         if not live:
+            # thirteenth review of 0.8.16: 'then retry' after an action that is still running queued it a second time
             return ("no modal window is open in XAE now (its main window is not disabled): the call is still running "
-                    "inside the shell (a long build, activation or login?) — xae_status / xae_dialogs, then retry")
+                    "inside the shell (a long build, activation or login?) — xae_status / xae_dialogs, then "
+                    + ("retry" if read_only else "check its result when it is done; do not repeat it before (it would "
+                       "run a second time)"))
         return ("open in XAE now: " + "; ".join(f"{_dlg.label(d)} ({_dlg.buttons_text(d)}) "
                                                 f"{str(d.get('text', ''))[:160]!r}" for d in live[:3])
                 + (" — answer it with xae_dialog_resolve(button=...)" if any(d.get("buttons") is not None for d in live)
@@ -3218,16 +3223,56 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         try:
             r = await app.xae_call(app.xae.scope_action, "start", name or None, timeout=60)
         except ToolError as exc:
+            c = exc.__cause__
+            if isinstance(c, XaeBusy):
+                # thirteenth review of 0.8.16: the busy text's 'repeat it' meant a second rec_start — a second recording
+                from . import dialogs as _dlg
+                why = (f"a dialog holds the shell: {_dlg.label(c.dialog)}" if c.dialog else
+                       f"XAE is busy — call rejected, 0x{c.busy[0] & 0xFFFFFFFF:08X}, asked again for {c.busy[1]:g} s"
+                       if c.busy else "XAE refused it")
+                return {"error": f"Scope recording NOT started: XAE refused StartRecord ({why}; it did not run). The "
+                                 f"ADS recording {rid} runs regardless — do not "
+                                 "repeat rec_start (it would start a second recording): scope_record(action='start') "
+                                 "starts Scope once XAE is free (not linked to this recording), or rec_stop and "
+                                 "rec_start again"}
             return {"error": f"Scope recording NOT started: {exc}. The ADS recording {rid} runs regardless."}
         app.scope_runs[rid] = {"scope": r["scope"], "name": name or None, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
                                "start_result": r.get("result_code"), "log_mark": mark}
         app.audit("scope_start", {"id": rid, "scope": r["scope"]}, OpClass.EDIT, "ok")
-        app.scope_runs[rid]["watcher"] = asyncio.ensure_future(_scope_watch(rid))
+        app.scope_runs[rid]["watcher"] = _bg(_scope_watch(rid))
         return {"started": True, **r, "note": "Scope records independently (its own ADS acquisition and timestamps); "
                                               "it is stopped, saved and exported when the recording ends — by itself "
                                               "(duration, stop_when, post_trigger, max_events …) or at rec_stop"}
 
     SCOPE_WATCH_S = 0.5
+
+    def _bg(coro: Any) -> Any:
+        """A background task of the Scope part, in a context of its own — thirteenth review of 0.8.16: a task inherited
+        rec_start's XAE steps ('this call's earlier step(s) ran (Scope StartRecord)' in a stop minutes later)."""
+        return asyncio.get_running_loop().create_task(coro, context=contextvars.Context())
+
+    def _stop_hold(rid: str) -> None:
+        app.scope_stop_asked[rid] = app.scope_stop_asked.get(rid, 0) + 1
+
+    def _stop_release(rid: str) -> bool:
+        """-> whether no other rec_stop / rec_delete of rid runs now (thirteenth review: two rec_stops shared one flag,
+        and the second one's end took it from the first)."""
+        n = app.scope_stop_asked.get(rid, 0) - 1
+        if n > 0:
+            app.scope_stop_asked[rid] = n
+            return False
+        app.scope_stop_asked.pop(rid, None)
+        return True
+
+    # thirteenth review of 0.8.16: who ended a recording is the recorder's own stop reason (both engines keep the first
+    # reason given) — a tool's stop is never an end of its own, whether or not the tool was still there to finish Scope
+    _STOPPED_BY = {"manual (rec_stop)": "rec_stop", "deleted": "rec_delete"}
+
+    def _end_label(reason: Any, who: str | None = None) -> str:
+        tool = _STOPPED_BY.get(str(reason or "")) or (None if reason else who)
+        if tool:
+            return f"{tool} (the call ended before its Scope part — finished after it)"
+        return f"the recording ended by itself ({reason or 'no stop reason recorded'})"
 
     async def _scope_watch(rid: str) -> None:
         """N182 (0.8.15 retest): a recording that ends by itself — duration_s, stop_when, post_trigger_s, max_events, a
@@ -3236,18 +3281,23 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         while rid in app.scope_runs and rid not in app.scope_finishing:
             try:
                 st = await app.mem_call(app.rec.status, rid)
-            except Exception:  # noqa: BLE001 — the recording is gone (server restart, reaped): rec_stop finishes it
-                return
+            except Exception as exc:  # noqa: BLE001
+                if rid in app.scope_stop_asked:
+                    return                             # rec_delete / rec_stop has its Scope part
+                # thirteenth review of 0.8.16: the recorder no longer knows it — Scope is not left recording
+                st = {"active": False, "stop_reason": f"the recorder no longer knows the recording ({exc})"}
             if not st.get("active"):
                 if rid in app.scope_stop_asked:
                     # eleventh review: rec_stop is stopping it — the recording turns inactive at the start of its
                     # stop, and the watch took the stop for an end of its own ('ended by itself (manual (rec_stop))')
                     return
-                app.scope_runs.get(rid, {})["recording_ended"] = {
-                    "seen": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
-                    "stop_reason": st.get("stop_reason")}
+                reason = st.get("stop_reason")
+                if str(reason or "") not in _STOPPED_BY:
+                    app.scope_runs.get(rid, {})["recording_ended"] = {
+                        "seen": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
+                        "stop_reason": reason}
                 try:
-                    await _scope_finish_once(rid, by=f"the recording ended by itself ({st.get('stop_reason')})")
+                    await _scope_finish_once(rid, by=_end_label(reason))
                 except Exception:  # noqa: BLE001 — said in rec_status / rec_stop (the stored result)
                     log.exception("Scope finish of %s at the recording's end failed", rid)
                 return
@@ -3274,7 +3324,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         app.scope_finishing.pop(rid, None)
         return res
 
-    def _scope_finish_task(rid: str, by: str) -> Any:
+    def _scope_finish_task(rid: str, by: str, save: bool = True) -> Any:
         """The one task that finishes a recording's Scope part (N182) — started by whichever comes first, its result
         stored when it ends whoever awaits it (a rec_stop that was cancelled meanwhile included)."""
         t = app.scope_finishing.get(rid)
@@ -3282,17 +3332,25 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             return t
         app.scope_finished_by[rid] = by
         app.scope_runs[rid]["finished_by"] = by
-        t = asyncio.ensure_future(_scope_finish(rid))
+        t = _bg(_scope_finish(rid, save))
         app.scope_finishing[rid] = t
         t.add_done_callback(lambda f: _scope_result(rid, f, by))
         return t
 
-    async def _scope_finish_once(rid: str, by: str = "rec_stop") -> dict[str, Any] | None:
+    def _stop_refused(r: dict[str, Any] | None, rid: str) -> bool:
+        """The stored finish of rid did not stop Scope because XAE refused StopRecord (it did not run) — thirteenth
+        review of 0.8.16: such a failure was final, and a rec_stop with XAE free again never asked again."""
+        return bool(r and (r.get("stop") or {}).get("not_run") and rid in app.scope_runs)
+
+    async def _scope_finish_once(rid: str, by: str = "rec_stop", save: bool = True) -> dict[str, Any] | None:
         """_scope_finish once per recording (N182): at its own end or at rec_stop, whichever comes first — StopRecord
-        is never sent twice; the second caller gets the stored result."""
+        is never sent twice; the second caller gets the stored result — unless XAE refused StopRecord (it did not
+        run): then it is asked again."""
         if rid in app.scope_results:
-            return app.scope_results[rid]
-        t = _scope_finish_task(rid, by)
+            if not _stop_refused(app.scope_results[rid], rid):
+                return app.scope_results[rid]
+            app.scope_results.pop(rid)
+        t = _scope_finish_task(rid, by, save)
         if t is None:
             return app.scope_results.get(rid)
         try:
@@ -3301,23 +3359,25 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             pass
         return _scope_result(rid, t, app.scope_finished_by.get(rid, by))
 
-    async def _scope_after_stop(rid: str) -> None:
-        """Twelfth review of 0.8.16: a rec_stop cancelled or timed out before its Scope part — the watch had left it to
-        rec_stop, so Scope recorded on. The Scope part is finished once the recording has stopped; until then it is
-        watched as before."""
+    async def _scope_after_call(rid: str, who: str) -> None:
+        """Twelfth review of 0.8.16: a rec_stop (thirteenth: or rec_delete) that failed, was cancelled or timed out
+        before its Scope part — the watch had left the part to it, so Scope recorded on. A recording still running is
+        watched as before (its end says who ended it); one that has stopped is finished now."""
         try:
             st = await app.mem_call(app.rec.status, rid)
-        except Exception:  # noqa: BLE001 — the recording is gone: nothing tells when it ended
+        except Exception:  # noqa: BLE001 — the recording is gone: the call's own doing
             st = {"active": False}
         if st.get("active"):
             await _scope_watch(rid)
             return
-        t = _scope_finish_task(rid, "rec_stop (the call ended before its Scope part — finished after it)")
-        if t is not None:
-            try:
-                await asyncio.shield(t)
-            except Exception:  # noqa: BLE001 — stored by the task's end
-                log.exception("Scope finish of %s after an interrupted rec_stop failed", rid)
+        try:
+            await _scope_finish_once(rid, by=_end_label(st.get("stop_reason"), who))
+        except Exception:  # noqa: BLE001 — stored by the task's end
+            log.exception("Scope finish of %s after an interrupted %s failed", rid, who)
+
+    def _rec_on_disk(rid: str) -> bool:
+        rec = app.rec.recs.get(rid)
+        return (rec.path if rec is not None else app.rec.root / f"{rid}.jsonl").is_file()
 
     def _rec_id(rid: str) -> str:
         """The recording's full id (the recorder takes a unique prefix — twelfth review: a rec_stop by prefix finished
@@ -3329,6 +3389,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     def _scope_state(rid: str) -> dict[str, Any] | None:
         """rec_status / rec_list: the Scope part of a recording — recording, finishing, finished (N182)."""
+        if _stop_refused(app.scope_results.get(rid), rid):
+            r = app.scope_results[rid] or {}
+            return {"state": "recording", "scope": r.get("scope"), "stop_refused": str(r["stop"].get("error"))[:400],
+                    "note": "Scope did not stop: XAE refused StopRecord (it did not run) — rec_stop asks again"}
         if rid in app.scope_results:
             r = app.scope_results[rid] or {}
             out: dict[str, Any] = {"state": "finished", "finished_by": r.get("finished_by")}
@@ -3348,7 +3412,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return None
 
     async def _scope_save(name: str | None, svdx: Path, csv: Path, overwrite: bool = False,
-                          mark: dict[str, Any] | None = None, since: str = "the recording began") -> dict[str, Any]:
+                          mark: dict[str, Any] | None = None, since: str = "the recording began",
+                          exists_hint: str = "overwrite=true") -> dict[str, Any]:
         """SaveSVD, then the CSV FROM THE SAVED FILE with Beckhoff's export tool (N117: XAE's ExportCSV right after
         SaveSVD wrote a CSV that lacked the end of the .svdx — 600 ms, and 3 rows of a 58 s recording; exported from the
         .svdx, the CSV holds what the file holds). XAE's ExportCSV only when the tool is missing or fails, flagged.
@@ -3365,7 +3430,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             if st is None:
                 out["save_svd"] = {"error": str(exc)}
                 return out
-            return await _scope_reset(name, csv, overwrite, mark, st.group(1), str(exc), since)
+            return await _scope_reset(name, csv, overwrite, mark, st.group(1), str(exc), since, exists_hint)
         watch = await asyncio.to_thread(_settled, svdx)
         out["save_svd"]["size_watch"] = watch
         if watch.get("still_growing_after_s") or "note" in watch:
@@ -3385,14 +3450,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 out["export_csv"] = {"path": e["file"], "via": "TC3ScopeExportTool.exe from the saved .svdx",
                                      "lines": e["lines"], "provenance": e["provenance"],
                                      **{k: e[k] for k in ("warning", "exported_from_copy") if k in e}}
-                out["cross_check"] = await _scope_cross_check(name, csv, e["lines"], overwrite)
+                out["cross_check"] = await _scope_cross_check(name, csv, e["lines"], overwrite, exists_hint)
                 return out
             except S.ScopeError as exc:
                 failed = str(exc)
         if csv.exists() and not overwrite:
             # scope audit (0.8.13): the fallback wrote over an existing CSV (or counted the stale one as written)
-            out["export_csv"] = {"error": f"{csv.name} exists — XAE's ExportCSV was not run over it (overwrite=true "
-                                          "replaces it)", "export_tool": failed}
+            out["export_csv"] = {"error": f"{csv.name} exists — XAE's ExportCSV was not run over it ({exists_hint})",
+                                 "export_tool": failed}
             return out
         try:
             r = await app.xae_call(app.xae.scope_action, "export_csv", name, str(csv), timeout=600)
@@ -3407,7 +3472,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return out
 
     async def _scope_reset(name: str | None, csv: Path, overwrite: bool, mark: dict[str, Any] | None, state: str,
-                           raw: str, since: str = "the recording began") -> dict[str, Any]:
+                           raw: str, since: str = "the recording began",
+                           exists_hint: str = "overwrite=true") -> dict[str, Any]:
         """N180 (0.8.15 retest): after a TwinCAT RUN→CONFIG→RUN during the recording, SaveSVD answered 'Invalid
         ScopeState! Reply requested, actual: Config (HRESULT 0x80020009)' — a raw COM text, no .svdx, no CSV. Said as
         what it is (Scope was reset by the restart, at the time its log says), and XAE's ExportCSV of what Scope still
@@ -3417,10 +3483,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # is in now is no restart ('actual: Record' matched the recording's own start); and the log is said read only
         # when it was (scope_record save had no mark: 'names no reset since the recording began', with no recording)
         rx = re.compile(r"state changes from '[^']*' to 'Config'|ServerReset", re.I)
-        read = bool(mark and mark.get("path")) and await asyncio.to_thread(
-            lambda: any(Path(p).is_file() for p in [mark["path"]] + [m.get("path") for m in mark.get("family") or []]
-                        if p))
-        lines = await asyncio.to_thread(S.log_find_since, mark, rx) if read and state.lower() == "config" else []
+        # thirteenth review of 0.8.16: the log is searched only for a reset to Config, and said as read only when it
+        # was — a mark taken when the log could not be read, a log unreadable now: None (log_find_since)
+        config = state.lower() == "config"
+        found = await asyncio.to_thread(S.log_find_since, mark, rx) if config else None
+        lines = found or []
         when = None
         for _f, ln in lines:
             t = re.match(r"\((\d{4}-\d\d-\d\d)-(\d\d:\d\d:\d\d)", ln)
@@ -3430,9 +3497,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # (actual: Record, no reset line) is said as the state Scope is in, no restart invented
         cause = (f"Scope was reset to {state} by a TwinCAT restart at {when} (Scope View log)" if lines and when else
                  f"Scope was reset to {state} (Scope View log)" if lines else
-                 f"Scope is in state {state}, not Reply — the Scope View log names no reset since {since}" if read else
-                 f"Scope is in state {state}, not Reply (the Scope View log could not be read: whether TwinCAT was "
-                 "restarted is not known)")
+                 f"Scope is in state {state}, not Reply — the Scope View log names no reset since {since}"
+                 if config and found is not None else
+                 f"Scope is in state {state}, not Reply (the Scope View log is missing or could not be read: whether "
+                 "TwinCAT was restarted is not known)" if config else f"Scope is in state {state}, not Reply")
         out: dict[str, Any] = {"save_svd": {
             "error": cause + " — SaveSVD refused; nothing was saved as .svdx",
             "scope_state": state, "detail": raw[:500]}}
@@ -3440,7 +3508,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             out["save_svd"]["reset_seen"] = [ln[:200] for _f, ln in lines[-3:]]
         what = f"Scope was reset to {state}" if lines else f"Scope was in state {state}"
         if csv.exists() and not overwrite:
-            out["export_csv"] = {"skipped": f"{csv.name} exists — not written over (overwrite=true)"}
+            out["export_csv"] = {"skipped": f"{csv.name} exists — not written over ({exists_hint})"}
             return out
         try:
             r = await app.xae_call(app.xae.scope_action, "export_csv", name, str(csv), timeout=600)
@@ -3469,12 +3537,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         with open(p, "rb") as fh:
             return sum(1 for _ in fh)
 
-    async def _scope_cross_check(name: str | None, csv: Path, svdx_lines: int, overwrite: bool) -> dict[str, Any]:
+    async def _scope_cross_check(name: str | None, csv: Path, svdx_lines: int, overwrite: bool,
+                                 exists_hint: str = "overwrite=true") -> dict[str, Any]:
         """N117: XAE's ExportCSV of what Scope holds in memory, beside the CSV of the saved .svdx, and how their row
         counts compare — evidence either way (0.8.12: the in-memory CSV lacked the end; 0.8.13: the .svdx did)."""
         xcsv = csv.with_name(csv.name[:-4] + ".xae.csv") if csv.name.lower().endswith(".csv") else csv.with_suffix(".xae.csv")
         if xcsv.exists() and not overwrite:
-            return {"skipped": f"{xcsv.name} exists (overwrite=true replaces it)"}
+            return {"skipped": f"{xcsv.name} exists ({exists_hint})"}
         try:
             await app.xae_call(app.xae.scope_action, "export_csv", name, str(xcsv), timeout=600)
             xl = await asyncio.to_thread(_csv_rows, xcsv)
@@ -3516,7 +3585,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 return {"bytes": now, "grew_after_save": True, "still_growing_after_s": round(limit_s, 1),
                         "warning": "the .svdx was still being written — the CSV may lack its end"}
 
-    async def _scope_finish(rid: str) -> dict[str, Any] | None:
+    async def _scope_finish(rid: str, save: bool = True) -> dict[str, Any] | None:
         from . import scope as S
         run = app.scope_runs.pop(rid, None)
         if run is None:
@@ -3524,13 +3593,32 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         d = _scope_dir()
         svdx, csv = d / f"{rid}.svdx", d / f"{rid}.scope.csv"
         out: dict[str, Any] = {"scope": run["scope"]}
+        # thirteenth review of 0.8.16: Scope's files belong to the recording — none are saved for one that was deleted
+        # (rec_delete, also one interrupted before its Scope part)
+        keep = save and await asyncio.to_thread(_rec_on_disk, rid)
         try:
             r = await app.xae_call(app.xae.scope_action, "stop", run["name"], None, timeout=600)
             out["stop"] = {k: r[k] for k in ("result_code", "warning", "result_note") if k in r}
         except ToolError as exc:
             out["stop"] = {"error": str(exc)}
-            out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
+            if isinstance(exc.__cause__, XaeBusy):
+                # thirteenth review of 0.8.16: XAE refused StopRecord — it did not run, Scope still records: the run is
+                # kept, and the next rec_stop asks again (a refused call is the one that may be repeated)
+                out["stop"]["not_run"] = True
+                if keep:
+                    app.scope_runs[rid] = run
+                    out["note"] = "Scope did not stop: XAE refused StopRecord (it did not run) — rec_stop asks again"
+                else:
+                    out["note"] = ("Scope did not stop: XAE refused StopRecord (it did not run) — the recording was "
+                                   "deleted: scope_record(action='stop') stops Scope once XAE is free")
+            else:
+                out["note"] = "Scope did not stop — stop it in XAE and save it by hand (scope_record)"
         else:
+            if not keep:
+                out["note"] = "the recording was deleted: Scope was stopped, nothing was saved"
+                app.audit("scope_finish", {"id": rid, "scope": run["scope"], "saved": False}, OpClass.EDIT, "ok")
+                out["scope_stopped"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
+                return out
             out.update(await _scope_save(run["name"], svdx, csv, mark=run.get("log_mark")))
             out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv, out.get("svdx_incomplete"))
             app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
@@ -3974,17 +4062,20 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def rec_stop(id: str) -> dict[str, Any]:
         """Stop a recording, release the ADS notifications, finalize the file; returns status + stats."""
         rid = _rec_id(id)
-        app.scope_stop_asked.add(rid)
+        _stop_hold(rid)
+        done = False
         try:
             res = await app.rec_call(app.rec.stop, id, "manual (rec_stop)", timeout=60)
             app.audit("rec_stop", {"id": rid, "events": res.get("events")}, OpClass.EDIT, "ok")
             # N182: the Scope part runs once — a recording that ended by itself has it finished already (stored)
             sc = await _scope_finish_once(rid)
+            done = True
         finally:
-            app.scope_stop_asked.discard(rid)
-            if rid in app.scope_runs and rid not in app.scope_results and rid not in app.scope_finishing:
+            last = _stop_release(rid)
+            if not done and last and rid in app.scope_runs and rid not in app.scope_finishing and \
+                    rid not in app.scope_results:
                 # twelfth review of 0.8.16: cancelled or timed out before the Scope part — finished after it
-                asyncio.ensure_future(_scope_after_stop(rid))
+                _bg(_scope_after_call(rid, "rec_stop"))
         if sc is not None:
             res["scope"] = sc
         return res
@@ -4046,7 +4137,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 re.sub(r"[^\w.-]+", "_", scope or "scope") + "-" + time.strftime("%Y%m%d-%H%M%S"))
             mark = await asyncio.to_thread(S.log_mark, _view_log())
             r = await _scope_save(scope, Path(str(base) + ".svdx"), Path(str(base) + ".csv"), mark=mark,
-                                  since="this call began")
+                                  since="this call began", exists_hint="give scope_record another path")
             if "error" in r["save_svd"]:
                 # twelfth review of 0.8.16: what XAE's ExportCSV still got (a CSV written, or nothing) is part of the
                 # answer — it was dropped, and the CSV it wrote went unsaid
@@ -4096,8 +4187,22 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                     h.update(chunk)
             return {"file": str(path), "bytes": path.stat().st_size, "sha256": h.hexdigest(), "footer": K_footer(path)}
         fp = await asyncio.to_thread(_fingerprint)
-        res = await app.confirmed("rec_delete", {"id": path.stem, **fp}, OpClass.DESTRUCTIVE, app.rec_call(app.rec.delete, path.stem))
-        res["deleted_file_sha256"] = fp["sha256"]
+        rid = path.stem
+        _stop_hold(rid)                    # thirteenth review of 0.8.16: its Scope part is rec_delete's (no watch finish)
+        done = False
+        try:
+            res = await app.confirmed("rec_delete", {"id": rid, **fp}, OpClass.DESTRUCTIVE, app.rec_call(app.rec.delete, rid))
+            res["deleted_file_sha256"] = fp["sha256"]
+            if rid in app.scope_runs or rid in app.scope_finishing:
+                # Scope recorded with it: stopped, nothing saved (the recording it belonged to is gone)
+                res["scope"] = await _scope_finish_once(rid, by="rec_delete", save=False)
+            done = True
+        finally:
+            last = _stop_release(rid)
+            if not done and last and rid in app.scope_runs and rid not in app.scope_finishing and \
+                    rid not in app.scope_results:
+                # the delete failed or the call ended before the Scope part (the watch had left it to rec_delete)
+                _bg(_scope_after_call(rid, "rec_delete"))
         return res
 
 

@@ -292,23 +292,37 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
     return out
 
 
-def log_find_since(mark: dict[str, Any], rx: "re.Pattern[str]") -> list[tuple[str, str]]:
+def log_find_since(mark: dict[str, Any] | None, rx: "re.Pattern[str]") -> list[tuple[str, str]] | None:
     """The lines the Scope View logs (the family of the mark) got after `mark` that match rx: [(file name, line)] in
-    file order — e.g. the 'state changes … to Config' line of a TwinCAT restart (N180)."""
+    file order — e.g. the 'state changes … to Config' line of a TwinCAT restart (N180). None when that cannot be told:
+    no mark, a mark taken when the log could not be read (read from its start, a line of days ago was taken for this
+    run's — thirteenth review of 0.8.16), or a log of the family that cannot be read now. A log that begins otherwise
+    than at the mark (a new log) or is shorter is read from its start, as log_errors_since reads it."""
     if not mark or not mark.get("path"):
-        return []
-    marked = {m["path"]: m for m in (mark.get("family") or [mark]) if m.get("path")}
+        return None
+    family = mark.get("family") or [mark]
+    if any(m.get("error") or (m.get("path") and m.get("size") is None) for m in family):
+        return None
+    marked = {m["path"]: m for m in family if m.get("path")}
     paths = log_family(Path(mark["family_of"])) if mark.get("family_of") else [Path(mark["path"])]
     out: list[tuple[str, str]] = []
+    if not any(p.is_file() for p in paths):
+        return None                                    # no log at all (TE130x not here, or view_log elsewhere)
     for p in paths:
         m = marked.get(str(p)) or {"path": str(p), "size": 0}
         try:
             size = p.stat().st_size
-            start = m.get("size") or 0
-            start = 0 if size < start else start
+        except FileNotFoundError:
+            continue                                   # not written (yet): nothing new in it
+        except OSError:
+            return None
+        start = m.get("size") or 0
+        try:
+            if size < start or (start and m.get("head") and _head(p, int(m.get("head_bytes") or 0)) != m["head"]):
+                start = 0
             out += [(p.name, ln.strip()) for ln in _new_lines(p, start, size) if rx.search(ln)]
         except OSError:
-            continue
+            return None
     return out
 
 

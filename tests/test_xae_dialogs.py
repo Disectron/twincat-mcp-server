@@ -465,6 +465,38 @@ async def test_n173_a_timeout_names_the_modal_state_found_at_that_moment(monkeyp
         gate.set()
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("read_only", [True, False])
+async def test_review13_0816_a_timed_out_action_is_not_to_be_repeated(monkeypatch, project_dir, read_only):
+    """Thirteenth review: a call that times out with no modal window is still running in the shell — 'then retry' fits
+    a read; an action retried then is queued a second time behind the one still running."""
+    from twincat_mcp.server import _READ_ONLY_CALL
+    desk = _Desk()
+    _vs(desk, main_enabled=True)
+    desk.install(monkeypatch)
+    app = App(mk_cfg(project_dir))
+    app.xae.pid = 100
+    gate = threading.Event()
+
+    def hangs():
+        gate.wait(10)
+        return {}
+    tok = _READ_ONLY_CALL.set(read_only)
+    try:
+        with pytest.raises(ToolError) as ei:
+            await app.xae_call(hangs, timeout=1.5)
+    finally:
+        _READ_ONLY_CALL.reset(tok)
+        gate.set()
+    msg = str(ei.value)
+    assert "no modal window is open in XAE" in msg, msg
+    if read_only:
+        assert msg.endswith("xae_status / xae_dialogs, then retry"), msg
+    else:
+        assert "then check its result when it is done; do not repeat it before (it would run a second time)" in msg \
+            and "retry" not in msg, msg
+
+
 # --------------------------------------------------------------------------- N173: UI Automation through COM vtables
 import ctypes as _ct
 
