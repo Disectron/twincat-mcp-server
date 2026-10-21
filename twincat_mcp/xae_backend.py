@@ -2211,12 +2211,25 @@ class XaeBackend:
             notes.append(f"links not read: {why} — which variables are linked is unknown")
             res["note"] = " ".join(notes)
             return res
+        unread = {g["group"].casefold() for g in groups if g.get("error")}
+        if unread:
+            # review 2 of 0.8.18: a group whose XML could not be read has no variables here — its links are not
+            # 'links without a variable', and nothing about its variables is known
+            local = [x for x in local if x[0].casefold() not in unread]
         unlinked, orphans = _match_links(groups, local)
-        res.update(groups=groups, unlinked=unlinked, unlinked_count=len(unlinked), links_read=True,
-                   links_total=len(local), links_without_variable=orphans)
+        res.update(groups=groups, unlinked=unlinked, unlinked_count=None if unread else len(unlinked),
+                   links_read=True, links_total=len(local), links_without_variable=orphans)
+        if unread:
+            res["variables_read"] = "partly"
+            notes.append(f"{len(unread)} variable group(s) could not be read ({', '.join(sorted(g['group'] for g in groups if g.get('error')))}): "
+                         "their variables and links are not checked — unlinked lists the other groups only")
         if orphans:
             notes.append(f"{len(orphans)} link(s) name a variable this program no longer has (renamed or moved?) — "
                          "they move nothing")
+        partial = [f"{g['group']}^{v['name']}" for g in groups for v in g["variables"] if v.get("not_checked")]
+        if partial:
+            notes.append(f"{len(partial)} variable(s) linked part by part could not be checked for gaps (not_checked): "
+                         + ", ".join(partial[:10]))
         if notes:
             res["note"] = " ".join(notes)
         return res
@@ -2625,6 +2638,18 @@ def _instance_io_areas(xml: str) -> list[dict[str, Any]]:
         for sym in da.findall("Symbol"):
             base = (sym.findtext("BaseType") or "").strip()
             dims = [(int(a.findtext("LBound") or 0), int(a.findtext("Elements") or 0)) for a in sym.findall("ArrayInfo")]
+            if not dims:
+                # review 2 of 0.8.18: an array of a struct has no ArrayInfo — its dimensions are in the BaseType text
+                # ('ARRAY [1..2] OF Tc2_System.ST_AmsAddr' on the 0.8.17 retest's project)
+                m = re.match(r"\s*ARRAY\s*\[([^\]]+)\]\s*OF\s+(.+)$", base, re.I)
+                if m:
+                    try:
+                        for rng in m.group(1).split(","):
+                            lo, hi = (int(x) for x in rng.split(".."))
+                            dims.append((lo, hi - lo + 1))
+                        base = m.group(2).strip()
+                    except ValueError:
+                        dims = []
             v: dict[str, Any] = {"name": (sym.findtext("Name") or "").strip(),
                                  "type": (f"ARRAY [{', '.join(f'{lb}..{lb + n - 1}' for lb, n in dims)}] OF {base}"
                                           if dims else base)}
@@ -2694,6 +2719,12 @@ def _match_links(groups: list[dict[str, Any]], local: list[tuple[str, str, str]]
                 unlinked.append({"group": g["group"], "name": v["name"], "type": v["type"]})
                 continue
             dims = v.get("dims") or []
+            # review 2 of 0.8.18: what is linked part by part and cannot be checked here is said, not counted as linked
+            if v["linked_to"] is None and any(lk["part"].startswith(".") for lk in v["links"]) and not dims:
+                v["not_checked"] = "linked member by member: whether every member is linked is not checked"
+            elif v["linked_to"] is None and dims and not (len(dims) == 1 and 0 < dims[0][1] <= 4096):
+                v["not_checked"] = ("a multi-dimensional array: its elements' links are listed, gaps not checked"
+                                    if len(dims) > 1 else "more than 4096 elements: gaps not checked")
             if v["linked_to"] is None and len(dims) == 1 and 0 < dims[0][1] <= 4096:
                 lb, n = dims[0]
                 seen = set()

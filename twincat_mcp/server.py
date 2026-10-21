@@ -937,7 +937,7 @@ class App:
                 earlier = [m for m in (be.messages if keep else []) if not m.get("failed") and m.get("messages")]
                 if earlier:            # review of 0.8.16: what the call's earlier steps logged, not only the last one's
                     more = " — XAE messages of the steps before it: " + "; ".join(
-                        f"{m['action']}: {m['messages'][:500]}" for m in earlier)
+                        f"{m['action']}{_msg_mark(m)}: {m['messages'][:500]}" for m in earlier)
                     new = copy.copy(exc)               # keeps what the error carries (XaeBusy.dialog, N181)
                     new.args = (f"{exc}{more}",)
                     new.steps_note = getattr(exc, "steps_note", "") + more
@@ -2229,8 +2229,8 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
             # twelfth review of 0.8.16: a tool that failed after XAE calls that logged messages (an activation's ADS
             # error, then a restart that failed) — what they logged is part of the error
             told = str(exc)
-            more = [f"{m.get('action')}: {str(m['messages'])[:500]}" for st in steps for m in st["messages"]
-                    if m.get("messages") and str(m["messages"])[:200] not in told]
+            more = [f"{m.get('action')}{_msg_mark(m)}: {str(m['messages'])[:500]}" for st in steps
+                    for m in st["messages"] if m.get("messages") and str(m["messages"])[:200] not in told]
             if more:
                 raise ToolError(f"{told} — XAE messages of this call's earlier steps: " + "; ".join(more)) from exc
             raise
@@ -2289,6 +2289,11 @@ class _NotRun(ToolError):
     before it started (a dialog an earlier call opened holds XAE; the worker is busy with another call). Repeating it
     runs it once — fourteenth review of 0.8.16: only the busy refusal was told apart, so a Scope stop refused while a
     dialog held XAE was final and Scope recorded on."""
+
+
+def _msg_mark(m: dict[str, Any]) -> str:
+    """Review 2 of 0.8.18: messages read after a failed before-read keep their mark wherever they are quoted."""
+    return " (may include earlier calls' — the read before it failed)" if m.get("messages_note") else ""
 
 
 class _HalfDone(ToolError):
@@ -3676,7 +3681,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if h.get("rid"):
             rid, st = h["rid"], h["state"]
             how = {"stop_refused": f"its StopRecord was refused (XAE busy or a dialog) — rec_stop(id='{rid}') asks again",
-                   "stop_unknown": "its StopRecord's outcome is unknown (a dialog held it, or it timed out): Scope may "
+                   "stop_unknown": "its StopRecord's outcome is unknown (a dialog held it, it timed out, or the shell "
+                                   "went away / failed after it acted): Scope may "
                                    "still record — check XAE's Scope View; scope_record(action='stop') or "
                                    "action='disconnect' takes Scope over"}.get(
                 st, f"it ends with that recording (rec_status(id='{rid}'), or rec_stop(id='{rid}'))")
@@ -4155,12 +4161,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         _scope_release("scope_record disconnect")
         return {k: r[k] for k in ("scope", "result_code", "warning", "result_note") if k in r}
 
-    def _scope_release(by: str) -> None:
+    def _scope_release(by: str) -> list[str]:
         """A stop_unknown part (StopRecord may have run) holds Scope until the user takes it over in a way that leaves
-        it stopped: scope_record stop / disconnect / new."""
+        it stopped: scope_record stop / disconnect / new. -> the recordings released."""
+        out = []
         for part in list(app.scope_parts.values()):
             if part.state == "stop_unknown" and not part.run.get("released_by"):
                 part.run["released_by"] = f"{by} ({dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')})"
+                out.append(part.rid)
+        return out
 
     async def _scope_new(name: str | None) -> dict[str, Any]:
         """Disconnect, then StartRecord at once — a Scope recording on its own (linked to no ADS recording); it owns
@@ -4184,10 +4193,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                             "scope_record(action='stop')") from exc
         except ToolError as exc:
             raise _HalfDone(f"Scope was disconnected (what it held is discarded); StartRecord failed ({exc})") from exc
+        app.scope_standalone = {"action": "new", "scope": name, "since": since}   # review 2: before the check
         state, how = await _start_check(mark)
         if state is not None:
+            app.scope_standalone = None
             raise _HalfDone("Scope was disconnected; " + _start_refused_text(state, how, r.get("result_code"), None))
-        app.scope_standalone = {"action": "new", "scope": name, "since": since}
         app.audit("scope_record", {"action": "start", "scope": name}, OpClass.EDIT, "ok")
         out.update(started=True, scope=r.get("scope"), start_check=how,
                    note="a Scope recording on its own, linked to no recording: scope_record(action='stop') then "
@@ -4830,22 +4840,27 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 else:
                     r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
                 if action == "start":
+                    # review 2 of 0.8.18: StartRecord ran — Scope is this run's from here on (a call cancelled
+                    # during the check left Scope recording with no owner)
+                    app.scope_standalone = {"action": "start", "scope": scope,
+                                            "since": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
                     state, how = await _start_check(mark)
                     if state is not None:
+                        app.scope_standalone = None
                         err = _start_refused_text(state, how, r.get("result_code"), None)
                         app.audit("scope_record", {"action": action, "scope": scope}, OpClass.EDIT, "error", err)
                         raise ToolError(err)
                     r = {k: v for k, v in r.items() if k != "result_note"}
                     r["start_check"] = how
-                    app.scope_standalone = {"action": "start", "scope": scope,
-                                            "since": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
                 else:
                     # StopRecord ran: Scope holds this data (Reply) until it is disconnected — the next recording with
                     # Scope asks first, as after a recording (N186)
                     app.scope_standalone = None
-                    _scope_release("scope_record stop")
+                    released = _scope_release("scope_record stop")
                     if app.scope_left is None:
-                        app.scope_left = {"rid": None, "scope": scope, "name": scope, "saved": None, "choice": "pause"}
+                        # review 2 of 0.8.18: after a stop_unknown part, what Scope holds is that recording's capture
+                        app.scope_left = {"rid": released[0] if released else None, "scope": scope, "name": scope,
+                                          "saved": None, "choice": "pause"}
             finally:
                 _scope_unclaim(claim)
         elif action == "save":

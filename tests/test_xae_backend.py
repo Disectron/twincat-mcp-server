@@ -2135,3 +2135,52 @@ def test_n192_what_cannot_be_read_is_said_never_counted_as_zero(monkeypatch):
 def test_n193_plc_split_takes_the_instance_path():
     assert X._plc_split("TIPC^Plc^Plc Instance") == ("TIPC^Plc", "TIPC^Plc^Plc Project")
     assert X._plc_split("TIPC^Plc^Plc Instance^PlcTask Inputs") == ("TIPC^Plc^Plc Instance^PlcTask Inputs",) * 2
+
+
+def test_r2_links_what_cannot_be_checked_is_said(monkeypatch):
+    """Review 2 of 0.8.18: an array of a struct (no ArrayInfo — its dimensions are in the BaseType text, as on the
+    retest's project), a 2-D array and a struct linked member by member were counted as linked without a word."""
+    xml = ('<TreeItem><TcModuleInstance><Module><DataAreas><DataArea><AreaNo AreaType="InputDst">0</AreaNo>'
+           '<Name>PlcTask Inputs</Name>'
+           '<Symbol><Name>GVL_IO.astAddr</Name><BitSize>128</BitSize>'
+           '<BaseType>ARRAY [1..2] OF Tc2_System.ST_AmsAddr</BaseType></Symbol>'
+           '<Symbol><Name>GVL_IO.aGrid</Name><BitSize>32</BitSize><BaseType>BOOL</BaseType>'
+           '<ArrayInfo><LBound>1</LBound><Elements>2</Elements></ArrayInfo>'
+           '<ArrayInfo><LBound>1</LBound><Elements>2</Elements></ArrayInfo></Symbol>'
+           '<Symbol><Name>GVL_IO.stTerm</Name><BitSize>64</BitSize><BaseType>ST_Term</BaseType></Symbol>'
+           '</DataArea></DataAreas></Module></TcModuleInstance></TreeItem>')
+    mapping = ('<VarLinks><OwnerA Name="TIPC^Plc^Plc Instance"><OwnerB Name="TIID^T">'
+               '<Link VarA="PlcTask Inputs^GVL_IO.astAddr[1]" VarB="InfoData^AdsAddr"/>'
+               '<Link VarA="PlcTask Inputs^GVL_IO.aGrid[1,1]" VarB="Channel 1^Input"/>'
+               '<Link VarA="PlcTask Inputs^GVL_IO.stTerm.nState" VarB="InfoData^State"/>'
+               '</OwnerB></OwnerA></VarLinks>')
+    be, _dte, sm = _xae_with(monkeypatch, _MapSysMan(mapping))
+    sm.items["TIPC^Plc^Plc Instance"] = FakeItem("Plc Instance", "TIPC^Plc^Plc Instance", xml=xml)
+    r = be.links("TIPC^Plc")
+    v = {x["name"]: x for x in r["groups"][0]["variables"]}
+    assert v["GVL_IO.astAddr"]["type"] == "ARRAY [1..2] OF Tc2_System.ST_AmsAddr"
+    assert v["GVL_IO.astAddr"]["unlinked_elements"] == ["[2]"]
+    assert {"group": "PlcTask Inputs", "name": "GVL_IO.astAddr[2]", "type": "Tc2_System.ST_AmsAddr"} in r["unlinked"]
+    assert "multi-dimensional" in v["GVL_IO.aGrid"]["not_checked"]
+    assert "member by member" in v["GVL_IO.stTerm"]["not_checked"]
+    assert "could not be checked for gaps" in r["note"] and "PlcTask Inputs^GVL_IO.aGrid" in r["note"]
+
+
+def test_r2_links_an_unreadable_group_is_no_zero(monkeypatch):
+    """Review 2 of 0.8.18: in the tree-children layout a group whose XML could not be read counted as read — '0
+    unlinked', and its links were said to name variables the program no longer has."""
+    class _BadXml(FakeItem):
+        def ProduceXml(self, _=False):
+            raise ComError(-2147467259, "Unspecified error")
+    inputs = _BadXml("PlcTask Inputs", "TIPC^Plc^Plc Instance^PlcTask Inputs")
+    outputs = FakeItem("PlcTask Outputs", "TIPC^Plc^Plc Instance^PlcTask Outputs",
+                       xml='<TreeItem><VarGrp><Var><Name>GVL_IO.bPump</Name><Type>BOOL</Type></Var></VarGrp></TreeItem>')
+    mapping = ('<VarLinks><OwnerA Name="TIPC^Plc^Plc Instance"><OwnerB Name="TIID^T">'
+               '<Link VarA="PlcTask Inputs^GVL_IO.bStart" VarB="Channel 1^Input"/>'
+               '<Link VarA="PlcTask Outputs^GVL_IO.bPump" VarB="Channel 2^Output"/></OwnerB></OwnerA></VarLinks>')
+    be, _dte, sm = _xae_with(monkeypatch, _MapSysMan(mapping))
+    sm.items["TIPC^Plc^Plc Instance"] = FakeItem("Plc Instance", "TIPC^Plc^Plc Instance", [inputs, outputs])
+    r = be.links("TIPC^Plc")
+    assert r["unlinked_count"] is None and r["variables_read"] == "partly", r
+    assert r["links_without_variable"] == [] and "could not be read (PlcTask Inputs)" in r["note"], r
+    assert r["groups"][1]["variables"][0]["linked_to"] == "TIID^T^Channel 2^Output"
