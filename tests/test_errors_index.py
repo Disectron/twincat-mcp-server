@@ -1381,3 +1381,15 @@ def test_review4_0816_kb_search_says_when_the_plugin_note_is_of_another_code_spa
     assert "does not apply" in r["known_error"].get("code_note", ""), r["known_error"]
     for d in k.search("ADS error 6 on port 851")["known_error"]["documented"]:
         assert "texts_note" not in d, d
+
+
+def test_review5_0816_tccom_loader_codes_and_failed_at(kb, tmp_path):
+    """Fifth review of 0.8.16: (3) the TcCOM loader's 0xC000xxxx codes (documented in tc3_c) and 'failed at 0x…' were
+    no longer read; (7) 'LabVIEW error 1808' got the plugin's ADS note though the message names another code space."""
+    from twincat_mcp import knowledge as K
+    for q in ("Loading TcCOM module 'Untitled1.tmx' failed (0xC0000428)", "failed at 0x98110745"):
+        assert X.read_query(q)["codes"], q
+    assert X.read_query("TCMARK_STOP 0xC0000000")["codes"] == []
+    r = K.Knowledge(tmp_path / "home", str(kb)).search("LabVIEW error 1808")
+    ke = r.get("known_error") or {}
+    assert ke["code"].startswith("ADS return code 0x710") and "may not apply" in ke["code_note"], ke

@@ -1516,11 +1516,12 @@ _PYADS = re.compile(r"\badserror\b\s*:[^\n]{0,200}?\((-?\d+)\)", re.I)        # 
 
 # an HRESULT written as one: 0x8…/0x9…/0xC… with 8 hex digits ('ConsumeXml failed (0x98510004)') — a code wherever it
 # stands (third review of 0.8.16); an address or an index is written otherwise
-_HRESULT_TOKEN = re.compile(r"0[xX](?:98[0-9A-Fa-f]{2}|800[0-7]|8004)(?!0000)[0-9A-Fa-f]{4}")
+_HRESULT_TOKEN = re.compile(r"0[xX](?:98[0-9A-Fa-f]{2}|800[0-7]|8004|[Cc]000)(?!0000)[0-9A-Fa-f]{4}")
 # fourth review of 0.8.16: 'invalid index offset 0x80000000', 'at address 0x8C2A1F00', 'IG:0x80000001' were read as
-# codes — an HRESULT is of a facility (0x9811 ADS, 0x9851 System Manager, 0x8007 Win32, 0x8000/0x8001/0x8004 COM),
-# never 0x…0000, and never right after a word that makes it an index group, an offset, an address or a handle
-_NOT_HRESULT_BEFORE = re.compile(r"\b(?:ig|igrp|group|indexgroup|offset|ioffs|io|address|addr|adr|at|pointer|ptr|"
+# codes — an HRESULT is of a facility (0x9811 ADS, 0x9851 System Manager, 0x8007 Win32, 0x8000/0x8001/0x8004 COM,
+# 0xC000 the TcCOM loader's NTSTATUS codes — fifth review: 'Loading … failed (0xC0000428)'), never 0x…0000, and never
+# right after a word that makes it an index group, an offset, an address or a handle ('at' is none: 'failed at 0x…')
+_NOT_HRESULT_BEFORE = re.compile(r"\b(?:ig|igrp|group|indexgroup|offset|ioffs|io|address|addr|adr|pointer|ptr|"
                                  r"handle|crc|checksum|mark)\W{0,3}$", re.I)
 
 
@@ -1604,6 +1605,12 @@ def _domains(con: sqlite3.Connection) -> dict[str, dict[str, Any]]:
                              "names": list(spec.get("names", ())), "hints": list(spec.get("hints", ())), "codes": 0,
                              "rows": 0, "variants": 0, "links": 0, "note": spec.get("note")})
     return out
+
+
+def named_domains(q: str) -> list[str]:
+    """The domains a message names by their names ('LabVIEW error 1808' → labview) — without an index."""
+    qn = _norm_words(q)
+    return [d for d, spec in DOMAINS.items() if any(f" {n} " in qn for n in spec.get("names", ()))]
 
 
 def _named(qn: str, doms: dict[str, dict[str, Any]]) -> list[str]:

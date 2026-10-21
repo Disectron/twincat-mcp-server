@@ -1083,6 +1083,14 @@ class Knowledge:
                                                 "say which")}
                 err = dict(err) if err else {"code": code}
                 err["documented"] = doc
+            if err and not doc and str(err.get("code") or "").startswith("ADS"):
+                other = [d for d in X.named_domains(q) if d != "ads"]
+                if other and "ads" not in X.named_domains(q):
+                    # fifth review of 0.8.16: 'LabVIEW error 1808' got the plugin's ADS note — the message names
+                    # another code space, which documents no such code
+                    err = {**err, "code_note": (f"the plugin's note is for {err.get('code')}; the message names "
+                                                f"{', '.join(other)}, which documents no such code — the note may not "
+                                                "apply")}
             names = message_names(q)
             for w in informative:
                 ignored.setdefault(w, "error message text (not a name of the code)")
