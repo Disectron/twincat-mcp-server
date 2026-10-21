@@ -431,6 +431,9 @@ def _names_in(q: list[str], s: list[str]) -> bool:
 _TREE_ITEM = re.compile(r"([A-Za-z][\w\-]*(?: [\w\-]+){0,3}?) \(([A-Za-z][\w.\- ]{0,40})\)")
 # a tree item an error text names without quotes: '<Word> <number> (<type>)'
 _TEXT_ITEM = re.compile(r"(?<![\w^'\"])([A-Z][A-Za-z]+ \d+ \([A-Za-z][\w.\-]{1,40}\))")
+# TwinCAT's own item words with their number, in any case ('term 5', 'Box 2')
+_TREE_WORD_ITEM = re.compile(r"(?i)(?<![\w^])(?:term|box|device|drive|axis|module|channel|coupler|slot|task) \d+"
+                             r"(?: ?\([A-Za-z][\w.\- ]{0,40}\))?(?![\w])")
 # how a question names a tree item it has not seen in an error: 'Term 4 (EL2008)', 'Term 4', 'Device 1', 'Pump
 # (EL7041)' — capitalised as the tree writes it ('port 851' is no item; an item an error is of is matched whatever case)
 _QUESTION_ITEM = re.compile(r"(?<![\w^])(?:[A-Z][A-Za-z\-]+ \d+(?: ?\([A-Za-z][\w.\- ]{0,40}\))?"
@@ -453,9 +456,29 @@ def _is_subject(v: str, quoted: bool = False) -> bool:
         bool(_ST_PATH.fullmatch(v)) or bool(_TREE_PATH.fullmatch(v)) or (quoted and bool(_TREE_ITEM.fullmatch(v))))
 
 
+def _tnorm(text: str) -> str:
+    """Text as tree items are compared: lower case, single spaces, one space before '(' — 'Term 4(EL2008)' is
+    'term 4 (el2008)' (ninth review of 0.8.16)."""
+    return re.sub(r"\s*\(\s*", " (", re.sub(r"\s+", " ", text.strip().lower()))
+
+
 def _tree_segs(path: str) -> list[str]:
-    """A tree path's parts as compared: lower case, single spaces."""
-    return [re.sub(r"\s+", " ", x.strip().lower()) for x in path.split("^")]
+    """A tree path's parts as compared (_tnorm)."""
+    return [_tnorm(x) for x in path.split("^")]
+
+
+def _path_in(path: str, qf: str) -> bool:
+    """The question (_tnorm) names the error's tree path or an item on it: a run of its parts — from its root or from
+    an item, at least two parts — that the question writes and does not continue below ('…^Plc1 Project fail?' names
+    TIPC^Plc1^Plc1 Project; '…^Device 1 (EtherCAT)^Term 9' is neither Term 4 nor Device 1). Ninth review of 0.8.16:
+    the question's path was cut at the first space of its last part and compared part by part without its root."""
+    segs = _tree_segs(path)
+    for j in range(len(segs)):
+        for k in range(len(segs), j + 1, -1):
+            run = "^".join(segs[j:k])
+            if re.search(rf"(?<![\w^]){re.escape(run)}(?![\w^(])(?! \()", qf):
+                return True
+    return False
 
 
 def _question_paths(query: str) -> list[tuple[str, int, int]]:
@@ -466,36 +489,52 @@ def _question_paths(query: str) -> list[tuple[str, int, int]]:
         parts = m.group(0).split("^")
         last = parts[-1].lstrip()
         t = _TREE_ITEM.match(last)
-        parts[-1] = t.group(0) if t else re.split(r"\s", last, maxsplit=1)[0].rstrip("?.,;:!'\"")
+        if t:
+            parts[-1] = t.group(0)
+        else:
+            # an untyped last part: its words while they are capitalised or numbers ('Plc1 Project fail' → 'Plc1
+            # Project', 'Axis 1 error' → 'Axis 1') — only how the path is reported; it is matched by _path_in
+            words = []
+            for w in last.split():
+                w2 = w.rstrip("?.,;:!'\"")
+                if words and not (w2[:1].isupper() or w2.isdigit()):
+                    break
+                words.append(w2)
+                if w2 != w:
+                    break
+            parts[-1] = " ".join(words)
         path = "^".join(parts)
         out.append((path, m.start(), m.start() + len(path)))
     return out
 
 
-def _tree_items(subjects: list[str], text: str = "") -> list[str]:
-    """The tree items (with their type) an error is of: the typed parts of its tree paths ('TIID^Device 1
-    (EtherCAT)^Term 4 (EL2008)'), the typed items it quotes, and the '<Word> <number> (<type>)' items its text names."""
-    out: list[str] = []
+def _tree_items(subjects: list[str], text: str = "") -> tuple[list[str], list[str]]:
+    """The tree items (with their type) an error is of -> (the typed parts of its tree paths ('TIID^Device 1
+    (EtherCAT)^Term 4 (EL2008)'): their place is known; the typed items it quotes and the '<Word> <number> (<type>)'
+    items its text names: their place is not)."""
+    on_path: list[str] = []
+    loose: list[str] = []
     for x in subjects:
         if _TREE_PATH.fullmatch(x.strip()):
-            out += [seg.strip() for seg in x.split("^")[1:] if _TREE_ITEM.fullmatch(seg.strip())]
+            on_path += [seg.strip() for seg in x.split("^")[1:] if _TREE_ITEM.fullmatch(seg.strip())]
         elif _TREE_ITEM.fullmatch(x.strip()):
-            out.append(x.strip())                   # quoted in the error's text
-    out += _TEXT_ITEM.findall(text)
-    return list(dict.fromkeys(out))
+            loose.append(x.strip())                 # quoted in the error's text
+    loose += _TEXT_ITEM.findall(text)
+    return list(dict.fromkeys(on_path)), [x for x in dict.fromkeys(loose) if x not in on_path]
 
 
-def _item_in(item: str, qn: str) -> bool:
-    """The question (lower case, single spaces) names the tree item: whole ('term 4 (el2008)') or by its name
-    ('term 4' — not 'term 41', not 'term 4 (el1008)', which names another type)."""
+def _item_in(item: str, qn: str, in_path: bool = True) -> bool:
+    """The question (_tnorm) names the tree item: whole ('term 4 (el2008)') or by its name ('term 4' — not 'term 41',
+    not 'term 4 (el1008)', which names another type) — and not as a parent of a deeper part ('device 1
+    (ethercat)^term 9'). in_path false (an item whose place in the tree is known): not as the end of a question's
+    path either — that path is compared as a path (_path_in)."""
     m = _TREE_ITEM.fullmatch(item.strip())
     if not m:
         return False
-    full = re.sub(r"\s+", " ", item.strip().lower())
-    if re.search(rf"(?<!\w){re.escape(full)}(?!\w)", qn):
+    before = r"(?<![\w^])" if not in_path else r"(?<!\w)"
+    if re.search(rf"{before}{re.escape(_tnorm(item))}(?!\w)(?! ?\^)", qn):
         return True
-    name = re.sub(r"\s+", " ", m.group(1).lower())
-    hit = re.search(rf"(?<!\w){re.escape(name)}(?!\w)( ?\()?", qn)
+    hit = re.search(rf"{before}{re.escape(_tnorm(m.group(1)))}(?!\w)( ?\(| ?\^)?", qn)
     return bool(hit) and not hit.group(1)
 
 
@@ -508,6 +547,12 @@ def _call_subjects(arguments: dict[str, Any]) -> list[str]:
             continue
         vals = list(v) if isinstance(v, (list, tuple)) else list(v.keys()) if isinstance(v, dict) else [v]
         out += [x.strip() for x in vals if isinstance(x, str) and _is_subject(x)]
+    # ninth review of 0.8.16: a call that creates an item (xae_tree_create_child(parent_path, name)) is of the new item
+    name = arguments.get("name")
+    for k, v in arguments.items():
+        if isinstance(v, str) and isinstance(name, str) and name.strip() and str(k).lower() == "parent_path" and \
+                _TREE_PATH.fullmatch(v.strip()) and "^" not in name:
+            out.append(f"{v.strip()}^{name.strip()}")
     return list(dict.fromkeys(out))[:50]
 
 
@@ -857,12 +902,12 @@ class App:
                 # eighth review of 0.8.16: the build releases its lock before its process exits — in that moment
                 # kb_status said complete and kb_rebuild 'already running'. A builder without its lock is starting
                 # (the index is not complete yet: running) or ending (complete: its exit is waited for)
-                st = self.kb.errors_state()
-                if st["state"] == "complete" and not st.get("rebuild"):
-                    try:
-                        p.wait(timeout=5.0)
-                    except subprocess.TimeoutExpired:
-                        pass
+                # ninth review: whatever the build left (complete, or failed its checks) — a starting builder takes
+                # its lock within this second, an ending one exits
+                try:
+                    p.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
             if p is not None and p.poll() is None:
                 return {"started": False, "already_running": {"pid": p.pid},
                         "message": "an errors-index build this server started is still running (kb_status shows it)"}
@@ -1062,10 +1107,12 @@ class App:
         if m:
             low_names = {n.lower() for n in names}
             # eighth review of 0.8.16: 'the last Term 5 error' lost its item; 'the last 3 errors' gave one
-            q_items = _QUESTION_ITEM.findall(m.group("q"))
+            q_items = list(dict.fromkeys(_QUESTION_ITEM.findall(m.group("q")) + _TREE_WORD_ITEM.findall(m.group("q"))))
             item_words = {w.lower() for x in q_items for w in re.findall(r"[\w\-]+", x)}
-            nums = [int(w) for w in re.findall(r"\d+", m.group("q")) if not any(w in x for x in q_items)]
-            count = max(1, min(nums[0], 10)) if nums else 1
+            # ninth review of 0.8.16: a count is a number of its own as the first word ('the last 3 errors') — not the
+            # digit of a name ('the last fbValve2 error', 'aValves[3]', 'EL2008') nor an item's ('the last term 5 error')
+            first = m.group("q").split()[:1]
+            count = max(1, min(int(first[0]), 10)) if first and first[0].isdigit() and not q_items else 1
             words = [w for w in re.split(r"[\s-]+", m.group("q")) if w and w.strip("()").lower() not in item_words]
 
             def kind(w: str) -> bool:
@@ -1083,7 +1130,7 @@ class App:
             rest = rest[:a] + " " + rest[b:]            # a path's parts are compared as the path, not one by one
         if m is not None:
             rest = rest.replace(m.group(0), " ")
-        items = list(dict.fromkeys(q_items + [x for x in _QUESTION_ITEM.findall(rest)
+        items = list(dict.fromkeys(q_items + [x for x in _QUESTION_ITEM.findall(rest) + _TREE_WORD_ITEM.findall(rest)
                                               if "(" in x or x.split()[0].lower() in _TREE_WORDS]))
         # the type of a tree item the question names is part of that name ('Term 4 (EL2008)', 'Drive 3
         # (AX5206-0000-0200)'), not a name of its own; a path's parts neither
@@ -1092,7 +1139,7 @@ class App:
         names = [n for n in names if not any(n.lower() in t for t in types)
                  and not any(n.lower() in pth.lower() for pth, _a, _b in paths)]
         return {"names": names, "items": items, "paths": [pth for pth, _a, _b in paths],
-                "qn": re.sub(r"\s+", " ", (rest + " " + " ".join(q_items)).lower()), "last": m is not None,
+                "qn": _tnorm(rest + " " + " ".join(q_items)), "qf": _tnorm(query), "last": m is not None,
                 "count": count,
                 "fams": fams, "doms": doms, "unused": unused}
 
@@ -1165,20 +1212,16 @@ class App:
         names = [(n, _segments(n)) for n in (q["names"] if by_names else [])]
         last = q["last"] and ordered
         fams, doms = q["fams"], q["doms"]
-        qpaths = [_tree_segs(x) for x in q.get("paths") or []]
+        qpaths = q.get("paths") or []
 
         def item_hits(t: dict[str, Any]) -> list[str]:
             if not by_names:
                 return []
-            hits = [x for x in t.get("items") or [] if _item_in(x, q["qn"])]
-            for qp in qpaths:
-                # eighth review of 0.8.16: a path is compared as a path — the question's path, or an item inside it, is
-                # the error's ('…^Term 9 (EL2008)' is not Term 4 of the same device, nor the device itself)
-                for x in t["subjects"]:
-                    if _TREE_PATH.fullmatch(x) and _tree_segs(x)[:len(qp)] == qp:
-                        hits.append(x)
-                hits += [x for x in t.get("items") or [] if _tree_segs(x) == qp[-1:]
-                         and not any(_TREE_PATH.fullmatch(s) for s in t["subjects"])]
+            # an item on a known path is named by itself only outside a path of the question; an item without a known
+            # place (quoted in the text) also as the end of one; a path by a run of its parts (_path_in)
+            hits = [x for x in t.get("path_items") or [] if _item_in(x, q["qf"], in_path=False)]
+            hits += [x for x in t.get("items") or [] if _item_in(x, q["qf"])]
+            hits += [x for x in t["subjects"] if _TREE_PATH.fullmatch(x) and _path_in(x, q["qf"])]
             return list(dict.fromkeys(hits))
 
         def kind_ok(t: dict[str, Any], c: dict[str, Any] | None) -> bool:
@@ -1227,9 +1270,11 @@ class App:
     # week-old error became 'the last error'. What such a tool raises is still recorded.
     # Eighth review of 0.8.16: a status read (ads_status, rec_status, xae_status) reports THIS call's errors — only
     # records of the past and listings are left out; a status polled with the same error is one record (note_error).
-    _STORED_STATE_TOOLS = frozenset("""exp_get exp_list exp_report exp_runs rec_list rec_read rec_stats rec_compare
-        rec_verify rec_profile_get rec_profile_list scope_list snap_list tcunit_results xae_dialogs ipc_eventlog
-        ipc_read_file ipc_list_dir""".split())
+    # Ninth review: exp_status (an experiment's persisted error), xae_diagnostics (the Error List: no time order, read
+    # for names), snap_compare (a stored snapshot's read errors) report stored state too.
+    _STORED_STATE_TOOLS = frozenset("""exp_get exp_list exp_report exp_runs exp_status rec_list rec_read rec_stats
+        rec_compare rec_verify rec_profile_get rec_profile_list scope_list snap_list snap_compare tcunit_results
+        xae_dialogs xae_diagnostics ipc_eventlog ipc_read_file ipc_list_dir""".split())
 
     def _error_texts(self) -> list[dict[str, Any]]:
         """Every error this server recorded, newest first, each kind in its place: the error a tool raised, the XAE
@@ -1247,7 +1292,7 @@ class App:
                               "text": e["text"],
                               "subjects": ([e["item"]] if e.get("item") else subj) + _quoted_subjects(e["text"])})
         for t in texts:
-            t["items"] = _tree_items(t["subjects"], t["text"])
+            t["path_items"], t["items"] = _tree_items(t["subjects"], t["text"])
         return texts
 
     async def _error_list_texts(self) -> tuple[list[dict[str, Any]], str | None]:
@@ -1271,9 +1316,10 @@ class App:
                 continue
             f = PureWindowsPath(str(i.get("file") or ""))
             subj = [x for x in (f.stem, str(i.get("project") or "")) if x] + _quoted_subjects(d)
+            on_path, loose = _tree_items(subj, d)
             out.append({"rec": -1 - k, "where": f"XAE Error List ({i.get('level') or 'message'})"
                         + (f" {f.name}" if f.name else ""), "tool": "xae", "xae": True, "text": d,
-                        "subjects": subj, "items": _tree_items(subj, d)})
+                        "subjects": subj, "path_items": on_path, "items": loose})
         return out, None
 
     async def err_from_logs(self, query: str) -> dict[str, Any] | None:
@@ -1283,8 +1329,10 @@ class App:
         match no error). None when the question names nothing and does not ask about the last error."""
         q = self._question(query)
         texts = self._error_texts()
-        said = q["names"] + q["items"] + q["paths"] + [x for t in texts for x in t["items"] if _item_in(x, q["qn"])
-                                                        and x not in q["items"]]
+        said = q["names"] + q["items"] + q["paths"] + [
+            x for t in texts for x in (t.get("path_items") or []) + (t.get("items") or [])
+            if _item_in(x, q["qf"], in_path=x not in (t.get("path_items") or [])) and x not in q["items"]] + [
+            x for t in texts for x in t["subjects"] if _TREE_PATH.fullmatch(x) and _path_in(x, q["qf"])]
         if not said and not q["last"]:
             return None
         entries = await asyncio.to_thread(self._err_log_entries, q, texts, "recent errors of this server")
@@ -1333,9 +1381,11 @@ class App:
         """A message id the text says is one: alone, or next to error / warning / compiler / build ('error C0046:',
         'C0046 error') — 'machine C0815' is a name."""
         t = re.escape(token)
+        # ninth review of 0.8.16: the compiler's own form — the id first, then ':' ('C0046: Identifier …', 'build
+        # failed: C0046: …') — says it as well
         return text.strip() == token or bool(re.search(
             rf"\b(?:error|warning|compiler|compile|build|message|meldung|fehler)\W{{0,3}}{t}\b|\b{t}\W{{0,3}}"
-            r"(?:error|warning)\b", text, re.I))
+            rf"(?:error|warning)\b|(?:^|[\n:]\s*){t}\s*:\s", text, re.I))
 
     @classmethod
     def online_terms(cls, query: str, res: dict[str, Any] | None = None) -> str:
@@ -1439,7 +1489,8 @@ class App:
                  for r in uniq if r.get("text") or r.get("symbol")]
         if not parts:
             return msg                     # an ESI text id worded differently per device: no one meaning to append
-        return f"{msg} [documented: " + "; ".join(parts) + "]"
+        more = f"; {len(parts) - 5} more code(s): err_lookup" if len(parts) > 5 else ""
+        return f"{msg} [documented: " + "; ".join(parts[:5]) + more + "]"
 
     def line_codes(self, lines: list[str], key: str, unusable: str | None = None) -> list[dict[str, Any]]:
         """N125: the codes message lines name (0xA2, HRESULTs, ADS error 1861, C0xxx) looked up in the errors index —
@@ -2934,7 +2985,7 @@ def _result_errors(res: Any, depth: int = 0, out: list[tuple[str | None, str]] |
     a symbol's key the entry is its failure only as {'error': …} alone — anything else there is its value (a struct
     with a member 'error' is data; sixth review of 0.8.16) — and the value keys (value, rows, samples …) are skipped."""
     out = [] if out is None else out
-    if depth > 3 or len(out) >= 20:
+    if depth > 5 or len(out) >= 20:        # ninth review of 0.8.16: xae_deploy's steps.build.items are 4 deep
         return out
     if isinstance(res, dict):
         own = label or next((str(res[k]) for k in ("symbol", "name", "path", "root") if isinstance(res.get(k), str)),
@@ -2945,10 +2996,12 @@ def _result_errors(res: Any, depth: int = 0, out: list[tuple[str | None, str]] |
             if k == "error" and isinstance(v, str) and v:
                 out.append((own or None, (f"{own}: " if own and own not in v else "") + v[:500]))
             elif (k == "description" and isinstance(v, str) and v and str(res.get("level") or "").lower() == "error"):
-                # eighth review of 0.8.16: a failed build's Error List items (C0046 …) are errors of this call
+                # eighth review of 0.8.16: a failed build's Error List items (C0046 …) are errors of this call; ninth:
+                # the Build-pane and Error-List-copy parsers keep the code apart ('code': 'C0046')
                 from pathlib import PureWindowsPath
                 f = PureWindowsPath(str(res.get("file") or "")).stem
-                out.append((f or own or None, v[:500]))
+                code = str(res.get("code") or "").strip()
+                out.append((f or own or None, ((f"{code}: " if code and code not in v else "") + v)[:500]))
             elif k in _VALUE_KEYS or k == "xae_messages":
                 continue
             elif "." in k and _ST_PATH.fullmatch(k):

@@ -1515,7 +1515,8 @@ class Knowledge:
         if loc is None or not L.index_file(loc, "errors").is_file():
             return None
         try:
-            r = X.err_lookup(msg, kb=loc, limit=3, fulltext=False)
+            # ninth review of 0.8.16: every code the message names (a message with four ADS codes lost one at 3)
+            r = X.err_lookup(msg, kb=loc, limit=X.LIMIT_MAX, fulltext=False)
         except (X.ErrError, sqlite3.Error):
             return None
         by_code = ("value", "hresult", "symbol", "dotnet name")

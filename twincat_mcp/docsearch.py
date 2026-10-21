@@ -454,6 +454,10 @@ code codes return returncode result hresult adserr adserror fehler fehlercode fe
 # 'error number 1861', 'error ID 1861', 'Fehler Nr. 1861': a code word followed by one of these right before the number
 _CODE_WORD_SUFFIX = frozenset("number id no nr code nummer".split())
 _COUNT_WORDS = frozenset("errors codes results warnings fehler".split())   # after a number: how many, not which one
+# words a number after which is that thing's number, not a code ('Term 4 error', 'Port 851 error', 'Line 34 error'):
+# TwinCAT's own tree item names and the things logs number
+_NUMBERED = frozenset("""term box device drive axis module channel coupler slot task port line step item terminal slave
+node station klemme kanal achse zeile""".split())
 _COUNT_BEFORE = frozenset("errors".split())                                # 'errors: 3' — before it as well
 
 
@@ -511,15 +515,23 @@ def _next_to_code_word(q: str, start: int, end: int) -> bool:
     if re.search(r"[\w-]$", q[:start]) or re.match(r"[\w-]", q[end:]):
         return False
     # 'nErrId := 1861' (ST's ' := '); seventh review of 0.8.16: a quoted code too ("AL Status Code: '0x001b'"); eighth
-    # review: after a dash, a semicolon or a comma too ('error - 1861', 'error – 0x4260', 'error; 1861')
-    before = re.search(r"([^\W\d_]+)[\s:=#('\"‘“\-–—;,]{1,6}$", q[:start])
+    # review: after a dash ('error - 1861', 'error – 0x4260') — ninth review: only when the number ends the phrase
+    # ('Error - 2 axes not referenced' is a count); a comma or a semicolon starts another phrase ('error; 3 retries')
+    before = re.search(r"([^\W\d_]+)([\s:=#('\"‘“\-–—]{1,6})$", q[:start])
+    if before is not None and re.search(r"[\-–—]", before.group(2)) and \
+            not re.match(r"\s*(?:$|[.,;:!?)\]'\"’”(])", q[end:]):
+        before = None
     # seventh review of 0.8.16: 'Task 1: ADSError 1861', 'Drive 2: error 1861', 'MAIN.TcPOU(34): error C0046', 'Port
     # 851: error 1808' read the item / line number as the code — a code word after the number counts only with a space
     # between ('1861 error'), and only when it does not name a code of its own ('Task 1 error 1861': it is 1861's)
     after = re.match(r"[ \t]{1,3}([^\W\d_]+)(\(s\))?", q[end:])
     # eighth review of 0.8.16: 'Term 4 error', 'Box 2 error', 'Drive 2 error, code 1861' read the item's number as the
-    # code — a number right after a word is that word's number (an item, a line, a port), never a code named after it
-    if after is not None and re.search(r"[^\W\d_][\w.\-]*[ \t]+$", q[:start]):
+    # code — a number right after a word that numbers things (a tree item, a line, a port, a task) is that thing's
+    # number. Ninth review: only after such a word — 'the 1861 error', 'ADS 1861 error' name the code
+    if after is not None and re.search(r"(?i)\b(?:" + "|".join(sorted(_NUMBERED)) + r")\.?[ \t]+$", q[:start]):
+        after = None
+    # 'Build: 1 error, 3 warnings': counts listed one after another, not a code
+    if after is not None and re.match(r"[ \t]*,[ \t]*\d+[ \t]+[^\W\d_]", q[end + after.end():]):
         after = None
     if after is not None and re.match(r"[\s:=#('\"‘“]{0,6}(?:0[xX][0-9a-fA-F]|16#[0-9a-fA-F]|#[xX][0-9a-fA-F]|-?\d|[A-Za-z]\d{3,})",
                                       q[end + after.end():]):

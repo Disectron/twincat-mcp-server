@@ -2344,3 +2344,63 @@ async def test_review8_0816_items_paths_kinds_counts(monkeypatch, project_dir, t
     log = {"from_error_log": {"entries": [{"read_as": ["0x98510004", "C0815"], "matches": [],
                                            "text": "ConsumeXml failed (0x98510004) at AcmeFoods C0815"}]}}
     assert app.online_terms("what does the last error mean?", log) == "0x98510004"
+
+
+@pytest.mark.anyio
+async def test_review9_0816_codes_paths_counts_builds(monkeypatch, project_dir, tmp_path):
+    """Ninth review of 0.8.16: (1) 'the 1861 error' was no code any more; (6) counts after 'error,' / 'error -' were
+    codes; (2) a path whose last part has a space ('TIPC^Plc1^Plc1 Project') or no root shortcut; (3) a build item's
+    code kept apart ('code': 'C0046') and xae_deploy's build items 4 deep; (4) a digit of a name was a count; (5)
+    exp_status / xae_diagnostics / snap_compare are stored state; (7) 'C0046: …' says its id; (8) the item a call
+    creates; (11) 'Term 4(EL2008)'."""
+    import time as _t
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp import errors_index as X
+    from twincat_mcp.server import App, _call_subjects, _result_errors
+    for q, want in (("what does the 1861 error mean?", ["1861"]), ("ADS 1861 error", ["1861"]),
+                    ("ads_read returns 1808 error", ["1808"]), ("the 0x745 error", ["0x745"]),
+                    ("please explain 1808 error code", ["1808"]), ("Build: 1 error, 3 warnings", []),
+                    ("ADS error; 3 retries", []), ("Error - 2 axes not referenced", []), ("Error, 4 of 8 in OP", []),
+                    ("Term 4 error", []), ("Port 851 error", []), ("error - 1861", ["1861"])):
+        assert [c["token"] for c in X.read_query(q)["codes"]] == want, q
+    deploy = {"deployed": False, "steps": {"build": {"success": False, "items": [
+        {"level": "error", "code": "C0046", "description": "Identifier 'nCount' not defined",
+         "file": "C:\\p\\POUs\\FB_Dosing.TcPOU"}]}}}
+    assert _result_errors(deploy) == [("FB_Dosing", "C0046: Identifier 'nCount' not defined")]
+    assert "TIPC^Plc1^Plc1 Project^FB_New" in _call_subjects({"parent_path": "TIPC^Plc1^Plc1 Project", "name": "FB_New"})
+    for q, n in (("the last fbValve2 error", 1), ("the last aValves[3] error", 1), ("the last EL2008 error", 1),
+                 ("the last 3 errors", 3), ("the last term 5 error", 1)):
+        assert App._question(q)["count"] == n, q
+    assert App._question("the last term 5 error")["items"] == ["term 5"]
+    assert {"exp_status", "xae_diagnostics", "snap_compare"} <= App._STORED_STATE_TOOLS
+    assert "ads_status" not in App._STORED_STATE_TOOLS
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    app.note_error("xae_boot_project", error="xae_boot_project: ConsumeXml failed (0x98510004)",
+                   subjects=["TIPC^Plc1^Plc1 Project"])
+    _t.sleep(1.1)
+    app.note_error("xae_tree_set_values", error="xae_tree_set_values: ConsumeXml failed (0x98510005)",
+                   subjects=["TIID^Device 1 (EtherCAT)^Term 4 (EL2008)"])
+    _t.sleep(1.1)
+    app.note_error("xae_build", result_errors=_result_errors(deploy))
+    r = await app.err_from_logs("why does TIPC^Plc1^Plc1 Project fail?")
+    assert r["entries"] and "0x98510004" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("what does the last TIPC^Plc1^Plc1 Project error mean?")
+    assert "0x98510004" in r["entries"][0]["text"] and "names_not_found" not in r, r
+    for q in ("why does Device 1 (EtherCAT)^Term 9 (EL2008) fail?", "why does tiid^device 2 (ethercat)^term 4 (el2008) fail?"):
+        r = await app.err_from_logs(q)
+        assert not r or all("0x98510005" not in e["text"] for e in r["entries"]), (q, r)
+    for q in ("why does Device 1 (EtherCAT)^Term 4 (EL2008) fail?", "is Term 4(EL2008) ok?"):
+        r = await app.err_from_logs(q)
+        assert r["entries"] and "0x98510005" in r["entries"][0]["text"], (q, r)
+    r = await app.err_from_logs("what does the last compiler error mean?")
+    assert r["entries"] and r["entries"][0]["read_as"] == ["C0046"], r
+    log = {"from_error_log": {"entries": [{"read_as": ["C0046"], "matches": [],
+                                           "text": "xae_build: build failed: C0046: Identifier 'nX' not defined"}]}}
+    assert app.online_terms("what does the last error mean?", log) == "C0046"
+    note = app.doc_note("ADS error 1861 and ADS error 1808 and ADS error 6 and ADS error 7")
+    assert all(h in note for h in ("0x745", "0x710", "0x6", "0x7")), note
