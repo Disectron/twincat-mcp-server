@@ -136,6 +136,10 @@ tool wishlist (2026-10-18).
   a version read answered after the cycle before it (`hold_for_check`); the four engine-level ones also run with the
   writer stalled 700 ms (`debug_writer_stall_ms`) — red on the old build, green on the new. Only the simulator
   changed (source_sim.cpp); the engine is unchanged.
+  The first release run of 0.8.17 failed in its test step (Windows, whole suite; CI on the same commit passed). Its
+  log is on a host not reachable from the build session, and release.yml — unlike ci.yml — reported no failures as
+  annotations: which test failed is unknown. Fixed: both workflows run one report script
+  (`.github/scripts/pytest_failures.py`, annotations + job summary).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
   Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
   trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library

@@ -67,7 +67,16 @@ jobs:
           echo "TCMCP_CAPTURE_EXE=$(cygpath -w "$PWD/$exe")" >> "$GITHUB_ENV"
       - name: Test (whole suite, with this exe)
         shell: bash
-        run: python -m pytest -q -p anyio -rfE --tb=short
+        run: |
+          set -o pipefail
+          python -m pytest -q -p anyio -rfE --tb=short --durations=10 2>&1 | tee pytest-output.txt
+      - name: Report failures as annotations (log hosts are not reachable everywhere)
+        if: failure()
+        shell: bash
+        env:
+          PYTHONUTF8: "1"            # the Windows console is cp1252; pytest output holds → — … and would kill this step
+          PYTHONIOENCODING: utf-8
+        run: python .github/scripts/pytest_failures.py
       - uses: actions/upload-artifact@v4
         with:
           name: tcmcp-capture-release
