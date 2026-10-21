@@ -1667,3 +1667,359 @@ def test_n174_a_shell_that_stays_busy_is_said_never_a_raw_error(name, monkeypatc
     with pytest.raises(X.XaeError) as ei:
         _PUBLIC_XAE[name](be, sm, tmp_path)
     assert "XAE is busy (call rejected, 0x80010001)" in str(ei.value) and "did not run" in str(ei.value), str(ei.value)
+
+
+# ------------------------------------------------------------------------------------------------ GetLastErrorMessages
+class _MsgSysMan(FakeSysMan):
+    """ITcSysManager2::GetLastErrorMessages as TE1000's current page describes it: the error and warning messages of the
+    internal buffer, the buffer cleared by the read (clears=False: a build where the read leaves it)."""
+
+    def __init__(self, clears=True):
+        super().__init__()
+        self.buffer, self.clears, self.reads = "", clears, 0
+
+    def GetLastErrorMessages(self):
+        self.reads += 1
+        b = self.buffer
+        if self.clears:
+            self.buffer = ""
+        return b
+
+    def ActivateConfiguration(self):
+        self.buffer += "Warning: Init4\\Activate Configuration: the license expires in 3 days\n"
+        super().ActivateConfiguration()
+
+
+def _xae_with(monkeypatch, sm):
+    be = X.XaeBackend(XaeConfig(com_retry_s=0.3))
+    dte = FakeDTE(sm)
+    monkeypatch.setattr(be, "_require_win", lambda: None)
+    monkeypatch.setattr(be, "_rot_candidates", lambda: [{"progid": "TcXaeShell.DTE.17.0", "moniker": "!TcXaeShell.DTE.17.0:1",
+                                                         "dte": dte, "solution": dte.Solution.FullName}])
+    monkeypatch.setattr(be, "_dte2", lambda: None)
+    be.attach()
+    return be, dte, sm
+
+
+WARN = "Warning: Init4\\Activate Configuration: the license expires in 3 days"
+
+
+def test_glem_an_action_records_what_the_system_manager_logged_apart_from_earlier_steps(monkeypatch):
+    """0.8.16: GetLastErrorMessages — 'many methods log additional diagnostic messages here, even if their HRESULT is
+    S_OK' (TE1000). A successful action records its messages; what the buffer held before it came from earlier steps
+    and is kept apart, labelled so."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+    sm.buffer = "Error: an earlier step\n"
+    assert be.activate_configuration()["activated"] is True
+    assert be.messages == [{"action": "ActivateConfiguration", "earlier_messages": "Error: an earlier step",
+                            "earlier_note": "in the buffer before this action: logged by earlier steps, not by it",
+                            "messages": WARN, "lines": [WARN]}], be.messages
+    be.messages = []
+    be.tree_delete_child("TIPC^Plc", "Old")                  # an action that logs nothing: no record
+    assert be.messages == [] and sm.reads >= 4
+
+
+def test_glem_a_failed_action_carries_its_messages(monkeypatch):
+    """A failure's error carries what the System Manager logged during the action (the HRESULT alone says 'E_FAIL');
+    the record is there too."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+
+    def fail():
+        sm.buffer += "Error: Init4\\Activate Configuration: ADS error 0x745 (1861)\nError: target not reachable\n"
+        raise ComError(-2147467259, "Unspecified error")
+    sm.ActivateConfiguration = fail
+    with pytest.raises(X.XaeError, match=r"Unspecified error \(HRESULT 0x80004005\) — XAE messages \(ActivateConfiguration\): Error: Init4"
+                                         r"\\Activate Configuration: ADS error 0x745 \(1861\)\nError: target not"):
+        be.activate_configuration()
+    assert be.messages[0]["lines"] == ["Error: Init4\\Activate Configuration: ADS error 0x745 (1861)",
+                                       "Error: target not reachable"], be.messages
+
+
+def test_glem_a_buffer_the_read_does_not_clear_gives_only_the_new_part(monkeypatch):
+    """The TwinCAT 2.11 page says only 'returns the last error messages': on a build whose read leaves the buffer, what
+    it held before the action is history — only what the action added is its messages, and nothing is 'earlier'."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan(clears=False))
+    sm.buffer = "Error: an old step\n"
+    be.activate_configuration()
+    assert be.messages == [{"action": "ActivateConfiguration", "messages": WARN, "lines": [WARN]}], be.messages
+
+
+def test_glem_without_the_member_or_on_a_busy_read_the_action_runs_as_before(monkeypatch):
+    """No ITcSysManager2 (FakeSysMan has no GetLastErrorMessages): no messages, the action unchanged. A read the shell
+    keeps rejecting is left out — never the reason an action fails."""
+    be, _dte, sm = _xae_with(monkeypatch, FakeSysMan())
+    assert be.activate_configuration()["activated"] is True and be.messages == [] and sm.activated == 1
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+
+    def busy():
+        raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+    sm.GetLastErrorMessages = busy
+    monkeypatch.setattr(be, "_modal_dialogs", lambda: [])
+    assert be.activate_configuration()["activated"] is True and be.messages == [] and sm.activated == 1
+
+
+def test_glem_create_child_on_a_new_item_and_an_import_are_read_too(monkeypatch):
+    """Every action that must not run twice is read: CreateChild (also on an item this call just created), DeleteChild,
+    PlcOpenImport, GenerateBootProject — through the one place they run (_on_item / _on_sm / _create_child)."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+    parent = sm.items["TIPC^Plc^Plc Project^POUs"]
+    orig = parent.CreateChild
+
+    def create(name, subtype, before="", info=None):
+        sm.buffer += f"Info: {name} created\n"
+        return orig(name, subtype, before, info)
+    parent.CreateChild = create
+    be.tree_create_child("TIPC^Plc^Plc Project^POUs", "FB_New", 604)
+    child = be._create_child(parent, "Sub", 604, "", None)
+    assert child.Name == "Sub"
+    assert [(r["action"], r["messages"]) for r in be.messages] == [("CreateChild", "Info: FB_New created"),
+                                                                    ("CreateChild", "Info: Sub created")], be.messages
+
+
+# ------------------------------------------------------------------------------------------------ review of 0.8.16
+def _be_on(monkeypatch, cands, com_retry_s=0.3):
+    be = X.XaeBackend(XaeConfig(com_retry_s=com_retry_s))
+    monkeypatch.setattr(be, "_require_win", lambda: None)
+    monkeypatch.setattr(be, "_rot_candidates", lambda: cands[0])
+    monkeypatch.setattr(be, "_dte2", lambda: None)
+    monkeypatch.setattr(be, "_modal_dialogs", lambda: [])
+    be.attach()
+    return be
+
+
+def _cand(dte, n=1):
+    return {"progid": "TcXaeShell.DTE.17.0", "moniker": f"!TcXaeShell.DTE.17.0:{n}", "dte": dte,
+            "solution": dte.Solution.FullName}
+
+
+def test_review_0816_a_shell_that_went_away_is_not_read_for_the_action_s_messages(monkeypatch):
+    """Review of 0.8.16 (5): the shell died during ActivateConfiguration; the server re-attached, and the messages were
+    then read — and cleared — from the NEW shell's buffer, attributed to the action that ran on the old one. Only the
+    System Manager the action ran on is read."""
+    old, new = _MsgSysMan(), _MsgSysMan()
+    old_dte, new_dte = FakeDTE(old), FakeDTE(new)
+    cands = [[_cand(old_dte)]]
+    be = _be_on(monkeypatch, cands)
+    new.buffer = "Info: solution Machine.sln loaded by the new shell\n"
+
+    def die():
+        cands[0] = [_cand(new_dte, 2)]
+        raise ComError(X.RPC_E_DISCONNECTED, "The object invoked has disconnected from its clients.")
+    old.ActivateConfiguration = die
+    with pytest.raises(X.XaeExplained) as ei:
+        be.activate_configuration()
+    assert "went away during the call" in str(ei.value) and "new shell" not in str(ei.value), str(ei.value)
+    assert new.reads == 0 and new.buffer.startswith("Info: solution") and be.messages == []
+
+
+def test_review_0816_a_clearing_buffer_keeps_an_action_that_logs_the_same_text_again(monkeypatch):
+    """Review of 0.8.16 (7): 'the after-read starts with the before-read, so the buffer did not clear' dropped the
+    messages of an action that logged the text the buffer already held (a warning of the user's own activation, logged
+    again). Whether a read clears the buffer is read from the buffer itself, once: the second read is empty."""
+    sm = _MsgSysMan(clears=True)
+    be = _be_on(monkeypatch, [[_cand(FakeDTE(sm))]])
+    sm.buffer = WARN + "\n"                          # left by an activation the user made in XAE
+    assert be.activate_configuration()["activated"] is True
+    assert be.messages == [{"action": "ActivateConfiguration", "earlier_messages": WARN,
+                            "earlier_note": "in the buffer before this action: logged by earlier steps, not by it",
+                            "messages": WARN, "lines": [WARN]}], be.messages
+    be.messages = []
+    sm.buffer = "Error: license missing\n"
+
+    def fail():
+        sm.buffer += "Error: license missing\nError: activation aborted\n"
+        raise ComError(-2147467259, "Unspecified error")
+    sm.ActivateConfiguration = fail
+    with pytest.raises(X.XaeError) as ei:
+        be.activate_configuration()
+    assert "XAE messages (ActivateConfiguration): Error: license missing\nError: activation aborted" in str(ei.value)
+    # a buffer the read does not clear: learnt the same way, the old text is history
+    sm2 = _MsgSysMan(clears=False)
+    be2 = _be_on(monkeypatch, [[_cand(FakeDTE(sm2))]])
+    sm2.buffer = WARN + "\n"
+    be2.activate_configuration()
+    assert be2.messages == [{"action": "ActivateConfiguration", "messages": WARN, "lines": [WARN]}], be2.messages
+    assert be2._msg_clears is False and be._msg_clears is True
+
+
+def test_review_0816_a_busy_shell_is_asked_for_the_messages_two_seconds_not_com_retry_s(monkeypatch):
+    """Review of 0.8.16 (9): the read meant to give up after 2 s first asked whether the member exists with the whole
+    com_retry_s — a busy shell after an activation made it wait (60 s by default). The member is asked once per System
+    Manager, and every read of the messages gives up after MESSAGES_READ_S."""
+    import time as _t
+    sm = _MsgSysMan()
+    be = _be_on(monkeypatch, [[_cand(FakeDTE(sm))]], com_retry_s=8.0)
+    busy = {"on": False}
+    orig_read, orig_act = sm.GetLastErrorMessages, sm.ActivateConfiguration
+
+    def read():
+        if busy["on"]:
+            raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+        return orig_read()
+
+    def act():
+        orig_act()
+        busy["on"] = True                            # the shell is busy right after the activation
+    sm.GetLastErrorMessages, sm.ActivateConfiguration = read, act
+    real_has = X._has_prop
+
+    def has_prop(obj, name):                         # the member check is rejected too while the shell is busy
+        if busy["on"] and name == "GetLastErrorMessages":
+            raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+        return real_has(obj, name)
+    monkeypatch.setattr(X, "_has_prop", has_prop)
+    t0 = _t.time()
+    assert be.activate_configuration()["activated"] is True
+    assert _t.time() - t0 < 4.0, _t.time() - t0      # MESSAGES_READ_S (2 s), not com_retry_s (8 s)
+    assert be.messages == []
+
+
+def test_review_0816_the_build_finds_the_system_manager_to_read(monkeypatch):
+    """Review of 0.8.16 (13): the build read the messages only when a System Manager happened to be cached — right
+    after attach or a solution reopen none is, and the build's messages were never read."""
+    sm = _MsgSysMan()
+    dte = FakeDTE(sm)
+    be = _be_on(monkeypatch, [[_cand(dte)]])
+    be.sysman = None
+    orig = dte.Solution.SolutionBuild.Build
+
+    def build(wait):
+        sm.buffer += "Warning: the build logged this\n"
+        return orig(wait)
+    dte.Solution.SolutionBuild.Build = build
+    be.build()
+    assert [(r["action"], r["messages"]) for r in be.messages] == [("SolutionBuild.Build",
+                                                                     "Warning: the build logged this")], be.messages
+
+
+def test_rereview_0816_a_rejected_second_read_keeps_the_action_s_messages(monkeypatch):
+    """Re-review of 0.8.16 (12): when the read that learns whether the buffer clears was rejected (busy), the old
+    'starts with it' guess returned and an action that logged the same text again lost its messages. Unknown is taken
+    as TE1000 documents it: the read clears."""
+    sm = _MsgSysMan(clears=True)
+    be = _be_on(monkeypatch, [[_cand(FakeDTE(sm))]])
+    be.MESSAGES_READ_S = 0.2
+    sm.buffer = WARN + "\n"
+    calls = {"n": 0}
+    orig = sm.GetLastErrorMessages
+
+    def read():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+        return orig()
+    sm.GetLastErrorMessages = read
+    monkeypatch.setattr(be, "_retry", lambda fn, what="", once=False, retry_s=None: fn() if "GetLastErrorMessages"
+                        not in what or calls["n"] != 1 else _raise_busy(fn))
+    be.activate_configuration()
+    assert be._msg_clears is None
+    assert [(r.get("earlier_messages"), r.get("messages")) for r in be.messages] == [(WARN, WARN)], be.messages
+
+
+def _raise_busy(fn):
+    try:
+        return fn()
+    except ComError as exc:
+        raise X.XaeBusy("busy") from exc
+
+
+def test_n175_0815_twincat_interface_export_is_the_oracle(xae, tmp_path):
+    """N175 (0.8.15 retest): TwinCAT 3.1.4026 writes an interface as <Interface><Methods><Method> with
+    <InterfaceAsPlainText> as a direct child of each — the oracle looked only under addData and returned {} for the
+    real export, so the replace of I_Module said checked_against 'name' and a changed method was never compared.
+    Fixture: the shape of a TwinCAT 3.1.4026 export (productVersion 3.5.21.61) of the retest project's I_Module."""
+    from pathlib import Path
+    fx = Path(__file__).parent / "fixtures" / "plcopen"
+    o = X._plcopen_oracle(str(fx / "I_Module_orig.xml"))
+    assert o["i_module"]["decl"] == "INTERFACE I_Module\n", o
+    assert set(o["i_module"]["kids"]) == {"execute", "getstatus"}, o
+    assert o["i_module"]["kids"]["getstatus"]["decl"] == "METHOD GetStatus : ST_ModuleStatus\n", o
+    assert "METHOD Execute : BOOL" in o["i_module"]["kids"]["execute"]["decl"], o
+    m = X._plcopen_oracle(str(fx / "I_Module_mod.xml"))
+    assert m["i_module"]["kids"]["getstatus"]["decl"].startswith("// N175 retest marker\n"), m
+    # eleventh review: an interface's <Properties> group was never read ('Properties'[:-1] is 'Propertie')
+    prop = (fx / "I_Module_orig.xml").read_text(encoding="utf-8").replace("        </Methods>", """        </Methods>
+        <Properties>
+          <Property name="nCount" ObjectId="0b6c2b0e-7d61-4c1c-9d64-1f0b8f6c9a11">
+            <InterfaceAsPlainText>
+              <xhtml xmlns="http://www.w3.org/1999/xhtml">PROPERTY nCount : INT
+</xhtml>
+            </InterfaceAsPlainText>
+            <GetAccessor>
+              <InterfaceAsPlainText>
+                <xhtml xmlns="http://www.w3.org/1999/xhtml">VAR
+END_VAR
+</xhtml>
+              </InterfaceAsPlainText>
+            </GetAccessor>
+            <addData />
+          </Property>
+        </Properties>""", 1)
+    (tmp_path / "I_Module_prop.xml").write_text(prop, encoding="utf-8")
+    p = X._plcopen_oracle(str(tmp_path / "I_Module_prop.xml"))
+    assert set(p["i_module"]["kids"]) == {"execute", "getstatus", "ncount"}, p
+    assert p["i_module"]["kids"]["ncount"]["decl"] == "PROPERTY nCount : INT\n", p
+    assert p["i_module"]["kids"]["ncount"]["kids"]["get"]["decl"] == "VAR\nEND_VAR\n", p
+    be, dte, sm = xae
+    proj = sm.items["TIPC^Plc^Plc Project"]
+    xml = o["i_module"]
+    base = "TIPC^Plc^Plc Project^I_Module"
+    kids = []
+    for n in ("Execute", "GetStatus"):
+        k = FakeItem(n, f"{base}^{n}")
+        k.DeclarationText, k.ImplementationText = f"METHOD {n} : BOOL // old\n", None
+        kids.append(k)
+    orig = FakeItem("I_Module", base, kids)
+    orig.DeclarationText, orig.ImplementationText = "INTERFACE I_Module\n", None
+    proj._children.append(orig)
+    for it in [orig, *kids]:
+        sm.items[it.PathName] = it
+
+    def dup(getstatus=None):
+        cbase = "TIPC^Plc^Plc Project^I_Module_1"
+        ck = []
+        for n in ("Execute", "GetStatus"):
+            k = FakeItem(n, f"{cbase}^{n}")
+            k.DeclarationText = (getstatus if (n == "GetStatus" and getstatus) else xml["kids"][n.lower()]["decl"])
+            k.ImplementationText = None
+            ck.append(k)
+        c = FakeItem("I_Module_1", cbase, ck)
+        c.DeclarationText, c.ImplementationText = "INTERFACE I_Module_1\n", None
+        proj._children.append(c)
+        for it in [c, *ck]:
+            sm.items[it.PathName] = it
+    # B4: a copy whose method text differs from the XML is refused, nothing written, the copy kept
+    proj.on_import = lambda: dup("METHOD GetStatus : INT\n")
+    with pytest.raises(X.XaeError, match=r"differs from the imported XML at .*I_Module\^GetStatus"):
+        be.plcopen_import("TIPC^Plc^Plc Project", str(fx / "I_Module_orig.xml"), "replace")
+    assert kids[1].DeclarationText == "METHOD GetStatus : BOOL // old\n" and proj.deleted == []
+    proj._children = [c for c in proj._children if c.Name != "I_Module_1"]
+    # B2: the copy as the XML has it: checked against the XML, header and methods compared
+    proj.on_import = dup
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(fx / "I_Module_orig.xml"), "replace")
+    rec = r["replaced"][0]
+    assert rec["checked_against"] == "xml" and not rec.get("not_in_xml"), rec
+    assert kids[1].DeclarationText == "METHOD GetStatus : ST_ModuleStatus\n" and proj.deleted == ["I_Module_1"]
+
+
+def test_review12_0816_a_rejected_step_after_an_action_is_no_repeat_it(xae):
+    """Twelfth review of 0.8.16: boot_project ran GenerateBootProject, then its read of BootProjectAutostart was
+    rejected by a busy shell — 'did not run this call — repeat it' invited a second generate / activate. 'Repeat it' only
+    when nothing of the call ran before the rejected step; else the steps that ran are named."""
+    be, dte, sm = xae
+
+    class Rejected(Exception):
+        hresult = X.RPC_E_CALL_REJECTED
+    be.cfg.com_retry_s = 0.3
+
+    def rejected():
+        raise Rejected("Call was rejected by callee.")
+    be.acted = []
+    with pytest.raises(X.XaeBusy, match=r"did not run this call — it was asked again for 0.3 s; repeat it\."):
+        be._retry(rejected, "BootProjectAutostart")
+    be._retry(lambda: "ok", "GenerateBootProject", once=True)
+    with pytest.raises(X.XaeBusy) as ei:
+        be._retry(rejected, "BootProjectAutostart")
+    assert "this call's earlier step(s) ran (GenerateBootProject): check the result before calling again" in \
+        str(ei.value) and "repeat it" not in str(ei.value), str(ei.value)
+    assert ei.value.busy and ei.value.busy[1] == 0.3

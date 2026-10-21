@@ -130,7 +130,9 @@ async def test_two_questions_in_one_call_are_each_asked_once():
     async with Client(_mini(), elicitation_callback=cb) as c:
         res = await c.call_tool("two_questions", {})
     assert not res.is_error, text(res)
-    assert payload(res) == {"a": True, "b": False} and cb.asked == ["first question", "second question"]
+    # N178: each question ends with its time limit (input_required rounds)
+    assert payload(res) == {"a": True, "b": False} and [a.split("\n\n(Answer within")[0] for a in cb.asked] == \
+        ["first question", "second question"], cb.asked
 
 
 @pytest.mark.anyio
@@ -313,3 +315,40 @@ async def test_n96_kb_rebuild_checks_before_it_asks(monkeypatch, project_dir, tm
         res = await c.call_tool("kb_rebuild", {"index": "manuals"})
     r = payload(res)
     assert r["started"] is False and "no PDF library" in r["error"] and cb.asked == [], (r, cb.asked)
+
+
+@pytest.mark.anyio
+async def test_n178_an_expired_confirmation_round_is_said_logged_and_audited(monkeypatch, project_dir, tmp_path):
+    """N178 (0.8.15 retest, S4): a confirmation answered ~18 min after it was asked got the SDK's fixed 'Invalid or
+    expired requestState'; the audit ended at 'asked' and server.log had nothing (the SDK logs on its own logger).
+    The question states the limit; the rejection is audited ('expired') and goes to server.log."""
+    import anyio
+    from twincat_mcp import server as SRV
+    install(monkeypatch)
+    monkeypatch.setattr(ASK, "ROUND_TTL_S", 1.0)
+    cfg = mk_cfg(project_dir, mode="guarded")
+    srv = build_server(cfg)
+    log = SRV.install_server_log(tmp_path / "logs" / "server.log")
+
+    class Late(Answers):
+        async def __call__(self, context, params):
+            self.asked.append(params.message)
+            await anyio.sleep(2.5)
+            return ACCEPT
+    cb = Late()
+    async with Client(srv, mode="auto", elicitation_callback=cb) as c:
+        try:
+            res = await c.call_tool("ads_plc_state", {"action": "stop"})
+            failed = res.is_error
+        except Exception:  # noqa: BLE001 — the SDK refuses the round as a protocol error
+            failed = True
+        tail = payload(await c.call_tool("tc_audit_tail", {"n": 10}))
+    assert failed and cb.asked and "Answer within" in cb.asked[0], cb.asked
+    entries = tail if isinstance(tail, list) else tail.get("entries", [])
+    assert any(e.get("outcome") == "expired" for e in entries), entries
+    for h in logging.getLogger("twincat_mcp").handlers:
+        h.flush()
+    assert log is not None and "requestState rejected" in log.read_text(encoding="utf-8")
+    from pyads import constants as PC
+    from tests.fake_ads import FakeConnection
+    assert FakeConnection.shared_state.get(851, (PC.ADSSTATE_RUN, 0))[0] == PC.ADSSTATE_RUN    # nothing was done

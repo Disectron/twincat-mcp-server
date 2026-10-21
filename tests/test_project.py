@@ -734,6 +734,26 @@ def test_n141_a_name_of_another_plc_project_says_where_it_is(tmp_path):
         p.resolve_symbol("PRG_X.n")
 
 
+def test_n141b_the_view_of_one_plc_project_says_where_the_name_is(tmp_path):
+    """N141b (0.8.15 retest, live ×2): wf_debug_symbol PRG_B.nBValue resolves through the view of the port's PLC project
+    (App.proj_for_port) — the other PLC projects are not in it, so it said "no program/GVL/FB named 'PRG_B' in PLC
+    project Untitled1 (ADS port 851); try proj_search" while proj_resolve_symbol named Plc2. The same message now."""
+    from twincat_mcp.project_backend import PlcView
+    _plc(tmp_path, "Plc1", "n := n + 1;", 10000)
+    _plc(tmp_path, "Plc2", "n := n + 2;", 2000, prog="PRG_B")
+    _tsproj(tmp_path, ("Plc1", 851), ("Plc2", 852))
+    p = idx(tmp_path)
+    view = PlcView(p, p.plc_project(port=851))
+    with pytest.raises(ProjectError) as whole:
+        p.resolve_symbol("PRG_B.n", 851)
+    with pytest.raises(ProjectError) as one:
+        view.resolve_symbol("PRG_B.n", 851)
+    assert str(one.value) == str(whole.value), (one.value, whole.value)
+    assert "not declared in PLC project Plc1 (ADS port 851) — it is in PLC project(s) ['Plc2']" in str(one.value)
+    with pytest.raises(ProjectError, match="no program/GVL/FB named 'PRG_X' in PLC project Plc1 \\(ADS port 851\\)"):
+        view.resolve_symbol("PRG_X.n", 851)
+
+
 def test_n142_a_pin_names_one_plc_project_of_a_shared_file(tmp_path):
     """N142 (0.8.14 retest, S3): a file both PLC projects compile — 'PlcA@GVL_Common' gave both PLC projects, so the
     pin the refusal asked for was refused the same way. A PLC-project pin is that PLC project."""

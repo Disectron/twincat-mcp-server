@@ -55,7 +55,16 @@ previous batch's ids. Check `ads_task_stats` once with the profile live; thin it
 ## When XAE stalls
 `xae_dialogs` → read title/buttons → `xae_dialog_resolve button=...` (machine-affecting prompts need confirmation).
 A window with `buttons: null` (not a standard dialog, buttons unreadable) cannot be pressed by the tool: ask the user to
-close it in XAE. "XAE is busy (call rejected …) and did not run this call" → nothing ran: repeat the call.
+close it in XAE. "XAE is busy (call rejected …) and did not run this call … repeat it" → that step did not run: repeat
+the call. "… this call's earlier step(s) ran (…)" → those did: check the result (xae_status) before repeating it.
+
+## XAE messages
+An action's result (activate, restart, build, create / delete, ConsumeXml, import, boot project, online commands) can
+carry `xae_messages`: what TwinCAT's System Manager logged during it (GetLastErrorMessages) — TwinCAT's text, also on
+success (warnings). `earlier_messages` were in the buffer before the action: earlier steps, not this one. A failed
+action's error ends with "XAE messages (…)": quote them as the cause before guessing one. A call a dialog refused did
+not run: a read-only tool says nothing was changed (answer the dialog, call again); any other says to check its
+result first.
 
 ## Library FB / type you have not used
 The twincat-docs skill first (`docs_declaration`, offline, every book). Fallback when its database is missing:

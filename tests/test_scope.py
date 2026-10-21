@@ -258,3 +258,45 @@ def test_review_0813_a_failed_export_keeps_the_old_csv_and_a_sealed_one_is_never
         assert out.read_bytes() == before
     finally:
         make_writable(out)
+
+
+def _scope_line(text: str, pad: int = 120) -> bytes:
+    """A line as TE130x writes it: the text, its newline, then NUL padding (N140)."""
+    return ("\n" + text).encode("utf-8") + b"\x00" * pad
+
+
+def test_n179_every_numbered_scope_view_log_is_read(tmp_path):
+    """N179 (0.8.15 retest, S2): from the evening a second XAE shell opened, TE130x wrote every line to
+    TcScopeView_1.log; the plugin read only TcScopeView.log and reported two recordings' Ads-Error 0xA2 lines as
+    error_count 0. A1: the old log unchanged, _1 gains two padded ERROR lines → 2, each naming _1. A2: a _2 that
+    appears after the mark counts from its start. A4: no log written → error_count 0 and said so."""
+    folder = tmp_path / "TE130X-Scope-View"
+    folder.mkdir()
+    main, one = folder / "TcScopeView.log", folder / "TcScopeView_1.log"
+    main.write_bytes(_scope_line("(2026-10-20-21:00:57:001)[ INFO  ] Scope View: closing"))
+    one.write_bytes(_scope_line("(2026-10-21-15:15:31:000)[ INFO  ] Scope Client: Single Client State change from "
+                                "'ROUTERSTOP' to 'AUTOSTOP' requested from '10.0.0.1.1.1'"))
+    mark = S.log_mark(main)
+    got = S.log_errors_since(mark)                                      # A4
+    assert got["error_count"] == 0 and got["note"].startswith("no Scope View log was written"), got
+    with open(one, "ab") as fh:
+        fh.write(_scope_line("(2026-10-21-15:15:32:727)[ ERROR ] Scope View: Server error on ordering data. This is "
+                             "often a hint at insufficient Router memory.TwinCAT.Scope2.ScopeClient.ReceiveMultiGroup"))
+        fh.write(_scope_line("(2026-10-21-15:15:33:038)[ ERROR ] Scope Client: TwinCAT.Ads.AdsErrorException- "
+                             "Ads-Error 0xA2 - A unknown Ads-Error has occurred. ('162' has occurred (AdsErrorCode- 162, "
+                             "0xA2))"))
+    got = S.log_errors_since(mark)                                      # A1
+    assert got["error_count"] == 2 and got["error_logs"] == ["TcScopeView_1.log"] * 2, got
+    assert got["log"] == str(one) and got["logs_written"] == ["TcScopeView_1.log"], got
+    assert "\x00" not in "".join(got["errors"]) and "0xA2" in got["errors"][1], got
+    assert set(got["logs_checked"]) == {"TcScopeView.log", "TcScopeView_1.log"}, got
+    (folder / "TcScopeView_2.log").write_bytes(_scope_line("(2026-10-21-15:30:19:037)[ ERROR ] Scope Client: "
+                                                           "Ads-Error 0xA2"))
+    got = S.log_errors_since(mark)                                      # A2
+    assert got["error_count"] == 3 and got["error_logs"][-1] == "TcScopeView_2.log", got
+    # [scope] view_log set by the user: honoured, its numbered siblings read too
+    custom = tmp_path / "mine" / "Scope.log"
+    custom.parent.mkdir()
+    m2 = S.log_mark(custom)
+    (custom.parent / "Scope_1.log").write_bytes(_scope_line("(x)[ ERROR ] boom"))
+    assert S.log_errors_since(m2)["error_logs"] == ["Scope_1.log"]

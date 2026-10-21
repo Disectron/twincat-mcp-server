@@ -1,0 +1,101 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<project xmlns="http://www.plcopen.org/xml/tc6_0200">
+  <fileHeader companyName="Beckhoff Automation GmbH" productName="TwinCAT PLC Control" productVersion="3.5.21.61" creationDateTime="2026-10-21T14:48:56.5320043" />
+  <contentHeader name="Plc" modificationDateTime="2026-10-21T14:48:56.5369587">
+    <coordinateInfo>
+      <fbd>
+        <scaling x="1" y="1" />
+      </fbd>
+      <ld>
+        <scaling x="1" y="1" />
+      </ld>
+      <sfc>
+        <scaling x="1" y="1" />
+      </sfc>
+    </coordinateInfo>
+    <addData>
+      <data name="http://www.3s-software.com/plcopenxml/projectinformation" handleUnknown="implementation">
+        <ProjectInformation />
+      </data>
+    </addData>
+  </contentHeader>
+  <types>
+    <dataTypes />
+    <pous />
+  </types>
+  <instances>
+    <configurations />
+  </instances>
+  <addData>
+    <data name="http://www.3s-software.com/plcopenxml/interface" handleUnknown="implementation">
+      <Interface name="I_Module" ObjectId="bea7a78a-93e5-4215-9f22-a66808d329d6">
+        <Methods>
+          <Method name="Execute" ObjectId="8ba0dfa4-9cf1-43c2-a12d-b33968d244a5">
+            <interface>
+              <returnType>
+                <BOOL />
+              </returnType>
+              <inputVars>
+                <variable name="eCmd">
+                  <type>
+                    <derived name="E_Command" />
+                  </type>
+                </variable>
+                <addData>
+                  <data name="http://www.3s-software.com/plcopenxml/interfaceasplaintext" handleUnknown="implementation">
+                    <InterfaceAsPlainText>
+                      <xhtml xmlns="http://www.w3.org/1999/xhtml">// Runs one cycle; FALSE while in error
+METHOD Execute : BOOL
+VAR_INPUT
+	eCmd : E_Command;
+END_VAR
+</xhtml>
+                    </InterfaceAsPlainText>
+                  </data>
+                </addData>
+              </inputVars>
+              <documentation>
+                <xhtml xmlns="http://www.w3.org/1999/xhtml"> Runs one cycle; FALSE while in error</xhtml>
+              </documentation>
+            </interface>
+            <InterfaceAsPlainText>
+              <xhtml xmlns="http://www.w3.org/1999/xhtml">// Runs one cycle; FALSE while in error
+METHOD Execute : BOOL
+VAR_INPUT
+	eCmd : E_Command;
+END_VAR
+</xhtml>
+            </InterfaceAsPlainText>
+            <addData />
+          </Method>
+          <Method name="GetStatus" ObjectId="fe589129-c899-4013-b46d-2d2800c239e4">
+            <interface>
+              <returnType>
+                <derived name="ST_ModuleStatus" />
+              </returnType>
+            </interface>
+            <InterfaceAsPlainText>
+              <xhtml xmlns="http://www.w3.org/1999/xhtml">// N175 retest marker
+METHOD GetStatus : ST_ModuleStatus
+</xhtml>
+            </InterfaceAsPlainText>
+            <addData />
+          </Method>
+        </Methods>
+        <InterfaceAsPlainText>
+          <xhtml xmlns="http://www.w3.org/1999/xhtml">INTERFACE I_Module
+</xhtml>
+        </InterfaceAsPlainText>
+        <addData />
+      </Interface>
+    </data>
+    <data name="http://www.3s-software.com/plcopenxml/projectstructure" handleUnknown="discard">
+      <ProjectStructure>
+        <Object Name="I_Module" ObjectId="bea7a78a-93e5-4215-9f22-a66808d329d6">
+          <Object Name="Execute" ObjectId="8ba0dfa4-9cf1-43c2-a12d-b33968d244a5" />
+          <Object Name="GetStatus" ObjectId="fe589129-c899-4013-b46d-2d2800c239e4" />
+        </Object>
+      </ProjectStructure>
+    </data>
+  </addData>
+</project>

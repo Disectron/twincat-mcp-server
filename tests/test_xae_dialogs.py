@@ -465,6 +465,38 @@ async def test_n173_a_timeout_names_the_modal_state_found_at_that_moment(monkeyp
         gate.set()
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("read_only", [True, False])
+async def test_review13_0816_a_timed_out_action_is_not_to_be_repeated(monkeypatch, project_dir, read_only):
+    """Thirteenth review: a call that times out with no modal window is still running in the shell — 'then retry' fits
+    a read; an action retried then is queued a second time behind the one still running."""
+    from twincat_mcp.server import _READ_ONLY_CALL
+    desk = _Desk()
+    _vs(desk, main_enabled=True)
+    desk.install(monkeypatch)
+    app = App(mk_cfg(project_dir))
+    app.xae.pid = 100
+    gate = threading.Event()
+
+    def hangs():
+        gate.wait(10)
+        return {}
+    tok = _READ_ONLY_CALL.set(read_only)
+    try:
+        with pytest.raises(ToolError) as ei:
+            await app.xae_call(hangs, timeout=1.5)
+    finally:
+        _READ_ONLY_CALL.reset(tok)
+        gate.set()
+    msg = str(ei.value)
+    assert "no modal window is open in XAE" in msg, msg
+    if read_only:
+        assert msg.endswith("xae_status / xae_dialogs, then retry"), msg
+    else:
+        assert "then check its result when it is done; do not repeat it before (it would run a second time)" in msg \
+            and "retry" not in msg, msg
+
+
 # --------------------------------------------------------------------------- N173: UI Automation through COM vtables
 import ctypes as _ct
 
@@ -657,3 +689,73 @@ def test_n173_windows_a_real_owned_window_is_found_read_and_pressed():  # pragma
             win32api.PostThreadMessage(t.native_id, win32con.WM_QUIT, 0, 0)
         except Exception:  # noqa: BLE001
             pass
+
+
+def test_n176_the_shells_own_frame_is_never_a_dialog(monkeypatch):
+    """N176 (0.8.15 retest, S4): when Options opened, the watchdog logged the shell's own frame ("TwinCAT Project15 -
+    TcXaeShell", HwndWrapper, buttons null) as a 'seen' dialog. A window with the (disabled) main window's title and
+    class — the shell's second frame — or the main window the shell names is never the window that holds it."""
+    desk = _Desk()
+    main = _vs(desk, main_enabled=False)
+    desk.top(90, WPF, "Project15 - TcXaeShell")                        # the shell's frame again, unowned, enabled
+    desk.top(70, WPF, "Options", owner=main)
+    desk.install(monkeypatch, uia={70: (["OK", "Cancel"], []), 90: ([], [])})
+    assert [(d.hwnd, d.title) for d in D.list_dialogs(100)] == [(70, "Options")]
+    del desk.w[70]                                                       # only the frame left: unidentified, not it
+    desk.install(monkeypatch, uia={90: ([], [])})
+    ds = D.list_dialogs(100)
+    assert len(ds) == 1 and not ds[0].identified and ds[0].hwnd == main, ds
+    # twelfth review of 0.8.16: the watchdog's log had that state as a 'seen' dialog titled like the shell — it is the
+    # shell's own frame, disabled, said as that (the N176 entry: 'Project15 - TcXaeShell', buttons null)
+    wd = D.DialogWatchdog([])
+    wd.pid = 100
+    wd.poll()
+    e = wd.log[-1]
+    assert e["event"] == "seen" and e["unidentified"] is True and "title" not in e and "buttons" not in e, e
+    assert e["note"] == D.UNIDENTIFIED and e["main_window_class"], e
+
+
+@pytest.mark.anyio
+async def test_n181_a_read_call_a_dialog_refused_says_nothing_was_changed(monkeypatch, project_dir):
+    """N181 (0.8.15 retest, live ×2): xae_tree_get / xae_status with the Options dialog open ended 'whether the action
+    ran is unknown until the dialog is answered' — nothing was being changed. The refused COM call did not run; a
+    read-only tool says nothing was changed (call again once it is answered); any other tool may have run steps before
+    the refused one and says to check its result first. The dialog's fields stay in the text (blocked_by_dialog)."""
+    from twincat_mcp import xae_backend as X
+    from twincat_mcp.server import build_server
+    from tests.fake_ads import install
+    from tests.test_server_e2e import client_for, text
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir))
+    app = srv._tcmcp_app
+    d = {"hwnd": 77, "title": "Options", "class": "#32770", "buttons": ["OK", "Cancel"], "text": "Environment"}
+
+    def tree_item(path):
+        raise X.XaeBusy.blocked(f"LookupTreeItem {path}", d)
+
+    def tree_consume_xml(path, xml):
+        raise X.XaeBusy.blocked(f"ConsumeXml {path}", d)
+    monkeypatch.setattr(app.xae, "tree_item", tree_item)
+    monkeypatch.setattr(app.xae, "tree_consume_xml", tree_consume_xml)
+
+    async def nothing(*a, **kw):
+        return None
+
+    async def confirmed(action, details, cls, coro):
+        return await coro
+    monkeypatch.setattr(app, "permit", nothing)
+    monkeypatch.setattr(app, "confirmed", confirmed)
+    async with client_for(srv) as s:
+        r = await s.call_tool("xae_tree_get", {"path": "TIPC"})
+        w = await s.call_tool("xae_tree_consume_xml", {"path": "TIRT^PlcTask", "xml": "<TreeItem/>"})
+    t, tw = text(r), text(w)
+    assert r.is_error and "LookupTreeItem TIPC: BLOCKED BY DIALOG 'Options'" in t, t
+    assert "it did not run. Nothing was changed (a read-only call): answer it (xae_dialog_resolve(button=...)), then " \
+           "call again." in t and "whether the action ran" not in t and "may have run" not in t, t
+    assert 'blocked_by_dialog: {"hwnd": 77, "title": "Options", "class": "#32770"' in t, t
+    assert w.is_error and "ConsumeXml TIRT^PlcTask: BLOCKED BY DIALOG 'Options'" in tw, tw
+    assert "Steps of this call before it may have run: answer it (xae_dialog_resolve(button=...)), then check the " \
+           "result before calling again." in tw and "Nothing was changed" not in tw, tw
+    # the backend alone does not know the tool: said as the latter; buttons it can't press: close it in XAE
+    e = X.XaeBusy.blocked("LookupTreeItem TIPC", {**d, "buttons": None, "buttons_note": "not readable"})
+    assert "may have run: close it in XAE (its buttons can't be pressed by the tool)" in str(e) and e.dialog["hwnd"] == 77

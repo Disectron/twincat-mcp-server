@@ -32,6 +32,9 @@ from mcp_types import ElicitRequest, ElicitRequestFormParams, ElicitResult, Inpu
 from mcp_types.version import is_version_at_least
 
 INPUT_REQUIRED_VERSION = "2026-07-28"      # the first revision without server-to-client requests
+# how long an input_required round may wait for its answer: the SDK seals the round for this long (the server is built
+# with it — build_server); an older answer is refused by the SDK with a fixed 'Invalid or expired requestState'
+ROUND_TTL_S = 600.0
 _STATE_V = 1
 _KEY_PREFIX = "tcmcp_ask_"
 
@@ -129,6 +132,10 @@ async def ask(ctx: Any, message: str, schema: type[BaseModel]) -> tuple[Any, flo
         except Exception as exc:  # noqa: BLE001 — the client refused or failed the request
             raise NoPrompt(f"{why}, but the request failed: {type(exc).__name__}: {exc}") from exc
         return res, round(time.monotonic() - t0, 2)
+    # N178 (0.8.15 retest): an answer ~18 min later met the SDK's fixed 'Invalid or expired requestState' — the limit
+    # is said in the question (the same text every round: it is no clock)
+    message = (f"{message}\n\n(Answer within {int(ROUND_TTL_S // 60)} minutes — after that this question expires, "
+               "nothing is done, and the call has to be made again.)")
     params = ElicitRequestFormParams(message=message, requested_schema=render_elicitation_schema(schema))
     q = _digest(params)
     key = _KEY_PREFIX + q[:16]
