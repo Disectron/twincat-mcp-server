@@ -50,8 +50,11 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    says so (`error 1861`, `nErrId := 1808`) — `ADS error on port 851` holds no code, so it is `documented: false`
    (`text_matches` only share its words: never an answer); a hex number also right after a domain's name
    (`AL status 0x0011`), a code's symbol also in capitals (`WSAETIMEDOUT`), and `C0373` is read as a compiler message.
-   The server's err_lookup tool adds `from_error_log` (the code of the errors it saw) and `online` (a web site search)
-   when nothing local answers; this command is offline. A number of several domains is
+   The server's err_lookup tool adds, for a question without a code, `from_error_log`: the errors it saw that hold a
+   name of the question whole (`MAIN.fbValve.bOpen`, `fbValve`), or the newest when the question says "the last /
+   previous error" — no word is matched. `online=true` adds `online`: a site search of infosys.beckhoff.com for the
+   question's codes and documented code names only (never its words, project, machine or customer names) — only when
+   asked, and pages that mention the code, not a meaning. This command is offline. A number of several domains is
    listed in all of them, ranked by the message's words; a message that names a domain (`ADS error 6`) is answered for
    it and the same number elsewhere comes in `other_domains` — never pick one silently. `documented: false` = not in
    the local documentation (CoE SDO abort codes and the compiler's C0xxx messages have no local source at all —

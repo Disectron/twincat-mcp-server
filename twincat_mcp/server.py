@@ -839,47 +839,41 @@ class App:
         if len(rec) > 2:
             self.recent_errors.append(rec)
 
+    # 0.8.16, narrowed by the user after five reviews (the guessing layer — which logged error a question is about,
+    # which words may go to the web — kept trading one wrong answer for another, and sent project names online):
+    # the error log is read for a question that names a variable / name that is in a recorded error, or that asks
+    # about the last error; online is a search the caller asks for (online=true), of codes and documented names only.
     ERR_LOG_PICK = 3                       # entries of the error log err_lookup offers for a question without a code
-
-    # words of every symbol path or error text: sharing one says nothing ('MAIN' in 'MAIN.nCounter' and 'MAIN.fbAxis')
-    _WEAK_WORDS = frozenset("main gvl gvls prg program plc task instance fb fbs the a an of on in to is not why does do "
-                            "did what when how fails failed fail failing error errors".split())
-    # a question about the newest error: said ('the last error' — wins over a shared word) or meant ('what does the
-    # error mean?', 'why did that fail?' — when no error shares the question's words)
-    _LAST_SAID = re.compile(r"\b(?:last|latest|previous|newest|most recent)\b", re.I)
-    _LAST_ERROR = re.compile(r"\b(?:last|latest|previous|recent|newest|this|that|the|same|it)\b[\w\s]{0,24}?"
-                             r"\b(?:error|errors|failure|fault|message|problem|fail|failed|fails|mean)\b", re.I)
+    # 'the last error', 'the previous ADS error', 'the latest XAE message' — the words must say it
+    _LAST_SAID = re.compile(r"\b(?:last|latest|previous|newest|most\s+recent)\s+(?:[\w-]+\s+){0,2}?"
+                            r"(?:error|errors|failure|fault|message|messages)\b", re.I)
+    # a name of the question: a path (MAIN.fbValve.bOpen), or a name with '_', an inner capital or letters and digits
+    _QUESTION_NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\b[A-Za-z_]*[a-z][A-Z]\w*\b|\b\w*[A-Za-z]_\w+\b"
+                                r"|\b[A-Za-z]+\d+[A-Za-z]*\b")
 
     def _err_log_entries(self, query: str, texts: list[tuple[str, str]], source: str,
                          ordered: bool = True) -> list[dict[str, Any]]:
-        """The texts (newest first: (where, text)) that name a code and are about the question — they hold one of its
-        names whole (MAIN.doesNotExist: 2 each) or one of its informative words (1 each, not 'main' / 'error' …); for a
-        question about the last error the newest. Each looked up in the errors index (a code read from it, never a
-        word). Third review of 0.8.16: 'main' made an unrelated error the answer; 'the last error' found none."""
-        from . import docsearch as DS
+        """The texts (newest first: (where, text)) that name a code and are about the question: one that holds a name
+        of the question whole (MAIN.fbValve.bOpen, fbValve, FB_Dosing) — or, for a question that asks about the last
+        error ('what does the last error mean?'), the newest one (`ordered`: the texts have a time order; the XAE Error
+        List has none). Each looked up in the errors index (a code read from the text, never a word of it)."""
         from . import errors_index as X
         loc = self.kb.location()[0]
-        names = {n.lower() for n in re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\b\w*[a-z][A-Z]\w*\b|\b\w+_\w+\b", query)}
-        words = [w for w in DS.informative_words(query) if not w.isdigit() and w not in X._GENERIC_WORDS
-                 and w not in self._WEAK_WORDS]
-        said = bool(self._LAST_SAID.search(query)) and ordered
-        last = bool(self._LAST_ERROR.search(query)) and ordered      # the XAE Error List has no time order
-
-        def has(w: str, low: str) -> bool:
-            # a word or its stem ('activation' / ActivateConfiguration: 'activ…') — fourth review of 0.8.16
-            return bool(re.search(rf"\b{re.escape(w[:5])}\w*" if len(w) >= 6 else rf"\b{re.escape(w)}\b", low))
-        cands = []
-        for k, (where, t) in enumerate(texts):
+        names = list(dict.fromkeys(self._QUESTION_NAME.findall(query)))
+        last = ordered and bool(self._LAST_SAID.search(query))
+        named, coded = [], []
+        for where, t in texts:
             read = X.read_query(t)
             if not (read["codes"] or read["names"] or read["caps"] or read["ids"]):
                 continue
-            low = (t + " " + where.split(" ", 1)[0].replace("_", " ")).lower()     # the tool's name counts too
-            score = 2 * sum(1 for n in names if n in low) + sum(1 for w in words if has(w, low))
-            cands.append((-score, k, where, t))
-        shared = sorted(c for c in cands if c[0] < 0)
-        picked = (cands[:1] if said else []) or shared[:self.ERR_LOG_PICK] or (cands[:1] if last else [])
+            coded.append((where, t))
+            hits = [n for n in names if re.search(rf"(?<!\w){re.escape(n)}(?!\w)", t, re.I)]
+            if hits:
+                named.append((where, t, hits))
+        picked = [(w, t, h) for w, t, h in named[:self.ERR_LOG_PICK]] or \
+            ([(coded[0][0], coded[0][1], None)] if last and coded else [])
         out = []
-        for score, _k, where, t in picked:
+        for where, t, hits in picked:
             try:
                 r = X.err_lookup(t, kb=loc, limit=3, fulltext=False)
             except X.ErrError:
@@ -892,22 +886,25 @@ class App:
                 continue
             out.append({"source": source, "where": where, "text": t[:600], "read_as": read_as,
                         "documented": bool(matches), "matches": matches,
-                        **({"newest": True} if said or not shared else {"shares_words": -score})})
+                        **({"names": hits} if hits else {"newest": True})})
         return out
 
     async def err_from_logs(self, query: str) -> dict[str, Any] | None:
-        """0.8.16 (user decision): a question without a code — the code is looked for where errors were seen: first the
-        errors this server returned and the XAE messages of its calls (newest first), then — when those name none that
-        is documented — the XAE Error List (the TwinCAT logger's messages), read only when XAE is attached."""
+        """A question without a code: the errors this server returned, the XAE messages of its calls and the errors
+        inside its results (newest first) that hold one of the question's names — or the newest, when the question
+        asks about the last error; then the XAE Error List (when XAE is attached) for the question's names. None when
+        the question names nothing and does not ask about the last error."""
+        if not self._QUESTION_NAME.search(query) and not self._LAST_SAID.search(query):
+            return None
         texts: list[tuple[str, str]] = []
-        for r in reversed(self.recent_errors):           # newest first, every kind in its place (third review)
+        for r in reversed(self.recent_errors):           # newest first, every kind in its place
             if r.get("error"):
                 texts.append((f"{r['tool']} {r['when']}", r["error"]))
             texts += [(f"{r['tool']} {r['when']} (XAE message)", ln) for ln in r.get("lines") or []]
             texts += [(f"{r['tool']} {r['when']} (in its result)", e) for e in r.get("result_errors") or []]
         entries = await asyncio.to_thread(self._err_log_entries, query, texts, "recent errors of this server")
         note = None
-        if not any(e["documented"] for e in entries):
+        if not entries and self._QUESTION_NAME.search(query):
             if getattr(self.xae, "dte", None) is not None:
                 try:
                     el = await self.xae_call(self.xae.errors, timeout=60)
@@ -918,125 +915,49 @@ class App:
                     note = f"the XAE Error List could not be read: {str(exc)[:200]}"
             else:
                 note = "the XAE Error List was not read: XAE is not attached (xae_attach)"
-        if not entries and note is None:
-            return None
         out: dict[str, Any] = {"entries": entries,
-                               "note": ("errors seen before that name a code and hold the question's names or words "
-                                        "(shares_words) — or, for a question about the last error, the newest (newest); "
-                                        "the code is looked up, never a word")}
+                               "note": ("errors seen before that hold a name of the question (names), or the newest for "
+                                        "a question about the last error (newest) — the code is read from the error "
+                                        "and looked up, never a word of it")}
         if not entries:
-            out["note"] = "no error seen before names a code and is about the question"
+            out["note"] = ("no error was seen yet" if not texts else
+                           "no error seen before holds a name of the question and names a code"
+                           if self._QUESTION_NAME.search(query) else "no error seen before names a code")
         if note:
             out["xae_error_list"] = note
         return out
 
     ONLINE_TIMEOUT_S = 12.0                # the online step of err_lookup gives up after this (no network: no 40 s wait)
-
-    # public names a question may hold besides the documented ones: products, protocols, states, the shell
-    PUBLIC_TERMS = frozenset("twincat ethercat ads ams xae plc nc cnc coe soe foe eoe aoe voe tcp udp ip opc ua mqtt "
-                             "modbus profinet profibus canopen devicenet ethernet tcunit beckhoff tcxaeshell init preop "
-                             "safeop op boot".split())
-    # COM's own error names (not in the local documentation) — a list: 'E_' alone is the project's enum convention
+    # COM's own error names — public, and not in the local documentation (a fixed list: 'E_' is also the enum prefix
+    # of every PLC project)
     COM_NAMES = frozenset("E_FAIL E_POINTER E_INVALIDARG E_NOTIMPL E_NOINTERFACE E_UNEXPECTED E_ACCESSDENIED "
                           "E_OUTOFMEMORY E_ABORT E_HANDLE E_PENDING S_OK S_FALSE".split())
-    COM_PREFIXES = ("RPC_E_", "CO_E_", "DISP_E_", "TYPE_E_", "STG_E_")
-    # Beckhoff product codes (EL3356, EK1100, CX9020, CP6606, AX5206, TF6250, C6015) and TwinCAT libraries (Tc2_MC2)
-    PRODUCT = re.compile(r"(?:E[LKPSRJMQB]|K[LSM]|B[KCX]|C[XPU]|A[XMGT]|T[FECS]|IL|IP|FC|C)\d{3,5}(?:-\d{4})*"
-                         r"|Tc[23]_\w+", re.I)
 
-    def _public_name(self, t: str) -> bool:
-        """A name that is Beckhoff's or everyone's: a product, protocol or library, a COM error name, a code's symbol in
-        the errors index, a symbol of the Infosys index, or a word of an Infosys page title written exactly so
-        (ConsumeXml in 'ITcSmTreeItem::ConsumeXml'; fbTimer is not 'FBTimer')."""
-        if t.lower() in self.PUBLIC_TERMS or t in self.COM_NAMES or t.startswith(self.COM_PREFIXES) \
-                or self.PRODUCT.fullmatch(t):
-            return True
-        loc = self.kb.location()[0]
-        if loc is None:
-            return False
-        from . import errors_index as X
-        from . import kb_layout as L
-        checks = ((L.index_file(loc, "errors"), "SELECT form FROM alias WHERE form = ? LIMIT 1", t.lower()),
-                  (self.kb.infosys_db(loc), "SELECT name FROM symbols WHERE name = ? LIMIT 1", t),
-                  (self.kb.infosys_db(loc), "SELECT title FROM pages_fts WHERE pages_fts MATCH ? LIMIT 20",
-                   'title:"' + t.replace('"', "") + '"'))
-        for db, sql, arg in checks:
-            if db is None or not Path(db).is_file():
-                continue
-            try:
-                con = X.connect_ro(Path(db))
-                try:
-                    rows = con.execute(sql, (arg,)).fetchall()
-                finally:
-                    con.close()
-            except sqlite3.Error:
-                continue
-            if "pages_fts" in sql:
-                if any(re.search(rf"(?<![\w]){re.escape(t)}(?![\w])", str(r[0])) for r in rows):
-                    return True
-            elif rows:
-                return True
-        return False
-
-    def _project_words(self) -> set[str] | None:
-        """Every name in the project's sources (POU / DUT / GVL names, variables, enum members, instances), lower case;
-        None when this server has no project index."""
-        try:
-            self.proj._ensure()
-            units = self.proj.all_units()
-        except Exception:  # noqa: BLE001 — no project root, or it cannot be read: the names are not known
-            return None
-        if not units:
-            return None
-        key = (getattr(self.proj, "scanned_at", None), len(units))
-        cached = getattr(self, "_proj_words_cache", None)
-        if cached is not None and cached[0] == key:
-            return cached[1]
-        words: set[str] = set()
-        for u in units:
-            words.add(u.name.lower())
-            words.update(w.lower() for w in re.findall(r"[A-Za-z_]\w*", f"{u.declaration}\n{u.implementation}"))
-        self._proj_words_cache = (key, words)
-        return words
-
-    def online_terms(self, query: str, res: dict[str, Any] | None = None) -> str:
-        """What the online search is sent: the codes read, the message ids, numbers, plain words, and names — a name
-        that is Beckhoff's or public (_public_name: EL3356, CX9020, MC_MoveAbsolute, EtherCAT, ConsumeXml, E_FAIL) is
-        sent; one in the project's sources is not (FB_DOSING_VALVE, E_VALVE_STATE, STATE_WAIT_SETTLE, fbTimer); an
-        unknown one is sent when the project's names are known, else not. A dotted path (MAIN.fbAxis) never.
-        Third / fourth review of 0.8.16: by a word's shape, project names in capitals were sent; by the documentation
-        alone, product and terminal names (EL3356, CX9020) were dropped."""
+    @classmethod
+    def online_terms(cls, query: str, res: dict[str, Any] | None = None) -> str:
+        """What an online search is sent: the codes err_lookup read (in the question's notation), its message ids,
+        the code symbols it found in the documentation, and COM's own error names — nothing else of the question: no
+        word and no name of it can carry a project's, a machine's or a customer's name to the search engine."""
         res = res or {}
         terms = [c["token"] for c in res.get("read_as") or []] + [m["token"] for m in res.get("message_ids") or []]
-        project = self._project_words()
-        for t in re.findall(r"[^\s,;:()\[\]\"'`]+", query):
-            t = t.strip(".?!")
-            if not t or t in terms:
-                continue
-            if re.fullmatch(r"[A-Za-z][a-z]+", t) and t.lower() not in self.PUBLIC_TERMS:
-                terms.append(t)                      # a plain word (a capital at the start of a sentence)
-            elif re.fullmatch(r"(?:0x|16#|#x)?-?[0-9A-Fa-f]+", t) and re.search(r"\d", t) \
-                    and not self.PRODUCT.fullmatch(t):
-                terms.append(t)                      # a number
-            elif "." not in t and re.fullmatch(r"[A-Za-z_][\w-]*", t):
-                if self._public_name(t):
-                    terms.append(t)
-                elif project is not None and t.lower() not in project:
-                    terms.append(t)                  # in neither the documentation nor the project: a vendor's name
-        return " ".join(terms)
+        terms += [m["symbol"] for m in (res.get("matches") or []) + (res.get("other_domains") or [])
+                  if m.get("symbol") and m.get("matched_by", "symbol") in ("symbol", "dotnet name")
+                  and m["symbol"].lower() in {n.lower() for n in res.get("names") or []}]
+        terms += [t for t in re.findall(r"\b[A-Z][A-Z_]+\b", query) if t in cls.COM_NAMES]
+        return " ".join(dict.fromkeys(terms))
 
     async def err_online(self, query: str, res: dict[str, Any] | None = None) -> dict[str, Any]:
-        """0.8.16 (user decision): when the local documentation has nothing — a site search of infosys.beckhoff.com on
-        the web (docs.web_fallback; off: said so). Pages that mention it, not a documented meaning. Sent: online_terms
-        (never the project's own names); it gives up after ONLINE_TIMEOUT_S."""
+        """err_lookup(online=true): a site search of infosys.beckhoff.com on the web for the codes and documented names
+        of the question (online_terms) — pages that mention them, not a documented meaning. Off with docs.web_fallback =
+        false or without the docs index (said so); it gives up after ONLINE_TIMEOUT_S."""
         if getattr(self, "docs", None) is None:
             return {"skipped": "the docs index is off (docs.enabled = false): no online search"}
         if not self.cfg.docs.web_fallback:
             return {"skipped": "docs.web_fallback = false: no online search"}
-        terms = await asyncio.to_thread(self.online_terms, query, res)
+        terms = self.online_terms(query, res)
         if not terms:
-            return {"skipped": "nothing to search for online: the question has no code and no word that may be sent "
-                               "(the project's own names and paths are not sent)"}
+            return {"skipped": "an online search is made for a code or a documented code name — the question has "
+                               "none (its words and names are never sent)"}
         try:
             # its own two threads: a network that drops traffic does not use up the pool every to_thread tool shares
             items = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(
@@ -2566,6 +2487,9 @@ def _com_detail(exc: BaseException, hr: int) -> str:
 import concurrent.futures as _cf
 _ONLINE_POOL = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="tcmcp-online")   # err_lookup's online step
 
+# what a result holds as read data, not as an outcome
+_VALUE_KEYS = frozenset("value values data rows samples items_raw tree leaves".split())
+
 # the tools whose errors err_lookup looks through: the target (ads_, rec_, scope_, snap_, ipc_, exp_, test_, tcunit_,
 # wf_), the XAE shell (xae_) and the HMI project (hmi_)
 _ERROR_SOURCES = frozenset("ads rec scope snap ipc exp test tcunit wf xae hmi".split())
@@ -2573,21 +2497,25 @@ _ERROR_SOURCES = frozenset("ads rec scope snap ipc exp test tcunit wf xae hmi".s
 
 def _result_errors(res: Any, depth: int = 0, out: list[str] | None = None, path: str = "") -> list[str]:
     """The error texts inside a result ('error': '…' at any depth up to 3, at most 20) — per-item failures of a tool
-    that succeeded as a whole."""
+    that succeeded as a whole — each with the item it is of: a symbol path key ('MAIN.fbValve.bOpen'), or the entry's
+    own name / symbol / path in a list ('ads_dump errors', 'rec blocks'). Never inside a value that was read (a PLC
+    struct with a member 'error' is data, not an error seen). Fifth review of 0.8.16."""
     out = [] if out is None else out
     if depth > 3 or len(out) >= 20:
         return out
     if isinstance(res, dict):
+        label = path or next((str(res[k]) for k in ("symbol", "name", "path", "root") if isinstance(res.get(k), str)),
+                             "")
         for k, v in res.items():
             if k == "error" and isinstance(v, str) and v:
-                # fourth review of 0.8.16: with the item it is of ('MAIN.fbValve.bOpen: ADSError 1793') — the backend's
-                # per-item text names none, and a question about the item never found it
-                out.append((f"{path}: " if path else "") + v[:500])
-            elif k not in ("xae_messages", "items_raw") and isinstance(v, (dict, list)):
-                _result_errors(v, depth + 1, out, k if isinstance(v, dict) else path)
+                out.append((f"{label}: " if label and label not in v else "") + v[:500])
+            elif k in _VALUE_KEYS or k == "xae_messages":
+                continue
+            elif isinstance(v, (dict, list)):
+                _result_errors(v, depth + 1, out, k if isinstance(v, dict) and "." in k else label)
     elif isinstance(res, list):
         for v in res[:200]:
-            _result_errors(v, depth + 1, out, path)
+            _result_errors(v, depth + 1, out, "")
     return out
 
 
@@ -3153,7 +3081,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         return res
 
     @mcp.tool(annotations=READ)
-    async def err_lookup(query: str, domain: str | None = None, limit: int = 5) -> dict[str, Any]:
+    async def err_lookup(query: str, domain: str | None = None, limit: int = 5,
+                         online: bool = False) -> dict[str, Any]:
         """What an error code, a code's name or a whole error message is in the LOCAL Beckhoff documentation (the error
         index index\\errors.db, built from the Infosys index, manuals.db and esi.db — N125). query: a number in any
         notation (0x745, 1861, 16#745, 0x00000745, an HRESULT 0x98110745 or its decimal), a symbol
@@ -3170,28 +3099,25 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         is listed apart (other_domains); `ranking` says why. Not documented: documented=false, the domains searched,
         no_local_source (CoE SDO abort codes, compiler C0xxx), full-text hits marked as such — never a guessed meaning.
         No code in the query ('ADS error on port 851'): documented=false — the codes whose text shares its words are
-        text_matches, not the answer; from_error_log: the codes of the errors this server returned and of the XAE
-        messages of its calls (then the XAE Error List, when attached), ranked by the words they share with the query,
-        each looked up. Nothing documented locally: online — a site search of infosys.beckhoff.com (docs.web_fallback),
-        pages that mention it, labelled so. domain= narrows (an id, or part of a page's id/title); limit 1-20. The
-        twincat-docs skill's err_lookup command is the same function offline (the same answer, without from_error_log
-        and online); the index's first build starts by itself."""
+        text_matches, not the answer; from_error_log: the errors this server returned, the XAE messages of its calls
+        and the errors inside its results that hold a name of the query (MAIN.fbValve.bOpen, fbValve), or the newest
+        for a question about the last error ('what does the last error mean?'); then the XAE Error List (attached)
+        for the query's names — the code read from the error and looked up. online=true: a site search of
+        infosys.beckhoff.com on the web (docs.web_fallback) for the query's codes and documented code names only —
+        never its words or other names; pages that mention them, labelled so. domain= narrows (an id, or part of a
+        page's id/title); limit 1-20. The twincat-docs skill's err_lookup command is the same function offline (the
+        same answer, without from_error_log and online); the index's first build starts by itself."""
         first = await asyncio.to_thread(app.errors_first_build)
         res = await app.kb_call(app.kb.err_lookup, query, domain, limit, timeout=60)
         if first:
             res["errors_first_build"] = first
-        if res.get("documented") is not True:
-            # 0.8.16 (user decision): no code in the question → the code is looked for in the errors seen before; and
-            # when the local documentation has nothing → online. documented=None (no errors index): both as well
-            if not res.get("read_as") and not res.get("message_ids"):   # a name nothing documents is no code read
-                logs = await app.err_from_logs(query)
-                if logs:
-                    res["from_error_log"] = logs
-            # re-review of 0.8.16: only an error that shares the question's words answers it — an unrelated older one
-            # (shares_words 0) kept the online search from running
-            if not any(e.get("documented") and (e.get("shares_words") or e.get("newest"))
-                       for e in (res.get("from_error_log") or {}).get("entries", [])):
-                res["online"] = await app.err_online(query, res)
+        if res.get("documented") is not True and not res.get("read_as") and not res.get("message_ids"):
+            # a question without a code: the code of an error seen before that it names (or the newest, asked so)
+            logs = await app.err_from_logs(query)
+            if logs:
+                res["from_error_log"] = logs
+        if online:
+            res["online"] = await app.err_online(query, res)
         return res
 
     async def tc_request_confirmation(action: str, target: str = "", args: dict[str, Any] | None = None) -> dict[str, Any]:

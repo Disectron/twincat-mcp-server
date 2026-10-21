@@ -1785,18 +1785,22 @@ async def test_0816_err_lookup_takes_the_code_from_the_errors_seen_then_goes_onl
     cfg.knowledge.location = str(kb)
     cfg.docs.enabled = False
     async with client_for(build_server(cfg)) as s:
+        # narrowed (user decision): no code, no name, no 'last error' — no error-log step; online only when asked
         r = payload(await s.call_tool("err_lookup", {"query": "ADS error on port 851"}))
-        assert r["documented"] is False and r["matches"] == [] and r["online"]["skipped"].startswith("the docs index"), r
-        assert r["from_error_log"]["entries"] == [] and "not attached" in r["from_error_log"]["xae_error_list"], sorted(r)
+        assert r["documented"] is False and r["matches"] == [] and "from_error_log" not in r and "online" not in r, r
+        r = payload(await s.call_tool("err_lookup", {"query": "ADS error on port 851", "online": True}))
+        assert r["online"]["skipped"].startswith("the docs index"), r
+        r = payload(await s.call_tool("err_lookup", {"query": "why does MAIN.fbAxis stop?"}))
+        assert r["from_error_log"]["entries"] == [] and "not attached" in r["from_error_log"]["xae_error_list"], r
         res = await s.call_tool("ads_read", {"name": "MAIN.doesNotExist"})
         assert res.is_error and "1808" in text(res), text(res)
         r = payload(await s.call_tool("err_lookup", {"query": "why does reading MAIN.doesNotExist fail?"}))
         e = r["from_error_log"]["entries"][0]
         assert e["source"] == "recent errors of this server" and e["where"].startswith("ads_read "), e
-        assert e["matches"][0]["symbol"] == "ADSERR_DEVICE_SYMBOLNOTFOUND" and e["shares_words"] >= 1, e
-        assert "online" not in r, r                          # the error log answered: nothing is looked up online
-        # a code the local documentation does not have: online, labelled
-        r = payload(await s.call_tool("err_lookup", {"query": "SDO abort 0x06020000"}))
+        assert e["matches"][0]["symbol"] == "ADSERR_DEVICE_SYMBOLNOTFOUND" and e["names"] == ["MAIN.doesNotExist"], e
+        assert "online" not in r, r
+        # a code the local documentation does not have, online asked: labelled (no docs index here: said so)
+        r = payload(await s.call_tool("err_lookup", {"query": "SDO abort 0x06020000", "online": True}))
         assert r["documented"] is False and "from_error_log" not in r and "skipped" in r["online"], r
 
 
@@ -1845,30 +1849,31 @@ async def test_rereview_0816_err_lookup_steps(monkeypatch, project_dir, tmp_path
         r = payload(await s.call_tool("err_lookup", {"query": "why does reading MAIN.doesNotExist fail?"}))
         e = r["from_error_log"]["entries"][0]
         assert e["where"].startswith("ads_read_many ") and e["matches"][0]["symbol"] == "ADSERR_DEVICE_SYMBOLNOTFOUND", e
-        r = payload(await s.call_tool("err_lookup", {"query": "E_FAIL"}))
+        r = payload(await s.call_tool("err_lookup", {"query": "E_FAIL", "online": True}))
         assert "online" in r and r["note"].startswith("E_FAIL: no documented code has this name"), r
     monkeypatch.setattr(App, "errors_first_build", lambda self: None)
     cfg2 = mk_cfg(project_dir)
     cfg2.knowledge.location = str(make_kb(tmp_path / "noerr"))          # no errors.db
     cfg2.docs.enabled = False
     async with client_for(build_server(cfg2)) as s:
-        r = payload(await s.call_tool("err_lookup", {"query": "ADS error on port 851"}))
+        r = payload(await s.call_tool("err_lookup", {"query": "why does MAIN.fbAxis fail?", "online": True}))
         assert r["documented"] is None and "from_error_log" in r and "online" in r, r
 
 
 @pytest.mark.anyio
 async def test_rereview_0816_the_online_step_sends_no_project_names_and_gives_up(tmp_path):
-    """Re-review of 0.8.16: (privacy) the whole question went to the search engine, project symbols included — only
-    codes, symbol-like names and plain words are sent; (13) a search that does not answer gives up after
-    ONLINE_TIMEOUT_S, not 40 s."""
+    """Re-review of 0.8.16: (privacy) the whole question went to the search engine, project symbols included — now
+    (narrowed by the user) only the codes read, message ids, documented code names and COM's error names are sent;
+    (13) a search that does not answer gives up after ONLINE_TIMEOUT_S, not 40 s."""
     import time as _t
     from twincat_mcp.server import App
     cfg = mk_cfg(tmp_path)
     cfg.docs.enabled = False
     app = App(cfg)
-    assert app.online_terms("why does reading MAIN.doesNotExist fail with E_FAIL?") == \
-        "why does reading fail with E_FAIL"
+    # narrowed (user decision): codes, message ids, documented code names and COM's names — nothing else of a question
+    assert app.online_terms("why does reading MAIN.doesNotExist fail with E_FAIL?") == "E_FAIL"
     assert app.online_terms("fbAxis.Execute: 0x4221", {"read_as": [{"token": "0x4221"}]}) == "0x4221"
+    assert app.online_terms("EL3356 on Givaudan_Line3 behind Doser_Station_3 shows TIMEOUT") == ""
 
     class SlowDocs:
         def web_search(self, q, limit=5):
@@ -1878,7 +1883,7 @@ async def test_rereview_0816_the_online_step_sends_no_project_names_and_gives_up
     app.cfg.docs.web_fallback = True
     app.ONLINE_TIMEOUT_S = 0.2
     t0 = _t.time()
-    r = await app.err_online("ADS error 0x4221")
+    r = await app.err_online("ADS error 0x4221", {"read_as": [{"token": "0x4221"}]})
     assert _t.time() - t0 < 0.9 and r["items"][0]["error"].startswith("the online search did not answer"), r
 
 
@@ -1907,7 +1912,7 @@ def test_rereview_0816_web_search_keeps_each_snippet_with_its_result_and_only_tc
 async def test_review3_0816_the_error_log_step(monkeypatch, project_dir, tmp_path):
     """Third review of 0.8.16: (2) an error inside a result is labelled as such and in its time; the plugin's own tools
     (a docs search) are not an error source; (5) 'main' alone does not make an error the answer, and 'the last error'
-    is the newest; (4) online_terms sends Beckhoff's names and no project names."""
+    is the newest; (4) online_terms sends no name of the question but COM's error names (narrowed by the user)."""
     import time as _t
     from tests.fake_ads import install
     from tests.test_errors_index import build as err_build, make_kb
@@ -1940,15 +1945,10 @@ async def test_review3_0816_the_error_log_step(monkeypatch, project_dir, tmp_pat
     assert all(x["where"].split()[0] != "ads_write" for x in r["entries"]), r     # 'main' alone: no answer
     r = await app.err_from_logs("what does the last error mean?")
     assert len(r["entries"]) == 1 and r["entries"][0]["newest"] and "1861" in r["entries"][0]["text"], r
-    r = await app.err_from_logs("why does the axis not move?")
-    assert r["entries"] == [], r
-    # the sample project's own names (FB_Valve, ST_Recipe, bEstop) stay home; products, protocols, COM names go
-    t = app.online_terms("TwinCAT error 0x80004005 in FB_Valve with ST_Recipe at bEstop and E_FAIL on EL3356 behind "
-                         "EK1100 at the CX9020")
-    for sent in ("TwinCAT", "E_FAIL", "EL3356", "EK1100", "CX9020", "0x80004005"):
-        assert sent in t.split(), (sent, t)
-    for kept in ("FB_Valve", "ST_Recipe", "bEstop"):
-        assert kept not in t.split(), (kept, t)
+    assert await app.err_from_logs("why does the axis not move?") is None      # no name, no 'last error': no step
+    # narrowed (user decision): online gets the codes read and COM's names, nothing else of the question
+    q = "TwinCAT error 0x80004005 in FB_Valve with ST_Recipe at bEstop and E_FAIL on EL3356 behind EK1100"
+    assert app.online_terms(q, {"read_as": [{"token": "0x80004005"}]}) == "0x80004005 E_FAIL"
 
 
 def test_review3_0816_web_search_drops_twincat2_supplements(tmp_path):
@@ -1969,9 +1969,9 @@ def test_review3_0816_web_search_drops_twincat2_supplements(tmp_path):
 @pytest.mark.anyio
 async def test_review4_0816_error_log_and_online_terms(monkeypatch, project_dir, tmp_path):
     """Fourth review of 0.8.16: (2) an error inside a result names its item ('MAIN.fbValve.bOpen: ADSError 1793'), so
-    a question about the item finds it; (7) the tool's name counts (stems: 'activation' / activate), 'what does the
-    error mean?' is about the newest, and 'the last error' wins over a shared word; (8) the XAE Error List has no
-    newest; (1) product names are sent online (EK1100 alone too)."""
+    a question about the item finds it; (8) the XAE Error List has no newest. (7) and (1) are settled by the user's
+    narrowing: no word or tool-name matching ('why does activation fail?': no step), 'the last error' said so is the
+    newest; no product name of a question goes online."""
     import time as _t
     from tests.test_errors_index import build as err_build, make_kb
     from twincat_mcp.server import App, _result_errors
@@ -1991,13 +1991,63 @@ async def test_review4_0816_error_log_and_online_terms(monkeypatch, project_dir,
         {"results": {"MAIN.fbValve.bOpen": {"error": "ADSError 1793 (0x701)"}}}))
     r = await app.err_from_logs("why did writing MAIN.fbValve.bOpen fail?")
     assert r["entries"][0]["text"].startswith("MAIN.fbValve.bOpen: ADSError 1793"), r
-    r = await app.err_from_logs("why does activation fail?")
-    assert r["entries"][0]["where"].startswith("xae_activate_configuration "), r
-    r = await app.err_from_logs("what does the error mean?")
-    assert len(r["entries"]) == 1 and r["entries"][0]["newest"] and "1793" in r["entries"][0]["text"], r
+    # narrowed (user decision): no word matching — a name of the question, or 'the last error' said so
+    assert await app.err_from_logs("why does activation fail?") is None
+    assert await app.err_from_logs("what does the error mean?") is None
     r = await app.err_from_logs("is the last error a timeout?")
     assert r["entries"][0]["newest"] and "1793" in r["entries"][0]["text"], r
     items = [("XAE Error List (error)", "C0077: Unknown type: 'FB_X'"), ("XAE Error List (error)", "ADS error 1808")]
     assert app._err_log_entries("what does the last error mean?", items, "XAE Error List", False) == []
-    assert app.online_terms("EK1100") == "EK1100"
-    assert app.online_terms("EL3356 shows weight 0 after CX9020 restart") == "EL3356 shows weight 0 after CX9020 restart"
+    assert app.online_terms("EK1100") == "" and app.online_terms("EL3356 shows weight 0 after CX9020 restart") == ""
+
+
+@pytest.mark.anyio
+async def test_review5_0816_narrowed_error_log_and_online(monkeypatch, project_dir, tmp_path):
+    """Fifth review of 0.8.16, settled by the user's narrowing ('Narrow A'): (1) the error log is read for a question
+    that names a recorded error's variable / name whole (fbValve is not fbValveB) or says 'last error' — not for 'the
+    last time'; (2) online only when asked (online=true), and of the codes and documented code names only — no
+    project, product or customer name; (4-6) an error inside a list-shaped result names its entry, and an 'error'
+    member of a value that was read is data, not an error seen."""
+    import time as _t
+    from tests.fake_ads import install
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App, _result_errors
+    assert _result_errors({"errors": [{"symbol": "MAIN.fbValve.bOpen", "error": "ADSError 1808"}]}) == \
+        ["MAIN.fbValve.bOpen: ADSError 1808"]
+    assert _result_errors({"value": {"error": "x", "nState": 3}, "rows": [{"error": "y"}]}) == []
+    assert _result_errors({"blocks": [{"name": "rec1", "error": "rec1: disk full"}]}) == ["rec1: disk full"]
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    r = await app.err_from_logs("what does the last error mean?")
+    assert r["entries"] == [] and r["note"] == "no error was seen yet", r
+    app.note_error("ads_read", error="ads_read MAIN.fbValveB.bOpen: ADSError 1808")
+    _t.sleep(1.1)
+    app.note_error("ads_write", error="ads_write MAIN.fbValve.bOpen: ADSError 1861 timeout")
+    r = await app.err_from_logs("why does fbValveB fail?")
+    assert [e["names"] for e in r["entries"]] == [["fbValveB"]] and "1808" in r["entries"][0]["text"], r
+    assert await app.err_from_logs("what happened the last time it worked?") is None
+    r = await app.err_from_logs("what does the previous ADS error mean?")
+    assert r["entries"][0]["newest"] and "1861" in r["entries"][0]["text"], r
+    for q in ("E_VALVE_STATE after ERR_DOSING_TIMEOUT in fbTimer", "MC_MoveAbsolute fails on Line3 of AcmeFoods",
+              "EtherCAT OP SAFEOP on EL3356"):
+        assert app.online_terms(q) == "", q
+    assert app.online_terms("ADSERR_DEVICE_SYMBOLNOTFOUND", {"names": ["ADSERR_DEVICE_SYMBOLNOTFOUND"], "matches": [
+        {"symbol": "ADSERR_DEVICE_SYMBOLNOTFOUND", "matched_by": "symbol"}]}) == "ADSERR_DEVICE_SYMBOLNOTFOUND"
+    assert app.online_terms("x", {"matches": [{"symbol": "ADSERR_DEVICE_SYMBOLNOTFOUND", "matched_by": "value"}]}) == ""
+    # online only when asked: no web search for an undocumented code unless online=true
+    install(monkeypatch)
+    asked: list[str] = []
+
+    async def fake_online(self, query, res=None):
+        asked.append(query)
+        return {"items": []}
+    monkeypatch.setattr(App, "err_online", fake_online)
+    async with client_for(build_server(cfg)) as s:
+        r = payload(await s.call_tool("err_lookup", {"query": "SDO abort 0x06020000"}))
+        assert r["documented"] is False and "online" not in r and asked == [], r
+        r = payload(await s.call_tool("err_lookup", {"query": "SDO abort 0x06020000", "online": True}))
+        assert r["online"] == {"items": []} and asked == ["SDO abort 0x06020000"], r

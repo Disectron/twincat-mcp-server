@@ -392,7 +392,9 @@ an index:
   `%ProgramData%\Microsoft\HelpLibrary2\Catalogs\<catalog>\ContentStore\EN-US\` (≈ 1 GB, ≈ 50k pages,
   ≈ 280 books). It is a zip of `<book>/1033/<pageid>.html` with the **same page ids as the website**, so
   every page is stored under its real `https://infosys.beckhoff.com/content/1033/<book>/<id>.html` URL.
-  `docs.source = "local"` (default): no network call at all, no web fallback; the newest package is found
+  `docs.source = "local"` (default): no network call at all, no web fallback — the one exception is
+  `err_lookup(online=true)`, a site search of infosys.beckhoff.com made only when asked, sent only the codes and
+  documented code names of the question (`docs.web_fallback=false` turns it off); the newest package is found
   automatically (`[docs] mshc` to pin one). **One index** (0.8.11, rules in `docs/KNOWLEDGE_BASE.md`): every
   TwinCAT 3 book of the package, built as a whole in its own process into `<knowledge folder>\index\infosys-1033.db`
   (without a knowledge folder: `<cache_dir>\helpviewer-1033\index.sqlite`) — the same file the `infosys_*` tools

@@ -3540,8 +3540,8 @@ class InfosysIndex:
         return [o for o, _ in out[:limit]]
 
     def web_search(self, q: str, limit: int = 5) -> list[dict[str, Any]]:
-        """A site search of infosys.beckhoff.com on the web (DuckDuckGo's HTML page) — err_lookup's online step (0.8.16,
-        user decision: when the local documentation has nothing). The search engine's results as they are: url, title,
+        """A site search of infosys.beckhoff.com on the web (DuckDuckGo's HTML page) — err_lookup(online=true) (0.8.16,
+        user decision: only when asked, of the codes and documented code names of the question). The search engine's results as they are: url, title,
         its snippet, and whether the page is in the local Help Viewer package (then infosys_get_page opens it; otherwise
         only a browser does — no page is fetched from the web in local mode). TwinCAT 2 books are left out (tc3_only).
         [{'error': …}] when the search cannot be reached."""
