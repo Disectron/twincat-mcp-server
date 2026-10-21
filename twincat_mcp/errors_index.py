@@ -1153,23 +1153,36 @@ def _swap(building: Path, final: Path, wait_s: float = SWAP_WAIT_S) -> str | Non
             time.sleep(1.0)
 
 
-def recorded_infosys(final: Path) -> str | None:
-    """The Infosys index the index in use was built from (its path), when there is one."""
-    return (_jl(read_meta(final).get("sources"), {}).get("infosys") or {}).get("path")
+_INFOSYS_FILE = re.compile(r"infosys-(\d+)\.db$", re.I)
+
+
+def recorded_infosys(final: Path, kb: Path) -> Path | None:
+    """The Infosys index a rebuild reads when none is named: this knowledge folder's, in the language the index in use
+    was built from (infosys-<lcid>.db) — never the path it recorded. Review of 0.8.16: a copied folder rebuilt from the
+    old folder's Infosys index (one index of two folders); a moved one found it 'missing' and a forced rebuild replaced
+    5610 codes with 52. None: no record, or a file of no language (the folder's default is read)."""
+    rec = (_jl(read_meta(final).get("sources"), {}).get("infosys") or {}).get("path")
+    m = _INFOSYS_FILE.search(str(rec or "").replace("\\", "/"))
+    return L.locate(Path(kb), "infosys", m.group(1)) if m else None
+
+
+def sources_building(ids: dict[str, dict[str, Any]]) -> list[str]:
+    """The source indexes being built now (their build lock is held), by name."""
+    from . import esi_index as E
+    from . import infosys_build as IB
+    locks = {"infosys": IB.side_files(Path(ids["infosys"]["path"]))[1],
+             "esi": E.side_files(Path(ids["esi"]["path"]))[1],
+             "manuals": Path(ids["manuals"]["path"]).with_name(Path(ids["manuals"]["path"]).name + ".lock")}
+    return [SOURCE_NAMES[k] for k, p in locks.items() if kb_lock.held(p)]
 
 
 def sources_ready(ids: dict[str, dict[str, Any]], kb: Path, lcid: str = L.DEFAULT_LCID) -> tuple[bool, str]:
     """Whether a build can start: a source exists, and no source index is being built (its first build, or a rebuild:
     the errors index would be built from the old one or none). -> (ready, why not)."""
-    from . import esi_index as E
-    from . import infosys_build as IB
     if all(v.get("missing") for v in ids.values()):
         return False, ("no source index: neither the Infosys index, manuals.db nor esi.db exists in the knowledge "
                        "folder")
-    locks = {"infosys": IB.side_files(Path(ids["infosys"]["path"]))[1],
-             "esi": E.side_files(Path(ids["esi"]["path"]))[1],
-             "manuals": Path(ids["manuals"]["path"]).with_name(Path(ids["manuals"]["path"]).name + ".lock")}
-    busy = [SOURCE_NAMES[k] for k, p in locks.items() if kb_lock.held(p)]
+    busy = sources_building(ids)
     if busy:
         return False, f"{', '.join(busy)} is being built — the errors index is built from it once that is complete"
     return True, ""
@@ -1183,7 +1196,7 @@ def build(final: Path, kb: Path, lcid: str = L.DEFAULT_LCID, force: bool = False
     final, kb = Path(final), Path(kb)
     building, lock = side_files(final)
     final.parent.mkdir(parents=True, exist_ok=True)
-    ids = identities(kb, lcid, infosys_db or recorded_infosys(final))
+    ids = identities(kb, lcid, infosys_db or recorded_infosys(final, kb))
     ok, why_not = sources_ready(ids, kb, lcid)
     if not ok:
         raise ErrError(why_not, "no_source")
@@ -1265,7 +1278,7 @@ def state(final: Path, kb: Path | None, lcid: str = L.DEFAULT_LCID, infosys_db: 
     rec = _jl(meta.get("sources"), {})
     now: dict[str, dict[str, Any]] = {}
     if kb is not None:
-        now = identities(Path(kb), lcid, infosys_db or (rec.get("infosys") or {}).get("path"))
+        now = identities(Path(kb), lcid, infosys_db or recorded_infosys(final, Path(kb)))
     if not final.is_file() or not meta:
         out["state"] = "missing"
     elif meta.get("format") != FORMAT:
@@ -1427,15 +1440,21 @@ def read_query(q: str) -> dict[str, Any]:
     for m in _PYADS.finditer(q):
         if all(c["value"] != int(m.group(1)) for c in codes):
             codes.append({"token": m.group(1), "value": int(m.group(1)), "how": "dec"})
-    names = []
+    names, caps = [], []
     for m in _NAME_TOKEN.finditer(q):
         t = m.group(0)
+        if DS._HEX.match(t) or t.upper() in ("ADSERROR",):
+            continue
         if "_" in t.strip("_") or re.search(r"[a-z][A-Z]", t) or (re.search(r"\d", t) and re.search(r"[A-Za-z]{2}", t)):
-            if not DS._HEX.match(t) and t.upper() not in ("ADSERROR",):
-                names.append(t)
+            names.append(t)
+        elif t.isupper() and sum(ch.isalpha() for ch in t) >= 4:
+            # review of 0.8.16: a symbol in capitals without '_' (WSAETIMEDOUT, WSAEINTR) was read as a word and its
+            # text search answered WSAEHOSTDOWN — such a word is a name when the alias table has it ('ERROR' in a log
+            # line is none): err_lookup decides
+            caps.append(t)
     ids = [{"token": m.group(0), "domain": did} for did, spec in DOMAINS.items() if spec.get("id_form")
            for m in re.finditer(spec["id_form"], qt)]
-    return {"codes": codes, "names": list(dict.fromkeys(names)), "ids": ids}
+    return {"codes": codes, "names": list(dict.fromkeys(names)), "caps": list(dict.fromkeys(caps)), "ids": ids}
 
 
 def _forms(v: int) -> set[int]:
@@ -1499,6 +1518,28 @@ def _domain_filter(domain: str | None, doms: dict[str, dict[str, Any]]) -> list[
                        f"{', '.join(sorted(k for k in doms if '/' not in k))} and the code pages of libraries "
                        "(their book/page id — any part of the id or title selects them)")
     return hit
+
+
+def _by_value(con: sqlite3.Connection, v: int) -> tuple[list[tuple[str, int, list[sqlite3.Row], str]],
+                                                         list[tuple[str, int, int]]]:
+    """Where a number is documented: in each of its 32-bit forms (-6908 = 0xFFFFE504), as the HRESULT of a code
+    (0x98110745 → ads 0x745), and the ESI text ids it links -> ([(domain, value, rows, how)], [(domain, value, n)])."""
+    found: list[tuple[str, int, list[sqlite3.Row], str]] = []
+    links: list[tuple[str, int, int]] = []
+    for f in sorted(_forms(v)):
+        by: dict[str, list[sqlite3.Row]] = {}
+        for r in con.execute("SELECT * FROM code WHERE value_int = ?", (f,)).fetchall():
+            by.setdefault(r["domain"], []).append(r)
+        for did, rs in by.items():
+            found.append((did, f, rs, "value"))
+        for a in con.execute("SELECT DISTINCT domain, value_int FROM alias WHERE kind = 'hresult' AND form = ?",
+                             (f"0x{f & 0xFFFFFFFF:08x}",)):
+            rs = con.execute("SELECT * FROM code WHERE domain = ? AND value_int = ?", (a[0], a[1])).fetchall()
+            if rs:
+                found.append((a[0], a[1], rs, "hresult"))
+        for lk in con.execute("SELECT domain, value_int, count FROM link WHERE value_int = ? AND target = 'esi'", (f,)):
+            links.append((lk[0], lk[1], lk[2]))
+    return found, links
 
 
 def _row_out(con: sqlite3.Connection, did: str, value: int, rows: list[sqlite3.Row], doms: dict[str, dict[str, Any]],
@@ -1569,8 +1610,11 @@ def _verified(con: sqlite3.Connection | None, a: dict[str, Any], value: int | No
 
 
 def _diag_out(kb: Path | None, value: int, count: int) -> dict[str, Any]:
+    # review of 0.8.16: every match has the fields of a documented code (value, hex, dec, text, ref) — doc_note read
+    # r['ref'] and kb_search d0['dec'] of an ESI text id and raised KeyError instead of the error it annotated
     out: dict[str, Any] = {"domain": "ethercat_diag", "domain_title": DOMAINS["ethercat_diag"]["title"], "value": value,
-                           "hex": f"#x{value:04X}", "documented_in": "esi.db", "messages": count,
+                           "hex": f"#x{value:04X}", "dec": str(value), "ref": f"esi.db, text id #x{value:04X}",
+                           "documented_in": "esi.db", "messages": count,
                            "see": f"hw_diag(code='#x{value:04X}') — the messages, causes and remedies (with device=…: "
                                   "that device's catalogue)", "matched_by": "value"}
     if kb is not None:
@@ -1665,25 +1709,13 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         named = list(dict.fromkeys(_named(qn, doms) + [i["domain"] for i in read["ids"] if i["domain"] in doms]))
         found: list[tuple[str, int, list[sqlite3.Row], str]] = []
         links: list[tuple[str, int, int]] = []
-        values = [c["value"] for c in read["codes"]]
-        for v in values:
-            for f in sorted(_forms(v)):
-                rows = con.execute("SELECT * FROM code WHERE value_int = ?", (f,)).fetchall()
-                by: dict[str, list[sqlite3.Row]] = {}
-                for r in rows:
-                    by.setdefault(r["domain"], []).append(r)
-                for did, rs in by.items():
-                    found.append((did, f, rs, "value"))
-                for a in con.execute("SELECT DISTINCT domain, value_int FROM alias WHERE kind = 'hresult' AND form = ?",
-                                     (f"0x{f & 0xFFFFFFFF:08x}",)):
-                    rs = con.execute("SELECT * FROM code WHERE domain = ? AND value_int = ?", (a[0], a[1])).fetchall()
-                    if rs:
-                        found.append((a[0], a[1], rs, "hresult"))
-                for lk in con.execute("SELECT domain, value_int, count FROM link WHERE value_int = ? AND target = 'esi'",
-                                      (f,)):
-                    links.append((lk[0], lk[1], lk[2]))
+        for v in [c["value"] for c in read["codes"]]:
+            f_found, f_links = _by_value(con, v)
+            found += f_found
+            links += f_links
         sym_domains: set[str] = set()
-        for n in read["names"]:
+        known_caps = []
+        for n in read["names"] + read["caps"]:
             hit: list[str] = []
             for a in con.execute("SELECT DISTINCT domain, value_int, kind FROM alias WHERE form = ? AND kind IN "
                                  "('symbol', 'dotnet')", (n.lower(),)):
@@ -1691,11 +1723,16 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
                 if rs:
                     found.append((a[0], a[1], rs, "symbol" if a[2] == "symbol" else "dotnet name"))
                     hit.append(a[0])
+            if hit and n in read["caps"]:
+                known_caps.append(n)
             if hit:
                 # a symbol names the code space it belongs to: of the domains that have it, the general one
                 # (ADSERR_CLIENT_SYNCTIMEOUT is ads 0x745; the LabVIEW table numbers the same symbol its own way —
                 # listed apart, in other_domains)
                 sym_domains.add(min(hit, key=lambda d: (doms.get(d, {}).get("priority", 10), d)))
+        if known_caps:                  # a capitalised word the alias table knows is a name of a code (WSAEINTR)
+            read = {**read, "names": read["names"] + known_caps}
+            out["names"] = read["names"]
         text_search = not read["codes"] and not found and not read["ids"]
         if text_search:
             # the words that can pick a text: not 'error' / 'code' / a domain's name ('ADS error on port 851' → port)
@@ -1734,6 +1771,17 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         entries.sort(key=lambda e: rank(e["domain"]))
         main = [e for e in entries if not named_all or e["domain"] in named_all]
         other = [e for e in entries if named_all and e["domain"] not in named_all]
+        if text_search and entries:
+            # review of 0.8.16 (user decision): a query without a code is not answered by a shared word — 'ADS error on
+            # port 851' was documented=true with five 'port' codes, 'E_FAIL' with the texts that say 'failed'. The codes
+            # whose text holds its words are listed apart, as what the words could mean (the server's err_lookup looks
+            # for the code in the recent errors and the XAE Error List, then online)
+            out["text_matches"] = [{k: e.get(k) for k in ("domain", "value", "hex", "symbol", "text", "ref")
+                                    if e.get(k) is not None} for e in (main + other)[:limit]]
+            out["text_matches_note"] = (f"no code in the query: the documented codes whose text holds its words "
+                                        f"({', '.join(out.get('searched_words', []))}) — not what the message is "
+                                        "unless it is one of them")
+            main, other = [], []
         out["documented"] = bool(main)
         out["matches"] = main[:limit]
         if len(main) > limit:
@@ -1761,10 +1809,6 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
             gaps = {d: n for d, n in gaps.items() if d in named_all}
         if gaps and (not main or named_all):
             out["no_local_source"] = gaps
-        if main and text_search:
-            out["note"] = (f"no code in the query: these are the documented codes whose text holds its words "
-                           f"({', '.join(out.get('searched_words', []))}) — a number counts as a code when it is the "
-                           "whole query or stands next to a word that says so (error 1861, nErrId := 1808)")
         if not main:
             given = [c["token"] for c in read["codes"]] + read["names"] + [i["token"] for i in read["ids"]]
             code_given = bool(read["codes"] or read["ids"]) or any(e["matched_by"] in ("symbol", "dotnet name")
@@ -1774,6 +1818,11 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
                 out["note"] = (f"{what}: not in the local Beckhoff documentation"
                                + (f" of {', '.join(named_all)}" if named_all else "")
                                + " — no meaning is given (the full-text hits, if any, only mention it)")
+            elif out.get("text_matches"):
+                out["note"] = ("no code or code name in the query: nothing is documented for it — the codes whose "
+                               "text holds its words are in text_matches. A number counts as a code when it is the "
+                               "whole query or stands next to a word that says so (error 1861, nErrId := 1808, ADS "
+                               "error 0x745), a name when it is a code's symbol")
             elif out.get("searched_words"):
                 out["note"] = (f"no code or code name in the query, and no documented text has all of its words "
                                f"({', '.join(out['searched_words'])})")
@@ -1833,7 +1882,8 @@ def describe_code(kb: Path | str | None, domain: str, value: int) -> dict[str, A
         return None
     try:
         with ErrIndex(db).con() as con:
-            r = con.execute("SELECT c.symbol, c.text, x.ref, c.hex FROM code c JOIN variant x ON x.domain = c.domain "
+            r = con.execute("SELECT c.symbol, c.text, COALESCE(c.source_ref, x.ref) AS ref, c.hex FROM code c JOIN "
+                            "variant x ON x.domain = c.domain "
                             f"AND x.variant = c.variant WHERE c.domain = ? AND c.value_int = ? ORDER BY {MAIN_ORDER} "
                             "LIMIT 1", (domain, value)).fetchone()
     except (sqlite3.Error, ErrError):
@@ -1854,14 +1904,14 @@ def code_summary(kb: Path | str | None, value: int, infosys_db: str | Path | Non
     try:
         with ErrIndex(db).con() as con:
             doms = _domains(con)
-            rows = con.execute("SELECT * FROM code WHERE value_int = ?", (value,)).fetchall()
-            by: dict[str, list[sqlite3.Row]] = {}
-            for r in rows:
-                by.setdefault(r["domain"], []).append(r)
-            for did in sorted(by, key=lambda d: (doms.get(d, {}).get("priority", 10), d)):
-                e = _row_out(con, did, value, by[did], doms, "value", "")
-                out.append({k: e[k] for k in ("domain", "domain_title", "symbol", "text", "ref", "books", "texts",
-                                              "missing_in") if k in e})
+            # review of 0.8.16: the forms err_lookup reads too (0x98110745 is ads 0x745, 0xFFFFE504 is LabVIEW -6908)
+            seen: dict[tuple[str, int], tuple[list[sqlite3.Row], str]] = {}
+            for did, v, rs, how in _by_value(con, value)[0]:
+                seen.setdefault((did, v), (rs, how))
+            for did, v in sorted(seen, key=lambda k: (doms.get(k[0], {}).get("priority", 10), k[0])):
+                e = _row_out(con, did, v, seen[(did, v)][0], doms, seen[(did, v)][1], "")
+                out.append({k: e[k] for k in ("domain", "domain_title", "value", "hex", "symbol", "text", "ref", "books",
+                                              "texts", "missing_in", "matched_by") if k in e})
     except (sqlite3.Error, ErrError):
         return None
     return out

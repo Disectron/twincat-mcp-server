@@ -421,6 +421,7 @@ class App:
         self.ads.alias_hint = self.source_alias
         from .config import _home
         self.init_done = threading.Event()        # set when __init__ is through (errors_first_build waits for it)
+        self._errors_spawn_lock = threading.Lock()     # one errors-index build started at a time (spawn_errors_build)
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
         # the permanent layout of the knowledge folder (docs/KNOWLEDGE_BASE.md) before anything opens an index
         self.kb.layout()
@@ -691,7 +692,17 @@ class App:
     def spawn_errors_build(self, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
         """errors_db.py update for the knowledge folder in its own process, with this server's Python (standard library
         only), from the knowledge folder's Infosys index, manuals.db and esi.db. dry_run: every check, nothing started
-        -> {'would_start': True} or why not (N96)."""
+        -> {'would_start': True} or why not (N96). One at a time: review of 0.8.16 — two callers at once (an err_lookup
+        and the first build's wait) both found no build running and both started one; the second failed on the lock
+        and its caller was told started=True."""
+        with self._errors_spawn_lock:
+            p = getattr(self, "errors_build_proc", None)
+            if p is not None and p.poll() is None:
+                return {"started": False, "already_running": {"pid": p.pid},
+                        "message": "an errors-index build this server started is still running (kb_status shows it)"}
+            return self._spawn_errors_build(force, dry_run)
+
+    def _spawn_errors_build(self, force: bool, dry_run: bool) -> dict[str, Any]:
         import subprocess
         from . import errors_index as X
         from . import kb_layout as L
@@ -706,7 +717,9 @@ class App:
         if st["state"] == "complete" and not force and not st.get("rebuild"):
             return {"started": False, "up_to_date": True, "message": st["message"]}
         final = L.index_file(loc, "errors")
-        infosys = self.kb.infosys_db(loc) if st["state"] == "missing" else None
+        # review of 0.8.16: every build reads this server's Infosys index (its language, in this knowledge folder) — a
+        # rebuild read the path the old index recorded: another folder's after a copy, a missing one after a move
+        infosys = self.kb.infosys_db(loc)
         if st["state"] == "complete" and not force and (st.get("rebuild") or {}).get("state") in ("stale", "incomplete"):
             # a work file left next to the complete, current index (a stale one, or a build that failed its checks):
             # no rebuild — discarded (rule 7), nothing asked
@@ -719,7 +732,7 @@ class App:
                 return {"started": False, "error": str(exc)}
             return {"started": False, "up_to_date": True, **({"discarded": r["discarded"]} if r.get("discarded") else {}),
                     "message": self.kb.errors_state()["message"]}
-        ok, why = X.sources_ready(X.identities(loc, infosys_db=infosys or X.recorded_infosys(final)), loc)
+        ok, why = X.sources_ready(X.identities(loc, infosys_db=infosys), loc)
         if not ok:
             return {"started": False, "error": why}
         if dry_run:
@@ -763,6 +776,39 @@ class App:
             return None
         return self.spawn_errors_build()
 
+    ERRORS_FIRST_WAIT_S = 15.0             # how often a waiting first build of the errors index looks again
+    ERRORS_FIRST_MAX_S = 6 * 3600.0
+
+    def _errors_first_build_when_ready(self) -> dict[str, Any] | None:
+        """Rule 6 for the errors index: its first build starts by itself once its sources can be read. Review of 0.8.16:
+        at the server start an ESI / manuals / Infosys index being built kept it from starting (one try), and only an
+        err_lookup call tried again — kb_search, the error texts and xae_messages stayed without it. This (a thread of
+        the server start) waits while a source index is being built — or the Infosys index of the local package is
+        coming — and tries again; it ends when the build started, the index exists, the knowledge folder changed, or
+        nothing is being built that could make it possible."""
+        from . import errors_index as X
+        from . import kb_layout as L
+        loc = self.kb.location()[0]
+        t0 = time.monotonic()
+        while True:
+            try:
+                first = self.errors_first_build()
+            except Exception as exc:  # noqa: BLE001 — a convenience; kb_status shows the state either way
+                log.warning("errors first build: %s", exc)
+                return None
+            if first:
+                log.info("errors index: first build %s", "started" if first.get("started") else first)
+                return first
+            if loc is None or self.kb.location()[0] != loc or L.index_file(loc, "errors").exists():
+                return None
+            infosys = self.kb.infosys_db(loc)
+            busy = X.sources_building(X.identities(loc, infosys_db=infosys))
+            coming = (getattr(self, "docs", None) is not None and self.docs.local is not None
+                      and (infosys is None or not infosys.is_file()))     # its first build starts with the server
+            if not busy and not coming or time.monotonic() - t0 > self.ERRORS_FIRST_MAX_S:
+                return None
+            time.sleep(self.ERRORS_FIRST_WAIT_S)
+
     def ads_error_text(self, code: int) -> str | None:
         """N125: Beckhoff's symbol and text of an ADS return code, with its page — from the errors index (None without
         one): what ads_backend's error texts add."""
@@ -782,11 +828,16 @@ class App:
             rows = None
         if not rows:
             return msg
-        r = rows[0]
-        if (r.get("symbol") and r["symbol"] in msg) or (r.get("text") and r["text"] in msg):
+        if any((r.get("symbol") and r["symbol"] in msg) or (r.get("text") and r["text"] in msg) for r in rows):
+            return msg                     # the message says it already (of one of the domains that have the code)
+        if len({r["domain"] for r in rows}) > 1:
+            # review of 0.8.16 (user decision): a code of several domains the message does not name is not annotated
+            # with one of them — 'CreateFile failed: error 6' got ADS's 0x6 although it is Win32's (spec §6: never pick
+            # a domain silently); a message that names its domain ('ADS error 6') has that one only
             return msg
+        r = rows[0]
         return (f"{msg} [documented: {r['domain']} {r['hex']}" + (f" {r['symbol']}" if r.get("symbol") else "")
-                + f": {r.get('text') or ''} ({r['ref']})]")
+                + f": {r.get('text') or ''}" + (f" ({r['ref']})" if r.get("ref") else "") + "]")
 
     def line_codes(self, lines: list[str], key: str) -> list[dict[str, Any]]:
         """N125: the codes message lines name (0xA2, HRESULTs, ADS error 1861, C0xxx) looked up in the errors index —
@@ -796,18 +847,26 @@ class App:
         codes = []
         for i, e in enumerate(lines):
             read = X.read_query(e)
-            if not read["codes"] and not read["names"] and not read["ids"]:
+            if not read["codes"] and not read["names"] and not read["caps"] and not read["ids"]:
                 continue
             try:
                 r = X.err_lookup(e, kb=loc, limit=3, fulltext=False)
             except X.ErrError:
                 continue
-            codes.append({key: i, "read_as": [c["token"] for c in r["read_as"]] + r.get("names", [])
+            # review of 0.8.16: a line counts when it names a code — a number read as one, a message id, or a word the
+            # errors index knows as a code's symbol. 'state change aborted' got read_as ['EtherCAT'] documented=false:
+            # a capitalised word that is no symbol is no code
+            by_name = [m for m in r.get("matches") or [] if m.get("matched_by") in ("symbol", "dotnet name")]
+            if not r["read_as"] and not r.get("message_ids") and not by_name:
+                continue
+            matches = [m for m in r.get("matches") or [] if m.get("matched_by") != "text"]
+            codes.append({key: i, "read_as": [c["token"] for c in r["read_as"]]
+                          + sorted({m["symbol"] for m in by_name if m.get("symbol")})
                           + [m["token"] for m in r.get("message_ids", [])],
-                          "documented": r.get("documented"),
+                          "documented": bool(matches) if r.get("documented") is not None else None,
                           "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref") if m.get(k)}
-                                      for m in r.get("matches") or []],
-                          **({"note": r["note"]} if r.get("note") else {})})
+                                      for m in matches],
+                          **({"note": r["note"]} if r.get("note") and not matches else {})})
         return codes
 
     def log_codes(self, log: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -875,12 +934,7 @@ class App:
                 log.info("ESI index: first build %s", "started" if first.get("started") else first)
         except Exception as exc:  # noqa: BLE001 — a convenience; kb_status shows the state either way
             log.warning("ESI first build: %s", exc)
-        try:
-            first = self.errors_first_build()
-            if first:
-                log.info("errors index: first build %s", "started" if first.get("started") else first)
-        except Exception as exc:  # noqa: BLE001 — a convenience; kb_status shows the state either way
-            log.warning("errors first build: %s", exc)
+        threading.Thread(target=self._errors_first_build_when_ready, name="tcmcp-errors-first", daemon=True).start()
         res = self.kb.builder_upkeep(__version__)
         for n, v in (res.get("tools") or {}).items():
             if isinstance(v, dict) and v.get("state") == "replaced":
@@ -1056,10 +1110,24 @@ class App:
                     return _BlockedByDialog(job, d)
             return None
         def run(*a2: Any, **kw2: Any) -> Any:
-            # the System Manager's messages of this call's actions only (XaeBackend._sm_messages_of)
-            if isinstance(getattr(self.xae, "messages", None), list):
-                self.xae.messages = []
-            return fn(*a2, **kw2)
+            # the System Manager's messages of THIS call's actions (XaeBackend._sm_messages_of), taken in the worker
+            # thread that ran them — review of 0.8.16: read later in the event loop, a call queued behind this one had
+            # already emptied the list (its messages lost) or filled it (another call's messages in this result)
+            be = self.xae
+            keep = isinstance(getattr(be, "messages", None), list)
+            if keep:
+                be.messages = []
+            try:
+                res = fn(*a2, **kw2)
+            except XaeError as exc:
+                earlier = [m for m in (be.messages if keep else []) if not m.get("failed") and m.get("messages")]
+                if earlier:            # review of 0.8.16: what the call's earlier steps logged, not only the last one's
+                    raise type(exc)(f"{exc} — XAE messages of the steps before it: " + "; ".join(
+                        f"{m['action']}: {m['messages'][:500]}" for m in earlier)) from exc
+                raise
+            if keep and be.messages and isinstance(res, dict):
+                res = {**res, "xae_messages": list(be.messages)}
+            return res
         run.__name__ = job                 # the worker names the job (busy / timeout messages) by it
         try:
             res = await self.xae_worker.run_watched(run, *a, timeout=timeout or self.cfg.xae.build_timeout_s + 60,
@@ -1100,9 +1168,8 @@ class App:
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ToolError(f"{job}: XAE call timed out — " + await asyncio.to_thread(self._timeout_cause)) from exc
         if isinstance(res, dict):
-            msgs = getattr(self.xae, "messages", None)
-            if isinstance(msgs, list) and msgs:
-                res = {**res, "xae_messages": await asyncio.to_thread(self.xae_messages, list(msgs))}
+            if res.get("xae_messages"):
+                res = {**res, "xae_messages": await asyncio.to_thread(self.xae_messages, res["xae_messages"])}
             live = self.dialogs_now()
             if live:                       # N87: the call ran, but the shell has a dialog waiting — say so
                 res = {**res, "open_dialogs": [_dialog_fields(d) for d in live[:5]]}

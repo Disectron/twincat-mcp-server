@@ -554,6 +554,8 @@ def test_acceptance_3_a_number_beside_port_is_no_code(kb):
     for q in ("ADS error on port 851", "port 851"):
         r = lookup(kb, q)
         assert r["read_as"] == [] and all(m["value"] != 851 for m in r.get("matches", [])), (q, r)
+        # review of 0.8.16 (user decision): no code, so nothing documented — the 'port' codes are text matches only
+        assert r["documented"] is False and r["matches"] == [], (q, r)
     assert lookup(kb, "851")["read_as"][0]["value"] == 851                       # the whole query: a code (N122)
 
 
@@ -797,7 +799,8 @@ def test_lookup_reads_codes_names_and_text_and_refuses_bad_input(kb):
     al = lookup(kb, "AL status code 0x001B")["matches"][0]
     assert al["domain"] == "ethercat_al" and al["ref"] == "EtherCAT_System_Documentation.pdf#p123", al
     t = lookup(kb, "remote terminal is not responding")
-    assert t["matches"][0]["matched_by"] == "text" and "no code in the query" in t["note"], t
+    assert t["documented"] is False and t["matches"] == [] and t["text_matches"][0]["hex"] == "0x745", t
+    assert "text_matches" in t["note"] and "no code in the query" in t["text_matches_note"], t
     with pytest.raises(X.ErrError, match="empty query"):
         lookup(kb, "  ")
     with pytest.raises(X.ErrError, match="limit must be"):
@@ -895,3 +898,156 @@ async def test_the_server_tool_and_the_skill_command_give_the_same_answer_first_
     assert p.returncode == 0 and skill == tool, (skill, tool)
     log = Path(cfg.safety.audit_log).parent / "logs" / "errors-build.log"
     assert "errors_db.py update" in log.read_text(encoding="utf-8") and "codes (" in log.read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------------------------------------ review of 0.8.16
+def _app(tmp_path, kb):
+    from tests.test_server_e2e import mk_cfg
+    from twincat_mcp.server import App
+    cfg = mk_cfg(tmp_path)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    return App(cfg)
+
+
+def test_review_0816_an_esi_text_id_has_the_fields_of_any_documented_code(kb, tmp_path):
+    """Review of 0.8.16 (1): the ESI match had no 'dec' and no 'ref' — doc_note (every XAE / ADS / rec error text) and
+    kb_search raised KeyError instead of giving the error. Every match has the fields of a documented code."""
+    from twincat_mcp import knowledge as K
+    m = lookup(kb, "EtherCAT diagnosis 0x4101")["matches"][0]
+    assert m["domain"] == "ethercat_diag" and {"value", "hex", "dec", "text", "ref"} <= set(m), m
+    app = _app(tmp_path, kb)
+    note = app.doc_note("Init4: EtherCAT diagnosis 0x4101 on Term 3")
+    assert note.endswith("[documented: ethercat_diag #x4101: Terminal-Overtemperature (esi.db, text id #x4101)]"), note
+    r = K.Knowledge(tmp_path / "home", str(kb)).search("EtherCAT diagnosis code 0x4101")
+    assert r["known_error"]["documented"][0]["domain"] == "ethercat_diag", r
+
+
+def test_review_0816_a_symbol_in_capitals_is_looked_up_by_its_name(kb):
+    """Review of 0.8.16 (2): WSAETIMEDOUT / WSAECONNREFUSED (capitals, no '_') were read as words — the text search
+    answered another code (WSAEHOSTDOWN) or nothing. A capitalised word is a name when the alias table has it; 'ERROR' in
+    a log line is none."""
+    r = lookup(kb, "connect failed: WSAECONNREFUSED")
+    m = r["matches"][0]
+    assert r["documented"] is True and (m["symbol"], m["matched_by"], m["value"]) == ("WSAECONNREFUSED", "symbol",
+                                                                                       10061), r
+    r = lookup(kb, "WSAETIMEDOUT")
+    assert (r["matches"][0]["domain"], r["matches"][0]["value"], r["matches"][0]["matched_by"]) == ("ads", 10060,
+                                                                                                    "symbol"), r
+    r = lookup(kb, "[ ERROR ] TIMEOUT while waiting")
+    assert "names" not in r and r["documented"] is False, r
+
+
+def test_review_0816_a_copied_or_moved_folder_rebuilds_from_its_own_infosys_index(kb, tmp_path):
+    """Review of 0.8.16 (3): a rebuild read the Infosys index path the old index recorded — after a copy the old folder's
+    (one index of two folders), after a move a missing one (a forced rebuild replaced 139 ADS codes with none). The
+    folder's own Infosys index of the recorded language is read."""
+    import shutil
+    kb2 = tmp_path / "moved" / "kb"
+    shutil.copytree(kb, kb2)
+    db2 = L.index_file(kb2, "errors")
+    assert X.build(db2, kb2, force=True, log=lambda m: None)["result"] == "built"
+    src = Path(json.loads(X.read_meta(db2)["sources"])["infosys"]["path"])
+    assert src.resolve().is_relative_to(kb2.resolve()), src            # the copy's own, not the old folder's
+    shutil.rmtree(kb)                                                   # moved: the old folder is gone
+    st = X.state(db2, kb2)
+    assert st["state"] == "complete", st
+    assert X.build(db2, kb2, force=True, log=lambda m: None)["result"] == "built"
+    assert X.state(db2, kb2, detail=True)["domains_detail"]["ads"]["codes"] == 139
+
+
+def test_review_0816_the_first_build_waits_while_a_source_is_built(tmp_path, monkeypatch):
+    """Review of 0.8.16 (8): at the server start an index being built (here esi.db) kept the errors index's first build
+    from starting, and only an err_lookup call tried again. The start's thread waits and starts it once the source is
+    complete."""
+    import time as _t
+    from twincat_mcp import esi_index as E
+    from twincat_mcp import kb_lock
+    from twincat_mcp.server import App
+    k = make_kb(tmp_path)
+    held = kb_lock.IndexLock(E.side_files(L.index_file(k, "esi"))[1])
+    held.__enter__()
+    started: list[int] = []
+    monkeypatch.setattr(App, "ERRORS_FIRST_WAIT_S", 0.05)
+    monkeypatch.setattr(App, "_spawn_errors_build", lambda self, force=False, dry_run=False:
+                        started.append(1) or {"started": True})
+    _app(tmp_path, k)
+    _t.sleep(0.5)
+    assert started == []                                                # esi.db is being built: it waits
+    held.__exit__(None, None, None)
+    t0 = _t.time()
+    while not started and _t.time() - t0 < 10:
+        _t.sleep(0.05)
+    assert started == [1]
+
+
+def test_review_0816_one_errors_build_at_a_time(kb, tmp_path, monkeypatch):
+    """Review of 0.8.16 (17): two callers at once (an err_lookup and the first build's wait) both started a builder;
+    the second failed on the lock and its caller was told started=True."""
+    import threading
+    import time as _t
+    from twincat_mcp.server import App
+    app = _app(tmp_path, kb)
+    calls: list[int] = []
+
+    class Running:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def spawn(self, force=False, dry_run=False):
+        calls.append(1)
+        _t.sleep(0.2)
+        self.errors_build_proc = Running()
+        return {"started": True}
+    monkeypatch.setattr(App, "_spawn_errors_build", spawn)
+    res: list[dict] = []
+    ts = [threading.Thread(target=lambda: res.append(app.spawn_errors_build(force=True))) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert calls == [1] and sorted(r["started"] for r in res) == [False, True], res
+    assert [r for r in res if not r["started"]][0]["already_running"] == {"pid": 4242}
+
+
+def test_review_0816_line_codes_only_for_lines_that_name_a_code(kb, tmp_path):
+    """Review of 0.8.16 (10): a capitalised word (EtherCAT, Init4, EK1100) made a line 'documented: false' — no code was
+    in it. A line counts when it names a code: a number read as one, a message id, a code's symbol."""
+    app = _app(tmp_path, kb)
+    codes = app.line_codes(["Init4: EtherCAT state change aborted on EK1100", "Error: ADS error 0x745",
+                            "[ ERROR ] TIMEOUT", "socket: WSAECONNREFUSED"], "line")
+    assert [c["line"] for c in codes] == [1, 3], codes
+    assert codes[0]["matches"][0]["symbol"] == "ADSERR_CLIENT_SYNCTIMEOUT" and codes[1]["read_as"] == ["WSAECONNREFUSED"]
+
+
+def test_review_0816_a_count_of_errors_is_no_code(kb):
+    """Review of 0.8.16 (11): 'Build: 3 errors, 0 warnings' was read as code 3, 'found 0 errors' as 0. A plural after a
+    number counts; '1861 error' names one."""
+    from twincat_mcp import docsearch as DS
+    for q in ("Build: 3 errors, 0 warnings", "found 0 errors", "PLC: 7 errors found", "17 codes"):
+        assert X.read_query(q)["codes"] == [], q
+    assert DS.code_forms("PLC: 17 errors found") is None
+    assert [c["value"] for c in X.read_query("1861 error")["codes"]] == [1861]
+
+
+def test_review_0816_code_lookup_reads_the_hresult_and_32_bit_forms(kb):
+    """Review of 0.8.16 (14): infosys_search's code_lookup took the plain value only — 0x98110745 (the HRESULT of ads
+    0x745) and 0xFFFFE504 (LabVIEW's -6908) found nothing there, though err_lookup finds both."""
+    a = X.code_summary(kb, 0x98110745)
+    assert [(e["domain"], e["symbol"], e["matched_by"]) for e in a] == [("ads", "ADSERR_CLIENT_SYNCTIMEOUT", "hresult")], a
+    b = X.code_summary(kb, 0xFFFFE504)
+    assert [(e["domain"], e["value"]) for e in b] == [("labview", -6908)], b
+
+
+def test_review_0816_doc_note_never_picks_one_of_several_domains(kb, tmp_path):
+    """Review of 0.8.16 (6), user decision: an error text is annotated only when the code's domain is clear — the
+    message names it ('ADS error 6') or only one domain has the code; a message that quotes one domain's text needs
+    nothing. 'CreateFile failed: error 6: The handle is invalid.' got ADS's 0x6 appended."""
+    app = _app(tmp_path, kb)
+    m = "CreateFile failed: error 6: The handle is invalid."
+    assert app.doc_note(m) == m
+    assert app.doc_note("FB_Socket: error 6") == "FB_Socket: error 6"           # ads, win32, a library: none picked
+    n = app.doc_note("ADS error 6 on read")
+    assert n.startswith("ADS error 6 on read [documented: ads 0x6 ERR_TARGETPORTNOTFOUND"), n

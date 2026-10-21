@@ -457,17 +457,26 @@ class XaeBackend:
     # S_OK" (the current page; the TwinCAT 2.11 page says only "returns the last error messages"). Whether a build's
     # read clears it is not assumed: a buffer that does not clear starts with what the read before the action gave.
     MESSAGES_MAX = 4000                    # characters of one action's messages kept (the lines: 50)
+    MESSAGES_READ_S = 2.0                  # how long a busy shell is asked for them (an addition: never a wait)
 
-    def _sm_messages(self) -> str | None:
-        """The System Manager's message buffer now ('' when empty); None when it can't be read — no System Manager, no
-        ITcSysManager2, a shell that stays busy: the messages are an addition to an action, never why it fails."""
-        if self.sysman is None:
+    def _sm_messages(self, sm: Any) -> str | None:
+        """The message buffer of the System Manager `sm` ('' when empty); None when it can't be read: no ITcSysManager2,
+        a shell that keeps rejecting the read for MESSAGES_READ_S (review of 0.8.16: the member check waited the whole
+        com_retry_s), or `sm` is no longer the System Manager in use — the shell went away during the action and the
+        server re-attached: the new shell's buffer is not this action's (review of 0.8.16, it was read and cleared)."""
+        if sm is None or self.sysman is not sm:
             return None
+        if getattr(self, "_msg_sm", None) is not sm:
+            # what is known of this System Manager's buffer: whether it has one, whether a read clears it
+            self._msg_sm, self._msg_has, self._msg_clears = sm, None, None
         try:
-            if not self._has(self._cur_sm(), "GetLastErrorMessages"):
+            if self._msg_has is None:
+                self._msg_has = bool(self._retry(lambda: _has_prop(sm, "GetLastErrorMessages"), "GetLastErrorMessages?",
+                                                 retry_s=self.MESSAGES_READ_S))
+            if not self._msg_has:
                 return None
-            return str(self._retry(lambda: _com_call(self._cur_sm(), "GetLastErrorMessages"), "GetLastErrorMessages",
-                                   retry_s=2.0) or "")
+            return str(self._retry(lambda: _com_call(sm, "GetLastErrorMessages"), "GetLastErrorMessages",
+                                   retry_s=self.MESSAGES_READ_S) or "")
         except XaeError:
             return None
 
@@ -475,36 +484,50 @@ class XaeBackend:
     def _sm_messages_of(self, what: str) -> Iterator[None]:
         """What the System Manager logged during one action (activate, restart, ConsumeXml, CreateChild, DeleteChild,
         PlcOpenImport, GenerateBootProject, an online command, the build): the buffer is read before the action — what
-        it held came from earlier steps — and after it, on success as on failure. A success records them (self.messages
-        → the result's xae_messages); a failure's error carries them. A call the shell rejected (XaeBusy) or a shell
-        that went away (XaeGone) ran nothing that could be read."""
-        before = self._sm_messages()
+        it held came from earlier steps — and after it, on success as on failure, from the same System Manager. A success
+        records them (self.messages → the result's xae_messages); a failure's error carries them. A call the shell
+        rejected (XaeBusy) or a shell that went away (XaeGone) ran nothing that could be read.
+
+        Whether a read clears the buffer (TE1000's current page: it does; the TwinCAT 2.11 page does not say) is read
+        from the buffer itself, once per System Manager: the first time it holds something, a second read follows — empty
+        means it clears. Review of 0.8.16: 'the after-read starts with the before-read, so it did not clear' dropped the
+        messages of an action that logged the same text again."""
+        sm = self.sysman
+        before = self._sm_messages(sm)
+        if before and getattr(self, "_msg_clears", None) is None:
+            again = self._sm_messages(sm)
+            if again is not None:
+                self._msg_clears = again == ""
         try:
             yield
         except (XaeBusy, XaeGone):
             raise
         except XaeError as exc:
-            rec = self._sm_messages_after(what, before)
+            rec = self._sm_messages_after(what, before, sm, failed=True)
             if rec and rec.get("messages"):
                 raise type(exc)(f"{exc} — XAE messages ({what}): {rec['messages'][:1500]}") from exc
             raise
-        self._sm_messages_after(what, before)
+        self._sm_messages_after(what, before, sm)
 
-    def _sm_messages_after(self, what: str, before: str | None) -> dict[str, Any] | None:
-        after = self._sm_messages()
+    def _sm_messages_after(self, what: str, before: str | None, sm: Any, failed: bool = False) -> dict[str, Any] | None:
+        after = self._sm_messages(sm)
         if after is None:
             return None
         rec: dict[str, Any] = {"action": what}
-        if before and after.startswith(before):
-            after = after[len(before):]      # the read did not clear the buffer: what it held before is history
-        elif before and before.strip():
-            rec["earlier_messages"] = before.strip()[:self.MESSAGES_MAX]
-            rec["earlier_note"] = "in the buffer before this action: logged by earlier steps, not by it"
+        if failed:
+            rec["failed"] = True
+        clears = getattr(self, "_msg_clears", None)
+        if before and before.strip():
+            if clears is False or (clears is None and after.startswith(before)):
+                after = after[len(before):] if after.startswith(before) else after   # history: it stays in the buffer
+            else:
+                rec["earlier_messages"] = before.strip()[:self.MESSAGES_MAX]
+                rec["earlier_note"] = "in the buffer before this action: logged by earlier steps, not by it"
         after = after.strip()
         if after:
             rec["messages"] = after[:self.MESSAGES_MAX]
             rec["lines"] = [ln.strip() for ln in after.splitlines() if ln.strip()][:50]
-        if len(rec) == 1:
+        if not rec.get("messages") and not rec.get("earlier_messages"):
             return None
         self.messages.append(rec)
         return rec
@@ -838,6 +861,12 @@ class XaeBackend:
             self._on_dte(lambda dte: dte.Solution.SolutionBuild.Clean(True), "SolutionBuild.Clean")
         if rebuild:
             self._on_dte(lambda dte: dte.Solution.SolutionBuild.Clean(True), "SolutionBuild.Clean")
+        try:
+            self._sm()                     # review of 0.8.16: the System Manager whose messages the build may log —
+        except (XaeBusy, XaeGone):         # read only when it happened to be cached
+            raise
+        except XaeError:
+            pass                           # no TwinCAT project in the solution: the build runs without them
         with self._sm_messages_of("SolutionBuild.Build"):
             self._on_dte(lambda dte: dte.Solution.SolutionBuild.Build(True), "SolutionBuild.Build")
         # N174 (0.8.14 retest): `self.dte.Solution.SolutionBuild` was read here outside _retry — right after a build the

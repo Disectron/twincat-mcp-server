@@ -1721,3 +1721,50 @@ async def test_glem_xae_call_adds_the_call_s_messages_with_their_documented_code
     assert len(m[0]["codes"]) == 2
     res = await app.xae_call(lambda: {"ok": True})
     assert "xae_messages" not in res and app.xae.messages == [], res
+
+
+@pytest.mark.anyio
+async def test_review_0816_each_xae_call_carries_only_its_own_messages(tmp_path):
+    """Review of 0.8.16 (4, 12): the call's messages were read in the event loop after the worker had moved on — a call
+    queued right behind emptied them (the activation's warning lost) or added its own (one message in both results).
+    They are taken in the worker thread that ran the call. And a call whose later step fails still says what its
+    earlier steps logged (a deploy whose restart fails showed only the restart's messages)."""
+    import time as _t
+    from twincat_mcp.server import App, ToolError
+    from twincat_mcp.xae_backend import XaeError
+    app = App(mk_cfg(tmp_path))
+    app.dialogs_now = lambda: []
+
+    def activate():
+        _t.sleep(0.3)
+        app.xae.messages.append({"action": "ActivateConfiguration", "messages": "Warning: license expires in 3 days",
+                                 "lines": ["Warning: license expires in 3 days"]})
+        return {"activated": True}
+
+    def status():
+        _t.sleep(0.2)
+        return {"attached": True}
+
+    def create():
+        app.xae.messages.append({"action": "CreateChild", "messages": "Info: FB_New created",
+                                 "lines": ["Info: FB_New created"]})
+        _t.sleep(0.2)
+        return {"created": True}
+    for second in (status, create):
+        a, b = await asyncio.gather(app.xae_call(activate), app.xae_call(second))
+        assert [m["messages"] for m in a["xae_messages"]] == ["Warning: license expires in 3 days"], (a, b)
+        if second is status:
+            assert "xae_messages" not in b, b
+        else:
+            assert [m["messages"] for m in b["xae_messages"]] == ["Info: FB_New created"], b
+
+    def deploy():
+        app.xae.messages.append({"action": "ActivateConfiguration", "messages": "Warning: license expires in 3 days",
+                                 "lines": ["Warning: license expires in 3 days"]})
+        app.xae.messages.append({"action": "StartRestartTwinCAT", "failed": True, "messages": "Error: timeout",
+                                 "lines": ["Error: timeout"]})
+        raise XaeError("StartRestartTwinCAT: E_FAIL — XAE messages (StartRestartTwinCAT): Error: timeout")
+    with pytest.raises(ToolError) as ei:
+        await app.xae_call(deploy)
+    assert "XAE messages of the steps before it: ActivateConfiguration: Warning: license expires in 3 days" in \
+        str(ei.value) and str(ei.value).count("Error: timeout") == 1, str(ei.value)

@@ -1774,3 +1774,119 @@ def test_glem_create_child_on_a_new_item_and_an_import_are_read_too(monkeypatch)
     assert child.Name == "Sub"
     assert [(r["action"], r["messages"]) for r in be.messages] == [("CreateChild", "Info: FB_New created"),
                                                                     ("CreateChild", "Info: Sub created")], be.messages
+
+
+# ------------------------------------------------------------------------------------------------ review of 0.8.16
+def _be_on(monkeypatch, cands, com_retry_s=0.3):
+    be = X.XaeBackend(XaeConfig(com_retry_s=com_retry_s))
+    monkeypatch.setattr(be, "_require_win", lambda: None)
+    monkeypatch.setattr(be, "_rot_candidates", lambda: cands[0])
+    monkeypatch.setattr(be, "_dte2", lambda: None)
+    monkeypatch.setattr(be, "_modal_dialogs", lambda: [])
+    be.attach()
+    return be
+
+
+def _cand(dte, n=1):
+    return {"progid": "TcXaeShell.DTE.17.0", "moniker": f"!TcXaeShell.DTE.17.0:{n}", "dte": dte,
+            "solution": dte.Solution.FullName}
+
+
+def test_review_0816_a_shell_that_went_away_is_not_read_for_the_action_s_messages(monkeypatch):
+    """Review of 0.8.16 (5): the shell died during ActivateConfiguration; the server re-attached, and the messages were
+    then read — and cleared — from the NEW shell's buffer, attributed to the action that ran on the old one. Only the
+    System Manager the action ran on is read."""
+    old, new = _MsgSysMan(), _MsgSysMan()
+    old_dte, new_dte = FakeDTE(old), FakeDTE(new)
+    cands = [[_cand(old_dte)]]
+    be = _be_on(monkeypatch, cands)
+    new.buffer = "Info: solution Machine.sln loaded by the new shell\n"
+
+    def die():
+        cands[0] = [_cand(new_dte, 2)]
+        raise ComError(X.RPC_E_DISCONNECTED, "The object invoked has disconnected from its clients.")
+    old.ActivateConfiguration = die
+    with pytest.raises(X.XaeExplained) as ei:
+        be.activate_configuration()
+    assert "went away during the call" in str(ei.value) and "new shell" not in str(ei.value), str(ei.value)
+    assert new.reads == 0 and new.buffer.startswith("Info: solution") and be.messages == []
+
+
+def test_review_0816_a_clearing_buffer_keeps_an_action_that_logs_the_same_text_again(monkeypatch):
+    """Review of 0.8.16 (7): 'the after-read starts with the before-read, so the buffer did not clear' dropped the
+    messages of an action that logged the text the buffer already held (a warning of the user's own activation, logged
+    again). Whether a read clears the buffer is read from the buffer itself, once: the second read is empty."""
+    sm = _MsgSysMan(clears=True)
+    be = _be_on(monkeypatch, [[_cand(FakeDTE(sm))]])
+    sm.buffer = WARN + "\n"                          # left by an activation the user made in XAE
+    assert be.activate_configuration()["activated"] is True
+    assert be.messages == [{"action": "ActivateConfiguration", "earlier_messages": WARN,
+                            "earlier_note": "in the buffer before this action: logged by earlier steps, not by it",
+                            "messages": WARN, "lines": [WARN]}], be.messages
+    be.messages = []
+    sm.buffer = "Error: license missing\n"
+
+    def fail():
+        sm.buffer += "Error: license missing\nError: activation aborted\n"
+        raise ComError(-2147467259, "Unspecified error")
+    sm.ActivateConfiguration = fail
+    with pytest.raises(X.XaeError) as ei:
+        be.activate_configuration()
+    assert "XAE messages (ActivateConfiguration): Error: license missing\nError: activation aborted" in str(ei.value)
+    # a buffer the read does not clear: learnt the same way, the old text is history
+    sm2 = _MsgSysMan(clears=False)
+    be2 = _be_on(monkeypatch, [[_cand(FakeDTE(sm2))]])
+    sm2.buffer = WARN + "\n"
+    be2.activate_configuration()
+    assert be2.messages == [{"action": "ActivateConfiguration", "messages": WARN, "lines": [WARN]}], be2.messages
+    assert be2._msg_clears is False and be._msg_clears is True
+
+
+def test_review_0816_a_busy_shell_is_asked_for_the_messages_two_seconds_not_com_retry_s(monkeypatch):
+    """Review of 0.8.16 (9): the read meant to give up after 2 s first asked whether the member exists with the whole
+    com_retry_s — a busy shell after an activation made it wait (60 s by default). The member is asked once per System
+    Manager, and every read of the messages gives up after MESSAGES_READ_S."""
+    import time as _t
+    sm = _MsgSysMan()
+    be = _be_on(monkeypatch, [[_cand(FakeDTE(sm))]], com_retry_s=8.0)
+    busy = {"on": False}
+    orig_read, orig_act = sm.GetLastErrorMessages, sm.ActivateConfiguration
+
+    def read():
+        if busy["on"]:
+            raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+        return orig_read()
+
+    def act():
+        orig_act()
+        busy["on"] = True                            # the shell is busy right after the activation
+    sm.GetLastErrorMessages, sm.ActivateConfiguration = read, act
+    real_has = X._has_prop
+
+    def has_prop(obj, name):                         # the member check is rejected too while the shell is busy
+        if busy["on"] and name == "GetLastErrorMessages":
+            raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+        return real_has(obj, name)
+    monkeypatch.setattr(X, "_has_prop", has_prop)
+    t0 = _t.time()
+    assert be.activate_configuration()["activated"] is True
+    assert _t.time() - t0 < 4.0, _t.time() - t0      # MESSAGES_READ_S (2 s), not com_retry_s (8 s)
+    assert be.messages == []
+
+
+def test_review_0816_the_build_finds_the_system_manager_to_read(monkeypatch):
+    """Review of 0.8.16 (13): the build read the messages only when a System Manager happened to be cached — right
+    after attach or a solution reopen none is, and the build's messages were never read."""
+    sm = _MsgSysMan()
+    dte = FakeDTE(sm)
+    be = _be_on(monkeypatch, [[_cand(dte)]])
+    be.sysman = None
+    orig = dte.Solution.SolutionBuild.Build
+
+    def build(wait):
+        sm.buffer += "Warning: the build logged this\n"
+        return orig(wait)
+    dte.Solution.SolutionBuild.Build = build
+    be.build()
+    assert [(r["action"], r["messages"]) for r in be.messages] == [("SolutionBuild.Build",
+                                                                     "Warning: the build logged this")], be.messages
