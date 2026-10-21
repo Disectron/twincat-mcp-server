@@ -129,6 +129,13 @@ tool wishlist (2026-10-18).
   Decided by Ryan (2026-10-21): Scope files go to `<recordings>\Scope Recordings\`; rec_delete never deletes them.
   After a recording the user chooses close (Disconnect) / new (Disconnect + StartRecord) / pause (keep the data);
   the next recording with Scope asks to disconnect first. Built in 0.8.17.
+  CI on main after the merge (Windows): `test_r43_another_build_after_an_outage_is_not_registered_again` failed —
+  nothing verified before the outage (`window_end_ms` null). Cause in the tests since 0.8.12: the sim's events run
+  on the wall clock, the engine's version checks on its writer thread; a writer late by 500 ms on a loaded runner
+  checks only after the event. Five R43 tests had that assumption. Fixed in 0.8.17: the sim holds a timed event until
+  a version read answered after the cycle before it (`hold_for_check`); the four engine-level ones also run with the
+  writer stalled 700 ms (`debug_writer_stall_ms`) — red on the old build, green on the new. Only the simulator
+  changed (source_sim.cpp); the engine is unchanged.
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
   Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
   trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library

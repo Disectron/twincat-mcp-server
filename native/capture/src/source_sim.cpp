@@ -17,7 +17,12 @@
 //           "version_after_outage": n,            (the runtime comes back with symbol version n)
 //           "version_at_start": n,                (the symbol version before anything changes, default 1)
 //           "version_read_fails": true,           (the runtime refuses every symbol version read)
-//           "version_fail_from": cycle}           (symbol version reads fail once that cycle is delivered)
+//           "version_fail_from": cycle,           (symbol version reads fail once that cycle is delivered)
+//           "hold_for_check": [cycle, ...]}       (that cycle is not delivered before a symbol version read was answered
+//                                                  after the cycle before it: a test that times an event against the
+//                                                  engine's version checks does not depend on the writer thread being
+//                                                  scheduled in time — on a loaded runner it can be late by 500 ms)
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -68,6 +73,8 @@ public:
         version_at_start_ = sim.integer("version_at_start", 1);
         if (const JVal* r = sim.get("version_read_fails")) version_read_fails_ = r->t == JVal::Bool && r->b;
         version_fail_from_ = sim.integer("version_fail_from", -1);
+        if (const JVal* h = sim.get("hold_for_check"))
+            for (auto& c : h->a) holds_.push_back(c.i);
     }
 
     bool read_version(uint32_t& v, std::string& err) override {
@@ -91,6 +98,8 @@ public:
             else if (rebuild_in_outage_) ver = version_at_start_ + 1;
         }
         v = static_cast<uint32_t>(ver);
+        int64_t seen = read_ok_through_.load();
+        while (m > seen && !read_ok_through_.compare_exchange_weak(seen, m)) {}
         return true;
     }
 
@@ -171,6 +180,12 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));   // PLC stopped: no more samples
                 continue;
             }
+            if (c > 0 && std::find(holds_.begin(), holds_.end(), c) != holds_.end()) {
+                // hold_for_check: a version read answered after cycle c-1 first (it may be its verification)
+                while (run_.load(std::memory_order_relaxed) && read_ok_through_.load() < c - 1)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!run_.load(std::memory_order_relaxed)) break;
+            }
             const int64_t ft = start_ft_ + c * cycle_;
             cycle_now_.store(c);
             if (outage_from_ >= 0 && c == outage_from_) dead_.store(true);   // the runtime went away: handles dead
@@ -228,6 +243,8 @@ private:
     bool rebuild_in_outage_ = false, version_read_fails_ = false;
     int64_t version_after_outage_ = -1, version_at_start_ = 1, version_fail_from_ = -1;
     std::atomic<int64_t> max_emitted_{-1};
+    std::atomic<int64_t> read_ok_through_{-1};          // the newest cycle a successful version read was taken after
+    std::vector<int64_t> holds_;                        // hold_for_check
     std::atomic<int64_t> cycle_now_{0};
     std::atomic<bool> dead_{false};
     uint64_t resubs_ = 0;
