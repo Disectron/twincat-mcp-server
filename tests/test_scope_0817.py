@@ -423,3 +423,159 @@ async def test_n186_an_earlier_capture_is_never_linked_as_this_recordings(monkey
     assert ("before StartRecord ran (this PC's clock" if clock == "pc" else
             "s before the recording's first sample") in sc["not_this_recording"], sc
     assert not (sd / f"{r['id']}.scope.json").exists() and not is_read_only(sd / f"{r['id']}.svdx")
+
+
+# ---- second review of 0.8.17 ------------------------------------------------------------------------------------------
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("users_run", [False, True])
+async def test_r2_n1_a_start_withdrawn_from_the_xae_queue_is_not_started(monkeypatch, project_dir, fake_xae, users_run):
+    """rec_start(also_scope) cancelled while its StartRecord waited behind another XAE job: the worker withdrew it — it
+    never ran. The part was taken for 'whether it ran is not known' and stopped, saved and signed a Scope this
+    recording never started — with users_run, the user's own Scope run."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        if users_run:
+            payload(await s.call_tool("scope_record", {"action": "start"}))
+            fake_xae.calls.clear()
+        blocker = app.xae_worker.submit(lambda: time.sleep(2.0))          # another XAE job runs for 2 s
+        with anyio.move_on_after(0.8):
+            await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "duration_s": 1,
+                                            "also_scope": True})
+        assert await _until(lambda: bool(app.rec.recs))
+        rid = next(iter(app.rec.recs))
+        while not blocker.done():
+            await anyio.sleep(0.1)
+        await anyio.sleep(1.5)                            # the recording has ended by itself meanwhile
+        out = payload(await s.call_tool("rec_stop", {"id": rid}))
+    part = app.scope_parts[rid]
+    assert part.state == "finished" and "before StartRecord ran" in part.result["error"], part.result
+    assert "start" not in fake_xae.calls and "stop" not in fake_xae.calls, fake_xae.calls
+    assert not (app.rec.root / "scope" / f"{rid}.scope.json").exists() and "NOT started" in out["scope"]["error"]
+    assert fake_xae.recording is users_run                 # the user's own run records on
+
+
+@pytest.mark.anyio
+async def test_r2_n2_rec_status_of_a_live_recording_is_never_deleted(monkeypatch, project_dir, fake_xae):
+    from twincat_mcp import recorder as R
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    orig = R.Recorder.reap
+    arm = {"on": False}
+
+    def reap(self):
+        if arm["on"]:          # sealing another recording whose file a virus scanner holds
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+        return orig(self)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        monkeypatch.setattr(R.Recorder, "reap", reap)
+        arm["on"] = True
+        st = await s.call_tool("rec_status", {"id": r["id"]})
+        arm["on"] = False
+        await s.call_tool("rec_stop", {"id": r["id"]})
+    assert st.is_error and "being used by another process" in text(st) and "deleted" not in text(st), text(st)
+
+
+@pytest.mark.anyio
+async def test_r2_l1_a_left_scope_part_by_its_id_prefix(monkeypatch, project_dir, fake_xae):
+    install(monkeypatch)
+    busy = _busy_stop(monkeypatch, fake_xae)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    cfg.xae.com_retry_s = 0.6
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "rec_delete", "target": r["id"]}))
+        payload(await s.call_tool("rec_delete", {"id": r["id"], "confirm_token": tok["confirm_token"]}))
+        pre = r["id"][:-2]
+        st = payload(await s.call_tool("rec_status", {"id": pre}))
+        busy["busy"] = False
+        out = payload(await s.call_tool("rec_stop", {"id": pre}))
+    assert st["id"] == r["id"] and st["scope"]["stop_refused"], st
+    assert out["id"] == r["id"] and out["scope"]["stop"]["result_code"] == 0 and not fake_xae.recording, out
+
+
+@pytest.mark.anyio
+async def test_r2_gap_a_start_refused_answers_requests_that_waited(monkeypatch, project_dir, fake_xae):
+    """rec_stop while the part is 'starting', then StartRecord is refused: not_started answers the waiting request —
+    without it rec_stop hung."""
+    install(monkeypatch)
+
+    def start():
+        time.sleep(1.0)
+        fake_xae.calls.append("start-rejected")
+        raise _R13Busy("call rejected")
+    monkeypatch.setattr(fake_xae, "StartRecord", start)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    cfg.xae.com_retry_s = 0.6
+    srv = build_server(cfg)
+    app = srv._tcmcp_app
+    outs: dict = {}
+    async with client_for(srv) as s:
+        async def start_():
+            outs["start"] = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change",
+                                                                     "also_scope": True}))
+
+        async def stop_():
+            assert await _until(lambda: bool(app.scope_parts), dt_s=0.02)
+            rid = next(iter(app.scope_parts))
+            outs["state"] = app.scope_parts[rid].state
+            with anyio.move_on_after(15) as cs:
+                outs["stop"] = payload(await s.call_tool("rec_stop", {"id": rid}))
+            outs["hung"] = cs.cancelled_caught
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(start_)
+            tg.start_soon(stop_)
+    assert outs["state"] == "starting" and not outs["hung"], outs
+    assert "NOT started" in outs["stop"]["scope"]["error"] and "stop" not in fake_xae.calls, (outs, fake_xae.calls)
+
+
+@pytest.mark.anyio
+async def test_r2_gap_a_part_whose_recording_is_being_deleted_is_not_listed_as_left(monkeypatch, project_dir, fake_xae):
+    install(monkeypatch)
+    _slow_remove(monkeypatch, 1.5)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "rec_delete", "target": r["id"]}))
+        seen: dict = {}
+
+        async def delete():
+            seen["d"] = payload(await s.call_tool("rec_delete", {"id": r["id"], "confirm_token": tok["confirm_token"]}))
+
+        async def list_():
+            assert await _until(lambda: r["id"] in app.rec.deleting, n=100, dt_s=0.02)
+            app.rec.recs.pop(r["id"], None)                # the recorder no longer holds it, the delete still runs
+            seen["l"] = payload(await s.call_tool("rec_list", {}))
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(delete)
+            tg.start_soon(list_)
+    assert "scope_without_recording" not in seen["l"], seen["l"]
+
+
+@pytest.mark.anyio
+async def test_r2_gap_a_start_cancelled_while_it_runs_stays_with_the_recording(monkeypatch, project_dir, fake_xae):
+    """The opposite of N1: rec_start cancelled while StartRecord RUNS — it may have started Scope: the part stays
+    (start_unknown) and rec_stop sends StopRecord."""
+    install(monkeypatch)
+    orig = fake_xae.StartRecord
+
+    def start():
+        time.sleep(1.5)
+        return orig()
+    monkeypatch.setattr(fake_xae, "StartRecord", start)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        with anyio.move_on_after(0.6):
+            await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True})
+        assert await _until(lambda: bool(app.scope_parts))
+        rid = next(iter(app.scope_parts))
+        assert await _until(lambda: app.scope_parts[rid].state == "recording", n=100)
+        out = payload(await s.call_tool("rec_stop", {"id": rid}))
+    assert app.scope_parts[rid].run["start_unknown"].startswith("rec_start was cancelled while StartRecord ran")
+    assert fake_xae.calls[:2] == ["start", "stop"] and not fake_xae.recording and out["scope"]["finished_by"] == "rec_stop"

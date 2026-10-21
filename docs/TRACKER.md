@@ -117,7 +117,15 @@ tool wishlist (2026-10-18).
   lookup fails before StopRecord runs and the part is final; in `_scope_reset` an ExportCSV refused as busy is said
   "lost"; a generic StopRecord failure still sets `scope_stopped`; a SaveSVD that timed out can be sealed while XAE
   may still write it; two `also_scope` recordings on one Scope configuration — the first one's StopRecord stops the
-  second. Decision for Ryan: should `rec_delete` also delete the recording's Scope files (.svdx, .scope.csv,
+  second.
+  Round 2 (the last): round 1's findings fixed; N1 (HIGH: a rec_start cancelled while its StartRecord was still
+  queued — never ran — was finished as a start of unknown outcome: StopRecord / SaveSVD / a signed link for a Scope
+  it never started, the user's own run included) and N2 (MEDIUM: rec_status said a live recording was deleted when
+  its status call failed) fixed with tests, checked by tests + CI (no third round); LOW: orphan lookup by prefix,
+  the refused-stop note waits for a delete — fixed. Retest on hardware: what StopRecord / SaveSVD do on a Scope
+  whose StartRecord never ran; rec_delete now waits for a Scope save under way (tens of seconds on a real shell) —
+  a client that times out meanwhile deletes nothing and its confirmation token is used.
+  Decision for Ryan: should `rec_delete` also delete the recording's Scope files (.svdx, .scope.csv,
   .xae.csv, .scope.json)? It never has; it now lists them (`scope_files_kept`). Decision for Ryan (N186): after a
   Scope part is saved, Scope stays in Reply and the next also_scope recording is refused until Scope is
   disconnected in XAE — should the plugin call IMeasurementScope.Disconnect() itself once the .svdx is saved
