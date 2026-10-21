@@ -746,6 +746,10 @@ def test_native_warmup_truth_that_lapsed_is_not_reported_as_a_delayed_trigger(ca
 
 
 # ------------------------------------------------------------------ R43: a program change during a recording
+# The sim's events run on the wall clock, the engine's version checks on its writer thread. A test that needs a check
+# before an event holds that event (sim hold_for_check) — and runs once with the writer thread stalled past it
+# (STALLS): on a loaded Windows runner it was late by 500 ms and nothing was verified before the outage.
+STALLS = (0, 700)
 def _run(capture_exe, tmp_path, name, blocks, timeout=30, **kw):
     s = Svc(capture_exe)
     try:
@@ -761,12 +765,13 @@ def _run(capture_exe, tmp_path, name, blocks, timeout=30, **kw):
 TWO = [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}, {"id": 1, "igrp": 0x4040, "ioffs": 64, "size": 4}]
 
 
-def test_r43_an_online_change_ends_the_recording_at_the_last_verified_sample(capture_exe, tmp_path):
+@pytest.mark.parametrize("stall", STALLS)
+def test_r43_an_online_change_ends_the_recording_at_the_last_verified_sample(capture_exe, tmp_path, stall):
     """The blocks sample memory addresses: after a download / online change they can hold other variables. A sample is
     written only once a symbol version read taken after its delivery returned the version the recording started
     with; the first read with another version ends the recording there — nothing of the new program is in the file."""
-    r, f = _run(capture_exe, tmp_path, "oc", TWO, duration_s=5, version_check_ms=5,
-                sim={"speed": 1, "program_change_at": 300})
+    r, f = _run(capture_exe, tmp_path, "oc", TWO, duration_s=5, version_check_ms=5, debug_writer_stall_ms=stall,
+                sim={"speed": 1, "program_change_at": 300, "hold_for_check": [300]})
     assert r["ok"], r
     end = f["window_end_ms"]
     assert "PLC program changed" in f["stop_reason"] and f["program_changed"]["symbol_version"] == [1, 2], f
@@ -778,14 +783,16 @@ def test_r43_an_online_change_ends_the_recording_at_the_last_verified_sample(cap
     assert f["samples"] == 2 * (int(end) + 1) and f["program_watch"]["checked"] is True
 
 
-def test_r43_another_build_after_an_outage_is_not_registered_again(capture_exe, tmp_path):
+@pytest.mark.parametrize("stall", STALLS)
+def test_r43_another_build_after_an_outage_is_not_registered_again(capture_exe, tmp_path, stall):
     """D13 registers the notifications again when TwinCAT comes back — at the old addresses. Another build (compile
     time / online-change count differ) is not: the recording ends at the last verified sample before the outage."""
     for ver_after in (2, 1):            # the version byte moved — or, after the restart, stands where it stood
         name = f"rb{ver_after}"
         r, f = _run(capture_exe, tmp_path, name, [TWO[0]], duration_s=4, cycle_100ns=100_000, silent_ms=300,
-                    resubscribe_after_ms=600, resubscribe_retry_ms=200,
-                    sim={"speed": 1, "outage": [50, 199], "rebuild_in_outage": True, "version_after_outage": ver_after})
+                    resubscribe_after_ms=600, resubscribe_retry_ms=200, debug_writer_stall_ms=stall,
+                    sim={"speed": 1, "outage": [50, 199], "hold_for_check": [50], "rebuild_in_outage": True,
+                         "version_after_outage": ver_after})
         assert r["ok"], r
         # read by the version check (program_changed) or by D13 before registering again (program_rebuilt_in_outage),
         # whichever comes first once the runtime answers
@@ -818,11 +825,12 @@ def test_r43_a_runtime_that_refuses_the_version_read_is_recorded_and_said(captur
     assert "would not be noticed" in f["program_watch_error"] and f["missing_samples"] == 0 and f["samples"] >= 299
 
 
-def test_r43_reads_that_fail_while_samples_keep_coming_end_the_recording(capture_exe, tmp_path):
+@pytest.mark.parametrize("stall", STALLS)
+def test_r43_reads_that_fail_while_samples_keep_coming_end_the_recording(capture_exe, tmp_path, stall):
     """Samples that cannot be verified are never written; when the reads keep failing while samples keep coming
     (max_delay + 1 s), the recording ends at the last verified sample instead of holding them forever."""
     r, f = _run(capture_exe, tmp_path, "lost", [TWO[0]], duration_s=10, cycle_100ns=100_000,
-                sim={"speed": 1, "version_fail_from": 30})
+                debug_writer_stall_ms=stall, sim={"speed": 1, "version_fail_from": 30, "hold_for_check": [30]})
     assert r["ok"], r
     assert f["program_watch_lost"] is True and "could not be read for" in f["stop_reason"], f
     end = f["window_end_ms"]
@@ -830,11 +838,13 @@ def test_r43_reads_that_fail_while_samples_keep_coming_end_the_recording(capture
     assert max(t for t, _k, _b in _rows(tmp_path / "lost.jsonl")) <= end
 
 
-def test_r43_unverified_samples_before_an_outage_are_counted_not_written(capture_exe, tmp_path):
+@pytest.mark.parametrize("stall", STALLS)
+def test_r43_unverified_samples_before_an_outage_are_counted_not_written(capture_exe, tmp_path, stall):
     """The reads fail from cycle 40, the runtime goes away at 50 and the duration ends during the outage: cycles after
     the last verified one were delivered but are not written — counted exactly (unverified_rows) and as missing."""
     r, f = _run(capture_exe, tmp_path, "unv", [TWO[0]], duration_s=1, cycle_100ns=100_000, silent_ms=300,
-                resubscribe_after_ms=60_000, sim={"speed": 1, "outage": [50, 100_000], "version_fail_from": 40})
+                resubscribe_after_ms=60_000, debug_writer_stall_ms=stall,
+                sim={"speed": 1, "outage": [50, 100_000], "version_fail_from": 40, "hold_for_check": [40]})
     assert r["ok"], r
     v = f["program_watch"]["verified_to_ms"]
     assert v is not None and 300.0 <= v < 400.0, f["program_watch"]
@@ -854,7 +864,8 @@ def test_r43_addresses_from_another_program_version_are_refused_at_the_start(cap
 def test_r43_recorder_passes_the_table_version_and_reports_a_change(rec):
     """The recorder hands the service the symbol version its addresses come from; a program change shows in rec_stop
     (footer fields and a warning)."""
-    rec.native_extra = {**rec.native_extra, "sim": {"speed": 1, "start_ft": START_FT, "program_change_at": 150},
+    rec.native_extra = {**rec.native_extra, "sim": {"speed": 1, "start_ft": START_FT, "program_change_at": 150,
+                                                         "hold_for_check": [150]},
                         "version_check_ms": 5}
     st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=1, duration_s=5,
                    max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name=None, max_symbols=10,
