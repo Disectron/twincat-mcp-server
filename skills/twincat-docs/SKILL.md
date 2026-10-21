@@ -50,9 +50,11 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    says so (`error 1861`, `nErrId := 1808`) — `ADS error on port 851` holds no code, so it is `documented: false`
    (`text_matches` only share its words: never an answer); a hex number also right after a domain's name
    (`AL status 0x0011`), a code's symbol also in capitals (`WSAETIMEDOUT`), and `C0373` is read as a compiler message.
-   The server's err_lookup tool adds, for a question without a code, `from_error_log`: the errors it saw that hold a
-   name of the question whole (`MAIN.fbValve.bOpen`, `fbValve`), or the newest when the question says "the last /
-   previous error" — no word is matched. `online=true` adds `online`: a site search of infosys.beckhoff.com for the
+   The server's err_lookup tool adds, for a question without a code, `from_error_log`: the errors it saw that are of
+   a name of the question (`MAIN.fbValve.bOpen`, `fbValve`, `aValves[3]`, a POU, a tree item — compared with the
+   names the call was made with and the names the error quotes; `aValves[5]` is not `aValves[3]`), then the XAE Error
+   List for those names; or the newest when the question says "the last / previous error" ("the last ADS error": of
+   that kind; `names_not_found` when no error is of its names) — no word of an error is matched. `online=true` adds `online`: a site search of infosys.beckhoff.com for the
    question's codes and documented code names only (never its words, project, machine or customer names) — only when
    asked, and pages that mention the code, not a meaning. This command is offline. A number of several domains is
    listed in all of them, ranked by the message's words; a message that names a domain (`ADS error 6`) is answered for

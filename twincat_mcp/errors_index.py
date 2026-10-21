@@ -60,7 +60,7 @@ LIMIT_MAX = 20
 
 
 class ErrError(RuntimeError):
-    """code: 'bad_param', 'empty_query', 'no_index', 'busy', 'no_source'."""
+    """code: 'bad_param', 'empty_query', 'no_index', 'unreadable', 'busy', 'no_source'."""
 
     def __init__(self, message: str, code: str = "bad_param"):
         super().__init__(message)
@@ -766,6 +766,22 @@ def read_meta(db: Path) -> dict[str, str]:
         return {}
 
 
+def meta_error(db: Path) -> str | None:
+    """Why an errors index file that exists cannot be read (an empty or cut copy, a file another program locks, a schema
+    this plugin does not know) — None when its meta table reads. Sixth review of 0.8.16: such a file was 'missing', and
+    a lookup raised sqlite's error out of a tool whose action had run."""
+    try:
+        con = sqlite3.connect(ro_uri(Path(db)), uri=True, timeout=5)
+        try:
+            if not con.execute("SELECT k, v FROM meta").fetchall():
+                return "its meta table is empty: not an index this plugin built"
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def _jl(s: str | None, default: Any) -> Any:
     try:
         v = json.loads(s) if s else default
@@ -1363,7 +1379,8 @@ def _int(v: Any) -> int | None:
 # --------------------------------------------------------------------------------------------- state
 def state(final: Path, kb: Path | None, lcid: str | None = None, infosys_db: str | Path | None = None,
           detail: bool = False) -> dict[str, Any]:
-    """missing | complete | rebuild_needed (another format, never finished, or a source index rebuilt / added since —
+    """missing | unreadable (the file is there and cannot be read — the reason names why; replaced by a rebuild once
+    approved) | complete | rebuild_needed (another format, never finished, or a source index rebuilt / added since —
     the reason names it), plus a build running / interrupted / incomplete (failed its checks: the failures) / waiting
     to replace it / stale. An index that exists is in use as it is until the user approves the rebuild. detail: the
     domains (codes, rows, variants), the sources with 0 rows (kb_status)."""
@@ -1376,8 +1393,11 @@ def state(final: Path, kb: Path | None, lcid: str | None = None, infosys_db: str
     if kb is not None:
         now = identities(Path(kb), lcid or L.DEFAULT_LCID,
                          infosys_db or (recorded_infosys(final, Path(kb)) if lcid is None else None))
-    if not final.is_file() or not meta:
+    if not final.is_file():
         out["state"] = "missing"
+    elif not meta:
+        out["state"] = "unreadable"
+        out["reason"] = meta_error(final) or "it could not be read"
     elif meta.get("format") != FORMAT:
         out["state"] = "rebuild_needed"
         out["reason"] = f"format {meta.get('format') or 'unknown'}, this plugin reads {FORMAT}"
@@ -1488,6 +1508,9 @@ def message(s: dict[str, Any]) -> str:
         tail = ""
     if st == "missing":
         return "no errors index yet — its first build starts by itself once a source index is there" + tail
+    if st == "unreadable":
+        return (f"the errors index cannot be read ({s.get('reason')}) — nothing documented can be named from it until "
+                "a rebuild replaces it, once approved: kb_rebuild(index='errors')" + tail)
     base = (f"{s.get('codes', '?')} codes in {s.get('domains', '?')} domains ({s.get('variants', '?')} table variants), "
             f"built {s.get('built', '?')}")
     if s.get("missing_sources"):
@@ -1587,9 +1610,16 @@ class ErrIndex:
     def con(self) -> Iterator[sqlite3.Connection]:
         if not self.db.is_file():
             raise ErrError(f"no errors index yet ({self.db})", "no_index")
-        c = connect_ro(self.db)
+        # sixth review of 0.8.16: sqlite's own error (a locked or cut file) is this module's — every caller handles
+        # ErrError; an sqlite3.Error escaped line_codes after an XAE action had run and made it look failed
+        try:
+            c = connect_ro(self.db)
+        except sqlite3.Error as exc:
+            raise ErrError(f"the errors index cannot be read ({self.db}): {exc}", "unreadable") from exc
         try:
             yield c
+        except sqlite3.Error as exc:
+            raise ErrError(f"the errors index could not be read ({self.db}): {exc}", "unreadable") from exc
         finally:
             c.close()
 
@@ -1834,9 +1864,10 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         out["message_ids"] = read["ids"]
     pn = pattern_note(q)
     notes: list[dict[str, Any]] = []
-    if db is None or not db.is_file():
+    if db is None or not db.is_file() or st["state"] == "unreadable":
         out["documented"] = None
-        out["note"] = ("no errors index (index\\errors.db): nothing documented can be named — "
+        out["note"] = (("no errors index (index\\errors.db)" if st["state"] != "unreadable" else
+                        "the errors index (index\\errors.db) cannot be read") + ": nothing documented can be named — "
                        + st["message"] + ". The plugin's own notes below are not Beckhoff's text.")
         for c in read["codes"]:
             for did in DOMAINS:
@@ -1862,6 +1893,7 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
             links += f_links
         sym_domains: set[str] = set()
         known_caps = []
+        code_names: list[str] = []
         for n in read["names"] + read["caps"]:
             if n in read["caps"] and not _caps_symbol(con, n, q, named):
                 # re-review of 0.8.16: 'TIMEOUT', 'INTERNAL', 'NOMEMORY' are symbols of some library table and words of
@@ -1876,6 +1908,8 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
                     hit.append(a[0])
             if hit and n in read["caps"]:
                 known_caps.append(n)
+            if hit and n not in code_names:
+                code_names.append(n)
             if hit:
                 # a symbol names the code space it belongs to: a domain the message names, else of the domains that have
                 # it the general one (ADSERR_CLIENT_SYNCTIMEOUT is ads 0x745; the LabVIEW table numbers the same symbol
@@ -1887,6 +1921,9 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         if known_caps:                  # a capitalised word the alias table knows is a name of a code (WSAEINTR)
             read = {**read, "names": read["names"] + known_caps}
             out["names"] = read["names"]
+        if code_names:
+            # the names of the query the index knows as a code's name (symbol or .NET name) — as the query writes them
+            out["code_names"] = code_names
         text_search = not read["codes"] and not found and not read["ids"]
         if text_search:
             # the words that can pick a text: not 'error' / 'code' / a domain's name ('ADS error on port 851' → port)
@@ -1940,6 +1977,10 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         out["matches"] = main[:limit]
         if len(main) > limit:
             out["more"] = f"{len(main) - limit} more match(es): limit=… (1-{LIMIT_MAX}) or domain=…"
+        if main:
+            # sixth review of 0.8.16: a list cut to `limit` read as complete ('documented in 3 domains' of 16) — every
+            # domain of the answer, whatever the limit
+            out["match_domains"] = list(dict.fromkeys(e["domain"] for e in main))
         if other:
             out["other_domains"] = [{k: e.get(k) for k in ("domain", "domain_title", "value", "hex", "symbol", "text",
                                                            "ref") if e.get(k) is not None} for e in other[:10]]

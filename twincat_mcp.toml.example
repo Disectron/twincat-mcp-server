@@ -63,7 +63,8 @@ edit_requires_config_mode = true    # PLC code/project edits refused unless Twin
 
 [docs]                             # Beckhoff Infosys reference (infosys_* tools), TwinCAT 3 only
 enabled = true
-source = "local"                   # local = the Help Viewer package XAE installs (every book, offline, no network call)
+source = "local"                   # local = the Help Viewer package XAE installs (every book, offline; the one network
+                                   #   call: err_lookup(online=true), a site search of the codes only — web_fallback)
                                    # web   = infosys.beckhoff.com (sitemap, page fetches, DuckDuckGo fallback)
 # mshc = 'C:\ProgramData\Microsoft\HelpLibrary2\Catalogs\VisualStudio15\ContentStore\EN-US\BKINFOSYS3_VS_100_EN-US.2.mshc'
 #                                  # default: the newest BKINFOSYS3*.mshc under %ProgramData%\Microsoft\HelpLibrary2
@@ -76,5 +77,6 @@ tc3_only = true
 max_workers = 6                    # web: parallel page fetches while indexing (keep ≤ 8)
 max_index_pages = 4000             # web: cap per infosys_index call
 sitemap_ttl_days = 7               # web
-web_fallback = true                # web: DuckDuckGo site: search when the index has no hit (never in local mode)
+web_fallback = true                # web: DuckDuckGo site: search when the index has no hit; every mode: the search of
+                                   #   err_lookup(online=true) (codes and documented code names only). false = neither
 # cache_dir = 'C:\Users\ryan\.twincat_mcp\infosys'

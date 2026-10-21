@@ -1318,7 +1318,10 @@ def test_review3_0816_doc_note_counts_every_domain_before_it_drops_a_textless_on
     app = _app(tmp_path, kb)
     rows = [{"domain": "ads", "hex": "0x6", "symbol": "ERR_TARGETPORTNOTFOUND", "text": "Target port not found."},
             {"domain": "ethercat_diag", "hex": "#x0006", "device_texts": 4}]
-    app.kb.documented = lambda msg: rows
+    app.kb.documented = lambda msg: {"rows": rows, "domains": ["ads", "ethercat_diag"]}
+    assert app.doc_note("error 0x0006") == "error 0x0006"
+    # sixth review of 0.8.16: the domains beyond the first three rows count too
+    app.kb.documented = lambda msg: {"rows": rows[:1], "domains": ["ads", "win32", "ethercat_diag", "nc"]}
     assert app.doc_note("error 0x0006") == "error 0x0006"
 
 

@@ -392,6 +392,82 @@ def _merge_checks(outs: list[tuple[str | None, dict[str, Any]]]) -> dict[str, An
     return merged
 
 
+# a name of an IEC 61131-3 program: an identifier with its array index ([3], [i, 2]) and dereference (^), joined by '.'
+# (MAIN.aValves[3].bOpen, pValve^.bOpen) — the names err_lookup compares a question's names with (0.8.16)
+_ST_SEG = r"[A-Za-z_]\w*(?:\[[^\]\n]{1,40}\])*\^?"
+_ST_PATH = re.compile(rf"{_ST_SEG}(?:\.{_ST_SEG})*")
+
+
+def _segments(name: str) -> list[str]:
+    """A name's parts as IEC 61131-3 compares names (case-insensitive; an array index without its spaces): a symbol
+    path split at '.' and '^' (MAIN.pValve^.bOpen), an XAE tree path at '^' (TIPC^Plc1^Plc1 Project)."""
+    out = []
+    for x in re.split(r"[.^]", name):
+        x = x.strip().lower()
+        if "[" in x:
+            base, idx = x.split("[", 1)
+            x = base.strip() + "[" + re.sub(r"\s+", "", idx)
+        if x:
+            out.append(x)
+    return out
+
+
+def _seg_match(q: str, s: str) -> bool:
+    """A part of a question's name and a part of an error's name: equal, or the question names the array without an
+    index (aValves covers aValves[3]; aValves[5] does not)."""
+    return q == s or ("[" not in q and s.split("[", 1)[0] == q)
+
+
+def _names_in(q: list[str], s: list[str]) -> bool:
+    """The question's name is a run of the error's name (fbValve.bOpen in MAIN.fbValve.bOpen; MAIN.aValves in
+    MAIN.aValves[3].bOpen — not MAIN.aValves[5].bOpen, not fbValveB)."""
+    n = len(q)
+    return n > 0 and any(all(_seg_match(q[i], s[k + i]) for i in range(n)) for k in range(len(s) - n + 1))
+
+
+def _is_subject(v: str) -> bool:
+    """A name an error can be of: a symbol path / identifier, or an XAE tree path (parts joined by '^')."""
+    v = v.strip()
+    return bool(v) and len(v) <= 300 and "\n" not in v and (
+        bool(_ST_PATH.fullmatch(v)) or ("^" in v and not v.startswith("^") and not re.search(r"[<>{}=;]", v)))
+
+
+def _call_subjects(arguments: dict[str, Any]) -> list[str]:
+    """The names a tool call was made with — its arguments that are names (a symbol, a list of symbols, the keys of
+    {symbol: value}, a tree path, a POU): what its errors are of. Never a confirmation token."""
+    out: list[str] = []
+    for k, v in arguments.items():
+        if "token" in str(k).lower():
+            continue
+        vals = list(v) if isinstance(v, (list, tuple)) else list(v.keys()) if isinstance(v, dict) else [v]
+        out += [x.strip() for x in vals if isinstance(x, str) and _is_subject(x)]
+    return list(dict.fromkeys(out))[:50]
+
+
+def _quoted_subjects(text: str) -> list[str]:
+    """The names an error text quotes ("symbol 'MAIN.aValves[3].bOpen' not found", "Unknown type: 'FB_X'")."""
+    return [m.strip() for m in re.findall(r"['\"`‘’“”]([^'\"`‘’“”\n]{1,200})['\"`‘’“”]", text) if _is_subject(m)]
+
+
+def _xae_lines(res: Any, depth: int = 0) -> list[str]:
+    """The lines of every xae_messages block in a result, nested ones too (xae_deploy's / tcunit_run's steps) — sixth
+    review of 0.8.16: only the top level was read, a deploy's activation messages never reached err_lookup."""
+    out: list[str] = []
+    if depth > 3:
+        return out
+    if isinstance(res, dict):
+        for m in res.get("xae_messages") or []:
+            if isinstance(m, dict):
+                out += [str(x) for x in m.get("lines") or []]
+        for k, v in res.items():
+            if k != "xae_messages" and k not in _VALUE_KEYS and isinstance(v, (dict, list)):
+                out += _xae_lines(v, depth + 1)
+    elif isinstance(res, list):
+        for v in res[:200]:
+            out += _xae_lines(v, depth + 1)
+    return out
+
+
 class TargetArgsError(ToolError):
     """token_target: the shell answered, but the arguments name no target (N41/N42: which PLC project)."""
 
@@ -826,103 +902,208 @@ class App:
             time.sleep(self.ERRORS_FIRST_WAIT_S)
 
     def note_error(self, tool: str, error: str | None = None, lines: list[str] | None = None,
-                   result_errors: list[str] | None = None) -> None:
+                   result_errors: list[Any] | None = None, subjects: list[str] | None = None) -> None:
         """What a tool returned that err_lookup may need later: its error text, the XAE messages of its result, the
-        errors inside a result that succeeded (ads_read_many's per-name ADSError)."""
+        errors inside a result that succeeded ((item, text): ads_read_many's per-name ADSError), and the names the call
+        was made with (subjects: its symbols, tree paths, POUs — what its errors are of)."""
         rec: dict[str, Any] = {"when": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "tool": tool}
         if error:
             rec["error"] = error[:2000]
         if lines:
             rec["lines"] = [str(x)[:500] for x in lines[:50]]
         if result_errors:
-            rec["result_errors"] = [str(x)[:500] for x in result_errors[:20]]
+            rec["result_errors"] = [{"item": e[0], "text": str(e[1])[:500]} if isinstance(e, tuple)
+                                    else {"item": None, "text": str(e)[:500]} for e in result_errors[:20]]
         if len(rec) > 2:
+            if subjects:
+                rec["subjects"] = [str(x)[:300] for x in subjects[:50]]
             self.recent_errors.append(rec)
 
     # 0.8.16, narrowed by the user after five reviews (the guessing layer — which logged error a question is about,
-    # which words may go to the web — kept trading one wrong answer for another, and sent project names online):
-    # the error log is read for a question that names a variable / name that is in a recorded error, or that asks
-    # about the last error; online is a search the caller asks for (online=true), of codes and documented names only.
+    # which words may go to the web — kept trading one wrong answer for another, and sent project names online): the
+    # error log answers a question that names what an error is of (a variable, a POU, a tree item — compared with the
+    # names the call was made with and the names the error quotes, never with its words), or that asks about the last
+    # error; online is a search the caller asks for (online=true), of codes and documented code names only.
     ERR_LOG_PICK = 3                       # entries of the error log err_lookup offers for a question without a code
-    # 'the last error', 'the previous ADS error', 'the latest XAE message' — the words must say it
-    _LAST_SAID = re.compile(r"\b(?:last|latest|previous|newest|most\s+recent)\s+(?:[\w-]+\s+){0,2}?"
-                            r"(?:error|errors|failure|fault|message|messages)\b", re.I)
-    # a name of the question: a path (MAIN.fbValve.bOpen), or a name with '_', an inner capital or letters and digits
-    _QUESTION_NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\b[A-Za-z_]*[a-z][A-Z]\w*\b|\b\w*[A-Za-z]_\w+\b"
-                                r"|\b[A-Za-z]+\d+[A-Za-z]*\b")
+    ERROR_LIST_TIMEOUT_S = 15.0            # reading the XAE Error List for err_lookup (never queued behind a build)
+    # 'the last error', 'the previous ADS error', 'the latest XAE message' — the words must say it; the words between
+    # ('ADS', 'XAE') choose the kind (_last_kinds)
+    _LAST_SAID = re.compile(r"\b(?:last|latest|previous|newest|most\s+recent)\s+(?P<q>(?:[\w-]+\s+){0,2}?)"
+                            r"(?:error|errors|failure|failures|fault|faults|message|messages)\b", re.I)
+    # a name in a question: a path (MAIN.fbValve.bOpen, MAIN.aValves[3].bOpen, pValve^.bOpen), an indexed name
+    # (aValves[3]), or a name with '_', an inner capital or letters and digits (fbValve, FB_Dosing, Plc1)
+    _QUESTION_NAME = re.compile(rf"(?<![\w.\]^]){_ST_SEG}(?:\.{_ST_SEG})+|(?<![\w.])[A-Za-z_]\w*(?:\[[^\]\n]{{1,40}}\])+\^?"
+                                r"|\b[A-Za-z_]*[a-z][A-Z]\w*\b|\b\w*[A-Za-z]_\w+\b|\b[A-Za-z]+\d+[A-Za-z]*\b")
 
-    def _err_log_entries(self, query: str, texts: list[tuple[str, str]], source: str,
-                         ordered: bool = True) -> list[dict[str, Any]]:
-        """The texts (newest first: (where, text)) that name a code and are about the question: one that holds a name
-        of the question whole (MAIN.fbValve.bOpen, fbValve, FB_Dosing) — or, for a question that asks about the last
-        error ('what does the last error mean?'), the newest one (`ordered`: the texts have a time order; the XAE Error
-        List has none). Each looked up in the errors index (a code read from the text, never a word of it)."""
-        from . import errors_index as X
-        loc = self.kb.location()[0]
-        names = list(dict.fromkeys(self._QUESTION_NAME.findall(query)))
-        last = ordered and bool(self._LAST_SAID.search(query))
-        named, coded = [], []
-        for where, t in texts:
-            read = X.read_query(t)
-            if not (read["codes"] or read["names"] or read["caps"] or read["ids"]):
-                continue
-            coded.append((where, t))
-            hits = [n for n in names if re.search(rf"(?<!\w){re.escape(n)}(?!\w)", t, re.I)]
-            if hits:
-                named.append((where, t, hits))
-        picked = [(w, t, h) for w, t, h in named[:self.ERR_LOG_PICK]] or \
-            ([(coded[0][0], coded[0][1], None)] if last and coded else [])
+    @classmethod
+    def question_names(cls, query: str) -> list[str]:
+        """The names a question holds (_QUESTION_NAME) — not an abbreviation ('e.g.', 'i.e.': one letter each part)."""
         out = []
-        for where, t, hits in picked:
-            try:
-                r = X.err_lookup(t, kb=loc, limit=3, fulltext=False)
-            except X.ErrError:
+        for n in cls._QUESTION_NAME.findall(query):
+            n = n.rstrip(".")
+            segs = _segments(n)
+            if not segs or ("." in n and all(len(x) == 1 for x in segs)):
                 continue
-            matches = [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref") if m.get(k) is not None}
-                       for m in r.get("matches") or [] if m.get("matched_by") != "text"]
-            read_as = [c["token"] for c in r["read_as"]] + r.get("names", []) + [m["token"] for m in
-                                                                                 r.get("message_ids", [])]
-            if not read_as:
-                continue
-            out.append({"source": source, "where": where, "text": t[:600], "read_as": read_as,
-                        "documented": bool(matches), "matches": matches,
-                        **({"names": hits} if hits else {"newest": True})})
+            out.append(n)
+        return list(dict.fromkeys(out))
+
+    @staticmethod
+    def _last_kinds(qual: str) -> tuple[set[str], set[str], list[str]]:
+        """'the last ADS error': the words between 'last' and 'error' — a tool family (ads, xae, tcunit …: the tool's
+        name; xae also an XAE message of any tool) and a domain the errors index names (ads, win32, nc, labview …: the
+        code's domain); any other word is not used, and said so."""
+        from . import errors_index as X
+        words = re.findall(r"[a-z0-9]+", qual.lower())
+        fams = {w for w in words if w in _ERROR_SOURCES}
+        doms = set(X.named_domains(qual)) if qual.strip() else set()
+        dom_words = {w for d in doms for n in X.DOMAINS[d].get("names", ()) for w in n.split()}
+        return fams, doms, [w for w in words if w not in fams and w not in dom_words]
+
+    def _code_entry(self, text: str, loc: Any) -> dict[str, Any] | None:
+        """The code a text names, looked up (err_lookup's rules, at most 3 matches with 'more' and every domain said):
+        None when it names none — a number read as a code, a message id, or a name the errors index knows as a code's
+        (an identifier is no code: 'ads_connect'). documented: None without a readable errors index."""
+        from . import errors_index as X
+        read = X.read_query(text)
+        if not (read["codes"] or read["names"] or read["caps"] or read["ids"]):
+            return None
+        try:
+            r = X.err_lookup(text, kb=loc, limit=3, fulltext=False)
+        except X.ErrError:
+            return None
+        # review of 0.8.16: a capitalised word that is no symbol is no code ('state change aborted' got EtherCAT)
+        by_name = [m for m in r.get("matches") or [] if m.get("matched_by") in ("symbol", "dotnet name")]
+        if not r["read_as"] and not r.get("message_ids") and not by_name:
+            return None
+        matches = [m for m in r.get("matches") or [] if m.get("matched_by") != "text"]
+        out: dict[str, Any] = {
+            "read_as": [c["token"] for c in r["read_as"]] + sorted({m["symbol"] for m in by_name if m.get("symbol")})
+            + [m["token"] for m in r.get("message_ids", [])],
+            "documented": bool(matches) if r.get("documented") is not None else None,
+            "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref", "device_texts", "device_texts_note")
+                         if m.get(k)} for m in matches]}
+        if r.get("more"):
+            # sixth review of 0.8.16: three of 16 domains read as the whole list
+            out["more"] = r["more"]
+            out["match_domains"] = r.get("match_domains")
+        if r.get("note") and not matches:
+            out["note"] = r["note"]
         return out
 
-    async def err_from_logs(self, query: str) -> dict[str, Any] | None:
-        """A question without a code: the errors this server returned, the XAE messages of its calls and the errors
-        inside its results (newest first) that hold one of the question's names — or the newest, when the question
-        asks about the last error; then the XAE Error List (when XAE is attached) for the question's names. None when
-        the question names nothing and does not ask about the last error."""
-        if not self._QUESTION_NAME.search(query) and not self._LAST_SAID.search(query):
-            return None
-        texts: list[tuple[str, str]] = []
-        for r in reversed(self.recent_errors):           # newest first, every kind in its place
+    def _err_log_entries(self, query: str, texts: list[dict[str, Any]], source: str, ordered: bool = True,
+                         by_names: bool = True) -> list[dict[str, Any]]:
+        """The texts ({where, tool, text, subjects, xae}; newest first) that name a code and are about the question:
+        one whose subjects (the names the call was made with, the item of a result, the names the text quotes) hold a
+        name of the question (names) — up to ERR_LOG_PICK, the newest one when the question also asks about the last
+        error — or, for a question about the last error without names (by_names false: none of its names was found),
+        the newest (newest; `ordered`: the texts have a time order — the XAE Error List has none). The words between
+        'last' and 'error' choose the kind (_last_kinds). Each looked up (a code read from the text, never a word)."""
+        loc = self.kb.location()[0]
+        names = [(n, _segments(n)) for n in (self.question_names(query) if by_names else [])]
+        m = self._LAST_SAID.search(query) if ordered else None
+        fams, doms, _unused = self._last_kinds(m.group("q")) if m else (set(), set(), [])
+        if not names and not m:
+            return []
+        out = []
+        for t in texts[:400]:
+            hits = [n for n, segs in names if any(_names_in(segs, _segments(x)) for x in t["subjects"])]
+            if names and not hits:
+                continue
+            c = self._code_entry(t["text"], loc)
+            if c is None:
+                continue
+            if fams or doms:
+                fam = t["tool"].split("_", 1)[0]
+                if not (fam in fams or ("xae" in fams and t.get("xae"))
+                        or any(x.get("domain") in doms for x in c["matches"])):
+                    continue
+            out.append({"source": source, "where": t["where"], "text": t["text"][:600], **c,
+                        **({"names": hits} if hits else {"newest": True})})
+            if m or len(out) >= self.ERR_LOG_PICK:
+                break
+        return out
+
+    def _error_texts(self) -> list[dict[str, Any]]:
+        """Every error this server recorded, newest first, each kind in its place: the error a tool raised, the XAE
+        messages of its calls, the errors inside its result — with what each is of (subjects)."""
+        texts: list[dict[str, Any]] = []
+        for r in reversed(self.recent_errors):
+            subj = list(r.get("subjects") or [])
             if r.get("error"):
-                texts.append((f"{r['tool']} {r['when']}", r["error"]))
-            texts += [(f"{r['tool']} {r['when']} (XAE message)", ln) for ln in r.get("lines") or []]
-            texts += [(f"{r['tool']} {r['when']} (in its result)", e) for e in r.get("result_errors") or []]
+                texts.append({"where": f"{r['tool']} {r['when']}", "tool": r["tool"], "text": r["error"],
+                              "subjects": subj + _quoted_subjects(r["error"])})
+            texts += [{"where": f"{r['tool']} {r['when']} (XAE message)", "tool": r["tool"], "xae": True, "text": ln,
+                       "subjects": subj + _quoted_subjects(ln)} for ln in r.get("lines") or []]
+            for e in r.get("result_errors") or []:
+                texts.append({"where": f"{r['tool']} {r['when']} (in its result)", "tool": r["tool"], "text": e["text"],
+                              "subjects": ([e["item"]] if e.get("item") else subj) + _quoted_subjects(e["text"])})
+        return texts
+
+    async def _error_list_texts(self) -> tuple[list[dict[str, Any]], str | None]:
+        """The XAE Error List's items as texts (subjects: the item's file and project, the names it quotes), or why it
+        was not read: XAE not attached, or busy (sixth review of 0.8.16: queued behind a build, err_lookup waited 60 s)."""
+        from pathlib import PureWindowsPath
+        if getattr(self.xae, "dte", None) is None:
+            return [], "the XAE Error List was not read: XAE is not attached (xae_attach)"
+        cur = getattr(self.xae_worker, "current", None)
+        if cur is not None:
+            return [], (f"the XAE Error List was not read: XAE is busy with {cur[0]} for "
+                        f"{time.monotonic() - cur[1]:.0f} s — ask again when it is done")
+        try:
+            el = await self.xae_call(self.xae.errors, timeout=self.ERROR_LIST_TIMEOUT_S)
+        except ToolError as exc:
+            return [], f"the XAE Error List could not be read: {str(exc)[:200]}"
+        out = []
+        for i in el.get("items") or []:
+            d = str(i.get("description") or "")
+            if not d:
+                continue
+            f = PureWindowsPath(str(i.get("file") or ""))
+            out.append({"where": f"XAE Error List ({i.get('level') or 'message'})" + (f" {f.name}" if f.name else ""),
+                        "tool": "xae", "xae": True, "text": d,
+                        "subjects": [x for x in (f.stem, str(i.get("project") or "")) if x] + _quoted_subjects(d)})
+        return out, None
+
+    async def err_from_logs(self, query: str) -> dict[str, Any] | None:
+        """A question without a code: the errors this server recorded (newest first) that are of a name of the question
+        — the newest of them when it asks about the last error — then the XAE Error List (attached, not busy) for its
+        names; a question about the last error whose names no error is of gets the newest, with names_not_found. None
+        when the question names nothing and does not ask about the last error."""
+        names = self.question_names(query)
+        m = self._LAST_SAID.search(query)
+        if not names and not m:
+            return None
+        texts = self._error_texts()
         entries = await asyncio.to_thread(self._err_log_entries, query, texts, "recent errors of this server")
         note = None
-        if not entries and self._QUESTION_NAME.search(query):
-            if getattr(self.xae, "dte", None) is not None:
-                try:
-                    el = await self.xae_call(self.xae.errors, timeout=60)
-                    items = [(f"XAE Error List ({i.get('level') or 'message'})", str(i.get("description") or ""))
-                             for i in (el.get("items") or []) if i.get("description")]
-                    entries += await asyncio.to_thread(self._err_log_entries, query, items, "XAE Error List", False)
-                except ToolError as exc:
-                    note = f"the XAE Error List could not be read: {str(exc)[:200]}"
-            else:
-                note = "the XAE Error List was not read: XAE is not attached (xae_attach)"
+        if names and not entries:
+            items, note = await self._error_list_texts()
+            if items:
+                entries = await asyncio.to_thread(self._err_log_entries, query, items, "XAE Error List", False)
         out: dict[str, Any] = {"entries": entries,
-                               "note": ("errors seen before that hold a name of the question (names), or the newest for "
-                                        "a question about the last error (newest) — the code is read from the error "
-                                        "and looked up, never a word of it")}
-        if not entries:
+                               "note": ("errors seen before that are of a name of the question (names: compared with the "
+                                        "names the call was made with and the names the error quotes, never its words), "
+                                        "or the newest for a question about the last error (newest) — the code is read "
+                                        "from the error and looked up")}
+        if names and not entries and m:
+            entries = await asyncio.to_thread(self._err_log_entries, query, texts, "recent errors of this server",
+                                              True, False)
+            if entries:
+                out["entries"] = entries
+                out["names_not_found"] = names
+                out["note"] = (f"no error seen before is of {', '.join(names)}: the newest error is given (newest) — "
+                               "it may be of something else")
+        if m:
+            unused = self._last_kinds(m.group("q"))[2]
+            if unused:
+                out["not_used"] = (f"'{' '.join(unused)}' is not a kind err_lookup can tell (a tool family: "
+                                   f"{', '.join(sorted(_ERROR_SOURCES))}; or a code space the errors index names: ads, "
+                                   "win32, nc, labview …): the newest error of any kind")
+        if not out["entries"]:
             out["note"] = ("no error was seen yet" if not texts else
-                           "no error seen before holds a name of the question and names a code"
-                           if self._QUESTION_NAME.search(query) else "no error seen before names a code")
+                           f"no error seen before is of {', '.join(names)} and names a code" if names else
+                           "no error seen before names a code" + (f" of the kind asked ({m.group('q').strip()})"
+                                                                  if m and m.group("q").strip() else ""))
         if note:
             out["xae_error_list"] = note
         return out
@@ -936,38 +1117,50 @@ class App:
     @classmethod
     def online_terms(cls, query: str, res: dict[str, Any] | None = None) -> str:
         """What an online search is sent: the codes err_lookup read (in the question's notation), its message ids,
-        the code symbols it found in the documentation, and COM's own error names — nothing else of the question: no
-        word and no name of it can carry a project's, a machine's or a customer's name to the search engine."""
+        the names of the question the errors index knows as a code's (symbol or .NET name: code_names), and COM's own
+        error names — nothing else of the question: no word and no name of it can carry a project's, a machine's or a
+        customer's name to the search engine. A term the search engine reads as an operator is quoted (sixth review of
+        0.8.16: '-6908' searched every page WITHOUT 6908)."""
         res = res or {}
         terms = [c["token"] for c in res.get("read_as") or []] + [m["token"] for m in res.get("message_ids") or []]
-        terms += [m["symbol"] for m in (res.get("matches") or []) + (res.get("other_domains") or [])
-                  if m.get("symbol") and m.get("matched_by", "symbol") in ("symbol", "dotnet name")
-                  and m["symbol"].lower() in {n.lower() for n in res.get("names") or []}]
+        terms += list(res.get("code_names") or [])
         terms += [t for t in re.findall(r"\b[A-Z][A-Z_]+\b", query) if t in cls.COM_NAMES]
-        return " ".join(dict.fromkeys(terms))
+        return " ".join(f'"{t}"' if t[:1] in "-+~" else t for t in dict.fromkeys(terms))
 
     async def err_online(self, query: str, res: dict[str, Any] | None = None) -> dict[str, Any]:
         """err_lookup(online=true): a site search of infosys.beckhoff.com on the web for the codes and documented names
-        of the question (online_terms) — pages that mention them, not a documented meaning. Off with docs.web_fallback =
-        false or without the docs index (said so); it gives up after ONLINE_TIMEOUT_S."""
-        if getattr(self, "docs", None) is None:
-            return {"skipped": "the docs index is off (docs.enabled = false): no online search"}
+        of the question (online_terms) — pages that mention them, not a documented meaning. Off with docs.enabled or
+        docs.web_fallback = false (said so); without a local Help Viewer package it runs all the same (whether a page is
+        in the package is then unknown); it gives up after ONLINE_TIMEOUT_S."""
+        from . import infosys as IS
+        if not self.cfg.docs.enabled:
+            return {"skipped": "docs.enabled = false: no online search"}
         if not self.cfg.docs.web_fallback:
             return {"skipped": "docs.web_fallback = false: no online search"}
         terms = self.online_terms(query, res)
         if not terms:
             return {"skipped": "an online search is made for a code or a documented code name — the question has "
                                "none (its words and names are never sent)"}
+        if getattr(self, "docs", None) is not None:
+            search: Callable[..., list[dict[str, Any]]] = self.docs.web_search
+        else:
+            # sixth review of 0.8.16: without a local package there is no index object — the search needs none
+            d = self.cfg.docs
+            search = functools.partial(IS.web_search, fetch=IS.Fetcher(min(float(d.fetch_timeout_s), 5.0)),
+                                       book_allowed=functools.partial(IS.allowed_book, tc3_only=d.tc3_only,
+                                                                      exclude=tuple(d.exclude_books or ())))
         try:
             # its own two threads: a network that drops traffic does not use up the pool every to_thread tool shares
             items = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(
-                _ONLINE_POOL, self.docs.web_search, terms, 5), self.ONLINE_TIMEOUT_S)
+                _ONLINE_POOL, search, terms, 5), self.ONLINE_TIMEOUT_S)
         except (TimeoutError, asyncio.TimeoutError):
             items = [{"error": f"the online search did not answer within {self.ONLINE_TIMEOUT_S:g} s"}]
         return {"source": "online: a site search of infosys.beckhoff.com (DuckDuckGo) — not the local documentation",
                 "searched": terms,
                 "note": ("pages the search engine finds for it — they mention it; none is a documented meaning. "
-                         "in_local_package: infosys_get_page opens it; otherwise only a browser"),
+                         + ("in_local_package: infosys_get_page opens it; otherwise only a browser"
+                            if getattr(getattr(self, "docs", None), "local", None) is not None else
+                            "no local Help Viewer package: in_local_package is unknown; a browser opens the page")),
                 "items": items}
 
     def ads_error_text(self, code: int) -> str | None:
@@ -984,11 +1177,12 @@ class App:
         next to a word that says so, a code's symbol, an HRESULT), when the errors index has it and the text does not
         say it already."""
         try:
-            rows = self.kb.documented(msg)
+            found = self.kb.documented(msg)
         except Exception:  # noqa: BLE001 — an addition to an error; the error itself must come through
-            rows = None
-        if not rows:
+            found = None
+        if not found:
             return msg
+        rows = found["rows"]
         def words(t: str) -> str:
             return " " + " ".join(re.findall(r"[a-z0-9]+", t.lower())) + " "
         said = words(msg)
@@ -997,7 +1191,7 @@ class App:
         if any((r.get("symbol") and words(r["symbol"]) in said) or (r.get("text") and words(r["text"]).strip()
                                                                       and words(r["text"]) in said) for r in rows):
             return msg
-        if len({r["domain"] for r in rows}) > 1:
+        if len(found["domains"]) > 1:
             # review of 0.8.16 (user decision): a code of several domains the message does not name is not annotated
             # with one of them — 'CreateFile failed: error 6' got ADS's 0x6 although it is Win32's (spec §6: never pick
             # a domain silently); a message that names its domain ('ADS error 6') has that one only
@@ -1010,32 +1204,14 @@ class App:
 
     def line_codes(self, lines: list[str], key: str) -> list[dict[str, Any]]:
         """N125: the codes message lines name (0xA2, HRESULTs, ADS error 1861, C0xxx) looked up in the errors index —
-        documented (domain, symbol, text, ref) or documented=false; an entry per line that names a code, {key: index}."""
+        documented (domain, symbol, text, ref) or documented=false; an entry per line that names a code, {key: index}
+        (_code_entry)."""
         loc = self.kb.location()[0]
-        from . import errors_index as X
         codes = []
         for i, e in enumerate(lines):
-            read = X.read_query(e)
-            if not read["codes"] and not read["names"] and not read["caps"] and not read["ids"]:
-                continue
-            try:
-                r = X.err_lookup(e, kb=loc, limit=3, fulltext=False)
-            except X.ErrError:
-                continue
-            # review of 0.8.16: a line counts when it names a code — a number read as one, a message id, or a word the
-            # errors index knows as a code's symbol. 'state change aborted' got read_as ['EtherCAT'] documented=false:
-            # a capitalised word that is no symbol is no code
-            by_name = [m for m in r.get("matches") or [] if m.get("matched_by") in ("symbol", "dotnet name")]
-            if not r["read_as"] and not r.get("message_ids") and not by_name:
-                continue
-            matches = [m for m in r.get("matches") or [] if m.get("matched_by") != "text"]
-            codes.append({key: i, "read_as": [c["token"] for c in r["read_as"]]
-                          + sorted({m["symbol"] for m in by_name if m.get("symbol")})
-                          + [m["token"] for m in r.get("message_ids", [])],
-                          "documented": bool(matches) if r.get("documented") is not None else None,
-                          "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref", "device_texts",
-                                                          "device_texts_note") if m.get(k)} for m in matches],
-                          **({"note": r["note"]} if r.get("note") and not matches else {})})
+            c = self._code_entry(e, loc)
+            if c is not None:
+                codes.append({key: i, **c})
         return codes
 
     def log_codes(self, log: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1050,7 +1226,12 @@ class App:
         codes its lines name looked up (line_codes) — Beckhoff's messages, labelled as such."""
         out = []
         for r in recs:
-            codes = self.line_codes(r.get("lines") or [], "line")
+            try:
+                codes = self.line_codes(r.get("lines") or [], "line")
+            except Exception as exc:  # noqa: BLE001 — sixth review of 0.8.16: an annotation of an action that ran must
+                # never make it look failed (a repeated activation): the messages come through, the lookup's failure said
+                out.append({**r, "codes_error": f"the codes were not looked up: {type(exc).__name__}: {str(exc)[:200]}"})
+                continue
             out.append({**r, **({"codes": codes} if codes else {})})
         return out
 
@@ -2495,24 +2676,31 @@ _VALUE_KEYS = frozenset("value values data rows samples items_raw tree leaves".s
 _ERROR_SOURCES = frozenset("ads rec scope snap ipc exp test tcunit wf xae hmi".split())
 
 
-def _result_errors(res: Any, depth: int = 0, out: list[str] | None = None, path: str = "") -> list[str]:
-    """The error texts inside a result ('error': '…' at any depth up to 3, at most 20) — per-item failures of a tool
-    that succeeded as a whole — each with the item it is of: a symbol path key ('MAIN.fbValve.bOpen'), or the entry's
-    own name / symbol / path in a list ('ads_dump errors', 'rec blocks'). Never inside a value that was read (a PLC
-    struct with a member 'error' is data, not an error seen). Fifth review of 0.8.16."""
+def _result_errors(res: Any, depth: int = 0, out: list[tuple[str | None, str]] | None = None,
+                   label: str = "") -> list[tuple[str | None, str]]:
+    """The errors inside a result ('error': '…' at any depth up to 3, at most 20) — per-item failures of a tool that
+    succeeded as a whole — as (item, text): the item a symbol path key ('MAIN.fbValve.bOpen') or the entry's own
+    symbol / name / path / root in a list ('ads_dump errors', 'rec blocks'). Never inside a value that was read: under
+    a symbol's key the entry is its failure only as {'error': …} alone — anything else there is its value (a struct
+    with a member 'error' is data; sixth review of 0.8.16) — and the value keys (value, rows, samples …) are skipped."""
     out = [] if out is None else out
     if depth > 3 or len(out) >= 20:
         return out
     if isinstance(res, dict):
-        label = path or next((str(res[k]) for k in ("symbol", "name", "path", "root") if isinstance(res.get(k), str)),
-                             "")
+        own = label or next((str(res[k]) for k in ("symbol", "name", "path", "root") if isinstance(res.get(k), str)),
+                            "")
         for k, v in res.items():
+            if len(out) >= 20:
+                break
             if k == "error" and isinstance(v, str) and v:
-                out.append((f"{label}: " if label and label not in v else "") + v[:500])
+                out.append((own or None, (f"{own}: " if own and own not in v else "") + v[:500]))
             elif k in _VALUE_KEYS or k == "xae_messages":
                 continue
+            elif "." in k and _ST_PATH.fullmatch(k):
+                if isinstance(v, dict) and set(v) == {"error"} and isinstance(v["error"], str) and v["error"]:
+                    out.append((k, (f"{k}: " if k not in v["error"] else "") + v["error"][:500]))
             elif isinstance(v, (dict, list)):
-                _result_errors(v, depth + 1, out, k if isinstance(v, dict) and "." in k else label)
+                _result_errors(v, depth + 1, out, "")
     elif isinstance(res, list):
         for v in res[:200]:
             _result_errors(v, depth + 1, out, "")
@@ -2535,19 +2723,28 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
         # third review of 0.8.16: the errors of the tools that talk to the target, XAE or the project's runtime — not the
         # plugin's own (a docs search whose web fallback failed made 'getaddrinfo failed' an 'error seen')
         note = note_error() if name.split("_", 1)[0] in _ERROR_SOURCES else None
+        subjects: list[str] = []
+        if note is not None:
+            # what the call's errors are of: the names it was made with (sixth review of 0.8.16 — a question's name is
+            # compared with these, never with the words of an error or of the plugin's notes on it)
+            try:
+                bound = inspect.signature(fn).bind_partial(*args, **kwargs).arguments
+            except (TypeError, ValueError):
+                bound = dict(kwargs)
+            subjects = _call_subjects(bound)
         try:
             res = await _run(*args, **kwargs)
         except ToolError as exc:
             if note is not None:
-                note(name, error=str(exc))
+                note(name, error=str(exc), subjects=subjects)
             raise
         if note is not None and isinstance(res, dict):
-            lines = [ln for m in res.get("xae_messages") or [] if isinstance(m, dict) for ln in m.get("lines") or []]
+            lines = _xae_lines(res)
             # re-review of 0.8.16: an error inside a result that succeeded (ads_read_many's per-name ADSError 1808) is
             # an error seen too — recorded as one, not as an XAE message
             inner = _result_errors(res)
             if lines or inner:
-                note(name, lines=lines, result_errors=inner)
+                note(name, lines=lines, result_errors=inner, subjects=subjects)
         return res
 
     async def _run(*args: Any, **kwargs: Any) -> Any:
@@ -2752,7 +2949,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             if ds.get("esi_state") in ("outdated", "rebuild_needed") or ds.get("esi_rebuild") in (
                     "running", "interrupted", "waiting_to_replace"):
                 infos.append("ESI index: " + ds["esi"])
-            if ds.get("errors_state") in ("outdated", "rebuild_needed") or ds.get("errors_rebuild") in (
+            if ds.get("errors_state") in ("outdated", "rebuild_needed", "unreadable") or ds.get("errors_rebuild") in (
                     "running", "interrupted", "waiting_to_replace", "incomplete"):
                 infos.append("errors index: " + ds["errors"])
         except Exception as exc:  # noqa: BLE001
@@ -3100,9 +3297,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         no_local_source (CoE SDO abort codes, compiler C0xxx), full-text hits marked as such — never a guessed meaning.
         No code in the query ('ADS error on port 851'): documented=false — the codes whose text shares its words are
         text_matches, not the answer; from_error_log: the errors this server returned, the XAE messages of its calls
-        and the errors inside its results that hold a name of the query (MAIN.fbValve.bOpen, fbValve), or the newest
-        for a question about the last error ('what does the last error mean?'); then the XAE Error List (attached)
-        for the query's names — the code read from the error and looked up. online=true: a site search of
+        and the errors inside its results that are of a name of the query (MAIN.fbValve.bOpen, fbValve, aValves[3], a
+        POU, a tree item — compared with the names the call was made with and the names the error quotes, never its
+        words), or the newest for a question about the last error ('what does the last ADS error mean?': of that
+        kind; names_not_found when no error is of its names); then the XAE Error List (attached, not busy) for the
+        query's names — the code read from the error and looked up. online=true: a site search of
         infosys.beckhoff.com on the web (docs.web_fallback) for the query's codes and documented code names only —
         never its words or other names; pages that mention them, labelled so. domain= narrows (an id, or part of a
         page's id/title); limit 1-20. The twincat-docs skill's err_lookup command is the same function offline (the
@@ -5505,7 +5704,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if not skip_build:
             await halt_if_dialog("build")
             b = await app.xae_call(app.xae.build, False, False, timeout=cfg.xae.build_timeout_s + 60)
-            steps["build"] = {k: b[k] for k in ("success", "errors", "warnings", "duration_s", "open_dialogs") if k in b}
+            steps["build"] = {k: b[k] for k in ("success", "errors", "warnings", "duration_s", "open_dialogs",
+                                                "xae_messages") if k in b}
             if not b["success"]:
                 steps["build"]["items"] = b["items"][:50]
                 app.audit("xae_deploy", {"target": tgt}, OpClass.DESTRUCTIVE, "build-failed", steps)
@@ -5803,7 +6003,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             steps["save"] = await app.save_verified("tcunit_run")        # D44: tcunit_run did not save at all
         if not skip_build:
             b = await app.xae_call(app.xae.build, False, False, timeout=cfg.xae.build_timeout_s + 60)
-            steps["build"] = {k: b[k] for k in ("success", "errors", "warnings")}
+            steps["build"] = {k: b[k] for k in ("success", "errors", "warnings", "xae_messages") if k in b}
             if not b["success"]:
                 steps["build"]["items"] = b["items"][:50]
                 app.audit("tcunit_run", {"target": tgt}, OpClass.DESTRUCTIVE, "build-failed", steps)

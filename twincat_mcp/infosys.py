@@ -3540,58 +3540,18 @@ class InfosysIndex:
         return [o for o, _ in out[:limit]]
 
     def web_search(self, q: str, limit: int = 5) -> list[dict[str, Any]]:
-        """A site search of infosys.beckhoff.com on the web (DuckDuckGo's HTML page) — err_lookup(online=true) (0.8.16,
-        user decision: only when asked, of the codes and documented code names of the question). The search engine's results as they are: url, title,
-        its snippet, and whether the page is in the local Help Viewer package (then infosys_get_page opens it; otherwise
-        only a browser does — no page is fetched from the web in local mode). TwinCAT 2 books are left out (tc3_only).
-        [{'error': …}] when the search cannot be reached."""
-        url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(f"site:infosys.beckhoff.com {q}")
-        try:
-            # third review of 0.8.16: its own short timeout — the index's fetcher waits 20 s twice, and the thread a
-            # caller gave up on kept running that long
-            fetch = self.fetch if not isinstance(self.fetch, Fetcher) else Fetcher(min(self.fetch.timeout_s, 5.0))
-            raw = fetch.get(url, allow_hosts=DDG_HOSTS).decode("utf-8", errors="replace")
-        except InfosysError as exc:
-            return [{"error": f"the online search is not reachable: {exc}"}]
-        local: dict[str, str] = {}
+        """err_lookup(online=true) with this index: web_search (module) with its own short timeout, this server's book
+        filter, and whether each page is in the local Help Viewer package."""
+        # third review of 0.8.16: its own short timeout — the index's fetcher waits 20 s twice, and the thread a caller
+        # gave up on kept running that long
+        fetch = self.fetch if not isinstance(self.fetch, Fetcher) else Fetcher(min(self.fetch.timeout_s, 5.0))
+        local: dict[str, str] | None = None
         if self.local is not None:
             try:
                 local = self.sitemap()
             except InfosysError:
                 local = {}
-
-        def plain(h: str) -> str:
-            return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", h))).strip()
-        # one result block each (title link and its own snippet) — re-review of 0.8.16: paired by position, a result
-        # without a snippet gave every later one the snippet of the one before it
-        blocks = re.split(r'(?=<div\b[^>]*class="[^"]*\bresult\b)', raw)
-        out: list[dict[str, Any]] = []
-        for blk in blocks:
-            t = re.search(r'<a\b([^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*)>(.*?)</a>', blk, re.S)
-            if not t:
-                continue
-            m = re.search(r'href="([^"]+)"', t.group(1))
-            if not m:
-                continue
-            href = html.unescape(m.group(1))
-            if "uddg=" in href:
-                href = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [""])[0])
-            href = re.sub(r"\?.*$", "", href.replace("http://", "https://").split("#", 1)[0])
-            # re-review of 0.8.16: a page of no known book (another language, TwinCAT 2's old '/html/…htm' form) passed —
-            # only English content pages of a book this server allows (tc3_only), as the sitemap check of _ddg does
-            if f"infosys.beckhoff.com/content/{LANG}/" not in href:
-                continue
-            b = book_of(href)
-            if not b or not self.book_allowed(b[0]) or is_tc2_supplement(b[0]):
-                continue
-            if any(o["url"] == href for o in out):
-                continue
-            sn = re.search(r'<(a|td|div)\b[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</\1>', blk, re.S)
-            out.append({"url": href, "title": plain(t.group(2)), "snippet": plain(sn.group(2)) if sn else None,
-                        "book": b[0], "in_local_package": href in local if self.local is not None else None})
-            if len(out) >= limit:
-                break
-        return out
+        return web_search(q, limit, fetch=fetch, book_allowed=self.book_allowed, local=local)
 
     def _ddg(self, q: str, limit: int) -> list[dict[str, Any]]:
         url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(f"site:infosys.beckhoff.com {q}")
@@ -3718,3 +3678,59 @@ def _summary(markdown: str | None, n: int = 220) -> str:
         b = " ".join(b.split())
         return b if len(b) <= n else b[: n - 1].rsplit(" ", 1)[0] + "…"
     return ""
+
+
+def web_search(q: str, limit: int = 5, *, fetch: Any, book_allowed: Callable[[str], bool],
+               local: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """A site search of infosys.beckhoff.com on the web (DuckDuckGo's HTML page) — err_lookup(online=true) (0.8.16,
+    user decision: only when asked, of the codes and documented code names of the question). The search engine's
+    results as they are: url, title, its snippet, and whether the page is in the local Help Viewer package (`local`: its
+    page list; None — no package — unknown). No page is fetched. Only English content pages of a book book_allowed lets
+    through (TwinCAT 2 books and supplements left out). [{'error': …}] when the search cannot be reached. Sixth review of
+    0.8.16: a function of its own — without a local package the server had no index object and said 'docs disabled'."""
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(f"site:infosys.beckhoff.com {q}")
+    try:
+        raw = fetch.get(url, allow_hosts=DDG_HOSTS).decode("utf-8", errors="replace")
+    except InfosysError as exc:
+        return [{"error": f"the online search is not reachable: {exc}"}]
+
+    def plain(h: str) -> str:
+        return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", h))).strip()
+    # one result block each (title link and its own snippet) — re-review of 0.8.16: paired by position, a result
+    # without a snippet gave every later one the snippet of the one before it
+    blocks = re.split(r'(?=<div\b[^>]*class="[^"]*\bresult\b)', raw)
+    out: list[dict[str, Any]] = []
+    for blk in blocks:
+        t = re.search(r'<a\b([^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*)>(.*?)</a>', blk, re.S)
+        if not t:
+            continue
+        m = re.search(r'href="([^"]+)"', t.group(1))
+        if not m:
+            continue
+        href = html.unescape(m.group(1))
+        if "uddg=" in href:
+            href = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [""])[0])
+        href = re.sub(r"\?.*$", "", href.replace("http://", "https://").split("#", 1)[0])
+        # re-review of 0.8.16: a page of no known book (another language, TwinCAT 2's old '/html/…htm' form) passed —
+        # only English content pages of a book this server allows (tc3_only), as the sitemap check of _ddg does
+        if f"infosys.beckhoff.com/content/{LANG}/" not in href:
+            continue
+        b = book_of(href)
+        if not b or not book_allowed(b[0]) or is_tc2_supplement(b[0]):
+            continue
+        if any(o["url"] == href for o in out):
+            continue
+        sn = re.search(r'<(a|td|div)\b[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</\1>', blk, re.S)
+        out.append({"url": href, "title": plain(t.group(2)), "snippet": plain(sn.group(2)) if sn else None,
+                    "book": b[0], "in_local_package": href in local if local is not None else None})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def allowed_book(book: str, tc3_only: bool = True, exclude: list[str] | tuple[str, ...] = ()) -> bool:
+    """A book this configuration allows (InfosysIndex.book_allowed without an index): not TwinCAT 2 when tc3_only,
+    not matched by an exclude_books pattern."""
+    if tc3_only and is_tc2_book(book):
+        return False
+    return not any(re.search(p, book, re.I) for p in exclude)

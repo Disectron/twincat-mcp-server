@@ -1789,7 +1789,7 @@ async def test_0816_err_lookup_takes_the_code_from_the_errors_seen_then_goes_onl
         r = payload(await s.call_tool("err_lookup", {"query": "ADS error on port 851"}))
         assert r["documented"] is False and r["matches"] == [] and "from_error_log" not in r and "online" not in r, r
         r = payload(await s.call_tool("err_lookup", {"query": "ADS error on port 851", "online": True}))
-        assert r["online"]["skipped"].startswith("the docs index"), r
+        assert r["online"]["skipped"].startswith("docs.enabled = false"), r
         r = payload(await s.call_tool("err_lookup", {"query": "why does MAIN.fbAxis stop?"}))
         assert r["from_error_log"]["entries"] == [] and "not attached" in r["from_error_log"]["xae_error_list"], r
         res = await s.call_tool("ads_read", {"name": "MAIN.doesNotExist"})
@@ -1880,6 +1880,7 @@ async def test_rereview_0816_the_online_step_sends_no_project_names_and_gives_up
             _t.sleep(1.0)
             return []
     app.docs = SlowDocs()
+    app.cfg.docs.enabled = True
     app.cfg.docs.web_fallback = True
     app.ONLINE_TIMEOUT_S = 0.2
     t0 = _t.time()
@@ -1936,9 +1937,9 @@ async def test_review3_0816_the_error_log_step(monkeypatch, project_dir, tmp_pat
         with pytest.raises(ToolError):
             await _tool_boundary(fn, note_error=lambda: (lambda *a, **k: seen.append((a, k))))()
     assert [a[0] for a, _k in seen] == ["ads_read"], seen                 # the plugin's own tools are no source
-    app.note_error("ads_write", error="ads_write MAIN.nCounter: ADSError 1808 symbol not found")
+    app.note_error("ads_write", error="ads_write MAIN.nCounter: ADSError 1808 symbol not found", subjects=["MAIN.nCounter"])
     _t.sleep(1.1)
-    app.note_error("ads_read_many", result_errors=["MAIN.fbAxis: ADSError 1861 timeout"])
+    app.note_error("ads_read_many", result_errors=[("MAIN.fbAxis", "MAIN.fbAxis: ADSError 1861 timeout")])
     r = await app.err_from_logs("why does MAIN.fbAxis time out?")
     e = r["entries"][0]
     assert e["where"].startswith("ads_read_many ") and e["where"].endswith("(in its result)"), r
@@ -1976,14 +1977,14 @@ async def test_review4_0816_error_log_and_online_terms(monkeypatch, project_dir,
     from tests.test_errors_index import build as err_build, make_kb
     from twincat_mcp.server import App, _result_errors
     assert _result_errors({"results": {"MAIN.fbValve.bOpen": {"error": "ADSError 1793 (0x701)"}}}) == \
-        ["MAIN.fbValve.bOpen: ADSError 1793 (0x701)"]
+        [("MAIN.fbValve.bOpen", "MAIN.fbValve.bOpen: ADSError 1793 (0x701)")]
     kb = make_kb(tmp_path)
     assert err_build(kb)["result"] == "built"
     cfg = mk_cfg(project_dir)
     cfg.knowledge.location = str(kb)
     cfg.docs.enabled = False
     app = App(cfg)
-    app.note_error("ads_read", error="ads_read MAIN.nOld: ADSError 1861 (0x745) timeout")
+    app.note_error("ads_read", error="ads_read MAIN.nOld: ADSError 1861 (0x745) timeout", subjects=["MAIN.nOld"])
     _t.sleep(1.1)
     app.note_error("xae_activate_configuration", error="ActivateConfiguration: failed (HRESULT 0x98110745)")
     _t.sleep(1.1)
@@ -1996,7 +1997,8 @@ async def test_review4_0816_error_log_and_online_terms(monkeypatch, project_dir,
     assert await app.err_from_logs("what does the error mean?") is None
     r = await app.err_from_logs("is the last error a timeout?")
     assert r["entries"][0]["newest"] and "1793" in r["entries"][0]["text"], r
-    items = [("XAE Error List (error)", "C0077: Unknown type: 'FB_X'"), ("XAE Error List (error)", "ADS error 1808")]
+    items = [{"where": "XAE Error List (error)", "tool": "xae", "xae": True, "text": t, "subjects": []}
+             for t in ("C0077: Unknown type: 'FB_X'", "ADS error 1808")]
     assert app._err_log_entries("what does the last error mean?", items, "XAE Error List", False) == []
     assert app.online_terms("EK1100") == "" and app.online_terms("EL3356 shows weight 0 after CX9020 restart") == ""
 
@@ -2013,9 +2015,9 @@ async def test_review5_0816_narrowed_error_log_and_online(monkeypatch, project_d
     from tests.test_errors_index import build as err_build, make_kb
     from twincat_mcp.server import App, _result_errors
     assert _result_errors({"errors": [{"symbol": "MAIN.fbValve.bOpen", "error": "ADSError 1808"}]}) == \
-        ["MAIN.fbValve.bOpen: ADSError 1808"]
+        [("MAIN.fbValve.bOpen", "MAIN.fbValve.bOpen: ADSError 1808")]
     assert _result_errors({"value": {"error": "x", "nState": 3}, "rows": [{"error": "y"}]}) == []
-    assert _result_errors({"blocks": [{"name": "rec1", "error": "rec1: disk full"}]}) == ["rec1: disk full"]
+    assert _result_errors({"blocks": [{"name": "rec1", "error": "rec1: disk full"}]}) == [("rec1", "rec1: disk full")]
     kb = make_kb(tmp_path)
     assert err_build(kb)["result"] == "built"
     cfg = mk_cfg(project_dir)
@@ -2024,9 +2026,9 @@ async def test_review5_0816_narrowed_error_log_and_online(monkeypatch, project_d
     app = App(cfg)
     r = await app.err_from_logs("what does the last error mean?")
     assert r["entries"] == [] and r["note"] == "no error was seen yet", r
-    app.note_error("ads_read", error="ads_read MAIN.fbValveB.bOpen: ADSError 1808")
+    app.note_error("ads_read", error="ads_read MAIN.fbValveB.bOpen: ADSError 1808", subjects=["MAIN.fbValveB.bOpen"])
     _t.sleep(1.1)
-    app.note_error("ads_write", error="ads_write MAIN.fbValve.bOpen: ADSError 1861 timeout")
+    app.note_error("ads_write", error="ads_write MAIN.fbValve.bOpen: ADSError 1861 timeout", subjects=["MAIN.fbValve.bOpen"])
     r = await app.err_from_logs("why does fbValveB fail?")
     assert [e["names"] for e in r["entries"]] == [["fbValveB"]] and "1808" in r["entries"][0]["text"], r
     assert await app.err_from_logs("what happened the last time it worked?") is None
@@ -2035,8 +2037,8 @@ async def test_review5_0816_narrowed_error_log_and_online(monkeypatch, project_d
     for q in ("E_VALVE_STATE after ERR_DOSING_TIMEOUT in fbTimer", "MC_MoveAbsolute fails on Line3 of AcmeFoods",
               "EtherCAT OP SAFEOP on EL3356"):
         assert app.online_terms(q) == "", q
-    assert app.online_terms("ADSERR_DEVICE_SYMBOLNOTFOUND", {"names": ["ADSERR_DEVICE_SYMBOLNOTFOUND"], "matches": [
-        {"symbol": "ADSERR_DEVICE_SYMBOLNOTFOUND", "matched_by": "symbol"}]}) == "ADSERR_DEVICE_SYMBOLNOTFOUND"
+    assert app.online_terms("ADSERR_DEVICE_SYMBOLNOTFOUND", {"code_names": ["ADSERR_DEVICE_SYMBOLNOTFOUND"]}) == \
+        "ADSERR_DEVICE_SYMBOLNOTFOUND"
     assert app.online_terms("x", {"matches": [{"symbol": "ADSERR_DEVICE_SYMBOLNOTFOUND", "matched_by": "value"}]}) == ""
     # online only when asked: no web search for an undocumented code unless online=true
     install(monkeypatch)
@@ -2051,3 +2053,124 @@ async def test_review5_0816_narrowed_error_log_and_online(monkeypatch, project_d
         assert r["documented"] is False and "online" not in r and asked == [], r
         r = payload(await s.call_tool("err_lookup", {"query": "SDO abort 0x06020000", "online": True}))
         assert r["online"] == {"items": []} and asked == ["SDO abort 0x06020000"], r
+
+
+@pytest.mark.anyio
+async def test_review6_0816_the_error_log_compares_names_with_what_an_error_is_of(monkeypatch, project_dir, tmp_path):
+    """Sixth review of 0.8.16: (1) an array index split a question's name — element 3's error answered element 5;
+    (2) words of the plugin's notes and product names ('e.g.', 'TwinCAT') were 'names' and beat 'the last error'; (5)
+    'the last ADS error' gave the newest of any kind; (14) an identifier ('ads_connect') counted as a code; (13) a
+    struct member 'error' that was read was an error seen. A question's name is compared with what an error is of: the
+    names the call was made with, the item of a result, the names the error quotes."""
+    import time as _t
+    from tests.fake_ads import install
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App, _result_errors
+    assert _result_errors({"MAIN.stAlarm": {"error": "Overpressure 16#4221", "nCode": 1},
+                           "GVL.stComm": {"stLink": {"error": "TIMEOUT 0x745"}}}) == []
+    install(monkeypatch)
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    async with client_for(build_server(cfg)) as s:
+        res = payload(await s.call_tool("ads_read_many", {"names": ["MAIN.aValves[3].bOpen"]}))
+        assert "1808" in json.dumps(res), res
+        r = payload(await s.call_tool("err_lookup", {"query": "why does MAIN.aValves[5].bOpen fail?"}))
+        assert r["from_error_log"]["entries"] == [], r
+        r = payload(await s.call_tool("err_lookup", {"query": "why does MAIN.aValves[3].bOpen fail?"}))
+        assert r["from_error_log"]["entries"][0]["names"] == ["MAIN.aValves[3].bOpen"], r
+        r = payload(await s.call_tool("err_lookup", {"query": "and aValves?"}))
+        assert r["from_error_log"]["entries"][0]["names"] == ["aValves"], r
+    app = App(cfg)
+    app.note_error("ads_read_many", result_errors=[(
+        "MAIN.fbPump.nSpeed", "MAIN.fbPump.nSpeed: ADSError 1793 (0x701) — the service is not supported (e.g. sum "
+        "commands on an old runtime); TwinCAT is in CONFIG")])
+    _t.sleep(1.1)
+    app.note_error("ads_read", error="ads_read MAIN.nCounter: ADSError 1808 symbol not found", subjects=["MAIN.nCounter"])
+    _t.sleep(1.1)
+    app.note_error("xae_import", error="ConsumeXml failed (0x98510004)", subjects=["TIPC^Plc1^Plc1 Project"])
+    _t.sleep(1.1)
+    app.note_error("ads_connect", error="ads_connect: the target did not answer")
+    r = await app.err_from_logs("what does the last ADS error mean, e.g. for the valve?")
+    assert [e["text"][:16] for e in r["entries"]] == ["ads_read MAIN.nC"] and r["entries"][0]["newest"], r
+    r = await app.err_from_logs("what does the last error in TwinCAT mean?")
+    assert r["names_not_found"] == ["TwinCAT"] and "0x98510004" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("what does the last error of MAIN.fbPump mean?")
+    assert r["entries"][0]["names"] == ["MAIN.fbPump"] and "1793" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("is the last fatal error a timeout?")
+    assert "fatal" in r["not_used"] and "0x98510004" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("why does Plc1 not import?")
+    assert r["entries"][0]["names"] == ["Plc1"], r
+    # the Error List is never waited for behind a running XAE job
+    app.xae.dte = object()
+    app.xae_worker.current = ("build", _t.monotonic() - 61)
+    t0 = _t.monotonic()
+    r = await app.err_from_logs("why does FB_Dosing not compile?")
+    assert _t.monotonic() - t0 < 2 and "busy with build" in r["xae_error_list"], r
+    app.xae_worker.current = None
+    app.xae.dte = None
+
+
+@pytest.mark.anyio
+async def test_review6_0816_nested_xae_messages_unreadable_index_and_online(monkeypatch, project_dir, tmp_path):
+    """Sixth review of 0.8.16: (3) the XAE messages inside xae_deploy's steps never reached the error log; (4) an
+    errors.db that cannot be read made an XAE action that had run raise sqlite's error, and read as 'missing'; (11)
+    without an errors index the error log said documented: false; (7) '-6908' went online as an exclusion; (8) a .NET
+    code name was never sent; (9) without a local package the online step said docs were disabled."""
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp import errors_index as X
+    from twincat_mcp import infosys as IS
+    from twincat_mcp import kb_layout as L
+    from twincat_mcp.server import App, _tool_boundary, _xae_lines
+    nested = {"deployed": True, "steps": {"activate": {"xae_messages": [
+        {"action": "ActivateConfiguration", "lines": ["Error: Init4\\Activate Configuration: ADS error 0x745 (1861)"]}]}}}
+    assert _xae_lines(nested) == ["Error: Init4\\Activate Configuration: ADS error 0x745 (1861)"]
+    seen: list = []
+
+    async def xae_deploy(plc_project_path: str = "", confirm_token: str | None = None):
+        return nested
+    await _tool_boundary(xae_deploy, note_error=lambda: (lambda *a, **k: seen.append((a, k))))(
+        plc_project_path="TIPC^Plc1^Plc1 Project", confirm_token="TIPC^secret")
+    assert seen[0][1]["lines"] and seen[0][1]["subjects"] == ["TIPC^Plc1^Plc1 Project"], seen
+    # an errors.db that cannot be read: said so, never raised out of an annotation of an action that ran
+    kb = make_kb(tmp_path)
+    L.index_file(kb, "errors").write_bytes(b"")
+    st = X.state(L.index_file(kb, "errors"), kb)
+    assert st["state"] == "unreadable" and "kb_rebuild(index='errors')" in st["message"], st
+    r = X.err_lookup("ADS error 0x745", kb=kb)
+    assert r["documented"] is None and "cannot be read" in r["note"], r
+    monkeypatch.setattr(App, "errors_first_build", lambda self: None)
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    out = app.xae_messages([{"action": "ActivateConfiguration", "lines": ["Error: ADS error 0x745 (1861)"]}])
+    assert out[0]["codes"][0]["documented"] is None, out
+    app.note_error("ads_read", error="ads_read MAIN.x: ADSError 1808", subjects=["MAIN.x"])
+    r = await app.err_from_logs("what does the last error mean?")
+    assert r["entries"][0]["documented"] is None, r
+    # online: quoted operators, .NET names, and no local package
+    kb2 = make_kb(tmp_path / "two")
+    assert err_build(kb2)["result"] == "built"
+    r = X.err_lookup("TargetPortNotFound", kb=kb2)
+    assert r["code_names"] == ["TargetPortNotFound"] and app.online_terms("TargetPortNotFound", r) == "TargetPortNotFound"
+    r = X.err_lookup("error 6", kb=kb2, limit=1)
+    assert r["match_domains"] == ["ads", "win32", "tf6310_tc3_tcpip/84252939"], r
+    urls: list[str] = []
+
+    class F:
+        def __init__(self, timeout_s=5.0):
+            self.timeout_s = timeout_s
+
+        def get(self, url, allow_hosts=None):
+            urls.append(url)
+            return (b'<div class="result"><a class="result__a" href="https://infosys.beckhoff.com/content/1033/'
+                    b'tf3710_tc3_interface_for_labview/1.html">LabVIEW errors</a></div>')
+    monkeypatch.setattr(IS, "Fetcher", F)
+    app.cfg.docs.enabled = True
+    app.cfg.docs.web_fallback = True
+    assert app.docs is None
+    r = await app.err_online("-6908", {"read_as": [{"token": "-6908"}]})
+    assert r["searched"] == '"-6908"' and "%22-6908%22" in urls[0] and r["items"][0]["in_local_package"] is None, r

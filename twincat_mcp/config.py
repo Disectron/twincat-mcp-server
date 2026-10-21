@@ -112,8 +112,9 @@ DEFAULT_DOCS_BOOKS = (
 class DocsConfig:
     """Beckhoff Infosys reference lookup (infosys_* tools)."""
     enabled: bool = True
-    # "local" = the Help Viewer package TwinCAT XAE installs (BKINFOSYS3_*.mshc, every book, offline; no network
-    # call at all); "web" = infosys.beckhoff.com (sitemap + page fetches + optional DuckDuckGo fallback)
+    # "local" = the Help Viewer package TwinCAT XAE installs (BKINFOSYS3_*.mshc, every book, offline; the one network
+    # call is err_lookup(online=true), asked per call — web_fallback = false turns it off); "web" =
+    # infosys.beckhoff.com (sitemap + page fetches + optional DuckDuckGo fallback)
     source: str = "local"
     mshc: str | None = None                # the .mshc (or its folder); None = newest under %ProgramData%\Microsoft\HelpLibrary2
     cache_dir: str | None = None           # None -> ~/.twincat_mcp/infosys
@@ -123,7 +124,8 @@ class DocsConfig:
     max_workers: int = 6                   # parallel page fetches while indexing a book
     max_index_pages: int = 4000            # hard cap per infosys_index call
     sitemap_ttl_days: int = 7
-    web_fallback: bool = True              # DuckDuckGo site: search when the local index has no hit
+    web_fallback: bool = True              # DuckDuckGo site: search when the web index has no hit; in every mode the
+                                           # search of err_lookup(online=true) — false turns both off
     fetch_timeout_s: float = 20.0
 
 

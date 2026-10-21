@@ -1062,10 +1062,11 @@ class Knowledge:
         if error_msg:
             # N125 (0.8.16): what the local Beckhoff documentation says about the message's code (symbol, text, the
             # page) beside the plugin's own note — from the errors index (err_lookup's rows), when there is one
-            doc = self.documented(q)
-            if doc:
+            found = self.documented(q)
+            doc = found["rows"] if found else None
+            if found:
                 d0 = doc[0]
-                doms = list(dict.fromkeys(d["domain"] for d in doc))
+                doms = found["domains"]
                 # re-review of 0.8.16: the code of several domains was named as the first one's ('CreateFile failed:
                 # error 6' → ads ERR_TARGETPORTNOTFOUND) — never one picked silently: all of them, in documented
                 code = (f"{d0['domain']} {d0['hex']} ({d0['dec']}) {d0.get('symbol') or ''}".strip() if len(doms) == 1
@@ -1505,9 +1506,11 @@ class Knowledge:
         except X.ErrError as exc:
             raise KnowledgeError(str(exc)) from None
 
-    def documented(self, msg: str) -> list[dict[str, Any]] | None:
-        """kb_search: what the errors index documents for the codes / code names of an error message (Beckhoff's
-        symbol, text, ref) — by value, HRESULT or symbol, never by a text match; None without an index or a row."""
+    def documented(self, msg: str) -> dict[str, Any] | None:
+        """kb_search / doc_note: what the errors index documents for the codes / code names of an error message —
+        {rows: the first three (Beckhoff's symbol, text, ref), domains: every domain that has it (sixth review of
+        0.8.16: the three rows read as the whole answer — 'documented in 3 domains' of 16)} — by value, HRESULT or
+        symbol, never by a text match; None without a readable index or a row."""
         loc = self.location()[0]
         if loc is None or not L.index_file(loc, "errors").is_file():
             return None
@@ -1515,10 +1518,13 @@ class Knowledge:
             r = X.err_lookup(msg, kb=loc, limit=3, fulltext=False)
         except (X.ErrError, sqlite3.Error):
             return None
+        by_code = ("value", "hresult", "symbol", "dotnet name")
         rows = [{k: m[k] for k in ("domain", "value", "hex", "dec", "symbol", "text", "ref", "url", "device_texts",
                                    "device_texts_note") if m.get(k) is not None}
-                for m in r.get("matches") or [] if m.get("matched_by") in ("value", "hresult", "symbol", "dotnet name")]
-        return rows or None
+                for m in r.get("matches") or [] if m.get("matched_by") in by_code]
+        if not rows:
+            return None
+        return {"rows": rows, "domains": r.get("match_domains") or list(dict.fromkeys(x["domain"] for x in rows))}
 
     HW_DETAILS = E.DETAILS
 
