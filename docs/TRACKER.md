@@ -167,6 +167,28 @@ tool wishlist (2026-10-18).
   rounds, HIGH / MEDIUM block, LOW to this list, later fixes checked by tests + CI). Then libraries 0.8.19 (1a, 1b),
   linking 0.8.20 (its read side comes with the N192 fix), EtherCAT 0.8.21, snapshots 0.8.22, tasks 0.8.23. The error
   index (held) has no slot yet.
+- In-depth review of the 0.8.16 – 0.8.17 Scope and recorder code, round 1 (two reviewers, 2026-10-22, at v0.8.17).
+  Fixed in 0.8.18: a rec_start cancelled during the start check left the part 'starting' with no owner (rec_stop /
+  rec_delete waited forever, Scope recorded on); a StartRecord of unknown outcome (shell gone, E_POINTER) said "NOT
+  started" and was never stopped; the start check confirmed by another call's 'Config → Record' line; the question
+  after a recording and the disconnect question applied to a state that changed while they were open, two rec_stop
+  calls applied both answers; scope_record start / stop / save / disconnect / new under a recording's part (one owner,
+  with N189); 'new' said "not done" after its Disconnect ran; a delete between a finish's check and its link left a
+  signed link to nothing; XAE messages after a failed before-read taken as the action's; the stale-data check mixed
+  the PC's and the target's clock (an old capture passed with the target ahead, the recording's own was refused with
+  it behind — without PLC time and a log confirmation it now says it cannot tell). LOW, left: on the input_required
+  path rec_stop is audited on each round, scope_record(new) writes two audit lines; `_scope_free` disconnects before
+  rec.start, a failed rec.start does not say so; a Disconnect of unknown outcome is said "could not be disconnected"
+  and the next rec_start sends it again; without prompts 'pause' is never recorded (rec_status keeps asking); older:
+  on the answering round a busy XAE drops the user's "yes" of the also_scope question; a refused Disconnect inside
+  the after-recording choice says "call again" inside rec_stop's result; stop_unknown parts of deleted recordings
+  stay in `scope_without_recording`; a busy Scope lookup on StopRecord's retry is final instead of stop_refused; two
+  rec_stop calls still ask the question twice (one answer is applied). Retest on hardware: does TE130x log a refusal
+  for StartRecord while Scope records, and how soon "Config → Record"; StopRecord / SaveSVD after another actor's
+  Disconnect; does Scope keep recording when the shell dies during StartRecord; can StartRecord / StopRecord throw
+  E_POINTER after acting; can a second shell's TcScopeView_1.log confirm this shell's start; a buffer the read does not
+  clear — reset by each method or accumulating. Checked on Ryan's files: the CSV header's FILETIMEs are UTC on the
+  target's clock, as the recording's t0 (Scope begins / ends 0.2 – 0.4 s after the recording; 4616 ran 28.1 s past).
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
