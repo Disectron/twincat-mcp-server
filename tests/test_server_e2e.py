@@ -2268,7 +2268,7 @@ async def test_review7_0816_tree_items(monkeypatch, project_dir, tmp_path):
                     ("TIID^Device 1 (EtherCAT)^Term 4 (EL2008) does not take the value", "Term 4 (EL2008)"),
                     ("what is wrong with Term 1?", "Term 1 (EK1100)"), ("is Box 2 lost?", "Box 2 (EK1100)")):
         r = await app.err_from_logs(q)
-        assert r and r["entries"] and item in r["entries"][0]["names"], (q, r)
+        assert r and r["entries"] and any(item in n for n in r["entries"][0]["names"]), (q, r)
     for q in ("why does Term 41 fail?", "why does Term 4 (EL1008) fail?", "why does EL2008 fail?"):
         r = await app.err_from_logs(q)
         assert r is None or r["entries"] == [], (q, r)
@@ -2276,3 +2276,71 @@ async def test_review7_0816_tree_items(monkeypatch, project_dir, tmp_path):
     assert len(r["entries"]) == 1 and "0x98510004" in r["entries"][0]["text"], r
     r = await app.err_from_logs("what does the last error of Term 7 mean?")
     assert r["names_not_found"] == ["Term 7"] and r["entries"][0]["newest"], r
+
+
+@pytest.mark.anyio
+async def test_review8_0816_items_paths_kinds_counts(monkeypatch, project_dir, tmp_path):
+    """Eighth review of 0.8.16: (1) 'the last Term 4 error' read 4 as the code; (2) a tree path in the question was
+    matched part by part; (3) ads_status' own errors were dropped; (4) a failed build's errors never reached the log;
+    (5) 'the last compiler error' never matched; (6) any 'words (word)' argument was a tree item; (10) a message id in a
+    logged text went online; (11) 'the last 3 errors', 'the last Term 5 (EL1008) error'; (12) 'TwinCAT 3' / 'Port 851'
+    were items, AX5206 a name."""
+    import time as _t
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp import errors_index as X
+    from twincat_mcp.server import App, _call_subjects, _result_errors, _tool_boundary
+    for q in ("what does the last Term 4 error mean?", "what is the Box 2 error?", "Drive 2 error", "Device 1 error"):
+        assert X.read_query(q)["codes"] == [], q
+    for q, want in (("Drive 2 error, code 1861", ["1861"]), ("Drive 2 error - 1861", ["1861"]),
+                    ("Axis 1 error – 0x4260", ["0x4260"]), ("Axis 1 error code 4260", ["4260"])):
+        assert [c["token"] for c in X.read_query(q)["codes"]] == want, q
+    assert _call_subjects({"name": "MAIN.sRecipe", "value": "Lemon (fast)", "snap": "before change (v2)",
+                           "path": "TIID^Device 1 (EtherCAT)^Term 4 (EL2008)"}) == \
+        ["MAIN.sRecipe", "TIID^Device 1 (EtherCAT)^Term 4 (EL2008)"]
+    assert _result_errors({"success": False, "items": [
+        {"level": "error", "description": "C0046: Identifier 'nX' not defined", "file": "C:\\p\\POUs\\MAIN.TcPOU"},
+        {"level": "warning", "description": "C0373: unused"}]}) == [("MAIN", "C0046: Identifier 'nX' not defined")]
+    q = App._question("why does TwinCAT 3 on Port 851 fail with Drive 3 (AX5206-0000-0200)?")
+    assert q["items"] == ["Drive 3 (AX5206-0000-0200)"] and "AX5206" not in q["names"], q
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    seen: list = []
+
+    async def ads_status():
+        return {"plc": {"error": "read_state failed: ADSError 6 (0x6) Target port not found"}}
+    await _tool_boundary(ads_status, note_error=lambda: (lambda *a, **k: seen.append((a, k))))()
+    assert seen and seen[0][1]["result_errors"], seen
+    app.note_error("xae_tree_set_values", error="xae_tree_set_values: ConsumeXml failed (0x98510004)",
+                   subjects=["TIID^Device 1 (EtherCAT)^Term 4 (EL2008)"])
+    _t.sleep(1.1)
+    app.note_error("ads_read", error="ads_read MAIN.x: ADSError 1808", subjects=["MAIN.x"])
+    _t.sleep(1.1)
+    app.note_error("xae_build", result_errors=_result_errors({"success": False, "items": [
+        {"level": "error", "description": "C0046: Identifier 'nX' not defined", "file": "C:\\p\\POUs\\MAIN.TcPOU"}]}))
+    r = await app.err_from_logs("what does the last compiler error mean?")
+    assert r["entries"] and "C0046" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("what does the last error mean?")
+    assert "C0046" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("what do the last 3 errors mean?")
+    assert len({e["where"] for e in r["entries"]}) == 3, r
+    res = app.kb.err_lookup("what does the last Term 4 error mean?")
+    assert res["read_as"] == [] and not res.get("message_ids"), res
+    r = await app.err_from_logs("what does the last Term 4 error mean?")
+    assert "0x98510004" in r["entries"][0]["text"] and "names_not_found" not in r, r
+    r = await app.err_from_logs("what does the last Term 5 (EL1008) error mean?")
+    assert r["names_not_found"] == ["Term 5 (EL1008)"], r
+    for q in ("why does TIID^Device 1 (EtherCAT)^Term 9 (EL2008) fail?",
+              "why does TIID^Device 2 (EtherCAT)^Term 4 (EL2008) fail?"):
+        r = await app.err_from_logs(q)
+        assert r["entries"] == [], (q, r)
+    r = await app.err_from_logs("why does TIID^Device 1 (EtherCAT)^Term 4 (EL2008) fail?")
+    assert "0x98510004" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("why does TIID^Device 1 (EtherCAT) fail?")
+    assert "0x98510004" in r["entries"][0]["text"], r          # an error of an item inside the device's path
+    log = {"from_error_log": {"entries": [{"read_as": ["0x98510004", "C0815"], "matches": [],
+                                           "text": "ConsumeXml failed (0x98510004) at AcmeFoods C0815"}]}}
+    assert app.online_terms("what does the last error mean?", log) == "0x98510004"

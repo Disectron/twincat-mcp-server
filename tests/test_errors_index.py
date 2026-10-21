@@ -1020,6 +1020,10 @@ def test_review_0816_one_errors_build_at_a_time(kb, tmp_path, monkeypatch):
         def poll(self):
             return None
 
+        def wait(self, timeout=None):
+            import subprocess
+            raise subprocess.TimeoutExpired("errors_db.py", timeout)
+
     def spawn(self, force=False, dry_run=False):
         calls.append(1)
         _t.sleep(0.2)
@@ -1445,3 +1449,42 @@ def test_review7_0816_item_numbers_quoted_codes_overflow_and_a_locked_index(kb, 
     app2 = _app(tmp_path / "b", bad / "kb")
     e = app2.line_codes(["Error: ADS error 0x745 (1861)"], "line")[0]
     assert e["documented"] is None and "could not be read" in e["note"], e
+
+
+def test_review8_0816_locked_index_once_ending_build_and_two_codes(kb, tmp_path):
+    """Eighth review of 0.8.16: (7) a locked errors.db cost 2 s per line of an XAE result; (8) kb_rebuild asked for
+    approval, then the builder refused the lock; (9) right after a build released its lock, kb_rebuild said 'already
+    running'; (13) two codes of one domain got the second one's text alone."""
+    import sqlite3
+    import time as _t
+    app = _app(tmp_path, kb)
+    lines = [f"Error: ADS error 0x745 (1861) on 'Term {k} (EK1100)'" for k in range(10)]
+    db = L.index_file(kb, "errors")
+    con = sqlite3.connect(db)
+    con.execute("BEGIN EXCLUSIVE")
+    try:
+        t0 = _t.monotonic()
+        out = app.xae_messages([{"action": "ActivateConfiguration", "lines": lines}])
+        assert _t.monotonic() - t0 < 4.0 and len(out[0]["codes"]) == 10, _t.monotonic() - t0
+        assert out[0]["codes"][0]["documented"] is None and "locked" in out[0]["codes"][0]["note"]
+        r = app.spawn_errors_build(force=True, dry_run=True)
+        assert r["started"] is False and "locked" in r["error"] and "would_start" not in r, r
+    finally:
+        con.rollback()
+        con.close()
+
+    class Ending:
+        pid = 4243
+        done = False
+
+        def poll(self):
+            return 0 if self.done else None
+
+        def wait(self, timeout=None):
+            self.done = True
+            return 0
+    app.errors_build_proc = Ending()
+    r = app.spawn_errors_build(dry_run=True)
+    assert r.get("up_to_date") and "already_running" not in r, r
+    note = app.doc_note("ADS error 1861, then ADS error 1808")
+    assert "0x745" in note and "0x710" in note, note

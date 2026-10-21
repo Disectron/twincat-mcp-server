@@ -437,13 +437,39 @@ _QUESTION_ITEM = re.compile(r"(?<![\w^])(?:[A-Z][A-Za-z\-]+ \d+(?: ?\([A-Za-z][\
                             r"|[A-Za-z][\w\-]* \([A-Za-z]{1,4}\d{3,5}[\w.\-]{0,30}\))(?![\w])")
 
 
-def _is_subject(v: str) -> bool:
-    """A name an error can be of: a symbol path / identifier, an XAE tree path (parts joined by '^'), or a tree item
-    with its type ('Term 4 (EL2008)')."""
+# an XAE tree path starts at a root shortcut (TIID I/O devices, TIPC PLC, TINC NC, TIRC real-time, TIRT tasks …)
+_TREE_PATH = re.compile(r"TI[A-Z]{1,5}(?:\^[^\^\n<>{}=;]{1,120})+")
+# TwinCAT's own names for new tree items — a question's 'Term 4' / 'Box 2' / 'Axis 1' is an item even before an error
+# names it; any other '<Word> <n>' ('Port 851', 'TwinCAT 3', 'Build 4024') is one only when an error is of it
+_TREE_WORDS = frozenset("term box device drive axis module channel coupler slot task image".split())
+
+
+def _is_subject(v: str, quoted: bool = False) -> bool:
+    """A name an error can be of: a symbol path / identifier, an XAE tree path from its root ('TIID^Device 1
+    (EtherCAT)^Term 4 (EL2008)'), or — quoted in the error's text — a tree item with its type ('Term 4 (EL2008)').
+    Eighth review of 0.8.16: any argument shaped 'words (word)' ('Lemon (fast)', a snapshot's name) was an item."""
     v = v.strip()
     return bool(v) and len(v) <= 300 and "\n" not in v and (
-        bool(_ST_PATH.fullmatch(v)) or bool(_TREE_ITEM.fullmatch(v))
-        or ("^" in v and not v.startswith("^") and not re.search(r"[<>{}=;]", v)))
+        bool(_ST_PATH.fullmatch(v)) or bool(_TREE_PATH.fullmatch(v)) or (quoted and bool(_TREE_ITEM.fullmatch(v))))
+
+
+def _tree_segs(path: str) -> list[str]:
+    """A tree path's parts as compared: lower case, single spaces."""
+    return [re.sub(r"\s+", " ", x.strip().lower()) for x in path.split("^")]
+
+
+def _question_paths(query: str) -> list[tuple[str, int, int]]:
+    """The tree paths a question writes, from their root ('…TIID^Device 1 (EtherCAT)^Term 9 (EL2008) fail?' →
+    'TIID^Device 1 (EtherCAT)^Term 9 (EL2008)'), with their place in it."""
+    out = []
+    for m in re.finditer(r"(?<![\w^])TI[A-Z]{1,5}(?:\^[^\^\n]+)+", query):
+        parts = m.group(0).split("^")
+        last = parts[-1].lstrip()
+        t = _TREE_ITEM.match(last)
+        parts[-1] = t.group(0) if t else re.split(r"\s", last, maxsplit=1)[0].rstrip("?.,;:!'\"")
+        path = "^".join(parts)
+        out.append((path, m.start(), m.start() + len(path)))
+    return out
 
 
 def _tree_items(subjects: list[str], text: str = "") -> list[str]:
@@ -451,7 +477,10 @@ def _tree_items(subjects: list[str], text: str = "") -> list[str]:
     (EtherCAT)^Term 4 (EL2008)'), the typed items it quotes, and the '<Word> <number> (<type>)' items its text names."""
     out: list[str] = []
     for x in subjects:
-        out += [seg.strip() for seg in x.split("^") if _TREE_ITEM.fullmatch(seg.strip())]
+        if _TREE_PATH.fullmatch(x.strip()):
+            out += [seg.strip() for seg in x.split("^")[1:] if _TREE_ITEM.fullmatch(seg.strip())]
+        elif _TREE_ITEM.fullmatch(x.strip()):
+            out.append(x.strip())                   # quoted in the error's text
     out += _TEXT_ITEM.findall(text)
     return list(dict.fromkeys(out))
 
@@ -487,7 +516,7 @@ def _quoted_subjects(text: str) -> list[str]:
     # seventh review of 0.8.16: an apostrophe inside a word opens no quote ("Couldn't create 'TIID^…'", "the object's
     # child 'FB_Dosing'" quoted nothing)
     return [m.strip() for m in re.findall(r"(?<!\w)['\"`‘“]([^'\"`’”\n]{1,200})['\"`’”](?!\w)", text)
-            if _is_subject(m)]
+            if _is_subject(m, quoted=True)]
 
 
 def _xae_lines(res: Any, depth: int = 0) -> list[str]:
@@ -816,8 +845,24 @@ class App:
         -> {'would_start': True} or why not (N96). One at a time: review of 0.8.16 — two callers at once (an err_lookup
         and the first build's wait) both found no build running and both started one; the second failed on the lock
         and its caller was told started=True."""
+        import subprocess
+        from . import errors_index as X
+        from . import kb_layout as L
+        from . import kb_lock
         with self._errors_spawn_lock:
             p = getattr(self, "errors_build_proc", None)
+            loc = self.kb.location()[0]
+            if p is not None and p.poll() is None and loc is not None and \
+                    not kb_lock.held(X.side_files(L.index_file(loc, "errors"))[1]):
+                # eighth review of 0.8.16: the build releases its lock before its process exits — in that moment
+                # kb_status said complete and kb_rebuild 'already running'. A builder without its lock is starting
+                # (the index is not complete yet: running) or ending (complete: its exit is waited for)
+                st = self.kb.errors_state()
+                if st["state"] == "complete" and not st.get("rebuild"):
+                    try:
+                        p.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        pass
             if p is not None and p.poll() is None:
                 return {"started": False, "already_running": {"pid": p.pid},
                         "message": "an errors-index build this server started is still running (kb_status shows it)"}
@@ -835,6 +880,9 @@ class App:
         st = self.kb.errors_state()
         if (st.get("rebuild") or {}).get("state") == "running":
             return {"started": False, "already_running": st["rebuild"], "message": st["message"]}
+        if st.get("locked"):
+            # eighth review of 0.8.16: asked for approval, then the builder refused — a lock is said before asking
+            return {"started": False, "error": st["message"]}
         if st["state"] == "complete" and not force and not st.get("rebuild"):
             return {"started": False, "up_to_date": True, "message": st["message"]}
         final = L.index_file(loc, "errors")
@@ -858,7 +906,8 @@ class App:
             return {"started": False, "error": why}
         if dry_run:
             return {"would_start": True}
-        cmd = [sys.executable, str(b / "errors_db.py"), "update", "--kb", str(loc)] + \
+        # -u: the build log is written as the builder goes (its counts were in the log only once it exited)
+        cmd = [sys.executable, "-u", str(b / "errors_db.py"), "update", "--kb", str(loc)] + \
             (["--infosys-db", str(infosys)] if infosys else []) + (["--force"] if force else [])
         logs = Path(self.cfg.safety.audit_log).parent / "logs"
         logs.mkdir(parents=True, exist_ok=True)
@@ -975,7 +1024,7 @@ class App:
     ERROR_LIST_TIMEOUT_S = 15.0            # reading the XAE Error List for err_lookup (never queued behind a build)
     # 'the last error', 'the previous ADS error', 'the latest XAE message', 'the last ADS-error' — the words must say it;
     # the words between ('ADS', 'XAE', 'win32') choose the kind (_question)
-    _LAST_SAID = re.compile(r"\b(?:last|latest|previous|newest|most\s+recent)[\s-]+(?P<q>(?:[\w.\[\]^]+[\s-]+){0,2}?)"
+    _LAST_SAID = re.compile(r"\b(?:last|latest|previous|newest|most\s+recent)[\s-]+(?P<q>(?:[\w.\[\]^()]+[\s-]+){0,3}?)"
                             r"(?:error|errors|failure|failures|fault|faults|message|messages)\b", re.I)
     # a name in a question: a path (MAIN.fbValve.bOpen, MAIN.aValves[3].bOpen, pValve^.bOpen), an indexed name
     # (aValves[3]), or a name with '_', an inner capital or letters and digits (fbValve, FB_Dosing, Plc1)
@@ -1008,9 +1057,16 @@ class App:
         fams: set[str] = set()
         doms: set[str] = set()
         unused: list[str] = []
+        count = 1
+        q_items: list[str] = []
         if m:
             low_names = {n.lower() for n in names}
-            words = [w for w in re.split(r"[\s-]+", m.group("q")) if w]
+            # eighth review of 0.8.16: 'the last Term 5 error' lost its item; 'the last 3 errors' gave one
+            q_items = _QUESTION_ITEM.findall(m.group("q"))
+            item_words = {w.lower() for x in q_items for w in re.findall(r"[\w\-]+", x)}
+            nums = [int(w) for w in re.findall(r"\d+", m.group("q")) if not any(w in x for x in q_items)]
+            count = max(1, min(nums[0], 10)) if nums else 1
+            words = [w for w in re.split(r"[\s-]+", m.group("q")) if w and w.strip("()").lower() not in item_words]
 
             def kind(w: str) -> bool:
                 return w.lower() in _ERROR_SOURCES or bool(X.named_domains(w))
@@ -1021,15 +1077,39 @@ class App:
             kinds = {w.lower() for w in words if w.lower() in fams or w.lower() in dom_words}
             unused = [w for w in words if w.lower() not in kinds and not w.isdigit()]   # 'the last 3 errors': a count
             names = [n for n in names if n.lower() not in kinds]
-        rest = query if m is None else query[:m.start()] + " " + query[m.end():]
-        items = list(dict.fromkeys(_QUESTION_ITEM.findall(rest)))
-        # the type of a tree item the question names is part of that name ('Term 4 (EL2008)'), not a name of its own
-        types = {t.group(2).lower() for x in items for t in [_TREE_ITEM.search(x)] if t}
-        names = [n for n in names if n.lower() not in types]
-        return {"names": names, "items": items, "qn": re.sub(r"\s+", " ", query.lower()), "last": m is not None,
+        paths = _question_paths(query)
+        rest = query
+        for _p, a, b in sorted(paths, key=lambda x: -x[1]):
+            rest = rest[:a] + " " + rest[b:]            # a path's parts are compared as the path, not one by one
+        if m is not None:
+            rest = rest.replace(m.group(0), " ")
+        items = list(dict.fromkeys(q_items + [x for x in _QUESTION_ITEM.findall(rest)
+                                              if "(" in x or x.split()[0].lower() in _TREE_WORDS]))
+        # the type of a tree item the question names is part of that name ('Term 4 (EL2008)', 'Drive 3
+        # (AX5206-0000-0200)'), not a name of its own; a path's parts neither
+        types = {t.group(2).lower() for x in items + [seg for pth, _a, _b in paths for seg in pth.split("^")]
+                 for t in [_TREE_ITEM.search(x)] if t}
+        names = [n for n in names if not any(n.lower() in t for t in types)
+                 and not any(n.lower() in pth.lower() for pth, _a, _b in paths)]
+        return {"names": names, "items": items, "paths": [pth for pth, _a, _b in paths],
+                "qn": re.sub(r"\s+", " ", (rest + " " + " ".join(q_items)).lower()), "last": m is not None,
+                "count": count,
                 "fams": fams, "doms": doms, "unused": unused}
 
-    def _code_entry(self, text: str, loc: Any) -> dict[str, Any] | None:
+    def _errors_unusable(self, loc: Any) -> str | None:
+        """Why the errors index cannot be read now (locked by another program, damaged) — one read; None when it reads
+        or does not exist. Eighth review of 0.8.16: a locked file cost 2 s per line of an XAE result."""
+        from . import errors_index as X
+        from . import kb_layout as L
+        if loc is None:
+            return None
+        db = L.index_file(loc, "errors")
+        if not db.is_file():
+            return None
+        meta, why = X.read_meta_checked(db)
+        return None if meta else (why or "it could not be read")
+
+    def _code_entry(self, text: str, loc: Any, unusable: str | None = None) -> dict[str, Any] | None:
         """The code a text names, looked up (err_lookup's rules, at most 3 matches with 'more' and every domain said):
         None when it names none — a number read as a code, a message id, or a name the errors index knows as a code's
         (an identifier is no code: 'ads_connect'). documented: None without a readable errors index (why: note)."""
@@ -1037,6 +1117,11 @@ class App:
         read = X.read_query(text)
         if not (read["codes"] or read["names"] or read["caps"] or read["ids"]):
             return None
+        if unusable:
+            if not (read["codes"] or read["ids"]):
+                return None
+            return {"read_as": [c["token"] for c in read["codes"]] + [i["token"] for i in read["ids"]],
+                    "documented": None, "matches": [], "note": f"the errors index cannot be read: {unusable}"[:300]}
         try:
             r = X.err_lookup(text, kb=loc, limit=3, fulltext=False)
         except X.ErrError as exc:
@@ -1074,57 +1159,77 @@ class App:
           the newest error (record) of the kind asked — its texts that name a code, else its error (no code). Seventh
           review of 0.8.16: 'the last error' was the newest error that named a code, an older one past a newer one.
         Each code read from the text and looked up, never a word of it."""
+        from . import errors_index as X
         loc = self.kb.location()[0]
+        unusable = self._errors_unusable(loc)
         names = [(n, _segments(n)) for n in (q["names"] if by_names else [])]
         last = q["last"] and ordered
         fams, doms = q["fams"], q["doms"]
+        qpaths = [_tree_segs(x) for x in q.get("paths") or []]
 
         def item_hits(t: dict[str, Any]) -> list[str]:
-            return [x for x in t.get("items") or [] if _item_in(x, q["qn"])] if by_names else []
+            if not by_names:
+                return []
+            hits = [x for x in t.get("items") or [] if _item_in(x, q["qn"])]
+            for qp in qpaths:
+                # eighth review of 0.8.16: a path is compared as a path — the question's path, or an item inside it, is
+                # the error's ('…^Term 9 (EL2008)' is not Term 4 of the same device, nor the device itself)
+                for x in t["subjects"]:
+                    if _TREE_PATH.fullmatch(x) and _tree_segs(x)[:len(qp)] == qp:
+                        hits.append(x)
+                hits += [x for x in t.get("items") or [] if _tree_segs(x) == qp[-1:]
+                         and not any(_TREE_PATH.fullmatch(s) for s in t["subjects"])]
+            return list(dict.fromkeys(hits))
 
         def kind_ok(t: dict[str, Any], c: dict[str, Any] | None) -> bool:
             if not (fams or doms):
                 return True
+            # eighth review of 0.8.16: a compiler message id has no documented row — its domain is the id's
             return (t["tool"].split("_", 1)[0] in fams or ("xae" in fams and bool(t.get("xae")))
-                    or any(x.get("domain") in doms for x in (c or {}).get("matches") or []))
+                    or any(x.get("domain") in doms for x in (c or {}).get("matches") or [])
+                    or any(i["domain"] in doms for i in X.read_query(t["text"])["ids"]))
 
         def entry(t: dict[str, Any], c: dict[str, Any] | None, how: dict[str, Any]) -> dict[str, Any]:
             return {"source": source, "where": t["where"], "text": t["text"][:600], **(c or self._NO_CODE), **how}
         out: list[dict[str, Any]] = []
-        named = names or (by_names and (q["items"] or any(item_hits(t) for t in texts[:400])))
+        named = names or (by_names and (q["items"] or qpaths or any(item_hits(t) for t in texts[:400])))
         if named:
             for t in texts[:400]:
                 hits = [n for n, segs in names if any(_names_in(segs, _segments(x)) for x in t["subjects"])]
                 hits += [x for x in item_hits(t) if x not in hits]
                 if not hits:
                     continue
-                c = self._code_entry(t["text"], loc)
+                c = self._code_entry(t["text"], loc, unusable)
                 if not kind_ok(t, c):
                     continue
                 out.append(entry(t, c, {"names": hits}))
-                if last or len(out) >= self.ERR_LOG_PICK:
+                if (last and len({e["where"] for e in out}) >= q.get("count", 1)) or len(out) >= self.ERR_LOG_PICK:
                     break
             return out
         if not last:
             return out
         recs = list(dict.fromkeys(t["rec"] for t in texts))
+        taken = 0
         for rec in recs:
-            mine = [(t, self._code_entry(t["text"], loc)) for t in texts if t["rec"] == rec]
+            mine = [(t, self._code_entry(t["text"], loc, unusable)) for t in texts if t["rec"] == rec]
             if not any(kind_ok(t, c) for t, c in mine):
                 continue
             coded = [(t, c) for t, c in mine if c is not None and kind_ok(t, c)]
-            if coded:
-                return [entry(t, c, {"newest": True}) for t, c in coded[:self.ERR_LOG_PICK]]
-            return [entry(mine[0][0], None, {"newest": True})]
+            out += ([entry(t, c, {"newest": True}) for t, c in coded[:self.ERR_LOG_PICK]] if coded
+                    else [entry(mine[0][0], None, {"newest": True})])
+            taken += 1
+            if taken >= q.get("count", 1):          # 'the last 3 errors': the three newest records
+                break
         return out
 
     # tools whose results report stored state (a run of last week, a recording's blocks, the Windows event log, a
     # dialog's late result): an 'error' in them is history, not this call's — seventh review of 0.8.16: exp_runs'
     # week-old error became 'the last error'. What such a tool raises is still recorded.
-    _STORED_STATE_TOOLS = frozenset("""ads_status exp_get exp_list exp_report exp_runs exp_status rec_list rec_status
-        rec_read rec_stats rec_compare rec_verify rec_snapshot rec_profile_get rec_profile_list scope_list scope_status
-        snap_list snap_compare tcunit_results xae_status xae_dialogs xae_diagnostics ipc_eventlog ipc_read_file
-        ipc_list_dir""".split())
+    # Eighth review of 0.8.16: a status read (ads_status, rec_status, xae_status) reports THIS call's errors — only
+    # records of the past and listings are left out; a status polled with the same error is one record (note_error).
+    _STORED_STATE_TOOLS = frozenset("""exp_get exp_list exp_report exp_runs rec_list rec_read rec_stats rec_compare
+        rec_verify rec_profile_get rec_profile_list scope_list snap_list tcunit_results xae_dialogs ipc_eventlog
+        ipc_read_file ipc_list_dir""".split())
 
     def _error_texts(self) -> list[dict[str, Any]]:
         """Every error this server recorded, newest first, each kind in its place: the error a tool raised, the XAE
@@ -1178,8 +1283,8 @@ class App:
         match no error). None when the question names nothing and does not ask about the last error."""
         q = self._question(query)
         texts = self._error_texts()
-        said = q["names"] + q["items"] + [x for t in texts for x in t["items"] if _item_in(x, q["qn"])
-                                          and x not in q["items"]]
+        said = q["names"] + q["items"] + q["paths"] + [x for t in texts for x in t["items"] if _item_in(x, q["qn"])
+                                                        and x not in q["items"]]
         if not said and not q["last"]:
             return None
         entries = await asyncio.to_thread(self._err_log_entries, q, texts, "recent errors of this server")
@@ -1223,6 +1328,15 @@ class App:
     COM_NAMES = frozenset("E_FAIL E_POINTER E_INVALIDARG E_NOTIMPL E_NOINTERFACE E_UNEXPECTED E_ACCESSDENIED "
                           "E_OUTOFMEMORY E_ABORT E_HANDLE E_PENDING S_OK S_FALSE".split())
 
+    @staticmethod
+    def _id_said(token: str, text: str) -> bool:
+        """A message id the text says is one: alone, or next to error / warning / compiler / build ('error C0046:',
+        'C0046 error') — 'machine C0815' is a name."""
+        t = re.escape(token)
+        return text.strip() == token or bool(re.search(
+            rf"\b(?:error|warning|compiler|compile|build|message|meldung|fehler)\W{{0,3}}{t}\b|\b{t}\W{{0,3}}"
+            r"(?:error|warning)\b", text, re.I))
+
     @classmethod
     def online_terms(cls, query: str, res: dict[str, Any] | None = None) -> str:
         """What an online search is sent: the codes err_lookup read (in the question's notation) and the codes of the
@@ -1233,19 +1347,16 @@ class App:
         customer's name to the search engine. A term the search engine reads as an operator is quoted ('-6908')."""
         res = res or {}
         terms = [c["token"] for c in res.get("read_as") or []]
-        for m in res.get("message_ids") or []:
-            t = re.escape(m["token"])
-            if query.strip() == m["token"] or re.search(
-                    rf"\b(?:error|warning|compiler|compile|build|message|meldung|fehler)\W{{0,3}}{t}\b|\b{t}\W{{0,3}}"
-                    r"(?:error|warning)\b", query, re.I):
-                terms.append(m["token"])
+        terms += [m["token"] for m in res.get("message_ids") or [] if cls._id_said(m["token"], query)]
         terms += list(res.get("code_names") or [])
         terms += [t for t in re.findall(r"\b[A-Z][A-Z_]+\b", query) if t in cls.COM_NAMES]
         for e in (res.get("from_error_log") or {}).get("entries") or []:
-            # a code of the log is a number, a documented symbol or a message id the log's text named — not a name
+            # a code of the log is a number, a documented symbol or a message id its text says is one (eighth review of
+            # 0.8.16: 'at AcmeFoods C0815' in a logged text went online) — not a name
             terms += [t for t in e.get("read_as") or []
-                      if re.fullmatch(r"(?:0[xX]|16#|#[xX])[0-9A-Fa-f_]+|-?\d+|[A-Za-z]\d{4}", t)
-                      or any(t == x.get("symbol") for x in e.get("matches") or [])]
+                      if re.fullmatch(r"(?:0[xX]|16#|#[xX])[0-9A-Fa-f_]+|-?\d+", t)
+                      or any(t == x.get("symbol") for x in e.get("matches") or [])
+                      or (re.fullmatch(r"[A-Za-z]\d{4}", t) and cls._id_said(t, str(e.get("text") or "")))]
         return " ".join(f'"{t}"' if t[:1] in "-+~" else t for t in dict.fromkeys(terms))
 
     async def err_online(self, query: str, res: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1309,28 +1420,36 @@ class App:
         said = words(msg)
         # the message says it already (one of the domains' symbol or text) — re-review of 0.8.16: compared as words,
         # 'ADSError: symbol not found (1808)' got 'Symbol not found.' appended
-        if any((r.get("symbol") and words(r["symbol"]) in said) or (r.get("text") and words(r["text"]).strip()
-                                                                      and words(r["text"]) in said) for r in rows):
+        def told(r: dict[str, Any]) -> bool:
+            return bool((r.get("symbol") and words(r["symbol"]) in said)
+                        or (r.get("text") and words(r["text"]).strip() and words(r["text"]) in said))
+        if len(rows) == 1 and told(rows[0]) or all(told(r) for r in rows):
             return msg
+        rows = [r for r in rows if not told(r)]      # a second code of the message is annotated all the same
         if len(found["domains"]) > 1:
             # review of 0.8.16 (user decision): a code of several domains the message does not name is not annotated
             # with one of them — 'CreateFile failed: error 6' got ADS's 0x6 although it is Win32's (spec §6: never pick
             # a domain silently); a message that names its domain ('ADS error 6') has that one only
             return msg
-        r = rows[0]
-        if not (r.get("text") or r.get("symbol")):
+        # eighth review of 0.8.16: 'ADS error 1861, then ADS error 1808' got 1808's text alone, as if the message's
+        # meaning — every code it names (of the one domain), each with its own text
+        uniq = list({(r["domain"], r.get("value"), r.get("hex")): r for r in rows}.values())
+        parts = [f"{r['domain']} {r['hex']}" + (f" {r['symbol']}" if r.get("symbol") else "")
+                 + f": {r.get('text') or ''}" + (f" ({r['ref']})" if r.get("ref") else "")
+                 for r in uniq if r.get("text") or r.get("symbol")]
+        if not parts:
             return msg                     # an ESI text id worded differently per device: no one meaning to append
-        return (f"{msg} [documented: {r['domain']} {r['hex']}" + (f" {r['symbol']}" if r.get("symbol") else "")
-                + f": {r.get('text') or ''}" + (f" ({r['ref']})" if r.get("ref") else "") + "]")
+        return f"{msg} [documented: " + "; ".join(parts) + "]"
 
-    def line_codes(self, lines: list[str], key: str) -> list[dict[str, Any]]:
+    def line_codes(self, lines: list[str], key: str, unusable: str | None = None) -> list[dict[str, Any]]:
         """N125: the codes message lines name (0xA2, HRESULTs, ADS error 1861, C0xxx) looked up in the errors index —
         documented (domain, symbol, text, ref) or documented=false; an entry per line that names a code, {key: index}
-        (_code_entry)."""
+        (_code_entry). The index is checked once for all lines (unusable: already checked)."""
         loc = self.kb.location()[0]
+        unusable = unusable or (self._errors_unusable(loc) if lines else None)
         codes = []
         for i, e in enumerate(lines):
-            c = self._code_entry(e, loc)
+            c = self._code_entry(e, loc, unusable)
             if c is not None:
                 codes.append({key: i, **c})
         return codes
@@ -1346,9 +1465,13 @@ class App:
         """What the System Manager logged during the call's actions (ITcSysManager2::GetLastErrorMessages), with the
         codes its lines name looked up (line_codes) — Beckhoff's messages, labelled as such."""
         out = []
+        try:
+            unusable = self._errors_unusable(self.kb.location()[0]) if any(r.get("lines") for r in recs) else None
+        except Exception:  # noqa: BLE001 — the lines come through whatever the index does
+            unusable = None
         for r in recs:
             try:
-                codes = self.line_codes(r.get("lines") or [], "line")
+                codes = self.line_codes(r.get("lines") or [], "line", unusable)
             except Exception as exc:  # noqa: BLE001 — sixth review of 0.8.16: an annotation of an action that ran must
                 # never make it look failed (a repeated activation): the messages come through, the lookup's failure said
                 out.append({**r, "codes_error": f"the codes were not looked up: {type(exc).__name__}: {str(exc)[:200]}"})
@@ -2821,6 +2944,11 @@ def _result_errors(res: Any, depth: int = 0, out: list[tuple[str | None, str]] |
                 break
             if k == "error" and isinstance(v, str) and v:
                 out.append((own or None, (f"{own}: " if own and own not in v else "") + v[:500]))
+            elif (k == "description" and isinstance(v, str) and v and str(res.get("level") or "").lower() == "error"):
+                # eighth review of 0.8.16: a failed build's Error List items (C0046 …) are errors of this call
+                from pathlib import PureWindowsPath
+                f = PureWindowsPath(str(res.get("file") or "")).stem
+                out.append((f or own or None, v[:500]))
             elif k in _VALUE_KEYS or k == "xae_messages":
                 continue
             elif "." in k and _ST_PATH.fullmatch(k):

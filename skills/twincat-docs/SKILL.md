@@ -52,11 +52,12 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
    (`AL status 0x0011`), a code's symbol also in capitals (`WSAETIMEDOUT`), and `C0373` is read as a compiler message.
    The server's err_lookup tool adds, for a question without a code, `from_error_log`: the errors it saw that are of
    a name of the question (a variable `MAIN.fbValve.bOpen` / `fbValve` / `aValves[3]`, a POU, a PLC project, an XAE
-   tree item `Term 4 (EL2008)` / `Term 4` — compared with the names the call was made with, the names the error quotes
-   and the tree items it names; `aValves[5]` is not `aValves[3]`, `Term 41` is not `Term 4`, the type `EL2008` alone
-   names no item),
+   tree item `Term 4 (EL2008)` / `Term 4` / its path `TIID^Device 1 (EtherCAT)^Term 4 (EL2008)` (a path is compared
+   as a path) — compared with the names the call was made with, the names the error quotes and the tree items it
+   names; `aValves[5]` is not `aValves[3]`, `Term 41` is not `Term 4`, the type `EL2008` alone names no item),
    then the XAE Error List for those names; or the newest error when the question says "the last / previous error"
-   ("the last ADS error": of that kind; an error without a code is said so; `names_not_found` when no error is of its
+   ("the last ADS error", "the last compiler error": of that kind; "the last 3 errors": three; an error without a
+   code is said so; a failed build's errors count; `names_not_found` when no error is of its
    names) — no word of an error is matched. With `online=true` the code the error log found is searched too. `online=true` adds `online`: a site search of infosys.beckhoff.com for the
    question's codes and documented code names only (never its words, project, machine or customer names) — only when
    asked, and pages that mention the code, not a meaning. This command is offline. A number of several domains is

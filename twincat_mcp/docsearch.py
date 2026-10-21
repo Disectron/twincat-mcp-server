@@ -510,12 +510,17 @@ def _next_to_code_word(q: str, start: int, end: int) -> bool:
     right before or after it says it is a code ('error 1861', 'nErrId = 1861', '1861 error')."""
     if re.search(r"[\w-]$", q[:start]) or re.match(r"[\w-]", q[end:]):
         return False
-    # 'nErrId := 1861' (ST's ' := '); seventh review of 0.8.16: a quoted code too ("AL Status Code: '0x001b'")
-    before = re.search(r"([^\W\d_]+)[\s:=#('\"‘“]{1,6}$", q[:start])
+    # 'nErrId := 1861' (ST's ' := '); seventh review of 0.8.16: a quoted code too ("AL Status Code: '0x001b'"); eighth
+    # review: after a dash, a semicolon or a comma too ('error - 1861', 'error – 0x4260', 'error; 1861')
+    before = re.search(r"([^\W\d_]+)[\s:=#('\"‘“\-–—;,]{1,6}$", q[:start])
     # seventh review of 0.8.16: 'Task 1: ADSError 1861', 'Drive 2: error 1861', 'MAIN.TcPOU(34): error C0046', 'Port
     # 851: error 1808' read the item / line number as the code — a code word after the number counts only with a space
     # between ('1861 error'), and only when it does not name a code of its own ('Task 1 error 1861': it is 1861's)
     after = re.match(r"[ \t]{1,3}([^\W\d_]+)(\(s\))?", q[end:])
+    # eighth review of 0.8.16: 'Term 4 error', 'Box 2 error', 'Drive 2 error, code 1861' read the item's number as the
+    # code — a number right after a word is that word's number (an item, a line, a port), never a code named after it
+    if after is not None and re.search(r"[^\W\d_][\w.\-]*[ \t]+$", q[:start]):
+        after = None
     if after is not None and re.match(r"[\s:=#('\"‘“]{0,6}(?:0[xX][0-9a-fA-F]|16#[0-9a-fA-F]|#[xX][0-9a-fA-F]|-?\d|[A-Za-z]\d{3,})",
                                       q[end + after.end():]):
         after = None
