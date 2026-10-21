@@ -1848,7 +1848,7 @@ async def test_review12_0816_a_busy_step_after_an_earlier_action_is_no_repeat_it
     from twincat_mcp.server import App, ToolError, _tool_boundary
     app = App(mk_cfg(tmp_path))
     app.dialogs_now = lambda: []
-    app._dialog_hint = lambda: ""
+    app._dialog_hint = lambda retry=True: ""
 
     def generate():
         app.xae.acted.append("GenerateBootProject")
