@@ -878,3 +878,73 @@ async def test_review13_0816_rec_delete_with_stop_refused_names_scope_record(mon
     assert sc["stop"]["not_run"] and "scope_record(action='stop') stops Scope once XAE is free" in sc["note"], sc
     assert "rec_stop asks again" not in sc["note"] and r["id"] not in app.scope_runs, sc
     assert "save" not in fake_xae.calls, fake_xae.calls
+
+
+# ---- fourteenth review of 0.8.16: an error of the status call is no end of the recording -----------------------------
+
+@pytest.mark.anyio
+async def test_review14_0816_a_failed_status_call_does_not_stop_scope(monkeypatch, project_dir, fake_xae):
+    """One status call of the watch fails while the recording runs: Scope records on; rec_stop finishes it as its own."""
+    import threading as _th
+    from twincat_mcp import recorder as R
+    install(monkeypatch)
+    orig = R.Recorder.status
+    arm = {"on": False, "hit": False}
+
+    def status(self, rid):
+        if arm["on"] and _th.current_thread().name != "MainThread":
+            arm["on"], arm["hit"] = False, True
+            raise RuntimeError("dictionary changed size during iteration")
+        return orig(self, rid)
+    monkeypatch.setattr(R.Recorder, "status", status)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        arm["on"] = True
+        for _ in range(40):
+            if arm["hit"]:
+                break
+            await _anyio12.sleep(0.1)
+        await _anyio12.sleep(1.5)                          # several watch periods after the failed call
+        st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    assert arm["hit"] and st["active"] and st["scope"]["state"] == "recording", st
+    assert fake_xae.recording is False and out["scope"]["finished_by"] == "rec_stop", out["scope"]
+    assert "recording_ended" not in app.scope_results[r["id"]], app.scope_results[r["id"]]
+
+
+@pytest.mark.anyio
+async def test_review14_0816_a_rec_start_during_a_slow_reap_does_not_stop_scope(monkeypatch, project_dir, fake_xae):
+    """The recorder's own race: a recording that ended by itself is reaped slowly (a slow ADS close) while a rec_start
+    adds another recording — the reap loop failed every status call, and the watch stopped Scope of a running one."""
+    import threading as _th
+    from tests import fake_ads as FA
+    fc = install(monkeypatch)
+    slow = {"armed": False, "in": _th.Event()}
+    orig_close = fc.close
+
+    def close(self):
+        if slow["armed"] and not _th.current_thread().name.startswith("rec-poll"):
+            slow["armed"] = False
+            slow["in"].set()
+            _t12.sleep(1.5)                                # a slow ADS close (router busy, target gone)
+        return orig_close(self)
+    monkeypatch.setattr(FA.FakeConnection, "close", close)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "poll", "cycle_ms": 50,
+                                                "max_events": 3, "also_scope": False}))
+        b = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        slow["armed"] = True
+        for _ in range(100):
+            if slow["in"].is_set():
+                break
+            await _anyio12.sleep(0.05)
+        c = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": False}))
+        await _anyio12.sleep(2.5)
+        st = payload(await s.call_tool("rec_status", {"id": b["id"]}))
+        await s.call_tool("rec_stop", {"id": b["id"]})
+        await s.call_tool("rec_stop", {"id": c["id"]})
+    assert slow["in"].is_set(), "the slow close was never reached"
+    assert st["active"] and st["scope"]["state"] == "recording", st

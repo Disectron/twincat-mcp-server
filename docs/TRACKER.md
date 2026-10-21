@@ -99,6 +99,19 @@ tool wishlist (2026-10-18).
   the error index and `err_lookup` (N125), the 0.8.15 retest's documentation items N177, N183, N184, typo-near
   symbols, manual kinds in `hw_lookup` — built and reviewed eleven rounds on branch `feat/0.8.16-errors-index`
   (Infosys format 8 there); the docs direct-access spec.
+  Known LOW findings of the fourteenth review, left for 0.8.17 (Ryan, 2026-10-21: no more review rounds for 0.8.16;
+  an in-depth adversarial review after 0.8.17, its stopping rules to be set before it starts): `rec_stop` /
+  `rec_delete` with Scope no longer carry `solution_mismatch` / `reattached` (the Scope part runs in its own task);
+  SaveSVD refused as busy right after StopRecord ran says "repeat it" though `rec_stop` returns the stored result;
+  the dialog hint's "retry in a few seconds" follows a busy text that withholds "repeat it"; a StopRecord refused
+  before it ran other than as busy (a dialog holding XAE, the worker busy) is final — Scope records on while
+  `rec_status` says finished; `rec_delete` cancelled after the stop but before the file went saves Scope for the
+  deleted recording, and one cancelled during the stop says "ended by itself (the recorder no longer knows …)"; a
+  late waiter of a refused finish can store its result over the retry's (store only when `scope_finishing.get(rid)
+  is t`); `scope_record(save)` with the export tool installed and the CSV present still advises `overwrite=true`
+  (scope.py's text); StartRecord blocked by a dialog or timed out is said "NOT started" while still pending, and
+  "Scope did not stop" after a StopRecord timeout is not checked. Proposed for 0.8.17: one owner per recording's
+  Scope part (a task that takes stop / delete / ended events in order) instead of the shared tables.
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
   Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
   trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library

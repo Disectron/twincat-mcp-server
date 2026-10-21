@@ -1457,3 +1457,25 @@ def test_n111_a_counter_the_program_resets_is_not_called_a_twincat_restart(rec):
     # the task's own counter: going back is a restart, repeating is a stopped task
     v2 = rec.verify(st["id"], counter=CC)
     assert v2["counter"]["lossless"] and "reset_note" not in v2["counter"]
+
+
+def test_review14_0816_reap_survives_a_recording_added_meanwhile(rec):
+    """Fourteenth review of 0.8.16: reap looped over the live dict — a native recording's reap waits for its process
+    and hashes its file (seconds); a rec_start on another thread meanwhile made every status call fail."""
+    class _Native:
+        engine = "native"
+
+        def __init__(self, added=None):
+            self.added = added
+            self.reaped = False
+
+        def reap(self):
+            self.reaped = True
+            if self.added is not None:
+                rec.recs["20261021-000002-bbbb"] = self.added      # what rec_start does from another thread
+
+    later = _Native()
+    first = _Native(added=later)
+    rec.recs["20261021-000001-aaaa"] = first
+    rec.reap()
+    assert first.reaped and "20261021-000002-bbbb" in rec.recs

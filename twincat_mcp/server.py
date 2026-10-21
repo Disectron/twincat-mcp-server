@@ -3278,13 +3278,22 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """N182 (0.8.15 retest): a recording that ends by itself — duration_s, stop_when, post_trigger_s, max_events, a
         program change, a stall — finishes its Scope run as rec_stop does. Scope ran on until a rec_stop came: the CSV
         of a 5 s recording spanned 28 s, and without a rec_stop it never stopped."""
+        failed = False
         while rid in app.scope_runs and rid not in app.scope_finishing:
             try:
                 st = await app.mem_call(app.rec.status, rid)
             except Exception as exc:  # noqa: BLE001
                 if rid in app.scope_stop_asked:
                     return                             # rec_delete / rec_stop has its Scope part
-                # thirteenth review of 0.8.16: the recorder no longer knows it — Scope is not left recording
+                if rid in app.rec.recs:
+                    # fourteenth review of 0.8.16: an error of the status call is no end of the recording — a
+                    # passing one stopped Scope of a recording that ran on, its link saying it had ended
+                    if not failed:
+                        log.warning("Scope watch of %s: the recording's status failed (%s) — watched on", rid, exc)
+                        failed = True
+                    await asyncio.sleep(SCOPE_WATCH_S)
+                    continue
+                # thirteenth review of 0.8.16: the recorder no longer holds it — Scope is not left recording
                 st = {"active": False, "stop_reason": f"the recorder no longer knows the recording ({exc})"}
             if not st.get("active"):
                 if rid in app.scope_stop_asked:
@@ -3365,8 +3374,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         watched as before (its end says who ended it); one that has stopped is finished now."""
         try:
             st = await app.mem_call(app.rec.status, rid)
-        except Exception:  # noqa: BLE001 — the recording is gone: the call's own doing
-            st = {"active": False}
+        except Exception:  # noqa: BLE001 — gone (the call's own doing) only when the recorder no longer holds it
+            st = {"active": rid in app.rec.recs}
         if st.get("active"):
             await _scope_watch(rid)
             return

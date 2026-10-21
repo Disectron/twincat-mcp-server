@@ -2627,8 +2627,11 @@ class Recorder:
                     pass
 
     def reap(self) -> None:
-        """Release ADS handles of recordings that ended on their own (limits/stop_when)."""
-        for rec in self.recs.values():
+        """Release ADS handles of recordings that ended on their own (limits/stop_when). Fourteenth review of 0.8.16:
+        over a copy — a native recording's reap waits for its process and hashes its file (seconds), and a rec_start
+        or rec_delete on another thread meanwhile made every status call fail ('dictionary changed size during
+        iteration')."""
+        for rec in list(self.recs.values()):
             if getattr(rec, "engine", "python") == "native":
                 rec.reap()
             elif not rec.active and rec.conn is not None:
@@ -2638,7 +2641,7 @@ class Recorder:
     def _get(self, rid: str) -> Recording:
         rec = self.recs.get(rid)
         if rec is None:
-            cands = [r for k, r in self.recs.items() if k.startswith(rid)]
+            cands = [r for k, r in list(self.recs.items()) if k.startswith(rid)]
             if len(cands) == 1:
                 return cands[0]
             raise RecorderError(f"recording {rid!r} unknown in this session (rec_list shows files on disk)")
@@ -2648,7 +2651,7 @@ class Recorder:
         self.reap()
         live = []
         # D21: the session list is paged like the files (newest first); session_total says how many there are
-        recs = sorted(self.recs.values(), key=lambda r: getattr(r, "id", ""), reverse=True)
+        recs = sorted(list(self.recs.values()), key=lambda r: getattr(r, "id", ""), reverse=True)
         for r in recs[offset:offset + limit]:
             s = r.status()
             live.append({k: s[k] for k in ("id", "name", "active", "mode", "symbols", "events", "samples", "missing_samples",
