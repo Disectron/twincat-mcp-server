@@ -170,6 +170,12 @@ _BUSY_HR = (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER)
 _GONE_HR = (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE)
 
 
+class XaeActedUnknown(XaeExplained):
+    """An action the shell may have run: it went away during the call, or failed after acting (E_POINTER from TwinCAT's
+    managed code). Never repeated — and never reported as 'did not run' (review 1 of 0.8.18: a StartRecord of unknown
+    outcome was said 'NOT started', and Scope recorded with nothing to stop it)."""
+
+
 class _ActedUnconfirmed(XaeExplained):
     """A PLC online command was accepted but its state was not read back: it may have acted — never retried elsewhere."""
 
@@ -283,7 +289,7 @@ class XaeBackend:
                             self.dte = self.sysman = None
                         finally:
                             self._reattaching = False
-                    raise XaeExplained(
+                    raise XaeActedUnknown(
                         f"{what}: the XAE shell went away during the call (closed or crashed, 0x{hr & 0xFFFFFFFF:08X}) — "
                         f"whether it acted is unknown, so it is not repeated ({where}). Check xae_status / ads_status "
                         "before you run it again.") from exc
@@ -315,7 +321,7 @@ class XaeBackend:
                     # AFTER acting — an action is never repeated on it. (_on_sm / _on_item refresh a stale System
                     # Manager with a read before the action, so a reopened solution does not end up here.)
                     self.sysman = None
-                    raise XaeExplained(
+                    raise XaeActedUnknown(
                         f"{what}: failed with {_com_msg(exc)} — whether it acted is unknown, so it is not repeated. "
                         "Check xae_status / the XAE tree before you run it again.") from exc
                 if self._stale_sysman(exc) and not refreshed and not getattr(self, "_refreshing_sm", False):
@@ -556,7 +562,8 @@ class XaeBackend:
         except XaeError as exc:
             rec = self._sm_messages_after(what, before, sm, failed=True)
             if rec and rec.get("messages"):
-                raise type(exc)(f"{exc} — XAE messages ({what}): {rec['messages'][:1500]}") from exc
+                more = " (may include earlier calls' — the read before it failed)" if rec.get("messages_note") else ""
+                raise type(exc)(f"{exc} — XAE messages ({what}){more}: {rec['messages'][:1500]}") from exc
             # N188 (0.8.16 retest): an error without XAE messages did not say whether the buffer was read
             last = self.msg_reads[-1] if getattr(self, "msg_reads", None) and self.msg_reads[-1]["action"] == what else None
             if last is not None:
@@ -589,6 +596,11 @@ class XaeBackend:
         if after:
             rec["messages"] = after[:self.MESSAGES_MAX]
             rec["lines"] = [ln.strip() for ln in after.splitlines() if ln.strip()][:50]
+            if before is None:
+                # review 1 of 0.8.18: the read before the action failed — what the buffer held already (a buffer that
+                # clears: everything since the last read; one that does not: its history) cannot be told apart
+                rec["messages_note"] = ("the read before this action failed: these may include messages of earlier "
+                                        "calls" + (" — this buffer keeps its history" if clears is False else ""))
         if isinstance(reads, list):
             reads.append({"action": what, "read": True, "empty": not rec.get("messages")})
         if not rec.get("messages") and not rec.get("earlier_messages"):

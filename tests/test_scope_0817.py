@@ -419,7 +419,9 @@ async def test_n186_an_earlier_capture_is_never_linked_as_this_recordings(monkey
     if clock == "fresh":
         assert sc["link"]["files"] and "not_this_recording" not in sc, sc
         return
-    assert "link" not in sc and sc["not_this_recording"].endswith("an earlier capture Scope still held"), sc
+    assert "link" not in sc and ("an earlier capture Scope still held" in sc["not_this_recording"]), sc
+    if clock == "pc":                      # review 1 of 0.8.18: with this PC's clock only, it cannot be told
+        assert sc["not_this_recording"].endswith("cannot be told") and "could not be shown" in sc["note"], sc
     assert ("before StartRecord ran (this PC's clock" if clock == "pc" else
             "s before the recording's first sample") in sc["not_this_recording"], sc
     assert not (sd / f"{r['id']}.scope.json").exists() and not is_read_only(sd / f"{r['id']}.svdx")
