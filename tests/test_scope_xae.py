@@ -706,7 +706,9 @@ async def test_review13_0816_a_stop_refused_after_the_end_is_no_step_of_rec_star
     assert st["scope"]["state"] == "recording" and f"rec_stop(id='{r['id']}') asks again" in st["scope"]["note"], \
         st["scope"]
     assert not fake_xae.recording and fake_xae.calls[-3:] == ["stop", "save", "csv"], fake_xae.calls
-    assert out["scope"]["finished_by"] == "rec_stop" and out["scope"]["save_svd"]["result_code"] == 0, out["scope"]
+    # the recording ended by itself (duration_s): that end is who ended it — rec_stop only asked StopRecord again
+    assert out["scope"]["finished_by"].startswith("the recording ended by itself (duration") and \
+        out["scope"]["save_svd"]["result_code"] == 0, out["scope"]
 
 
 @pytest.mark.anyio
@@ -1033,7 +1035,8 @@ async def test_0817_a_stop_refused_by_a_held_dialog_is_asked_again(monkeypatch, 
     assert st["scope"]["state"] == "recording" and f"rec_stop(id='{r['id']}') asks again" in st["scope"]["note"], \
         st["scope"]
     assert "NOT started: XAE is held by the dialog" in st["scope"]["stop_refused"], st["scope"]
-    assert not fake_xae.recording and out["scope"]["finished_by"] == "rec_stop", (fake_xae.calls, out["scope"])
+    assert not fake_xae.recording and out["scope"]["finished_by"].startswith("the recording ended by itself (duration"), \
+        (fake_xae.calls, out["scope"])
     assert out["scope"]["save_svd"]["result_code"] == 0
 
 
@@ -1196,4 +1199,9 @@ async def test_0817_rec_stop_and_rec_delete_together_stop_scope_once(monkeypatch
     # rec_stop came first: its Scope part is saved and linked; rec_delete then removes the ADS recording and says the
     # Scope files stay (first review of 0.8.17)
     d = payload(outs["delete"])
-    assert d["scope_files_kept"]["files"] == sorted(part.result["link"]["files"]), d
+    link = part.result.get("link")
+    if link:                               # the save came before the delete: its files stay, and rec_delete says so
+        assert d["scope_files_kept"]["files"] == sorted(link["files"]), d
+    else:                                  # the delete came first: nothing saved for the deleted recording
+        sd = app.rec.root / "scope"
+        assert "scope_files_kept" not in d and not any(p.name.startswith(r["id"]) for p in sd.glob("*")), d
