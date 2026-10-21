@@ -3528,6 +3528,54 @@ class InfosysIndex:
         out.sort(key=lambda x: x[1])
         return [o for o, _ in out[:limit]]
 
+    def web_search(self, q: str, limit: int = 5) -> list[dict[str, Any]]:
+        """A site search of infosys.beckhoff.com on the web (DuckDuckGo's HTML page) — err_lookup's online step (0.8.16,
+        user decision: when the local documentation has nothing). The search engine's results as they are: url, title,
+        its snippet, and whether the page is in the local Help Viewer package (then infosys_get_page opens it; otherwise
+        only a browser does — no page is fetched from the web in local mode). TwinCAT 2 books are left out (tc3_only).
+        [{'error': …}] when the search cannot be reached."""
+        url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(f"site:infosys.beckhoff.com {q}")
+        try:
+            raw = self.fetch.get(url, allow_hosts=DDG_HOSTS).decode("utf-8", errors="replace")
+        except InfosysError as exc:
+            return [{"error": f"the online search is not reachable: {exc}"}]
+        local: dict[str, str] = {}
+        if self.local is not None:
+            try:
+                local = self.sitemap()
+            except InfosysError:
+                local = {}
+
+        def plain(h: str) -> str:
+            return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", h))).strip()
+        titles = re.findall(r'<a\b[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*>(.*?)</a>', raw, re.S)
+        tags = re.findall(r'<a\b[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*>', raw)
+        snippets = re.findall(r'<(?:a|td|div)\b[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</(?:a|td|div)>',
+                              raw, re.S)
+        out: list[dict[str, Any]] = []
+        for i, tag in enumerate(tags):
+            m = re.search(r'href="([^"]+)"', tag)
+            if not m:
+                continue
+            href = html.unescape(m.group(1))
+            if "uddg=" in href:
+                href = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [""])[0])
+            if "infosys.beckhoff.com/content/" not in href:
+                continue
+            href = re.sub(r"\?.*$", "", href.replace("http://", "https://").split("#", 1)[0])
+            b = book_of(href)
+            if b and not self.book_allowed(b[0]):
+                continue
+            if any(o["url"] == href for o in out):
+                continue
+            out.append({"url": href, "title": plain(titles[i]) if i < len(titles) else None,
+                        "snippet": plain(snippets[i]) if i < len(snippets) else None,
+                        "book": b[0] if b else None, "in_local_package": href in local if self.local is not None
+                        else None})
+            if len(out) >= limit:
+                break
+        return out
+
     def _ddg(self, q: str, limit: int) -> list[dict[str, Any]]:
         url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(f"site:infosys.beckhoff.com {q}")
         try:

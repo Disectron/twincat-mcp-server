@@ -422,6 +422,10 @@ class App:
         from .config import _home
         self.init_done = threading.Event()        # set when __init__ is through (errors_first_build waits for it)
         self._errors_spawn_lock = threading.Lock()     # one errors-index build started at a time (spawn_errors_build)
+        # 0.8.16 (user decision): the errors this server returned and the XAE messages of its calls, newest last — where
+        # err_lookup looks for the code of a question that names none ('ADS error on port 851')
+        import collections
+        self.recent_errors: collections.deque[dict[str, Any]] = collections.deque(maxlen=50)
         self.kb = K.Knowledge(_home(), cfg.knowledge.location, cfg.knowledge.esi_dirs, cfg.knowledge.library_dirs)
         # the permanent layout of the knowledge folder (docs/KNOWLEDGE_BASE.md) before anything opens an index
         self.kb.layout()
@@ -808,6 +812,95 @@ class App:
             if not busy and not coming or time.monotonic() - t0 > self.ERRORS_FIRST_MAX_S:
                 return None
             time.sleep(self.ERRORS_FIRST_WAIT_S)
+
+    def note_error(self, tool: str, error: str | None = None, lines: list[str] | None = None) -> None:
+        """What a tool returned that err_lookup may need later: its error text, or the XAE messages of its result."""
+        rec: dict[str, Any] = {"when": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "tool": tool}
+        if error:
+            rec["error"] = error[:2000]
+        if lines:
+            rec["lines"] = [str(x)[:500] for x in lines[:50]]
+        if len(rec) > 2:
+            self.recent_errors.append(rec)
+
+    ERR_LOG_PICK = 3                       # entries of the error log err_lookup offers for a question without a code
+
+    def _err_log_entries(self, query: str, texts: list[tuple[str, str]], source: str) -> list[dict[str, Any]]:
+        """The texts (newest first: (where, text)) that name a code, ranked by the words they share with the query —
+        each looked up in the errors index (a code read from it, never from a shared word)."""
+        from . import docsearch as DS
+        from . import errors_index as X
+        loc = self.kb.location()[0]
+        words = [w for w in DS.informative_words(query) if not w.isdigit() and w not in X._GENERIC_WORDS]
+        cands = []
+        for k, (where, t) in enumerate(texts):
+            read = X.read_query(t)
+            if not (read["codes"] or read["names"] or read["caps"] or read["ids"]):
+                continue
+            low = t.lower()
+            cands.append((-sum(1 for w in words if w in low), k, where, t))
+        cands.sort()
+        shared = [c for c in cands if c[0] < 0]
+        out = []
+        for score, _k, where, t in (shared or cands)[:self.ERR_LOG_PICK]:
+            try:
+                r = X.err_lookup(t, kb=loc, limit=3, fulltext=False)
+            except X.ErrError:
+                continue
+            matches = [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref") if m.get(k) is not None}
+                       for m in r.get("matches") or [] if m.get("matched_by") != "text"]
+            read_as = [c["token"] for c in r["read_as"]] + r.get("names", []) + [m["token"] for m in
+                                                                                 r.get("message_ids", [])]
+            if not read_as:
+                continue
+            out.append({"source": source, "where": where, "text": t[:600], "read_as": read_as,
+                        "documented": bool(matches), "matches": matches,
+                        "shares_words": -score if shared else 0})
+        return out
+
+    async def err_from_logs(self, query: str) -> dict[str, Any] | None:
+        """0.8.16 (user decision): a question without a code — the code is looked for where errors were seen: first the
+        errors this server returned and the XAE messages of its calls (newest first), then — when those name none that
+        is documented — the XAE Error List (the TwinCAT logger's messages), read only when XAE is attached."""
+        recs = list(reversed(self.recent_errors))
+        texts = [(f"{r['tool']} {r['when']}", r["error"]) for r in recs if r.get("error")]
+        texts += [(f"{r['tool']} {r['when']} (XAE message)", ln) for r in recs for ln in r.get("lines") or []]
+        entries = await asyncio.to_thread(self._err_log_entries, query, texts, "recent errors of this server")
+        note = None
+        if not any(e["documented"] for e in entries):
+            if getattr(self.xae, "dte", None) is not None:
+                try:
+                    el = await self.xae_call(self.xae.errors, timeout=60)
+                    items = [(f"XAE Error List ({i.get('level') or 'message'})", str(i.get("description") or ""))
+                             for i in (el.get("items") or []) if i.get("description")]
+                    entries += await asyncio.to_thread(self._err_log_entries, query, items, "XAE Error List")
+                except ToolError as exc:
+                    note = f"the XAE Error List could not be read: {str(exc)[:200]}"
+            else:
+                note = "the XAE Error List was not read: XAE is not attached (xae_attach)"
+        if not entries and note is None:
+            return None
+        out: dict[str, Any] = {"entries": entries,
+                               "note": ("errors seen before that name a code — what the question may be about, ranked "
+                                        "by the words they share with it; the code is looked up, never a word")}
+        if not entries:
+            out["note"] = "no error seen before names a code"
+        if note:
+            out["xae_error_list"] = note
+        return out
+
+    async def err_online(self, query: str) -> dict[str, Any]:
+        """0.8.16 (user decision): when the local documentation has nothing — a site search of infosys.beckhoff.com on
+        the web (docs.web_fallback; off: said so). Pages that mention it, not a documented meaning."""
+        if getattr(self, "docs", None) is None:
+            return {"skipped": "the docs index is off (docs.enabled = false): no online search"}
+        if not self.cfg.docs.web_fallback:
+            return {"skipped": "docs.web_fallback = false: no online search"}
+        items = await asyncio.to_thread(self.docs.web_search, query, 5)
+        return {"source": "online: a site search of infosys.beckhoff.com (DuckDuckGo) — not the local documentation",
+                "note": ("pages the search engine finds for it — they mention it; none is a documented meaning. "
+                         "in_local_package: infosys_get_page opens it; otherwise only a browser"),
+                "items": items}
 
     def ads_error_text(self, code: int) -> str | None:
         """N125: Beckhoff's symbol and text of an ADS return code, with its page — from the errors index (None without
@@ -2316,7 +2409,8 @@ def _com_detail(exc: BaseException, hr: int) -> str:
 
 
 def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]] | None] = lambda: None,
-                   dialog_hint: Callable[[], Callable[[], str] | None] = lambda: None) -> Any:
+                   dialog_hint: Callable[[], Callable[[], str] | None] = lambda: None,
+                   note_error: Callable[[], Callable[..., None] | None] = lambda: None) -> Any:
     """What leaves a tool. mcp >= 2.1 passes only a ToolError's text to the client — any other exception arrives as a
     bare "Error executing tool X" (R37: never an empty error): a deliberate error keeps its text; a defect says its
     type and message and is logged with its traceback under a crash id (N174: in server.log, which the message
@@ -2326,6 +2420,19 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
 
     @functools.wraps(fn)
     async def run(*args: Any, **kwargs: Any) -> Any:
+        # what left the tool, for err_lookup (App.note_error): its error, or the XAE messages of its result
+        note = note_error()
+        try:
+            res = await _run(*args, **kwargs)
+        except ToolError as exc:
+            if note is not None and name != "err_lookup":
+                note(name, error=str(exc))
+            raise
+        if note is not None and isinstance(res, dict) and res.get("xae_messages"):
+            note(name, lines=[ln for m in res["xae_messages"] if isinstance(m, dict) for ln in m.get("lines") or []])
+        return res
+
+    async def _run(*args: Any, **kwargs: Any) -> Any:
         used = _XAE_USED.set(False)
         try:
             res = await fn(*args, **kwargs)
@@ -2398,12 +2505,13 @@ class TcMcpServer(MCPServer):
 
     xae_flags: Callable[[], dict[str, Any]] | None = None     # App.xae_flags, set by build_server
     dialog_hint: Callable[[], str] | None = None              # App._dialog_hint (N174), set by build_server
+    note_error: Callable[..., None] | None = None             # App.note_error (0.8.16), set by build_server
 
     def tool(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
         register = super().tool(*args, **kwargs)
 
         def decorator(fn: Any) -> Any:
-            register(_tool_boundary(fn, lambda: self.xae_flags, lambda: self.dialog_hint))
+            register(_tool_boundary(fn, lambda: self.xae_flags, lambda: self.dialog_hint, lambda: self.note_error))
             return fn                     # the closure keeps the plain function (tools that call each other)
         return decorator
 
@@ -2417,6 +2525,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                       subscriptions=False)
     mcp.xae_flags = app.xae_flags
     mcp.dialog_hint = app._dialog_hint
+    mcp.note_error = app.note_error
     # N162: the instructions are read again whenever a connection is initialised (a transport that serves several
     # sessions from one process asks for them per session), not only when the process started
     low = mcp._lowlevel_server
@@ -2870,12 +2979,26 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         message's words; a message that names a domain ('ADS error 6') is answered for it and the same number elsewhere
         is listed apart (other_domains); `ranking` says why. Not documented: documented=false, the domains searched,
         no_local_source (CoE SDO abort codes, compiler C0xxx), full-text hits marked as such — never a guessed meaning.
-        domain= narrows (an id, or part of a page's id/title); limit 1-20. The twincat-docs skill's err_lookup command
-        is the same function (the same answer); the index's first build starts by itself."""
+        No code in the query ('ADS error on port 851'): documented=false — the codes whose text shares its words are
+        text_matches, not the answer; from_error_log: the codes of the errors this server returned and of the XAE
+        messages of its calls (then the XAE Error List, when attached), ranked by the words they share with the query,
+        each looked up. Nothing documented locally: online — a site search of infosys.beckhoff.com (docs.web_fallback),
+        pages that mention it, labelled so. domain= narrows (an id, or part of a page's id/title); limit 1-20. The
+        twincat-docs skill's err_lookup command is the same function offline (the same answer, without from_error_log
+        and online); the index's first build starts by itself."""
         first = await asyncio.to_thread(app.errors_first_build)
         res = await app.kb_call(app.kb.err_lookup, query, domain, limit, timeout=60)
         if first:
             res["errors_first_build"] = first
+        if res.get("documented") is False:
+            # 0.8.16 (user decision): no code in the question → the code is looked for in the errors seen before; and
+            # when the local documentation has nothing → online
+            if not res.get("read_as") and not res.get("message_ids"):   # a name nothing documents is no code read
+                logs = await app.err_from_logs(query)
+                if logs:
+                    res["from_error_log"] = logs
+            if not any(e.get("documented") for e in (res.get("from_error_log") or {}).get("entries", [])):
+                res["online"] = await app.err_online(query)
         return res
 
     async def tc_request_confirmation(action: str, target: str = "", args: dict[str, Any] | None = None) -> dict[str, Any]:

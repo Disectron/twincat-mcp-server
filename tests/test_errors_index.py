@@ -1051,3 +1051,83 @@ def test_review_0816_doc_note_never_picks_one_of_several_domains(kb, tmp_path):
     assert app.doc_note("FB_Socket: error 6") == "FB_Socket: error 6"           # ads, win32, a library: none picked
     n = app.doc_note("ADS error 6 on read")
     assert n.startswith("ADS error 6 on read [documented: ads 0x6 ERR_TARGETPORTNOTFOUND"), n
+
+
+TSM_PAGE = """# Miscallaneous error codes
+
+The following error codes represent the HRESULT values of Automation Interface methods.
+
+```
+typedefenum TCSYSMANAGERHRESULTS
+{
+    [helpstring("ITcSmTreeItem not found!" (ITcSmTreeItem nicht gefunden!))]
+    TSM_E_ITEMNOTFOUND         = 0x98510001,
+    [helpstring("Invalid Item Type!" (Ungültiger Elementtyp!))]
+    TSM_E_INVALIDITEMTYPE         = 0x98510002,
+    [helpstring("XML Error" (XML-Fehler))]
+    TSM_E_XMLERROR             = 0x98510008,
+} TCSYSMANAGERHRESULTS;
+```
+
+| Error | Description |
+|---|---|
+| RPC_E_CALL_REJECTED | The COM-Server has rejected the call. |
+"""
+ST_ENUM_PAGE = """# E_HomingErrorCodes
+
+```st
+TYPE MC_Switch_Mode :
+(
+    MC_HOMINGERROR_DRIVETYPE               := 16#4B90, (* the drive type is not supported *)
+    // the direction is invalid
+    MC_HOMINGERROR_DIRECTION               := 16#4B91,
+    MC_HOMINGERROR_SWITCHMODE              := 16#4B92  (* 4B92 hex *)
+) UDINT;
+END_TYPE
+```
+
+Example:
+
+```st
+nErr := 16#4B90;
+nState := 16#0001;
+nOther := 16#0002;
+```
+"""
+
+
+def test_review_0816_codes_in_an_enum_code_block_are_indexed():
+    """Review of 0.8.16 (15), user decision: the Automation Interface's HRESULTs (TSM_E_ITEMNOTFOUND 0x98510001 …) are
+    an IDL enum in a code block, a library's error enum an ST TYPE — the table parser read neither. Members with their
+    value and Beckhoff's text (an IDL helpstring's English string, an ST comment); a number-only comment is no text; an
+    assignment in a code example is no enum."""
+    r = X.parse_code_enums(TSM_PAGE)
+    assert [(x["symbol"], x["value"], x["hresult"], x["text"]) for x in r] == [
+        ("TSM_E_ITEMNOTFOUND", 0x98510001, "0x98510001", "ITcSmTreeItem not found!"),
+        ("TSM_E_INVALIDITEMTYPE", 0x98510002, "0x98510002", "Invalid Item Type!"),
+        ("TSM_E_XMLERROR", 0x98510008, "0x98510008", "XML Error")], r
+    r = X.parse_code_enums(ST_ENUM_PAGE)
+    assert [(x["symbol"], x["value"], x["text"]) for x in r] == [
+        ("MC_HOMINGERROR_DRIVETYPE", 0x4B90, "the drive type is not supported"),
+        ("MC_HOMINGERROR_DIRECTION", 0x4B91, "the direction is invalid"),
+        ("MC_HOMINGERROR_SWITCHMODE", 0x4B92, None)], r
+    assert X.parse_code_enums("```st\nnErr := 16#4B90;\nnA := 1;\nnB := 2;\n```") == []
+
+
+def test_review_0816_an_automation_interface_hresult_is_documented(tmp_path):
+    """The XAE failure codes: 0x98510001 in every form (the hex, its negative 32-bit form, the symbol) answers
+    TSM_E_ITEMNOTFOUND 'ITcSmTreeItem not found!' of the TE1000 book; a library enum's member by its symbol."""
+    k = tmp_path / "kb"
+    write_infosys(L.index_file(k, "infosys"), _pages() + [
+        ("tc3_automationinterface", "242957195", "Miscallaneous error codes", None, TSM_PAGE),
+        ("tcplclib_tc3_mc2_advancedhoming", "645493643", "E_HomingErrorCodes", "Tc3_MC2_AdvancedHoming", ST_ENUM_PAGE)])
+    write_manuals(L.index_file(k, "manuals"))
+    write_esi(L.index_file(k, "esi"))
+    assert build(k)["result"] == "built"
+    for q in ("0x98510001", "-1739522047", "TSM_E_ITEMNOTFOUND", "LookupTreeItem failed (HRESULT 0x98510001)"):
+        m = lookup(k, q)["matches"][0]
+        assert (m["domain"], m["symbol"], m["text"]) == ("tcsysmanager", "TSM_E_ITEMNOTFOUND",
+                                                         "ITcSmTreeItem not found!"), (q, m)
+    m = lookup(k, "MC_HOMINGERROR_DIRECTION")["matches"][0]
+    assert (m["value"], m["text"], m["ref"]) == (0x4B91, "the direction is invalid",
+                                                 "tcplclib_tc3_mc2_advancedhoming/645493643"), m

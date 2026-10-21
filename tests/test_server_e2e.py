@@ -1768,3 +1768,58 @@ async def test_review_0816_each_xae_call_carries_only_its_own_messages(tmp_path)
         await app.xae_call(deploy)
     assert "XAE messages of the steps before it: ActivateConfiguration: Warning: license expires in 3 days" in \
         str(ei.value) and str(ei.value).count("Error: timeout") == 1, str(ei.value)
+
+
+@pytest.mark.anyio
+async def test_0816_err_lookup_takes_the_code_from_the_errors_seen_then_goes_online(monkeypatch, project_dir, tmp_path):
+    """0.8.16 (user decision): a question without a code is not answered from a shared word. The code is looked for
+    where errors were seen — the errors this server returned (an ads_read that failed with ADS error 1808) and the XAE
+    messages of its calls, then the XAE Error List — and when the local documentation has nothing, a site search of
+    infosys.beckhoff.com online (docs.web_fallback; off or without a docs index: said so)."""
+    from tests.fake_ads import install
+    from tests.test_errors_index import build as err_build, make_kb
+    install(monkeypatch)
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    async with client_for(build_server(cfg)) as s:
+        r = payload(await s.call_tool("err_lookup", {"query": "ADS error on port 851"}))
+        assert r["documented"] is False and r["matches"] == [] and r["online"]["skipped"].startswith("the docs index"), r
+        assert r["from_error_log"]["entries"] == [] and "not attached" in r["from_error_log"]["xae_error_list"], sorted(r)
+        res = await s.call_tool("ads_read", {"name": "MAIN.doesNotExist"})
+        assert res.is_error and "1808" in text(res), text(res)
+        r = payload(await s.call_tool("err_lookup", {"query": "why does reading MAIN.doesNotExist fail?"}))
+        e = r["from_error_log"]["entries"][0]
+        assert e["source"] == "recent errors of this server" and e["where"].startswith("ads_read "), e
+        assert e["matches"][0]["symbol"] == "ADSERR_DEVICE_SYMBOLNOTFOUND" and e["shares_words"] >= 1, e
+        assert "online" not in r, r                          # the error log answered: nothing is looked up online
+        # a code the local documentation does not have: online, labelled
+        r = payload(await s.call_tool("err_lookup", {"query": "SDO abort 0x06020000"}))
+        assert r["documented"] is False and "from_error_log" not in r and "skipped" in r["online"], r
+
+
+def test_0816_the_online_step_is_a_labelled_site_search(tmp_path):
+    """InfosysIndex.web_search: the search engine's results (url, title, snippet), TwinCAT 2 books left out, whether the
+    page is in the local package; a search that cannot be reached is said so."""
+    from twincat_mcp.infosys import InfosysError, InfosysIndex
+    page = ('<div class="result"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg='
+            'https%3A%2F%2Finfosys.beckhoff.com%2Fcontent%2F1033%2Ftc3_ads_intro%2F374277003.html&amp;rut=x">'
+            '<b>ADS</b> Return Codes</a><a class="result__snippet" href="x">0x745 Timeout has occurred</a></div>'
+            '<div class="result"><a class="result__a" href="https://infosys.beckhoff.com/content/1033/'
+            'tcplclibsystem/1.html">TwinCAT 2 page</a></div>')
+
+    class F:
+        def __init__(self, data): self.data = data
+        def get(self, url, allow_hosts=None):
+            if self.data is None:
+                raise InfosysError("no network")
+            assert "duckduckgo.com" in url and allow_hosts
+            return self.data.encode()
+    idx = InfosysIndex(tmp_path / "c", fetcher=F(page))
+    items = idx.web_search("0x745 timeout", 5)
+    assert items[0]["url"] == "https://infosys.beckhoff.com/content/1033/tc3_ads_intro/374277003.html", items
+    assert items[0]["title"] == "ADS Return Codes" and items[0]["snippet"] == "0x745 Timeout has occurred", items
+    assert len(items) == 1, items                         # tcplclibsystem: a TwinCAT 2 book (tc3_only)
+    assert InfosysIndex(tmp_path / "d", fetcher=F(None)).web_search("x")[0]["error"].startswith("the online search")

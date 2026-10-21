@@ -47,8 +47,11 @@ python "<skill folder>/kb_docs.py" docs_search "query=fbRead( READ := FALSE )" l
 ## Rules
 1. Documentation → this skill. Live PLC values and types → the ads_* tools.
    **An error code → `err_lookup` first.** A number counts as a code only as the whole query or next to a word that
-   says so (`error 1861`, `nErrId := 1808`) — `ADS error on port 851` holds no code; a hex number also right after a
-   domain's name (`AL status 0x0011`), and `C0373` is read as a compiler message. A number of several domains is
+   says so (`error 1861`, `nErrId := 1808`) — `ADS error on port 851` holds no code, so it is `documented: false`
+   (`text_matches` only share its words: never an answer); a hex number also right after a domain's name
+   (`AL status 0x0011`), a code's symbol also in capitals (`WSAETIMEDOUT`), and `C0373` is read as a compiler message.
+   The server's err_lookup tool adds `from_error_log` (the code of the errors it saw) and `online` (a web site search)
+   when nothing local answers; this command is offline. A number of several domains is
    listed in all of them, ranked by the message's words; a message that names a domain (`ADS error 6`) is answered for
    it and the same number elsewhere comes in `other_domains` — never pick one silently. `documented: false` = not in
    the local documentation (CoE SDO abort codes and the compiler's C0xxx messages have no local source at all —

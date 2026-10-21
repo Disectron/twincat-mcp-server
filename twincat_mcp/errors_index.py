@@ -227,6 +227,12 @@ DOMAINS: dict[str, dict[str, Any]] = {
               "hints": ("socket", "file", "path", "system", "wsa", "access", "denied")},
     "hresult": {"title": "HRESULT codes", "origin": "infosys", "priority": 2, "names": (),
                 "hints": ("hresult", "com", "xae", "visual", "studio", "shell")},
+    # review of 0.8.16 (user decision): the HRESULTs an Automation Interface method fails with (TSM_E_ITEMNOTFOUND
+    # 0x98510001 …) — an enum in a code block of the TE1000 book, read by parse_code_enums
+    "tcsysmanager": {"title": "Automation Interface HRESULTs (TSM_E_…)", "origin": "infosys", "priority": 3,
+                     "books": ("tc3_automationinterface",),
+                     "names": ("automation interface", "tcsysmanager", "system manager", "itcsysmanager"),
+                     "hints": ("xae", "treeitem", "tree", "item", "consumexml", "lookuptreeitem")},
     "nc": {"title": "NC errors", "origin": "infosys", "priority": 3, "books": ("tc3ncerrcode",), "error_book": True,
            "names": ("nc", "ncerror", "ncerr"),
            "hints": ("axis", "axes", "drive", "encoder", "controller", "channel", "group", "motion", "mc", "bode",
@@ -626,6 +632,58 @@ def parse_al_sections(pages: list[tuple[int, str]]) -> dict[str, Any]:
     return {"rows": out, "pages": on}
 
 
+# a code page whose codes are an enumeration in a code block, not a table: the TE1000 HRESULTs (IDL 'typedef enum
+# TCSYSMANAGERHRESULTS { [helpstring("ITcSmTreeItem not found!" …)] TSM_E_ITEMNOTFOUND = 0x98510001, … }') and the
+# libraries' error enums (ST 'TYPE E_HomingErrorCodes : ( MC_HOMINGERROR_DRIVETYPE := 16#4B90, … ) UDINT; END_TYPE')
+_CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+_IDL_ENUM = re.compile(r"(?:\btypedef\s*enum|\benum)\b[^{;]*\{(.*?)\}", re.S)     # the page writes 'typedefenum'
+_ST_ENUM = re.compile(r"\bTYPE\s+\w+\s*:\s*\((.*?)\)\s*\w*\s*;?\s*END_TYPE", re.S | re.I)
+_ENUM_MEMBER = re.compile(r"^\s*([A-Za-z_]\w*)\s*:?=\s*(0x[0-9A-Fa-f]+|16#[0-9A-Fa-f_]+|-?\d+)\s*,?\s*"
+                          r"(?:\(\*\s*(.*?)\s*\*\)|//\s*(.*?))?\s*$")
+_HELPSTRING = re.compile(r'helpstring\(\s*"([^"]*)"')
+_NUMBER_ONLY = re.compile(r"^\s*(?:0x|16#)?[0-9A-Fa-f_]+\s*(?:hex|dec|h)?\s*$", re.I)
+_COMMENT_LINE = re.compile(r"^\s*(?:\(\*\s*(.*?)\s*\*\)|//\s*(.*?))\s*$")
+
+
+def parse_code_enums(md: str) -> list[dict[str, Any]]:
+    """The members of the enumerations in a page's code blocks — symbol, value, and Beckhoff's text when the block gives
+    one (an IDL helpstring's first, English, string; an ST comment on the member's line or the lines right above it). A
+    block counts when it declares an enum (IDL 'enum … { }', ST 'TYPE x : ( … ) END_TYPE') of at least three members
+    with distinct values — an assignment in a code example ('nErr := 16#1234;') is none."""
+    out: list[dict[str, Any]] = []
+    for block in _CODE_BLOCK.findall(md or ""):
+        for body in [m.group(1) for m in _IDL_ENUM.finditer(block)] + [m.group(1) for m in _ST_ENUM.finditer(block)]:
+            rows: list[dict[str, Any]] = []
+            text: list[str] = []
+            for ln in body.splitlines():
+                h = _HELPSTRING.search(ln)
+                if h:
+                    text = [h.group(1).strip()]
+                    continue
+                c = _COMMENT_LINE.match(ln)
+                if c and not _ENUM_MEMBER.match(ln):
+                    text.append((c.group(1) or c.group(2) or "").strip())
+                    continue
+                m = _ENUM_MEMBER.match(ln)
+                if not m:
+                    if ln.strip():
+                        text = []
+                    continue
+                raw = m.group(2)
+                v = int(raw[3:].replace("_", ""), 16) if raw.startswith("16#") else int(raw, 0)
+                own = (m.group(3) or m.group(4) or "").strip()
+                t = own or " ".join(x for x in text if x).strip() or None
+                if t and _NUMBER_ONLY.match(t):
+                    t = None                   # '(* 20 hex *)', '// 102': the value again, no meaning
+                hres = f"0x{v:08X}" if 0x80000000 <= v <= 0xFFFFFFFF else None
+                rows.append({"value": v, "hex": f"0x{v:X}" if v >= 0 else str(v), "dec": str(v), "hresult": hres,
+                             "symbol": m.group(1), "text": t, "kind": None})
+                text = []
+            if len(rows) >= 3 and len({r["value"] for r in rows}) == len(rows):
+                out += rows
+    return out
+
+
 # --------------------------------------------------------------------------------------------- the database
 SCHEMA = """
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
@@ -874,6 +932,13 @@ class _Build:
                         tdom = "hresult" if t["rows"][0]["hresult_only"] and did == "ads" else did
                         by_dom.setdefault(tdom, []).extend(t["rows"])
                     found = sum(len(v) for v in by_dom.values())
+                    if not found:
+                        enum_rows = parse_code_enums(md)
+                        if enum_rows:
+                            by_dom[did] = enum_rows
+                            parsers.add("enum")
+                            code_tables += 1
+                            found = len(enum_rows)
                     n_rows += found
                     self.inconsistent += [f"{r['book']}/{r['page_id']}: {x}" for x in bad[:3]]
                     for tdom, rows in by_dom.items():
@@ -1532,6 +1597,7 @@ def _by_value(con: sqlite3.Connection, v: int) -> tuple[list[tuple[str, int, lis
             by.setdefault(r["domain"], []).append(r)
         for did, rs in by.items():
             found.append((did, f, rs, "value"))
+    for f in sorted(_forms(v)):                # a code stored as its value is matched by value, not as an HRESULT
         for a in con.execute("SELECT DISTINCT domain, value_int FROM alias WHERE kind = 'hresult' AND form = ?",
                              (f"0x{f & 0xFFFFFFFF:08x}",)):
             rs = con.execute("SELECT * FROM code WHERE domain = ? AND value_int = ?", (a[0], a[1])).fetchall()
