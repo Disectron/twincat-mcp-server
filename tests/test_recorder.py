@@ -1479,3 +1479,19 @@ def test_review14_0816_reap_survives_a_recording_added_meanwhile(rec):
     rec.recs["20261021-000001-aaaa"] = first
     rec.reap()
     assert first.reaped and "20261021-000002-bbbb" in rec.recs
+
+
+def test_n187_the_last_program_check_reads_on_an_open_connection(rec):
+    """N187 (0.8.16 retest): the stop closed the connection with the notifications, and the drain's last program
+    check read the symbol version on it — pyads gives None on a closed connection → TypeError: the samples after the
+    last periodic check were dropped as unverified, missing_tail counted, verdict FAIL with a lossless counter."""
+    st = _cycle_rec(rec)
+    c = _conn()
+    for i in range(100):
+        c.fire("MAIN.nCycle", i, ft(i))
+    out = rec.stop(st["id"])                               # at once: the samples since the last check need the last one
+    f = _footer(out)
+    pw = f["program_watch"]
+    assert "unverified_rows" not in f and max(_rows_t(out)) == 99.0, f
+    assert pw["verified_to_ms"] == 99.0 and "TypeError" not in str(pw.get("last_error")), pw
+    assert rec.recs[st["id"]].conn is None                  # closed once the drain was over

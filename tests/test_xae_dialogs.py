@@ -734,6 +734,8 @@ async def test_n181_a_read_call_a_dialog_refused_says_nothing_was_changed(monkey
         raise X.XaeBusy.blocked(f"LookupTreeItem {path}", d)
 
     def tree_consume_xml(path, xml):
+        if path.endswith("Task2"):
+            app.xae.calls_ok += 1                  # a COM call of this call ran before the refused one
         raise X.XaeBusy.blocked(f"ConsumeXml {path}", d)
     monkeypatch.setattr(app.xae, "tree_item", tree_item)
     monkeypatch.setattr(app.xae, "tree_consume_xml", tree_consume_xml)
@@ -747,13 +749,17 @@ async def test_n181_a_read_call_a_dialog_refused_says_nothing_was_changed(monkey
     monkeypatch.setattr(app, "confirmed", confirmed)
     async with client_for(srv) as s:
         r = await s.call_tool("xae_tree_get", {"path": "TIPC"})
-        w = await s.call_tool("xae_tree_consume_xml", {"path": "TIRT^PlcTask", "xml": "<TreeItem/>"})
+        w = await s.call_tool("xae_tree_consume_xml", {"path": "TIRT^PlcTask2", "xml": "<TreeItem/>"})
+        w1 = await s.call_tool("xae_tree_consume_xml", {"path": "TIRT^PlcTask", "xml": "<TreeItem/>"})
     t, tw = text(r), text(w)
+    # N181b (0.8.16 retest): refused at its first COM call, an edit ran nothing — said so
+    assert "it did not run. Nothing of this call ran (it was refused at its first step): answer it " \
+           "(xae_dialog_resolve(button=...)), then call again." in text(w1) and "may have run" not in text(w1), text(w1)
     assert r.is_error and "LookupTreeItem TIPC: BLOCKED BY DIALOG 'Options'" in t, t
     assert "it did not run. Nothing was changed (a read-only call): answer it (xae_dialog_resolve(button=...)), then " \
            "call again." in t and "whether the action ran" not in t and "may have run" not in t, t
     assert 'blocked_by_dialog: {"hwnd": 77, "title": "Options", "class": "#32770"' in t, t
-    assert w.is_error and "ConsumeXml TIRT^PlcTask: BLOCKED BY DIALOG 'Options'" in tw, tw
+    assert w.is_error and "ConsumeXml TIRT^PlcTask2: BLOCKED BY DIALOG 'Options'" in tw, tw
     assert "Steps of this call before it may have run: answer it (xae_dialog_resolve(button=...)), then check the " \
            "result before calling again." in tw and "Nothing was changed" not in tw, tw
     # the backend alone does not know the tool: said as the latter; buttons it can't press: close it in XAE

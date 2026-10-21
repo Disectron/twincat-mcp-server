@@ -194,6 +194,8 @@ class FakeConnection:
         return bytes(self.read(0x4040, i * 64, ctypes.c_ubyte * n, return_ctypes=True))
 
     def read(self, index_group, index_offset, plc_datatype, return_ctypes=False, check_length=True):
+        if not self.is_open:
+            return None                                  # pyads: a read on a closed Connection returns None (N187)
         if index_group == 0xF008:                        # ADSIGRP_SYM_VERSION
             if FakeConnection.fail_version_reads:
                 raise pyads.ADSError(1861)              # timeout: the runtime does not answer

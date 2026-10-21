@@ -686,6 +686,10 @@ class Recording:
         self.handles: list[tuple[int, int]] = []
         self.conn: pyads.Connection | None = None
         self.on_finish: Callable[[], None] | None = None   # releases the notifications (ingest thread, at stop)
+        # closes the connection once the drain is over — N187 (0.8.16 retest): it was closed with the notifications,
+        # and the drain's last program check read the version on a closed connection (None → TypeError): the samples
+        # after the last check were dropped as unverified and the verdict said FAIL
+        self.on_closed: Callable[[], None] | None = None
         self._poll_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------ setup
@@ -1423,6 +1427,13 @@ class Recording:
 
     def _finish(self) -> None:
         self._release()
+        cb = self.on_closed
+        if cb is not None:
+            try:
+                cb()                     # the last program check is done (the drain is over): the connection goes
+            except Exception as exc:  # noqa: BLE001
+                if len(self.errors) < 20:
+                    self.errors.append(f"close: {exc}")
         # a notification in flight while the subscriptions were deleted can land after the last drain: received, past
         # the end — counted, not lost from the accounting
         late = 0
@@ -2467,7 +2478,8 @@ class Recorder:
         except Exception as exc:  # noqa: BLE001
             raise AdsError(f"recorder connection failed: {_fmt_exc(exc)}") from exc
         rec.conn = conn
-        rec.on_finish = lambda: self._stop_notifications(rec)
+        rec.on_finish = lambda: self._stop_notifications(rec, close=False)
+        rec.on_closed = lambda: self._stop_notifications(rec)
         rec.read_program = lambda: int(conn.read(ADSIGRP_SYM_VERSION, 0, ctypes.c_ubyte))     # R43, ingest thread
         rec.read_identity = lambda: _program_identity(conn)
         trans = C.ADSTRANS_SERVERCYCLE if rec.mode == "cycle" else C.ADSTRANS_SERVERONCHA
@@ -2507,9 +2519,13 @@ class Recorder:
                                "Nothing is recorded rather than a recording with holes; pass allow_partial=true to "
                                "record the rest (the missing symbols are then listed in unsubscribed_symbols).")
 
-    def _stop_notifications(self, rec: Recording) -> None:
+    def _stop_notifications(self, rec: Recording, close: bool = True) -> None:
+        """Delete the recording's notifications; close its connection too unless close=False — N187: the drain's last
+        program-version check still reads on it (Recording.on_closed closes it after)."""
         with rec._lock:
-            conn, rec.conn = rec.conn, None
+            conn = rec.conn
+            if close:
+                rec.conn = None
             handles, rec.handles = list(rec.handles), []
             fs, rec._fast_switch = getattr(rec, "_fast_switch", False), False
         if fs:
@@ -2521,6 +2537,8 @@ class Recorder:
                 conn.del_device_notification(nh, uh)
             except Exception:  # noqa: BLE001
                 pass
+        if not close:
+            return
         try:
             conn.close()
         except Exception:  # noqa: BLE001
@@ -2607,7 +2625,7 @@ class Recorder:
                 rec._stop.wait(timeout=TAIL_WAIT_S + rec.max_delay_ms / 1000.0 + 5.0)
                 rec.request_stop(reason)      # the wait is over in any case
             if rec.mode != "poll":
-                self._stop_notifications(rec)
+                self._stop_notifications(rec, close=False)     # N187: closed by the drain's end (on_closed)
             if rec._poll_thread:
                 rec._poll_thread.join(timeout=5)
         if rec._thread:
@@ -2620,6 +2638,19 @@ class Recorder:
             st["stats_note"] = (f"{len(rec.symbols)} leaves" + ("" if rec.live_stats else ", high-rate recording") +
                                 " — rec_stats(id, symbols=[…]) computes exact statistics from the file")
         return st
+
+    def t0_filetime(self, rid: str) -> int | None:
+        """The PLC time (FILETIME, UTC) of the recording's first sample — live, or from its file (`_t0`); None when it
+        has none yet. N186: a Scope part's saved data is checked against it."""
+        v = getattr(self.recs.get(rid), "t0_ft", None)
+        if isinstance(v, int):
+            return v
+        try:
+            t0 = _read_t0(self._path_for(rid)) or {}
+        except RecorderError:
+            return None
+        v = t0.get("filetime")
+        return v if isinstance(v, int) else None
 
     def stop_all(self) -> None:
         for rid, rec in list(self.recs.items()):

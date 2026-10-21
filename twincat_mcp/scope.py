@@ -106,13 +106,36 @@ def _content_end(path: Path, size: int) -> int:
 
 
 _HEAD = 4096
+# N185 (0.8.16 retest): TcScopeView.log begins with a binary header whose bytes 4–7 are the log's length (u32 LE = the
+# file size) — a fingerprint of its first bytes changed with every write, every call took the log for a new one and read
+# it from its start: 23 ERRORs of earlier days reported as this call's. The fingerprint starts at its first text line
+# ('(2026-04-03-08:03:33:268)[ INFO ] …', UTF-8 or UTF-16), found within the first _HEAD_SCAN bytes.
+_HEAD_SCAN = 64 << 10
+_FIRST_LINE = re.compile(rb"\((?:\x00)?\d(?:\x00)?\d(?:\x00)?\d(?:\x00)?\d(?:\x00)?-")
 
 
-def _head(path: Path, n: int) -> str:
-    """A fingerprint of the log's first n bytes — a new log (rotated) begins otherwise."""
+def _head_at(path: Path, end: int) -> int:
+    """Where the log's text begins: its first '(yyyy-' line within _HEAD_SCAN bytes; else 0 (a log of another
+    format is fingerprinted from its start, as before)."""
+    with open(path, "rb") as fh:
+        m = _FIRST_LINE.search(fh.read(min(end, _HEAD_SCAN)))
+    return m.start() if m else 0
+
+
+def _head(path: Path, n: int, at: int = 0) -> str:
+    """A fingerprint of n bytes of the log from offset `at` (its first text line) — a new log (rotated) begins
+    otherwise; the header before it changes with every write (N185)."""
     import hashlib
     with open(path, "rb") as fh:
+        fh.seek(at)
         return hashlib.sha256(fh.read(n)).hexdigest()[:16]
+
+
+def _same_log(path: Path, m: dict[str, Any]) -> bool:
+    """Whether the log still begins as at the mark m (by its first text line, N185)."""
+    if not m.get("head"):
+        return True
+    return _head(path, int(m.get("head_bytes") or 0), int(m.get("head_at") or 0)) == m["head"]
 
 
 def _mark_one(path: Path | None) -> dict[str, Any]:
@@ -124,8 +147,10 @@ def _mark_one(path: Path | None) -> dict[str, Any]:
         return {"path": None, "size": None}
     try:
         end = _content_end(path, path.stat().st_size)
-        n = min(_HEAD, end)
-        return {"path": str(path), "size": end, **({"head": _head(path, n), "head_bytes": n} if n else {})}
+        at = _head_at(path, end) if end else 0
+        n = min(_HEAD, end - at)
+        return {"path": str(path), "size": end,
+                **({"head": _head(path, n, at), "head_bytes": n, "head_at": at} if n > 0 else {})}
     except FileNotFoundError:
         return {"path": str(path), "size": 0}
     except OSError as exc:
@@ -194,7 +219,7 @@ def _errors_one(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
         start = 0
     elif mark.get("head"):
         try:
-            if _head(path, int(mark.get("head_bytes") or 0)) != mark["head"]:
+            if not _same_log(path, mark):
                 out["note"] = "the log begins otherwise than when the call began (a new log) — read from its start"
                 start = 0
         except OSError as exc:
@@ -230,6 +255,8 @@ def _errors_one(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
         new = size - start
     out.update({"new_bytes": new, "error_count": len(entries),
                 "errors": [" | ".join(e)[:800] for e in entries[-limit:]]})
+    if len(entries) > limit:
+        out["truncated"] = True            # N185: error_count 23, 20 shown — said
     return out
 
 
@@ -284,6 +311,8 @@ def log_errors_since(mark: dict[str, Any], limit: int = 20) -> dict[str, Any]:
         "new_bytes": sum(int(r.get("new_bytes") or 0) for _p, r in per),
         "error_count": sum(int(r.get("error_count") or 0) for _p, r in per),
         "errors": errors[-limit:], "error_logs": logs[-limit:]}
+    if out["error_count"] > len(out["errors"]):
+        out["truncated"] = True            # N185 (0.8.16 retest): error_count 23 with 20 shown, unsaid
     notes = [f"{Path(p).name}: {r['note']}" for p, r in per if r.get("note") and "does not exist" not in r["note"]]
     if not written:
         notes.insert(0, "no Scope View log was written since the call began (" + ", ".join(out["logs_checked"]) + ")")
@@ -318,12 +347,44 @@ def log_find_since(mark: dict[str, Any] | None, rx: "re.Pattern[str]") -> list[t
             return None
         start = m.get("size") or 0
         try:
-            if size < start or (start and m.get("head") and _head(p, int(m.get("head_bytes") or 0)) != m["head"]):
+            if size < start or (start and not _same_log(p, m)):
                 start = 0
             out += [(p.name, ln.strip()) for ln in _new_lines(p, start, size) if rx.search(ln)]
         except OSError:
             return None
     return out
+
+
+def csv_span(path: Path) -> tuple[int, int] | None:
+    """(start, end) of a Scope CSV export as FILETIME (UTC) — its header lines 'Starttime of export\t<filetime>\t…'
+    and 'Endtime of export\t<filetime>\t…' (both Beckhoff's export tool and XAE's ExportCSV write them); None when
+    the file has no such header. N186 (0.8.16 retest): a refused StartRecord left an earlier capture in Scope, and it
+    was saved and signed as a later recording's — its span gives it away."""
+    got: dict[str, int] = {}
+    try:
+        with open(path, "rb") as fh:
+            for _ in range(12):
+                ln = fh.readline()
+                if not ln:
+                    break
+                cells = ln.decode("utf-8", "replace").lstrip("\ufeff").rstrip("\r\n").split("\t")
+                key = cells[0].strip().lower()
+                if key in ("starttime of export", "endtime of export") and len(cells) > 1:
+                    try:
+                        got[key] = int(cells[1].strip())
+                    except ValueError:
+                        return None
+    except OSError:
+        return None
+    if "starttime of export" not in got or "endtime of export" not in got:
+        return None
+    return got["starttime of export"], got["endtime of export"]
+
+
+def filetime_iso(ft: int) -> str:
+    import datetime as _dt
+    return (_dt.datetime(1601, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=ft // 10)).isoformat(
+        timespec="milliseconds")
 
 
 def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool = False, timeout_s: float = 600,

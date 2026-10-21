@@ -301,3 +301,125 @@ async def test_m1_rec_stop_right_after_an_end_of_its_own_says_that_end(monkeypat
             seen.append((out.get("stop_reason"), link.get("finished_by"), link.get("recording_ended")))
     for reason, fb, ended in seen:
         assert fb == f"the recording ended by itself ({reason})" and ended["stop_reason"] == reason, seen
+
+
+# ---- N186 (0.8.16 retest): Scope in Reply refuses StartRecord; an earlier capture never becomes this recording's ------
+
+def _view_log(tmp_path, cfg):
+    log = tmp_path / "TE130X" / "TcScopeView.log"
+    log.parent.mkdir(exist_ok=True)
+    log.write_text("(2026-10-21-22:40:00:000)[ INFO ] Scope View: start\n", encoding="utf-8")
+    cfg.scope.view_log = str(log)
+    return log
+
+
+def _logs(log, line):
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+@pytest.mark.anyio
+async def test_n186_a_start_scope_refused_in_reply_is_not_started(monkeypatch, project_dir, fake_xae, tmp_path):
+    """StartRecord returned 1 and TE130x logged 'Invalid ScopeState! Config requested, actual- Reply' — 0.8.16 said
+    'started: true', and at the end saved and signed the previous capture as this recording's."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    log = _view_log(tmp_path, cfg)
+
+    def start():
+        fake_xae.calls.append("start")
+        _logs(log, "(2026-10-21-22:43:32:332)[ ERROR ] Scope View: Invalid ScopeState! Config requested, actual- Reply")
+        return 1
+    monkeypatch.setattr(fake_xae, "StartRecord", start)
+    srv = build_server(cfg)
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    e = r["scope"]["error"]
+    assert e.startswith("Scope recording NOT started: Scope refused StartRecord — it is in state Reply") and \
+        "do not repeat rec_start" in e and r["scope"]["scope_state"] == "Reply", r["scope"]
+    assert st["scope"]["state"] == "finished" and "NOT started" in st["scope"]["error"], st["scope"]
+    assert fake_xae.calls == ["start"] and "NOT started" in out["scope"]["error"], (fake_xae.calls, out["scope"])
+    sd = app.rec.root / "scope"
+    assert not sd.is_dir() or not any(p.name.startswith(r["id"]) for p in sd.iterdir())
+
+
+@pytest.mark.anyio
+async def test_n186_a_start_the_log_confirms_is_said_so(monkeypatch, project_dir, fake_xae, tmp_path):
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    log = _view_log(tmp_path, cfg)
+    orig = fake_xae.StartRecord
+
+    def start():
+        _logs(log, "(2026-10-21-22:50:00:000)[ INFO ] Scope View: Scope Project state changes from 'Config' to 'Record'")
+        return orig()
+    monkeypatch.setattr(fake_xae, "StartRecord", start)
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        await s.call_tool("rec_stop", {"id": r["id"]})
+    assert r["scope"]["started"] is True and r["scope"]["start_check"].startswith("confirmed by the Scope View log"), \
+        r["scope"]
+    assert "result_note" not in r["scope"], r["scope"]
+
+
+@pytest.mark.anyio
+async def test_n186_scope_record_start_refused_is_an_error(monkeypatch, project_dir, fake_xae, tmp_path):
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    log = _view_log(tmp_path, cfg)
+
+    def start():
+        _logs(log, "(2026-10-21-22:45:43:000)[ ERROR ] Scope View: Invalid ScopeState! Config requested, actual- Reply")
+        return 1
+    monkeypatch.setattr(fake_xae, "StartRecord", start)
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        r = await s.call_tool("scope_record", {"action": "start"})
+    assert r.is_error and "Scope refused StartRecord — it is in state Reply" in text(r) and "rec_start" not in text(r), \
+        text(r)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("clock", ["pc", "plc", "fresh"])
+async def test_n186_an_earlier_capture_is_never_linked_as_this_recordings(monkeypatch, project_dir, fake_xae, clock):
+    """Defence behind the start check: the CSV Scope exports says when its data was recorded — data that ends minutes
+    before the recording's first sample is an earlier capture: kept, not linked to the recording, not sealed."""
+    install(monkeypatch)
+
+    def export(path):
+        fake_xae.calls.append("csv")
+        now_ft = int((time.time() + 11_644_473_600) * 10_000_000)
+        # 335 s before the recording began (the retest: 5.6 min); 'fresh': the data of this recording
+        end = now_ft - (0 if clock == "fresh" else 335 * 10_000_000)
+        start_ = end - 41_000_000
+        Path(path).write_text(
+            f"Name\t20261021-224543-7dd7\t\nFile\t{path}\t\n"
+            f"Starttime of export\t{start_}\t21 October 2026\t22:40:04.001\n"
+            f"Endtime of export\t{end}\t21 October 2026\t22:40:08.100\n\n\nName\tGVL.x\n1\t2\n", encoding="utf-8")
+        return 0
+    from pathlib import Path
+    from twincat_mcp import recorder as R
+    monkeypatch.setattr(fake_xae, "ExportCSV", export)
+    if clock == "plc":                                     # a recording with PLC time (cycle / change mode)
+        plc_t0 = int((time.time() + 11_644_473_600) * 10_000_000)
+        monkeypatch.setattr(R.Recorder, "t0_filetime", lambda self, rid: plc_t0)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "poll", "cycle_ms": 20,
+                                                     "max_events": 5, "also_scope": True}))
+        assert await _until(lambda: app.scope_parts[r["id"]].state == "finished", n=200)
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    sc = out["scope"]
+    sd = app.rec.root / "scope"
+    if clock == "fresh":
+        assert sc["link"]["files"] and "not_this_recording" not in sc, sc
+        return
+    assert "link" not in sc and sc["not_this_recording"].endswith("an earlier capture Scope still held"), sc
+    assert ("before StartRecord ran (this PC's clock" if clock == "pc" else
+            "s before the recording's first sample") in sc["not_this_recording"], sc
+    assert not (sd / f"{r['id']}.scope.json").exists() and not is_read_only(sd / f"{r['id']}.svdx")

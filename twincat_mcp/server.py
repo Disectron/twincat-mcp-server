@@ -908,9 +908,15 @@ class App:
             if isinstance(getattr(be, "acted", None), list):
                 be.acted = []
                 box["acted"] = be.acted            # the actions that ran in this call (the worker fills it)
+            if isinstance(getattr(be, "msg_reads", None), list):
+                be.msg_reads = []
+            if isinstance(getattr(be, "calls_ok", None), int):
+                be.calls_ok = 0
             try:
                 res = fn(*a2, **kw2)
             except XaeError as exc:
+                # N181b: how many COM calls of this call ran before the error — taken here, in the worker that ran them
+                exc.calls_ok = getattr(be, "calls_ok", None)
                 earlier = [m for m in (be.messages if keep else []) if not m.get("failed") and m.get("messages")]
                 if earlier:            # review of 0.8.16: what the call's earlier steps logged, not only the last one's
                     more = " — XAE messages of the steps before it: " + "; ".join(
@@ -922,6 +928,13 @@ class App:
                 raise
             if keep and be.messages and isinstance(res, dict):
                 res = {**res, "xae_messages": list(be.messages)}
+            reads = [m for m in (getattr(be, "msg_reads", None) or []) if not m.get("read") or m.get("empty")]
+            if reads and isinstance(res, dict):
+                # N188 (0.8.16 retest): an action whose buffer gave nothing says so — read and empty, or not read
+                res = {**res, "xae_messages_note": "; ".join(
+                    f"{m['action']}: " + ("XAE's message buffer was read — empty" if m.get("read") else
+                                         f"XAE's message buffer was not read ({m.get('why')})") for m in reads)}
+            box["calls_ok"] = getattr(be, "calls_ok", None)
             return res
         run.__name__ = job                 # the worker names the job (busy / timeout messages) by it
         try:
@@ -944,8 +957,12 @@ class App:
             msg = str(exc)
             low = msg.lower()
             if isinstance(exc, XaeBusy) and exc.dialog is not None:
-                # N181 (0.8.15 retest): the backend named the dialog; what the refusal means depends on this tool
-                msg = XaeBusy.blocked_text(exc.what, exc.dialog, _READ_ONLY_CALL.get()) + getattr(exc, "steps_note", "")
+                # N181 (0.8.15 retest): the backend named the dialog; what the refusal means depends on this tool.
+                # N181b (0.8.16 retest): refused at the first COM call of the tool — nothing of it ran
+                first = getattr(exc, "calls_ok", None) == 0 and not any(
+                    st.get("acted") or (st.get("calls_ok") or 0) > 0 for st in (_XAE_STEPS.get() or []))
+                msg = (XaeBusy.blocked_text(exc.what, exc.dialog, _READ_ONLY_CALL.get(), nothing_ran=first)
+                       + getattr(exc, "steps_note", ""))
             elif "blocked by dialog" in low:
                 pass                                   # the backend already named the dialog
             elif isinstance(exc, XaeBusy):
@@ -974,7 +991,7 @@ class App:
                            + await asyncio.to_thread(self._timeout_cause, _READ_ONLY_CALL.get())) from exc
         steps = _XAE_STEPS.get()
         if steps is not None:
-            steps.append({"job": job, "acted": list(box["acted"]),
+            steps.append({"job": job, "acted": list(box["acted"]), "calls_ok": box.get("calls_ok"),
                           "messages": [m for m in (res.get("xae_messages") or []) if isinstance(m, dict)]
                           if isinstance(res, dict) else []})
         if isinstance(res, dict):
@@ -3276,11 +3293,57 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # retries for up to com_retry_s)
         run.update(scope=r["scope"], start_result=r.get("result_code"),
                    started=dt.datetime.now(dt.timezone.utc).isoformat())
+        state, how = await _start_check(mark)
+        if state is not None:
+            # N186 (0.8.16 retest): StartRecord returned 1 and Scope did not record — it was still in Reply with the
+            # previous recording; that capture was then saved and signed as this recording's
+            err = _start_refused_text(state, how, r.get("result_code"), rid)
+            part.not_started(err)
+            app.audit("scope_start", {"id": rid, "scope": r["scope"]}, OpClass.EDIT, "error", f"Scope in {state}")
+            return {"error": err, "scope_state": state}
+        run["start_check"] = how
         part.begin()
         app.audit("scope_start", {"id": rid, "scope": r["scope"]}, OpClass.EDIT, "ok")
-        return {"started": True, **r, "note": "Scope records independently (its own ADS acquisition and timestamps); "
-                                              "it is stopped, saved and exported when the recording ends — by itself "
-                                              "(duration, stop_when, post_trigger, max_events …) or at rec_stop"}
+        r = {k: v for k, v in r.items() if k != "result_note"}     # N186: StartRecord's 1 is not what tells
+        return {"started": True, **r, "start_check": how,
+                "note": "Scope records independently (its own ADS acquisition and timestamps); it is stopped, saved and "
+                        "exported when the recording ends — by itself (duration, stop_when, post_trigger, max_events …) "
+                        "or at rec_stop"}
+
+    SCOPE_START_CHECK_S = 2.0
+    # N186: what the Scope View logs when StartRecord is refused ('Invalid ScopeState! Config requested, actual- Reply')
+    # or when the start goes ahead (the Scope project leaves Config)
+    _START_SEEN = re.compile(r"Invalid\s+ScopeState!\s*Config requested,\s*actual\W*(\w+)|"
+                             r"Scope Project state changes from 'Config' to '(\w+)'", re.I)
+
+    async def _start_check(mark: dict[str, Any] | None) -> tuple[str | None, str]:
+        """N186 (0.8.16 retest): StartRecord's return value does not tell (1 when Scope records, 1 when it refused) —
+        the Scope View log does. -> (the state Scope refused the start in, its log line) or (None, how the start was
+        checked). Waits up to SCOPE_START_CHECK_S for either line."""
+        from . import scope as S
+        t_end = time.monotonic() + SCOPE_START_CHECK_S
+        while True:
+            found = await asyncio.to_thread(S.log_find_since, mark, _START_SEEN)
+            if found is None:
+                return None, "the Scope View log could not be read: whether Scope accepted StartRecord is not known"
+            for _f, ln in found:
+                m = _START_SEEN.search(ln)
+                if m and m.group(1):
+                    return m.group(1), ln[:300]
+                if m:
+                    return None, f"confirmed by the Scope View log: {ln[:200]}"
+            if time.monotonic() >= t_end:
+                return None, (f"no line of the Scope View log within {SCOPE_START_CHECK_S:g} s confirms or refuses the "
+                              "start")
+            await asyncio.sleep(0.2)
+
+    def _start_refused_text(state: str, line: str, rc: Any, rid: str | None) -> str:
+        return (f"Scope recording NOT started: Scope refused StartRecord — it is in state {state}, not Config "
+                f"(Scope View log: {line!r}; StartRecord returned {rc}). Scope still holds an earlier recording: save it "
+                "in XAE's Scope View if it is needed, then Disconnect there (it discards what Scope holds) — Scope is "
+                "back in Config and records again."
+                + (f" The ADS recording {rid} runs regardless — do not repeat rec_start (it would start a second "
+                   "recording)." if rid else ""))
 
     SCOPE_WATCH_S = 0.5
 
@@ -3685,6 +3748,35 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 return {"bytes": now, "grew_after_save": True, "still_growing_after_s": round(limit_s, 1),
                         "warning": "the .svdx was still being written — the CSV may lack its end"}
 
+    SCOPE_STALE_S = 30.0
+
+    def _scope_not_this(rid: str, run: dict[str, Any], csv: Path) -> str | None:
+        """N186: why the Scope CSV just saved is not this recording's — its data ends more than SCOPE_STALE_S before
+        the recording's first sample (the target's clock, as Scope's) and before StartRecord ran (this PC's clock);
+        None when it is, or when that cannot be told (no CSV header, no sample yet)."""
+        from . import scope as S
+        span = S.csv_span(csv) if csv.is_file() else None
+        if span is None:
+            return None
+        t0 = app.rec.t0_filetime(rid)
+        end, tol = span[1], int(SCOPE_STALE_S * 1e7)
+        try:
+            host = int((dt.datetime.fromisoformat(run["started"]) - dt.datetime(1601, 1, 1, tzinfo=dt.timezone.utc))
+                       .total_seconds() * 1e7) if run.get("started") else None
+        except (TypeError, ValueError):
+            host = None
+        if t0 is not None:
+            # the recording's first sample (the target's clock, as Scope's) and StartRecord (this PC's): both say old
+            if end >= t0 - tol or (host is not None and end >= host - tol):
+                return None
+            return (f"its data ends at {S.filetime_iso(end)}, {(t0 - end) / 1e7:.0f} s before the recording's first "
+                    f"sample ({S.filetime_iso(t0)}) — an earlier capture Scope still held")
+        if host is None or end >= host - tol:
+            return None                    # no PLC time (poll mode, no sample yet): StartRecord's time on this PC only
+        return (f"its data ends at {S.filetime_iso(end)}, {(host - end) / 1e7:.0f} s before StartRecord ran (this PC's "
+                "clock — the recording has no PLC time; the target's clock may differ) — an earlier capture Scope "
+                "still held")
+
     async def _kept(rid: str, save: bool) -> bool:
         """Whether Scope's files are saved with the recording: not for one that was deleted — a delete under way
         (rec_delete, also one whose call has gone) has its outcome first."""
@@ -3739,7 +3831,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 out["scope_stopped"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
                 return out
             out.update(await _scope_save(run["name"], svdx, csv, mark=run.get("log_mark")))
-            if await _kept(rid, True):
+            stale = await asyncio.to_thread(_scope_not_this, rid, run, csv)
+            if stale:
+                # N186 (0.8.16 retest): an earlier capture Scope still held was saved and signed as this recording's
+                out["not_this_recording"] = stale
+                out["note"] = (f"the Scope data saved is not this recording's: {stale} — its files are kept, not linked "
+                               "to the recording nor sealed")
+                app.audit("scope_finish", {"id": rid, "scope": run["scope"], "linked": False}, OpClass.EDIT, "error",
+                          stale)
+            elif await _kept(rid, True):
                 out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv, out.get("svdx_incomplete"))
                 app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
                           OpClass.EDIT, "ok")
@@ -4284,7 +4384,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         log's new ERROR / FATAL lines).
         scope = its name when several are open. Affects only the Scope recording, not the PLC."""
         if action in ("start", "stop"):
+            from . import scope as S
+            mark = await asyncio.to_thread(S.log_mark, _view_log()) if action == "start" else None
             r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
+            if action == "start":
+                state, how = await _start_check(mark)
+                if state is not None:
+                    err = _start_refused_text(state, how, r.get("result_code"), None)
+                    app.audit("scope_record", {"action": action, "scope": scope}, OpClass.EDIT, "error", err)
+                    raise ToolError(err)
+                r = {k: v for k, v in r.items() if k != "result_note"}
+                r["start_check"] = how
         elif action == "save":
             from . import scope as S
             base = app.out_path(str(Path(path).with_suffix(".svdx")), False, "scope file").with_suffix("") if path else _scope_dir() / (
