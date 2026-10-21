@@ -123,7 +123,7 @@ If `claude plugin configure` also refuses, the options are plain environment var
 **Pre-build the venv now** (optional but recommended — it removes the one-minute first-start wait from §5):
 
 ```powershell
-python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.15\scripts\launch.py" --no-run
+python "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.16\scripts\launch.py" --no-run
 ```
 (the version folder changes with each plugin version; `dir $env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp` lists it.)
 
@@ -357,8 +357,8 @@ GitHub release (`twincat-mcp-<version>-windows-x64.zip`, `.mcpb`, `SHA256SUMS`).
 or the virus scanner quarantines it, allow it or set `[recorder] engine = "python"`.
 
 ```powershell
-$exe = "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.15\twincat_mcp\bin\tcmcp-capture.exe"
-& $exe --version      # {"version": "0.8.15", ... "ads": "Beckhoff AdsLib on TcAdsDll ..."}
+$exe = "$env:USERPROFILE\.claude\plugins\cache\twincat-mcp\twincat-mcp\0.8.16\twincat_mcp\bin\tcmcp-capture.exe"
+& $exe --version      # {"version": "0.8.16", ... "ads": "Beckhoff AdsLib on TcAdsDll ..."}
 & $exe --selftest     # six "ok" lines
 ```
 
