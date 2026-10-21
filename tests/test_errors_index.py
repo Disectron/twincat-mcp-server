@@ -795,7 +795,7 @@ def test_lookup_reads_codes_names_and_text_and_refuses_bad_input(kb):
     assert lookup(kb, "LabVIEW error 0xFFFFE504")["matches"][0]["value"] == -6908
     d = lookup(kb, "diag code #x4101")["matches"][0]
     # re-review of 0.8.16: two devices word #x4101 differently — no one text is its meaning (hw_diag with device=)
-    assert d["domain"] == "ethercat_diag" and d["messages"] == 2 and "text" not in d and d["texts"] == 2, d
+    assert d["domain"] == "ethercat_diag" and d["messages"] == 2 and "text" not in d and d["device_texts"] == 2, d
     assert "hw_diag" in d["see"]
     al = lookup(kb, "AL status code 0x001B")["matches"][0]
     assert al["domain"] == "ethercat_al" and al["ref"] == "EtherCAT_System_Documentation.pdf#p123", al
@@ -1289,3 +1289,73 @@ def test_rereview_0816_an_enum_on_a_page_about_something_else_is_no_code_table()
           "    ERR_B := 16#4A01, (* table not found *)\n    ERR_C := 16#4A02\n) UDINT;\nEND_TYPE\n```"
     assert [(r["symbol"], r["text"]) for r in X.parse_code_enums(md2, "E_CamErr")] == [
         ("ERR_A", None), ("ERR_B", "table not found"), ("ERR_C", None)]
+
+
+# ------------------------------------------------------------------------------------------------ third review of 0.8.16
+SHIFTED = """# Support Return Codes
+
+| error value | symbol | Error description | Remedy option |
+|---|---|---|---|
+| 16#00001414 | 5140 | TF3710_ERR_INVALID_REQUEST | The request is not currently supported |
+| 16#00001415 | 5141 | TF3710_ERR_BETA_TRIAL_EXPIRED | Beta trial period has expired |
+| 16#00001416 | 5142 | TF3710_ERR_LICENSE_STATE_ISSUE | The license state is not valid |
+"""
+
+
+def test_review3_0816_a_header_shifted_against_its_cells_is_read_by_the_cells():
+    """Third review of 0.8.16: TF3710's 'error value | symbol | Error description | Remedy option' sits over hex |
+    decimal | symbol | text — 70 LabVIEW codes had the symbol '5140' and their name as the text."""
+    t = X.parse_table([[c.strip() for c in ln.strip().strip("|").split("|")] for ln in SHIFTED.splitlines()
+                       if ln.startswith("|") and not ln.startswith("|---")])
+    r = t["rows"][0]
+    assert (r["value"], r["symbol"], r["text"]) == (0x1414, "TF3710_ERR_INVALID_REQUEST",
+                                                    "The request is not currently supported"), t
+
+
+def test_review3_0816_doc_note_counts_every_domain_before_it_drops_a_textless_one(kb, tmp_path):
+    """Third review of 0.8.16 (1): the ESI row of a text id with several texts was dropped BEFORE the several-domains
+    check — doc_note then picked the other domain ('error 0x100F': ads appended though ESI has it too)."""
+    app = _app(tmp_path, kb)
+    rows = [{"domain": "ads", "hex": "0x6", "symbol": "ERR_TARGETPORTNOTFOUND", "text": "Target port not found."},
+            {"domain": "ethercat_diag", "hex": "#x0006", "device_texts": 4}]
+    app.kb.documented = lambda msg: rows
+    assert app.doc_note("error 0x0006") == "error 0x0006"
+
+
+def test_review3_0816_names_reads_and_counts(kb, tmp_path):
+    """Third review of 0.8.16: (3) the Winsock family is WSA… (WSASYSNOTREADY), a capitals word of a domain the message
+    names is its symbol, the whole query may end in a period; (6) a hex number after 'errors' is a code (a count is
+    decimal); (7) 'win32 error WSAETIMEDOUT' is answered for win32 only; (11) a hex number after 'System Manager' is a
+    code; (older) an HRESULT-shaped number is a code anywhere."""
+    kw = winsock_kb(tmp_path)
+    assert lookup(kw, "WSAEINTR.")["matches"][0]["symbol"] == "WSAEINTR"
+    r = lookup(kb, "errors: 0x745")
+    assert r["documented"] is True and r["matches"][0]["symbol"] == "ADSERR_CLIENT_SYNCTIMEOUT", r
+    r = lookup(kb, "win32 error WSAETIMEDOUT")
+    assert [m["domain"] for m in r["matches"]] == ["win32"] and r["other_domains_note"].startswith(
+        "the message names win32"), r
+    r = lookup(kb, "System Manager: 0x98110745")
+    assert r["documented"] is True and r["matches"][0]["symbol"] == "ADSERR_CLIENT_SYNCTIMEOUT", r
+    r = lookup(kb, "ConsumeXml failed (0x98110745)")
+    assert r["documented"] is True and r["matches"][0]["hex"] == "0x745", r
+
+
+def test_review3_0816_infosys_search_reads_negative_codes(kb, tmp_path):
+    """Third review of 0.8.16 (8): 'error -6908' gave no code_lookup, and a table row '| 0xFFFFE504 | -6908 |' was not
+    the code's definition."""
+    from twincat_mcp import docsearch as DS
+    assert DS.code_forms("error -6908")["value"] == -6908
+    assert DS.definition_score("| 0xFFFFE504 | -6908 | ERR_NOERROR | No error. |", -6908) == 2
+    assert [e["domain"] for e in _app(tmp_path, kb).code_lookup("LabVIEW error -6908")] == ["labview"]
+
+
+def test_review3_0816_kb_search_keeps_the_device_pointer_and_says_the_plugin_note_s_space(kb, tmp_path):
+    """Third review of 0.8.16: (9) an ESI text id of several texts lost its pointer (texts_note) in kb_search; (10) the
+    plugin's ADS note named the code although the documentation has it in several domains."""
+    from twincat_mcp import knowledge as K
+    k = K.Knowledge(tmp_path / "home", str(kb))
+    r = k.search("EtherCAT diagnosis code 0x4101")
+    d = r["known_error"]["documented"][0]
+    assert d["device_texts"] == 2 and "hw_diag" in d["texts_note"], d
+    r = k.search("read failed: error 1808")
+    assert "documented in" in r["known_error"].get("code_note", ""), r["known_error"]

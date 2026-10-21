@@ -2358,6 +2358,17 @@ def is_tc2_book(book: str) -> bool:
     return any(r.search(book) for r in TC2_BOOK_RES)
 
 
+# TwinCAT 2 supplement books the local package does not ship, so only the online search meets them (third review of
+# 0.8.16: 'ts6100_tc2_opcua_configurator', 'ts6340_tc2_serial', 'tcdbserver', 'tcsmssmtpsrv'). Kept apart from
+# TC2_BOOK_RES on purpose: that table is part of the Infosys index's format (tests/test_formats.py) and these books
+# change nothing stored — they go into it with its next format change.
+TC2_SUPPLEMENT_RE = re.compile(r"^ts\d+_tc2_|^tcdbserver$|^tcsmssmtpsrv$")
+
+
+def is_tc2_supplement(book: str) -> bool:
+    return bool(TC2_SUPPLEMENT_RE.search(book))
+
+
 def book_category(book: str) -> str:
     if book.startswith("tcplclib_"):
         return "plc-library"
@@ -3536,7 +3547,10 @@ class InfosysIndex:
         [{'error': …}] when the search cannot be reached."""
         url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(f"site:infosys.beckhoff.com {q}")
         try:
-            raw = self.fetch.get(url, allow_hosts=DDG_HOSTS).decode("utf-8", errors="replace")
+            # third review of 0.8.16: its own short timeout — the index's fetcher waits 20 s twice, and the thread a
+            # caller gave up on kept running that long
+            fetch = self.fetch if not isinstance(self.fetch, Fetcher) else Fetcher(min(self.fetch.timeout_s, 5.0))
+            raw = fetch.get(url, allow_hosts=DDG_HOSTS).decode("utf-8", errors="replace")
         except InfosysError as exc:
             return [{"error": f"the online search is not reachable: {exc}"}]
         local: dict[str, str] = {}
@@ -3568,7 +3582,7 @@ class InfosysIndex:
             if f"infosys.beckhoff.com/content/{LANG}/" not in href:
                 continue
             b = book_of(href)
-            if not b or not self.book_allowed(b[0]):
+            if not b or not self.book_allowed(b[0]) or is_tc2_supplement(b[0]):
                 continue
             if any(o["url"] == href for o in out):
                 continue

@@ -235,6 +235,9 @@ DOMAINS: dict[str, dict[str, Any]] = {
                      # in nearly every XAE error and named this domain the only answer ('ITcSysManager::Activate…
                      # failed: HRESULT 0x98110745' lost ADS 0x745); its codes are found by value and by TSM_E_ symbol
                      "names": (),
+                     # a hex number right after these is a code (third review: 'System Manager: 0x98110745') — of
+                     # whichever domain has it
+                     "hex_after": ("automation interface", "system manager", "itcsysmanager", "tcsysmanager"),
                      "hints": ("xae", "treeitem", "tree", "item", "consumexml", "lookuptreeitem")},
     "nc": {"title": "NC errors", "origin": "infosys", "priority": 3, "books": ("tc3ncerrcode",), "error_book": True,
            "names": ("nc", "ncerror", "ncerr"),
@@ -456,6 +459,17 @@ def parse_table(rows: list[list[str]], label: str = "") -> dict[str, Any]:
                 parser = "header+content"
             else:
                 del cols[i]
+    # third review of 0.8.16: a header shifted against its cells (TF3710's 'error value | symbol | Error description |
+    # Remedy option' over '16#00001414 | 5140 | TF3710_ERR_INVALID_REQUEST | The request is …') — 70 LabVIEW codes had
+    # the symbol '5140' and their name as the text. A symbol column of numbers is a decimal one; a text column of names
+    # is then the symbol column, and the text the prose column after it
+    for i, m in list(cols.items()):
+        if m == "symbol" and data and rate(i, lambda c: bool(re.fullmatch(r"-?\d+", c.strip()))) >= 0.8:
+            cols[i] = "dec"
+            parser = "header+content"
+            for j, mj in list(cols.items()):
+                if mj == "text" and rate(j, lambda c: bool(re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", c.strip()))) >= 0.8:
+                    cols[j] = "symbol"
     if not any(m in _VALUE_KINDS for m in cols.values()) and data:
         # no header says which column holds the code: the column whose cells are numbers (and only that one)
         nums = [i for i in range(width) if i not in cols
@@ -1500,13 +1514,19 @@ _NAME_TOKEN = re.compile(r"(?<![\w#])[A-Za-z_][A-Za-z0-9_]{2,}(?![\w#])")
 _PYADS = re.compile(r"\badserror\b\s*:[^\n]{0,200}?\((-?\d+)\)", re.I)        # pyads: 'ADSError: symbol not found (1808).'
 
 
+# an HRESULT written as one: 0x8…/0x9…/0xC… with 8 hex digits ('ConsumeXml failed (0x98510004)') — a code wherever it
+# stands (third review of 0.8.16); an address or an index is written otherwise
+_HRESULT_TOKEN = re.compile(r"0x[89ACac][0-9A-Fa-f]{7}")
+
+
 def _after_domain_name(q: str, start: int) -> bool:
     """The token at q[start:] stands right after a domain's name ('AL status 0x0011', 'ADS 0x745', 'NC 0x4221')."""
     pre = q[:start]
     if not re.search(r"[\s:=#(]$", pre):
         return False
     nw = _norm_words(pre)
-    return any(nw.endswith(f" {n} ") for d in DOMAINS.values() for n in d.get("names", ()))
+    return any(nw.endswith(f" {n} ") for d in DOMAINS.values() for n in tuple(d.get("names", ()))
+               + tuple(d.get("hex_after", ())))
 
 
 def read_query(q: str) -> dict[str, Any]:
@@ -1519,7 +1539,8 @@ def read_query(q: str) -> dict[str, Any]:
     qt = DS.query_text(q)
     toks = DS.code_tokens(qt, min_digits=1, hex_anywhere=True)
     codes = [{"token": t["token"], "value": t["value"], "how": t["how"]} for t in toks
-             if t["how"] == "dec" or t["whole"] or t["next_to_code_word"] or _after_domain_name(qt, t["start"])]
+             if t["how"] == "dec" or t["whole"] or t["next_to_code_word"] or _after_domain_name(qt, t["start"])
+             or _HRESULT_TOKEN.fullmatch(t["token"])]
     for m in _PYADS.finditer(q):
         if all(c["value"] != int(m.group(1)) for c in codes):
             codes.append({"token": m.group(1), "value": int(m.group(1)), "how": "dec"})
@@ -1603,16 +1624,20 @@ def _domain_filter(domain: str | None, doms: dict[str, dict[str, Any]]) -> list[
     return hit
 
 
-CAPS_FAMILY_MIN = 10        # capitals-only symbols sharing their first four letters in one domain: a family (WSAE…)
+CAPS_FAMILY_MIN = 10        # capitals-only symbols sharing their first three letters in one domain: a family (WSA…)
 
 
-def _caps_symbol(con: sqlite3.Connection, token: str, query: str) -> bool:
-    """A word in capitals without '_' (WSAETIMEDOUT) is a code's name when it is the whole query, or when it belongs to
-    a family of such symbols in one domain (Winsock's 54 WSAE… names) — not when it is a library's one-word symbol that
-    is also a word of any log line (TIMEOUT, INTERNAL, NOMEMORY)."""
-    if query.strip().upper() == token.upper():
+def _caps_symbol(con: sqlite3.Connection, token: str, query: str, named: list[str] | None = None) -> bool:
+    """A word in capitals without '_' (WSAETIMEDOUT) is a code's name when it is the whole query (quotes and a final
+    period aside), a symbol of a domain the message names ('labview TIMEOUT', 'NC: AXISNOTENABLED'), or a member of a
+    family of such symbols in one domain (Winsock's 54 WSA… names: WSAETIMEDOUT, WSASYSNOTREADY) — not when it is a
+    library's one-word symbol that is also a word of any log line (TIMEOUT, INTERNAL, NOMEMORY)."""
+    if re.sub(r"[^\w]", "", query).upper() == token.upper():
         return True
-    pre = token[:4].lower()
+    if named and con.execute("SELECT 1 FROM alias WHERE kind = 'symbol' AND form = ? AND domain IN (%s) LIMIT 1"
+                             % ",".join("?" * len(named)), (token.lower(), *named)).fetchone():
+        return True
+    pre = token[:3].lower()
     for (n,) in con.execute("SELECT MAX(c) FROM (SELECT domain, COUNT(DISTINCT form) AS c FROM alias WHERE kind = "
                             "'symbol' AND form LIKE ? ESCAPE '\\' AND form NOT GLOB '*[^a-z]*' GROUP BY domain)",
                             (pre.replace("_", "\\_") + "%",)):
@@ -1725,7 +1750,9 @@ def _diag_out(kb: Path | None, value: int, count: int) -> dict[str, Any]:
                 c = sqlite3.connect(ro_uri(p), uri=True, timeout=5)
                 try:
                     r = c.execute("SELECT message FROM msg WHERE text_id = ? ORDER BY id LIMIT 1", (value,)).fetchone()
-                    n = c.execute("SELECT COUNT(DISTINCT message) FROM msg WHERE text_id = ?", (value,)).fetchone()[0]
+                    # texts that differ in case or a final period only are one (third review: 6 ids)
+                    n = c.execute("SELECT COUNT(DISTINCT lower(rtrim(trim(message), '.'))) FROM msg WHERE text_id = ?",
+                                  (value,)).fetchone()[0]
                 finally:
                     c.close()
                 if r and n == 1:
@@ -1733,7 +1760,7 @@ def _diag_out(kb: Path | None, value: int, count: int) -> dict[str, Any]:
                 elif r:
                     # re-review of 0.8.16: 1473 of 3028 text ids have other texts on other devices (#x4101: 16) — the
                     # first one annotated another device's error as the documented meaning
-                    out["texts"] = n
+                    out["device_texts"] = n
                     out["texts_note"] = (f"{n} different texts on different devices — the device's own: "
                                          f"hw_diag(code='#x{value:04X}', device=…)")
             except sqlite3.Error:
@@ -1824,7 +1851,7 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
         sym_domains: set[str] = set()
         known_caps = []
         for n in read["names"] + read["caps"]:
-            if n in read["caps"] and not _caps_symbol(con, n, q):
+            if n in read["caps"] and not _caps_symbol(con, n, q, named):
                 # re-review of 0.8.16: 'TIMEOUT', 'INTERNAL', 'NOMEMORY' are symbols of some library table and words of
                 # every log line ('[ ERROR ] TIMEOUT while waiting' answered LabVIEW 0xFFFFDDEB) — not a code's name
                 continue
@@ -1838,10 +1865,13 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
             if hit and n in read["caps"]:
                 known_caps.append(n)
             if hit:
-                # a symbol names the code space it belongs to: of the domains that have it, the general one
-                # (ADSERR_CLIENT_SYNCTIMEOUT is ads 0x745; the LabVIEW table numbers the same symbol its own way —
-                # listed apart, in other_domains)
-                sym_domains.add(min(hit, key=lambda d: (doms.get(d, {}).get("priority", 10), d)))
+                # a symbol names the code space it belongs to: a domain the message names, else of the domains that have
+                # it the general one (ADSERR_CLIENT_SYNCTIMEOUT is ads 0x745; the LabVIEW table numbers the same symbol
+                # its own way — listed apart, in other_domains). Third review of 0.8.16: 'win32 error WSAETIMEDOUT'
+                # was answered for ads too
+                in_named = [d for d in hit if d in named]
+                if not in_named:
+                    sym_domains.add(min(hit, key=lambda d: (doms.get(d, {}).get("priority", 10), d)))
         if known_caps:                  # a capitalised word the alias table knows is a name of a code (WSAEINTR)
             read = {**read, "names": read["names"] + known_caps}
             out["names"] = read["names"]
@@ -1902,8 +1932,11 @@ def err_lookup(query: str, domain: str | None = None, kb: Path | str | None = No
             out["other_domains"] = [{k: e.get(k) for k in ("domain", "domain_title", "value", "hex", "symbol", "text",
                                                            "ref") if e.get(k) is not None} for e in other[:10]]
             if named:
-                out["other_domains_note"] = (f"the message names {', '.join(named_all)}: the same number in other "
-                                             "domains is listed here, not as the answer")
+                out["other_domains_note"] = (f"the message names {', '.join(named)}"
+                                             + (f" (and its symbol is of {', '.join(sorted(sym_domains))})"
+                                                if sym_domains - set(named) else "")
+                                             + ": the same number or symbol in other domains is listed here, not as "
+                                               "the answer")
             else:
                 # re-review of 0.8.16: 'WSAETIMEDOUT' said 'the message names ads' — the symbol chose it
                 out["other_domains_note"] = (f"the symbol is answered in {', '.join(named_all)} (of the domains that "

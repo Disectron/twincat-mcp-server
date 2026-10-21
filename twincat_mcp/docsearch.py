@@ -492,7 +492,8 @@ def code_forms(query: str) -> dict[str, Any] | None:
     # number is a code. Review of 0.8.14: the query's other numbers do not cancel it ('ADS error 1861 on port 851',
     # 'ADS error 0x745 (1861)' — one code, written twice); two different codes are none
     # re-review of 0.8.16: a negative number that IS the query ('-6908', LabVIEW's 0xFFFFE504) is a code too
-    cands = [(c["token"], c["value"]) for c in code_tokens(query) if not c["token"].startswith("-") or c["whole"]]
+    cands = [(c["token"], c["value"]) for c in code_tokens(query)
+             if not c["token"].startswith("-") or c["whole"] or c["next_to_code_word"]]       # 'error -6908' too
     if len({v for _t, v in cands}) != 1:
         return None
     t, value = cands[0]
@@ -512,9 +513,10 @@ def _next_to_code_word(q: str, start: int, end: int) -> bool:
     after = re.match(r"[\s:)]{1,3}([^\W\d_]+)(\(s\))?", q[end:])
     # review of 0.8.16: a plural after the number counts ('Build: 3 errors, 0 warnings', 'found 0 errors', '1 error(s)',
     # '3 Fehler') — it read as code 3; '1861 error' (singular) names one. 'errors: 3' (the plural before it) counts too
-    if after is not None and (fold(after.group(1)) in _COUNT_WORDS or after.group(2)):
+    counted = not _HEX.match(q[start:end])        # third review: 'errors: 0x745' is a code (a count is decimal)
+    if counted and after is not None and (fold(after.group(1)) in _COUNT_WORDS or after.group(2)):
         after = None
-    if before is not None and fold(before.group(1)) in _COUNT_BEFORE:
+    if counted and before is not None and fold(before.group(1)) in _COUNT_BEFORE:
         before = None
     if any(x is not None and fold(x.group(1)) in _CODE_WORDS for x in (before, after)):
         return True
@@ -530,7 +532,7 @@ def _cell_value(cell: str) -> tuple[str, int] | None:
             return "hex", int(m.group(1).replace("_", ""), 16)
         except ValueError:
             return None
-    if re.fullmatch(r"\d+", c):
+    if re.fullmatch(r"-?\d+", c):                     # a negative decimal too (LabVIEW's -6908)
         return "dec", int(c)
     return None
 
@@ -542,7 +544,9 @@ def definition_score(markdown: str | None, value: int) -> int:
     for ln in (markdown or "").splitlines():
         if not ln.startswith("|"):
             continue
-        forms = {f for f, v in filter(None, (_cell_value(c) for c in ln.strip().strip("|").split("|"))) if v == value}
+        # third review of 0.8.16: in 32 bits — '| 0xFFFFE504 | -6908 |' is the row of -6908 and of 0xFFFFE504
+        forms = {f for f, v in filter(None, (_cell_value(c) for c in ln.strip().strip("|").split("|")))
+                 if v & 0xFFFFFFFF == value & 0xFFFFFFFF}
         if {"hex", "dec"} <= forms:
             return 2
         if forms:

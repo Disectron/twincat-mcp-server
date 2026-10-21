@@ -1070,6 +1070,12 @@ class Knowledge:
                 # error 6' → ads ERR_TARGETPORTNOTFOUND) — never one picked silently: all of them, in documented
                 code = (f"{d0['domain']} {d0['hex']} ({d0['dec']}) {d0.get('symbol') or ''}".strip() if len(doms) == 1
                         else f"{d0['hex']} ({d0['dec']}) — documented in {len(doms)} domains: {', '.join(doms)}")
+                if err and len(doms) > 1:
+                    # third review of 0.8.16: the plugin's note is of one code space; the documentation has the code in
+                    # several, and the message does not say which — said, not picked
+                    err = {**err, "code_note": (f"the plugin's note is for {err.get('code')}; the code is documented "
+                                                f"in {len(doms)} domains ({', '.join(doms)}) and the message does not "
+                                                "say which")}
                 err = dict(err) if err else {"code": code}
                 err["documented"] = doc
             names = message_names(q)
@@ -1496,7 +1502,8 @@ class Knowledge:
             r = X.err_lookup(msg, kb=loc, limit=3, fulltext=False)
         except (X.ErrError, sqlite3.Error):
             return None
-        rows = [{k: m[k] for k in ("domain", "value", "hex", "dec", "symbol", "text", "ref", "url") if m.get(k) is not None}
+        rows = [{k: m[k] for k in ("domain", "value", "hex", "dec", "symbol", "text", "ref", "url", "device_texts",
+                                   "texts_note") if m.get(k) is not None}
                 for m in r.get("matches") or [] if m.get("matched_by") in ("value", "hresult", "symbol", "dotnet name")]
         return rows or None
 

@@ -30,7 +30,7 @@ MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes
 ESI_FINGERPRINT = ("2", "49f0ad9346541e7b")    # index\\esi.db (esi_index.py): format 2 — modules found by their
 #                                                 devices (N156, 0.8.14 retest), one object per index of a dictionary
 #                                                 (EL6653, kb_verify E2; format 2 is not released yet); 1 since 0.8.12
-ERRORS_FINGERPRINT = ("1", "54d239d2ae43349b")  # index\\errors.db (errors_index.py): format 1 — 0.8.16 (N125), not
+ERRORS_FINGERPRINT = ("1", "15fb5f4ed366b250")  # index\\errors.db (errors_index.py): format 1 — 0.8.16 (N125), not
 #                                                  released yet: AL codes by section (code.detail), enum code blocks
 
 EXCLUDE = frozenset({

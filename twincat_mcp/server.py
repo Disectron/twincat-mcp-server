@@ -825,36 +825,53 @@ class App:
                 return None
             time.sleep(self.ERRORS_FIRST_WAIT_S)
 
-    def note_error(self, tool: str, error: str | None = None, lines: list[str] | None = None) -> None:
-        """What a tool returned that err_lookup may need later: its error text, or the XAE messages of its result."""
+    def note_error(self, tool: str, error: str | None = None, lines: list[str] | None = None,
+                   result_errors: list[str] | None = None) -> None:
+        """What a tool returned that err_lookup may need later: its error text, the XAE messages of its result, the
+        errors inside a result that succeeded (ads_read_many's per-name ADSError)."""
         rec: dict[str, Any] = {"when": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "tool": tool}
         if error:
             rec["error"] = error[:2000]
         if lines:
             rec["lines"] = [str(x)[:500] for x in lines[:50]]
+        if result_errors:
+            rec["result_errors"] = [str(x)[:500] for x in result_errors[:20]]
         if len(rec) > 2:
             self.recent_errors.append(rec)
 
     ERR_LOG_PICK = 3                       # entries of the error log err_lookup offers for a question without a code
 
+    # words of every symbol path or error text: sharing one says nothing ('MAIN' in 'MAIN.nCounter' and 'MAIN.fbAxis')
+    _WEAK_WORDS = frozenset("main gvl gvls prg program plc task instance fb fbs the a an of on in to is not why does do "
+                            "did what when how fails failed fail failing error errors".split())
+    # a question about the newest error ('what does the last error mean?') — it shares no word with it
+    _LAST_ERROR = re.compile(r"\b(?:last|latest|previous|recent|newest|this|that|the same)\b[\w\s]{0,24}?"
+                             r"\b(?:error|errors|failure|fault|message|problem)\b", re.I)
+
     def _err_log_entries(self, query: str, texts: list[tuple[str, str]], source: str) -> list[dict[str, Any]]:
-        """The texts (newest first: (where, text)) that name a code, ranked by the words they share with the query —
-        each looked up in the errors index (a code read from it, never from a shared word)."""
+        """The texts (newest first: (where, text)) that name a code and are about the question — they hold one of its
+        names whole (MAIN.doesNotExist: 2 each) or one of its informative words (1 each, not 'main' / 'error' …); for a
+        question about the last error the newest. Each looked up in the errors index (a code read from it, never a
+        word). Third review of 0.8.16: 'main' made an unrelated error the answer; 'the last error' found none."""
         from . import docsearch as DS
         from . import errors_index as X
         loc = self.kb.location()[0]
-        words = [w for w in DS.informative_words(query) if not w.isdigit() and w not in X._GENERIC_WORDS]
+        names = {n.lower() for n in re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\b\w*[a-z][A-Z]\w*\b|\b\w+_\w+\b", query)}
+        words = [w for w in DS.informative_words(query) if not w.isdigit() and w not in X._GENERIC_WORDS
+                 and w not in self._WEAK_WORDS]
+        last = bool(self._LAST_ERROR.search(query))
         cands = []
         for k, (where, t) in enumerate(texts):
             read = X.read_query(t)
             if not (read["codes"] or read["names"] or read["caps"] or read["ids"]):
                 continue
             low = t.lower()
-            cands.append((-sum(1 for w in words if w in low), k, where, t))
-        cands.sort()
-        shared = [c for c in cands if c[0] < 0]
+            score = 2 * sum(1 for n in names if n in low) + sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", low))
+            cands.append((-score, k, where, t))
+        shared = sorted(c for c in cands if c[0] < 0)
+        picked = shared[:self.ERR_LOG_PICK] or (cands[:1] if last else [])
         out = []
-        for score, _k, where, t in (shared or cands)[:self.ERR_LOG_PICK]:
+        for score, _k, where, t in picked:
             try:
                 r = X.err_lookup(t, kb=loc, limit=3, fulltext=False)
             except X.ErrError:
@@ -867,16 +884,19 @@ class App:
                 continue
             out.append({"source": source, "where": where, "text": t[:600], "read_as": read_as,
                         "documented": bool(matches), "matches": matches,
-                        "shares_words": -score if shared else 0})
+                        **({"shares_words": -score} if shared else {"newest": True})})
         return out
 
     async def err_from_logs(self, query: str) -> dict[str, Any] | None:
         """0.8.16 (user decision): a question without a code — the code is looked for where errors were seen: first the
         errors this server returned and the XAE messages of its calls (newest first), then — when those name none that
         is documented — the XAE Error List (the TwinCAT logger's messages), read only when XAE is attached."""
-        recs = list(reversed(self.recent_errors))
-        texts = [(f"{r['tool']} {r['when']}", r["error"]) for r in recs if r.get("error")]
-        texts += [(f"{r['tool']} {r['when']} (XAE message)", ln) for r in recs for ln in r.get("lines") or []]
+        texts: list[tuple[str, str]] = []
+        for r in reversed(self.recent_errors):           # newest first, every kind in its place (third review)
+            if r.get("error"):
+                texts.append((f"{r['tool']} {r['when']}", r["error"]))
+            texts += [(f"{r['tool']} {r['when']} (XAE message)", ln) for ln in r.get("lines") or []]
+            texts += [(f"{r['tool']} {r['when']} (in its result)", e) for e in r.get("result_errors") or []]
         entries = await asyncio.to_thread(self._err_log_entries, query, texts, "recent errors of this server")
         note = None
         if not any(e["documented"] for e in entries):
@@ -893,33 +913,67 @@ class App:
         if not entries and note is None:
             return None
         out: dict[str, Any] = {"entries": entries,
-                               "note": ("errors seen before that name a code — what the question may be about, ranked "
-                                        "by the words they share with it; the code is looked up, never a word")}
+                               "note": ("errors seen before that name a code and hold the question's names or words "
+                                        "(shares_words) — or, for a question about the last error, the newest (newest); "
+                                        "the code is looked up, never a word")}
         if not entries:
-            out["note"] = "no error seen before names a code"
+            out["note"] = "no error seen before names a code and is about the question"
         if note:
             out["xae_error_list"] = note
         return out
 
     ONLINE_TIMEOUT_S = 12.0                # the online step of err_lookup gives up after this (no network: no 40 s wait)
 
-    @staticmethod
-    def online_terms(query: str, res: dict[str, Any] | None = None) -> str:
-        """What the online search is sent: the codes read, the message ids, symbol-like names (capitals, digits, '_')
-        and plain words — never the project's own names (MAIN.fbAxis, doesNotExist: mixed case or dotted). Re-review of
-        0.8.16: the whole question went to the search engine, project symbols included."""
+    # public names a question may hold besides the documented ones: products and protocols, and the namespaces of
+    # error names everyone uses (COM / Win32 / Winsock / ADS / TwinCAT runtime)
+    PUBLIC_TERMS = frozenset("twincat ethercat ads ams xae plc nc cnc coe soe foe eoe aoe voe tcp udp ip opc ua mqtt "
+                             "modbus profinet profibus canopen devicenet ethernet tcunit beckhoff".split())
+    PUBLIC_PREFIXES = ("E_", "S_", "RPC_E_", "CO_E_", "DISP_E_", "ERROR_", "WSA", "ADSERR_", "ERR_", "RTERR_",
+                       "TSM_E_")
+
+    def _public_name(self, t: str) -> bool:
+        """A name that is Beckhoff's or everyone's, never the project's own: a code's symbol in the errors index, a
+        symbol or a page title of the Infosys index, a product / protocol, an error name of a public namespace."""
+        if t.lower() in self.PUBLIC_TERMS or (t.isupper() and t.startswith(self.PUBLIC_PREFIXES)):
+            return True
+        loc = self.kb.location()[0]
+        if loc is None:
+            return False
+        from . import errors_index as X
+        from . import kb_layout as L
+        for db, sql in ((L.index_file(loc, "errors"), "SELECT 1 FROM alias WHERE form = ? LIMIT 1"),
+                        (self.kb.infosys_db(loc), "SELECT 1 FROM symbols WHERE name = ? COLLATE NOCASE LIMIT 1"),
+                        (self.kb.infosys_db(loc), "SELECT 1 FROM pages WHERE title = ? COLLATE NOCASE LIMIT 1")):
+            if db is None or not Path(db).is_file():
+                continue
+            try:
+                con = X.connect_ro(Path(db))
+                try:
+                    if con.execute(sql, (t.lower() if "alias" in sql else t,)).fetchone():
+                        return True
+                finally:
+                    con.close()
+            except sqlite3.Error:
+                continue
+        return False
+
+    def online_terms(self, query: str, res: dict[str, Any] | None = None) -> str:
+        """What the online search is sent: the codes read, the message ids, plain words, and names that are Beckhoff's
+        or public (_public_name) — never the project's own (MAIN.fbAxis, FB_DOSING_VALVE, STATE_WAIT_SETTLE: a name the
+        documentation does not know is the project's). Third review of 0.8.16: decided by a word's shape, project names
+        in capitals were sent and Beckhoff's (MC_MoveAbsolute, EtherCAT, ConsumeXml) dropped."""
         res = res or {}
         terms = [c["token"] for c in res.get("read_as") or []] + [m["token"] for m in res.get("message_ids") or []]
         for t in re.findall(r"[^\s,;:()\[\]\"'`]+", query):
             t = t.strip(".?!")
             if not t or t in terms:
                 continue
-            if re.fullmatch(r"[A-Z0-9_]+", t) and re.search(r"[A-Z]", t):
-                terms.append(t)                      # ADSERR_…, E_FAIL, WSAETIMEDOUT, EL3102
-            elif re.fullmatch(r"[a-z]+", t) or re.fullmatch(r"[A-Z][a-z]+", t):
-                terms.append(t)                      # plain words
-            elif re.fullmatch(r"(?:0x|16#|#x)?[0-9A-Fa-f]+", t) and t not in terms:
-                terms.append(t)
+            if re.fullmatch(r"[A-Za-z][a-z]+", t) and t.lower() not in self.PUBLIC_TERMS:
+                terms.append(t)                      # a plain word (a capital at the start of a sentence)
+            elif re.fullmatch(r"(?:0x|16#|#x)?-?[0-9A-Fa-f]+", t) and re.search(r"\d", t):
+                terms.append(t)                      # a number
+            elif "." not in t and re.fullmatch(r"[A-Za-z_][\w]*", t) and self._public_name(t):
+                terms.append(t)                      # EtherCAT, MC_MoveAbsolute, ConsumeXml, E_FAIL, WSAETIMEDOUT
         return " ".join(terms)
 
     async def err_online(self, query: str, res: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -930,12 +984,14 @@ class App:
             return {"skipped": "the docs index is off (docs.enabled = false): no online search"}
         if not self.cfg.docs.web_fallback:
             return {"skipped": "docs.web_fallback = false: no online search"}
-        terms = self.online_terms(query, res)
+        terms = await asyncio.to_thread(self.online_terms, query, res)
         if not terms:
             return {"skipped": "nothing to search for online: the question has no code and no word that is not a "
                                "name of this project"}
         try:
-            items = await asyncio.wait_for(asyncio.to_thread(self.docs.web_search, terms, 5), self.ONLINE_TIMEOUT_S)
+            # its own two threads: a network that drops traffic does not use up the pool every to_thread tool shares
+            items = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(
+                _ONLINE_POOL, self.docs.web_search, terms, 5), self.ONLINE_TIMEOUT_S)
         except (TimeoutError, asyncio.TimeoutError):
             items = [{"error": f"the online search did not answer within {self.ONLINE_TIMEOUT_S:g} s"}]
         return {"source": "online: a site search of infosys.beckhoff.com (DuckDuckGo) — not the local documentation",
@@ -971,15 +1027,14 @@ class App:
         if any((r.get("symbol") and words(r["symbol"]) in said) or (r.get("text") and words(r["text"]).strip()
                                                                       and words(r["text"]) in said) for r in rows):
             return msg
-        rows = [r for r in rows if r.get("text") or r.get("symbol")]      # an ESI text id of many texts: none
-        if not rows:
-            return msg
         if len({r["domain"] for r in rows}) > 1:
             # review of 0.8.16 (user decision): a code of several domains the message does not name is not annotated
             # with one of them — 'CreateFile failed: error 6' got ADS's 0x6 although it is Win32's (spec §6: never pick
             # a domain silently); a message that names its domain ('ADS error 6') has that one only
             return msg
         r = rows[0]
+        if not (r.get("text") or r.get("symbol")):
+            return msg                     # an ESI text id worded differently per device: no one meaning to append
         return (f"{msg} [documented: {r['domain']} {r['hex']}" + (f" {r['symbol']}" if r.get("symbol") else "")
                 + f": {r.get('text') or ''}" + (f" ({r['ref']})" if r.get("ref") else "") + "]")
 
@@ -1008,8 +1063,8 @@ class App:
                           + sorted({m["symbol"] for m in by_name if m.get("symbol")})
                           + [m["token"] for m in r.get("message_ids", [])],
                           "documented": bool(matches) if r.get("documented") is not None else None,
-                          "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref") if m.get(k)}
-                                      for m in matches],
+                          "matches": [{k: m[k] for k in ("domain", "hex", "symbol", "text", "ref", "device_texts",
+                                                          "texts_note") if m.get(k)} for m in matches],
                           **({"note": r["note"]} if r.get("note") and not matches else {})})
         return codes
 
@@ -2459,6 +2514,14 @@ def _com_detail(exc: BaseException, hr: int) -> str:
             + (f": {desc[:300]}" if desc else ""))
 
 
+import concurrent.futures as _cf
+_ONLINE_POOL = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="tcmcp-online")   # err_lookup's online step
+
+# the tools whose errors err_lookup looks through: the target (ads_, rec_, scope_, snap_, ipc_, exp_, test_, tcunit_,
+# wf_), the XAE shell (xae_) and the HMI project (hmi_)
+_ERROR_SOURCES = frozenset("ads rec scope snap ipc exp test tcunit wf xae hmi".split())
+
+
 def _result_errors(res: Any, depth: int = 0, out: list[str] | None = None) -> list[str]:
     """The error texts inside a result ('error': '…' at any depth up to 3, at most 20) — per-item failures of a tool
     that succeeded as a whole."""
@@ -2490,20 +2553,22 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
     @functools.wraps(fn)
     async def run(*args: Any, **kwargs: Any) -> Any:
         # what left the tool, for err_lookup (App.note_error): its error, or the XAE messages of its result
-        note = note_error()
+        # third review of 0.8.16: the errors of the tools that talk to the target, XAE or the project's runtime — not the
+        # plugin's own (a docs search whose web fallback failed made 'getaddrinfo failed' an 'error seen')
+        note = note_error() if name.split("_", 1)[0] in _ERROR_SOURCES else None
         try:
             res = await _run(*args, **kwargs)
         except ToolError as exc:
-            if note is not None and name != "err_lookup":
+            if note is not None:
                 note(name, error=str(exc))
             raise
-        if note is not None and isinstance(res, dict) and name != "err_lookup":
+        if note is not None and isinstance(res, dict):
             lines = [ln for m in res.get("xae_messages") or [] if isinstance(m, dict) for ln in m.get("lines") or []]
             # re-review of 0.8.16: an error inside a result that succeeded (ads_read_many's per-name ADSError 1808) is
-            # an error seen too
-            lines += _result_errors(res)
-            if lines:
-                note(name, lines=lines)
+            # an error seen too — recorded as one, not as an XAE message
+            inner = _result_errors(res)
+            if lines or inner:
+                note(name, lines=lines, result_errors=inner)
         return res
 
     async def _run(*args: Any, **kwargs: Any) -> Any:
@@ -3073,7 +3138,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                     res["from_error_log"] = logs
             # re-review of 0.8.16: only an error that shares the question's words answers it — an unrelated older one
             # (shares_words 0) kept the online search from running
-            if not any(e.get("documented") and e.get("shares_words")
+            if not any(e.get("documented") and (e.get("shares_words") or e.get("newest"))
                        for e in (res.get("from_error_log") or {}).get("entries", [])):
                 res["online"] = await app.err_online(query, res)
         return res

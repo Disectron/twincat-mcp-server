@@ -1863,12 +1863,12 @@ async def test_rereview_0816_the_online_step_sends_no_project_names_and_gives_up
     ONLINE_TIMEOUT_S, not 40 s."""
     import time as _t
     from twincat_mcp.server import App
-    assert App.online_terms("why does reading MAIN.doesNotExist fail with E_FAIL?") == \
-        "why does reading fail with E_FAIL"
-    assert App.online_terms("fbAxis.Execute: 0x4221", {"read_as": [{"token": "0x4221"}]}) == "0x4221"
     cfg = mk_cfg(tmp_path)
     cfg.docs.enabled = False
     app = App(cfg)
+    assert app.online_terms("why does reading MAIN.doesNotExist fail with E_FAIL?") == \
+        "why does reading fail with E_FAIL"
+    assert app.online_terms("fbAxis.Execute: 0x4221", {"read_as": [{"token": "0x4221"}]}) == "0x4221"
 
     class SlowDocs:
         def web_search(self, q, limit=5):
@@ -1901,3 +1901,62 @@ def test_rereview_0816_web_search_keeps_each_snippet_with_its_result_and_only_tc
             return page.encode()
     items = InfosysIndex(tmp_path / "c", fetcher=F()).web_search("0x745", 5)
     assert [(i["title"], i["snippet"]) for i in items] == [("First", None), ("ADS Return Codes", "0x745 Timeout")], items
+
+
+@pytest.mark.anyio
+async def test_review3_0816_the_error_log_step(monkeypatch, project_dir, tmp_path):
+    """Third review of 0.8.16: (2) an error inside a result is labelled as such and in its time; the plugin's own tools
+    (a docs search) are not an error source; (5) 'main' alone does not make an error the answer, and 'the last error'
+    is the newest; (4) online_terms sends Beckhoff's names and no project names."""
+    import time as _t
+    from tests.fake_ads import install
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App
+    install(monkeypatch)
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    from twincat_mcp.server import ToolError, _tool_boundary
+    seen: list[tuple] = []
+
+    async def infosys_search():
+        raise ToolError("web fallback failed: getaddrinfo failed (WSAHOST_NOT_FOUND)")
+
+    async def ads_read():
+        raise ToolError("ads_read MAIN.x: ADSError 1808")
+    for fn in (infosys_search, ads_read):
+        with pytest.raises(ToolError):
+            await _tool_boundary(fn, note_error=lambda: (lambda *a, **k: seen.append((a, k))))()
+    assert [a[0] for a, _k in seen] == ["ads_read"], seen                 # the plugin's own tools are no source
+    app.note_error("ads_write", error="ads_write MAIN.nCounter: ADSError 1808 symbol not found")
+    _t.sleep(1.1)
+    app.note_error("ads_read_many", result_errors=["MAIN.fbAxis: ADSError 1861 timeout"])
+    r = await app.err_from_logs("why does MAIN.fbAxis time out?")
+    e = r["entries"][0]
+    assert e["where"].startswith("ads_read_many ") and e["where"].endswith("(in its result)"), r
+    assert all(x["where"].split()[0] != "ads_write" for x in r["entries"]), r     # 'main' alone: no answer
+    r = await app.err_from_logs("what does the last error mean?")
+    assert len(r["entries"]) == 1 and r["entries"][0]["newest"] and "1861" in r["entries"][0]["text"], r
+    r = await app.err_from_logs("why does the axis not move?")
+    assert r["entries"] == [], r
+    t = app.online_terms("TwinCAT error 0x80004005 in ConsumeXml on FB_DOSING_VALVE at STATE_WAIT_SETTLE with "
+                         "MC_MoveAbsolute and E_FAIL")
+    assert "TwinCAT" in t and "E_FAIL" in t and "FB_DOSING_VALVE" not in t and "STATE_WAIT_SETTLE" not in t, t
+
+
+def test_review3_0816_web_search_drops_twincat2_supplements(tmp_path):
+    """Third review of 0.8.16 (12): TwinCAT 2 supplement books (ts6100_tc2_…, tcdbserver) passed the online filter."""
+    from twincat_mcp.infosys import InfosysIndex
+    page = ('<div class="result"><a class="result__a" href="https://infosys.beckhoff.com/content/1033/'
+            'ts6100_tc2_opcua_configurator/374277003.html">TC2 OPC UA</a></div>'
+            '<div class="result"><a class="result__a" href="https://infosys.beckhoff.com/content/1033/tcdbserver/1.html">'
+            'TC2 DB</a></div><div class="result"><a class="result__a" href="https://infosys.beckhoff.com/content/1033/'
+            'tf6100_tc3_opcua/1.html">TC3 OPC UA</a></div>')
+
+    class F:
+        def get(self, url, allow_hosts=None):
+            return page.encode()
+    assert [i["title"] for i in InfosysIndex(tmp_path / "c", fetcher=F()).web_search("opc ua", 5)] == ["TC3 OPC UA"]
