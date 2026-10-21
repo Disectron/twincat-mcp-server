@@ -300,3 +300,46 @@ def test_n179_every_numbered_scope_view_log_is_read(tmp_path):
     m2 = S.log_mark(custom)
     (custom.parent / "Scope_1.log").write_bytes(_scope_line("(x)[ ERROR ] boom"))
     assert S.log_errors_since(m2)["error_logs"] == ["Scope_1.log"]
+
+
+def _te130x_log(path, lines):
+    """A TcScopeView.log as TE130x writes it (N185, 0.8.16 retest): a 12-byte binary header whose bytes 4–7 are the
+    log's length (u32 LE), then the text."""
+    import struct
+    text = "\n" + "".join(ln + "\n" for ln in lines)
+    body = text.encode("utf-8")
+    size = 12 + len(body)
+    path.write_bytes(b"\x00\x04\x00\x00" + struct.pack("<I", size) + b"\x00\x00\x00\x00" + body)
+
+
+def test_n185_the_log_header_is_no_new_log(tmp_path):
+    """N185: the header's length field changes with every write — the fingerprint of the first bytes did too, and
+    every call read the whole log as new: 23 ERRORs of earlier days reported as this call's."""
+    import re
+    from twincat_mcp import scope as S
+    log = tmp_path / "TcScopeView.log"
+    old = [f"(2026-10-18-0{i}:00:00:000)[ ERROR ] Scope View: Ads-Error 0xA2 old {i}" for i in range(23)]
+    _te130x_log(log, ["(2026-04-03-08:03:33:268)[ INFO ] Scope View: Scope Project created"] + old)
+    mark = S.log_mark(log)
+    assert mark["head_at"] == 13, mark
+    new = ["(2026-10-21-22:43:32:332)[ ERROR ] Scope View: Invalid ScopeState! Config requested, actual- Reply"]
+    _te130x_log(log, ["(2026-04-03-08:03:33:268)[ INFO ] Scope View: Scope Project created"] + old + new)
+    got = S.log_errors_since(mark)
+    assert got["error_count"] == 1 and "Invalid ScopeState" in got["errors"][0] and "new log" not in got.get("note", ""), got
+    rx = re.compile(r"Invalid ScopeState", re.I)
+    assert [ln for _f, ln in S.log_find_since(mark, rx)] == [new[0]]
+    # a log that really is new (rotated: another first line) is still read from its start
+    _te130x_log(log, ["(2026-10-21-23:00:00:000)[ INFO ] Scope View: a new log"] + new + ["x" * 3000])
+    got = S.log_errors_since(mark)                    # longer than at the mark, another first line: a new log
+    assert got["error_count"] == 1 and "a new log) — read from its start" in got["note"], got
+
+
+def test_n185_more_errors_than_shown_say_truncated(tmp_path):
+    from twincat_mcp import scope as S
+    log = tmp_path / "TcScopeView.log"
+    _te130x_log(log, ["(2026-04-03-08:03:33:268)[ INFO ] start"])
+    mark = S.log_mark(log)
+    _te130x_log(log, ["(2026-04-03-08:03:33:268)[ INFO ] start"] +
+                [f"(2026-10-21-22:00:{i:02d}:000)[ ERROR ] e{i}" for i in range(23)])
+    got = S.log_errors_since(mark)
+    assert got["error_count"] == 23 and len(got["errors"]) == 20 and got["truncated"] is True, got

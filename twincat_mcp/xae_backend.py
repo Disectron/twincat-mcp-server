@@ -141,7 +141,7 @@ class XaeBusy(XaeError):
         return cls(cls.blocked_text(what, d, None), d, what)
 
     @staticmethod
-    def blocked_text(what: str, d: dict[str, Any], read_only: bool | None) -> str:
+    def blocked_text(what: str, d: dict[str, Any], read_only: bool | None, nothing_ran: bool = False) -> str:
         """N181 (0.8.15 retest): the refused COM call did not run — that is said as it is. What it means for the tool
         that made it depends on the tool: a read-only one changed nothing (call it again once the dialog is
         answered); any other may have run steps before the refused one, so its result is checked first. read_only
@@ -149,7 +149,10 @@ class XaeBusy(XaeError):
         from . import dialogs as _dlg
         answer = ("answer it (xae_dialog_resolve(button=...))" if d.get("buttons") is not None else
                   "close it in XAE (its buttons can't be pressed by the tool)")
+        # N181b (0.8.16 retest): refused at the call's first COM call — nothing of it ran, also for a tool that edits
         then = ("Nothing was changed (a read-only call): " + answer + ", then call again." if read_only else
+                "Nothing of this call ran (it was refused at its first step): " + answer + ", then call again."
+                if nothing_ran else
                 "Steps of this call before it may have run: " + answer + ", then check the result before calling "
                 "again.")
         return (f"{what}: BLOCKED BY DIALOG {_dlg.label(d)} — {_dlg.buttons_text(d)}; text: "
@@ -205,6 +208,12 @@ class XaeBackend:
         # the actions (once=True) that ran in the current call — the server empties it before each XAE call (a
         # rejected step after them is no 'repeat it', twelfth review of 0.8.16)
         self.acted: list[str] = []
+        # N181b (0.8.16 retest): COM calls that ran in the current server call — 0 when a dialog refused its first one
+        self.calls_ok = 0
+        # N188 (0.8.16 retest): each action's read of the message buffer — {"action", "read", "why"?} — so a result
+        # without xae_messages says whether the buffer was read and empty or could not be read
+        self.msg_reads: list[dict[str, Any]] = []
+        self._msg_why = ""
         self.sysman: Any = None
         self.progid: str | None = None
         self.attached_at: float | None = None
@@ -241,6 +250,7 @@ class XaeBackend:
                 res = fn()
                 if once and isinstance(getattr(self, "acted", None), list):
                     self.acted.append(what)            # it ran: a rejected step after it is no 'repeat it'
+                self.calls_ok = getattr(self, "calls_ok", 0) + 1
                 return res
             except Exception as exc:  # noqa: BLE001
                 hr = getattr(exc, "hresult", None)
@@ -499,7 +509,11 @@ class XaeBackend:
         a shell that keeps rejecting the read for MESSAGES_READ_S (review of 0.8.16: the member check waited the whole
         com_retry_s), or `sm` is no longer the System Manager in use — the shell went away during the action and the
         server re-attached: the new shell's buffer is not this action's (review of 0.8.16, it was read and cleared)."""
-        if sm is None or self.sysman is not sm:
+        if sm is None:
+            self._msg_why = "no System Manager"
+            return None
+        if self.sysman is not sm:
+            self._msg_why = "the shell went away during the action and was re-attached — its buffer is not this action's"
             return None
         if getattr(self, "_msg_sm", None) is not sm:
             # what is known of this System Manager's buffer: whether it has one, whether a read clears it
@@ -509,10 +523,12 @@ class XaeBackend:
                 self._msg_has = bool(self._retry(lambda: _has_prop(sm, "GetLastErrorMessages"), "GetLastErrorMessages?",
                                                  retry_s=self.MESSAGES_READ_S))
             if not self._msg_has:
+                self._msg_why = "this System Manager has no GetLastErrorMessages (ITcSysManager2)"
                 return None
             return str(self._retry(lambda: _com_call(sm, "GetLastErrorMessages"), "GetLastErrorMessages",
                                    retry_s=self.MESSAGES_READ_S) or "")
-        except XaeError:
+        except XaeError as exc:
+            self._msg_why = f"the read failed ({str(exc)[:160]})"
             return None
 
     @contextlib.contextmanager
@@ -541,12 +557,20 @@ class XaeBackend:
             rec = self._sm_messages_after(what, before, sm, failed=True)
             if rec and rec.get("messages"):
                 raise type(exc)(f"{exc} — XAE messages ({what}): {rec['messages'][:1500]}") from exc
+            # N188 (0.8.16 retest): an error without XAE messages did not say whether the buffer was read
+            last = self.msg_reads[-1] if getattr(self, "msg_reads", None) and self.msg_reads[-1]["action"] == what else None
+            if last is not None:
+                raise type(exc)(f"{exc} — XAE messages ({what}): " + (
+                    "none, the buffer was read and is empty" if last["read"] else f"not read: {last['why']}")) from exc
             raise
         self._sm_messages_after(what, before, sm)
 
     def _sm_messages_after(self, what: str, before: str | None, sm: Any, failed: bool = False) -> dict[str, Any] | None:
         after = self._sm_messages(sm)
+        reads = getattr(self, "msg_reads", None)
         if after is None:
+            if isinstance(reads, list):
+                reads.append({"action": what, "read": False, "why": self._msg_why or "not known why"})
             return None
         rec: dict[str, Any] = {"action": what}
         if failed:
@@ -565,6 +589,8 @@ class XaeBackend:
         if after:
             rec["messages"] = after[:self.MESSAGES_MAX]
             rec["lines"] = [ln.strip() for ln in after.splitlines() if ln.strip()][:50]
+        if isinstance(reads, list):
+            reads.append({"action": what, "read": True, "empty": not rec.get("messages")})
         if not rec.get("messages") and not rec.get("earlier_messages"):
             return None
         self.messages.append(rec)
@@ -2299,11 +2325,13 @@ class XaeBackend:
         return sc[0]
 
     def scope_action(self, action: str, name: str | None = None, path: str | None = None) -> dict[str, Any]:
-        """start | stop | save_svd(path) | export_csv(path) on one Scope configuration."""
+        """start | stop | disconnect | save_svd(path) | export_csv(path) on one Scope configuration. disconnect:
+        IMeasurementScope.Disconnect() — 'disconnects the connection to the ScopeServer. The recording is discarded'
+        (TE1000): Scope is back in Config and records again (0.8.17: after a recording it stays in Reply, N186)."""
         d = self._scope_pick(name)
         obj = d["_obj"]
-        calls = {"start": ("StartRecord", ()), "stop": ("StopRecord", ()), "save_svd": ("SaveSVD", (path,)),
-                 "export_csv": ("ExportCSV", (path,))}
+        calls = {"start": ("StartRecord", ()), "stop": ("StopRecord", ()), "disconnect": ("Disconnect", ()),
+                 "save_svd": ("SaveSVD", (path,)), "export_csv": ("ExportCSV", (path,))}
         if action not in calls:
             raise XaeError(f"scope action must be one of {list(calls)}")
         meth, args = calls[action]

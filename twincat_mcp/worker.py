@@ -93,6 +93,9 @@ class SerialWorker:
         if fut.cancel():
             cur = self.current
             if isinstance(exc, asyncio.CancelledError):
+                # the job never ran — said on the cancellation, for a caller that must know (second review of 0.8.17:
+                # a Scope StartRecord withdrawn here was taken for 'may have run', and its Scope was stopped and saved)
+                exc.job_withdrawn = True  # type: ignore[attr-defined]
                 raise exc
             raise WorkerBusy(self.name, getattr(fn, "__name__", "job"), cur[0] if cur else None,
                              (time.monotonic() - cur[1]) if cur else None, self._q.qsize()) from None

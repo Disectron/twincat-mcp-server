@@ -2023,3 +2023,23 @@ def test_review12_0816_a_rejected_step_after_an_action_is_no_repeat_it(xae):
     assert "this call's earlier step(s) ran (GenerateBootProject): check the result before calling again" in \
         str(ei.value) and "repeat it" not in str(ei.value), str(ei.value)
     assert ei.value.busy and ei.value.busy[1] == 0.3
+
+
+def test_n188_an_action_says_whether_its_message_buffer_was_read(monkeypatch):
+    """N188 (0.8.16 retest): xae_messages never appeared and nothing said why — the buffer read and empty, or not read.
+    Each action records its read; a failure without messages says which."""
+    be, _dte, sm = _xae_with(monkeypatch, _MsgSysMan())
+    be.tree_delete_child("TIPC^Plc", "Old")                  # an action that logs nothing
+    assert be.messages == [] and be.msg_reads and all(m["read"] and m["empty"] for m in be.msg_reads), be.msg_reads
+
+    def fail():
+        raise ComError(-2147467259, "Unspecified error")
+    sm.ActivateConfiguration = fail
+    with pytest.raises(X.XaeError, match=r"XAE messages \(ActivateConfiguration\): none, the buffer was read and is "
+                                         r"empty"):
+        be.activate_configuration()
+    be, _dte, sm = _xae_with(monkeypatch, FakeSysMan())         # no ITcSysManager2
+    sm.ActivateConfiguration = fail
+    with pytest.raises(X.XaeError, match=r"XAE messages \(ActivateConfiguration\): not read: this System Manager has "
+                                         r"no GetLastErrorMessages"):
+        be.activate_configuration()

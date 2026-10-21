@@ -159,7 +159,7 @@ class RecorderConfig:
 class ScopeConfig:
     # TC3ScopeExportTool.exe (TE130x Scope View / TF3300 Scope Server); None = searched in TwinCAT's Functions folders
     export_tool: str | None = None
-    # where scope_export writes CSVs when no target is given; None = <recordings>/scope
+    # where scope_export writes CSVs when no target is given; None = <recordings>/Scope Recordings (0.8.16 and before: <recordings>/scope)
     export_dir: str | None = None
     # the Scope configuration rec_start records alongside (name in the XAE solution); None = the only one open
     project: str | None = None

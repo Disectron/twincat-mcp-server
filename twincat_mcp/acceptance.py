@@ -71,8 +71,8 @@ MANUAL: dict[str, str] = {
     "kb_reindex": "after editing a POU in an added folder",
     "kb_search": "an FB name from an added folder, and an error text (e.g. 'ADSError 1861') → known_error",
     "scope_record": "with a Scope configuration in the solution: scope_record start, wait, stop, save → .svdx + .csv in "
-                    "<recordings>/scope; then rec_start(..., also_scope=true) + rec_stop → <id>.svdx/.scope.csv/.scope.json",
-    "scope_export": "save a Scope View recording as .svdx, then scope_export svd=<file> → CSV in <recordings>/scope "
+                    "<recordings>/Scope Recordings; then rec_start(..., also_scope=true) + rec_stop → <id>.svdx/.scope.csv/.scope.json",
+    "scope_export": "save a Scope View recording as .svdx, then scope_export svd=<file> → CSV in <recordings>/Scope Recordings "
                     "plus <csv>.provenance.json; open the CSV next to the Scope View chart",
     "hw_lookup": "'EL2008' (or a terminal you use) → PDOs and CoE objects from the ESI index (index\\esi.db)",
     "hw_object": "hw_object(device='EL3356-0010', index='#x8000') → sub-indices with defaults and enum texts; compare "

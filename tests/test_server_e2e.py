@@ -1848,7 +1848,7 @@ async def test_review12_0816_a_busy_step_after_an_earlier_action_is_no_repeat_it
     from twincat_mcp.server import App, ToolError, _tool_boundary
     app = App(mk_cfg(tmp_path))
     app.dialogs_now = lambda: []
-    app._dialog_hint = lambda: ""
+    app._dialog_hint = lambda retry=True: ""
 
     def generate():
         app.xae.acted.append("GenerateBootProject")
@@ -1870,3 +1870,23 @@ async def test_review12_0816_a_busy_step_after_an_earlier_action_is_no_repeat_it
         await app.xae_call(read)
     with pytest.raises(ToolError, match="repeat it"):
         await _tool_boundary(one_read)()
+
+
+async def test_n188_a_result_says_the_message_buffer_was_empty(tmp_path):
+    from twincat_mcp.server import App
+    app = App(mk_cfg(tmp_path))
+    app.dialogs_now = lambda: []
+
+    def activate():
+        app.xae.msg_reads.append({"action": "ActivateConfiguration", "read": True, "empty": True})
+        return {"activated": True}
+
+    def build():
+        app.xae.msg_reads.append({"action": "Build", "read": False, "why": "the read failed (busy)"})
+        return {"built": True}
+    res = await app.xae_call(activate)
+    assert res["xae_messages_note"] == "ActivateConfiguration: XAE's message buffer was read — empty", res
+    res = await app.xae_call(build)
+    assert res["xae_messages_note"] == "Build: XAE's message buffer was not read (the read failed (busy))", res
+    res = await app.xae_call(lambda: {"ok": True})
+    assert "xae_messages_note" not in res, res

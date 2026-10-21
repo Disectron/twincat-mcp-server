@@ -28,6 +28,14 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| 0.8.17 | Scope part with one owner: `rec_start(also_scope=true, duration_s=5)` and let it end; again with `rec_stop` cancelled (stop the client call) during its stop; `rec_delete` of a recording while Scope runs; a second `rec_start` while the first one ends | `rec_status` → `scope.state` recording → finishing → finished, `finished_by` "the recording ended by itself (duration …)" / "rec_stop" / "rec_stop (the call ended before its Scope part — finished after it)" / "rec_delete"; `rec_delete` of a recording whose Scope still records → no .svdx / .scope.csv of that id in `<recordings>\Scope Recordings`; of one whose Scope part was saved (it had ended) → the files stay, listed in `scope_files_kept`; Scope stops every time (`scope_list` / the Scope View) |
+| 0.8.17 | XAE busy or a dialog open when a recording with Scope ends: open Tools → Options in XAE, let the recording end, close Options, `rec_stop` | while Options is open `rec_status` → `scope.state: recording`, `stop_refused`, note "rec_stop asks again"; after closing it `rec_stop` stops and saves Scope; a dialog Scope itself opens during StopRecord → `state: stop_unknown`, StopRecord not sent again |
+| 0.8.17 | Scope after a recording (Ryan's choice): `rec_start(also_scope=true)`, `rec_stop` — answer the prompt close, then new, then pause on three recordings; then `rec_start(also_scope=true)` once more | files in `<recordings>\Scope Recordings\`; close: Scope View back in Config (empty); new: Scope records at once, `scope_record stop` + `save` keep it; pause: Scope View still shows the data, and the next rec_start asks "Scope still holds the recording of … Disconnect it and record with Scope now?"; the export tool runs on paths with the space in 'Scope Recordings' |
+| 0.8.17 | N186: `rec_start(also_scope=true, duration_s=5)`, let it end, then a 2nd `rec_start(also_scope=true, duration_s=3)` without touching Scope | the 2nd: `scope.error` "Scope recording NOT started: Scope refused StartRecord — it is in state Reply …" (no Scope files for it); after Disconnect in XAE's Scope View a 3rd one records (`start_check` "confirmed by the Scope View log …" — or which line it found); no `.scope.json` ever links a CSV whose "Starttime of export" lies before its recording |
+| 0.8.17 | N185: any also_scope recording; count today's `[ ERROR ]` lines in `TcScopeView*.log` since the call | `scope_view_log` has exactly those (no "a new log" note while the log only grew); `truncated` when more than 20 |
+| 0.8.17 | N187: `rec_capture engine=python` 5 s 1 ms `MAIN.nCycleCount`; `rec_start engine=python start_when=…` | no TypeError, no `unverified_rows`, verdict PASS with the counter |
+| 0.8.17 | N188 / N181b: `xae_tree_consume_xml` bad XML; `xae_build` with an error; Tools → Options open, then `xae_tree_consume_xml` | error says "XAE messages (…): none, the buffer was read and is empty" or "not read: …"; a successful action's result has `xae_messages_note` when the buffer gave nothing; with Options open: "Nothing of this call ran (it was refused at its first step)" |
+| 0.8.17 | N178: answer a confirmation question after more than 10 minutes; request a `confirm_token` and use it after `confirm_ttl_s` (180 s default) | two limits, both by design: the question (elicitation round) expires after 10 minutes — "confirmation expired … nothing was done"; a token from `tc_request_confirmation` after `confirm_ttl_s` |
 | 0.8.16 | XAE messages (ITcSysManager2::GetLastErrorMessages): `xae_activate_configuration`, `xae_build` with an error, `xae_tree_consume_xml` with a wrong XML, `xae_deploy` | the results carry `xae_messages` (action, messages, lines) with TwinCAT's own text, also warnings on success; a failed action's error ends with "XAE messages (…)"; an `earlier_messages` block when the buffer held something before the action |
 | 0.8.16 | N175: `xae_plcopen_export` + `xae_plcopen_import` replace of an interface (I_Module) on TwinCAT 3.1.4026; then of an interface with a property | `checked_against: xml`; methods from the export's `InterfaceAsPlainText`; no refusal for a member that is there. The property shape (`<Properties><Property>` with `InterfaceAsPlainText`, `GetAccessor`) is tested on a constructed file, not yet on a real 4026 export — send the export if the property is refused or `not_in_xml` |
 | 0.8.16 | N179 / N180 / N182 Scope: a numbered `TcScopeView_1.log`; RUN→CONFIG→RUN during `rec_start(also_scope=true)`; a recording that ends by itself (duration) | `scope_view_log.logs_checked` lists every numbered log, `logs_written` the one written; the save says "Scope was reset to Config by a TwinCAT restart at <time> (Scope View log)" (Config without a reset line since the call began: "the Scope View log names no reset since …"; a log missing or unreadable: "whether TwinCAT was restarted is not known"; another state: only the state Scope is in) and the CSV is `recovered` or `lost`; `rec_status` / `rec_list` show the Scope part `finished` with `finished_by: "the recording ended by itself (duration …)"` without `rec_stop`; a `rec_stop` gives `finished_by: rec_stop` — one cancelled or timed out before its Scope part `rec_stop (the call ended before its Scope part — finished after it)`; `rec_delete` stops Scope and saves nothing (`finished_by: rec_delete`; a delete that fails after stopping the recording: `rec_delete (the call ended …)`, saved) |
@@ -99,19 +107,28 @@ tool wishlist (2026-10-18).
   the error index and `err_lookup` (N125), the 0.8.15 retest's documentation items N177, N183, N184, typo-near
   symbols, manual kinds in `hw_lookup` — built and reviewed eleven rounds on branch `feat/0.8.16-errors-index`
   (Infosys format 8 there); the docs direct-access spec.
-  Known LOW findings of the fourteenth review, left for 0.8.17 (Ryan, 2026-10-21: no more review rounds for 0.8.16;
-  an in-depth adversarial review after 0.8.17, its stopping rules to be set before it starts): `rec_stop` /
-  `rec_delete` with Scope no longer carry `solution_mismatch` / `reattached` (the Scope part runs in its own task);
-  SaveSVD refused as busy right after StopRecord ran says "repeat it" though `rec_stop` returns the stored result;
-  the dialog hint's "retry in a few seconds" follows a busy text that withholds "repeat it"; a StopRecord refused
-  before it ran other than as busy (a dialog holding XAE, the worker busy) is final — Scope records on while
-  `rec_status` says finished; `rec_delete` cancelled after the stop but before the file went saves Scope for the
-  deleted recording, and one cancelled during the stop says "ended by itself (the recorder no longer knows …)"; a
-  late waiter of a refused finish can store its result over the retry's (store only when `scope_finishing.get(rid)
-  is t`); `scope_record(save)` with the export tool installed and the CSV present still advises `overwrite=true`
-  (scope.py's text); StartRecord blocked by a dialog or timed out is said "NOT started" while still pending, and
-  "Scope did not stop" after a StopRecord timeout is not checked. Proposed for 0.8.17: one owner per recording's
-  Scope part (a task that takes stop / delete / ended events in order) instead of the shared tables.
+  The fourteenth review's LOW findings are fixed in 0.8.17 (one owner per recording's Scope part).
+- 0.8.17 adversarial review (Ryan, 2026-10-21: review before the release; at most 2 rounds, the 0.8.17 changes only,
+  HIGH / MEDIUM block, LOW to this list). Round 1: 4 HIGH + 1 MEDIUM fixed. LOW, left: an automatic finish takes the
+  one-time `reattached` note into the Scope result (rec_status does not show it, the next XAE tool no longer gets it);
+  "XAE refused StartRecord" is also said for the worker busy / XAE held by another call's dialog; `stop_refused` texts
+  name the job `scope_action`; the `stop_unknown` note advises `scope_record(save)` also for a deleted recording.
+  Older, outside the 0.8.17 change: at server shutdown (`atexit` stop_all, no event loop) no Scope part is finished;
+  StopRecord looks the Scope up by name — with `scope` unset and a second Scope configuration opened meanwhile the
+  lookup fails before StopRecord runs and the part is final; in `_scope_reset` an ExportCSV refused as busy is said
+  "lost"; a generic StopRecord failure still sets `scope_stopped`; a SaveSVD that timed out can be sealed while XAE
+  may still write it; two `also_scope` recordings on one Scope configuration — the first one's StopRecord stops the
+  second.
+  Round 2 (the last): round 1's findings fixed; N1 (HIGH: a rec_start cancelled while its StartRecord was still
+  queued — never ran — was finished as a start of unknown outcome: StopRecord / SaveSVD / a signed link for a Scope
+  it never started, the user's own run included) and N2 (MEDIUM: rec_status said a live recording was deleted when
+  its status call failed) fixed with tests, checked by tests + CI (no third round); LOW: orphan lookup by prefix,
+  the refused-stop note waits for a delete — fixed. Retest on hardware: what StopRecord / SaveSVD do on a Scope
+  whose StartRecord never ran; rec_delete now waits for a Scope save under way (tens of seconds on a real shell) —
+  a client that times out meanwhile deletes nothing and its confirmation token is used.
+  Decided by Ryan (2026-10-21): Scope files go to `<recordings>\Scope Recordings\`; rec_delete never deletes them.
+  After a recording the user chooses close (Disconnect) / new (Disconnect + StartRecord) / pause (keep the data);
+  the next recording with Scope asks to disconnect first. Built in 0.8.17.
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
   Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
   trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library

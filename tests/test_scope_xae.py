@@ -31,6 +31,11 @@ class FakeScope:
         self.recording = False
         return 0
 
+    def Disconnect(self):
+        self.calls.append("disconnect")
+        self.recording = False
+        return 0
+
     def SaveSVD(self, path):
         self.calls.append("save")
         Path(path).write_bytes(b"SVDX" * 64)
@@ -54,6 +59,12 @@ def fake_xae(monkeypatch):
         self.dte = object()              # "attached"
     monkeypatch.setattr(X.XaeBackend, "__init__", init)
     return sc
+
+
+def _done(app, rid):
+    """The result of the recording's Scope part once a finish ran (finished, refused, unknown) — else None."""
+    part = app.scope_parts.get(rid)
+    return part.result if part is not None and part.state != "finishing" else None
 
 
 @pytest.mark.anyio
@@ -97,7 +108,7 @@ async def test_also_scope_records_saves_exports_and_links(monkeypatch, project_d
         sc = out["scope"]
         svdx, csv = Path(sc["save_svd"]["path"]), Path(sc["export_csv"]["path"])
         assert svdx.name == f"{r['id']}.svdx" and csv.name == f"{r['id']}.scope.csv"
-        assert svdx.parent == Path(out["file"]).parent / "scope"                  # next to the recording
+        assert svdx.parent == Path(out["file"]).parent / "Scope Recordings"                  # next to the recording
         link = json.loads(Path(sc["link"]["file"]).read_text(encoding="utf-8"))
         assert link["recording"] == r["id"] and link["files"][svdx.name]["sha256"] == file_sha256(svdx)[0] and link["hmac"]
         assert is_read_only(svdx) and is_read_only(csv)
@@ -268,7 +279,7 @@ async def test_n182_scope_is_finished_when_the_recording_ends_by_itself(monkeypa
     async with client_for(srv) as s:
         for extra in ({"mode": "change", "duration_s": 1}, {"mode": "poll", "cycle_ms": 50, "max_events": 3}):
             fake_xae.calls.clear()
-            r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "also_scope": True, **extra}))
+            r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "also_scope": True, "scope_disconnect": True, **extra}))
             assert r["scope"]["started"], r
             st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
             seen = [st.get("scope", {}).get("state")]
@@ -280,9 +291,11 @@ async def test_n182_scope_is_finished_when_the_recording_ends_by_itself(monkeypa
                 seen.append(st.get("scope", {}).get("state"))
             assert st["scope"]["state"] == "finished" and not st["active"], (extra, seen, st.get("scope"))
             assert "ended by itself" in st["scope"]["finished_by"] and st["scope"]["files"], st["scope"]
-            assert fake_xae.calls == ["start", "stop", "save", "csv"], fake_xae.calls
+            # 0.8.17: Scope held the previous recording — disconnected first (scope_disconnect=true)
+            assert [c for c in fake_xae.calls if c != "disconnect"] == ["start", "stop", "save", "csv"], fake_xae.calls
             out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
-            assert fake_xae.calls == ["start", "stop", "save", "csv"], fake_xae.calls      # StopRecord once
+            assert [c for c in fake_xae.calls if c != "disconnect"] == ["start", "stop", "save", "csv"], \
+                fake_xae.calls      # StopRecord once
             assert "ended by itself" in out["scope"]["finished_by"] and out["scope"]["link"]["files"], out["scope"]
             link = json.loads(Path(out["scope"]["link"]["file"]).read_text(encoding="utf-8"))
             assert "ended by itself" in link["finished_by"] and link["recording_ended"]["stop_reason"], link
@@ -313,7 +326,7 @@ async def test_n180_save_after_a_twincat_restart_is_said_and_recovered_or_lost(m
     cfg.scope.view_log = str(log)
     srv = build_server(cfg)
     async with client_for(srv) as s:
-        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True, "scope_disconnect": True}))
         with open(log, "a", encoding="utf-8") as fh:
             fh.write("(2026-10-21-15:16:25:123)[ INFO  ] Scope View: Scope Project state changes from 'ServerReset' "
                      "to 'Config'\n")
@@ -328,7 +341,7 @@ async def test_n180_save_after_a_twincat_restart_is_said_and_recovered_or_lost(m
             fake_xae.calls.append("csv")
             raise RuntimeError("Invalid ScopeState! Reply requested, actual: Config")
         monkeypatch.setattr(fake_xae, "ExportCSV", no_csv)
-        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True, "scope_disconnect": True}))
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
         # eleventh review: no reset line since this recording began — the state is said, no restart invented
         sv = out["scope"]["save_svd"]
@@ -339,7 +352,7 @@ async def test_n180_save_after_a_twincat_restart_is_said_and_recovered_or_lost(m
         def record_state(path):
             raise RuntimeError("Invalid ScopeState! Reply requested, actual: Record")
         monkeypatch.setattr(fake_xae, "SaveSVD", record_state)
-        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True, "scope_disconnect": True}))
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
         assert out["scope"]["save_svd"]["error"].startswith("Scope is in state Record, not Reply — SaveSVD"), out["scope"]
 
@@ -579,7 +592,7 @@ async def test_review13_0816_rec_stop_cancelled_while_the_recording_is_still_act
             await s.call_tool("rec_stop", {"id": r["id"]})
         st = await _r13_finished(s, r["id"])
     assert st["scope"]["finished_by"] == "rec_stop (the call ended before its Scope part — finished after it)", st
-    assert "recording_ended" not in srv._tcmcp_app.scope_results[r["id"]] and fake_xae.calls == ["start", "stop", "save",
+    assert "recording_ended" not in _done(srv._tcmcp_app, r["id"]) and fake_xae.calls == ["start", "stop", "save",
                                                                                                   "csv"], fake_xae.calls
 
 
@@ -661,10 +674,10 @@ async def test_review13_0816_rec_delete_stops_scope_and_saves_nothing(monkeypatc
         await _anyio12.sleep(2.0)
         rs = await s.call_tool("rec_stop", {"id": r["id"]})
         await _anyio12.sleep(1.0)
-    res = app.scope_results[r["id"]]
+    res = _done(app, r["id"])
     assert not fake_xae.recording and fake_xae.calls == ["start", "stop"], fake_xae.calls
     assert res["finished_by"] == "rec_delete" and "nothing was saved" in res["note"], res
-    assert d["scope"]["finished_by"] == "rec_delete" and rs.is_error and r["id"] not in app.scope_runs, (d, text(rs))
+    assert d["scope"]["finished_by"] == "rec_delete" and rs.is_error and app.scope_parts[r["id"]].state == "finished", (d, text(rs))
 
 
 @pytest.mark.anyio
@@ -689,17 +702,20 @@ async def test_review13_0816_a_stop_refused_after_the_end_is_no_step_of_rec_star
         r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "duration_s": 1,
                                                      "also_scope": True}))
         for _ in range(60):
-            if r["id"] in app.scope_results:
+            if _done(app, r["id"]) is not None:
                 break
             await _anyio12.sleep(0.25)
-        refused = dict(app.scope_results[r["id"]])
+        refused = dict(_done(app, r["id"]))
         st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
         state["busy"] = False                       # XAE answers again
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
     assert refused["stop"].get("not_run") and "earlier step" not in str(refused["stop"]), refused
-    assert st["scope"]["state"] == "recording" and "rec_stop asks again" in st["scope"]["note"], st["scope"]
+    assert st["scope"]["state"] == "recording" and f"rec_stop(id='{r['id']}') asks again" in st["scope"]["note"], \
+        st["scope"]
     assert not fake_xae.recording and fake_xae.calls[-3:] == ["stop", "save", "csv"], fake_xae.calls
-    assert out["scope"]["finished_by"] == "rec_stop" and out["scope"]["save_svd"]["result_code"] == 0, out["scope"]
+    # the recording ended by itself (duration_s): that end is who ended it — rec_stop only asked StopRecord again
+    assert out["scope"]["finished_by"].startswith("the recording ended by itself (duration") and \
+        out["scope"]["save_svd"]["result_code"] == 0, out["scope"]
 
 
 @pytest.mark.anyio
@@ -853,19 +869,24 @@ async def test_review13_0816_a_failed_rec_delete_still_finishes_scope(monkeypatc
     assert d.is_error and "WinError 32" in text(d), text(d)
     assert st["scope"]["finished_by"] == "rec_delete (the call ended before its Scope part — finished after it)", st
     assert not fake_xae.recording and fake_xae.calls == ["start", "stop", "save", "csv"], fake_xae.calls
-    assert "recording_ended" not in app.scope_results[r["id"]], app.scope_results[r["id"]]
+    assert "recording_ended" not in _done(app, r["id"]), _done(app, r["id"])
 
 
 @pytest.mark.anyio
 async def test_review13_0816_rec_delete_with_stop_refused_names_scope_record(monkeypatch, project_dir, fake_xae):
-    """rec_delete, XAE refuses StopRecord: the recording is gone, so no rec_stop can ask again — the answer names
-    scope_record(action='stop'), and nothing is kept for a rec_stop."""
+    """rec_delete, XAE refuses StopRecord: the recording is gone — first review of 0.8.17: the part stays (a note no
+    tool could show left Scope recording with nothing to stop it); rec_list lists it, rec_status shows it, and
+    rec_stop(id) asks again once XAE is free — nothing is saved for the deleted recording."""
     install(monkeypatch)
+    orig = fake_xae.StopRecord
+    state = {"busy": True}
 
-    def busy():
-        fake_xae.calls.append("stop-rejected")
-        raise _R13Busy("call rejected")
-    monkeypatch.setattr(fake_xae, "StopRecord", busy)
+    def stop():
+        if state["busy"]:
+            fake_xae.calls.append("stop-rejected")
+            raise _R13Busy("call rejected")
+        return orig()
+    monkeypatch.setattr(fake_xae, "StopRecord", stop)
     cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
     cfg.xae.com_retry_s = 0.6
     srv = build_server(cfg)
@@ -874,10 +895,18 @@ async def test_review13_0816_rec_delete_with_stop_refused_names_scope_record(mon
         r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "rec_delete", "target": r["id"]}))
         d = payload(await s.call_tool("rec_delete", {"id": r["id"], "confirm_token": tok["confirm_token"]}))
+        lst = payload(await s.call_tool("rec_list", {}))
+        st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+        state["busy"] = False
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
     sc = d["scope"]
-    assert sc["stop"]["not_run"] and "scope_record(action='stop') stops Scope once XAE is free" in sc["note"], sc
-    assert "rec_stop asks again" not in sc["note"] and r["id"] not in app.scope_runs, sc
-    assert "save" not in fake_xae.calls, fake_xae.calls
+    assert sc["stop"]["not_run"] and f"rec_stop(id='{r['id']}') asks again" in sc["note"], sc
+    assert "the recording was deleted: nothing will be saved" in sc["note"], sc
+    assert [o["id"] for o in lst.get("scope_without_recording") or []] == [r["id"]], lst.get("scope_without_recording")
+    assert st["scope"]["state"] == "recording" and st["scope"].get("stop_refused"), st
+    assert not fake_xae.recording and "save" not in fake_xae.calls, fake_xae.calls
+    assert out["scope"]["stop"]["result_code"] == 0 and "nothing was saved" in out["scope"]["note"], out["scope"]
+    assert app.scope_parts[r["id"]].state == "finished"
 
 
 # ---- fourteenth review of 0.8.16: an error of the status call is no end of the recording -----------------------------
@@ -911,7 +940,7 @@ async def test_review14_0816_a_failed_status_call_does_not_stop_scope(monkeypatc
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
     assert arm["hit"] and st["active"] and st["scope"]["state"] == "recording", st
     assert fake_xae.recording is False and out["scope"]["finished_by"] == "rec_stop", out["scope"]
-    assert "recording_ended" not in app.scope_results[r["id"]], app.scope_results[r["id"]]
+    assert "recording_ended" not in _done(app, r["id"]), _done(app, r["id"])
 
 
 @pytest.mark.anyio
@@ -948,3 +977,238 @@ async def test_review14_0816_a_rec_start_during_a_slow_reap_does_not_stop_scope(
         await s.call_tool("rec_stop", {"id": c["id"]})
     assert slow["in"].is_set(), "the slow close was never reached"
     assert st["active"] and st["scope"]["state"] == "recording", st
+
+
+# ---- 0.8.17: one owner per recording's Scope part; the fourteenth review's LOW findings ------------------------------
+
+@pytest.mark.anyio
+async def test_0817_rec_stop_with_scope_carries_the_binding_flags(monkeypatch, project_dir, fake_xae):
+    """N116: rec_stop's Scope part runs in its owner task — its result still says what the XAE binding was."""
+    install(monkeypatch)
+    monkeypatch.setattr(X.XaeBackend, "mismatch_note", lambda self: "bound to C:\\P\\Other.sln, not xae.solution_path")
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    assert r.get("solution_mismatch") and out.get("solution_mismatch"), sorted(out)
+    assert out["scope"].get("solution_mismatch"), out["scope"]
+
+
+@pytest.mark.anyio
+async def test_0817_save_refused_after_the_stop_ran_is_said_as_that(monkeypatch, project_dir, fake_xae):
+    """SaveSVD refused (busy) right after StopRecord ran: no 'repeat it' — what Scope holds is saved by scope_record."""
+    install(monkeypatch)
+    orig = fake_xae.SaveSVD
+
+    def save(path):
+        fake_xae.calls.append("save-rejected")
+        raise _R13Busy("call rejected")
+    monkeypatch.setattr(fake_xae, "SaveSVD", save)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    cfg.xae.com_retry_s = 0.6
+    srv = build_server(cfg)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    sv = out["scope"]["save_svd"]
+    assert sv.get("not_run") and "repeat it" not in sv["error"] and "retry" not in sv["error"], sv
+    assert "earlier step(s) ran (Scope StopRecord)" in sv["error"], sv
+    assert "scope_record(action='save') saves it once XAE is free" in out["scope"]["note"], out["scope"]
+    assert orig is not None and fake_xae.calls.count("stop") == 1
+
+
+@pytest.mark.anyio
+async def test_0817_a_stop_refused_by_a_held_dialog_is_asked_again(monkeypatch, project_dir, fake_xae):
+    """XAE held by a dialog another call opened when the recording ends: StopRecord did not run — Scope still
+    records, rec_status says so, and rec_stop asks again once the dialog is answered."""
+    import concurrent.futures as _cf
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    fut: _cf.Future = _cf.Future()
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "duration_s": 1,
+                                                     "also_scope": True}))
+        app.xae_held = {"job": "xae_tree_get", "since": _t12.monotonic(), "future": fut,
+                        "dialog": {"hwnd": 77, "title": "Options", "class": "#32770", "buttons": ["OK", "Cancel"],
+                                   "text": ""}}
+        for _ in range(60):
+            if _done(app, r["id"]) is not None:
+                break
+            await _anyio12.sleep(0.25)
+        st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+        fut.set_result({"done": True})                     # the dialog was answered: XAE is free
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    assert st["scope"]["state"] == "recording" and f"rec_stop(id='{r['id']}') asks again" in st["scope"]["note"], \
+        st["scope"]
+    assert "NOT started: XAE is held by the dialog" in st["scope"]["stop_refused"], st["scope"]
+    assert not fake_xae.recording and out["scope"]["finished_by"].startswith("the recording ended by itself (duration"), \
+        (fake_xae.calls, out["scope"])
+    assert out["scope"]["save_svd"]["result_code"] == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stop_first", [False, True])
+async def test_0817_a_cancelled_rec_delete_saves_nothing_and_names_itself(monkeypatch, project_dir, fake_xae,
+                                                                          stop_first):
+    """rec_delete cancelled — after its stop, while the file is removed (stop_first=False), or while its stop is still
+    under way (stop_first=True): the part waits for the delete's outcome, saves nothing for the deleted recording and
+    says rec_delete ended it."""
+    from twincat_mcp import recorder as R
+    install(monkeypatch)
+    if stop_first:
+        orig_stop = R.Recorder.stop
+
+        def slow_stop(self, rid, reason="requested"):
+            _t12.sleep(1.5)                                # the stop not yet under way: the recording is active
+            return orig_stop(self, rid, reason)
+        monkeypatch.setattr(R.Recorder, "stop", slow_stop)
+    else:
+        orig_rm = R._remove_file
+
+        def slow_remove(p, tries=10):
+            _t12.sleep(1.5)                                # Windows: a scanner holds the file, its removal retried
+            return orig_rm(p, tries)
+        monkeypatch.setattr(R, "_remove_file", slow_remove)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "rec_delete", "target": r["id"]}))
+        with _anyio12.move_on_after(0.4):
+            await s.call_tool("rec_delete", {"id": r["id"], "confirm_token": tok["confirm_token"]})
+        for _ in range(100):
+            if _done(app, r["id"]) is not None:
+                break
+            await _anyio12.sleep(0.1)
+        await _anyio12.sleep(1.0)
+    res = _done(app, r["id"])
+    left = sorted(p.name for p in (app.rec.root / "Scope Recordings").iterdir()) if (app.rec.root / "Scope Recordings").is_dir() else []
+    assert not (app.rec.root / f"{r['id']}.jsonl").exists(), "the delete did not go through"
+    assert not any(n.startswith(r["id"]) for n in left), left
+    assert res["finished_by"] == "rec_delete (the call ended before its Scope part — finished after it)", res
+    assert "nothing was saved" in res["note"] and not fake_xae.recording and "save" not in fake_xae.calls, res
+
+
+@pytest.mark.anyio
+async def test_0817_a_start_held_by_a_dialog_stays_with_the_recording(monkeypatch, project_dir, fake_xae):
+    """StartRecord held by a dialog it opened: its outcome is not known — said so, and the part stays with the
+    recording, so rec_stop stops Scope once it has started (0.8.16: 'NOT started', and Scope recorded unowned)."""
+    from twincat_mcp import dialogs as D
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    st = {"dlg": False}
+    dlg = D.Dialog(90, 1, "TwinCAT Scope", "Overwrite?", [(1, "Yes"), (2, "No")]).to_dict()
+    monkeypatch.setattr(app, "dialogs_now", lambda: [dlg] if st["dlg"] else [])
+    orig = fake_xae.StartRecord
+
+    def start():
+        st["dlg"] = True
+        _t12.sleep(3.5)                                    # the shell waits on its dialog; the user answers it
+        st["dlg"] = False
+        return orig()
+    monkeypatch.setattr(fake_xae, "StartRecord", start)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        sc0 = payload(await s.call_tool("rec_status", {"id": r["id"]}))["scope"]
+        await _anyio12.sleep(3.0)
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    assert r["scope"]["start_unknown"] and "NOT started" not in str(r["scope"]), r["scope"]
+    assert sc0["state"] == "recording" and "BLOCKED BY DIALOG" in sc0["start_unknown"], sc0
+    assert not fake_xae.recording and out["scope"]["finished_by"] == "rec_stop", (fake_xae.calls, out["scope"])
+    assert out["scope"]["start_unknown"], out["scope"]
+
+
+@pytest.mark.anyio
+async def test_0817_a_stop_held_by_a_dialog_is_never_sent_again(monkeypatch, project_dir, fake_xae):
+    """StopRecord held by a dialog it opened: whether Scope stopped is not known — it is not sent again (it may have
+    run), and nothing claims Scope did or did not stop (0.8.16: 'Scope did not stop')."""
+    from twincat_mcp import dialogs as D
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    st = {"dlg": False}
+    dlg = D.Dialog(91, 1, "TwinCAT Scope", "Stop the record?", [(1, "Yes"), (2, "No")]).to_dict()
+    monkeypatch.setattr(app, "dialogs_now", lambda: [dlg] if st["dlg"] else [])
+    orig = fake_xae.StopRecord
+
+    def stop():
+        fake_xae.calls.append("stop-asked")
+        st["dlg"] = True
+        _t12.sleep(4.5)                                    # well past the 2 s a dialog needs to count as blocking
+        st["dlg"] = False
+        return orig()
+    monkeypatch.setattr(fake_xae, "StopRecord", stop)
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+        await _anyio12.sleep(3.0)
+        again = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+        stt = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+    sc = out["scope"]
+    assert sc["stop"]["outcome_unknown"] and "whether Scope stopped is not known" in sc["note"], sc
+    assert "did not stop" not in sc["note"] and fake_xae.calls.count("stop-asked") == 1, (sc, fake_xae.calls)
+    assert again["scope"] == sc and stt["scope"]["state"] == "stop_unknown", stt["scope"]
+
+
+@pytest.mark.anyio
+async def test_0817_scope_record_save_with_the_export_tool_names_its_own_way_out(monkeypatch, project_dir, fake_xae,
+                                                                                 tmp_path):
+    from twincat_mcp import scope as S
+    install(monkeypatch)
+    monkeypatch.setattr(S, "find_tool", lambda configured=None: Path("C:/TwinCAT/Functions/TE130X/TC3ScopeExportTool.exe"))
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    out = tmp_path / "home" / "recordings" / "manual.svdx"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    (out.parent / "manual.csv").write_text("old\n", encoding="utf-8")
+    async with client_for(srv) as s:
+        r = await s.call_tool("scope_record", {"action": "save", "path": str(out)})
+    t = text(r) if r.is_error else json.dumps(payload(r))
+    assert "overwrite=true" not in t and "give scope_record another path" in t, t
+    assert (out.parent / "manual.csv").read_text(encoding="utf-8") == "old\n"
+
+
+@pytest.mark.anyio
+async def test_0817_rec_stop_and_rec_delete_together_stop_scope_once(monkeypatch, project_dir, fake_xae):
+    """rec_stop and rec_delete of one recording at the same time: one StopRecord; nothing saved for the deleted one."""
+    from twincat_mcp import recorder as R
+    install(monkeypatch)
+    orig = R.Recorder.stop
+
+    def slow_stop(self, rid, reason="requested"):
+        st = orig(self, rid, reason)
+        _t12.sleep(0.8)
+        return st
+    monkeypatch.setattr(R.Recorder, "stop", slow_stop)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "rec_delete", "target": r["id"]}))
+        outs: dict = {}
+
+        async def stop():
+            outs["stop"] = await s.call_tool("rec_stop", {"id": r["id"]})
+
+        async def delete():
+            outs["delete"] = await s.call_tool("rec_delete", {"id": r["id"], "confirm_token": tok["confirm_token"]})
+        async with _anyio12.create_task_group() as tg:
+            tg.start_soon(stop)
+            await _anyio12.sleep(0.1)
+            tg.start_soon(delete)
+        await _anyio12.sleep(1.0)
+    assert fake_xae.calls.count("stop") == 1 and not fake_xae.recording, fake_xae.calls
+    part = app.scope_parts[r["id"]]
+    assert part.state == "finished" and part.holds == 0, (part.state, part.holds)
+    assert not outs["stop"].is_error and not outs["delete"].is_error, (text(outs["stop"]), text(outs["delete"]))
+    assert payload(outs["stop"])["scope"] == payload(outs["delete"])["scope"], "one Scope part, one result"
+    # rec_stop came first: its Scope part is saved and linked; rec_delete then removes the ADS recording and says the
+    # Scope files stay (first review of 0.8.17)
+    d = payload(outs["delete"])
+    link = part.result.get("link")
+    if link:                               # the save came before the delete: its files stay, and rec_delete says so
+        assert d["scope_files_kept"]["files"] == sorted(link["files"]), d
+    else:                                  # the delete came first: nothing saved for the deleted recording
+        sd = app.rec.root / "Scope Recordings"
+        assert "scope_files_kept" not in d and not any(p.name.startswith(r["id"]) for p in sd.glob("*")), d
