@@ -167,6 +167,8 @@ tool wishlist (2026-10-18).
   rounds, HIGH / MEDIUM block, LOW to this list, later fixes checked by tests + CI). Then libraries 0.8.19 (1a, 1b),
   linking 0.8.20 (its read side comes with the N192 fix), EtherCAT 0.8.21, snapshots 0.8.22, tasks 0.8.23. The error
   index (held) has no slot yet.
+- Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
+  docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
   Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
   trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library
