@@ -115,7 +115,35 @@ class XaeExplained(XaeError):
 
 class XaeBusy(XaeError):
     """N174: the shell rejected the call (RPC_E_CALL_REJECTED / RPC_E_SERVERCALL_RETRYLATER) for all of com_retry_s,
-    or a dialog holds it — the call did not run. Never read as 'no value' by a read that has a fallback (_get)."""
+    or a dialog holds it — the call did not run. Never read as 'no value' by a read that has a fallback (_get).
+    dialog: the modal window that holds the shell (BLOCKED BY DIALOG), else None."""
+
+    def __init__(self, msg: str, dialog: dict[str, Any] | None = None, what: str = "") -> None:
+        super().__init__(msg)
+        self.dialog = dialog
+        self.what = what
+
+    @classmethod
+    def blocked(cls, what: str, d: dict[str, Any]) -> "XaeBusy":
+        return cls(cls.blocked_text(what, d, None), d, what)
+
+    @staticmethod
+    def blocked_text(what: str, d: dict[str, Any], read_only: bool | None) -> str:
+        """N181 (0.8.15 retest): the refused COM call did not run — that is said as it is. What it means for the tool
+        that made it depends on the tool: a read-only one changed nothing (call it again once the dialog is
+        answered); any other may have run steps before the refused one, so its result is checked first. read_only
+        None: not known here (the backend alone) — said as the latter."""
+        from . import dialogs as _dlg
+        answer = ("answer it (xae_dialog_resolve(button=...))" if d.get("buttons") is not None else
+                  "close it in XAE (its buttons can't be pressed by the tool)")
+        then = ("Nothing was changed (a read-only call): " + answer + ", then call again." if read_only else
+                "Steps of this call before it may have run: " + answer + ", then check the result before calling "
+                "again.")
+        return (f"{what}: BLOCKED BY DIALOG {_dlg.label(d)} — {_dlg.buttons_text(d)}; text: "
+                f"{str(d.get('text', ''))[:300]!r}. The shell is waiting for an answer and refused this call — it did "
+                f"not run. {then} blocked_by_dialog: "
+                + json.dumps({k: d.get(k) for k in ("hwnd", "title", "class", "buttons", "buttons_note") if k in d},
+                             default=str))
 
 
 class XaeGone(XaeError):
@@ -158,6 +186,9 @@ class XaeBackend:
     def __init__(self, cfg: XaeConfig):
         self.cfg = cfg
         self.dte: Any = None
+        # what the System Manager logged during the actions of the current call (_sm_messages_of; the server empties it
+        # before each XAE call and adds it to the result as xae_messages)
+        self.messages: list[dict[str, Any]] = []
         self.sysman: Any = None
         self.progid: str | None = None
         self.attached_at: float | None = None
@@ -200,17 +231,7 @@ class XaeBackend:
                     # offers only Cancel goes away by itself, so the call is asked again)
                     dlg = self._modal_dialogs()
                     if dlg:
-                        from . import dialogs as _dlg
-                        d = dlg[0]
-                        raise XaeBusy(
-                            f"{what}: BLOCKED BY DIALOG {_dlg.label(d)} — {_dlg.buttons_text(d)}; text: "
-                            f"{str(d.get('text', ''))[:300]!r}. The shell is waiting for an answer, so whether the action ran "
-                            "is unknown until the dialog is answered (xae_dialog_resolve(button=...)"
-                            + ("" if d.get("buttons") is not None else "; its buttons can't be pressed by the tool — "
-                               "close it in XAE") + "), then check the result. blocked_by_dialog: "
-                            + json.dumps({k: d.get(k) for k in ("hwnd", "title", "class", "buttons", "buttons_note")
-                                          if k in d}, default=str)
-                        ) from exc
+                        raise XaeBusy.blocked(what, dlg[0]) from exc
                 if hr in _BUSY_HR and time.time() < deadline:
                     time.sleep(delay)
                     delay = min(delay * 1.5, 2.0)
@@ -429,19 +450,108 @@ class XaeBackend:
         self._retry(lambda: self._cur_sm().GetTargetNetId(), "ITcSysManager check")
 
     def _on_sm(self, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
-        """op(System Manager) through _retry, the System Manager taken in every attempt."""
+        """op(System Manager) through _retry, the System Manager taken in every attempt. An action (once) is read for
+        the System Manager's messages (_sm_messages_of)."""
         self._sm()                         # N116: the bound solution, checked once per call
-        if once:
-            self._live_sm()
-        return self._retry(lambda: op(self._cur_sm()), what, once)
+        if not once:
+            return self._retry(lambda: op(self._cur_sm()), what, once)
+        self._live_sm()
+        with self._sm_messages_of(what):
+            return self._retry(lambda: op(self._cur_sm()), what, once)
 
     def _on_item(self, path: str, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(tree item at path) through _retry, the item looked up in every attempt — a refreshed System Manager or a
-        re-attached shell gives a live item, never the stale one of the first attempt."""
+        re-attached shell gives a live item, never the stale one of the first attempt. An action (once) is read for
+        the System Manager's messages (_sm_messages_of)."""
         self._sm()
-        if once:
-            self._live_sm()
-        return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what, once)
+        if not once:
+            return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what, once)
+        self._live_sm()
+        with self._sm_messages_of(what):
+            return self._retry(lambda: op(self._cur_sm().LookupTreeItem(path)), what, once)
+
+    # TE1000 ITcSysManager2::GetLastErrorMessages: "Returns the error and warning messages accumulated in the internal
+    # buffer and then clears the buffer. Many methods log additional diagnostic messages here, even if their HRESULT is
+    # S_OK" (the current page; the TwinCAT 2.11 page says only "returns the last error messages"). Whether a build's
+    # read clears it is not assumed: a buffer that does not clear starts with what the read before the action gave.
+    MESSAGES_MAX = 4000                    # characters of one action's messages kept (the lines: 50)
+    MESSAGES_READ_S = 2.0                  # how long a busy shell is asked for them (an addition: never a wait)
+
+    def _sm_messages(self, sm: Any) -> str | None:
+        """The message buffer of the System Manager `sm` ('' when empty); None when it can't be read: no ITcSysManager2,
+        a shell that keeps rejecting the read for MESSAGES_READ_S (review of 0.8.16: the member check waited the whole
+        com_retry_s), or `sm` is no longer the System Manager in use — the shell went away during the action and the
+        server re-attached: the new shell's buffer is not this action's (review of 0.8.16, it was read and cleared)."""
+        if sm is None or self.sysman is not sm:
+            return None
+        if getattr(self, "_msg_sm", None) is not sm:
+            # what is known of this System Manager's buffer: whether it has one, whether a read clears it
+            self._msg_sm, self._msg_has, self._msg_clears = sm, None, None
+        try:
+            if self._msg_has is None:
+                self._msg_has = bool(self._retry(lambda: _has_prop(sm, "GetLastErrorMessages"), "GetLastErrorMessages?",
+                                                 retry_s=self.MESSAGES_READ_S))
+            if not self._msg_has:
+                return None
+            return str(self._retry(lambda: _com_call(sm, "GetLastErrorMessages"), "GetLastErrorMessages",
+                                   retry_s=self.MESSAGES_READ_S) or "")
+        except XaeError:
+            return None
+
+    @contextlib.contextmanager
+    def _sm_messages_of(self, what: str) -> Iterator[None]:
+        """What the System Manager logged during one action (activate, restart, ConsumeXml, CreateChild, DeleteChild,
+        PlcOpenImport, GenerateBootProject, an online command, the build): the buffer is read before the action — what
+        it held came from earlier steps — and after it, on success as on failure, from the same System Manager. A success
+        records them (self.messages → the result's xae_messages); a failure's error carries them. A call the shell
+        rejected (XaeBusy) or a shell that went away (XaeGone) ran nothing that could be read.
+
+        Whether a read clears the buffer (TE1000's current page: it does; the TwinCAT 2.11 page does not say) is read
+        from the buffer itself, once per System Manager: the first time it holds something, a second read follows — empty
+        means it clears. Review of 0.8.16: 'the after-read starts with the before-read, so it did not clear' dropped the
+        messages of an action that logged the same text again."""
+        sm = self.sysman
+        before = self._sm_messages(sm)
+        if before and getattr(self, "_msg_clears", None) is None:
+            again = self._sm_messages(sm)
+            if again is not None:
+                self._msg_clears = again == ""
+        try:
+            yield
+        except (XaeBusy, XaeGone):
+            raise
+        except XaeError as exc:
+            rec = self._sm_messages_after(what, before, sm, failed=True)
+            if rec and rec.get("messages"):
+                raise type(exc)(f"{exc} — XAE messages ({what}): {rec['messages'][:1500]}") from exc
+            raise
+        self._sm_messages_after(what, before, sm)
+
+    def _sm_messages_after(self, what: str, before: str | None, sm: Any, failed: bool = False) -> dict[str, Any] | None:
+        after = self._sm_messages(sm)
+        if after is None:
+            return None
+        rec: dict[str, Any] = {"action": what}
+        if failed:
+            rec["failed"] = True
+        clears = getattr(self, "_msg_clears", None)
+        if before and before.strip():
+            # a buffer known not to clear: what the read before gave is history. Unknown (the second read was rejected):
+            # taken as TE1000 documents it — cleared; re-review of 0.8.16: the old 'starts with it' guess lost an action
+            # that logged the same text again
+            if clears is False and after.startswith(before):
+                after = after[len(before):]
+            else:
+                rec["earlier_messages"] = before.strip()[:self.MESSAGES_MAX]
+                rec["earlier_note"] = "in the buffer before this action: logged by earlier steps, not by it"
+        after = after.strip()
+        if after:
+            rec["messages"] = after[:self.MESSAGES_MAX]
+            rec["lines"] = [ln.strip() for ln in after.splitlines() if ln.strip()][:50]
+        if not rec.get("messages") and not rec.get("earlier_messages"):
+            return None
+        self.messages.append(rec)
+        return rec
 
     def _on_dte(self, op: Callable[[Any], Any], what: str, once: bool = False) -> Any:
         """op(DTE) through _retry, the DTE taken in every attempt (a dead proxy is replaced by _retry's re-attach)."""
@@ -772,7 +882,14 @@ class XaeBackend:
             self._on_dte(lambda dte: dte.Solution.SolutionBuild.Clean(True), "SolutionBuild.Clean")
         if rebuild:
             self._on_dte(lambda dte: dte.Solution.SolutionBuild.Clean(True), "SolutionBuild.Clean")
-        self._on_dte(lambda dte: dte.Solution.SolutionBuild.Build(True), "SolutionBuild.Build")
+        try:
+            self._sm()                     # review of 0.8.16: the System Manager whose messages the build may log —
+        except (XaeBusy, XaeGone):         # read only when it happened to be cached
+            raise
+        except XaeError:
+            pass                           # no TwinCAT project in the solution: the build runs without them
+        with self._sm_messages_of("SolutionBuild.Build"):
+            self._on_dte(lambda dte: dte.Solution.SolutionBuild.Build(True), "SolutionBuild.Build")
         # N174 (0.8.14 retest): `self.dte.Solution.SolutionBuild` was read here outside _retry — right after a build the
         # shell rejects calls, and the rejection left xae_build / xae_deploy as an 'internal error' (crash 4ee44bfb,
         # 388c3b88). Every read goes through _retry; the build itself is not repeated.
@@ -1472,7 +1589,8 @@ class XaeBackend:
         def run(op: Callable[[Any], Any], what: str) -> Any:
             if isinstance(parent, str):
                 return self._on_item(parent, op, what, once=True)
-            return self._retry(lambda: op(parent), what, once=True)
+            with self._sm_messages_of(what):
+                return self._retry(lambda: op(parent), what, once=True)
         if info is None:
             return run(lambda p: p.CreateChild(name, subtype, before), "CreateChild")
         try:
@@ -2563,6 +2681,11 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
             el.tag = el.tag.split("}", 1)[1]
 
     def plain(el: Any) -> str | None:
+        # N175 (0.8.15 retest): TwinCAT 3.1.4026 writes an interface's (and its methods' / properties') plain text as
+        # a direct child <InterfaceAsPlainText><xhtml> — not under addData; looked for first
+        x = el.find("./InterfaceAsPlainText/xhtml")
+        if x is not None:
+            return x.text or ""
         for d in el.findall("./interface/addData/data") + el.findall("./addData/data"):
             if str(d.get("name", "")).endswith("interfaceasplaintext"):
                 x = d.find("./InterfaceAsPlainText/xhtml")
@@ -2592,8 +2715,13 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
 
     def node(el: Any) -> dict[str, Any]:
         kids: dict[str, Any] = {}
-        for d in el.findall("./addData/data"):
-            nm = str(d.get("name", ""))
+        # N175 (0.8.15 retest): TwinCAT 3.1.4026's interface export holds its members as direct children —
+        # <Interface><Methods><Method>, <Properties><Property> — besides the addData/data[…/method] form of others
+        groups = [(str(d.get("name", "")), d) for d in el.findall("./addData/data")]
+        # eleventh review: each group by the member tag it holds ('Properties'[:-1] was 'Propertie' — never read)
+        groups += [("/" + tag, d) for g, tag in (("Methods", "method"), ("Properties", "property"), ("Actions", "action"))
+                   for d in el.findall("./" + g)]
+        for nm, d in groups:
             for tag in ("Method", "Action", "Property", "Transition"):
                 if nm.endswith("/" + tag.lower()):
                     for c in d.findall("./" + tag):

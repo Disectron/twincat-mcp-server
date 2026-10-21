@@ -1486,6 +1486,7 @@ class Recording:
                     footer["poll_refused"] = self.poll_refused
                 footer.update(self.stop_and_trigger_notes())
                 footer.update(self.program_footer())
+                footer.update(self._native_like(footer, miss))     # after the stop's notes: whose end was waited for
                 if self.stall_cfg:
                     footer["stall_counter_block"] = self.stall_cfg.get("block")
                 if self.key:
@@ -1498,6 +1499,28 @@ class Recording:
                 sealed = False
         if sealed and not self.scratch:
             self.manifest = seal_recording(self.path, self.key)
+
+    def _native_like(self, footer: dict[str, Any], miss: int | None) -> dict[str, Any]:
+        """0.8.15 retest (rec acea): the fields the native engine's footer has and this one had not — rec_capture and
+        rec_verify showed verdict_hint / overflow_samples null. overflow_samples: the samples lost on this PC (here the
+        backlog that was full: `dropped`); requested_s; for a cycle recording the missing samples at the head, in gaps
+        and at the tail, and verdict_hint: PASS for a COMPLETE file, FAIL for an INCOMPLETE one whose end every block
+        was waited for — none for a change / poll recording (no timeline to prove) or an end that was not waited for
+        (rec_verify's tail rule decides)."""
+        out: dict[str, Any] = {"overflow_samples": self.dropped,
+                               "requested_s": self.duration_s if self.duration_s else None}
+        if self.mode == "cycle" and self.t0_wall is not None:
+            ws, we, fb, org = self.window_start(), self.window_end(), self.fallback_period(), self.window_origin()
+            blocks = list(self.timeline_blocks())
+            head = sum(max(0, b.head_missing(ws, fb)) for b in blocks)
+            tail = sum(max(0, b.tail_missing(we, fb, org)) for b in blocks) if we is not None else 0
+            out.update({"missing_head": head, "missing_tail": tail, "missing_gaps": max(0, (miss or 0) - head - tail)})
+        label = footer.get("label")
+        if label == "COMPLETE":
+            out["verdict_hint"] = "PASS"
+        elif label == "INCOMPLETE" and not end_not_waited_for(footer):
+            out["verdict_hint"] = "FAIL"
+        return out
 
     def label(self, miss: int | None = None) -> str:
         """R5: COMPLETE only when the PLC timeline proves every sample is in the file (cycle mode); INCOMPLETE when
