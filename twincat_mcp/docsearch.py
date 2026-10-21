@@ -483,39 +483,62 @@ def _title_keyer(query: str) -> Callable[[str, str], tuple[tuple[Any, ...], str 
 
 # ------------------------------------------------------------------------------------------- error codes (N99)
 _HEX = re.compile(r"^(?:0x|16#|#x)([0-9a-f_]+)$", re.I)
-# Which numbers of a question are codes (N99, N121, N122, rounds 7-10 of the 0.8.16 review). One rule set, read
-# against one corpus of questions (tests/fixtures/code_questions.tsv) — each round's fix of one phrasing had broken
-# others ('the 1861 error', '1861 error, 3 times', 'axis 0x4650 error', 'Build failed with 1 error'):
-#   - a code word right before the number names it: 'error 1861', 'error: 1861', 'error - 1861', 'error, 0x745',
-#     'nErrId := 1861', "AL Status Code: '0x001b'", two words: 'error number 1861', 'return value 1861';
-#   - a code word right after it (a space between) names it: '1861 error', 'the 0x745 error' — not a number of one
-#     digit ('1 error', 'retry 3 error': a count), not a number a thing's name stands before ('Term 4 error',
-#     'Port 851 error'; a hex number is no thing's number, and four digits are no term's, axis' or device's:
-#     'axis 4650 error'), not when the code word names a code of its own after it ('Task 1 error 1861');
-#   - a count is no code: a decimal followed by what it counts ('Error: 2 axes not referenced', 'error 3 times',
-#     '1 error, 3 warnings' — up to three digits: 'error 1808 symbols not found' is 1808), a position ('Error 1 of 3'),
-#     a plural code word after it ('3 errors', '1 error(s)', '3 error messages' — not after a list of codes: '1861
-#     and 1808 errors'), a decimal after 'errors' ('errors: 3'; four digits name codes: 'errors 1861 and 1808');
-#   - a number listed with a code ('error 1861 or 1808', 'errors 1861 and 1808') is one too — two digits at least.
+# Which numbers of a question are codes (N99, N121, N122, rounds 7-11 of the 0.8.16 review). One rule set, read
+# against one corpus of questions (tests/fixtures/code_questions.tsv). Rounds 8-11 each widened the rules for some
+# phrasings and read counts, addresses or dates as codes in others; the rules now take a number for a code only when
+# nothing around it reads as a count or as a thing's number — a question that names a code another way gets
+# documented=false and is asked again, while a count read as a code gets a wrong meaning:
+#   - a code word right before the number names it: 'error 1861', 'error: 1861', 'nErrId := 1861', "AL Status Code:
+#     '0x001b'", 'the error code is 1861', two words: 'error number 1861', 'return value 1861', 'Fehler-Nr. 1861';
+#     after a dash, a comma or a semicolon a decimal only when the phrase ends there or goes on with a word that is no
+#     noun ('error - 1861 when reading', 'I got an error, 1861' — not 'Error - 12 PLCs down', 'error, 25 more');
+#   - a code word right after it (a space between) names it: '1861 error', 'the 0x745 error' — a decimal of three
+#     digits or more ('12 error in my build' counts), not after a thing's name ('Term 4 error', 'Port 851 error',
+#     'slave 1001 error': EtherCAT addresses start at 1001), not when the code word names a code of its own after it
+#     ('Task 1 error 1861' — a count after it is none: '1861 error 3 times'), not before a plural code word
+#     ('3 errors', '1 error(s)', '1861 Fehler' — German writes the plural so; not after a list of codes: '1861 and
+#     1808 errors'), not '12 error messages' (up to three digits);
+#   - a count is no code: a decimal of up to three digits followed by what it counts ('Error: 2 axes not referenced',
+#     'error 3 times', 'error 20 PLCs', 'error 30 min after start'), a position ('Error 1 of 3', 'Error 3/10'), a
+#     decimal after 'errors' ('errors: 3'; four digits name codes: 'errors 1861 and 1808'), a part of a date, a time
+#     or a version ('21.10.2026', '14:30', '3.1.4024');
+#   - a number listed with a code by 'and' / 'or' / 'vs' / a comma ('error 1861 or 1808', 'codes 1861, 1808 and 1792')
+#     is one too: three digits or more, standing alone ('error 1861, 100 reads' and 'error 1861 and 20 others' list no
+#     code).
 # A hex number is never a count or a thing's number.
-_CODE_WORDS = frozenset("""error errors err errid nerrid errorid nerrorid errorcode nerrorcode errcode errno errnum
-code codes return returncode result hresult adserr adserror fehler fehlercode fehlernummer""".split())
+_CODE_WORDS = frozenset(fold(w) for w in """error errors err errid nerrid errorid nerrorid errorcode nerrorcode errcode
+errno errnum code codes return returncode result hresult adserr adserror fehler fehlercode fehlernummer fehlernr
+fehlermeldung rückgabewert""".split())
+# a word that ends in one of these names a code too ('Achsfehler 4650', 'AxisError 4650', 'nDriveErrorId 2342')
+_CODE_WORD_ENDS = ("error", "fehler", "errid", "errorid", "errorcode", "errcode")
 # 'error number 1861', 'error ID 1861', 'Fehler Nr. 1861', 'return value 1861': a code word and one of these
-_CODE_WORD_SUFFIX = frozenset("number id no nr code nummer value wert".split())
+_CODE_WORD_SUFFIX = frozenset(fold(w) for w in "number id no nr code nummer value wert message".split())
 _COUNT_WORDS = frozenset("errors codes results warnings fehler".split())   # after a number: how many, not which one
-_SAME_PLURAL = frozenset({"fehler"})          # a plural like its singular: '3 Fehler' counts, '1861 Fehler' names
-# what a number counts when it stands right before it ('2 axes', '3 times', '3 warnings', '2 Achsen')
-_COUNT_NOUNS = frozenset("""times mal retries tries attempts axes achsen terminals klemmen symbols symbole variables
-variablen seconds secs sekunden minutes minuten hours stunden days tage ms warnings warnungen errors messages meldungen
-devices geräte drives antriebe boxes slaves items entries values werte cycles zyklen tasks channels kanäle modules
-steps schritte lines zeilen points objects objekte codes fehler hinweise infos""".split())
-# words a number after which is that thing's number, not a code ('Term 4 error', 'Port 851 error', 'Line 34 error'):
-# TwinCAT's own tree item names and the things logs number — a port's, a line's and a step's number of any size
+# what a number counts when it stands right before it ('2 axes', '3 times', '3 warnings', '2 Achsen', '64 bytes',
+# '30 min'); a word in capitals with a plural s counts too ('20 PLCs', '3 IPCs')
+_COUNT_NOUNS = frozenset(fold(w) for w in """times mal retries tries attempts axes achsen terminals klemmen symbols symbole variables
+variablen seconds secs sec s sekunden minutes minuten min mins hours hrs h stunden days tage ms us µs warnings warnungen
+errors messages meldungen devices geräte drives antriebe boxes slaves items entries values werte cycles zyklen tasks
+channels kanäle modules steps schritte lines zeilen points objects objekte codes fehler hinweise infos bytes byte bit
+bits inputs outputs eingänge ausgänge frames telegramme clients nodes connections verbindungen instances instanzen
+reads writes others more weitere andere stations teilnehmer stück pcs percent prozent x packets pakete projects
+projekte""".split())
+# after a dash / comma / semicolon a decimal is a code when the phrase ends or goes on with one of these
+_FUNCTION_WORDS = frozenset(fold(w) for w in """on at in when while after before from during for with by since and or then but if as to
+via is was occurs occurred appears appeared happens happened comes came means beim bei nach vor wenn während auf im
+und oder""".split())
+# words a number after which is that thing's number, not a code ('Term 4 error', 'Port 851 error', 'Line 34 error',
+# 'slave 1001 error'): TwinCAT's own tree item names and the things logs number — of any size
 _NUMBERED = frozenset("""term box device drive axis module channel coupler slot task port line step item terminal slave
-node station klemme kanal achse zeile""".split())
-_NUMBERED_ANY = frozenset("port line zeile step".split())
+node station klemme kanal achse zeile teilnehmer address adresse""".split())
 _COUNT_BEFORE = frozenset("errors".split())                                # 'errors: 3' — before it as well
-_LISTED = re.compile(r"\s*(?:,|/|&|\band\b|\bor\b|\bvs\b\.?|\bversus\b|\bund\b|\boder\b)\s*\Z", re.I)
+_LISTED = re.compile(r"\s*(?:,|/|\band\b|\bor\b|\bvs\b\.?|\bversus\b|\bund\b|\boder\b|,?\s*\bthen\b|,?\s*\bdann\b)\s*\Z",
+                     re.I)
+_LISTED_WORD = re.compile(r"\s*(?:\band\b|\bor\b|\bvs\b\.?|\bversus\b|\bund\b|\boder\b)\s*\Z", re.I)
+# a query that is nothing but numbers ('1861 and 1808', '0x745, 0x746'): each is a code
+_ONLY_NUMBERS = re.compile(r"(?:0[xX][0-9a-fA-F_]+|16#[0-9a-fA-F_]+|#[xX][0-9a-fA-F_]+|-?\d+)"
+                           r"(?:\s*(?:,|/|\band\b|\bor\b|\bvs\b\.?|\bund\b|\boder\b)\s*"
+                           r"(?:0[xX][0-9a-fA-F_]+|16#[0-9a-fA-F_]+|#[xX][0-9a-fA-F_]+|-?\d+))*", re.I)
 
 
 def code_tokens(query: str, min_digits: int = 2, hex_anywhere: bool = True) -> list[dict[str, Any]]:
@@ -524,12 +547,13 @@ def code_tokens(query: str, min_digits: int = 2, hex_anywhere: bool = True) -> l
     else only as the whole query or next to a word that says it is a code; a decimal number of min_digits digits or more
     (a minus sign right before it belongs to it: '-6908') only as the whole query ('1861', '1808?') or next to such a
     word ('error 1861', 'nErrId := 1808', '1861 error' — 'ADS error on port 851' is no code 851, N121), or listed with
-    such a number ('error 1861 or 1808'). -> [{token, value, how: 'hex' | 'dec', whole, next_to_code_word, start,
-    end}] in the order of the query."""
+    such a number ('error 1861 or 1808') — the rules above. -> [{token, value, how: 'hex' | 'dec', whole,
+    next_to_code_word, start, end}] in the order of the query."""
     q = query_text(query)
     found: list[dict[str, Any]] = []
     # fourth review of 0.8.16: '0X98110745' (a capital X) is a hex number too
-    bare = q.strip().rstrip("?!.").strip()
+    bare = q.strip().rstrip("?!.").strip().strip("`'\"„“”‚‘’").strip()
+    only_numbers = bool(_ONLY_NUMBERS.fullmatch(bare))
     for tk in re.finditer(r"(?:0[xX]|16#|#[xX])[0-9a-fA-F_]+|(?:(?<![\w.\-])-)?\b\d{%d,}\b" % max(1, int(min_digits)), q):
         t = tk.group(0)
         m = _HEX.match(t)
@@ -537,22 +561,26 @@ def code_tokens(query: str, min_digits: int = 2, hex_anywhere: bool = True) -> l
             value = int(m.group(1).replace("_", ""), 16) if m else int(t)
         except ValueError:
             continue
-        found.append({"token": t, "value": value, "how": "hex" if m else "dec", "whole": bare == t,
+        found.append({"token": t, "value": value, "how": "hex" if m else "dec", "whole": bare == t or only_numbers,
                       "next_to_code_word": _next_to_code_word(q, tk.start(), tk.end()), "start": tk.start(),
                       "end": tk.end()})
-    # tenth review of 0.8.16: a number listed with a code is one ('error 1861 or 1808'); not a count, not one digit
+    # a number listed with a code ('error 1861 or 1808'): three digits or more, standing alone — not a count, not a
+    # thing's number, not followed by a word ('error 1861, 100 reads', 'error 1861 and 20 others')
     changed = True
     while changed:
         changed = False
         for i, c in enumerate(found):
-            if c["next_to_code_word"] or (c["how"] == "dec" and len(c["token"].lstrip("-")) < 2) or \
-                    _counted(q, c["start"], c["end"]) or _attached(q, c["start"], c["end"]) or \
-                    _things_number(q, c["start"], c["end"]):
+            s, e = c["start"], c["end"]
+            nxt = re.match(r"[ \t]*([^\W\d_]+)", q[e:])
+            if c["next_to_code_word"] or _counted(q, s, e) or _attached(q, s, e) or _things_number(q, s, e) or \
+                    (nxt and fold(nxt.group(1)) not in _FUNCTION_WORDS):
                 continue
+            short = c["how"] == "dec" and len(c["token"].lstrip("-")) < 3
             for j in (i - 1, i + 1):
                 if 0 <= j < len(found) and found[j]["next_to_code_word"]:
                     a, b = (found[j], c) if j < i else (c, found[j])
-                    if _LISTED.match(q[a["end"]:b["start"]]):
+                    # 'ADS error 6 and 7' (and / or: any length); 'error 1861, 1808', '1861/1808' (three digits)
+                    if (_LISTED_WORD if short else _LISTED).match(q[a["end"]:b["start"]]):
                         c["next_to_code_word"] = changed = True
                         break
     return [c for c in found if c["whole"] or c["next_to_code_word"] or (c["how"] == "hex" and hex_anywhere)]
@@ -581,30 +609,42 @@ def code_forms(query: str) -> dict[str, Any] | None:
 
 
 def _attached(q: str, start: int, end: int) -> bool:
-    """Part of a name, not a number of its own: 'P-CHAN-00020', 'EL3102_1', 'error1861', 'error-1861'."""
-    return bool(re.search(r"[\w-]$", q[:start]) or re.match(r"[\w-]", q[end:]))
+    """Part of a name, not a number of its own: 'P-CHAN-00020', 'EL3102_1', 'error1861', 'error-1861' — or of a date, a
+    time or a version ('21.10.2026', '14:30:12', '3.1.4024')."""
+    return bool(re.search(r"[\w-]$|\d[.:]$", q[:start]) or re.match(r"[\w-]|[.:]\d", q[end:]))
+
+
+def _count_noun(word: str, plural_s: bool = False) -> bool:
+    """A word a number before it counts: _COUNT_NOUNS, '(s)', a word in capitals with a plural s ('PLCs')."""
+    return plural_s or fold(word) in _COUNT_NOUNS or bool(re.fullmatch(r"[A-Z]{2,}s", word))
 
 
 def _counted(q: str, start: int, end: int) -> bool:
-    """The decimal q[start:end] says how many, or which one of several: a position ('Error 1 of 3', '4 of 10
-    symbols'), or a number of up to three digits right before what it counts ('2 axes', '3 times', '3 warnings',
-    '3 warning(s)'). A hex number never counts."""
-    if _HEX.match(q[start:end]):
+    """The decimal q[start:end] of up to three digits says how many, or which one of several: a position ('Error 1 of
+    3', '4 of 10 symbols', 'Error 3/10'), or a number right before what it counts ('2 axes', '3 times', '3 warnings',
+    '3 warning(s)', '20 PLCs'). A hex number never counts; four digits are a code's ('error 1808 symbols not found')."""
+    if _HEX.match(q[start:end]) or len(q[start:end].lstrip("-")) > 3:
         return False
-    if re.match(r"[ \t]+(?:of|von)[ \t]+\d", q[end:], re.I):
+    if re.match(r"[ \t]+(?:out[ \t]+)?(?:of|von)[ \t]+\d|[ \t]*/[ \t]*\d", q[end:], re.I) or \
+            re.search(r"\d[ \t]*/[ \t]*$", q[:start]):
         return True
-    m = re.match(r"[ \t]{1,3}([^\W\d_]+)(\(s\))?", q[end:])
-    return bool(m and len(q[start:end].lstrip("-")) <= 3 and (fold(m.group(1)) in _COUNT_NOUNS or m.group(2)))
+    m = re.match(r"[ \t]{1,3}\(?([^\W\d_]+)(\(s\))?", q[end:])
+    if m and fold(m.group(1)) == "times" and re.match(r"[ \t]+out\b", q[end + m.end():], re.I):
+        return False                                  # 'ADS error 6 times out': the verb
+    return bool(m and _count_noun(m.group(1), bool(m.group(2))))
 
 
 def _things_number(q: str, start: int, end: int) -> bool:
-    """The decimal q[start:end] is the number of the thing named right before it ('Term 4', 'Port 851', 'line 1861';
-    four digits are no term's, axis' or device's: 'axis 4650')."""
-    tok = q[start:end]
-    if _HEX.match(tok):
+    """The decimal q[start:end] is the number of the thing named right before it ('Term 4', 'Port 851', 'line 1861',
+    'slave 1001')."""
+    if _HEX.match(q[start:end]):
         return False
-    thing = re.search(r"(?i)\b(" + "|".join(sorted(_NUMBERED)) + r")\.?[ \t]+$", q[:start])
-    return bool(thing and (thing.group(1).lower() in _NUMBERED_ANY or len(tok.lstrip("-")) <= 3))
+    return bool(re.search(r"(?i)\b(?:" + "|".join(sorted(_NUMBERED)) + r")\.?[ \t]+$", q[:start]))
+
+
+def _is_code_word(w: str) -> bool:
+    """A folded word that says a number is a code: _CODE_WORDS, or a word that ends in one ('achsfehler', 'axiserror')."""
+    return w in _CODE_WORDS or (len(w) > 6 and w.endswith(_CODE_WORD_ENDS))
 
 
 def _next_to_code_word(q: str, start: int, end: int) -> bool:
@@ -615,39 +655,48 @@ def _next_to_code_word(q: str, start: int, end: int) -> bool:
     tok = q[start:end]
     dec = not _HEX.match(tok)
     digits = len(tok.lstrip("-"))
-    # before: the code word, then a space, ':', '=', '#', '(', a quote, a dash, a comma or a semicolon ('error 1861',
-    # 'nErrId := 1861', "AL Status Code: '0x001b'", 'error – 0x4260', 'I got an error, 1861')
-    before = re.search(r"([^\W\d_]+)([\s:=#('\"‘“\-–—,;]{1,6})$", q[:start])
+    # before: the code word, then a space, ':', '=', '#', '(', a quote or a backtick ('error 1861', 'nErrId := 1861',
+    # "AL Status Code: '0x001b'"), 'is' / 'was' ('the error code is 1861'), or a dash, a comma or a semicolon
+    before = re.search(r"([^\W\d_]+)\.?([\s:=#('\"‘“„‚`\-–—,;]{1,6}|\s+(?:is|was|ist|war)\s+)$", q[:start], re.I)
     if before is not None:
         w = fold(before.group(1))
-        # after a comma or a semicolon one digit is too little ('an error, 2 PLCs down' — a count of what it names)
-        loose = dec and digits < 2 and re.search(r"[,;]", before.group(2))
-        if w in _CODE_WORDS and not (dec and w in _COUNT_BEFORE and digits <= 3) and not loose:
-            return True
-    two = re.search(r"([^\W\d_]+)\s+([^\W\d_]+)\.?[\s:=#(]{1,6}$", q[:start])
-    if two and fold(two.group(1)) in _CODE_WORDS and fold(two.group(2)) in _CODE_WORD_SUFFIX:
+        if _is_code_word(w) and not (dec and w in _COUNT_BEFORE and digits <= 3):
+            if not dec or not re.search(r"[\-–—,;]", before.group(2)):
+                return True
+            # after a dash, a comma or a semicolon: the phrase ends here or goes on with a word that is no noun
+            nxt = re.match(r"\s*([^\W\d_]+)", q[end:])
+            if re.match(r"\s*(?:$|[.,;:!?)\]'\"’”(])", q[end:]) or (nxt and fold(nxt.group(1)) in _FUNCTION_WORDS):
+                return True
+    two = re.search(r"([^\W\d_]+)[\s\-]+([^\W\d_]+)\.?(?:[\s:=#(]{1,6}|\s+(?:is|was|ist|war)\s+)$", q[:start], re.I)
+    if two and _is_code_word(fold(two.group(1))) and fold(two.group(2)) in _CODE_WORD_SUFFIX:
         return True
-    # after: a space, then the code word ('1861 error', 'the 0x745 error', '1 error(s)')
-    after = re.match(r"[ \t]{1,3}([^\W\d_]+)(\(s\))?", q[end:])
-    if after is None or fold(after.group(1)) not in _CODE_WORDS:
+    # after: a space, then the code word ('1861 error', 'the 0x745 error', '1 error(s)', '1861 ADS error')
+    after = re.match(r"(?i)[ \t]{1,3}(?:(?:ads|nc|win32|plc|sps|ethercat|twincat|tc3|com|labview)[ \t]+)?([^\W\d_]+)(\(s\))?",
+                     q[end:])
+    if after is None or not _is_code_word(fold(after.group(1))):
         return False
     rest = q[end + after.end():]
-    # 'Task 1 error 1861', 'Line 34 error C0046': the code word names the code after it
-    if re.match(r"[\s:=#('\"‘“]{0,6}(?:0[xX][0-9a-fA-F]|16#[0-9a-fA-F]|#[xX][0-9a-fA-F]|-?\d|[A-Za-z]\d{3,})", rest):
-        return False
+    # 'Task 1 error 1861', 'Line 34 error C0046': the code word names the code after it — not a count after it
+    nxt = re.match(r"[\s:=#('\"‘“]{0,6}(?:0[xX][0-9a-fA-F]|16#[0-9a-fA-F]|#[xX][0-9a-fA-F]|-?\d|[A-Za-z]\d{3,})", rest)
+    if nxt:
+        num = re.match(r"[\s:=#('\"‘“]{0,6}(-?\d+)\b", rest)
+        at = end + after.end() + (num.start(1) if num else 0)
+        if not (num and _counted(q, at, at + len(num.group(1)))):
+            return False
     if not dec:
         return True                                   # a hex number is no count and no thing's number
-    if digits < 2:
-        return False                                  # '1 error', 'retry 3 error', 'Step 3 of 5 error': a count
+    if digits < 3:
+        return False                                  # '1 error', '12 error in my build': a count
     if _things_number(q, start, end):
-        return False                                  # 'Term 4 error', 'Port 851 error', 'line 1861 error'
+        return False                                  # 'Term 4 error', 'Port 851 error', 'slave 1001 error'
     w = fold(after.group(1))
     if after.group(2) or w in _COUNT_WORDS:
         listed = re.search(r"(?:0[xX][0-9a-fA-F]+|\d+)" + _LISTED.pattern.replace(r"\Z", "$"), q[:start], re.I)
-        if not listed and not (w in _SAME_PLURAL and not after.group(2) and digits >= 4):
-            return False                              # '3 errors', '1861 errors' — not '1861 and 1808 errors'
-    if re.match(r"[ \t]+([^\W\d_]+)", rest) and fold(re.match(r"[ \t]+([^\W\d_]+)", rest).group(1)) in _COUNT_NOUNS:
-        return False                                  # '12 error messages', '10 error codes': how many
+        if not listed:
+            return False                              # '3 errors', '1861 Fehler' — not '1861 and 1808 errors'
+    m2 = re.match(r"[ \t]+([^\W\d_]+)", rest)
+    if digits <= 3 and m2 and _count_noun(m2.group(1)):
+        return False                                  # '120 error messages': how many
     return True
 
 

@@ -591,8 +591,10 @@ _IEC_TYPES = ("ARRAY|POINTER|REFERENCE|BOOL|BYTE|WORD|DWORD|LWORD|SINT|INT|DINT|
 _ST_DECL = re.compile(rf"^\s*\w+\s*(?:AT\s+%\S+\s*)?:\s*(?:{_IEC_TYPES})\b[^;\n]*;", re.M)
 _CS_SIGNS = [(re.compile(p, re.M), w) for p, w in (
     (r"^\s*using\s+System\b", 3), (r"\busing\s*\(", 2), (r"^\s*using\s+[A-Z]\w*(\.\w+)+\s*;", 2),
-    (r"\b(private|public|protected|internal)\s+((static|async|override|virtual|readonly|sealed|abstract|partial)\s+)*"
-     r"[\w<>\[\],.?]+\s+\w+(<[^>()]*>)?\s*[({;=]", 2),
+    # a member with its access modifier: generic types with spaces ('Func<Value, bool>'), a field without ';' at the
+    # line's end ('public static readonly DateTime MaxValue') — eleventh review
+    (r"\b(private|public|protected|internal)\s+((static|async|override|virtual|readonly|sealed|abstract|partial|const|"
+     r"new|unsafe|extern|event)\s+)*[\w.?\[\]]+(?:<[^()\n]*?>)?(?:\[\])?\??\s+\w+(?:<[^()\n]*>)?\s*(?:[({;=]|$)", 2),
     (r"\b(public|private|internal)\s+(sealed\s+|static\s+|partial\s+|abstract\s+)*(class|interface|enum|struct)\s+\w+", 2),
     (r"\b(public|private|internal|protected)\b[^;{]*\boperator\b", 2),
     (r"\bvar\s+\w+\s*=", 2), (r"\bawait\s", 2), (r"\basync\s+Task\b", 2), (r"\bConsole\.\w+", 2),
@@ -1435,9 +1437,11 @@ def search_index(con: Any, query: str, limit: int, where: str = "", extra: list[
     # more: hits not shown — more documents than shown up to this page among those read, or pages that were not
     # read. `total` counts pages: a page in several books once per book (copies are listed once, with same_page_in)
     more = seen["documents"] > len(rows) or total > seen["read"] + outside
+    # N183 (0.8.15 retest): why a hit is where it is when its score did not place it — the code's table, or its title;
+    # ranked over every hit up to this page (eleventh review: offset=5 began again at title_rank 1)
+    placed = DS.title_ranks(rows[:offset + limit], query, skip=ids)
     rows = rows[offset:offset + limit]                                     # N167: this page of the hits
-    # N183 (0.8.15 retest): why a hit is where it is when its score did not place it — the code's table, or its title
-    placed = DS.title_ranks(rows, query, skip=ids)
+    placed = {r["rid"]: placed[r["rid"]] for r in rows if r["rid"] in placed}
     return {"rows": rows, "total": total, "more": more, "mode": mode, "expr": expr, "info": info, "code": forms,
             "offset": offset, "next_offset": offset + len(rows) if more and rows else None,
             "defined": sum(1 for r in rows if r["rid"] in ids),

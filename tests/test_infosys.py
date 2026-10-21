@@ -1441,3 +1441,20 @@ def test_n160b_a_typo_inside_a_word_has_its_symbol_near(idx):
     with pytest.raises(InfosysError, match=r"near: \['ADSREAD \(https://"):
         idx.get_page("ADSREED")
     assert inf._edits("fb_fileopn", "fb_fileopen", 2) == 1 and inf._edits("abcdef", "uvwxyz", 2) == 3
+
+
+def test_review11_0816_title_rank_goes_on_across_pages(idx):
+    """Eleventh review of 0.8.16 (N183): title_rank was computed on each page of hits alone — MC_MoveAbsolute with
+    offset=5 began again at rank 1 while page 1 had the same kind of match at rank 4. The ranks are of the whole
+    order: the next page goes on from where the one before ended."""
+    P = "tf5000_tc3_nc_ptp"
+    titles = ["MC_MoveAbsolute", "MC_MoveAbsoluteCA", "MC_MoveAbsolute command", "Moving to an absolute position",
+              "MC_MoveModulo", "MC_MoveRelative", "MC_MoveVelocity", "MC_MoveAdditive"]
+    _store_pages(idx, [(f"{P}/{2000000100 + i}", t, f"<p>{t}: MC_MoveAbsolute moves the axis to an absolute "
+                                                    "position.</p>") for i, t in enumerate(titles)])
+    idx.sync_derived()
+    whole = [i.get("title_rank") for i in idx.search("MC_MoveAbsolute", limit=8)["items"]]
+    paged = [i.get("title_rank") for off in (0, 3, 6) for i in idx.search("MC_MoveAbsolute", limit=3, offset=off)["items"]]
+    assert paged == whole[:len(paged)], (paged, whole)
+    ranked = [r for r in paged if r is not None]
+    assert ranked == sorted(ranked) and len(set(ranked)) > 1, paged

@@ -330,5 +330,44 @@ async def test_n180_save_after_a_twincat_restart_is_said_and_recovered_or_lost(m
         monkeypatch.setattr(fake_xae, "ExportCSV", no_csv)
         r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
-        assert out["scope"]["save_svd"]["error"].startswith("Scope was reset to Config"), out["scope"]
-        assert "is lost" in out["scope"]["export_csv"]["lost"], out["scope"]
+        # eleventh review: no reset line since this recording began — the state is said, no restart invented
+        sv = out["scope"]["save_svd"]
+        assert sv["error"].startswith("Scope is in state Config, not Reply — the Scope View log names no reset"), sv
+        assert "restart" not in sv["error"] and "reset_seen" not in sv, sv
+        assert "Scope was in state Config and refused both" in out["scope"]["export_csv"]["lost"], out["scope"]
+
+        def record_state(path):
+            raise RuntimeError("Invalid ScopeState! Reply requested, actual: Record")
+        monkeypatch.setattr(fake_xae, "SaveSVD", record_state)
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+        assert out["scope"]["save_svd"]["error"].startswith("Scope is in state Record, not Reply"), out["scope"]
+
+
+@pytest.mark.anyio
+async def test_review11_0816_rec_stop_is_never_taken_for_an_end_of_its_own(monkeypatch, project_dir, fake_xae):
+    """Eleventh review of 0.8.16: a recording turns inactive at the start of its stop; while rec_stop sealed a large
+    file (0.3 s and more) the N182 watch finished the Scope run and wrote 'the recording ended by itself (manual
+    (rec_stop))' into rec_stop's result and the signed .scope.json link. rec_stop's stop is its own."""
+    import json as _json
+    import time as _t
+    from pathlib import Path
+    from twincat_mcp import recorder as R
+    from twincat_mcp.server import build_server
+    from tests.fake_ads import install
+    from tests.test_server_e2e import client_for, mk_cfg, payload
+    install(monkeypatch)
+    orig = R.Recorder.stop
+
+    def slow_stop(self, rid, reason="requested"):
+        st = orig(self, rid, reason)
+        _t.sleep(1.2)                                  # the seal / stats of a large recording, after it turned inactive
+        return st
+    monkeypatch.setattr(R.Recorder, "stop", slow_stop)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    assert out["scope"]["finished_by"] == "rec_stop" and "recording_ended" not in out["scope"], out["scope"]
+    link = _json.loads(Path(out["scope"]["link"]["file"]).read_text(encoding="utf-8"))
+    assert link.get("finished_by") == "rec_stop", link

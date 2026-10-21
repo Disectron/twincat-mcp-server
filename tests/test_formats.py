@@ -24,13 +24,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (format version, fingerprint of the code that produces it)
-INFOSYS_FINGERPRINT = (8, "8fab192cec4104ce")   # 0.8.16: code sample languages by counted signs (N184); 7 (0.8.15):
+INFOSYS_FINGERPRINT = (8, "27d687f130760f6d")   # 0.8.16: code sample languages by counted signs (N184); 7 (0.8.15):
 #                                                    kinds from the page's own evidence, symbols inside pages (N170)
 MANUALS_FINGERPRINT = ("6", "481f937f2d3d0a9d")   # 0.8.14 retest: product codes of every family (N163)
 ESI_FINGERPRINT = ("2", "49f0ad9346541e7b")    # index\\esi.db (esi_index.py): format 2 — modules found by their
 #                                                 devices (N156, 0.8.14 retest), one object per index of a dictionary
 #                                                 (EL6653, kb_verify E2; format 2 is not released yet); 1 since 0.8.12
-ERRORS_FINGERPRINT = ("1", "15fb5f4ed366b250")  # index\\errors.db (errors_index.py): format 1 — 0.8.16 (N125), not
+ERRORS_FINGERPRINT = ("1", "c106571e87e45e92")  # index\\errors.db (errors_index.py): format 1 — 0.8.16 (N125), not
 #                                                  released yet: AL codes by section (code.detail), enum code blocks
 
 EXCLUDE = frozenset({
@@ -43,6 +43,15 @@ EXCLUDE = frozenset({
     # that changes leaves the stored index right; connect_ro / ErrError: connection handling, an error type
     "ANNOTATIONS", "connect_ro", "ErrError",
 })
+
+
+def _canon(val):
+    """A value as fingerprinted: patterns as (pattern, flags), lists and tuples item by item."""
+    if isinstance(val, re.Pattern):
+        return (val.pattern, val.flags)
+    if isinstance(val, (list, tuple)):
+        return tuple(_canon(x) for x in val)
+    return val
 
 
 def _closure(roots: list, modules: list) -> dict[str, str]:
@@ -65,6 +74,10 @@ def _closure(roots: list, modules: list) -> dict[str, str]:
                 todo.append(val)
         elif isinstance(val, re.Pattern):
             found.setdefault(name, repr((val.pattern, val.flags)))
+        elif isinstance(val, (list, tuple)) and any(isinstance(x, (re.Pattern, list, tuple)) for x in val):
+            # eleventh review of 0.8.16: a list of rules (infosys._CS_SIGNS: (pattern, weight)) was not in the
+            # fingerprint at all, and repr() cuts a pattern at 200 characters
+            found.setdefault(name, repr(_canon(val)))
         elif isinstance(val, (str, bytes, int, float, bool, tuple)):
             found.setdefault(name, repr(val))
         elif isinstance(val, (set, frozenset)):

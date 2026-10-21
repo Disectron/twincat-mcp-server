@@ -2449,3 +2449,36 @@ async def test_review10_0816_the_whole_log_typed_and_untyped_items_and_counts(mo
         r = await app.err_from_logs(q)
         assert r is None or r["entries"] == [], (q, r)
     assert App._question("what do the last 2 Term 4 errors mean?")["count"] == 2
+
+
+@pytest.mark.anyio
+async def test_review11_0816_an_untyped_item_is_of_its_parent(monkeypatch, project_dir, tmp_path):
+    """Eleventh review of 0.8.16 (#10): an untyped item of a path ('Channel 1') is under every terminal — 'why does
+    Term 5 Channel 1 fail?' answered Term 6's channel error. (#19) 'Term 4  (EL2008)' with two spaces leaked the type
+    as a name. (#15) 'the last 5 Term 4 errors' gave three entries unsaid; 'the last two errors' counted one."""
+    import time as _t
+    from tests.test_errors_index import build as err_build, make_kb
+    from twincat_mcp.server import App
+    kb = make_kb(tmp_path)
+    assert err_build(kb)["result"] == "built"
+    cfg = mk_cfg(project_dir)
+    cfg.knowledge.location = str(kb)
+    cfg.docs.enabled = False
+    app = App(cfg)
+    app.note_error("xae_tree_set_values", error="xae_tree_set_values: ConsumeXml failed (0x98510004)",
+                   subjects=["TIID^Device 1 (EtherCAT)^Term 6 (EL1008)^Channel 1"])
+    for q in ("why does Term 5 Channel 1 fail?", "Channel 1 of Term 5 is broken"):
+        r = await app.err_from_logs(q)
+        assert r is None or r["entries"] == [], (q, r)
+    for q in ("why does Term 6 Channel 1 fail?", "why does Channel 1 fail?"):
+        r = await app.err_from_logs(q)
+        assert r and r["entries"] and "ConsumeXml" in r["entries"][0]["text"], (q, r)
+    qq = App._question("why does Term 4  (EL2008) fail?")
+    assert qq["items"] == ["Term 4 (EL2008)"] and "EL2008" not in qq["names"], qq
+    for k in range(6):
+        app.note_error("xae_tree_set_values", error=f"xae_tree_set_values: ConsumeXml failed (0x98510004) #{k}",
+                       subjects=["TIID^Device 1 (EtherCAT)^Term 4 (EL2008)"])
+        _t.sleep(1.05)
+    r = await app.err_from_logs("what do the last 5 Term 4 errors mean?")
+    assert len({e["where"] for e in r["entries"]}) == 5, r
+    assert App._question("what do the last two errors mean?")["count"] == 2

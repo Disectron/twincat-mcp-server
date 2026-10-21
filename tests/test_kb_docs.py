@@ -663,3 +663,9 @@ def test_n183_the_order_of_the_hits_is_said_where_the_score_did_not_give_it(kbdi
     res = INF.search_index(con, "ADSREAD xyzqq", 10)
     assert [r2["title"] for r2 in res["rows"]] == [it["title"] for it in items]
     assert [res["title_match"].get(r2["rid"], (None, None))[0] for r2 in res["rows"]] == [it.get("title_rank") for it in items]
+    # eleventh review: the ranks are of the whole order — the next page goes on from the last rank of the one before
+    first = INF.search_index(con, "ADSREAD", 2)
+    nxt = INF.search_index(con, "ADSREAD", 2, offset=2)
+    r1 = [first["title_match"][r2["rid"]][0] for r2 in first["rows"] if r2["rid"] in first["title_match"]]
+    r2_ = [nxt["title_match"][r2["rid"]][0] for r2 in nxt["rows"] if r2["rid"] in nxt["title_match"]]
+    assert not r1 or not r2_ or min(r2_) >= max(r1), (r1, r2_)

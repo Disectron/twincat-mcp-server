@@ -1937,6 +1937,29 @@ def test_n175_0815_twincat_interface_export_is_the_oracle(xae, tmp_path):
     assert "METHOD Execute : BOOL" in o["i_module"]["kids"]["execute"]["decl"], o
     m = X._plcopen_oracle(str(fx / "I_Module_mod.xml"))
     assert m["i_module"]["kids"]["getstatus"]["decl"].startswith("// N175 retest marker\n"), m
+    # eleventh review: an interface's <Properties> group was never read ('Properties'[:-1] is 'Propertie')
+    prop = (fx / "I_Module_orig.xml").read_text(encoding="utf-8").replace("        </Methods>", """        </Methods>
+        <Properties>
+          <Property name="nCount" ObjectId="0b6c2b0e-7d61-4c1c-9d64-1f0b8f6c9a11">
+            <InterfaceAsPlainText>
+              <xhtml xmlns="http://www.w3.org/1999/xhtml">PROPERTY nCount : INT
+</xhtml>
+            </InterfaceAsPlainText>
+            <GetAccessor>
+              <InterfaceAsPlainText>
+                <xhtml xmlns="http://www.w3.org/1999/xhtml">VAR
+END_VAR
+</xhtml>
+              </InterfaceAsPlainText>
+            </GetAccessor>
+            <addData />
+          </Property>
+        </Properties>""", 1)
+    (tmp_path / "I_Module_prop.xml").write_text(prop, encoding="utf-8")
+    p = X._plcopen_oracle(str(tmp_path / "I_Module_prop.xml"))
+    assert set(p["i_module"]["kids"]) == {"execute", "getstatus", "ncount"}, p
+    assert p["i_module"]["kids"]["ncount"]["decl"] == "PROPERTY nCount : INT\n", p
+    assert p["i_module"]["kids"]["ncount"]["kids"]["get"]["decl"] == "VAR\nEND_VAR\n", p
     be, dte, sm = xae
     proj = sm.items["TIPC^Plc^Plc Project"]
     xml = o["i_module"]

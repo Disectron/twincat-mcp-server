@@ -238,12 +238,12 @@ def test_review10_0816_one_corpus_of_questions_and_the_codes_they_name():
     """Tenth review of 0.8.16: each round's fix of one phrasing broke others — 'the 1861 error' (round 8), counts after
     a comma (round 9: '1861 error, 3 times' lost 1861), hex after an item word ('axis 0x4650 error'), singular counts
     read as codes again ('Build failed with 1 error'), a dash or a comma before the code ('error - 0x745 when
-    reading'). The rules are one set (docsearch, above code_tokens), held against one corpus of 370 questions."""
+    reading'). The rules are one set (docsearch, above code_tokens), held against one corpus of questions (eleventh review: 680)."""
     from pathlib import Path
     from twincat_mcp import errors_index as X
     rows = [ln.split("\t") for ln in (Path(__file__).parent / "fixtures" / "code_questions.tsv").read_text(
         encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
-    assert len(rows) >= 360
+    assert len(rows) >= 650
     wrong = []
     for q, want in rows:
         got = ",".join(c["token"] for c in X.read_query(q)["codes"]) or "-"

@@ -2718,7 +2718,9 @@ def _plcopen_oracle(xml_file: str) -> dict[str, dict[str, Any]]:
         # N175 (0.8.15 retest): TwinCAT 3.1.4026's interface export holds its members as direct children —
         # <Interface><Methods><Method>, <Properties><Property> — besides the addData/data[…/method] form of others
         groups = [(str(d.get("name", "")), d) for d in el.findall("./addData/data")]
-        groups += [("/" + g[:-1].lower(), d) for g in ("Methods", "Properties", "Actions") for d in el.findall("./" + g)]
+        # eleventh review: each group by the member tag it holds ('Properties'[:-1] was 'Propertie' — never read)
+        groups += [("/" + tag, d) for g, tag in (("Methods", "method"), ("Properties", "property"), ("Actions", "action"))
+                   for d in el.findall("./" + g)]
         for nm, d in groups:
             for tag in ("Method", "Action", "Property", "Transition"):
                 if nm.endswith("/" + tag.lower()):

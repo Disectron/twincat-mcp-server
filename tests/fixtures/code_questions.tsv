@@ -1,7 +1,10 @@
 # What err_lookup / kb_search read as codes in everyday questions (errors_index.read_query; the rules above
-# docsearch.code_tokens). One corpus for every change of the rules: rounds 7-10 of the 0.8.16 review each fixed
-# some phrasings and broke others. Columns: the question, a TAB, the codes in the order of the question ('-': none).
-# Phrasings from the reviews' corpora (review10_0816/scripts/phrasings*.txt) and their findings.
+# docsearch.code_tokens). One corpus for every change of the rules: rounds 7-11 of the 0.8.16 review each widened
+# the rules for some phrasings and broke others. Columns: the question, a TAB, the codes in the order of the
+# question ('-': none). Policy where readers disagree: a number after a thing's name is that thing's whatever its
+# size ('axis 4650 error', 'slave 1001 error' — no code); 'N Fehler' / 'N errors' count; a number of up to three
+# digits before what it counts is a count. Phrasings from the reviews' corpora (review10_0816 / review11_0816
+# scripts) and their findings.
 what does the 1861 error mean?	1861
 what does error 1861 mean?	1861
 what does ADS error 1861 mean	1861
@@ -90,7 +93,7 @@ ads error "1861"	1861
 Fehler 1861	1861
 Fehlercode 1861	1861
 Fehler Nr. 1861	1861
-1861 Fehler	1861
+1861 Fehler	-
 was bedeutet Fehler 1861	1861
 was bedeutet der Fehler 1861?	1861
 AdsError 1861	1861
@@ -100,12 +103,12 @@ code 1861 from ads_read	1861
 returns code 1861	1861
 result 1861	1861
 return value 1861	1861
-the error is 1861	-
-the error was 1861	-
-error is 1861	-
-the code is 1861	-
-the error code is 1861	-
-error code was 1808	-
+the error is 1861	1861
+the error was 1861	1861
+error is 1861	1861
+the code is 1861	1861
+the error code is 1861	1861
+error code was 1808	1808
 I got an error, 1861	1861
 error, 1861	1861
 error; 1861	1861
@@ -242,7 +245,7 @@ nErrorID 1861	1861
 ErrorID: 16#745	16#745
 nErrId 16#0745	16#0745
 bError TRUE nErrorID 1861	1861
-the error id is 1861	-
+the error id is 1861	1861
 returned errorid 1861	1861
 fbRead.nErrId = 1861	1861
 MAIN.fbRead.nErrId 1861	1861
@@ -264,7 +267,7 @@ GVL.nErr 1861	-
 0x745 (1861)	-
 error 0x745 (1861)	0x745
 error 1861 (0x745)	1861
-1861 / 0x745	-
+1861 / 0x745	1861,0x745
 1861 = 0x745?	-
 is 1861 the same as 0x745?	-
 error 1861 vs 1808	1861,1808
@@ -278,18 +281,18 @@ ads_read gives 1808 error, 4 of 10 symbols	1808
 I get the 1861 error, 2 times a day	1861
 ADS error 1861, 2 times a day	1861
 1861 error , 2 times	1861
-NC axis 4650 error	4650
-axis 4650 error	4650
-my axis 4650 error	4650
-the axis 4650 error	4650
+NC axis 4650 error	-
+axis 4650 error	-
+my axis 4650 error	-
+the axis 4650 error	-
 NC axis 0x4650 error	0x4650
 axis 0x4650 error	0x4650
 Axis 0x4650 error	0x4650
 the drive 0x2342 error	0x2342
-drive 2342 error	2342
-device 1861 error	1861
-ADS device 1861 error	1861
-task 1861 error	1861
+drive 2342 error	-
+device 1861 error	-
+ADS device 1861 error	-
+task 1861 error	-
 port 1861 error	-
 line 0x745 error	0x745
 step 0x745 error	0x745
@@ -370,3 +373,300 @@ error 18 occurs on axis 2	18
 ADS error 6 means	6
 ADS error 1861 at line 34	1861
 codes 1861, 1808 and 1792	1861,1808,1792
+error code was 1861	1861
+the error number is 1861	1861
+the ADS error is 1861	1861
+ADS returns 1861	-
+ADSREAD returned 1861	-
+the call returns error 1861	1861
+error message 1861	1861
+error 1861 - timeout	1861
+Error – 1861	1861
+Error - 2 PLCs down	-
+Error - 12 PLCs down	-
+error 2 EtherCAT slaves lost	2
+error 12 PLCs	-
+EtherCAT error: 3 lost frames	3
+ADS error 3 clients	-
+error 4 bytes	-
+error 10 sec after start	-
+error 30 min after power on	-
+error 5 s after enable	-
+error 2 h after start	-
+error 1861, 12 PLCs affected	1861
+error 1861, 10 reads failed	1861
+ADS error 1861, 30 min after start	1861
+error 1861 and 20 others	1861
+error 0x745, 12 PLCs	0x745
+I have 15 error in my build	-
+compile gives 25 error	-
+there are 15 error	-
+I get 12 error in TwinCAT	-
+build shows 34 error and 2 warning	-
+Fehler-Nr. 1861	1861
+Fehlermeldung 1861	1861
+Fehlermeldung: 1861	1861
+Fehlernr. 1861	1861
+Achsfehler 4650	4650
+Antriebsfehler 2342	2342
+NC-Fehler 4650	4650
+error `1861`	1861
+`1861`	1861
+Fehler „1861“	1861
+EtherCAT slave 1001 error	-
+slave 1001 error	-
+node 1002 error	-
+station 1001 error	-
+EtherCAT address 1001 error	-
+Box 1001 error	-
+terminal 1002 error	-
+Term 1004 (EL2008) error	-
+EtherCAT device 1001 error 0x0011	0x0011
+error at line 34: 1861	-
+Error 1861 in line 34	1861
+line 34 error 1861	1861
+error 1861 at line 34	1861
+Error(1861)	1861
+[error 1861]	1861
+(error 1861)	1861
+error 1861/1808	1861,1808
+errors 1861, 1808 and 1793	1861,1808,1793
+error codes: 1861, 1808	1861,1808
+1861, 1808 errors	1861,1808
+1861 ADS error	1861
+1861 ads error on port 851	1861
+3 errors and 2 warnings	-
+Build: 0 errors, 0 warnings	-
+Build succeeded - 0 errors	-
+========== Build: 0 succeeded, 1 failed, 0 up-to-date, 0 skipped ==========	-
+Rebuild All: 2 succeeded, 1 failed	-
+Build failed: 1 error	-
+Build failed: 12 errors	-
+Build failed with 12 error(s)	-
+12 error(s), 3 warning(s)	-
+1>  3 Error(s), 0 Warning(s)	-
+Compile complete -- 3 errors, 0 warnings	-
+Übersetzung abgeschlossen -- 12 Fehler, 3 Warnungen	-
+Erstellen: 1 Fehler	-
+3 Fehler, 0 Warnungen	-
+Fehler 1861 und 1808	1861,1808
+Fehler 1861 tritt 3 mal auf	1861
+Fehler tritt 3 mal auf	-
+3 mal Fehler 1861	1861
+Ich bekomme 1861 Fehler	-
+Ich bekomme 12 Fehler	-
+error count: 12	-
+number of errors: 12	-
+Errors: 12	-
+Error list shows 25 errors	-
+Error 25 of 100	-
+error 1861 of 3 symbols	1861
+ADS error 1861 of the read	1861
+error 1861 on 3 of 10 symbols	1861
+Axis 12 error	-
+Axis 1: error 4650	4650
+Axis1 error 4650	4650
+Box 12 error	-
+Task 1 error	-
+port 851 error 1861	1861
+Line 1234 error	-
+step 1000 error	-
+Kanal 2 Fehler	-
+Klemme 4 Fehler	-
+Fehler 4650 an Achse 1	4650
+slot 3 error	-
+error 3 x	-
+error every 10 seconds	-
+error 10 seconds after start	-
+error in 3 of 10 cycles	-
+error on 12 terminals	-
+Error: 12 terminals in OP	-
+error 500 ms after enable	-
+I get error 1861 every 2 minutes	1861
+error 1861 since 2 days	1861
+error 1861 for 3 hours	1861
+error 1861 in 2 PLCs	1861
+1861 error in 2 PLCs	1861
+error 2 PLCs	-
+error 20 PLCs	-
+error, 20 PLCs	-
+error: 20 PLCs down	-
+error 20 PCs	-
+error 16 inputs	-
+error 64 bytes	-
+error 32 bit	-
+error 8 bits	-
+error 3 frames	-
+error 3 nodes	-
+error 3 clients	-
+error 3 connections	-
+error 10 packets	-
+error 3 instances	-
+error 2 projects	-
+error 5 FBs	-
+Fehler 3 Antriebe	-
+Fehler 12 Teilnehmer	-
+Fehler 12 Variablen	-
+error 1861 3 times	1861
+error 1861 3x	1861
+error 1861 or 12 other errors	1861
+error 1861 and 15 more	1861
+ADS error 1861 and 30 others	1861
+ADS error 1861, 21.10.2026 14:30	1861
+error 1861, 14:30	1861
+error 1861, yesterday 14:30	1861
+error 1861, 100 reads	1861
+ADS error 1808, 25 PLC variables	1808
+ADS error 1808, 25 symbole	1808
+ADS error 1808 / 25 symbols	1808
+ADS error 1808 & 25 PLC symbols	1808
+error 1861 or 1808 or 1793	1861,1808,1793
+error 1861 and 851	1861,851
+error 4650 / 4651	4650,4651
+ADS error 1808 of 12 symbols	1808
+ADS error 1861 of 10 reads	1861
+Fehler 1861 von 3 Lesezugriffen	1861
+error 1861 (1 of 3)	1861
+error 1861 1 of 3	1861
+Fehler 1861 bei 2 von 5 Achsen	1861
+Ich habe 1000 Fehler im Projekt	-
+über 1000 Fehler	-
+2000 Fehler beim Übersetzen	-
+1000 errors	-
+EtherCAT slave 1001 has error 0x001b	0x001b
+EL1008 at address 1003 error	-
+EtherCAT slave 1005 (Term 5) error	-
+slave 1001: error	-
+node 1001 error 1861	1861
+Error - 2 EtherCAT slaves lost	-
+error – 3 PLCs not reachable	-
+ADS error - 2 PLCs down	-
+error - 20 symbols missing	-
+error – 1861	1861
+Error, 20 PLCs offline	-
+Error; 20 PLCs offline	-
+error, 25 more in the list	-
+ADS error, 30 min after start	-
+an error, 10 seconds after login	-
+Error 1 of 3	-
+Error 12 of 30	-
+Error 12/30	-
+Error 3/10	-
+error 1 out of 3	-
+error 12 out of 30 times	-
+Fehler 3 von 10	-
+error 1861 at 3 of 10 terminals	1861
+1 error 1861	1861
+1 error: 1861	1861
+2 errors: 1861 and 1808	1861,1808
+2 errors, 1861 and 1808	1861,1808
+3 errors (1861, 1808, 1793)	1861,1808,1793
+errors (1861, 1808)	1861,1808
+errors 1861 1808	1861
+error 1861 1808	1861
+error codes 1861 and 1808	1861,1808
+error codes 18 and 19	18,19
+error 12 and 13	12,13
+errors 12 and 13	-
+error 7 and 8	7,8
+ADS error 6 and 7	6,7
+error 1861 and error 1808	1861,1808
+1861 or 1808?	1861,1808
+1861, 1808	1861,1808
+1861 and 1808	1861,1808
+0x745, 0x746	0x745,0x746
+1861 error, 12 times	1861
+1861 error, 25 symbols not found	1861
+1861 error, 12 PLCs	1861
+1808 error, 25 variables	1808
+I get the 1861 error, 10 times a day	1861
+getting 1861 error, 30 seconds after login	1861
+0x745 error, 12 retries	0x745
+1861 error; 3 times	1861
+1861 error - 3 times	1861
+1861 error (3 times)	1861
+1861 error 3 times	1861
+the 1861 error, 2 symbols	1861
+1861 error, 1808 error	1861,1808
+1861 error, then 1808 error	1861,1808
+error 1861, then error 1808	1861,1808
+1861 error and 3 warnings	1861
+1861 error, 3 warnings	1861
+error: - 1861	1861
+error —1861	1861
+error, code 1861	1861
+Error: (1861)	1861
+error , 1861	1861
+error,1861	1861
+error;1861	1861
+error - 0x745	0x745
+I have 12 error in my build	-
+Build failed with 12 error	-
+there is 12 error in FB_Dosing	-
+retry 12 error	-
+attempt 12 error	-
+the 12 error codes	-
+cycle 12 error	-
+Zyklus 12 Fehler	-
+Versuch 12 Fehler	-
+nach 12 Fehler	-
+Axis 1 0x4650 error	0x4650
+Axis 1 4650 error	4650
+axis 12 0x4650 error	0x4650
+the drive 2342 error	-
+drive 12 error	-
+Error: 12 axes not referenced	-
+error 12 times	-
+ADS error 12 times	-
+error: 13 retries	-
+Fehler: 12 Achsen nicht referenziert	-
+Fehler 12 mal	-
+1861 error codes	1861
+I keep getting 1861 error messages	1861
+the 1861 error messages in the log	1861
+ADS 1808 error messages	1808
+1808 error entries in the logger	1808
+EtherCAT slave 1004 state change aborted	-
+'Term 5 (EL2008)' (1005): 'INIT to PREOP' failed! Error: 'check vendor id'. AL Status '0x0000' read and '0x0001' expected.	0x0000
+Slave 1004 error: state change aborted	-
+why does slave 1004 error?	-
+slave 1004 error 0x001b	0x001b
+EtherCAT slave 1002 error, AL status 0x001b	0x001b
+station 1001 error code 0x0011	0x0011
+error at EtherCAT address 1001	-
+Box 1001 error 1861	1861
+Axis 4650 error	-
+ADS error 6 times out	6
+error 18 values	-
+ADS error 1861 2 times	1861
+1861 error 2 times	1861
+1861 error twice	1861
+1861 error 10 times	1861
+1861 error (10 times)	1861
+1861 error, then 1808	1861
+Was bedeutet ADS-Fehler 1861?	1861
+Was bedeutet der ADS Fehler 1861 bei 12 Variablen?	1861
+ADS-Fehler 1861, 12 Variablen betroffen	1861
+ADS-Fehler 1861, 15 SPS betroffen	1861
+Fehler 1861, seit 14:30	1861
+Ich bekomme 1861 Fehlermeldungen	-
+Ich bekomme Fehler 1861 und 1808 bei 3 von 10 Variablen	1861,1808
+Fehlercode 0x745 bei Klemme 4	0x745
+Fehler 1861 an Klemme 1004	1861
+EtherCAT Slave 1004 Fehler	-
+Teilnehmer 1004 Fehler	-
+Fehler 4650 bei Achse 1	4650
+Übersetzen: 3 Fehler, 2 Warnungen	-
+Erstellen fehlgeschlagen mit 12 Fehlern	-
+12 Fehlern	-
+Fehler: 12 Fehler gefunden	-
+1861er Fehler	-
+Fehler 1861 tritt alle 10 Sekunden auf	1861
+Fehler 1861 nach 30 min	1861
+nach 30 min Fehler 1861	1861
+Fehlermeldung 1861 erscheint 3 mal	1861
+Rückgabewert 1861	1861
+Rückgabewert: 0x745	0x745
+Fehlercode ist 1861	1861
+Fehler ist 1861	1861
+ADS error 1861, 21.10.2026 14:30:12	1861

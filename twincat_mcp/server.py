@@ -446,6 +446,9 @@ _TREE_PATH = re.compile(r"TI[A-Z]{1,5}(?:\^[^\^\n<>{}=;]{1,120})+")
 # TwinCAT's own names for new tree items — a question's 'Term 4' / 'Box 2' / 'Axis 1' is an item even before an error
 # names it; any other '<Word> <n>' ('Port 851', 'TwinCAT 3', 'Build 4024') is one only when an error is of it
 _TREE_WORDS = frozenset("term box device drive axis module channel coupler slot task image".split())
+# 'the last two errors' (eleventh review of 0.8.16): a count written as a word
+_COUNT_WORD_NUMBERS = {w: i for i, w in enumerate("one two three four five six seven eight nine ten".split(), 1)} | {
+    w: i for i, w in enumerate("eins zwei drei vier fünf sechs sieben acht neun zehn".split(), 1)}
 # such an item without its type: 'Term 9', 'Axis 1'
 _UNTYPED_ITEM = re.compile(r"(?i)(?:term|box|device|drive|axis|module|channel|coupler|slot|task) \d+")
 
@@ -536,6 +539,16 @@ def _tree_items(subjects: list[str], text: str = "") -> tuple[list[str], list[st
             loose.append(x.strip())                 # quoted in the error's text
     loose += _TEXT_ITEM.findall(text)
     return list(dict.fromkeys(on_path)), [x for x in dict.fromkeys(loose) if x not in on_path]
+
+
+def _names_other_item(t: dict[str, Any], q_items: list[str]) -> bool:
+    """The question names a tree item this error is not of (eleventh review of 0.8.16: an untyped item — 'Channel 1'
+    under Term 6 — is under every terminal; 'why does Term 5 Channel 1 fail?' is not Term 6's)."""
+    def name(x: str) -> str:
+        m = _TREE_ITEM.fullmatch(x.strip())
+        return _tnorm(m.group(1) if m else x)
+    on = {name(x) for x in (t.get("path_items") or []) + (t.get("items") or [])}
+    return any(name(x) not in on for x in q_items)
 
 
 @functools.lru_cache(maxsize=8192)
@@ -650,6 +663,7 @@ class App:
         # N182 (0.8.15 retest): the Scope part of a recording is finished once — when the recording ends by itself
         # (a watcher) or at rec_stop, whichever comes first; the result is kept for the other
         self.scope_finishing: dict[str, Any] = {}           # recording id → the task finishing its Scope run
+        self.scope_stop_asked: set[str] = set()             # recordings a rec_stop is stopping (their Scope is its)
         self.scope_results: dict[str, dict[str, Any]] = {}  # recording id → the finished Scope part
         self.rec.rcfg = cfg.recorder
 
@@ -1122,7 +1136,7 @@ class App:
         # tenth review of 0.8.16: 'Term 4(EL2008)', 'Term 4 ( EL2008 )' — an item's type as the tree writes it, so the
         # type is part of the item's name and no name of its own
         query = re.sub(r"(?<=[\w\-])\((?=[A-Za-z][\w.\- ]{0,40}\))", " (",
-                       re.sub(r"\s+\)", ")", re.sub(r"\(\s+", "(", query)))
+                       re.sub(r"\s+\)", ")", re.sub(r"\(\s+", "(", re.sub(r"[ \t]{2,}", " ", query))))
         names = cls.question_names(query)
         m = cls._LAST_SAID.search(query)
         fams: set[str] = set()
@@ -1139,7 +1153,8 @@ class App:
             # digit of a name ('the last fbValve2 error', 'aValves[3]', 'EL2008') nor an item's ('the last term 5 error')
             first = m.group("q").split()[:1]
             # tenth review: 'the last 2 Term 4 errors' — a number as the first word is the count, items or not
-            count = max(1, min(int(first[0]), 10)) if first and first[0].isdigit() else 1
+            n = _COUNT_WORD_NUMBERS.get(first[0].lower()) if first else None
+            count = max(1, min(int(first[0]), 10)) if first and first[0].isdigit() else n or 1
             words = [w for w in re.split(r"[\s-]+", m.group("q")) if w and w.strip("()").lower() not in item_words]
 
             def kind(w: str) -> bool:
@@ -1149,7 +1164,8 @@ class App:
             doms = set(X.named_domains(" ".join(words))) if words else set()
             dom_words = {x for d in doms for n in X.DOMAINS[d].get("names", ()) for x in n.split()}
             kinds = {w.lower() for w in words if w.lower() in fams or w.lower() in dom_words}
-            unused = [w for w in words if w.lower() not in kinds and not w.isdigit()]   # 'the last 3 errors': a count
+            unused = [w for w in words if w.lower() not in kinds and not w.isdigit()
+                      and w.lower() not in _COUNT_WORD_NUMBERS]   # 'the last 3 errors': a count
             names = [n for n in names if n.lower() not in kinds]
         paths = _question_paths(query)
         rest = query
@@ -1246,7 +1262,8 @@ class App:
                 return []
             # an item on a known path is named by itself only outside a path of the question; an item without a known
             # place (quoted in the text) also as the end of one; a path by a run of its parts (_path_in)
-            hits = [x for x in t.get("path_items") or [] if _item_in(x, q["qf"], in_path=False)]
+            hits = [x for x in t.get("path_items") or [] if _item_in(x, q["qf"], in_path=False)
+                    and (_TREE_ITEM.fullmatch(x.strip()) or not _names_other_item(t, q["items"]))]
             hits += [x for x in t.get("items") or [] if _item_in(x, q["qf"])]
             hits += [x for x in t["subjects"] if _TREE_PATH.fullmatch(x) and _path_in(x, q["qf"])]
             return list(dict.fromkeys(hits))
@@ -1275,7 +1292,9 @@ class App:
                 if not kind_ok(t, c):
                     continue
                 out.append(entry(t, c, {"names": hits}))
-                if (last and len({e["where"] for e in out}) >= q.get("count", 1)) or len(out) >= self.ERR_LOG_PICK:
+                # eleventh review: 'the last 5 Term 4 errors' — the count asked, not ERR_LOG_PICK
+                if (last and len({e["where"] for e in out}) >= q.get("count", 1)) or \
+                        len(out) >= max(self.ERR_LOG_PICK, q.get("count", 1) if last else 0):
                     break
             return out
         if not last:
@@ -1362,7 +1381,9 @@ class App:
         def what_is_said() -> list[str]:
             return q["names"] + q["items"] + q["paths"] + [
                 x for t in texts for x in (t.get("path_items") or []) + (t.get("items") or [])
-                if _item_in(x, q["qf"], in_path=x not in (t.get("path_items") or [])) and x not in q["items"]] + [
+                if _item_in(x, q["qf"], in_path=x not in (t.get("path_items") or [])) and x not in q["items"]
+                and (_TREE_ITEM.fullmatch(x.strip()) or x not in (t.get("path_items") or [])
+                     or not _names_other_item(t, q["items"]))] + [
                 x for t in texts for x in t["subjects"] if _TREE_PATH.fullmatch(x) and _path_in(x, q["qf"])]
         # tenth review of 0.8.16: compared in a worker thread — a long pasted log held the event loop for seconds
         said = await asyncio.to_thread(what_is_said)
@@ -4239,6 +4260,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             except Exception:  # noqa: BLE001 — the recording is gone (server restart, reaped): rec_stop finishes it
                 return
             if not st.get("active"):
+                if rid in app.scope_stop_asked:
+                    # eleventh review: rec_stop is stopping it — the recording turns inactive at the start of its
+                    # stop, and the watch took the stop for an end of its own ('ended by itself (manual (rec_stop))')
+                    return
                 app.scope_runs.get(rid, {})["recording_ended"] = {
                     "seen": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
                     "stop_reason": st.get("stop_reason")}
@@ -4366,11 +4391,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             t = re.match(r"\((\d{4}-\d\d-\d\d)-(\d\d:\d\d:\d\d)", ln)
             if t:
                 when = f"{t.group(1)} {t.group(2)}"
+        # eleventh review of 0.8.16: the cause only when the Scope View log says it — any other 'Invalid ScopeState'
+        # (actual: Record, no reset line) is said as the state Scope is in, no restart invented
+        cause = (f"Scope was reset to {state} by a TwinCAT restart at {when} (Scope View log)" if lines and when else
+                 f"Scope was reset to {state} (Scope View log)" if lines else
+                 f"Scope is in state {state}, not Reply — the Scope View log names no reset since the recording began")
         out: dict[str, Any] = {"save_svd": {
-            "error": (f"Scope was reset to {state} by a TwinCAT restart"
-                      + (f" at {when} (Scope View log)" if when else " (no reset line found in the Scope View log)")
-                      + " — SaveSVD refused; nothing was saved as .svdx"),
+            "error": cause + " — SaveSVD refused; nothing was saved as .svdx",
             "scope_state": state, "detail": raw[:500]}}
+        if lines:
+            out["save_svd"]["reset_seen"] = [ln[:200] for _f, ln in lines[-3:]]
+        what = f"Scope was reset to {state}" if lines else f"Scope was in state {state}"
         if csv.exists() and not overwrite:
             out["export_csv"] = {"skipped": f"{csv.name} exists — not written over (overwrite=true)"}
             return out
@@ -4379,7 +4410,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             rows = await asyncio.to_thread(_csv_samples, csv) if csv.is_file() else 0
         except (ToolError, OSError) as exc:
             out["export_csv"] = {"error": str(exc)[:300], "lost": (
-                f"the Scope data of this run is lost: Scope was reset to {state} and refused both SaveSVD and ExportCSV")}
+                f"the Scope data of this run is lost: {what} and refused both SaveSVD and ExportCSV")}
             return out
         if rows > 0:
             out["export_csv"] = {**{k: r[k] for k in ("result_code", "path") if k in r}, "via": "XAE ExportCSV",
@@ -4816,10 +4847,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         res = await app.mem_call(app.rec.status, id)
         sc = _scope_state(id)
         if sc is not None:
-            if sc["state"] == "recording" and ((res.get("gap_markers") or 0) > 0 or (res.get("resubscriptions") or 0) > 0):
-                # N180: a TwinCAT restart resets Scope to Config — said while it records, not only at the save
-                sc["warning"] = ("the recording saw an outage (a TwinCAT restart re-subscribes it) — a TwinCAT restart "
-                                 "resets Scope to Config, and Scope may then refuse to save this run (SaveSVD)")
+            resub = res.get("resubscriptions") or 0
+            if sc["state"] == "recording" and ((res.get("gap_markers") or 0) > 0 or resub > 0):
+                # N180: a TwinCAT restart resets Scope to Config — said while it records, not only at the save. Eleventh
+                # review: a gap marker is a hole in the PLC timeline, not by itself an outage — said as what was seen
+                seen = (f"the recording was re-subscribed {resub} time(s) (the runtime went away and came back)"
+                        if resub else f"the recording has {res.get('gap_markers')} gap marker(s) (holes in the PLC "
+                                      "timeline: an outage, a TwinCAT restart, or samples not delivered)")
+                sc["warning"] = (seen + " — if TwinCAT was restarted, Scope was reset to Config and may refuse to save "
+                                 "this run (SaveSVD)")
             res["scope"] = sc
         return res
 
@@ -4901,15 +4937,19 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=EDIT)
     async def rec_stop(id: str) -> dict[str, Any]:
         """Stop a recording, release the ADS notifications, finalize the file; returns status + stats."""
-        res = await app.rec_call(app.rec.stop, id, "manual (rec_stop)", timeout=60)
-        app.audit("rec_stop", {"id": id, "events": res.get("events")}, OpClass.EDIT, "ok")
+        app.scope_stop_asked.add(id)
         try:
-            # N182: the Scope part runs once — a recording that ended by itself has it finished already (stored)
-            sc = await _scope_finish_once(id)
-        except Exception as exc:  # noqa: BLE001 — the ADS recording is stopped and sealed: its result is kept
-            log.exception("Scope finish of %s failed", id)
-            sc = {"error": f"the Scope part failed ({type(exc).__name__}: {exc}) — the ADS recording {id} is stopped and "
-                           "complete; stop / save the Scope configuration in XAE (scope_record)"}
+            res = await app.rec_call(app.rec.stop, id, "manual (rec_stop)", timeout=60)
+            app.audit("rec_stop", {"id": id, "events": res.get("events")}, OpClass.EDIT, "ok")
+            try:
+                # N182: the Scope part runs once — a recording that ended by itself has it finished already (stored)
+                sc = await _scope_finish_once(id)
+            except Exception as exc:  # noqa: BLE001 — the ADS recording is stopped and sealed: its result is kept
+                log.exception("Scope finish of %s failed", id)
+                sc = {"error": f"the Scope part failed ({type(exc).__name__}: {exc}) — the ADS recording {id} is stopped "
+                               "and complete; stop / save the Scope configuration in XAE (scope_record)"}
+        finally:
+            app.scope_stop_asked.discard(id)
         if sc is not None:
             res["scope"] = sc
         return res
