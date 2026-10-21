@@ -2325,11 +2325,13 @@ class XaeBackend:
         return sc[0]
 
     def scope_action(self, action: str, name: str | None = None, path: str | None = None) -> dict[str, Any]:
-        """start | stop | save_svd(path) | export_csv(path) on one Scope configuration."""
+        """start | stop | disconnect | save_svd(path) | export_csv(path) on one Scope configuration. disconnect:
+        IMeasurementScope.Disconnect() — 'disconnects the connection to the ScopeServer. The recording is discarded'
+        (TE1000): Scope is back in Config and records again (0.8.17: after a recording it stays in Reply, N186)."""
         d = self._scope_pick(name)
         obj = d["_obj"]
-        calls = {"start": ("StartRecord", ()), "stop": ("StopRecord", ()), "save_svd": ("SaveSVD", (path,)),
-                 "export_csv": ("ExportCSV", (path,))}
+        calls = {"start": ("StartRecord", ()), "stop": ("StopRecord", ()), "disconnect": ("Disconnect", ()),
+                 "save_svd": ("SaveSVD", (path,)), "export_csv": ("ExportCSV", (path,))}
         if action not in calls:
             raise XaeError(f"scope action must be one of {list(calls)}")
         meth, args = calls[action]

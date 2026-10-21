@@ -31,6 +31,11 @@ class FakeScope:
         self.recording = False
         return 0
 
+    def Disconnect(self):
+        self.calls.append("disconnect")
+        self.recording = False
+        return 0
+
     def SaveSVD(self, path):
         self.calls.append("save")
         Path(path).write_bytes(b"SVDX" * 64)
@@ -103,7 +108,7 @@ async def test_also_scope_records_saves_exports_and_links(monkeypatch, project_d
         sc = out["scope"]
         svdx, csv = Path(sc["save_svd"]["path"]), Path(sc["export_csv"]["path"])
         assert svdx.name == f"{r['id']}.svdx" and csv.name == f"{r['id']}.scope.csv"
-        assert svdx.parent == Path(out["file"]).parent / "scope"                  # next to the recording
+        assert svdx.parent == Path(out["file"]).parent / "Scope Recordings"                  # next to the recording
         link = json.loads(Path(sc["link"]["file"]).read_text(encoding="utf-8"))
         assert link["recording"] == r["id"] and link["files"][svdx.name]["sha256"] == file_sha256(svdx)[0] and link["hmac"]
         assert is_read_only(svdx) and is_read_only(csv)
@@ -274,7 +279,7 @@ async def test_n182_scope_is_finished_when_the_recording_ends_by_itself(monkeypa
     async with client_for(srv) as s:
         for extra in ({"mode": "change", "duration_s": 1}, {"mode": "poll", "cycle_ms": 50, "max_events": 3}):
             fake_xae.calls.clear()
-            r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "also_scope": True, **extra}))
+            r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "also_scope": True, "scope_disconnect": True, **extra}))
             assert r["scope"]["started"], r
             st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
             seen = [st.get("scope", {}).get("state")]
@@ -286,9 +291,11 @@ async def test_n182_scope_is_finished_when_the_recording_ends_by_itself(monkeypa
                 seen.append(st.get("scope", {}).get("state"))
             assert st["scope"]["state"] == "finished" and not st["active"], (extra, seen, st.get("scope"))
             assert "ended by itself" in st["scope"]["finished_by"] and st["scope"]["files"], st["scope"]
-            assert fake_xae.calls == ["start", "stop", "save", "csv"], fake_xae.calls
+            # 0.8.17: Scope held the previous recording — disconnected first (scope_disconnect=true)
+            assert [c for c in fake_xae.calls if c != "disconnect"] == ["start", "stop", "save", "csv"], fake_xae.calls
             out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
-            assert fake_xae.calls == ["start", "stop", "save", "csv"], fake_xae.calls      # StopRecord once
+            assert [c for c in fake_xae.calls if c != "disconnect"] == ["start", "stop", "save", "csv"], \
+                fake_xae.calls      # StopRecord once
             assert "ended by itself" in out["scope"]["finished_by"] and out["scope"]["link"]["files"], out["scope"]
             link = json.loads(Path(out["scope"]["link"]["file"]).read_text(encoding="utf-8"))
             assert "ended by itself" in link["finished_by"] and link["recording_ended"]["stop_reason"], link
@@ -319,7 +326,7 @@ async def test_n180_save_after_a_twincat_restart_is_said_and_recovered_or_lost(m
     cfg.scope.view_log = str(log)
     srv = build_server(cfg)
     async with client_for(srv) as s:
-        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True, "scope_disconnect": True}))
         with open(log, "a", encoding="utf-8") as fh:
             fh.write("(2026-10-21-15:16:25:123)[ INFO  ] Scope View: Scope Project state changes from 'ServerReset' "
                      "to 'Config'\n")
@@ -334,7 +341,7 @@ async def test_n180_save_after_a_twincat_restart_is_said_and_recovered_or_lost(m
             fake_xae.calls.append("csv")
             raise RuntimeError("Invalid ScopeState! Reply requested, actual: Config")
         monkeypatch.setattr(fake_xae, "ExportCSV", no_csv)
-        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True, "scope_disconnect": True}))
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
         # eleventh review: no reset line since this recording began — the state is said, no restart invented
         sv = out["scope"]["save_svd"]
@@ -345,7 +352,7 @@ async def test_n180_save_after_a_twincat_restart_is_said_and_recovered_or_lost(m
         def record_state(path):
             raise RuntimeError("Invalid ScopeState! Reply requested, actual: Record")
         monkeypatch.setattr(fake_xae, "SaveSVD", record_state)
-        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True, "scope_disconnect": True}))
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
         assert out["scope"]["save_svd"]["error"].startswith("Scope is in state Record, not Reply — SaveSVD"), out["scope"]
 
@@ -1076,7 +1083,7 @@ async def test_0817_a_cancelled_rec_delete_saves_nothing_and_names_itself(monkey
             await _anyio12.sleep(0.1)
         await _anyio12.sleep(1.0)
     res = _done(app, r["id"])
-    left = sorted(p.name for p in (app.rec.root / "scope").iterdir()) if (app.rec.root / "scope").is_dir() else []
+    left = sorted(p.name for p in (app.rec.root / "Scope Recordings").iterdir()) if (app.rec.root / "Scope Recordings").is_dir() else []
     assert not (app.rec.root / f"{r['id']}.jsonl").exists(), "the delete did not go through"
     assert not any(n.startswith(r["id"]) for n in left), left
     assert res["finished_by"] == "rec_delete (the call ended before its Scope part — finished after it)", res
@@ -1203,5 +1210,5 @@ async def test_0817_rec_stop_and_rec_delete_together_stop_scope_once(monkeypatch
     if link:                               # the save came before the delete: its files stay, and rec_delete says so
         assert d["scope_files_kept"]["files"] == sorted(link["files"]), d
     else:                                  # the delete came first: nothing saved for the deleted recording
-        sd = app.rec.root / "scope"
+        sd = app.rec.root / "Scope Recordings"
         assert "scope_files_kept" not in d and not any(p.name.startswith(r["id"]) for p in sd.glob("*")), d

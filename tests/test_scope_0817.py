@@ -20,7 +20,7 @@ from tests.test_server_e2e import client_for, mk_cfg, payload, text
 
 
 def _link(app, rid):
-    return json.loads((app.rec.root / "scope" / f"{rid}.scope.json").read_text(encoding="utf-8"))
+    return json.loads((app.rec.root / "Scope Recordings" / f"{rid}.scope.json").read_text(encoding="utf-8"))
 
 
 async def _until(cond, n=200, dt_s=0.05):
@@ -244,7 +244,7 @@ async def test_h3_no_link_for_a_recording_deleted_while_scope_was_saved(monkeypa
         r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
         rid_box["id"] = r["id"]
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
-    sd = app.rec.root / "scope"
+    sd = app.rec.root / "Scope Recordings"
     assert not (sd / f"{r['id']}.scope.json").exists() and "link" not in out["scope"], out["scope"]
     assert "not linked to it nor sealed" in out["scope"]["note"], out["scope"]
     assert (sd / f"{r['id']}.svdx").exists() and not is_read_only(sd / f"{r['id']}.svdx")
@@ -293,7 +293,7 @@ async def test_m1_rec_stop_right_after_an_end_of_its_own_says_that_end(monkeypat
     async with client_for(srv) as s:
         for _ in range(3):
             r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "poll", "cycle_ms": 20,
-                                                         "max_events": 3, "also_scope": True}))
+                                                         "max_events": 3, "also_scope": True, "scope_disconnect": True}))
             rid = r["id"]
             assert await _until(lambda: not app.rec.recs[rid].active, n=500, dt_s=0.005)
             out = payload(await s.call_tool("rec_stop", {"id": rid}))
@@ -342,7 +342,7 @@ async def test_n186_a_start_scope_refused_in_reply_is_not_started(monkeypatch, p
         "do not repeat rec_start" in e and r["scope"]["scope_state"] == "Reply", r["scope"]
     assert st["scope"]["state"] == "finished" and "NOT started" in st["scope"]["error"], st["scope"]
     assert fake_xae.calls == ["start"] and "NOT started" in out["scope"]["error"], (fake_xae.calls, out["scope"])
-    sd = app.rec.root / "scope"
+    sd = app.rec.root / "Scope Recordings"
     assert not sd.is_dir() or not any(p.name.startswith(r["id"]) for p in sd.iterdir())
 
 
@@ -415,7 +415,7 @@ async def test_n186_an_earlier_capture_is_never_linked_as_this_recordings(monkey
         assert await _until(lambda: app.scope_parts[r["id"]].state == "finished", n=200)
         out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
     sc = out["scope"]
-    sd = app.rec.root / "scope"
+    sd = app.rec.root / "Scope Recordings"
     if clock == "fresh":
         assert sc["link"]["files"] and "not_this_recording" not in sc, sc
         return
@@ -453,7 +453,7 @@ async def test_r2_n1_a_start_withdrawn_from_the_xae_queue_is_not_started(monkeyp
     part = app.scope_parts[rid]
     assert part.state == "finished" and "before StartRecord ran" in part.result["error"], part.result
     assert "start" not in fake_xae.calls and "stop" not in fake_xae.calls, fake_xae.calls
-    assert not (app.rec.root / "scope" / f"{rid}.scope.json").exists() and "NOT started" in out["scope"]["error"]
+    assert not (app.rec.root / "Scope Recordings" / f"{rid}.scope.json").exists() and "NOT started" in out["scope"]["error"]
     assert fake_xae.recording is users_run                 # the user's own run records on
 
 
@@ -579,3 +579,120 @@ async def test_r2_gap_a_start_cancelled_while_it_runs_stays_with_the_recording(m
         out = payload(await s.call_tool("rec_stop", {"id": rid}))
     assert app.scope_parts[rid].run["start_unknown"].startswith("rec_start was cancelled while StartRecord ran")
     assert fake_xae.calls[:2] == ["start", "stop"] and not fake_xae.recording and out["scope"]["finished_by"] == "rec_stop"
+
+
+# ---- Ryan, 2026-10-21: Scope's files in 'Scope Recordings'; after a recording the user chooses close / new / pause ----
+
+def _answering(choice=None, disconnect=None):
+    """An elicitation callback that answers the Scope questions (and records them)."""
+    from mcp import types as _types
+    asked: list[str] = []
+
+    async def elicit(context, params):
+        asked.append(params.message)
+        props = (params.requested_schema or {}).get("properties", {})
+        if "next" in props:
+            return _types.ElicitResult(action="accept", content={"next": choice})
+        if "disconnect" in props:
+            return _types.ElicitResult(action="accept", content={"disconnect": disconnect})
+        return _types.ElicitResult(action="decline")
+    return elicit, asked
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("choice", ["close", "new", "pause"])
+async def test_ryan_after_rec_stop_scope_closes_starts_anew_or_pauses(monkeypatch, project_dir, fake_xae, choice):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    app = srv._tcmcp_app
+    elicit, asked = _answering(choice)
+    async with client_for(srv, elicitation_callback=elicit) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+    sd = app.rec.root / "Scope Recordings"
+    assert (sd / f"{r['id']}.svdx").is_file() and (sd / f"{r['id']}.scope.json").is_file()   # the folder Ryan named
+    assert len(asked) == 1 and "What should Scope do now?" in asked[0] and f"{r['id']}.svdx" in asked[0], asked
+    nx = out["scope_next"]
+    assert nx["choice"] == choice, nx
+    if choice == "close":
+        assert fake_xae.calls[-1] == "disconnect" and app.scope_left is None and not fake_xae.recording, fake_xae.calls
+    elif choice == "new":
+        assert fake_xae.calls[-2:] == ["disconnect", "start"] and nx["started"] and fake_xae.recording, fake_xae.calls
+        assert "linked to no recording" in nx["note"] and app.scope_left is None
+    else:
+        assert "disconnect" not in fake_xae.calls and app.scope_left["choice"] == "pause", fake_xae.calls
+
+
+@pytest.mark.anyio
+async def test_ryan_paused_scope_the_next_recording_asks_to_disconnect(monkeypatch, project_dir, fake_xae):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    app = srv._tcmcp_app
+    elicit, asked = _answering("pause", disconnect=True)
+    async with client_for(srv, elicitation_callback=elicit) as s:
+        r1 = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        payload(await s.call_tool("rec_stop", {"id": r1["id"]}))
+        fake_xae.calls.clear()
+        r2 = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        await s.call_tool("rec_stop", {"id": r2["id"]})
+    assert any("Scope still holds the recording of " + r1["id"] in q and "Disconnect it" in q for q in asked), asked
+    assert fake_xae.calls[:2] == ["disconnect", "start"] and r2["scope"]["started"], fake_xae.calls
+
+
+@pytest.mark.anyio
+async def test_ryan_without_a_prompt_the_agent_is_told_to_ask(monkeypatch, project_dir, fake_xae):
+    """No prompt in the session: rec_stop's result and rec_status say what to ask; the next recording with Scope is
+    refused until the answer comes as scope_disconnect — nothing started meanwhile."""
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "duration_s": 1,
+                                                     "also_scope": True}))
+        assert await _until(lambda: app.scope_parts[r["id"]].state == "finished")
+        st = payload(await s.call_tool("rec_status", {"id": r["id"]}))
+        out = payload(await s.call_tool("rec_stop", {"id": r["id"]}))
+        n_recs = len(app.rec.recs)
+        again = await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True})
+        n_after = len(app.rec.recs)
+        no_scope = payload(await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change",
+                                                            "also_scope": True, "scope_disconnect": False}))
+        await s.call_tool("rec_stop", {"id": no_scope["id"]})
+    assert "What should Scope do now?" in st["scope"]["next"]["ask_user"], st["scope"]
+    assert "scope_record(action='disconnect')" in out["scope_next"]["then"], out
+    assert again.is_error and "scope_disconnect=true" in text(again) and n_after == n_recs, text(again)
+    assert "scope" not in no_scope and "disconnect" not in fake_xae.calls, (no_scope, fake_xae.calls)
+
+
+@pytest.mark.anyio
+async def test_ryan_scope_record_disconnect_of_unsaved_data_needs_the_users_ok(monkeypatch, project_dir, fake_xae):
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded", allow_elicitation=False))
+    async with client_for(srv) as s:
+        r = await s.call_tool("scope_record", {"action": "disconnect"})
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "scope_record", "target": "disconnect:"}))
+        ok = payload(await s.call_tool("scope_record", {"action": "disconnect", "confirm_token": tok["confirm_token"]}))
+    assert r.is_error and "confirm" in text(r).lower() and fake_xae.calls == ["disconnect"], (text(r), fake_xae.calls)
+    assert ok["result_code"] == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_ryan_the_scope_question_on_both_protocol_eras(monkeypatch, project_dir, fake_xae, mode):
+    """2026-07-28 ('auto'): the question is returned as input_required and rec_stop runs again with the answer — the
+    recording is not stopped twice, StopRecord / SaveSVD run once, Disconnect once."""
+    from mcp import Client, types as _types
+    install(monkeypatch)
+    srv = build_server(mk_cfg(project_dir, mode="guarded"))
+    app = srv._tcmcp_app
+    asked: list[str] = []
+
+    async def elicit(context, params):
+        asked.append(params.message)
+        return _types.ElicitResult(action="accept", content={"next": "close"})
+    async with Client(srv, mode=mode, elicitation_callback=elicit) as c:
+        r = payload(await c.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "also_scope": True}))
+        out = payload(await c.call_tool("rec_stop", {"id": r["id"]}))
+    assert len(asked) == 1 and out["scope_next"]["choice"] == "close", (asked, out.get("scope_next"))
+    assert fake_xae.calls == ["start", "stop", "save", "csv", "disconnect"], fake_xae.calls
+    assert out["scope"]["finished_by"] == "rec_stop" and app.scope_left is None
