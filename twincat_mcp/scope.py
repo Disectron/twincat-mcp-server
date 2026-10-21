@@ -327,7 +327,8 @@ def log_find_since(mark: dict[str, Any] | None, rx: "re.Pattern[str]") -> list[t
 
 
 def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool = False, timeout_s: float = 600,
-           key: bytes | None = None, version: str = "?", view_log: Path | None = None) -> dict[str, Any]:
+           key: bytes | None = None, version: str = "?", view_log: Path | None = None,
+           exists_hint: str | None = None) -> dict[str, Any]:
     """Run the export tool on `svd`. N118: a read-only source (rec_stop sets its .svdx read-only, like the recording)
     is exported from a byte-identical writable copy — the tool exited 0 without a CSV on such a file, while it
     exported a writable one; whether read-only is the cause is not proven, the copy rules it out. A run that writes no
@@ -343,7 +344,8 @@ def export(svd: str | Path, target: str | Path, *, tool: Path, overwrite: bool =
     if out.suffix.lower() != ".csv":
         raise ScopeError("target must be a .csv file (TDMS/DAT need a full Scope licence and are not offered here)")
     if out.exists() and not overwrite:
-        raise ScopeError(f"{out} exists; pass overwrite=true or another target")
+        # fourteenth review of 0.8.16: scope_record(save) has no overwrite — its caller names its own way out
+        raise ScopeError(f"{out} exists; {exists_hint or 'pass overwrite=true or another target'}")
     if out.exists() and is_read_only(out):
         # a CSV rec_stop sealed (its SHA-256 is in the signed <id>.scope.json): replacing it would break the seal
         raise ScopeError(f"{out} is sealed (read-only, written by rec_stop with the recording) — it is never replaced; "

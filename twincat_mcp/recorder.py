@@ -2002,6 +2002,9 @@ class Recorder:
         self.ring_events = ring_events
         self.max_runs = max_runs
         self.recs: dict[str, Any] = {}      # Recording (Python engine) or NativeRecording
+        # ids whose delete is under way (worker thread) — the Scope part of a recording waits for its outcome rather
+        # than taking the stop for an end (fourteenth review of 0.8.16: a rec_delete cancelled meanwhile)
+        self.deleting: set[str] = set()
         self._key: bytes | None = None
         self.rcfg: Any = None                # config.RecorderConfig (engine, capture_exe, ring); None = defaults
         self.native_extra: dict[str, Any] | None = None   # tests: extra start fields (backend="sim", sim={...})
@@ -3002,20 +3005,24 @@ class Recorder:
             th.join(timeout=DRAIN_TIMEOUT_S + 10)
 
     def delete(self, rid: str) -> dict[str, Any]:
-        rec = self.recs.get(rid)
-        if rec and rec.active:
-            self.stop(rid, "deleted")
-        if rec is not None:
-            self._settle(rec)
-        path = self._path_for(rid)
-        removed = []
-        for p in (path, manifest_path(path), path.with_suffix(".wide.csv"), path.with_suffix(".long.csv"),
-                  provenance_path(path.with_suffix(".wide.csv")), provenance_path(path.with_suffix(".long.csv"))):
-            if p.exists():
-                _remove_file(p)
-                removed.append(str(p))
-        self.recs.pop(rid, None)
-        return {"id": rid, "removed": removed}
+        self.deleting.add(rid)
+        try:
+            rec = self.recs.get(rid)
+            if rec and rec.active:
+                self.stop(rid, "deleted")
+            if rec is not None:
+                self._settle(rec)
+            path = self._path_for(rid)
+            removed = []
+            for p in (path, manifest_path(path), path.with_suffix(".wide.csv"), path.with_suffix(".long.csv"),
+                      provenance_path(path.with_suffix(".wide.csv")), provenance_path(path.with_suffix(".long.csv"))):
+                if p.exists():
+                    _remove_file(p)
+                    removed.append(str(p))
+            self.recs.pop(rid, None)
+            return {"id": rid, "removed": removed}
+        finally:
+            self.deleting.discard(rid)
 
     def seal_unsealed(self, max_files: int = 500) -> dict[str, Any]:
         """N27 / server start: a recording whose footer is in the file but that has no manifest (the server went away

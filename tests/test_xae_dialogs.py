@@ -759,3 +759,29 @@ async def test_n181_a_read_call_a_dialog_refused_says_nothing_was_changed(monkey
     # the backend alone does not know the tool: said as the latter; buttons it can't press: close it in XAE
     e = X.XaeBusy.blocked("LookupTreeItem TIPC", {**d, "buttons": None, "buttons_note": "not readable"})
     assert "may have run: close it in XAE (its buttons can't be pressed by the tool)" in str(e) and e.dialog["hwnd"] == 77
+
+
+@pytest.mark.anyio
+async def test_0817_busy_after_an_action_never_says_retry(project_dir):
+    """Fourteenth review of 0.8.16: after an action of the same tool ran, the busy text withholds 'repeat it' — the
+    dialog hint then said 'retry in a few seconds' (a second boot project / activation)."""
+    from twincat_mcp import xae_backend as X
+    from twincat_mcp.server import _tool_boundary
+    app = App(mk_cfg(project_dir))
+    app.dialogs_now = lambda: []
+
+    def generate():
+        app.xae.acted.append("GenerateBootProject")
+        return {"generated": True}
+
+    def read():
+        raise X.XaeBusy(X.XaeBusy.busy_text("BootProjectAutostart", X.RPC_E_CALL_REJECTED, 0.3, []),
+                        what="BootProjectAutostart", busy=(X.RPC_E_CALL_REJECTED, 0.3))
+
+    async def two_calls():
+        await app.xae_call(generate)
+        await app.xae_call(read)
+    with pytest.raises(ToolError) as ei:
+        await _tool_boundary(two_calls)()
+    t = str(ei.value)
+    assert "earlier step(s) ran (GenerateBootProject)" in t and "retry" not in t and "repeat it" not in t, t
