@@ -28,6 +28,10 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| 0.8.18 | N189: two `rec_start(also_scope=true)` in one batch (A `duration_s=10`, B `duration_s=3`); while A records: `rec_start(also_scope=true)`, `rec_start` without also_scope, `scope_record` start / stop / save / disconnect / new | one recording has Scope, the other is refused "Scope belongs to recording …" / "being started by another call … This recording was not started"; without also_scope: recorded, `scope_note` says why Scope was not offered; every scope_record action refused "nothing was done"; A's `.scope.csv` span = A's recording; no two links share a capture |
+| 0.8.18 | Scope recording of its own: `scope_record start`, then `rec_start(also_scope=true)`; `scope_record stop`; `rec_start(also_scope=true)` again; `scope_record save`; `rec_start(also_scope=true, scope_disconnect=true)` | refused "Scope records on its own …"; after stop the next asks "Scope still holds a Scope recording of its own (scope_record) (NOT saved …)"; after save the disconnect needs no confirmation; the last records with Scope |
+| 0.8.18 | N191 / N190: a Scope stop refused (Tools → Options open when the recording ends), Cancel, `rec_stop`; then a normal also_scope recording; the audit log | the first: `scope_span.runs_past_s` ≈ the extra seconds, note "Scope's capture covers … it ran … s past its end", the same `span` in the signed `.scope.json`; the normal one: no `scope_span`; audit has `scope_disconnect_asked` (with the answer) and `scope_next` |
+| 0.8.18 | N192 / N193: `xae_links` on DrumFillingMachineV0 (`TIPC^DrumFillingMachine`, then its instance path); on TwinCAT Project15 | 16 variables (11 inputs, 5 outputs), 21 links; `unlinked`: `GVL_WeighingScale.abLoadCellWcState[1]`, `bDoWcState`, `bManualSwitchIn`, `abManBulkBtnIn`, `abManFineBtnIn`; the instance path gives the same; Project15: its own I/O, never "0 unlinked" when nothing was read |
 | 0.8.17 | Scope part with one owner: `rec_start(also_scope=true, duration_s=5)` and let it end; again with `rec_stop` cancelled (stop the client call) during its stop; `rec_delete` of a recording while Scope runs; a second `rec_start` while the first one ends | `rec_status` → `scope.state` recording → finishing → finished, `finished_by` "the recording ended by itself (duration …)" / "rec_stop" / "rec_stop (the call ended before its Scope part — finished after it)" / "rec_delete"; `rec_delete` of a recording whose Scope still records → no .svdx / .scope.csv of that id in `<recordings>\Scope Recordings`; of one whose Scope part was saved (it had ended) → the files stay, listed in `scope_files_kept`; Scope stops every time (`scope_list` / the Scope View) |
 | 0.8.17 | XAE busy or a dialog open when a recording with Scope ends: open Tools → Options in XAE, let the recording end, close Options, `rec_stop` | while Options is open `rec_status` → `scope.state: recording`, `stop_refused`, note "rec_stop asks again"; after closing it `rec_stop` stops and saves Scope; a dialog Scope itself opens during StopRecord → `state: stop_unknown`, StopRecord not sent again |
 | 0.8.17 | Scope after a recording (Ryan's choice): `rec_start(also_scope=true)`, `rec_stop` — answer the prompt close, then new, then pause on three recordings; then `rec_start(also_scope=true)` once more | files in `<recordings>\Scope Recordings\`; close: Scope View back in Config (empty); new: Scope records at once, `scope_record stop` + `save` keep it; pause: Scope View still shows the data, and the next rec_start asks "Scope still holds the recording of … Disconnect it and record with Scope now?"; the export tool runs on paths with the space in 'Scope Recordings' |
@@ -140,6 +144,73 @@ tool wishlist (2026-10-18).
   log is on a host not reachable from the build session, and release.yml — unlike ci.yml — reported no failures as
   annotations: which test failed is unknown. Fixed: both workflows run one report script
   (`.github/scripts/pytest_failures.py`, annotations + job summary).
+- 0.8.17 retest (Ryan, 2026-10-22, bugs.md §37 / §37b). Passed live: N185, N186, N187, N188, N181b, N178 (token
+  half), a recording that ends by itself, `rec_delete` while Scope records and after its save, close / new / pause,
+  `stop_refused` with Options open, the export tool on "Scope Recordings"; smoke R7, N27. New:
+  N189 (S2) — two `also_scope` recordings at once: B's Scope part stops Scope at B's end and saves A's capture, A
+  saves the same capture again, both signed (A's covers 3.5 s of 10 s). Cause: `rec_start` never checks whether
+  another recording's part holds Scope — one owner per recording, none across recordings, one Scope. The 0.8.17
+  review listed it as LOW ("older, outside the change"); under its own rule (a false statement in a signed link =
+  HIGH) it should have blocked the release. N190 (S4) the disconnect question and its answer are not audited.
+  N191 (S4) a Scope span past (or short of) its recording is saved without a note. N192 (S3 in bugs.md; S2 by this
+  list's rule — "0 unlinked" reads as "all linked") `xae_links` on a 4026 project: the instance item has no tree
+  children; the variables are in its XML (`DataAreas`), the links only in the mapping table → `groups: []`,
+  `unlinked_count: 0`. N193 (S4) `xae_links` refuses the instance path that `xae_plc_projects` names. Not run: N179,
+  N180 (testable now), N178 (10-minute half), `rec_stop` cancelled during its Scope part.
+- TE1000 probe (Ryan, 2026-10-22; DrumFillingMachineV0, his XAE): `ITcSysManager15` — LinkVariables /
+  UnlinkVariables / ProduceMappingInfo (21 links) / ConsumeMappingInfo / GetTypeSystem / LookupTreeItemById present;
+  JsonCommand, BuildTargetPlatform absent. The References item's `_ITcPlcLibraryManager`: References (18, requested
+  and effective resolution), ScanLibraries (277), AddLibrary, RemoveReference, AddPlaceholder,
+  SetEffectiveResolution, FreezePlaceholder, ProduceLibrarySignatures present; `Repositories` items → E_NOINTERFACE
+  (another route needed); `GetLibraryIecDeclaration` offered by no object; a signature holds names, inputs /
+  outputs with types and comments only — no methods, struct members or constant values (Recipe Management: 1 of
+  29 FBs with an input). GetLastErrorMessages: the buffer was empty, clearing not decided (the code handles both).
+  Type system v1: 862 types, the project's own DUTs / FBs among them.
+- Decided by Ryan (2026-10-22): library part 1d (declarations compared with the docs) dropped. 0.8.18 = fixes only:
+  N189 – N193 and the findings of the in-depth review (Scope and recorder code changed in 0.8.16 – 0.8.17; at most 2
+  rounds, HIGH / MEDIUM block, LOW to this list, later fixes checked by tests + CI). Then libraries 0.8.19 (1a, 1b),
+  linking 0.8.20 (its read side comes with the N192 fix), EtherCAT 0.8.21, snapshots 0.8.22, tasks 0.8.23. The error
+  index (held) has no slot yet.
+- In-depth review of the 0.8.16 – 0.8.17 Scope and recorder code, round 1 (two reviewers, 2026-10-22, at v0.8.17).
+  Fixed in 0.8.18: a rec_start cancelled during the start check left the part 'starting' with no owner (rec_stop /
+  rec_delete waited forever, Scope recorded on); a StartRecord of unknown outcome (shell gone, E_POINTER) said "NOT
+  started" and was never stopped; the start check confirmed by another call's 'Config → Record' line; the question
+  after a recording and the disconnect question applied to a state that changed while they were open, two rec_stop
+  calls applied both answers; scope_record start / stop / save / disconnect / new under a recording's part (one owner,
+  with N189); 'new' said "not done" after its Disconnect ran; a delete between a finish's check and its link left a
+  signed link to nothing; XAE messages after a failed before-read taken as the action's; the stale-data check mixed
+  the PC's and the target's clock (an old capture passed with the target ahead, the recording's own was refused with
+  it behind — without PLC time and a log confirmation it now says it cannot tell). LOW, left: on the input_required
+  path rec_stop is audited on each round, scope_record(new) writes two audit lines; `_scope_free` disconnects before
+  rec.start, a failed rec.start does not say so; a Disconnect of unknown outcome is said "could not be disconnected"
+  and the next rec_start sends it again; without prompts 'pause' is never recorded (rec_status keeps asking); older:
+  on the answering round a busy XAE drops the user's "yes" of the also_scope question; a refused Disconnect inside
+  the after-recording choice says "call again" inside rec_stop's result; stop_unknown parts of deleted recordings
+  stay in `scope_without_recording`; a busy Scope lookup on StopRecord's retry is final instead of stop_refused; two
+  rec_stop calls still ask the question twice (one answer is applied). Retest on hardware: does TE130x log a refusal
+  for StartRecord while Scope records, and how soon "Config → Record"; StopRecord / SaveSVD after another actor's
+  Disconnect; does Scope keep recording when the shell dies during StartRecord; can StartRecord / StopRecord throw
+  E_POINTER after acting; can a second shell's TcScopeView_1.log confirm this shell's start; a buffer the read does not
+  clear — reset by each method or accumulating. Checked on Ryan's files: the CSV header's FILETIMEs are UTC on the
+  target's clock, as the recording's t0 (Scope begins / ends 0.2 – 0.4 s after the recording; 4616 ran 28.1 s past).
+- Round 2 (the last, two reviewers, 2026-10-22, at f6eab54): round 1's HIGH / MEDIUM and N189 – N193 fixed or
+  closed by its fixes. New, fixed in 0.8.18 with tests (red on the code before): xae_links counted an array of a struct
+  (dimensions only in the BaseType text — the retest's `astLoadCellAdsAddr`), a 2-D array, one of more than 4096
+  elements and a struct linked member by member as linked without a word (now element-checked or `not_checked`); a
+  tree-children group that could not be read gave "0 unlinked" and false "links without a variable"; scope_record
+  start / new cancelled during the start check left Scope recording with no owner; the answer 'new' after a
+  recording took no claim between its Disconnect and its StartRecord (a rec_start took Scope in the gap); a Scope
+  recording of its own left scope_left naming an earlier recording's saved data (disconnect without confirmation);
+  StartRecord's job returned a tuple — open_dialogs / xae_messages were lost (regression against 0.8.17); marked
+  messages lost their mark in a later step's error; the refusal under a run of its own did not name disconnect;
+  scope_record stop with nothing recording set a question about data that may not exist. LOW, left: a scope_record
+  start of unknown outcome does not say Scope is held as a recording of its own until scope_record stop; two rec_stop
+  calls still ask the question twice. Retest on hardware: can ProduceMappingInfo return an empty string, or the
+  `.tsproj` form `OwnerA Name="InputDst"` (xae_links would then report every variable unlinked although links were
+  read); which TwinCAT versions show the instance's variable groups as tree children; StopRecord / Disconnect in
+  Config and in Reply; is Scope in Reply reset to Config by xae_activate_configuration.
+- Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
+  docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
   Not in 0.8.15: the error index (N125, 0.8.16); title ranking by word rarity (the 'OPC UA server security'
   trade-off); the index proposals of 2026-10-21 (a golden query set, the real-data diff as a repo tool, a library

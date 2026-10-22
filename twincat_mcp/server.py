@@ -55,7 +55,7 @@ import pyads
 
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
-from .xae_backend import XaeBackend, XaeBusy, XaeError, XaeExplained, sta_init, sta_teardown
+from .xae_backend import XaeActedUnknown, XaeBackend, XaeBusy, XaeError, XaeExplained, sta_init, sta_teardown
 from .project_backend import PlcView, ProjectIndex, ProjectError, declaring, not_on_target, parse_tcunit_xml
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
@@ -445,6 +445,10 @@ class App:
         # 0.8.17 (Ryan, 2026-10-21): what Scope holds after a recording's Scope part stopped it — Scope stays in Reply
         # with that recording until it is disconnected (N186); the user chooses close / new / pause
         self.scope_left: dict[str, Any] | None = None
+        # N189 (0.8.17 retest): there is one Scope — a call that starts it holds it from its check on (scope_claim),
+        # a Scope recording on its own (scope_record start / new) holds it until it is stopped (scope_standalone)
+        self.scope_claim: str | None = None
+        self.scope_standalone: dict[str, Any] | None = None
         self.rec.rcfg = cfg.recorder
 
         # N62: the recorder compares cycle_ms with the task that runs each recorded program (project task config)
@@ -933,7 +937,7 @@ class App:
                 earlier = [m for m in (be.messages if keep else []) if not m.get("failed") and m.get("messages")]
                 if earlier:            # review of 0.8.16: what the call's earlier steps logged, not only the last one's
                     more = " — XAE messages of the steps before it: " + "; ".join(
-                        f"{m['action']}: {m['messages'][:500]}" for m in earlier)
+                        f"{m['action']}{_msg_mark(m)}: {m['messages'][:500]}" for m in earlier)
                     new = copy.copy(exc)               # keeps what the error carries (XaeBusy.dialog, N181)
                     new.args = (f"{exc}{more}",)
                     new.steps_note = getattr(exc, "steps_note", "") + more
@@ -989,6 +993,8 @@ class App:
             elif ("0x80010001" in low or "0x8001010a" in low or "-2147418111" in low or "-2147417846" in low
                     or "call was rejected" in low or "retry later" in low):
                 msg += " — XAE refused the COM call: it is busy or a modal dialog has the shell." + await asyncio.to_thread(self._dialog_hint)
+            if isinstance(exc, XaeActedUnknown):
+                raise _Pending(msg) from exc           # review 1 of 0.8.18: it may have run — never 'did not run'
             if isinstance(exc, XaeExplained):
                 raise ToolError(msg) from exc          # it carries its own cause and what to do
             lic = _license_hint(msg)
@@ -1955,6 +1961,8 @@ CODE_EDIT_ACTIONS = frozenset({"xae_pou_set", "xae_pou_create", "proj_set_code",
 
 # what the confirmation prompt says will happen
 ACTION_EFFECTS = {
+    "scope_record": "disconnects the TwinCAT Scope configuration: what Scope holds (a capture the plugin has not saved) "
+                    "is discarded and XAE's Scope view is cleared — the PLC and every ADS recording are not touched",
     "kb_rebuild": "rebuilds a knowledge-base index from its source on this PC; the current index stays in use until the "
                   "new one is complete, then replaces it — nothing else is changed or deleted (docs/KNOWLEDGE_BASE.md)",
     "xae_activate_configuration": "overwrites the boot configuration on the target; the runtime goes to CONFIG/restart",
@@ -2221,8 +2229,8 @@ def _tool_boundary(fn: Any, xae_flags: Callable[[], Callable[[], dict[str, Any]]
             # twelfth review of 0.8.16: a tool that failed after XAE calls that logged messages (an activation's ADS
             # error, then a restart that failed) — what they logged is part of the error
             told = str(exc)
-            more = [f"{m.get('action')}: {str(m['messages'])[:500]}" for st in steps for m in st["messages"]
-                    if m.get("messages") and str(m["messages"])[:200] not in told]
+            more = [f"{m.get('action')}{_msg_mark(m)}: {str(m['messages'])[:500]}" for st in steps
+                    for m in st["messages"] if m.get("messages") and str(m["messages"])[:200] not in told]
             if more:
                 raise ToolError(f"{told} — XAE messages of this call's earlier steps: " + "; ".join(more)) from exc
             raise
@@ -2281,6 +2289,16 @@ class _NotRun(ToolError):
     before it started (a dialog an earlier call opened holds XAE; the worker is busy with another call). Repeating it
     runs it once — fourteenth review of 0.8.16: only the busy refusal was told apart, so a Scope stop refused while a
     dialog held XAE was final and Scope recorded on."""
+
+
+def _msg_mark(m: dict[str, Any]) -> str:
+    """Review 2 of 0.8.18: messages read after a failed before-read keep their mark wherever they are quoted."""
+    return " (may include earlier calls' — the read before it failed)" if m.get("messages_note") else ""
+
+
+class _HalfDone(ToolError):
+    """A step of a two-step Scope action (disconnect, then StartRecord) ran, the next did not (or its outcome is not
+    known) — never 'not done' (review 1 of 0.8.18)."""
 
 
 class _Pending(ToolError):
@@ -3210,19 +3228,40 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             raise ToolError("mode must be cycle | change | poll")
         if engine is not None and str(engine).lower() not in ("auto", "native", "python"):
             raise ToolError("engine must be auto | native | python")
-        want_scope = await _scope_decide(also_scope, scope, ctx)
-        if want_scope is not None and app.scope_left:
-            want_scope = await _scope_free(want_scope, scope_disconnect, ctx)
-        res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
-                                 cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
-                                 start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
-                                 name=name, max_symbols=max_symbols, post_trigger_s=post_trigger_s,
-                                 allow_partial=allow_partial, max_delay_ms=max_delay_ms, cycle_counter=cycle_counter,
-                                 edge_triggers=edge_triggers, engine=engine, timeout=120)
-        app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode, "engine": res.get("engine")},
-                  OpClass.EDIT, "ok")
+        scope_note = None
+        h = _scope_holder()
+        if also_scope is None and h is not None and str(app.cfg.recorder.also_scope or "ask").lower() == "ask":
+            # N189: Scope has another owner — it is not offered (a yes could only be refused)
+            want_scope, scope_note = None, f"Scope was not offered: {_scope_owner_text(h)}"
+        else:
+            want_scope = await _scope_decide(also_scope, scope, ctx)
+        claim = None
         if want_scope is not None:
-            res["scope"] = await _scope_start(res["id"], want_scope)
+            # N189: Scope is checked and claimed before anything starts — a second rec_start (also in the same batch)
+            # sees the claim, and its recording is not started
+            try:
+                claim = _scope_claim("rec_start")
+            except ToolError as exc:
+                raise ToolError(f"{exc} This recording was not started: call rec_start again with also_scope=false to "
+                                "record without Scope, or once Scope is free.") from exc
+        try:
+            if want_scope is not None and app.scope_left:
+                want_scope = await _scope_free(want_scope, scope_disconnect, ctx)
+            res = await app.rec_call(app.rec.start, symbols=symbols, prefix=prefix, pattern=pattern, mode=mode,
+                                     cycle_ms=cycle_ms, duration_s=duration_s, max_events=max_events,
+                                     start_when=start_when, stop_when=stop_when, pre_trigger_ms=pre_trigger_ms,
+                                     name=name, max_symbols=max_symbols, post_trigger_s=post_trigger_s,
+                                     allow_partial=allow_partial, max_delay_ms=max_delay_ms,
+                                     cycle_counter=cycle_counter, edge_triggers=edge_triggers, engine=engine,
+                                     timeout=120)
+            app.audit("rec_start", {"id": res["id"], "symbols": res["symbols"], "mode": mode,
+                                    "engine": res.get("engine")}, OpClass.EDIT, "ok")
+            if want_scope is not None:
+                res["scope"] = await _scope_start(res["id"], want_scope)     # the part holds Scope from here on
+            elif scope_note:
+                res["scope_note"] = scope_note
+        finally:
+            _scope_unclaim(claim)
         return res
 
     async def _scope_free(name: str, disconnect: bool | None, ctx: Context | None) -> str | None:
@@ -3230,17 +3269,28 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         — the user decides (Ryan, 2026-10-21: the next recording with Scope asks). -> the Scope name, or None (this
         recording without Scope). Raises when nothing could be decided; nothing is started then."""
         left = app.scope_left or {}
-        held = (f"Scope still holds the recording of {left.get('rid')} (" +
+        held = (f"Scope still holds {_left_label(left)} (" +
                 (f"saved: {Path(left['saved']).name}" if left.get("saved") else "NOT saved — disconnecting discards it")
                 + ")")
+        via = "scope_disconnect argument" if disconnect is not None else None
         if disconnect is None and ctx is not None and app.cfg.safety.allow_elicitation:
             try:
                 ans, _open_s = await ASK.ask(ctx, f"{held}. Disconnect it and record with Scope now?",
                                              ScopeDisconnectSchema)
+                via = "prompt"
                 if ans.action == "accept" and ans.data is not None:
                     disconnect = ans.data.disconnect
             except ASK.NoPrompt:
                 pass
+        if via is not None:
+            # N190 (0.8.17 retest): the question and its answer are in the audit, as a confirmation is
+            app.audit("scope_disconnect_asked", {"held": left.get("rid"), "saved": bool(left.get("saved")), "via": via,
+                                                 "answer": disconnect}, OpClass.EDIT, "ok")
+        if app.scope_left is not left and app.scope_left is not None:
+            raise ToolError("What Scope holds changed while the question was open — call rec_start again. Nothing was "
+                            "started.")
+        if app.scope_left is None and disconnect is not None:
+            return name if disconnect else None   # disconnected meanwhile: nothing left to discard
         if disconnect is None:
             raise ToolError(f"{held}: it records anew only once it is disconnected. Ask the user, then call rec_start "
                             "again with scope_disconnect=true (Scope is disconnected first) or also_scope=false. Nothing "
@@ -3302,7 +3352,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         part = _ScopePart(rid, run)
         app.scope_parts[rid] = part
         try:
-            r = await app.xae_call(app.xae.scope_action, "start", name or None, timeout=60)
+            r = await app.xae_call(_marked_start(name or None), timeout=60)
+            mark = r.pop("_log_mark", None)
         except asyncio.CancelledError as exc:
             if _did_not_run(exc):
                 # second review of 0.8.17: StartRecord was withdrawn from the XAE queue (or refused) — it never ran;
@@ -3345,7 +3396,14 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # retries for up to com_retry_s)
         run.update(scope=r["scope"], start_result=r.get("result_code"),
                    started=dt.datetime.now(dt.timezone.utc).isoformat())
-        state, how = await _start_check(mark)
+        try:
+            state, how = await _start_check(mark)
+        except BaseException:
+            # review 1 of 0.8.18: rec_start cancelled during the check (or the log read failed) — StartRecord ran; the
+            # part was left 'starting' with no owner: rec_stop / rec_delete waited forever and Scope recorded on
+            run["start_check"] = "not checked: rec_start was cancelled (or the log read failed) during the check"
+            part.begin()
+            raise
         if state is not None:
             # N186 (0.8.16 retest): StartRecord returned 1 and Scope did not record — it was still in Reply with the
             # previous recording; that capture was then saved and signed as this recording's
@@ -3361,6 +3419,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 "note": "Scope records independently (its own ADS acquisition and timestamps); it is stopped, saved and "
                         "exported when the recording ends — by itself (duration, stop_when, post_trigger, max_events …) "
                         "or at rec_stop"}
+
+    def _marked_start(name: str | None) -> Callable[[], dict[str, Any]]:
+        """StartRecord with the Scope View log's mark taken in the same XAE job, right before it (review 1 of 0.8.18:
+        the mark was taken before the call queued — another start meanwhile, its 'Config → Record' line confirmed a
+        start Scope refused). -> (mark, StartRecord's result)."""
+        from . import scope as S
+
+        def scope_action() -> dict[str, Any]:
+            mark = S.log_mark(_view_log())
+            # review 2 of 0.8.18: a dict, so xae_call adds open_dialogs / xae_messages to it (a tuple lost them)
+            return {**app.xae.scope_action("start", name, None), "_log_mark": mark}
+        return scope_action
 
     def _did_not_run(exc: BaseException) -> bool:
         """A cancellation of an XAE call that never ran: the worker withdrew the queued job, or it came while a
@@ -3455,6 +3525,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             self.queue: asyncio.Queue = asyncio.Queue()
             self.idle = asyncio.Event()
             self.idle.set()
+            # review 1 of 0.8.18: whether the recording is kept and the signed link are one step — rec_delete's delete
+            # waits for it, or it for the delete (a delete between the check and the link left a link to nothing)
+            self.link_lock = asyncio.Lock()
             self.task: Any = None
 
         def begin(self) -> None:
@@ -3588,6 +3661,63 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             return str(app.rec._get(rid).id)
         except Exception:  # noqa: BLE001 — the recorder says it in its own error
             return rid
+
+    # N189 (0.8.17 retest): two rec_start(also_scope=true) at once each got a Scope part of the ONE Scope — B's stopped
+    # Scope at B's end and saved A's capture, A saved the same capture again, both signed. One owner of Scope at a
+    # time: a recording's part (until it is finished), a call starting it (from its check on, no await in between),
+    # a Scope recording on its own. Everything that would start, stop, save or discard Scope under another owner is
+    # refused before it acts.
+    SCOPE_HOLDING = ("starting", "recording", "stop_refused", "finishing")
+
+    def _scope_holder() -> dict[str, Any] | None:
+        for rid, part in list(app.scope_parts.items()):
+            if part.state in SCOPE_HOLDING or (part.state == "stop_unknown" and not part.run.get("released_by")):
+                return {"rid": rid, "state": part.state}
+        if app.scope_claim:
+            return {"rid": None, "state": "claimed", "by": app.scope_claim.split(" #", 1)[0]}
+        if app.scope_standalone:
+            return {"rid": None, "state": "standalone", **app.scope_standalone}
+        return None
+
+    def _scope_owner_text(h: dict[str, Any]) -> str:
+        if h.get("rid"):
+            rid, st = h["rid"], h["state"]
+            how = {"stop_refused": f"its StopRecord was refused (XAE busy or a dialog) — rec_stop(id='{rid}') asks again",
+                   "stop_unknown": "its StopRecord's outcome is unknown (a dialog held it, it timed out, or the shell "
+                                   "went away / failed after it acted): Scope may "
+                                   "still record — check XAE's Scope View; scope_record(action='stop') or "
+                                   "action='disconnect' takes Scope over"}.get(
+                st, f"it ends with that recording (rec_status(id='{rid}'), or rec_stop(id='{rid}'))")
+            return f"Scope belongs to recording {rid} (its Scope part: {st}) — {how}"
+        if h["state"] == "claimed":
+            return f"Scope is being started by another call ({h.get('by')}) — try again once that call has returned"
+        return (f"Scope records on its own (scope_record {h.get('action', 'start')}, {h.get('since')}) — "
+                "scope_record(action='stop') stops it first (when StopRecord fails — Scope reset to Config by a "
+                "TwinCAT restart — scope_record(action='disconnect') frees it)")
+
+    def _scope_claim(by: str) -> str:
+        """Check and claim Scope in one step (no await between them): -> the claim; ToolError when it has an owner."""
+        h = _scope_holder()
+        if h is not None:
+            raise ToolError(f"{_scope_owner_text(h)}. One Scope records for one owner at a time.")
+        app.scope_claim = f"{by} #{secrets.token_hex(4)}"
+        return app.scope_claim
+
+    def _scope_record_allowed(action: str) -> None:
+        """scope_record under another owner: refused before it acts (N189)."""
+        h = _scope_holder()
+        if h is not None and (h.get("rid") and h["state"] != "stop_unknown" or h["state"] == "claimed"
+                              or (h["state"] == "stop_unknown" and action == "start")
+                              or (h["state"] == "standalone" and action == "start")):
+            what = {"start": "start Scope a second time", "stop": "stop Scope under its owner — the owner's own stop "
+                    "would then save data it did not stop", "disconnect": "discard what Scope records for its owner",
+                    "new": "discard what Scope records for its owner", "save": "save Scope's data while it records "
+                    "for its owner"}[action]
+            raise ToolError(f"{_scope_owner_text(h)}. scope_record(action='{action}') would {what}: nothing was done.")
+
+    def _scope_unclaim(claim: str | None) -> None:
+        if claim is not None and app.scope_claim == claim:
+            app.scope_claim = None
 
     def _scope_state(rid: str) -> dict[str, Any] | None:
         """rec_status / rec_list: the Scope part of a recording — recording, finishing, finished, stop_unknown (N182)."""
@@ -3841,16 +3971,87 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         except (TypeError, ValueError):
             host = None
         if t0 is not None:
-            # the recording's first sample (the target's clock, as Scope's) and StartRecord (this PC's): both say old
-            if end >= t0 - tol or (host is not None and end >= host - tol):
+            # the recording's first sample and Scope's data: the target's clock both (review 1 of 0.8.18: also taking
+            # this PC's clock passed an old capture when the target's clock runs ahead)
+            if end >= t0 - tol:
                 return None
             return (f"its data ends at {S.filetime_iso(end)}, {(t0 - end) / 1e7:.0f} s before the recording's first "
                     f"sample ({S.filetime_iso(t0)}) — an earlier capture Scope still held")
+        if str(run.get("start_check") or "").startswith("confirmed"):
+            # no PLC time (poll mode): the Scope View log saw this start — what Scope saved is this run's, whatever the
+            # two clocks say (review 1 of 0.8.18: a target clock behind the PC's refused the recording's own capture)
+            return None
+        if host is None and run.get("start_asked"):
+            try:                           # a start of unknown outcome: when it was asked (review 1 of 0.8.18)
+                host = int((dt.datetime.fromisoformat(run["start_asked"]) - dt.datetime(1601, 1, 1, tzinfo=dt.timezone.utc))
+                           .total_seconds() * 1e7)
+            except (TypeError, ValueError):
+                host = None
         if host is None or end >= host - tol:
             return None                    # no PLC time (poll mode, no sample yet): StartRecord's time on this PC only
+        # review 1 of 0.8.18: said 'an earlier capture' — the target's clock behind this PC's gives the same picture
         return (f"its data ends at {S.filetime_iso(end)}, {(host - end) / 1e7:.0f} s before StartRecord ran (this PC's "
-                "clock — the recording has no PLC time; the target's clock may differ) — an earlier capture Scope "
-                "still held")
+                "clock — the recording has no PLC time and the Scope View log did not confirm the start): an earlier "
+                "capture Scope still held, or the target's clock differs from this PC's — which, cannot be told")
+
+    SCOPE_SPAN_TOL_S = 1.0                 # the 0.8.17 retest: Scope begins / ends 0.2 – 0.4 s after the recording
+
+    def _scope_span(rid: str, csv: Path) -> dict[str, Any] | None:
+        """N189 / N191 (0.8.17 retest): Scope's capture (the CSV's 'Starttime / Endtime of export') against the
+        recording's window (its first sample + window_start / window_end of its footer) — both the target's clock. A
+        capture that begins later, ends earlier or runs past the recording by more than SCOPE_SPAN_TOL_S is described;
+        None when it matches, or when that cannot be told (no CSV header, no PLC time, no footer window)."""
+        from . import scope as S
+        span = S.csv_span(csv) if csv.is_file() else None
+        t0 = app.rec.t0_filetime(rid)
+        if span is None or t0 is None:
+            return None
+        try:
+            ft = K_footer(app.rec._path_for(rid)) or {}
+        except Exception:  # noqa: BLE001 — no footer: nothing to compare with
+            return None
+        wend, wstart = ft.get("window_end_ms"), ft.get("window_start_ms")
+        if not isinstance(wend, (int, float)):
+            return None
+        r0 = t0 + int(float(wstart) * 1e4) if isinstance(wstart, (int, float)) and wstart > 0 else t0
+        r1 = t0 + int(float(wend) * 1e4)
+        s0, s1 = span
+        tol = SCOPE_SPAN_TOL_S * 1e7
+        out: dict[str, Any] = {"scope_from": S.filetime_iso(s0), "scope_to": S.filetime_iso(s1),
+                               "recording_from": S.filetime_iso(r0), "recording_to": S.filetime_iso(r1)}
+        said = []
+        if s0 - r0 > tol:
+            out["starts_after_s"] = round((s0 - r0) / 1e7, 1)
+            said.append(f"began {out['starts_after_s']} s after the recording")
+        if r1 - s1 > tol:
+            out["ends_before_s"] = round((r1 - s1) / 1e7, 1)
+            said.append(f"ended {out['ends_before_s']} s before it")
+        if s1 - r1 > tol:
+            out["runs_past_s"] = round((s1 - r1) / 1e7, 1)
+            said.append(f"ran {out['runs_past_s']} s past its end")
+        if not said:
+            return None
+        out["covers_s"] = round(max(0, min(s1, r1) - max(s0, r0)) / 1e7, 1)
+        out["recording_s"] = round((r1 - r0) / 1e7, 1)
+        out["note"] = (f"Scope's capture covers {out['covers_s']} s of the recording's {out['recording_s']} s: it "
+                       + ", ".join(said))
+        return out
+
+    async def _link_if_kept(part: Any, svdx: Path, csv: Path, out: dict[str, Any]) -> bool:
+        """The signed link, written only while the recording is kept — under the part's link_lock, which rec_delete's
+        delete takes too. -> whether it was written."""
+        rid, run = part.rid, part.run
+        async with part.link_lock:
+            if not await _kept(rid, True):
+                return False
+            span = await asyncio.to_thread(_scope_span, rid, csv)
+            if span is not None:
+                # N189 / N191 (0.8.17 retest): a capture that began late, ended early or ran past the recording is
+                # said — in the result and in the signed link
+                run["span"] = out["scope_span"] = span
+                out["note"] = (out["note"] + " · " if out.get("note") else "") + span["note"]
+            out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv, out.get("svdx_incomplete"))
+            return True
 
     async def _kept(rid: str, save: bool) -> bool:
         """Whether Scope's files are saved with the recording: not for one that was deleted — a delete under way
@@ -3911,12 +4112,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             if stale:
                 # N186 (0.8.16 retest): an earlier capture Scope still held was saved and signed as this recording's
                 out["not_this_recording"] = stale
-                out["note"] = (f"the Scope data saved is not this recording's: {stale} — its files are kept, not linked "
-                               "to the recording nor sealed")
+                out["note"] = ((f"the Scope data saved could not be shown to be this recording's: {stale}"
+                                if stale.endswith("cannot be told") else
+                                f"the Scope data saved is not this recording's: {stale}")
+                               + " — its files are kept, not linked to the recording nor sealed")
                 app.audit("scope_finish", {"id": rid, "scope": run["scope"], "linked": False}, OpClass.EDIT, "error",
                           stale)
-            elif await _kept(rid, True):
-                out["link"] = await asyncio.to_thread(_scope_link, rid, run, svdx, csv, out.get("svdx_incomplete"))
+            elif await _link_if_kept(part, svdx, csv, out):
                 app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": out["link"].get("files")},
                           OpClass.EDIT, "ok")
             else:
@@ -3958,33 +4160,96 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         r = await app.xae_call(app.xae.scope_action, "disconnect", name, None, timeout=120)
         app.audit("scope_disconnect", {"scope": name, "held": (app.scope_left or {}).get("rid")}, OpClass.EDIT, "ok")
         app.scope_left = None
+        app.scope_standalone = None           # N189: what Scope recorded on its own is discarded with it
+        _scope_release("scope_record disconnect")
         return {k: r[k] for k in ("scope", "result_code", "warning", "result_note") if k in r}
 
+    def _scope_release(by: str) -> list[str]:
+        """A stop_unknown part (StopRecord may have run) holds Scope until the user takes it over in a way that leaves
+        it stopped: scope_record stop / disconnect / new. -> the recordings released."""
+        out = []
+        for part in list(app.scope_parts.values()):
+            if part.state == "stop_unknown" and not part.run.get("released_by"):
+                part.run["released_by"] = f"{by} ({dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')})"
+                out.append(part.rid)
+        return out
+
     async def _scope_new(name: str | None) -> dict[str, Any]:
-        """Disconnect, then StartRecord at once — a Scope recording on its own (linked to no ADS recording)."""
+        """Disconnect, then StartRecord at once — a Scope recording on its own (linked to no ADS recording); it owns
+        Scope until scope_record(action='stop') (N189)."""
         from . import scope as S
         out: dict[str, Any] = {"disconnect": await _scope_disconnect(name)}
-        mark = await asyncio.to_thread(S.log_mark, _view_log())
-        r = await app.xae_call(app.xae.scope_action, "start", name, None, timeout=120)
+        since = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        try:
+            r = await app.xae_call(_marked_start(name), timeout=120)
+            mark = r.pop("_log_mark", None)
+        except _NotRun as exc:
+            # review 1 of 0.8.18: 'not done' was said after the Disconnect had run
+            raise _HalfDone(f"Scope was disconnected (what it held is discarded); StartRecord was refused and did not "
+                            f"run ({exc}) — Scope is in Config: scope_record(action='start') starts it") from exc
+        except (_Pending, asyncio.CancelledError) as exc:
+            if not (isinstance(exc, asyncio.CancelledError) and _did_not_run(exc)):
+                app.scope_standalone = {"action": "new", "scope": name, "since": since, "start_unknown": True}
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise _HalfDone(f"Scope was disconnected (what it held is discarded); StartRecord's outcome is not known "
+                            f"({exc}) — Scope may record: it is held as a recording of its own until "
+                            "scope_record(action='stop')") from exc
+        except ToolError as exc:
+            raise _HalfDone(f"Scope was disconnected (what it held is discarded); StartRecord failed ({exc})") from exc
+        app.scope_standalone = {"action": "new", "scope": name, "since": since}   # review 2: before the check
         state, how = await _start_check(mark)
         if state is not None:
-            raise ToolError(_start_refused_text(state, how, r.get("result_code"), None))
+            app.scope_standalone = None
+            raise _HalfDone("Scope was disconnected; " + _start_refused_text(state, how, r.get("result_code"), None))
         app.audit("scope_record", {"action": "start", "scope": name}, OpClass.EDIT, "ok")
         out.update(started=True, scope=r.get("scope"), start_check=how,
                    note="a Scope recording on its own, linked to no recording: scope_record(action='stop') then "
                         "scope_record(action='save') stop and save it")
         return out
 
+    def _left_label(left: dict[str, Any]) -> str:
+        return (f"the recording of {left['rid']}" if left.get("rid") else
+                "a Scope recording of its own (scope_record)")
+
     async def _scope_apply(choice: str, left: dict[str, Any]) -> dict[str, Any]:
+        # N189: the answer can come minutes after the question — Scope may meanwhile have been disconnected, or record
+        # for another owner: a choice for data Scope no longer holds does nothing
+        if app.scope_left is not left:
+            return {"choice": choice, "error": f"Scope no longer holds the data of {left.get('rid')} (it was "
+                                               "disconnected, or records again meanwhile): nothing was done"}
+        if left.get("choice"):
+            # review 1 of 0.8.18: two rec_stop calls each asked, and both answers were applied (Disconnect twice)
+            return {"choice": choice, "error": f"already answered in another call ({left['choice']}): nothing was done"}
+        claim = None
+        if choice != "pause":
+            h = _scope_holder()
+            if h is not None:
+                return {"choice": choice, "error": f"{_scope_owner_text(h)}: nothing was done"}
+            # review 2 of 0.8.18: no claim between the Disconnect and the StartRecord of 'new' — a rec_start took
+            # Scope in that gap; claimed here with no await since the check
+            claim = app.scope_claim = f"the choice after recording {left.get('rid')} #{secrets.token_hex(4)}"
+        try:
+            return await _scope_apply_owned(choice, left)
+        finally:
+            _scope_unclaim(claim)
+
+    async def _scope_apply_owned(choice: str, left: dict[str, Any]) -> dict[str, Any]:
         if choice == "pause":
             left["choice"] = "pause"
             return {"choice": "pause", "note": "Scope keeps the data (Reply) — the next recording with Scope asks to "
                                                "disconnect it; scope_record(action='disconnect') closes it any time"}
+        left["choice"] = choice                # set before the first await: a second answer finds it
         try:
             got = await (_scope_disconnect(left.get("name")) if choice == "close" else _scope_new(left.get("name")))
+        except _HalfDone as exc:
+            return {"choice": choice, "error": str(exc)[:600]}
+        except _NotRun as exc:
+            left["choice"] = None
+            return {"choice": choice, "error": str(exc)[:600], "note": f"not done — {_SCOPE_NEXT_HOW}"}
         except ToolError as exc:
             return {"choice": choice, "error": str(exc)[:600],
-                    "note": f"not done — {_SCOPE_NEXT_HOW}"}
+                    "note": "the Disconnect's outcome is not known — check XAE's Scope View before anything else"}
         return {"choice": choice, **got}
 
     async def _scope_next(ctx: Context | None, rid: str) -> dict[str, Any] | None:
@@ -4002,7 +4267,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             return {"ask_user": q, "then": _SCOPE_NEXT_HOW, "no_prompt": str(exc)[:300]}
         if ans.action != "accept" or ans.data is None:
             left["choice"] = "pause"
+            app.audit("scope_next", {"id": rid, "answer": None}, OpClass.EDIT, "ok", "not answered: pause")
             return {"choice": "pause", "note": "the question was not answered: Scope keeps the data (pause)"}
+        app.audit("scope_next", {"id": rid, "answer": ans.data.next}, OpClass.EDIT, "ok")   # N190
         return await _scope_apply(ans.data.next, left)
 
     def _scope_link(rid: str, run: dict[str, Any], svdx: Path, csv: Path, incomplete: str | None = None) -> dict[str, Any]:
@@ -4030,6 +4297,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             link["finished_by"] = run["finished_by"]          # N182: the recording's own end, or rec_stop
         if run.get("recording_ended"):
             link["recording_ended"] = run["recording_ended"]
+        if run.get("span"):
+            link["span"] = run["span"]                        # N189 / N191: Scope's capture against the recording
         if incomplete:
             link["not_sealed"] = {"file": svdx.name, "why": incomplete}
         if app.rec.key:
@@ -4545,27 +4814,72 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         with Beckhoff's export tool — XAE's ExportCSV only without it, flagged, and never over an existing CSV; XAE's
         ExportCSV of the in-memory data beside it, <name>.xae.csv, row counts compared in cross_check; the Scope View
         log's new ERROR / FATAL lines).
-        scope = its name when several are open. Affects only the Scope recording, not the PLC."""
+        scope = its name when several are open. Affects only the Scope recording, not the PLC.
+        One Scope, one owner (N189): while a recording's Scope part has Scope, its rec_stop / rec_delete stop and save
+        it — start / stop / save / disconnect / new here are refused; a Scope recording started here owns Scope until
+        action='stop'."""
+        if action not in ("start", "stop", "disconnect", "new", "save"):
+            raise ToolError("action must be start | stop | disconnect | new | save")
+        _scope_record_allowed(action)
         if action in ("disconnect", "new"):
             left = app.scope_left
             if not (left and left.get("saved")):
                 # what Scope holds was not saved by the plugin (or is not known): discarding it is the user's call
                 await app.permit(ctx, OpClass.DESTRUCTIVE, "scope_record", f"disconnect:{scope or ''}", confirm_token)
-            r = await (_scope_disconnect(scope) if action == "disconnect" else _scope_new(scope))
+                _scope_record_allowed(action)  # review 1 of 0.8.18: a recording may have taken Scope meanwhile
+            claim = None
+            if action == "new":
+                # the owner checked above is none, a Scope recording of its own or a stop_unknown part — both are taken
+                # over here; the claim keeps a rec_start out between the disconnect and StartRecord
+                claim = app.scope_claim = f"scope_record new #{secrets.token_hex(4)}"
+            try:
+                r = await (_scope_disconnect(scope) if action == "disconnect" else _scope_new(scope))
+            finally:
+                _scope_unclaim(claim)
             app.audit("scope_record", {"action": action, "scope": scope}, OpClass.EDIT, "ok")
             return r
         if action in ("start", "stop"):
             from . import scope as S
-            mark = await asyncio.to_thread(S.log_mark, _view_log()) if action == "start" else None
-            r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
-            if action == "start":
-                state, how = await _start_check(mark)
-                if state is not None:
-                    err = _start_refused_text(state, how, r.get("result_code"), None)
-                    app.audit("scope_record", {"action": action, "scope": scope}, OpClass.EDIT, "error", err)
-                    raise ToolError(err)
-                r = {k: v for k, v in r.items() if k != "result_note"}
-                r["start_check"] = how
+            claim = _scope_claim("scope_record start") if action == "start" else None
+            try:
+                if action == "start":
+                    try:
+                        r = await app.xae_call(_marked_start(scope), timeout=120)
+                        mark = r.pop("_log_mark", None)
+                    except (_Pending, asyncio.CancelledError) as exc:
+                        # it may record: held as a recording of its own until scope_record stop
+                        if not (isinstance(exc, asyncio.CancelledError) and _did_not_run(exc)):
+                            app.scope_standalone = {"action": "start", "scope": scope, "start_unknown": True, "since":
+                                                    dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
+                        raise
+                else:
+                    r = await app.xae_call(app.xae.scope_action, action, scope, None, timeout=120)
+                if action == "start":
+                    # review 2 of 0.8.18: StartRecord ran — Scope is this run's from here on (a call cancelled
+                    # during the check left Scope recording with no owner)
+                    app.scope_standalone = {"action": "start", "scope": scope,
+                                            "since": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
+                    left_before, app.scope_left = app.scope_left, None   # review 2: Scope records anew — not A's data
+                    state, how = await _start_check(mark)
+                    if state is not None:
+                        app.scope_standalone, app.scope_left = None, left_before   # refused: Scope holds what it held
+                        err = _start_refused_text(state, how, r.get("result_code"), None)
+                        app.audit("scope_record", {"action": action, "scope": scope}, OpClass.EDIT, "error", err)
+                        raise ToolError(err)
+                    r = {k: v for k, v in r.items() if k != "result_note"}
+                    r["start_check"] = how
+                else:
+                    # StopRecord ran: Scope holds this data (Reply) until it is disconnected — the next recording with
+                    # Scope asks first, as after a recording (N186)
+                    was_own = app.scope_standalone is not None
+                    app.scope_standalone = None
+                    released = _scope_release("scope_record stop")
+                    if app.scope_left is None and (was_own or released):
+                        # review 2 of 0.8.18: after a stop_unknown part, what Scope holds is that recording's capture
+                        app.scope_left = {"rid": released[0] if released else None, "scope": scope, "name": scope,
+                                          "saved": None, "choice": "pause"}
+            finally:
+                _scope_unclaim(claim)
         elif action == "save":
             from . import scope as S
             base = app.out_path(str(Path(path).with_suffix(".svdx")), False, "scope file").with_suffix("") if path else _scope_dir() / (
@@ -4584,8 +4898,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                           r["save_svd"]["error"] + more)
                 raise ToolError(f"Scope save: {r['save_svd']['error']}{more}")
             r["scope_view_log"] = await asyncio.to_thread(S.log_errors_since, mark)
-        else:
-            raise ToolError("action must be start | stop | disconnect | new | save")
+            left = app.scope_left
+            if left is not None and left.get("rid") is None and not app.scope_standalone:
+                left["saved"] = str(Path(str(base) + ".svdx"))   # what Scope holds is saved: disconnect needs no confirmation
         app.audit("scope_record", {"action": action, "scope": scope, "path": path}, OpClass.EDIT, "ok")
         return r
 
@@ -4631,7 +4946,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 # first review of 0.8.17: a finish under way (the recording had ended) completes as it began — the
                 # recording was deleted under it, and its Scope files were sealed into a link to nothing
                 await part.idle.wait()
-            res = await app.confirmed("rec_delete", {"id": rid, **fp}, OpClass.DESTRUCTIVE, app.rec_call(app.rec.delete, rid))
+            if part is not None:
+                async with part.link_lock:     # review 1 of 0.8.18: not between a finish's check and its link
+                    res = await app.confirmed("rec_delete", {"id": rid, **fp}, OpClass.DESTRUCTIVE,
+                                              app.rec_call(app.rec.delete, rid))
+            else:
+                res = await app.confirmed("rec_delete", {"id": rid, **fp}, OpClass.DESTRUCTIVE,
+                                          app.rec_call(app.rec.delete, rid))
             res["deleted_file_sha256"] = fp["sha256"]
             if part is not None:
                 # Scope recorded with it: stopped, nothing saved (the recording it belonged to is gone). A delete that
@@ -5032,8 +5353,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def xae_links(plc_project_path: str) -> dict[str, Any]:
-        """Variable links of the PLC instance: every AT %I*/%Q* variable with its link target;
-        lists the unlinked ones (the usual reason an output never moves)."""
+        """Variable links of the PLC instance: every AT %I*/%Q* variable (from the instance's XML) with its link
+        targets (the project's mapping table, ProduceMappingInfo); lists the unlinked ones — array elements too, the
+        usual reason an output never moves — and links whose variable is gone. plc_project_path: plc_path,
+        iec_project_path or instance_path. What could not be read is said (unlinked_count null), never counted as 0."""
         return await app.xae_call(app.xae.links, plc_project_path, timeout=300)
 
     @mcp.tool(annotations=READ)

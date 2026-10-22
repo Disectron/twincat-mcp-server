@@ -419,7 +419,9 @@ async def test_n186_an_earlier_capture_is_never_linked_as_this_recordings(monkey
     if clock == "fresh":
         assert sc["link"]["files"] and "not_this_recording" not in sc, sc
         return
-    assert "link" not in sc and sc["not_this_recording"].endswith("an earlier capture Scope still held"), sc
+    assert "link" not in sc and ("an earlier capture Scope still held" in sc["not_this_recording"]), sc
+    if clock == "pc":                      # review 1 of 0.8.18: with this PC's clock only, it cannot be told
+        assert sc["not_this_recording"].endswith("cannot be told") and "could not be shown" in sc["note"], sc
     assert ("before StartRecord ran (this PC's clock" if clock == "pc" else
             "s before the recording's first sample") in sc["not_this_recording"], sc
     assert not (sd / f"{r['id']}.scope.json").exists() and not is_read_only(sd / f"{r['id']}.svdx")
@@ -438,8 +440,16 @@ async def test_r2_n1_a_start_withdrawn_from_the_xae_queue_is_not_started(monkeyp
     app = srv._tcmcp_app
     async with client_for(srv) as s:
         if users_run:
+            # N189 (0.8.17 retest): the user's own Scope run owns Scope — a recording with Scope is refused before
+            # anything starts (0.8.17 gave it a Scope part of the same Scope)
             payload(await s.call_tool("scope_record", {"action": "start"}))
             fake_xae.calls.clear()
+            r = await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "duration_s": 1,
+                                                "also_scope": True})
+            assert r.is_error and "Scope records on its own" in text(r) and "was not started" in text(r), text(r)
+            assert app.rec.recs == {} and app.scope_parts == {} and fake_xae.calls == []
+            assert fake_xae.recording is True                 # the user's own run records on
+            return
         blocker = app.xae_worker.submit(lambda: time.sleep(2.0))          # another XAE job runs for 2 s
         with anyio.move_on_after(0.8):
             await s.call_tool("rec_start", {"symbols": ["MAIN.nCycle"], "mode": "change", "duration_s": 1,
@@ -454,7 +464,7 @@ async def test_r2_n1_a_start_withdrawn_from_the_xae_queue_is_not_started(monkeyp
     assert part.state == "finished" and "before StartRecord ran" in part.result["error"], part.result
     assert "start" not in fake_xae.calls and "stop" not in fake_xae.calls, fake_xae.calls
     assert not (app.rec.root / "Scope Recordings" / f"{rid}.scope.json").exists() and "NOT started" in out["scope"]["error"]
-    assert fake_xae.recording is users_run                 # the user's own run records on
+    assert fake_xae.recording is False
 
 
 @pytest.mark.anyio

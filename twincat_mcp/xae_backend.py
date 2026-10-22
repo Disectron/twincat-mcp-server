@@ -170,6 +170,12 @@ _BUSY_HR = (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER)
 _GONE_HR = (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE)
 
 
+class XaeActedUnknown(XaeExplained):
+    """An action the shell may have run: it went away during the call, or failed after acting (E_POINTER from TwinCAT's
+    managed code). Never repeated — and never reported as 'did not run' (review 1 of 0.8.18: a StartRecord of unknown
+    outcome was said 'NOT started', and Scope recorded with nothing to stop it)."""
+
+
 class _ActedUnconfirmed(XaeExplained):
     """A PLC online command was accepted but its state was not read back: it may have acted — never retried elsewhere."""
 
@@ -283,7 +289,7 @@ class XaeBackend:
                             self.dte = self.sysman = None
                         finally:
                             self._reattaching = False
-                    raise XaeExplained(
+                    raise XaeActedUnknown(
                         f"{what}: the XAE shell went away during the call (closed or crashed, 0x{hr & 0xFFFFFFFF:08X}) — "
                         f"whether it acted is unknown, so it is not repeated ({where}). Check xae_status / ads_status "
                         "before you run it again.") from exc
@@ -315,7 +321,7 @@ class XaeBackend:
                     # AFTER acting — an action is never repeated on it. (_on_sm / _on_item refresh a stale System
                     # Manager with a read before the action, so a reopened solution does not end up here.)
                     self.sysman = None
-                    raise XaeExplained(
+                    raise XaeActedUnknown(
                         f"{what}: failed with {_com_msg(exc)} — whether it acted is unknown, so it is not repeated. "
                         "Check xae_status / the XAE tree before you run it again.") from exc
                 if self._stale_sysman(exc) and not refreshed and not getattr(self, "_refreshing_sm", False):
@@ -556,7 +562,8 @@ class XaeBackend:
         except XaeError as exc:
             rec = self._sm_messages_after(what, before, sm, failed=True)
             if rec and rec.get("messages"):
-                raise type(exc)(f"{exc} — XAE messages ({what}): {rec['messages'][:1500]}") from exc
+                more = " (may include earlier calls' — the read before it failed)" if rec.get("messages_note") else ""
+                raise type(exc)(f"{exc} — XAE messages ({what}){more}: {rec['messages'][:1500]}") from exc
             # N188 (0.8.16 retest): an error without XAE messages did not say whether the buffer was read
             last = self.msg_reads[-1] if getattr(self, "msg_reads", None) and self.msg_reads[-1]["action"] == what else None
             if last is not None:
@@ -589,6 +596,11 @@ class XaeBackend:
         if after:
             rec["messages"] = after[:self.MESSAGES_MAX]
             rec["lines"] = [ln.strip() for ln in after.splitlines() if ln.strip()][:50]
+            if before is None:
+                # review 1 of 0.8.18: the read before the action failed — what the buffer held already (a buffer that
+                # clears: everything since the last read; one that does not: its history) cannot be told apart
+                rec["messages_note"] = ("the read before this action failed: these may include messages of earlier "
+                                        "calls" + (" — this buffer keeps its history" if clears is False else ""))
         if isinstance(reads, list):
             reads.append({"action": what, "read": True, "empty": not rec.get("messages")})
         if not rec.get("messages") and not rec.get("earlier_messages"):
@@ -2153,39 +2165,120 @@ class XaeBackend:
         return {"devices": changed, "note": "takes effect on the next ActivateConfiguration"}
 
     def links(self, plc_project_path: str) -> dict[str, Any]:
-        """Variable links of the PLC instance (inputs/outputs groups) from their XML:
-        name, type, link target; lists unlinked AT %I*/%Q* variables."""
+        """Variable links of the PLC instance: its I/O variables (AT %I* / %Q*) with their link targets, the unlinked
+        ones (array elements too) and links whose variable no longer exists.
+
+        N192 (0.8.17 retest, TwinCAT 3.1.4026): the instance item has no tree children there. Its variables are in its
+        own XML (TcModuleInstance/Module/DataAreas: 'PlcTask Inputs' AreaType InputDst, 'PlcTask Outputs' OutputSrc),
+        which holds no link; the links are the project's mapping table (ITcSysManager2::ProduceMappingInfo). The walk
+        of tree children and their LinkedTo gave groups [] and "0 unlinked" — read as "everything is linked". What
+        cannot be read is said (variables_read / links_read false, unlinked_count null), never counted as 0."""
         outer = _plc_split(plc_project_path)[0]
         inst_path = f"{outer}^{outer.split('^')[-1]} Instance"
         inst = self._item(inst_path)
-        groups = []
-        unlinked = []
+        groups: list[dict[str, Any]] = []
+        notes: list[str] = []
+        try:
+            xml = self._retry(lambda: inst.ProduceXml(False), f"{inst_path} ProduceXml")
+            groups = _instance_io_areas(str(xml or ""))
+        except (XaeBusy, XaeGone):
+            raise
+        except Exception as exc:  # noqa: BLE001 — XAE's or the parser's: said, the tree children are tried next
+            notes.append(f"the instance's XML could not be read ({_com_msg(getattr(exc, '__cause__', None) or exc)})")
+        variables_from = "the instance's XML (DataAreas)" if groups else None
+        child_links: dict[tuple[str, str], str] = {}
+        if not groups:
+            groups, child_links = self._instance_children_io(inst, inst_path)
+            if groups:
+                variables_from = "the instance's tree children"
+        local, links_from, why = self._instance_links(inst_path)
+        if local is None and child_links:
+            local, links_from = [(g, v, to) for (g, v), to in child_links.items()], "LinkedTo in the group XML"
+        res: dict[str, Any] = {"instance": inst_path, "variables_from": variables_from, "links_from": links_from}
+        if not groups:
+            res.update(groups=[], unlinked=[], unlinked_count=None, variables_read=False,
+                       links_total=len(local) if local is not None else None)
+            notes.append("no I/O variables found in the PLC instance — neither in its XML nor as tree children: links "
+                         "not checked. A PLC project the shell has not built has none yet: build it, then call again.")
+            res["note"] = " ".join(notes)
+            return res
+        res["variables_read"] = True
+        if local is None:
+            for g in groups:
+                for v in g["variables"]:
+                    v.update(linked_to=None, links=None)
+            res.update(groups=groups, unlinked=None, unlinked_count=None, links_read=False, links_total=None)
+            notes.append(f"links not read: {why} — which variables are linked is unknown")
+            res["note"] = " ".join(notes)
+            return res
+        unread = {g["group"].casefold() for g in groups if g.get("error")}
+        if unread:
+            # review 2 of 0.8.18: a group whose XML could not be read has no variables here — its links are not
+            # 'links without a variable', and nothing about its variables is known
+            local = [x for x in local if x[0].casefold() not in unread]
+        unlinked, orphans = _match_links(groups, local)
+        res.update(groups=groups, unlinked=unlinked, unlinked_count=None if unread else len(unlinked),
+                   links_read=True, links_total=len(local), links_without_variable=orphans)
+        if unread:
+            res["variables_read"] = "partly"
+            notes.append(f"{len(unread)} variable group(s) could not be read ({', '.join(sorted(g['group'] for g in groups if g.get('error')))}): "
+                         "their variables and links are not checked — unlinked lists the other groups only")
+        if orphans:
+            notes.append(f"{len(orphans)} link(s) name a variable this program no longer has (renamed or moved?) — "
+                         "they move nothing")
+        partial = [f"{g['group']}^{v['name']}" for g in groups for v in g["variables"] if v.get("not_checked")]
+        if partial:
+            notes.append(f"{len(partial)} variable(s) linked part by part could not be checked for gaps (not_checked): "
+                         + ", ".join(partial[:10]))
+        if notes:
+            res["note"] = " ".join(notes)
+        return res
+
+    def _instance_children_io(self, inst: Any, inst_path: str) -> tuple[list[dict[str, Any]], dict[tuple[str, str], str]]:
+        """The instance's variable groups as tree children (a layout where the instance item has them), with the
+        LinkedTo their XML carries: (groups, {(group, variable): target})."""
+        groups: list[dict[str, Any]] = []
+        linked: dict[tuple[str, str], str] = {}
         # N174: every access through _retry (ChildCount / Child were read raw: a rejection escaped)
-        n = int(self._retry(lambda: inst.ChildCount, f"{inst_path} ChildCount"))
+        n = int(self._retry(lambda: inst.ChildCount, f"{inst_path} ChildCount") or 0)
         for i in range(1, n + 1):
             grp = self._retry(lambda i=i: inst.Child(i), f"{inst_path} Child({i})")
             gname = self._get(lambda: grp.Name, f"{inst_path} Child({i}) Name") or f"group {i}"
             try:
-                xml = self._retry(lambda: grp.ProduceXml(False), f"{gname} ProduceXml")
-                root = ET.fromstring(xml)
+                root = ET.fromstring(self._retry(lambda: grp.ProduceXml(False), f"{gname} ProduceXml"))
             except (XaeBusy, XaeGone):
                 raise
             except XaeError as exc:
-                groups.append({"group": gname, "error": _com_msg(exc.__cause__ or exc)})
+                groups.append({"group": gname, "error": _com_msg(exc.__cause__ or exc), "variables": [], "count": 0})
                 continue
             except Exception as exc:  # noqa: BLE001 — XML the parser does not take
-                groups.append({"group": gname, "error": _com_msg(exc)})
+                groups.append({"group": gname, "error": _com_msg(exc), "variables": [], "count": 0})
                 continue
             vars_ = []
             for v in root.iter("Var"):
                 name = (v.findtext("Name") or "").strip()
-                vtype = (v.findtext("Type") or "").strip()
-                linked = (v.findtext("LinkedTo") or "").strip()
-                vars_.append({"name": name, "type": vtype, "linked_to": linked or None})
-                if not linked:
-                    unlinked.append({"group": gname, "name": name, "type": vtype})
-            groups.append({"group": gname, "variables": vars_, "count": len(vars_)})
-        return {"instance": inst_path, "groups": groups, "unlinked": unlinked, "unlinked_count": len(unlinked)}
+                vars_.append({"name": name, "type": (v.findtext("Type") or "").strip()})
+                to = (v.findtext("LinkedTo") or "").strip()
+                if to:
+                    linked[(gname, name)] = to
+            groups.append({"group": gname, "direction": _io_direction(gname), "variables": vars_, "count": len(vars_)})
+        return groups, linked
+
+    def _instance_links(self, inst_path: str) -> tuple[list[tuple[str, str, str]] | None, str | None, str]:
+        """The links of the PLC instance from the mapping table (ITcSysManager2::ProduceMappingInfo):
+        ([(group, variable, target)], 'ProduceMappingInfo', '') or (None, None, why)."""
+        try:
+            if not self._retry(lambda: _has_prop(self._cur_sm(), "ProduceMappingInfo"), "ProduceMappingInfo?"):
+                return None, None, "this System Manager has no ProduceMappingInfo (ITcSysManager2)"
+            xml = self._retry(lambda: _com_call(self._cur_sm(), "ProduceMappingInfo"), "ProduceMappingInfo")
+        except (XaeBusy, XaeGone):
+            raise
+        except XaeError as exc:
+            return None, None, f"ProduceMappingInfo failed ({_com_msg(exc.__cause__ or exc)})"
+        try:
+            return _varlinks_of(str(xml or ""), inst_path), "ProduceMappingInfo", ""
+        except ET.ParseError as exc:
+            return None, None, f"ProduceMappingInfo returned XML the parser does not take ({exc})"
 
     def _nested_projects(self, plc_project_path: str | None = None) -> list[str]:
         if plc_project_path:
@@ -2518,14 +2611,145 @@ def _has_member(obj: Any, name: str) -> bool:
         return False
 
 
+
+# N192: the PLC instance's I/O variables and links (TwinCAT 3.1.4026 layout)
+_IO_AREA_TYPES = {"inputdst": "input", "outputsrc": "output"}
+
+
+def _io_direction(group: str) -> str | None:
+    g = group.lower()
+    return "input" if "input" in g else "output" if "output" in g else None
+
+
+def _instance_io_areas(xml: str) -> list[dict[str, Any]]:
+    """The I/O data areas of a PLC instance's XML (TcModuleInstance/Module/DataAreas/DataArea, AreaType InputDst /
+    OutputSrc — the process image; Internal areas are not I/O) with their symbols: [{group, direction, variables:
+    [{name, type, bit_size, (array: lbound, elements per dimension)}], count}]. [] when the XML has none."""
+    if not xml.strip():
+        return []
+    root = ET.fromstring(xml)
+    out: list[dict[str, Any]] = []
+    for da in root.iter("DataArea"):
+        an = da.find("AreaNo")
+        direction = _IO_AREA_TYPES.get(str((an.get("AreaType") if an is not None else "") or "").lower())
+        if direction is None:
+            continue
+        vars_ = []
+        for sym in da.findall("Symbol"):
+            base = (sym.findtext("BaseType") or "").strip()
+            dims = [(int(a.findtext("LBound") or 0), int(a.findtext("Elements") or 0)) for a in sym.findall("ArrayInfo")]
+            if not dims:
+                # review 2 of 0.8.18: an array of a struct has no ArrayInfo — its dimensions are in the BaseType text
+                # ('ARRAY [1..2] OF Tc2_System.ST_AmsAddr' on the 0.8.17 retest's project)
+                m = re.match(r"\s*ARRAY\s*\[([^\]]+)\]\s*OF\s+(.+)$", base, re.I)
+                if m:
+                    try:
+                        for rng in m.group(1).split(","):
+                            lo, hi = (int(x) for x in rng.split(".."))
+                            dims.append((lo, hi - lo + 1))
+                        base = m.group(2).strip()
+                    except ValueError:
+                        dims = []
+            v: dict[str, Any] = {"name": (sym.findtext("Name") or "").strip(),
+                                 "type": (f"ARRAY [{', '.join(f'{lb}..{lb + n - 1}' for lb, n in dims)}] OF {base}"
+                                          if dims else base)}
+            if (sym.findtext("BitSize") or "").strip().isdigit():
+                v["bit_size"] = int(sym.findtext("BitSize"))
+            if dims:
+                v["dims"] = dims
+            vars_.append(v)
+        out.append({"group": (da.findtext("Name") or "").strip(), "direction": direction, "variables": vars_,
+                    "count": len(vars_)})
+    return out
+
+
+def _varlinks_of(xml: str, inst_path: str) -> list[tuple[str, str, str]]:
+    """The links of one PLC instance in ProduceMappingInfo's XML (<VarLinks><OwnerA Name><OwnerB Name><Link VarA VarB>):
+    [(group, variable, target)] — the instance may be either owner; the variable is '<group>^<name>' on its side."""
+    root = ET.fromstring(xml) if xml.strip() else ET.Element("VarLinks")
+    me = inst_path.casefold()
+    out: list[tuple[str, str, str]] = []
+    for a in root.iter("OwnerA"):
+        an = a.get("Name") or ""
+        for b in a.findall("OwnerB"):
+            bn = b.get("Name") or ""
+            for lk in b.findall("Link"):
+                va, vb = lk.get("VarA") or "", lk.get("VarB") or ""
+                if an.casefold() == me:
+                    mine, to = va, f"{bn}^{vb}"
+                elif bn.casefold() == me:
+                    mine, to = vb, f"{an}^{va}"
+                else:
+                    continue
+                group, _, var = mine.partition("^")
+                out.append((group, var, to))
+    return out
+
+
+def _match_links(groups: list[dict[str, Any]], local: list[tuple[str, str, str]]
+                 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Puts each link on its variable (the whole variable, an element 'x[2]' or a member 'x.y'); sets linked_to (the
+    target of a link to the whole variable) and links [{part, to}] on every variable. -> (unlinked, links without a
+    variable). An array linked element by element lists the elements without a link (one dimension)."""
+    by_group: dict[str, list[dict[str, Any]]] = {}
+    for g in groups:
+        by_group.setdefault(g["group"].casefold(), []).extend(g["variables"])
+        for v in g["variables"]:
+            v["linked_to"], v["links"] = None, []
+    orphans: list[dict[str, str]] = []
+    for group, var, to in local:
+        vf = var.casefold()
+        hit = None
+        for v in by_group.get(group.casefold(), []):
+            n = v["name"].casefold()
+            if vf == n or (vf.startswith(n) and vf[len(n):len(n) + 1] in ("[", ".")):
+                if hit is None or len(v["name"]) > len(hit["name"]):
+                    hit = v
+        if hit is None:
+            orphans.append({"group": group, "variable": var, "to": to})
+            continue
+        part = var[len(hit["name"]):]
+        hit["links"].append({"part": part, "to": to})
+        if not part and hit["linked_to"] is None:
+            hit["linked_to"] = to
+    unlinked: list[dict[str, Any]] = []
+    for g in groups:
+        for v in g["variables"]:
+            if not v["links"]:
+                unlinked.append({"group": g["group"], "name": v["name"], "type": v["type"]})
+                continue
+            dims = v.get("dims") or []
+            # review 2 of 0.8.18: what is linked part by part and cannot be checked here is said, not counted as linked
+            if v["linked_to"] is None and any(lk["part"].startswith(".") for lk in v["links"]) and not dims:
+                v["not_checked"] = "linked member by member: whether every member is linked is not checked"
+            elif v["linked_to"] is None and dims and not (len(dims) == 1 and 0 < dims[0][1] <= 4096):
+                v["not_checked"] = ("a multi-dimensional array: its elements' links are listed, gaps not checked"
+                                    if len(dims) > 1 else "more than 4096 elements: gaps not checked")
+            if v["linked_to"] is None and len(dims) == 1 and 0 < dims[0][1] <= 4096:
+                lb, n = dims[0]
+                seen = set()
+                for lk in v["links"]:
+                    m = re.match(r"\[\s*(-?\d+)\s*\]", lk["part"])
+                    if m:
+                        seen.add(int(m.group(1)))
+                base = v["type"].split(" OF ", 1)[-1]
+                missing = [i for i in range(lb, lb + n) if i not in seen]
+                if missing:
+                    v["unlinked_elements"] = [f"[{i}]" for i in missing]
+                    unlinked.extend({"group": g["group"], "name": f"{v['name']}[{i}]", "type": base} for i in missing)
+    return unlinked, orphans
+
 def _plc_split(path: str) -> tuple[str, str]:
-    """('TIPC^X', 'TIPC^X^X Project') from either form (R14: tools took one form each and failed on the other).
+    """('TIPC^X', 'TIPC^X^X Project') from any of the three forms — also 'TIPC^X^X Instance' (R14: tools took one form
+    each and failed on the other; N193).
     Anything else (a deeper path, another root) comes back unchanged in both places."""
     segs = [x for x in (path or "").split("^") if x]
     if len(segs) >= 2 and segs[0].upper() == "TIPC":
         outer = "^".join(segs[:2])
         nested = f"{outer}^{segs[1]} Project"
-        if len(segs) == 2 or (len(segs) == 3 and segs[2].lower() == f"{segs[1]} project".lower()):
+        # N193: the instance path xae_plc_projects names ('TIPC^X^X Instance') is the same PLC project
+        if len(segs) == 2 or (len(segs) == 3 and segs[2].lower() in (f"{segs[1]} project".lower(),
+                                                                       f"{segs[1]} instance".lower())):
             return outer, nested
     return path, path
 
