@@ -5970,6 +5970,55 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         res = await app.confirmed("ipc_reboot", {"delay_s": delay_s, "shutdown_only": shutdown_only}, OpClass.DESTRUCTIVE, app.ads_call(app.files.reboot, delay_s, not shutdown_only, timeout=30))
         return res
 
+    @mcp.tool(annotations=READ)
+    async def ipc_info(ams_net_id: str | None = None, module_types: list[str] | None = None,
+                       max_reads: int = 600) -> dict[str, Any]:
+        """IPC diagnostics (Beckhoff Device Manager, MDP) of the target: the module list, then per module its name
+        and the values the Device Manager documents — CPU (frequency, usage %, temperature °C), memory, TwinCAT
+        (version, AMS NetId, status, router memory max / available, registered ports), OS (version, uptime),
+        mainboard (serial, boot count, operating time, temperatures, BIOS), fans (rpm), disks (drive, label, file
+        system, size, free). Each value with its MDP address; one that fails is listed with its ADS error, never as 0.
+        module_types: names (CPU, Memory, TwinCAT, OS, Fan, Mainboard, DiskManagement …) to read only those.
+        ams_net_id: another device (a route is needed). Read-only. The ADS address used (port 10000, index group
+        0xF302) is not yet confirmed on hardware — the result says so."""
+        from . import mdp as M
+        types = None
+        if module_types:
+            by_name = {v.lower(): k for k, v in M.MODULE_TYPES.items()}
+            bad = [t for t in module_types if t.lower() not in by_name]
+            if bad:
+                raise ToolError(f"unknown module type(s) {bad} — known: {sorted(M.MODULE_TYPES.values())}. Nothing "
+                                "was read")
+            types = {by_name[t.lower()] for t in module_types}
+        return await app.ads_call(app.ads.ipc_info, ams_net_id, types, max(10, min(int(max_reads), 5000)),
+                                  timeout=180, slow=True)
+
+    @mcp.tool(annotations=READ)
+    async def ipc_mdp_read(index: int, subindex: int, type: str = "hex", size: int | None = None,
+                           ams_net_id: str | None = None) -> dict[str, Any]:
+        """One MDP address of the target's Device Manager: index (0x8nnT: nn = the module ID from ipc_info, 0…0xFFFF),
+        subindex (0…0xFF; 0 = the table's length), type: u8 u16 u32 u64 i16 i32 bool string hex (hex: exactly size
+        bytes, default 4). The decoded value and the raw bytes; an answer shorter than the type is an error, never a
+        value. Read-only. The ADS address used (port 10000, index group 0xF302) is not yet confirmed on hardware."""
+        from . import mdp as M
+        typ = type.lower()
+        if typ not in ("hex", "string", "u8", "u16", "u32", "u64", "i16", "i32", "bool"):
+            raise ToolError("type must be one of hex, string, u8, u16, u32, u64, i16, i32, bool — nothing was read")
+        if size is not None and typ != "hex":
+            raise ToolError(f"size is for type='hex' only ({typ} has its own size) — nothing was read")
+        if size is not None and not 1 <= int(size) <= 4096:
+            raise ToolError(f"size must be 1…4096 bytes (got {size}) — nothing was read")
+        try:
+            M.check_address(int(index), int(subindex))
+        except M.MdpError as exc:
+            raise ToolError(str(exc)) from exc
+        n = int(size or 4)
+        r = await app.ads_call(app.ads.mdp_read, int(index), int(subindex), typ, ams_net_id, n, timeout=30)
+        return {"mdp": M.label(int(index), int(subindex)), "type": typ, **r,
+                "ads_address": {"port": M.MDP_PORT, "index_group": f"0x{M.MDP_INDEX_GROUP:X}",
+                                "index_offset": f"0x{M.index_offset(int(index), int(subindex)):08X}",
+                                "confirmed": "not yet on hardware — the address is inferred (docs/PLAN-0.8.19.md, IPC diagnostics)"}}
+
     # ======================================================================
     # xae_* Automation Interface
     # ======================================================================

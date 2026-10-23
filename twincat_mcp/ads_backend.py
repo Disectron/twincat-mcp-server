@@ -1560,6 +1560,61 @@ class AdsBackend:
             raise AdsError(f"raw read 0x{index_group:X}/0x{index_offset:X} ({size} B) on port {c.ams_net_port}: {_fmt_exc(exc)}") from exc
         return {"hex": raw.hex(), "size": len(raw), "as_uint_le": int.from_bytes(raw[:8], "little") if len(raw) <= 8 else None}
 
+    def mdp_read(self, index: int, subindex: int, typ: str, net_id: str | None = None,
+                 size: int | None = None, cancel: threading.Event | None = None) -> dict[str, Any]:
+        """One MDP value (IPC diagnostics, 0.8.19): {value, hex?}. A fixed-size type is read with its exact size and
+        a shorter answer is an error (pyads' length check — a padded buffer would read as 0); a STRING as a PLC
+        string. The ADS address is mdp.py's (NOT confirmed on hardware: port 10000, index group 0xF302)."""
+        from . import mdp as M
+        if cancel is not None and cancel.is_set():
+            # review 2 of 0.8.19: only ipc_info's own reads (its worker's flag) — ipc_mdp_read runs on another worker
+            raise M.MdpStop("the call was cancelled")
+        c = self.conn(M.MDP_PORT, net_id)
+        io = M.index_offset(index, subindex)
+        where = (f"MDP {M.label(index, subindex)} (ADS index group 0x{M.MDP_INDEX_GROUP:X}, offset 0x{io:08X}, "
+                 f"port {M.MDP_PORT})")
+        try:
+            if typ == "string":
+                # review 2 of 0.8.19: pyads decodes a PLC string as strict UTF-8 — the buffer is taken raw and decoded
+                # as TwinCAT's Windows-1252 (mdp.decode), the bytes up to the first NUL shown
+                v = c.read(M.MDP_INDEX_GROUP, io, pyads.PLCTYPE_STRING, return_ctypes=True)
+                if v is None:
+                    raise AdsError(f"{where}: no answer (the connection is closed)")
+                text_b = bytes(v.raw).split(b"\x00", 1)[0]
+                return {"value": M.decode(text_b, "string"), "hex": text_b.hex()}
+            n = int(size) if typ == "hex" and size else (4 if typ == "hex" else M.size_of(typ))
+            raw = c.read(M.MDP_INDEX_GROUP, io, ctypes.c_ubyte * n, return_ctypes=True, check_length=True)
+        except AdsError:
+            raise
+        except RuntimeError as exc:
+            got = re.search(r"(\d+) were read", str(exc))
+            raise AdsError(f"{where}: the target answered {got.group(1) if got else 'fewer'} byte(s), {typ} needs "
+                           f"{n} — not decoded" + (f" (read it as type='hex', size={got.group(1)})" if got and
+                                                  got.group(1) != "0" else "")) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise AdsError(f"{where}: {_fmt_exc(exc)}") from exc
+        if raw is None:
+            raise AdsError(f"{where}: no answer (the connection is closed)")
+        b = bytes(raw)
+        try:
+            return {"value": M.decode(b, typ), "hex": b.hex()}
+        except M.MdpError as exc:
+            raise AdsError(f"{where}: {exc} (raw {b.hex()})") from exc
+
+    def ipc_info(self, net_id: str | None = None, types: set[int] | None = None,
+                 max_reads: int = 600) -> dict[str, Any]:
+        from . import mdp as M
+        try:
+            res = M.read_info(lambda i, s, t: self.mdp_read(i, s, t, net_id, cancel=self.cancel)["value"], max_reads,
+                              types)
+        except M.MdpError as exc:
+            raise AdsError(str(exc)) from exc          # through _ads_explain: the cause and its fix hints
+        res["target"] = net_id or self.net_id or "(local)"
+        res["ads_address"] = {"port": M.MDP_PORT, "index_group": f"0x{M.MDP_INDEX_GROUP:X}",
+                              "index_offset": "index << 16 | subindex",
+                              "confirmed": "not yet on hardware — the address is inferred (docs/PLAN-0.8.19.md, IPC diagnostics)"}
+        return res
+
     def write_raw(self, index_group: int, index_offset: int, hex_data: str, port: int | None = None,
                   net_id: str | None = None) -> dict[str, Any]:
         c = self.conn(port, net_id)
