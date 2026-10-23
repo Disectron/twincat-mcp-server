@@ -84,6 +84,9 @@ class LibMan(FakeItem):
 
     def AddLibrary(self, name, version="", company=""):
         self.calls.append(("AddLibrary", name, version, company))
+        if "," in name:                                     # TE1000 takes a display name too
+            p = X._lib_parts(name)
+            name, version = p["library"], p["version"]
         lib = self._find_inst(name, version)
         if lib is None:
             raise ComError(-2147467259, "TSM_E_ITEMNOTFOUND: managed library not found")
@@ -396,31 +399,63 @@ def test_r1_xae_removing_the_other_reference_is_said_and_no_consequence_is_claim
 
 def test_r1_hash_means_placeholder_and_a_version_narrows_to_libraries(monkeypatch):
     be, lm = _libs(monkeypatch)
-    with pytest.raises(X.XaeError, match="Ex_Base is not referenced"):
+    with pytest.raises(X.XaeError, match="Ex_Base is referenced .* but not as a library of version 1.2.0.0"):
         be.library_remove(PROJ, "Ex_Base", version="1.2.0.0")       # only a placeholder of that name
     r = be.library_remove(PROJ, "#Ex_Visu")
     assert lm.calls == [("RemoveReference", "Ex_Visu", "", "")] and r["removed"][0]["kind"] == "placeholder", r
 
 
-def test_r1_a_name_with_a_trailing_comma_is_read_not_crashed(monkeypatch):
+def test_r1_r2_a_name_that_is_not_a_display_name_is_refused_not_crashed(monkeypatch):
     be, lm = _libs(monkeypatch)
-    r = be.library_add(PROJ, "Ex_Math, ")
-    assert [x["name"] for x in r["added"]] == ["Ex_Math"], r
-    with pytest.raises(X.XaeError, match="no library name"):
-        be.library_add(PROJ, " , 1.0")
+    for bad in ("Ex_Math, ", "Ex_Math, (Example Corp)", " , 1.0"):
+        with pytest.raises(X.XaeError, match="not a display name|no library name"):
+            be.library_add(PROJ, bad)
+    with pytest.raises(X.XaeError, match="names version '1.4.0.0'.*give one of them"):
+        be.library_add(PROJ, "Ex_Math, 1.4.0.0 (Example Corp)", version="1.0.0.0")
+    assert lm.calls == []
+    r = be.library_add(PROJ, "Ex_Math, 1.4.0.0 (Example Corp)")
+    assert lm.calls == [("AddLibrary", "Ex_Math, 1.4.0.0 (Example Corp)", "", "")] and r["added"], r
+
+
+def _plcproj(project_dir, body):
+    (project_dir / "Plc" / "Plc.plcproj").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">'
+        f'<ItemGroup>{body}</ItemGroup></Project>\n', encoding="utf-8")
 
 
 @pytest.mark.anyio
-async def test_r1_an_unsaved_resolve_shows_against_the_saved_file(monkeypatch, project_dir):
+async def test_r2_the_saved_file_is_compared_on_what_both_state(monkeypatch, project_dir):
+    """Review 2: the round-1 'effective' comparison guessed what the saved file resolves to (profile-managed and
+    '*' pinned placeholders gave false differences) and a freeze never showed — only stated facts are compared now,
+    and what is not compared is said."""
     srv, app, lm = _server(monkeypatch, project_dir)
-    lm.refs.append(Placeholder("Tc2_Standard", Lib("Tc2_Standard", "*", "Beckhoff Automation GmbH"),
-                               Lib("Tc2_Standard", "3.3.3.0", "Beckhoff Automation GmbH")))
-    monkeypatch.setattr(app.kb, "installed_libraries", lambda: {
-        "tc2_standard": {"name": "Tc2_Standard", "vendor": "Beckhoff Automation GmbH", "versions": ["3.3.3.0", "3.4.7.0"]}})
+    lm.refs = [Placeholder("Ex_Base", Lib("Ex_Base", "*"), Lib("Ex_Base", "1.0.0.0")),
+               Placeholder("Ex_Pin", Lib("Ex_Pin", "*"), Lib("Ex_Pin", "2.0.0.0")),
+               Lib("Ex_Math", "1.3.0.0"), Lib("Ex_Math", "1.4.0.0")]
+    _plcproj(project_dir,
+             '<PlaceholderReference Include="Ex_Base"><DefaultResolution>Ex_Base, * (Example Corp)</DefaultResolution>'
+             '</PlaceholderReference>'
+             '<PlaceholderReference Include="Ex_Pin"><DefaultResolution>Ex_Pin, * (Example Corp)</DefaultResolution>'
+             '</PlaceholderReference>'
+             '<PlaceholderResolution Include="Ex_Pin"><Resolution>Ex_Pin, * (Example Corp)</Resolution>'
+             '</PlaceholderResolution>'
+             '<LibraryReference Include="Ex_Math, 1.4.0.0 (Example Corp)" />')
     async with client_for(srv) as s:
         sv = payload(await s.call_tool("xae_library_list", {}))["saved_plcproj"]
-    assert {"reference": "placeholder Tc2_Standard", "what": "effective", "xae": "3.3.3.0", "saved": "3.4.7.0"} in \
-        sv["version_differs"] and sv["same"] is False, sv
+    assert sv["compared"] and sv["only_in_xae"] == ["library Ex_Math 1.3.0.0"], sv     # two versions stay two
+    assert "version_differs" not in sv, sv                  # '*' pinned and an unpinned effective: not differences
+    assert "freeze" in sv["not_compared"], sv
+
+
+def test_r2_inside_a_drive_root():
+    import ntpath
+    from unittest import mock
+    from twincat_mcp import server as S
+    with mock.patch.object(S, "os") as fake_os:
+        fake_os.path = ntpath
+        fake_os.sep = "\\"
+        assert S._inside(r"C:\Proj\Plc\Plc.plcproj", "C:\\")
+        assert not S._inside(r"D:\Proj\Plc\Plc.plcproj", "C:\\")
 
 
 @pytest.mark.anyio

@@ -353,6 +353,17 @@ TOKEN_TARGET_ARGS = {"xae_target": "net_id", "ads_plc_state": "action", "ads_sys
                      "kb_rebuild": "index"}
 
 
+def _inside(child: str, parent: str) -> bool:
+    """Is the file `child` inside the folder `parent` (a drive or share root too; links and short names resolved where
+    the OS can)?"""
+    try:
+        c = os.path.normcase(os.path.realpath(os.path.abspath(child)))
+        p = os.path.normcase(os.path.realpath(os.path.abspath(parent)))
+        return os.path.commonpath([c, p]) == p
+    except (OSError, ValueError):
+        return False
+
+
 def _plc_iec_path(path: str) -> str:
     from .xae_backend import _plc_split
     return _plc_split(path)[1]
@@ -5415,40 +5426,38 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             return {"compared": False, "why": (f"{len(cand)} files named {name}.plcproj under the project root: {cand}"
                                                 if cand else f"no {name}.plcproj under the project root")}
         sol = getattr(app.xae, "bound_solution", None)
-        if sol:
+        if sol and not _inside(cand[0], os.path.dirname(os.path.abspath(str(sol)))):
             # review 1 of 0.8.19: the project root may hold another project than the solution XAE has open
-            sdir = os.path.normcase(os.path.dirname(os.path.abspath(str(sol))))
-            if not os.path.normcase(os.path.abspath(cand[0])).startswith(sdir + os.sep):
-                return {"compared": False, "file": cand[0],
-                        "why": f"{cand[0]} is not in the folder of the solution XAE has open ({sol})"}
-        try:
-            installed = await asyncio.to_thread(app.kb.installed_libraries)
-        except Exception:  # noqa: BLE001 — no repository on this PC: the saved file's effective versions are not known
-            installed = {}
-        rep = (await asyncio.to_thread(K.library_report, cand, installed))["projects"][0]
+            return {"compared": False, "file": cand[0],
+                    "why": f"{cand[0]} is not in the folder of the solution XAE has open ({sol})"}
+        rep = (await asyncio.to_thread(K.library_report, cand, {}))["projects"][0]
         if rep.get("error"):
             return {"compared": False, "file": cand[0], "why": rep["error"]}
-        saved = {(r["kind"], r["name"].lstrip("#").lower()): r for r in rep["libraries"]}
-        xae = {(r["kind"], r["name"].lstrip("#").lower()): r for r in refs}
+        # review 2 of 0.8.19: only what both sides state is compared — the references (a library by name and version,
+        # so two versions of one library stay two), the versions a library and a placeholder's default ask for, and a
+        # resolution the saved file pins to a version. What an unpinned placeholder resolves to is not compared: the
+        # saved file does not say it (the placeholder profile and the repositories decide), and a freeze leaves no
+        # mark XAE's Automation Interface shows.
+
+        def key(r: dict[str, Any], ver: str | None) -> tuple[str, str, str]:
+            return (r["kind"], r["name"].lstrip("#").lower(), (ver or "") if r["kind"] == "library" else "")
+        saved = {key(r, r.get("requested")): r for r in rep["libraries"]}
+        xae = {key(r, r.get("version")): r for r in refs}
         out: dict[str, Any] = {"compared": True, "file": cand[0]}
-        only_x = [f"{k[0]} {xae[k]['name']}" for k in xae if k not in saved]
-        only_s = [f"{k[0]} {saved[k]['name']}" for k in saved if k not in xae]
+        label = (lambda k, r: f"{k[0]} {r['name']}" + (f" {k[2]}" if k[2] else ""))
+        only_x = [label(k, xae[k]) for k in xae if k not in saved]
+        only_s = [label(k, saved[k]) for k in saved if k not in xae]
         vdiff = []
         for k in xae.keys() & saved.keys():
             x, sv = xae[k], saved[k]
-            if k[0] == "library":
-                pairs = [("version", x.get("version"), sv.get("requested"))]
-            elif sv.get("pinned_by"):      # the saved file pins it: its resolution against XAE's effective one
+            if k[0] != "placeholder":
+                continue                       # a library's version is part of its key
+            if sv.get("pinned_by"):
                 pairs = [("resolution", (x.get("effective") or {}).get("version"), sv.get("requested"))]
             else:
-                # review 1 of 0.8.19: an unsaved resolve / freeze changes the effective resolution only — compared
-                # with what the saved file resolves to on this PC (when that is known: not 'profile')
-                se = sv.get("effective")
-                pairs = [("default", (x.get("default") or {}).get("version"), sv.get("requested")),
-                         ("effective", (x.get("effective") or {}).get("version"),
-                          se if se and se not in ("profile", "*") else None)]
+                pairs = [("default", (x.get("default") or {}).get("version"), sv.get("requested"))]
             for what, xv, svv in pairs:
-                if xv and svv and xv != svv:
+                if xv and svv and svv != "*" and xv != svv:
                     vdiff.append({"reference": f"{k[0]} {x['name']}", "what": what, "xae": xv, "saved": svv})
         if only_x:
             out["only_in_xae"] = only_x
@@ -5456,11 +5465,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             out["only_in_saved_file"] = only_s
         if vdiff:
             out["version_differs"] = vdiff
-        if not installed:
-            out["effective_not_compared"] = ("no library repository found on this PC: what the saved file's "
-                                             "placeholders resolve to is not known — an unsaved resolve or freeze "
-                                             "would not show here")
         out["same"] = not (only_x or only_s or vdiff)
+        out["not_compared"] = ("what an unpinned placeholder resolves to, and whether a placeholder is frozen: an unsaved "
+                               "xae_placeholder_resolve / _freeze does not show here (save with xae_build(save_first="
+                               "true), then the .plcproj holds it as a PlaceholderResolution)")
         if not out["same"]:
             out["note"] = ("XAE holds other references than the saved file: changes not saved yet (xae_build with "
                            "save_first saves them), or the file on disk is another state of the project")
@@ -5474,7 +5482,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """The library references of a PLC project as XAE holds them now (TE1000 ITcPlcLibraryManager): libraries
         (name, version, distributor) and placeholders (default and effective resolution — '*' and what it resolves
         to). Flags a library referenced twice and a version that is not installed (ScanLibraries; check_installed=false
-        skips it), and what differs from the saved .plcproj (unsaved changes). plc_project_path: plc_path,
+        skips it), and the references and requested versions that differ from the saved .plcproj (unsaved changes; an
+        unsaved resolve / freeze cannot be seen). plc_project_path: plc_path,
         iec_project_path or instance_path — needed when the solution has more than one PLC project."""
         proj = await app.plc_project(plc_project_path, "xae_library_list")
         res = await app.xae_call(app.xae.library_list, proj, check_installed, timeout=300)
@@ -5526,7 +5535,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         and a placeholder of the same name, two versions) is refused until kind ('library' / 'placeholder') or version
         says which ('#X' = the placeholder X). RemoveReference itself takes a name (and a library's version): which of
         a placeholder and a library of one name XAE removes is checked afterwards and said. Code that uses it does not build any more — said, nothing in the code is changed. Destructive-class:
-        tc_request_confirmation(action='xae_library_remove', target='<iec project path>:<library>')."""
+        tc_request_confirmation(action='xae_library_remove', target='<iec project path>:<library>' + ' (<kind>)' and
+        ', <version>' when given)."""
         a = {"library": library, "version": version, "distributor": distributor, "kind": kind,
              "plc_project_path": plc_project_path}
         return await _lib_action("xae_library_remove", OpClass.DESTRUCTIVE, a, confirm_token, ctx,
@@ -5548,7 +5558,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                       plc_project_path: str | None = None, confirm_token: str | None = None,
                                       ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Set what a placeholder resolves to (SetEffectiveResolution): library, version ('' or '*' = newest).
-        The result checks the effective resolution after it. target='<iec project path>:<placeholder>=<library>'."""
+        The result checks the effective resolution after it. target='<iec project path>:<placeholder>=<library>' +
+        ', <version>' when given."""
         a = {"placeholder": placeholder, "library": library, "version": version, "distributor": distributor,
              "plc_project_path": plc_project_path}
         return await _lib_action("xae_placeholder_resolve", OpClass.CONTROL, a, confirm_token, ctx,

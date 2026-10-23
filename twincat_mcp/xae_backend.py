@@ -1864,16 +1864,31 @@ class XaeBackend:
     def library_add(self, plc_project_path: str, library: str, version: str = "", distributor: str = "") -> dict[str, Any]:
         path, it = self._libman(plc_project_path)
         before = self._lib_refs(it, path)
-        want = ((_lib_parts(library).get("library") or library.split(",")[0]) if "," in library else library).strip()
+        parts = _lib_parts(library) if "," in library else {}
+        if "," in library and not parts.get("library"):
+            # review 2 of 0.8.19: 'X, (Dist)' lost its distributor silently — a display name is 'Name, Version
+            # (Distributor)'; anything else is given in its own arguments
+            raise XaeError(f"{library!r} is not a display name 'Name, Version (Distributor)' — pass library, version and "
+                           "distributor separately. Nothing was done")
+        if parts.get("library") and ((version and version != parts.get("version"))
+                                     or (distributor and parts.get("distributor")
+                                         and distributor != parts.get("distributor"))):
+            raise XaeError(f"{library!r} names version {parts.get('version')!r} (distributor "
+                           f"{parts.get('distributor')!r}) and the arguments say {version!r} / {distributor!r} — give "
+                           "one of them. Nothing was done")
+        want = (parts.get("library") or library).strip()
         if not want:
             raise XaeError(f"no library name in {library!r} — nothing was done")
         have = _ref_find(before, want.lstrip("#"))
         if have:
             # TE1000: ArgumentException 'Library or placeholder is already included' — refused here, with what is there
+            asked = version or parts.get("version") or ""
+            other_ver = [h for h in have if h["kind"] == "library" and asked and asked != "*"
+                         and h.get("version") != asked]
             raise XaeError(f"{want} is already referenced in {_plc_split(plc_project_path)[1]}: {have} — nothing was "
                            "done" + (" (xae_placeholder_resolve changes what a placeholder resolves to)"
                                      if any(h["kind"] == "placeholder" for h in have) else
-                                     " (another version: xae_library_remove it first)"))
+                                     " (for another version: xae_library_remove it first)" if other_ver else ""))
         what = f"AddLibrary {library}" + (f", {version}" if version else "") + (f" ({distributor})" if distributor else "")
 
         def expect(after: list[dict[str, Any]]) -> str | None:
@@ -1881,7 +1896,7 @@ class XaeBackend:
                 f"XAE reported success, but {want} is not among the references after it"
         # a full display name ('Tc2_Math, * (Beckhoff Automation GmbH)') is passed as it is (TE1000 takes it), anything
         # else as the bare name read from it
-        arg = library.strip() if "," in library and _lib_parts(library).get("library") else want
+        arg = library.strip() if parts.get("library") else want
         return self._lib_change(plc_project_path, path, before, what,
                                 lambda x: _com_call(x, "AddLibrary", arg, version or "", distributor or ""), expect)
 
@@ -1894,6 +1909,12 @@ class XaeBackend:
         proj = _plc_split(plc_project_path)[1]
         hit = _ref_find(before, library, kind or None, version)
         if not hit:
+            named = _ref_find(before, library, kind or None)
+            if version and named:
+                # review 2 of 0.8.19: 'not referenced' for a name that is — a version narrows to libraries
+                raise XaeError(f"{library} is referenced ({[r['kind'] + ' ' + r['name'] + ' ' + str(r.get('version') or '') for r in named]}) "
+                               f"but not as a library of version {version} — a placeholder has no version of its own. "
+                               "Nothing was done")
             raise XaeError(f"{library} is not referenced in {proj} — its references: "
                            f"{[r['kind'] + ' ' + r['name'] for r in before]}. Nothing was done")
         if len(hit) > 1:
@@ -1978,8 +1999,9 @@ class XaeBackend:
                                lambda x: _com_call(x, "FreezePlaceholder", ph), lambda after: None)
         res["frozen_note"] = (("the placeholder keeps the version it resolves" if ph else
                                "every placeholder keeps the version it resolves")
-                              + " to now instead of following '*' (the newest installed); the Automation Interface "
-                              "shows no 'frozen' mark — the saved .plcproj holds it as the placeholder's resolution")
+                              + " to now (FreezePlaceholder: 'freezes the EffectiveResolution'); the Automation "
+                              "Interface shows no 'frozen' mark — once saved, the .plcproj holds it as the "
+                              "placeholder's resolution")
         return res
 
     # ------------------------------------------------------------ PLC
