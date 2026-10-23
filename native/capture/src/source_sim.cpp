@@ -14,6 +14,11 @@
 //           "program_change_at": cycle,           (an online change: once a sample of that cycle is delivered, the
 //                                                  symbol version reads 2 and the online-change count 1)
 //           "rebuild_in_outage": true,            (the runtime comes back from the outage with another build)
+//           "stale_port_after_outage": true,      (N197: after the outage re-registering keeps failing with ADS 0x6
+//                                                  until reopen() opened a new connection; the system state reads RUN)
+//           "system_state_in_outage": "unreadable", (the system state cannot be read during the outage; default: it
+//                                                  reads CONFIG)
+//           "reopen_fails": n,                    (the first n reopen() calls fail; the old connection is kept)
 //           "version_after_outage": n,            (the runtime comes back with symbol version n)
 //           "version_at_start": n,                (the symbol version before anything changes, default 1)
 //           "version_read_fails": true,           (the runtime refuses every symbol version read)
@@ -69,6 +74,9 @@ public:
             if (o->a.size() == 2) { outage_from_ = o->a[0].i; outage_to_ = o->a[1].i; }
         program_change_at_ = sim.integer("program_change_at", -1);
         if (const JVal* r = sim.get("rebuild_in_outage")) rebuild_in_outage_ = r->t == JVal::Bool && r->b;
+        if (const JVal* r = sim.get("stale_port_after_outage")) stale_port_ = r->t == JVal::Bool && r->b;
+        sys_unreadable_in_outage_ = sim.str("system_state_in_outage") == "unreadable";
+        reopen_fails_ = sim.integer("reopen_fails", 0);
         version_after_outage_ = sim.integer("version_after_outage", -1);
         version_at_start_ = sim.integer("version_at_start", 1);
         if (const JVal* r = sim.get("version_read_fails")) version_read_fails_ = r->t == JVal::Bool && r->b;
@@ -140,12 +148,41 @@ public:
             err = "ADS error 0x6 (6): target port not found (simulated outage)";
             return false;
         }
+        if (stale_port_) {
+            err = "ADS error 0x6 (6): target port not found (simulated stale connection)";
+            return false;
+        }
         dead_.store(false);
         ++resubs_;
         return true;
     }
 
     uint64_t resubscriptions() const override { return resubs_; }
+
+    bool reopen(std::string& err) override {
+        if (reopen_fails_ > 0) {
+            --reopen_fails_;
+            err = "opening the ADS port again failed: ADS error 0x748 (1864): port not open (simulated)";
+            return false;
+        }
+        if (outage_from_ >= 0 && cycle_now_.load() > outage_to_) stale_port_ = false;   // a new connection reaches it
+        ++reopens_;
+        return true;
+    }
+
+    int system_state(std::string& text) override {
+        if (away()) {
+            if (sys_unreadable_in_outage_) {
+                text = "TwinCAT system state not readable on this connection: ADS error 0x745 (1861): timeout "
+                       "elapsed (simulated)";
+                return -1;
+            }
+            text = "TwinCAT system state on this connection: CONFIG (simulated)";
+            return 0;
+        }
+        text = "TwinCAT system state on this connection: RUN (simulated)";
+        return 1;
+    }
 
     std::string describe() const override {
         JObj o;
@@ -247,6 +284,10 @@ private:
     std::vector<int64_t> holds_;                        // hold_for_check
     std::atomic<int64_t> cycle_now_{0};
     std::atomic<bool> dead_{false};
+    bool stale_port_ = false;
+    bool sys_unreadable_in_outage_ = false;
+    int64_t reopen_fails_ = 0;
+    uint64_t reopens_ = 0;
     uint64_t resubs_ = 0;
     double speed_ = 1.0;
     std::vector<Range> drops_, late_, skew_, batch_;   // skew_: {block, cycles ahead, unused}; batch_: {block, cycles}

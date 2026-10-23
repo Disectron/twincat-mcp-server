@@ -65,6 +65,7 @@ class LibMan(FakeItem):
                      Lib("Ex_Visu", "3.5.10.0", "System"),
                      Lib("Ex_Util", "2.0.0.0")]                    # pinned to a version that is not installed
         self.calls = []
+        self.scans = 0
 
     @property
     def References(self):
@@ -75,19 +76,25 @@ class LibMan(FakeItem):
         return Coll([Repo("System", r"C:\TwinCAT\3.1\Components\Plc\Managed Libraries")])
 
     def ScanLibraries(self):
+        self.scans += 1
         return Coll(self.installed)
 
-    def _find_inst(self, name, version):
+    def _find_inst(self, name, version, dist=""):
         c = [x for x in self.installed if x.Name.lower() == name.lower() and (not version or version == "*"
-                                                                             or x.Version == version)]
-        return sorted(c, key=lambda x: x.Version)[-1] if c else None
+                                                                             or x.Version == version)
+             and (not dist or x.Distributor.lower() == dist.lower())]
+        return sorted(c, key=lambda x: X._ver_key(x.Version))[-1] if c else None
 
     def AddLibrary(self, name, version="", company=""):
         self.calls.append(("AddLibrary", name, version, company))
-        if "," in name:                                     # TE1000 takes a display name too
+        if not version and not company:
+            # XAE 4024 (0.8.19 retest N199): with version and distributor empty the name is read as a display name —
+            # a bare 'Tc2_Math' raises "LibInfo display name 'Tc2_Math' is not valid" (HRESULT 0x80020009)
             p = X._lib_parts(name)
-            name, version = p["library"], p["version"]
-        lib = self._find_inst(name, version)
+            if "library" not in p:
+                raise ComError(-2147352567, f"LibInfo display name '{name}' is not valid")
+            name, version, company = p["library"], p["version"], p["distributor"]
+        lib = self._find_inst(name, version, company)
         if lib is None:
             raise ComError(-2147467259, "TSM_E_ITEMNOTFOUND: managed library not found")
         self.refs.append(Lib(lib.Name, version or lib.Version, lib.Distributor))
@@ -180,7 +187,8 @@ def test_a_project_without_a_library_manager_is_said(monkeypatch):
 def test_library_add_runs_once_and_gives_the_difference(monkeypatch):
     be, lm = _libs(monkeypatch)
     r = be.library_add(PROJ, "Ex_Math")
-    assert lm.calls == [("AddLibrary", "Ex_Math", "", "")] and be.acted == ["AddLibrary Ex_Math"], lm.calls
+    assert lm.calls == [("AddLibrary", "Ex_Math, * (Example Corp)", "", "")] and \
+        be.acted == ["AddLibrary Ex_Math, * (Example Corp)"], lm.calls
     assert [x["name"] for x in r["added"]] == ["Ex_Math"] and r["removed"] == [] and r["changed"] == [], r
     assert r["build_required"] is True and "not built and not saved" in r["note"] and "warning" not in r
     with pytest.raises(X.XaeError, match="Ex_Math is already referenced .* nothing was done"):
@@ -191,7 +199,7 @@ def test_library_add_runs_once_and_gives_the_difference(monkeypatch):
 def test_library_add_xae_refusal_carries_its_message_and_nothing_is_said_done(monkeypatch):
     be, lm = _libs(monkeypatch)
     with pytest.raises(X.XaeError, match="TSM_E_ITEMNOTFOUND"):
-        be.library_add(PROJ, "Ex_Missing")
+        be.library_add(PROJ, "Ex_Missing", "1.0.0.0", "Example Corp")     # named in full: XAE is asked
     assert [x for x in lm.refs if getattr(x, "Name", "") == "Ex_Missing"] == []
 
 
@@ -239,11 +247,13 @@ def test_library_remove_says_when_xae_removed_the_other_reference(monkeypatch):
 def test_placeholder_add_resolve_freeze(monkeypatch):
     be, lm = _libs(monkeypatch)
     r = be.placeholder_add(PROJ, "Ex_Math", "Ex_Math", "*")
-    assert lm.calls[-1] == ("AddPlaceholder", "Ex_Math", "Ex_Math", "*", "") and r["added"][0]["kind"] == "placeholder"
+    assert lm.calls[-1] == ("AddPlaceholder", "Ex_Math", "Ex_Math", "*", "Example Corp") and \
+        r["added"][0]["kind"] == "placeholder", lm.calls
     r = be.placeholder_resolve(PROJ, "#Ex_Base", "Ex_Base", "1.0.0.0")
-    assert lm.calls[-1] == ("SetEffectiveResolution", "Ex_Base", "Ex_Base", "1.0.0.0", ""), lm.calls
+    assert lm.calls[-1] == ("SetEffectiveResolution", "Ex_Base", "Ex_Base", "1.0.0.0", "Example Corp"), lm.calls
     assert r["changed"][0]["after"]["effective"]["version"] == "1.0.0.0" and "warning" not in r, r
-    r = be.placeholder_resolve(PROJ, "Ex_Base", "Ex_Base", "9.9.9.9")       # XAE took it, the resolution says otherwise
+    r = be.placeholder_resolve(PROJ, "Ex_Base", "Ex_Base", "9.9.9.9", "Example Corp")   # XAE took it, the resolution
+    #                                                                                     says otherwise
     assert "resolves to nothing after it, not to Ex_Base 9.9.9.9" in r["warning"], r
     with pytest.raises(X.XaeError, match="no placeholder Ex_Util"):
         be.placeholder_resolve(PROJ, "Ex_Util", "Ex_Util")                 # a library, not a placeholder
@@ -310,7 +320,7 @@ async def test_server_changes_need_the_users_ok_in_guarded_mode_bound_to_library
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_library_add",
                                                                     "args": {"library": "Ex_Math"}}))
         r = payload(await s.call_tool("xae_library_add", {"library": "Ex_Math", "confirm_token": tok["confirm_token"]}))
-        assert [x["name"] for x in r["added"]] == ["Ex_Math"] and lm.calls == [("AddLibrary", "Ex_Math", "", "")]
+        assert [x["name"] for x in r["added"]] == ["Ex_Math"] and lm.calls == [("AddLibrary", "Ex_Math, * (Example Corp)", "", "")]
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_placeholder_resolve",
                                                                     "args": {"placeholder": "Ex_Base",
                                                                              "library": "Ex_Base"}}))
@@ -364,7 +374,7 @@ async def test_server_a_change_carries_xaes_messages(monkeypatch, project_dir):
     async with client_for(srv) as s:
         r = payload(await s.call_tool("xae_library_add", {"library": "Ex_Math"}))
     msgs = r.get("xae_messages") or []
-    assert any(m.get("action") == "AddLibrary Ex_Math" and "project was reloaded" in m.get("messages", "")
+    assert any(m.get("action") == "AddLibrary Ex_Math, * (Example Corp)" and "project was reloaded" in m.get("messages", "")
                for m in msgs), r
 
 

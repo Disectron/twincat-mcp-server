@@ -10,6 +10,8 @@
 namespace tcmcp {
 
 static constexpr int64_t kFtUnixEpoch = 116444736000000000LL;   // FILETIME of 1970-01-01
+static constexpr uint64_t kReopenAfter = 3;     // N197: failed attempts in one outage before the connection is opened again
+static constexpr uint64_t kReopenGapMax = 30;   // then after 6, 12, 24, at most 30 more attempts (about 60 s at 2 s)
 
 // ---------------------------------------------------------------- time formatting
 static int64_t floor_div(int64_t a, int64_t b) {
@@ -888,10 +890,11 @@ void Engine::writer_loop() {
                     resub_tried_ = true;
                     last_resub_try_ = now;
                     std::string err;
-                    const std::string id_now = source_->identity();
-                    if (identity_differs(identity_, id_now)) {
-                        // R43: another build / an online change came back — its variables need not be where the old
-                        // ones were
+                    // R43: another build / an online change came back — its variables need not be where the old ones
+                    // were. Checked before registering, on the old connection and again on a new one (review 2 of
+                    // 0.8.20: on a refused connection the read gives nothing, which is no comparison)
+                    auto program_changed = [&](const std::string& id_now) {
+                        if (!identity_differs(identity_, id_now)) return false;
                         rebuild_note_ = "the PLC program changed while TwinCAT was away (program " + identity_ +
                                         " -> " + id_now + ": compile time, online changes, table sizes): the "
                                         "notifications were not registered again "
@@ -899,18 +902,81 @@ void Engine::writer_loop() {
                                         std::string(watch_ ? "verified sample" : "sample") + " before the outage";
                         if (watch_) end_at(verified_ft_, have_verified_, rebuild_note_);
                         else end_at(last_emitted_, any_emitted_, rebuild_note_);
-                    } else if (source_->resubscribe(err)) {
-                        resub_since_check_ = true;   // the next read compares the program identity too
-                        char n[200];
-                        std::snprintf(n, sizeof n, "notifications registered again after %.1f s without samples (TwinCAT restart / route loss?) at %s ms",
-                                      std::chrono::duration<double>(now - blocks_[0]->progress).count(),
-                                      have_t0_ ? ms(last_emitted_).c_str() : "?");
-                        resub_notes_.push_back(n);
-                        resub_error_.clear();
-                        for (auto& bp : blocks_) bp->progress = now;   // give the new handles their silence budget
-                    } else {
-                        ++resub_failures_;
-                        resub_error_ = err;
+                        return true;
+                    };
+                    if (!program_changed(source_->identity())) {
+                        // one attempt: register again; when that fails, the system state says whether TwinCAT is away
+                        // (CONFIG: wait) or back with this connection refused (N197: open a new one, at most at
+                        // growing intervals, and ask again at once)
+                        ++outage_attempts_;
+                        std::string st;
+                        bool ok = source_->resubscribe(err);
+                        bool via_reopen = false, changed = false;
+                        if (!ok && !stop_req_.load()) {
+                            const int sys = source_->system_state(st);
+                            const std::string failure = err + (st.empty() ? "" : " - " + st);
+                            outage_last_failure_ = failure;
+                            if (sys == 1) {
+                                ++outage_run_refusals_;      // the PLC port refused while the system service read RUN
+                                if (outage_first_run_refusal_.empty()) outage_first_run_refusal_ = failure;
+                            }
+                            if (sys != 0 && outage_attempts_ >= next_reopen_at_) {
+                                reopen_gap_ = std::min<uint64_t>(reopen_gap_ * 2, kReopenGapMax);
+                                next_reopen_at_ = outage_attempts_ + reopen_gap_;
+                                std::string rerr;
+                                if (source_->reopen(rerr)) {
+                                    ++port_reopens_;
+                                    ++outage_reopens_;
+                                    reopen_error_.clear();
+                                    std::string err2;
+                                    if (program_changed(source_->identity())) {
+                                        changed = true;
+                                    } else if (source_->resubscribe(err2)) {
+                                        ok = via_reopen = true;
+                                    } else {
+                                        err = err2 + " (after opening the ADS connection again)";
+                                    }
+                                } else {
+                                    reopen_error_ = rerr;   // the old connection is kept (review 2 of 0.8.20)
+                                }
+                            }
+                        }
+                        if (ok) {
+                            resub_since_check_ = true;   // the next read compares the program identity too
+                            char n[200];
+                            std::snprintf(n, sizeof n, "notifications registered again after %.1f s without samples (TwinCAT restart / route loss?) at %s ms",
+                                          std::chrono::duration<double>(now - blocks_[0]->progress).count(),
+                                          have_t0_ ? ms(last_emitted_).c_str() : "?");
+                            std::string note = n;
+                            const uint64_t failed_before = outage_attempts_ - (via_reopen ? 0 : 1);
+                            if (failed_before)
+                                note += " - " + std::to_string(failed_before) + " attempt(s) failed, last: " +
+                                        outage_last_failure_;
+                            if (outage_run_refusals_)
+                                note += " - the PLC port refused " + std::to_string(outage_run_refusals_) +
+                                        " time(s) while the system service read RUN (first: " +
+                                        outage_first_run_refusal_ + ")";
+                            if (via_reopen)
+                                note += outage_run_refusals_ ? " - registered on a new ADS connection"
+                                                             : " - registered on a new ADS connection (the system "
+                                                               "state was not readable on the old one)";
+                            else if (outage_reopens_)
+                                note += " - the ADS connection had been opened again " + std::to_string(outage_reopens_) +
+                                        " time(s) in this outage";
+                            resub_notes_.push_back(note);
+                            resub_error_.clear();
+                            outage_attempts_ = 0;
+                            outage_reopens_ = 0;
+                            outage_run_refusals_ = 0;
+                            outage_first_run_refusal_.clear();
+                            outage_last_failure_.clear();
+                            reopen_gap_ = kReopenAfter;
+                            next_reopen_at_ = kReopenAfter;
+                            for (auto& bp : blocks_) bp->progress = now;   // give the new handles their silence budget
+                        } else if (!changed && !stop_req_.load()) {
+                            ++resub_failures_;
+                            resub_error_ = st.empty() ? err : err + " - " + st;
+                        }
                     }
                 }
             }
@@ -1081,8 +1147,11 @@ void Engine::finish() {
         stop_wait_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stop_cut_wall_).count();
     if (fh_ && have_t0_ && stall_open_) close_stall(have_end ? std::max(end, stall_adv_ft_) : blocks_[stall_block_]->last_ft);
     for (auto& n : resub_notes_) errors_.push_back(n);
-    if (!resub_error_.empty()) errors_.push_back("re-registering the notifications failed " + std::to_string(resub_failures_) +
-                                                 " time(s), last: " + resub_error_);
+    if (!resub_error_.empty()) errors_.push_back("re-registering the notifications failed " + std::to_string(outage_attempts_) +
+                                                 " time(s) since the last samples, last: " + resub_error_ +
+                                                 (outage_reopens_ ? " - the ADS connection was opened again " +
+                                                                    std::to_string(outage_reopens_) + " time(s)" : "") +
+                                                 (reopen_error_.empty() ? "" : " - opening it again failed: " + reopen_error_));
     const int64_t miss = head + gaps + tail;
     const uint64_t good = samples_ > stalled_samples_ ? samples_ - stalled_samples_ : 0;
     const double comp = (samples_ + miss) ? double(good) / double(samples_ + static_cast<uint64_t>(miss)) : 0.0;
@@ -1210,6 +1279,8 @@ void Engine::finish() {
         .u("gap_markers", gap_markers_).u("chain_checkpoints", chains_)
         .u("stalls", stalls_).u("stalled_samples", stalled_samples_).d("stall_s", double(stall_100ns_) / 1e7, 8)
         .u("resubscriptions", source_ ? source_->resubscriptions() : 0);
+    if (port_reopens_) f.u("port_reopens", port_reopens_);
+    if (resub_failures_) f.u("resubscribe_failures_total", resub_failures_);   // every failed attempt of the recording
     if (!pass && !label_reason.empty()) f.str("label_reason", label_reason);
     if (stall_block_ >= 0) f.u("stall_counter_block", blocks_[stall_block_]->spec.id);
     f.raw("blocks", jarr(bl)).raw("errors", jarr(errs));
@@ -1264,7 +1335,10 @@ std::string Engine::status() {
     o.u("stalls", stalls_).u("stalled_samples", stalled_now).b("stalled", stall_open_);
     if (stall_open_ && have_t0_) o.raw("stalled_since_ms", ms(stall_adv_ft_));
     o.u("resubscriptions", source_ ? source_->resubscriptions() : 0);
-    if (!resub_error_.empty()) o.str("resubscribe_error", resub_error_);
+    if (!resub_error_.empty()) o.str("resubscribe_error", resub_error_).u("resubscribe_failures", outage_attempts_);
+    if (port_reopens_) o.u("port_reopens", port_reopens_);
+    if (outage_reopens_) o.u("outage_reopens", outage_reopens_);
+    if (!reopen_error_.empty()) o.str("reopen_error", reopen_error_);
     if (have_warm_true_ && have_t0_) {
         o.raw("start_when_warmup_true_ms", ms(warm_true_ft_));
         if (triggered_ && !warm_lapsed_) o.raw("trigger_delayed_ms", jnum(double(trig_ft_ - warm_true_ft_) / 1e4, 6));
@@ -1331,8 +1405,8 @@ std::string Engine::stop(const std::string& reason) {
         }
         if (!at_cut) {
             manual_stop_.store(true);  // nothing delivered yet / still armed: no window end to wait for
+            stop_req_.store(true);     // review 1 of 0.8.20: first, so the writer starts no re-registration after it
             unsubscribe_once();        // no new samples; what the rings hold was taken before the stop
-            stop_req_.store(true);
         }
     }
     if (writer_.joinable()) writer_.join();

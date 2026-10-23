@@ -2,11 +2,13 @@
 //   Windows + TwinCAT (USE_TWINCAT_ROUTER): AdsLib over Beckhoff's TcAdsDll.dll — the local TwinCAT router,
 //     same path as TwinCAT's own tools; works for the local runtime and every routed target.
 //   Elsewhere (standalone AdsLib): AdsLib's own AMS/TCP router to a remote IPC (route on the IPC needed).
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -82,6 +84,14 @@ std::string ads_error_text(long code) {
     }
 }
 
+static std::string state_name(int s) {
+    static const char* const names[] = {"INVALID", "IDLE", "RESET", "INIT", "START", "RUN", "STOP", "SAVECFG",
+                                        "LOADCFG", "POWERFAILURE", "POWERGOOD", "ERROR", "SHUTDOWN", "SUSPEND",
+                                        "RESUME", "CONFIG", "RECONFIG", "STOPPING", "INCOMPATIBLE", "EXCEPTION"};
+    if (s >= 0 && s < static_cast<int>(sizeof names / sizeof names[0])) return names[s];
+    return std::to_string(s);
+}
+
 class AdsSource : public Source {
 public:
     AdsSource(std::string net_id, uint16_t port, std::string ip, uint32_t timeout_ms)
@@ -98,13 +108,7 @@ public:
             return false;
         }
         try {
-            dev_.reset(new AdsDevice(ip_, id, port_));
-            if (dev_->GetLocalPort() == 0) {
-                err = "could not open an ADS port on the local router (TwinCAT router not running?)";
-                dev_.reset();
-                return false;
-            }
-            dev_->SetTimeout(timeout_ms_);
+            if (!open_port(id, err)) return false;
             DeviceInfo info = dev_->GetDeviceInfo();
             std::ostringstream os;
             os << int(info.version.version) << '.' << int(info.version.revision) << '.' << info.version.build;
@@ -122,8 +126,21 @@ public:
         return true;
     }
 
+    // A new local AMS port on the router towards the target (no request to the target: it may still be away).
+    bool open_port(const AmsNetId& id, std::string& err) {
+        dev_.reset(new AdsDevice(ip_, id, port_));
+        if (dev_->GetLocalPort() == 0) {
+            err = "could not open an ADS port on the local router (TwinCAT router not running?)";
+            dev_.reset();
+            return false;
+        }
+        dev_->SetTimeout(timeout_ms_);
+        return true;
+    }
+
     bool subscribe(const std::vector<BlockSpec>& blocks, int64_t cycle_100ns, int64_t max_delay_100ns, Sink* sink,
                    SubscribeError& err) override {
+        std::lock_guard<std::mutex> lk(m_);
         g_sink.store(sink, std::memory_order_release);
         blocks_ = blocks;
         cycle_ = cycle_100ns;
@@ -142,25 +159,30 @@ public:
                 err.block = static_cast<int>(k);
                 err.code = ex.errorCode;
                 err.message = ads_error(ex.errorCode);
-                unsubscribe();
+                drop_locked();
                 return false;
             } catch (const std::exception& ex) {
                 err.block = static_cast<int>(k);
                 err.message = ex.what();
-                unsubscribe();
+                drop_locked();
                 return false;
             }
         }
         return true;
     }
 
+    // Called by the engine's stop path on another thread than the writer, which may be in resubscribe() / reopen() at
+    // that moment (review 1 of 0.8.20: two threads clearing notes_, and a reopen freeing the AdsDevice the
+    // notification deleters still pointed at) — every use of dev_ / notes_ holds m_; after it nothing is registered
+    // again.
     void unsubscribe() override {
-        // AdsNotification's destructor deletes the device notification (synchronous ADS request).
-        notes_.clear();
-        g_sink.store(nullptr, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(m_);
+        stopped_ = true;
+        drop_locked();
     }
 
     bool read_version(uint32_t& version, std::string& err) override {
+        std::lock_guard<std::mutex> lk(m_);
         if (!dev_) {
             err = "not connected";
             return false;
@@ -183,6 +205,7 @@ public:
     // "t<compile time>:c<online changes>:u<symbols>,<symbol bytes>,<datatypes>,<datatype bytes>" of the PLC
     // application; "" when any part is not readable.
     std::string identity() override {
+        std::lock_guard<std::mutex> lk(m_);
         if (!dev_) return "";
         static const char kTs[] = "TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp";
         static const char kOc[] = "TwinCAT_SystemInfoVarList._AppInfo.OnlineChangeCnt";
@@ -202,8 +225,13 @@ public:
     // (the delete request fails fast while the port is away) and register every block again. All or nothing, like
     // subscribe(): a partial set would record some blocks and silently miss others.
     bool resubscribe(std::string& err) override {
+        std::lock_guard<std::mutex> lk(m_);
+        if (stopped_) {
+            err = "stopped";
+            return false;
+        }
         if (!dev_ || blocks_.empty()) {
-            err = "nothing subscribed";
+            err = dev_ ? "nothing subscribed" : "no ADS connection (opening it again failed)";
             return false;
         }
         notes_.clear();
@@ -233,6 +261,60 @@ public:
 
     uint64_t resubscriptions() const override { return resubs_; }
 
+    bool reopen(std::string& err) override {
+        std::lock_guard<std::mutex> lk(m_);
+        if (stopped_) {
+            err = "stopped";
+            return false;
+        }
+        // review 2 of 0.8.20: the new connection is opened first and the old one kept when that fails (the router may
+        // be restarting) — never left without one
+        std::unique_ptr<AdsDevice> fresh;
+        try {
+            fresh.reset(new AdsDevice(ip_, make_AmsNetId(net_id_), port_));
+            if (fresh->GetLocalPort() == 0) {
+                err = "opening the ADS port again failed: no local port (TwinCAT router not running?)";
+                return false;
+            }
+            fresh->SetTimeout(timeout_ms_);
+        } catch (const AdsException& ex) {
+            err = "opening the ADS port again failed: " + ads_error(ex.errorCode);
+            return false;
+        } catch (const std::exception& ex) {
+            err = std::string("opening the ADS port again failed: ") + ex.what();
+            return false;
+        }
+        notes_.clear();                      // the delete requests on the old port fail fast; the handles are dead
+        dev_.swap(fresh);                    // `fresh` holds the old device now: its local port closes here
+        fresh.reset();
+        return true;
+    }
+
+    // Review 1 of 0.8.20: a ReadState on the PLC port answers 0x6 whenever registering there does — the system service
+    // (port 10000) is asked instead: RUN with the PLC port refusing is the N197 case, CONFIG is TwinCAT away.
+    int system_state(std::string& text) override {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!dev_) {
+            text = "TwinCAT system state: no ADS connection";
+            return -1;
+        }
+        const long local = dev_->GetLocalPort();
+        AmsAddr sys{make_AmsNetId(net_id_), 10000};
+        uint16_t ads = 0, dev = 0;
+        // a diagnostic: at most 1 s of the attempt (the engine holds its mutex across it, review 2 of 0.8.20)
+        dev_->SetTimeout(std::min<uint32_t>(timeout_ms_, 1000));
+        const long e = AdsSyncReadStateReqEx(local, &sys, &ads, &dev);
+        dev_->SetTimeout(timeout_ms_);
+        if (e != 0) {
+            text = "TwinCAT system state not readable on this connection: " + ads_error(e) + " (local port " +
+                   std::to_string(local) + ")";
+            return -1;
+        }
+        text = "TwinCAT system state on this connection: " + state_name(ads) + " (local port " + std::to_string(local) +
+               ")";
+        return ads == ADSSTATE_RUN ? 1 : 0;
+    }
+
     std::string describe() const override {
         JObj o;
         o.str("ads_lib", "Beckhoff AdsLib");
@@ -261,6 +343,14 @@ private:
     std::vector<BlockSpec> blocks_;
     int64_t cycle_ = 10000, max_delay_ = 0;
     uint64_t resubs_ = 0;
+    std::mutex m_;               // dev_ / notes_ / blocks_: the writer thread and the stop path
+    bool stopped_ = false;
+
+    void drop_locked() {
+        // AdsNotification's destructor deletes the device notification (synchronous ADS request).
+        notes_.clear();
+        g_sink.store(nullptr, std::memory_order_release);
+    }
 };
 
 }  // namespace

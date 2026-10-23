@@ -273,6 +273,53 @@ tool wishlist (2026-10-18).
   and what is not (an unpinned resolution, a freeze) is said. All fixed with tests red before. LOW, left: none open.
   Not seen on hardware: whether RemoveReference(name) removes the placeholder or the library when both share a name
   (the result checks and says); whether AddLibrary takes a display name on 4024 (TE1000 says it does).
+- 0.8.19 retest (Ryan, 2026-10-24, bugs.md §39 – §39d). Passed live: N196 (`tcunit_results(path=)`, `ads_read(symbol=)`
+  refused), N195 (PLCopen replace of PRG_Machine ×3), N194 (python change mode across RUN → CONFIG → RUN:
+  resubscriptions 1, `_restart` before the first sample after it, INCOMPLETE, rec_verify FAIL; the symbol version moved
+  150 → 151), N180 (`restart_seen`; the hardware order is Record → RouterStop → AutoStop → Reply, as assumed; every
+  restart shows two RouterStop → AutoStop → Reply cycles), R7 native 1 ms (30003 samples, LOSSLESS), the native restart
+  without Scope, `xae_library_list` / `_installed` / add / remove / placeholder add → resolve → freeze → build (the
+  .plcproj then has the PlaceholderResolution), R40 from CONFIG; native 1 ms with `max_delay_ms` 0 – 2000 lossless
+  (§39d: Beckhoff's FIFO sends when full or at nMaxDelay). New: N197 (S3, 1 of 4) — a native cycle recording with
+  Scope did not recover from a TwinCAT restart: 20 re-registrations failed with ADS 0x6 (target port not found) while
+  TwinCAT was in RUN, nothing delivered for the rest of the 60 s; Scope, the restart time and the 0xA2 lines do not
+  separate it from the three runs that recovered; cause not established. N198 (S4) — `saved_plcproj.same` false after a
+  save: XAE lists the placeholder Tc3_GlobalTypes, the .plcproj does not hold it. N199 (S3) — `xae_library_add` with the
+  bare name fails on 4024 ("LibInfo display name 'Tc2_Math' is not valid", HRESULT 0x80020009): XAE wants the display
+  name; with version + distributor, or 'Tc2_Math, * (Beckhoff Automation GmbH)', it works. `xae_library_repositories`
+  → "not readable through this XAE's Automation Interface" (E_NOINTERFACE): per the plan the tool is dropped. Left in
+  the test project: Tc2_EtherCAT 3.8.2.0 and `90_Test\PRG_LibTest` (on the user's request). Not run: the Options-open
+  refusal, the GetLastErrorMessages probe, `runtime_away_at_end`, the DrumFillingMachine rows (VisuSymbols ×2).
+- 0.8.20 fixes of the 0.8.19 retest (Ryan, 2026-10-23: fixes first, then linking; repositories: find out why; proj_set_code
+  while XAE has the project open: warn only). N199: only call forms seen working on the retest PC go to XAE — a display
+  name as given, (name, version, distributor) as given (nothing looked up); a bare name gets its distributor from
+  ScanLibraries and is sent as 'Name, * (Distributor)'; a name with a pinned version, its distributor completed, as
+  (name, version, distributor). Refused before XAE is asked: not installed, several distributors and none given, a
+  pinned version not installed, installed without a distributor. `xae_placeholder_add` / `_resolve` take a display name
+  too and complete the library the same way; a '*' resolution XAE resolves to another version than the newest
+  installed is said (`resolution_note`). N198: Tc3_GlobalTypes and Tc3_GlobalTypes_Global — the virtual data-type
+  libraries TwinCAT adds itself from build 4026 (Beckhoff "Using global data types") — are `added_by_twincat`, not a
+  difference, and not checked against ScanLibraries. N197 (cause still not established): a failed re-registration reads
+  the system service (port 10000, at most 1 s) on the capture's own connection; reading RUN (the PLC port refusing, the
+  N197 case) or nothing, the engine opens a new connection — the new one first, the old one kept if that fails — on the
+  3rd attempt of the outage, then after 6, 12, 24, at most 30 more, checks the program identity on it and registers at
+  once; reading CONFIG it waits. A recovery's note has the outage's failed attempts, the last failure, how often and
+  first when the PLC port refused while the system service read RUN, and whether a new connection did it; rec_status
+  warns while it lasts. The ADS source guards its device and handles with a mutex (review 1: the stop path cleared them
+  while the writer re-registered); nothing is tried after a stop. `proj_set_code` says `xae_open` when the server last
+  knew XAE attached with the solution over the file. Repositories: TE1000 documents ITcPlcLibRepository as IUnknown-based
+  (not IDispatch) while its collection is IDispatch-based — pywin32 (late binding only) cannot read Name / Folder; a
+  read-only probe (pywin32 QueryInterface of the item for the repository IID, the type library's description, comtypes'
+  early-bound route) went to Ryan before the tool changes. Two independent review rounds: round 1 1 HIGH, 5 MEDIUM,
+  5 LOW; round 2 0 HIGH, 2 MEDIUM, 7 LOW — fixed with tests red before, except these LOW: the retry block runs under the
+  engine mutex, so rec_status (10 s) waits behind its ADS calls — identity() 3 reads, the registrations, now the state
+  read (≤ 1 s) and on a reopen identity() and the registrations again; 0x6 fails fast, a 5 s timeout per request does
+  not (pre-existing with identity()); a confirmation is spent when library_add then refuses and its prompt cannot show
+  the distributor filled in after it (`named_as` in the result does); `xae_open` misses a .sln in a subfolder of the
+  project; a name given in full is sent in the case typed; a name-only library that ScanLibraries does not list is
+  refused (XAE refused the bare name anyway), a distributor without version needs ScanLibraries. Not seen on hardware:
+  AddPlaceholder / SetEffectiveResolution with '*' and the distributor filled; the system state read on port 10000
+  through the capture's connection; whether a new connection recovers the N197 state.
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).

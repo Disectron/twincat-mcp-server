@@ -1783,8 +1783,8 @@ class XaeBackend:
                     eff = r.get("effective") or {}
                     lib, ver = (eff.get("library"), eff.get("version")) if r["kind"] == "placeholder" else \
                         (r["name"], r.get("version"))
-                    if not lib or not ver or ver == "*":
-                        continue
+                    if not lib or not ver or ver == "*" or _virtual_lib(lib) or _virtual_lib(r["name"]):
+                        continue                    # N198: Tc3_GlobalTypes is made by TwinCAT, never installed
                     vs = have.get(lib.lower())
                     if vs is None:
                         r["not_installed"] = f"{lib} is not installed in a repository ScanLibraries reads"
@@ -1866,41 +1866,81 @@ class XaeBackend:
     def library_add(self, plc_project_path: str, library: str, version: str = "", distributor: str = "") -> dict[str, Any]:
         path, it = self._libman(plc_project_path)
         before = self._lib_refs(it, path)
-        parts = _lib_parts(library) if "," in library else {}
-        if "," in library and not parts.get("library"):
-            # review 2 of 0.8.19: 'X, (Dist)' lost its distributor silently — a display name is 'Name, Version
-            # (Distributor)'; anything else is given in its own arguments
-            raise XaeError(f"{library!r} is not a display name 'Name, Version (Distributor)' — pass library, version and "
-                           "distributor separately. Nothing was done")
-        if parts.get("library") and ((version and version != parts.get("version"))
-                                     or (distributor and parts.get("distributor")
-                                         and distributor != parts.get("distributor"))):
-            raise XaeError(f"{library!r} names version {parts.get('version')!r} (distributor "
-                           f"{parts.get('distributor')!r}) and the arguments say {version!r} / {distributor!r} — give "
-                           "one of them. Nothing was done")
-        want = (parts.get("library") or library).strip()
-        if not want:
-            raise XaeError(f"no library name in {library!r} — nothing was done")
+        want, version, distributor, display = _lib_args(library, version, distributor)
         have = _ref_find(before, want.lstrip("#"))
         if have:
             # TE1000: ArgumentException 'Library or placeholder is already included' — refused here, with what is there
-            asked = version or parts.get("version") or ""
-            other_ver = [h for h in have if h["kind"] == "library" and asked and asked != "*"
-                         and h.get("version") != asked]
+            other_ver = [h for h in have if h["kind"] == "library" and version and version != "*"
+                         and h.get("version") != version]
             raise XaeError(f"{want} is already referenced in {_plc_split(plc_project_path)[1]}: {have} — nothing was "
                            "done" + (" (xae_placeholder_resolve changes what a placeholder resolves to)"
                                      if any(h["kind"] == "placeholder" for h in have) else
                                      " (for another version: xae_library_remove it first)" if other_ver else ""))
-        what = f"AddLibrary {library}" + (f", {version}" if version else "") + (f" ({distributor})" if distributor else "")
+        # N199 (0.8.19 retest): with version and distributor empty XAE 4024 reads the name as a display name and refuses
+        # the bare one ("LibInfo display name 'Tc2_Math' is not valid"). Only forms seen working on that PC are sent: a
+        # display name as given, (name, version, distributor) as given. A bare name gets its distributor (and '*')
+        # from ScanLibraries and is sent as the display name 'Name, * (Distributor)' (worked there); a name with a
+        # pinned version, its distributor completed, as (name, version, distributor) (worked there, review 2 of 0.8.20).
+        name, ver, dist, _inst = self._lib_identity(it, path, want, version, distributor)
+        if display or ver == "*":
+            display = display or f"{name}, {ver} ({dist})"
+            args, what = (display, "", ""), f"AddLibrary {display}"
+        else:
+            args, what = (name, ver, dist), f"AddLibrary {name}, {ver} ({dist})"
+        completed = not (version and distributor)
 
         def expect(after: list[dict[str, Any]]) -> str | None:
             return None if _ref_find(after, want) else \
                 f"XAE reported success, but {want} is not among the references after it"
-        # a full display name ('Tc2_Math, * (Beckhoff Automation GmbH)') is passed as it is (TE1000 takes it), anything
-        # else as the bare name read from it
-        arg = library.strip() if parts.get("library") else want
-        return self._lib_change(plc_project_path, path, before, what,
-                                lambda x: _com_call(x, "AddLibrary", arg, version or "", distributor or ""), expect)
+        res = self._lib_change(plc_project_path, path, before, what,
+                               lambda x: _com_call(x, "AddLibrary", *args), expect)
+        if completed:
+            filled = ([f"distributor {dist!r}"] if not distributor else []) + \
+                ([f"version {ver!r} (the newest installed)"] if not version else [])
+            call = f"AddLibrary({args[0]!r})" if args[1:] == ("", "") else f"AddLibrary({name!r}, {ver!r}, {dist!r})"
+            res["named_as"] = f"{call} — {' and '.join(filled)} from ScanLibraries (XAE refuses a bare name)"
+        return res
+
+    def _lib_identity(self, it: Any, path: str, name: str, version: str, distributor: str
+                      ) -> tuple[str, str, str, list[dict[str, Any]] | None]:
+        """(name, version, distributor, installed rows of it) of a library — the parts not given completed from
+        ScanLibraries: version '' → '*' (the newest installed), the distributor of the only installed library of that
+        name. Refused (nothing done) when it is not installed, when several distributors have it and none was named,
+        or when a pinned version is not installed. With version and distributor both given nothing is looked up (the
+        form that worked on the 0.8.19 retest PC) and the rows are None."""
+        if version.strip() and distributor.strip():
+            return name, version.strip(), distributor.strip(), None
+        try:
+            listed = self._installed(it, path)
+        except (XaeBusy, XaeGone):
+            raise
+        except XaeError as exc:
+            raise XaeError(f"the distributor/version of {name} could not be read (ScanLibraries failed: {exc}) — give "
+                           "version (or '*') and distributor. Nothing was done") from exc
+        inst = [x for x in listed if (x.get("library") or "").lower() == name.lower()]
+        if not inst:
+            raise XaeError(f"{name} is not installed in the repositories XAE uses (ScanLibraries) — nothing was done "
+                           "(xae_library_installed lists what is; with version and distributor both given nothing is "
+                           "looked up)")
+        if distributor:
+            mine = [x for x in inst if (x.get("distributor") or "").lower() == distributor.lower()]
+            if not mine:
+                raise XaeError(f"{name} is not installed from {distributor!r} — installed from: "
+                               f"{sorted({x.get('distributor') for x in inst})}. Nothing was done")
+            inst = mine
+        dists = sorted({x.get("distributor") or "" for x in inst})
+        if len(dists) > 1:
+            raise XaeError(f"{name} is installed from several distributors {dists} — say which (distributor=). "
+                           "Nothing was done")
+        if not dists[0]:
+            # review 1 of 0.8.20: 'Name, * ()' is no name XAE takes — said instead of sent
+            raise XaeError(f"{name} is installed without a distributor (ScanLibraries) — give version and distributor "
+                           "as XAE shows them. Nothing was done")
+        ver = version.strip() or "*"
+        if ver != "*" and ver not in {x.get("version") for x in inst}:
+            raise XaeError(f"{name} {ver} is not installed (installed: "
+                           f"{sorted({x.get('version') for x in inst}, key=_ver_key)}) — nothing was done")
+        return inst[0].get("library") or name, ver, dists[0], inst
 
     def library_remove(self, plc_project_path: str, library: str, version: str = "", distributor: str = "",
                        kind: str | None = None) -> dict[str, Any]:
@@ -1961,7 +2001,12 @@ class XaeBackend:
         have = _ref_find(before, ph)
         if have:
             raise XaeError(f"{ph} is already referenced in {_plc_split(plc_project_path)[1]}: {have} — nothing was done")
-        what = f"AddPlaceholder {ph}" + (f" → {library}" if library else " (default library from the device)")
+        if library:
+            # N199: the default library named in full (a display name too, review 1 of 0.8.20)
+            lib, version, distributor, _d = _lib_args(library, version, distributor)
+            library, version, distributor, _inst = self._lib_identity(it, path, lib, version, distributor)
+        what = f"AddPlaceholder {ph}" + (f" → {library}, {version} ({distributor})" if library else
+                                         " (default library from the device)")
 
         def expect(after: list[dict[str, Any]]) -> str | None:
             return None if _ref_find(after, ph, "placeholder") else \
@@ -1977,18 +2022,30 @@ class XaeBackend:
         if not _ref_find(before, ph, "placeholder"):
             raise XaeError(f"no placeholder {ph} in {_plc_split(plc_project_path)[1]} — nothing was done "
                            "(xae_library_list lists the references)")
-        what = f"SetEffectiveResolution {ph} → {library}" + (f", {version}" if version else "")
+        lib, version, distributor, _d = _lib_args(library, version, distributor)
+        library, version, distributor, inst = self._lib_identity(it, path, lib, version, distributor)
+        what = f"SetEffectiveResolution {ph} → {library}, {version} ({distributor})"
+
+        seen: dict[str, Any] = {}
 
         def expect(after: list[dict[str, Any]]) -> str | None:
             row = _ref_find(after, ph, "placeholder")
             eff = (row[0].get("effective") or {}) if row else {}
+            seen.update(eff)
             if (eff.get("library") or "").lower() != library.strip().lower() or (
                     version and version != "*" and eff.get("version") != version):
                 return (f"XAE reported success, but {ph} resolves to {eff.get('display') or 'nothing'} after it, not "
                         f"to {library}" + (f" {version}" if version else ""))
             return None
-        return self._lib_change(plc_project_path, path, before, what, lambda x: _com_call(
+        res = self._lib_change(plc_project_path, path, before, what, lambda x: _com_call(
             x, "SetEffectiveResolution", ph, library, version or "", distributor or ""), expect)
+        newest = max((x.get("version") or "" for x in inst or []), key=_ver_key, default="")
+        if version == "*" and newest and seen.get("version") not in (None, "", "*", newest):
+            # review 1 of 0.8.20: '*' set, and XAE resolves it to another version than the newest installed — said as
+            # seen (a repository of higher priority or the placeholder profile may decide), not called wrong
+            res["resolution_note"] = (f"asked for '*': XAE resolves {ph} to {seen.get('version')}; the newest installed "
+                                      f"(ScanLibraries) is {newest}")
+        return res
 
     def placeholder_freeze(self, plc_project_path: str, placeholder: str | None = None) -> dict[str, Any]:
         path, it = self._libman(plc_project_path)
@@ -3159,6 +3216,46 @@ def _lib_parts(display: str) -> dict[str, str]:
         return {"display": str(display or "")}
     return {"library": m["lib"], "version": m["ver"], "distributor": (m["dist"] or "").strip(),
             "display": str(display)}
+
+
+def _lib_args(library: str, version: str = "", distributor: str = "") -> tuple[str, str, str, str]:
+    """(name, version, distributor, display name as given or '') of a library argument: 'Name, Version (Distributor)'
+    or a name with its own version / distributor arguments. Refused (nothing done) when it is neither, or when both
+    say a different version / distributor."""
+    library = str(library or "")
+    if "," in library:
+        parts = _lib_parts(library)
+        if not parts.get("library"):
+            # review 2 of 0.8.19: 'X, (Dist)' lost its distributor silently — a display name is 'Name, Version
+            # (Distributor)'; anything else is given in its own arguments
+            raise XaeError(f"{library!r} is not a display name 'Name, Version (Distributor)' — pass library, version and "
+                           "distributor separately. Nothing was done")
+        if (version and version != parts.get("version")) or (distributor and parts.get("distributor")
+                                                               and distributor != parts.get("distributor")):
+            raise XaeError(f"{library!r} names version {parts.get('version')!r} (distributor "
+                           f"{parts.get('distributor')!r}) and the arguments say {version!r} / {distributor!r} — give "
+                           "one of them. Nothing was done")
+        name = parts["library"].strip()
+        if not name:
+            raise XaeError(f"no library name in {library!r} — nothing was done")
+        version = (version or parts.get("version") or "").strip()
+        distributor = (distributor or parts.get("distributor") or "").strip()
+        return name, version, distributor, library.strip() if parts.get("distributor") else ""
+    name = library.strip()
+    if not name:
+        raise XaeError(f"no library name in {library!r} — nothing was done")
+    return name, (version or "").strip(), (distributor or "").strip(), ""
+
+
+_VIRTUAL_LIB = re.compile(r"^#?tc3_globaltypes(_global)?$", re.IGNORECASE)
+
+
+def _virtual_lib(name: str | None) -> bool:
+    """N198: Tc3_GlobalTypes and Tc3_GlobalTypes_Global — the virtual libraries TwinCAT makes from the global data
+    types and adds to the PLC project itself (build 4026+, Beckhoff 'Using global data types'; the libraries of
+    namespaces below them are named after the namespace and cannot be told by name); never in the .plcproj, never
+    installed."""
+    return bool(_VIRTUAL_LIB.match(str(name or "").strip()))
 
 
 def _ver_key(v: str | None) -> tuple[int, ...]:
