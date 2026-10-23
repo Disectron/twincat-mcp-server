@@ -28,6 +28,10 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| 0.8.19 | N194: `rec_start` (change mode, python engine) on `MAIN.nCycle`, RUN → CONFIG → RUN, wait 5 s, `rec_stop`, `rec_verify` | samples after the restart; `resubscriptions 1`, `runtime_restarts` names the restart; the recording's `.jsonl` has a `_restart` line (`t_from`) before the first sample after it; `label INCOMPLETE` and rec_verify not PASS; CONFIG left for more than 3 s until `rec_stop` → `runtime_away_at_end`, the marker `until_end` (less: a `program_watch` note); `runtime_restarts[].why` names "the task cycle count started again" — tell me whether the symbol version moved |
+| 0.8.19 | N195: `xae_plcopen_export` + `xae_plcopen_import(option='replace')` of PRG_Machine three times in a row | never "removed … References^…"; a reference that stays unlisted → `references_not_listed` + `references_note`, the replace done; a real removal names the copies left (`renamed copies are still in the project: …`) |
+| 0.8.19 | N196: `tcunit_results(path=…)`, `ads_read(name=…, symbol=…)` | "unknown argument(s) ['path'] — its parameters are […]. Nothing was done"; nothing read |
+| 0.8.19 | N180: `rec_start(also_scope=true)`, RUN → CONFIG → RUN, `rec_stop`; copy the Scope View log's state lines of that minute | `scope.restart_seen` (`router_stop_at`, `auto_stop_at`, `states`), note "TwinCAT was restarted while Scope recorded … Scope stopped recording at the restart — its data ends there" (or "recorded again from … gap" when the log has a Record after it); the same `restart` in the signed `.scope.json`. Send the state lines: the record → RouterStop line was not seen on hardware yet (0.8.16's lines were from a Scope in Reply) |
 | 0.8.18 | N189: two `rec_start(also_scope=true)` in one batch (A `duration_s=10`, B `duration_s=3`); while A records: `rec_start(also_scope=true)`, `rec_start` without also_scope, `scope_record` start / stop / save / disconnect / new | one recording has Scope, the other is refused "Scope belongs to recording …" / "being started by another call … This recording was not started"; without also_scope: recorded, `scope_note` says why Scope was not offered; every scope_record action refused "nothing was done"; A's `.scope.csv` span = A's recording; no two links share a capture |
 | 0.8.18 | Scope recording of its own: `scope_record start`, then `rec_start(also_scope=true)`; `scope_record stop`; `rec_start(also_scope=true)` again; `scope_record save`; `rec_start(also_scope=true, scope_disconnect=true)` | refused "Scope records on its own …"; after stop the next asks "Scope still holds a Scope recording of its own (scope_record) (NOT saved …)"; after save the disconnect needs no confirmation; the last records with Scope |
 | 0.8.18 | N191 / N190: a Scope stop refused (Tools → Options open when the recording ends), Cancel, `rec_stop`; then a normal also_scope recording; the audit log | the first: `scope_span.runs_past_s` ≈ the extra seconds, note "Scope's capture covers … it ran … s past its end", the same `span` in the signed `.scope.json`; the normal one: no `scope_span`; audit has `scope_disconnect_asked` (with the answer) and `scope_next` |
@@ -209,6 +213,51 @@ tool wishlist (2026-10-18).
   `.tsproj` form `OwnerA Name="InputDst"` (xae_links would then report every variable unlinked although links were
   read); which TwinCAT versions show the instance's variable groups as tree children; StopRecord / Disconnect in
   Config and in Reply; is Scope in Reply reset to Config by xae_activate_configuration.
+- 0.8.18 retest (Ryan, 2026-10-22, bugs.md §38 – §38d). Passed live: N189 (batch refusal, scope_record refusals,
+  `scope_note`), the Scope owner flow, N179 (6 = 6, 2 = 2 ERROR lines), N190, N191 (`runs_past_s 69.9` in the result
+  and the signed link; a normal run has no span), N192 / N193 (16 variables, 21 links, 5 unlinked; Project15 `unlinked_count
+  null`), N173 both halves, R7, R41 (with post_trigger), D11, R40 3 + 3, N93, R42 (the SOP's "completes" expectation
+  is outdated: `max_leaves` stops it too), D44, N31, N58, N59, N40, N42, R4, R3, #10, #11, #33, N64, N56, N57, N47,
+  N48, N51, N39, N50 (pointer half), N38 / N45 / N97 / N43, N9 / #49. Still open: N180 (no "Scope was reset by a
+  TwinCAT restart" note — the log shows RouterStop → AutoStop → Reply), N184, N117 (seen again, both directions).
+  New: N194 (S2) — a change-mode python recording across RUN → CONFIG → RUN received nothing after the restart (no
+  re-registration, marker or error) and rec_verify said PASS; N195 (S3) — the first `xae_plcopen_import(replace)` of
+  PRG_Machine said a reference ('System_VisuElemMeter') was removed from its place and left `PRG_Machine_1`, the
+  second worked (intermittent); N196 (S4) — `tcunit_results(path=…)` (not a parameter) was accepted silently and the
+  boot result file was read instead. Observations: the audit does not say who answered a prompt; D11's 11.35 s step is
+  not named by rec_verify; `scope_disconnect=true` right after `scope_record stop` discards the unsaved capture
+  without a question (the argument is the answer — by design).
+- 0.8.19 fixes (branch `fix/0.8.19-retest`, tests red on 0.8.18): N194 — the python engine checks the runtime when
+  no sample came for 1 s (symbol version read), re-registers its notifications after a restart into the same program
+  (marker `_restart`, `resubscriptions`, `runtime_restarts`, label INCOMPLETE), ends the recording on another program;
+  N195 — an object missing after PlcOpenImport is read again after 1 s, only what is missing from both listings
+  counts, a library reference not listed never stops a replace (said: `references_not_listed`), a refusal names the
+  copies it leaves; N196 — every tool refuses an argument it does not have, before it runs; N180 — after a recording
+  with Scope the Scope View log since its start is read for RouterStop / AutoStop / Record, said in the result and the
+  signed link (`restart_seen` / `restart`). Not changed: the refusal path ('Invalid ScopeState … Config') keeps its
+  0.8.16 wording.
+- 0.8.19 review round 1 (independent reviewer per branch, 2026-10-23). Retest fixes: no HIGH; MEDIUM fixed with
+  tests red before — one failed version read taken for a TwinCAT restart (now: failing for RUNTIME_AWAY_S with no
+  sample, a shorter failure that ends with the same version is a failed read; no baseline version → not judged); an
+  online change on a quiet recording called a restart; the `_restart` marker written before a pre-restart row still
+  waiting for its check (now before the first row after t_from, the value reset per block too); a router stop while
+  Scope was in Reply said to end its data, several restarts summarised by the first; a renamed copy missing from the
+  first listing after PlcOpenImport made a replace say "unchanged". LOW, left: a re-registration that fails part-way
+  deletes and re-adds every block on each retry — with real ADS each re-add sends an initial sample (duplicate rows,
+  unmarked). LOW, done: the restart note kept when the recording is deleted during the save; Scope View times said to
+  be this PC's local time; the references note says 'replace' only for a replace.
+- 0.8.19 review round 2 of the retest fixes (the last, 2026-10-23): one MEDIUM — a TwinCAT restart shorter than
+  RUNTIME_AWAY_S that came back with the same symbol version (Beckhoff: the version changes when a program is
+  uploaded; a restart is not listed) was taken for a failed read, the notifications never registered again (N194
+  back). Fixed with a test red before: `_TaskInfo[1].CycleCount` is read about once a second while the runtime answers
+  and again when it answers after a failure — a count that started again is a restart, whatever its length and the
+  version; a version that moved while the count went on is no restart (same program: the recording continues). LOW,
+  done: a confirmed outage is no longer cleared by the next sample (it is re-registered and marked); failing reads at
+  the end are said in `program_watch`; a router stop the Scope View log shows outside Record followed by Record again is
+  said as a possible gap. LOW, left: a recording started within seconds of a TwinCAT start whose runtime restarts
+  again soon after can see a cycle count that is not lower than its baseline (then the 0.8.19 round-1 rules apply);
+  N180's walk takes 'Record → RouterStop' as the cut — the real line order of a restart during a recording is still to
+  be seen (retest row).
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).

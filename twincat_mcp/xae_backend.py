@@ -509,6 +509,8 @@ class XaeBackend:
     # read clears it is not assumed: a buffer that does not clear starts with what the read before the action gave.
     MESSAGES_MAX = 4000                    # characters of one action's messages kept (the lines: 50)
     MESSAGES_READ_S = 2.0                  # how long a busy shell is asked for them (an addition: never a wait)
+    RELIST_SETTLE_S = 1.0                  # N195: pause before the project is listed again when an import seems to
+                                           # have removed something (the shell may still be re-reading the project)
 
     def _sm_messages(self, sm: Any) -> str | None:
         """The message buffer of the System Manager `sm` ('' when empty); None when it can't be read: no ITcSysManager2,
@@ -2220,9 +2222,48 @@ class XaeBackend:
                               f"{'before' if before is None else 'after'} the import: the objects added or removed (and "
                               "any renamed copies such as PRG_X_1) are not known — check the tree (xae_tree)")
             return res
+        in_file = {o.lower() for o in names}
+
+        def copies(listing: dict[str, str]) -> list[str]:
+            # R15: 'replace' replaces an object at the SAME place; when the XML carries no folder for it, TwinCAT puts
+            # it at the project root and renames it (PRG_X_1) because the name exists elsewhere — a silent duplicate. A
+            # name the file itself holds (FB_Axis_2 imported on purpose) is never a copy.
+            return [p for p, n in listing.items() if p not in before and n.lower() not in in_file
+                    and any(re.fullmatch(re.escape(o) + r"_\d+", n, re.I) for o in names)]
+        gone = sorted(p for p in before if p not in after)
+        existing = sorted({n for n in before.values() if n.lower() in in_file})
+        relisted = bool(gone or (option == "replace" and existing and not copies(after)))
+        if relisted:
+            # N195 (0.8.18 retest): right after PlcOpenImport the shell can still be re-reading the project — a library
+            # reference ('…^References^System_VisuElemMeter') was missing from the listing while it was in the tree,
+            # so a replace was refused and its copy left at the root. What is gone — or, for a replace, a copy that
+            # should be there and is not (review 1 of 0.8.19: the same transient listing hid the copy and the replace
+            # said "unchanged") — is read once more after a pause; only what is missing from both listings counts. A
+            # second listing that fails confirms nothing.
+            time.sleep(self.RELIST_SETTLE_S)
+            again = snapshot()
+            if again is not None:
+                after = {**after, **again}            # an object in either listing after the import is there
+                gone = sorted(p for p in before if p not in after)
+            else:
+                res["relist_failed"] = ("the second listing of the project failed: what follows is from the first "
+                                        "listing after the import only")
+        reads = ("one listing after the import — the second failed" if "relist_failed" in res else
+                 "listed twice" if relisted else "listed once")
         added = {p: n for p, n in after.items() if p not in before}
         res["added"] = sorted(added)[:200]
-        gone = sorted(p for p in before if p not in after)
+        # a library reference is not an object an import puts somewhere else (N97 is about POUs, DUTs, GVLs leaving
+        # their folders): one no longer listed is said, and the replace — which never touches references — goes on
+        refs_root = f"{plc_project_path}^References^".lower()
+        refs_gone = [p for p in gone if p.lower().startswith(refs_root)]
+        gone = [p for p in gone if p not in refs_gone]
+        if refs_gone:
+            res["references_not_listed"] = refs_gone[:200]
+            res["references_note"] = (f"{len(refs_gone)} library reference(s) listed before the import are not listed "
+                                      f"after it ({reads}): {refs_gone[:10]} — check the project's References"
+                                      + (". A 'replace' does not depend on them and was not stopped by this"
+                                         if option == "replace" else ""))
+        dup = copies(after)
         if gone:
             # N97: objects that were in the project before the import and are not now — never silent
             res["removed"] = gone[:200]
@@ -2230,24 +2271,22 @@ class XaeBackend:
             if moved:
                 res["moved"] = moved[:200]
             if option == "replace":
-                raise XaeError(f"PlcOpenImport removed {len(gone)} existing object(s) from their place: {gone[:10]}"
+                # N195: the import's renamed copies stay in the project — named (the retest found PRG_Machine_1 only
+                # by looking at the tree)
+                raise XaeError(f"PlcOpenImport removed {len(gone)} existing object(s) from their place ({reads}): "
+                               f"{gone[:10]}"
                                + (f" — re-created elsewhere: {moved[:10]}" if moved else "")
-                               + ". The in-place replace was not done; put them back (xae_tree) before importing again")
+                               + ". The in-place replace was not done; put them back (xae_tree) before importing again"
+                               + (f". The import's renamed copies are still in the project: {dup[:10]} — delete them "
+                                  "(xae_tree_delete) when the originals are back" if dup else ""))
             res["warning"] = (f"{len(gone)} object(s) that were in the project before the import are not at their place "
                               f"any more: {gone[:10]}" + (f"; re-created at {[m['to'] for m in moved[:10]]}" if moved
                                                           else ""))
-        # R15: 'replace' replaces an object at the SAME place; when the XML carries no folder for it, TwinCAT puts it at
-        # the project root and renames it (PRG_X_1) because the name exists elsewhere — a silent duplicate. A name the
-        # file itself holds (FB_Axis_2 imported on purpose) is never a copy.
-        in_file = {o.lower() for o in names}
-        dup = [p for p, n in added.items() if n.lower() not in in_file
-               and any(re.fullmatch(re.escape(o) + r"_\d+", n, re.I) for o in names)]
         if dup:
             res["duplicates_created"] = dup
             if option == "replace":
                 return self._replace_from_copies(res, dup, added, before, _plcopen_oracle(xml_file))
         if option == "replace":
-            existing = sorted({n for n in before.values() if n.lower() in in_file})
             if existing:
                 res["warning"] = (f"{existing[:10]} exist in the project, but the import made no copy of them, so "
                                   "nothing was written into them — they are unchanged")
