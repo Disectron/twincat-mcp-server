@@ -236,6 +236,16 @@ tool wishlist (2026-10-18).
   with Scope the Scope View log since its start is read for RouterStop / AutoStop / Record, said in the result and the
   signed link (`restart_seen` / `restart`). Not changed: the refusal path ('Invalid ScopeState … Config') keeps its
   0.8.16 wording.
+- 0.8.19 review round 1 (independent reviewer per branch, 2026-10-23). Retest fixes: no HIGH; MEDIUM fixed with
+  tests red before — one failed version read taken for a TwinCAT restart (now: failing for RUNTIME_AWAY_S with no
+  sample, a shorter failure that ends with the same version is a failed read; no baseline version → not judged); an
+  online change on a quiet recording called a restart; the `_restart` marker written before a pre-restart row still
+  waiting for its check (now before the first row after t_from, the value reset per block too); a router stop while
+  Scope was in Reply said to end its data, several restarts summarised by the first; a renamed copy missing from the
+  first listing after PlcOpenImport made a replace say "unchanged". LOW, left: a re-registration that fails part-way
+  deletes and re-adds every block on each retry — with real ADS each re-add sends an initial sample (duplicate rows,
+  unmarked). LOW, done: the restart note kept when the recording is deleted during the save; Scope View times said to
+  be this PC's local time; the references note says 'replace' only for a replace.
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).

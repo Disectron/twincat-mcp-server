@@ -77,6 +77,8 @@ QUEUE_BYTES = 256 << 20        # in-memory backlog cap per recording
 HOLD_MARGIN_MS = 50.0            # transport margin on top of max_delay_ms for a block's late delivery
 VERSION_CHECK_MS = 20.0          # R43: how often the symbol version is read while block samples wait for it
 RUNTIME_CHECK_S = 1.0           # N194: with no sample for this long, is the runtime still the one subscribed to?
+RUNTIME_AWAY_S = 3.0            # review 1 of 0.8.19: reads failing for this long (no sample since) = the runtime away;
+                                # a shorter failure that ends with the same symbol version is a failed read, no restart
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
 TAIL_WAIT_S = 1.0             # after the duration: wait at most this long for in-flight samples up to the cut
 
@@ -322,6 +324,7 @@ class Block:
     dup_stamps: int = 0
     gaps: list[list[float]] = field(default_factory=list)   # [t_ms, est. missing] — first 20
     prev: bytes | None = None
+    reset_after: float | None = None        # N194: the first row after this PLC time starts with every value
     registered: bool = False
     error: str | None = None
     last_wall: float | None = None          # monotonic time the last sample arrived (D14: silence estimate)
@@ -697,7 +700,10 @@ class Recording:
         self._away_since: float | None = None
         self._away_from_t: float | None = None
         self._away_error: str | None = None
-        self._restart_due: dict[str, Any] | None = None     # the marker, written before the first row after it
+        self._away_ver: int | None = None
+        self._away_confirmed = False          # failing for RUNTIME_AWAY_S with no sample: the runtime is away
+        self._resub_error: str | None = None
+        self._restart_due: dict[str, Any] | None = None     # the marker, written before the first row after t_from
         self.conn: pyads.Connection | None = None
         self.on_finish: Callable[[], None] | None = None   # releases the notifications (ingest thread, at stop)
         # closes the connection once the drain is over — N187 (0.8.16 retest): it was closed with the notifications,
@@ -796,7 +802,7 @@ class Recording:
             tf = "?" if r.get("t_from") is None else f"{r['t_from']:.4f} ms"
             parts.append(f"TwinCAT restarted after {tf} ({r['why']}): the notifications were registered again, "
                          "changes in between are unknown")
-        if self._away_since is not None:
+        if self._is_away():
             tf = "?" if self._away_from_t is None else f"{self._away_from_t:.4f} ms"
             parts.append(f"the runtime has not answered since {tf} ({self._away_error}): nothing after it is received")
         if self.poll_refused:
@@ -1035,10 +1041,12 @@ class Recording:
         self._check_failing = False
         same = (id_now == self._identity) if use_id else (v == self._ver)
         if same:
-            if v != self._ver:
+            if v != self._ver and self._away_since is None:
                 self.program_notes.append(f"symbol version {self._ver} -> {v} with the same program ({id_now}): the "
                                           "recording continued")
                 self._ver = v
+            # (review 1 of 0.8.19) while the runtime watch has the runtime away, a moved version is its to judge: a
+            # restart whose notifications must be registered again, not 'the recording continued' (N194)
             if self._verified_t is None or newest > self._verified_t:
                 self._verified_t = newest
             return
@@ -1063,18 +1071,34 @@ class Recording:
             return
         self._end_at(self._verified_t, reason, "program_change")
 
+    def _is_away(self) -> bool:
+        return self._away_since is not None and self._away_confirmed
+
+    def _clear_away(self) -> None:
+        self._away_since = self._away_from_t = self._away_error = self._away_ver = None
+        self._away_confirmed = False
+
     def _watch_runtime(self) -> None:
         """N194, ingest thread: no sample for RUNTIME_CHECK_S (a quiet change recording, or a runtime that went away):
-        read the symbol version. A failed read marks the runtime away; when it answers again — or its version moved
-        with no sample since — TwinCAT restarted (or the program was downloaded again) and the notifications of
-        before are gone: the same program (its identity) gets them registered again, and the span is marked; another
-        program, or one that cannot be identified, ends the recording at the last verified sample (R43)."""
-        if self.read_program is None or self.mode == "poll" or self.resubscribe is None or self.program_changed:
+        read the symbol version. Reads failing for RUNTIME_AWAY_S with no sample since mark the runtime away; when it
+        answers again — or its version moved with no sample since — the program may have been restarted or downloaded
+        and the notifications of before may be gone: the same program (its identity) gets them registered again, and
+        the span is marked; another program, or one that cannot be identified, ends the recording at the last verified
+        sample (R43). Review 1 of 0.8.19: a failure shorter than RUNTIME_AWAY_S that ends with the same version is a
+        failed read, not a restart; a sample that arrives clears it; without a baseline version nothing is judged."""
+        if (self.read_program is None or self.mode == "poll" or self.resubscribe is None or self.program_changed
+                or not self._watch or self._ver is None):
             return
         now = time.monotonic()
+        last = max((b.last_wall for b in self.blocks if b.last_wall is not None), default=None)
+        if self._away_since is not None and last is not None and last > self._away_since and not self._resub_error:
+            # samples arrive: the notifications work — the failed reads were reads, not a runtime away
+            if len(self.program_notes) < 20:
+                self.program_notes.append(f"the symbol version could not be read for {now - self._away_since:.1f} s "
+                                          f"({self._away_error}) while samples kept coming: not taken as a restart")
+            self._clear_away()
         if now - self._live_last < RUNTIME_CHECK_S:
             return
-        last = max((b.last_wall for b in self.blocks if b.last_wall is not None), default=None)
         if self._away_since is None and last is not None and now - last < RUNTIME_CHECK_S:
             return                                   # samples arrive: the notifications work
         self._live_last = now
@@ -1082,52 +1106,71 @@ class Recording:
             v = int(self.read_program())  # type: ignore[misc]
         except Exception as exc:  # noqa: BLE001
             if self._away_since is None:
-                self._away_since, self._away_error = now, _fmt_exc(exc)
+                self._away_since, self._away_error, self._away_ver = now, _fmt_exc(exc), self._ver
                 self._away_from_t = self._max_seen_t if self.t0_ft is not None else None
+            elif now - self._away_since >= RUNTIME_AWAY_S:
+                self._away_confirmed = True
             return
-        if self._away_since is None and (self._ver is None or v == self._ver):
+        was_away = self._away_since is not None
+        ver_before = self._away_ver if was_away else self._ver
+        if not was_away and v == self._ver:
             return                                   # quiet values: the runtime ran on
+        if was_away and not self._away_confirmed and not self._resub_error and v == ver_before:
+            if len(self.program_notes) < 20:
+                self.program_notes.append(f"the symbol version could not be read for {now - self._away_since:.1f} s "
+                                          f"({self._away_error}); it answered again with the same version {v}: a failed "
+                                          "read, not taken as a restart")
+            self._clear_away()
+            return
         id_now = None
         try:
             id_now = self.read_identity() if self.read_identity is not None else None
         except Exception:  # noqa: BLE001
             id_now = None
-        t_from = self._away_from_t if self._away_since is not None else (
-            self._max_seen_t if self.t0_ft is not None else None)
-        why = (f"the runtime did not answer for {now - self._away_since:.1f} s ({self._away_error})"
-               if self._away_since is not None else f"its symbol version moved {self._ver} -> {v} with no sample since")
+        t_from = self._away_from_t if was_away else (self._max_seen_t if self.t0_ft is not None else None)
+        why = (f"the runtime did not answer for {now - self._away_since:.1f} s ({self._away_error})" if was_away else
+               f"its symbol version moved {ver_before} -> {v} with no sample since")
         if self._identity is None or id_now is None or id_now != self._identity:
             what = (f"the program is another one ({self._identity} -> {id_now})" if id_now and self._identity else
                     "the program could not be identified (compile time, online changes, table sizes)")
             if self.program_changed is None:
-                self.program_changed = {"after_ms": None if self._verified_t is None else round(self._verified_t, 4),
-                                        "symbol_version": [self._ver, v], "after_restart": True,
-                                        "rule": "TwinCAT restarted (or the program was downloaded) while the recording "
-                                                "ran; nothing after the last verified sample is written"}
-            self._end_program(f"TwinCAT restarted ({why}) and {what}: the notifications are not registered again — "
-                              "the recording ends at the last verified sample")
+                self.program_changed = {
+                    "after_ms": None if self._verified_t is None else round(self._verified_t, 4),
+                    "symbol_version": [ver_before, v], "after_restart": was_away,
+                    "rule": ("the runtime was away (TwinCAT restart / connection lost)" if was_away else
+                             "the symbol version moved with no sample since (a download, an online change or a TwinCAT "
+                             "restart)") + "; nothing after the last verified sample is written"}
+            cause = (f"TwinCAT restarted or the connection was lost ({why})" if was_away else
+                     f"the PLC program changed ({why}: a download, an online change or a TwinCAT restart)")
+            self._end_program(f"{cause} and {what}: the notifications are not registered again — the recording ends "
+                              "at the last verified sample")
             return
         err = self.resubscribe()
         if err:
+            self._resub_error = err
             if self._away_since is None:
-                self._away_since, self._away_error, self._away_from_t = now, err, t_from
+                self._away_since, self._away_error, self._away_from_t, self._away_ver = now, err, t_from, ver_before
+            self._away_confirmed = True              # the old notifications are gone and new ones are not there
             if len(self.errors) < 20:
                 self.errors.append(f"registering the notifications again failed ({err}) — tried again in "
                                    f"{RUNTIME_CHECK_S:g} s")
             return
+        self._resub_error = None
         self.resubscriptions += 1
-        entry = {"t_from": None if t_from is None else round(t_from, 4), "symbol_version": [self._ver, v],
+        entry = {"t_from": None if t_from is None else round(t_from, 4), "symbol_version": [ver_before, v],
                  "detected": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"), "why": why}
         if len(self.runtime_restarts) < 20:
             self.runtime_restarts.append(entry)
-        if v != self._ver:
-            self.program_notes.append(f"symbol version {self._ver} -> {v} with the same program ({id_now}) after a "
+        if v != ver_before:
+            self.program_notes.append(f"symbol version {ver_before} -> {v} with the same program ({id_now}) after a "
                                       "TwinCAT restart: the notifications were registered again")
-            self._ver = v
+        self._ver = v
         self._restart_due = entry
-        self._away_since = self._away_from_t = self._away_error = None
+        self._clear_away()
         for b in self.blocks:
-            b.prev = None            # the first sample after it re-establishes every value (change mode: all leaves)
+            # the first row after t_from re-establishes every value (change mode: all leaves); a row from before the
+            # restart still waiting for its check keeps its comparison (review 1 of 0.8.19)
+            b.reset_after = t_from if t_from is not None else -float("inf")
 
     def _restart_marker(self, entry: dict[str, Any], until_end: bool = False) -> None:
         tf = "null" if entry.get("t_from") is None else f"{entry['t_from']:.4f}"
@@ -1355,9 +1398,12 @@ class Recording:
                 self._write_gap(b, "gap", prev, t, gap)
         else:
             b.samples += 1
-        if self._restart_due is not None:
-            self._restart_marker(self._restart_due)            # N194: rows before it all lie at or before t_from
+        if self._restart_due is not None and (self._restart_due.get("t_from") is None
+                                              or _ticks(t) > _ticks(self._restart_due["t_from"])):
+            self._restart_marker(self._restart_due)            # N194: before the first row after t_from
             self._restart_due = None
+        if b.reset_after is not None and _ticks(t) > _ticks(b.reset_after):
+            b.prev, b.reset_after = None, None
         self.last_t = max(self.last_t, t)
         self._written_t.append(t)
         self._write(f'[{t:.4f},"#{b.bid}","{base64.b64encode(data).decode("ascii")}"]\n')
@@ -1558,7 +1604,7 @@ class Recording:
                 if self._restart_due is not None:
                     self._restart_marker(self._restart_due)        # re-registered, but nothing came after it
                     self._restart_due = None
-                if self._away_since is not None:
+                if self._is_away():
                     self._restart_marker({"t_from": self._away_from_t}, until_end=True)
                 if self.mode == "cycle" and self.t0_wall is not None:
                     ws, we = self.window_start(), self.window_end()
@@ -1600,10 +1646,10 @@ class Recording:
                         footer["rows_after_window_at_least"] = True
                 if self.poll_refused:
                     footer["poll_refused"] = self.poll_refused
-                if self.runtime_restarts or self._away_since is not None:
+                if self.runtime_restarts or self._is_away():
                     footer["resubscriptions"] = self.resubscriptions
                     footer["runtime_restarts"] = list(self.runtime_restarts)
-                    if self._away_since is not None:
+                    if self._is_away():
                         footer["runtime_away_at_end"] = {
                             "t_from": None if self._away_from_t is None else round(self._away_from_t, 4),
                             "error": self._away_error}
@@ -1650,10 +1696,10 @@ class Recording:
         anything is missing or was lost; NOT_PROVABLE for change/poll recordings (silence can't be told from loss)."""
         if self.mode != "cycle":
             # N194: a restart (or a runtime away at the end) is a known hole — not 'cannot be proven'
-            return "INCOMPLETE" if (self.runtime_restarts or self._away_since is not None) else "NOT_PROVABLE"
+            return "INCOMPLETE" if (self.runtime_restarts or self._is_away()) else "NOT_PROVABLE"
         miss = self.missing_samples() if miss is None else miss
         ok = (self.samples > 0 and not miss and not self.dropped and not self.dropped_on_stop and not self.unsubscribed
-              and not self.runtime_restarts and self._away_since is None
+              and not self.runtime_restarts and not self._is_away()
               and (self.start_when is None or self.triggered_at is not None) and not self.stalled_now()
               and not unprovable_blocks(self.timeline_blocks(), self.fallback_period()))
         return "COMPLETE" if ok else "INCOMPLETE"
@@ -1815,10 +1861,13 @@ class Recording:
             warn.append(f"ingest cannot keep up: backlog {backlog}/{self.q.maxsize} — fewer symbols, a larger cycle_ms or mode='change'")
         if self.unsubscribed:
             warn.append(f"{len(self.unsubscribed)} symbols could not be subscribed")
-        if self._away_since is not None:
+        if self._is_away():
             warn.append(f"the runtime has not answered for {time.monotonic() - self._away_since:.1f} s "
                         f"({self._away_error}): nothing is received — TwinCAT restart / connection lost; the "
                         "notifications are registered again once it answers with the same program")
+        if self._resub_error:
+            warn.append(f"the runtime answers again, but registering the notifications again failed "
+                        f"({self._resub_error}) — tried again every {RUNTIME_CHECK_S:g} s")
         if self.runtime_restarts:
             st["resubscriptions"] = self.resubscriptions
             st["runtime_restarts"] = list(self.runtime_restarts)

@@ -3409,6 +3409,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # retries for up to com_retry_s)
         run.update(scope=r["scope"], start_result=r.get("result_code"),
                    started=dt.datetime.now(dt.timezone.utc).isoformat())
+        if mark is not None:
+            run["start_mark"] = mark       # review 1 of 0.8.19: the restart check reads from StartRecord on (N180)
         try:
             state, how = await _start_check(mark)
         except BaseException:
@@ -3915,9 +3917,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     def _scope_restart(mark: dict[str, Any] | None) -> dict[str, Any] | None:
         """N180 (0.8.18 retest): a TwinCAT RUN→CONFIG→RUN while Scope recorded, then a save that worked — nothing said
         it. TE130x's Scope View log names it ('Scope Project state changes from … to RouterStop', then '… to
-        AutoStop', '… to Reply'; read on the 0.8.16 retest PC). Said from the log's lines since the recording's mark:
-        when the router stopped, whether Scope auto-stopped and whether it recorded again. None when the log names no
-        RouterStop since the mark, or cannot be read (log_find_since: None — nothing said either way)."""
+        AutoStop', '… to Reply'; read on the 0.8.16 retest PC). The state lines since StartRecord are walked: a
+        RouterStop out of Record cut the capture; a later change to Record started it again. Review 1 of 0.8.19: a
+        RouterStop while Scope was not recording (Reply: its capture had ended) cuts nothing, and with several restarts
+        the last one decides whether the data runs on. The times are the Scope View log's (this PC's local time).
+        None when the log names no RouterStop since the mark, or cannot be read (nothing said either way)."""
         from . import scope as S
         found = S.log_find_since(mark, _STATE_LINE)
         moves = []
@@ -3929,25 +3933,48 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         first = next((i for i, mv in enumerate(moves) if mv[2].lower() == "routerstop"), None)
         if first is None:
             return None
-        after = moves[first:]
-        rs = after[0][0]
-        auto = next((at for at, _a, b in after if b.lower() == "autostop"), None)
-        again = [at for at, _a, b in after if b.lower() == "record"]
-        out: dict[str, Any] = {"router_stop_at": rs, "states": [f"{at} {a} → {b}" for at, a, b in after][:12]}
-        if auto:
-            out["auto_stop_at"] = auto
-        if again:
-            out["recorded_again_at"] = again[-1]
-            out["note"] = (f"TwinCAT was restarted while Scope recorded (Scope View log: RouterStop at {rs}"
-                           + (f", AutoStop at {auto}" if auto else "") + f"); Scope recorded again from {again[-1]}: "
-                           "its data has a gap between the two")
-        elif auto:
-            out["note"] = (f"TwinCAT was restarted while Scope recorded (Scope View log: RouterStop at {rs}, AutoStop "
-                           f"at {auto}, no Record after it): Scope stopped recording at the restart — its data ends "
-                           "there, not at the recording's end")
+        cuts: list[dict[str, Any]] = []
+        outside: list[str] = []
+        for at, a, b in moves:
+            if b.lower() == "routerstop":
+                if a.lower() == "record":
+                    cuts.append({"router_stop_at": at})
+                elif not cuts or "recorded_again_at" in cuts[-1]:
+                    outside.append(f"{at} (Scope in {a})")
+            elif b.lower() == "autostop" and cuts and "auto_stop_at" not in cuts[-1] and \
+                    "recorded_again_at" not in cuts[-1]:
+                cuts[-1]["auto_stop_at"] = at
+            elif b.lower() == "record" and cuts and "recorded_again_at" not in cuts[-1]:
+                cuts[-1]["recorded_again_at"] = at
+        out: dict[str, Any] = {"times": "the Scope View log's (this PC's local time)",
+                               "states": [f"{at} {a} → {b}" for at, a, b in moves[first:]][:16]}
+        if not cuts:
+            out["router_stop_at"] = moves[first][0]
+            out["note"] = (f"the Scope View log names a TwinCAT router stop at {moves[first][0]} while Scope was in "
+                           f"{moves[first][1]}, not Record — the log does not show it cutting a recording (scope_span "
+                           "compares the capture with the recording)")
+            return out
+        out["router_stop_at"] = cuts[0]["router_stop_at"]
+        out["restarts"] = cuts
+        last = cuts[-1]
+        if "auto_stop_at" in cuts[0]:
+            out["auto_stop_at"] = cuts[0]["auto_stop_at"]
+        gaps = [f"{c['router_stop_at']} – {c['recorded_again_at']}" for c in cuts if "recorded_again_at" in c]
+        if "recorded_again_at" in last:
+            out["recorded_again_at"] = last["recorded_again_at"]
+            out["note"] = (f"TwinCAT was restarted while Scope recorded ({len(cuts)}×, Scope View log); Scope recorded "
+                           f"again after each — its data has a gap: {gaps}")
+        elif "auto_stop_at" in last:
+            out["note"] = (f"TwinCAT was restarted while Scope recorded (Scope View log: RouterStop at "
+                           f"{last['router_stop_at']}, AutoStop at {last['auto_stop_at']}, no Record after it): Scope "
+                           "stopped recording at the restart — its data ends there, not at the recording's end"
+                           + (f" (earlier gaps: {gaps})" if gaps else ""))
         else:
-            out["note"] = (f"TwinCAT's router stopped while Scope recorded (Scope View log: RouterStop at {rs}); the log "
-                           "names no AutoStop and no Record after it — whether Scope recorded after it is not known")
+            out["note"] = (f"TwinCAT's router stopped while Scope recorded (Scope View log: RouterStop at "
+                           f"{last['router_stop_at']}); the log names no AutoStop and no Record after it — whether "
+                           "Scope recorded after it is not known" + (f" (earlier gaps: {gaps})" if gaps else ""))
+        if outside:
+            out["router_stops_while_not_recording"] = outside[:8]
         return out
 
     def _csv_samples(p: Path) -> int:
@@ -4162,7 +4189,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 _scope_holds(rid, run, None)
                 return out
             out.update(await _scope_save(run["name"], svdx, csv, mark=run.get("log_mark")))
-            restart = await asyncio.to_thread(_scope_restart, run.get("log_mark"))
+            restart = await asyncio.to_thread(_scope_restart, run.get("start_mark") or run.get("log_mark"))
             if restart is not None:
                 # N180 (0.8.18 retest): a TwinCAT restart during the recording, said in the result and the signed link
                 run["restart"] = out["restart_seen"] = restart
@@ -4185,8 +4212,9 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 # first review of 0.8.17: the recording was deleted while Scope was saved — no signed link to a
                 # recording that is gone; the files written are kept (never deleted by the server), unsealed
                 left = sorted(p.name for p in (svdx, csv, csv.with_name(csv.name[:-4] + ".xae.csv")) if p.is_file())
-                out["note"] = ("the recording was deleted while Scope was saved: its files are kept, not linked to it "
-                               f"nor sealed: {left}")
+                out["note"] = (out["note"] + " · " if out.get("note") else "") + (
+                    f"the recording was deleted while Scope was saved: its files are kept, not linked to it nor sealed: "
+                    f"{left}")
                 app.audit("scope_finish", {"id": rid, "scope": run["scope"], "files": left, "linked": False},
                           OpClass.EDIT, "ok")
         if run.get("log_mark"):

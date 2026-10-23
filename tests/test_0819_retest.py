@@ -136,5 +136,65 @@ async def test_n180_a_twincat_restart_while_scope_recorded_is_said_when_the_save
     if case == "stopped":
         assert "Scope stopped recording at the restart — its data ends there" in sc["note"], sc
     else:
-        assert rs["recorded_again_at"] and "its data has a gap between the two" in sc["note"], sc
+        assert rs["recorded_again_at"] and "Scope recorded again after each — its data has a gap" in sc["note"], sc
+    assert _link(app, rid)["restart"] == rs
+
+
+# ---- review 1 of 0.8.19 ----------------------------------------------------------------------------------------------
+
+def test_n195_r1_a_copy_missing_from_the_first_listing_is_read_again(xae, tmp_path, monkeypatch):
+    """Review 1: the same transient listing could hide the renamed copy itself — the replace then said 'the import
+    made no copy … unchanged' and PRG_TcUnitRunner_1 stayed at the root."""
+    be, dte, sm = xae
+    be.RELIST_SETTLE_S = 0
+    proj, orig, meth, f, dup = _r15_setup(sm, tmp_path)
+    proj.on_import = dup
+    real, calls = be.tree_children, []
+
+    def listing(*a, **k):
+        out = real(*a, **k)
+        calls.append(1)
+        if len(calls) == 2:                   # the listing right after the import misses the copy
+            out = {**out, "items": [x for x in out["items"] if not str(x.get("Name")).endswith("_1")
+                                    and "_1^" not in str(x.get("PathName"))]}
+            out["count"] = len(out["items"])
+        return out
+    monkeypatch.setattr(be, "tree_children", listing)
+    r = be.plcopen_import("TIPC^Plc^Plc Project", str(f), "replace")
+    assert len(calls) == 3 and r["replaced"][0]["object"] == orig.PathName, r
+    assert proj.deleted == ["PRG_TcUnitRunner_1"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("case", ["not_recording", "twice"])
+async def test_n180_r1_the_state_scope_was_in_and_the_last_restart_decide(monkeypatch, project_dir, fake_xae,
+                                                                           tmp_path, case):
+    """Review 1: a router stop while Scope was in Reply (its capture had ended) was said to end its data; with two
+    restarts the first one's Record-again was taken as the data running on."""
+    install(monkeypatch)
+    cfg = mk_cfg(project_dir, mode="guarded", allow_elicitation=False)
+    log = _view_log(tmp_path, cfg)
+    st = _stateful(monkeypatch, fake_xae, log)
+    srv = build_server(cfg)
+    app = srv._tcmcp_app
+    async with client_for(srv) as s:
+        rid = payload(await s.call_tool("rec_start", {**REC, "also_scope": True}))["id"]
+        if case == "not_recording":
+            seq = [("Record", "Reply"), ("Reply", "RouterStop"), ("RouterStop", "AutoStop"), ("AutoStop", "Reply")]
+        else:
+            one = [("Record", "RouterStop"), ("RouterStop", "Reply"), ("Reply", "RouterStop"),
+                   ("RouterStop", "AutoStop"), ("AutoStop", "Reply")]
+            seq = one + [("Reply", "Record")] + one
+        for a, b in seq:
+            _log_line(log, f"Scope Project state changes from '{a}' to '{b}'")
+        st["s"] = "Reply"
+        out = payload(await s.call_tool("rec_stop", {"id": rid}))
+    rs = out["scope"]["restart_seen"]
+    if case == "not_recording":
+        assert "restarts" not in rs and "while Scope was in Reply, not Record" in rs["note"], rs
+        assert "its data ends there" not in out["scope"]["note"], out["scope"]
+    else:
+        assert len(rs["restarts"]) == 2 and "recorded_again_at" not in rs, rs
+        assert "Scope stopped recording at the restart — its data ends there" in rs["note"] and "earlier gaps" in \
+            rs["note"], rs["note"]
     assert _link(app, rid)["restart"] == rs

@@ -1518,6 +1518,7 @@ def test_n194_a_restart_registers_the_notifications_again_and_is_marked(rec, mod
     is marked in the file (_restart), the label is INCOMPLETE and rec_verify FAILs."""
     from twincat_mcp import recorder as R
     monkeypatch.setattr(R, "RUNTIME_CHECK_S", 0.2)
+    monkeypatch.setattr(R, "RUNTIME_AWAY_S", 0.5)
     st = _cycle_rec(rec, mode=mode, cycle_ms=1 if mode == "cycle" else 10)
     c = _conn()
     for i in range(20):
@@ -1549,6 +1550,7 @@ def test_n194_a_restart_registers_the_notifications_again_and_is_marked(rec, mod
 def test_n194_a_runtime_away_until_the_end_is_said(rec, monkeypatch):
     from twincat_mcp import recorder as R
     monkeypatch.setattr(R, "RUNTIME_CHECK_S", 0.2)
+    monkeypatch.setattr(R, "RUNTIME_AWAY_S", 0.5)
     st = _cycle_rec(rec, mode="change", cycle_ms=10)
     c = _conn()
     for i in range(10):
@@ -1593,3 +1595,81 @@ def test_n194_a_quiet_change_recording_is_left_alone(rec, monkeypatch):
     out = rec.stop(st["id"])
     f = _footer(out)
     assert f["label"] == "NOT_PROVABLE" and "resubscriptions" not in f, f
+
+
+# ---- review 1 of 0.8.19 (N194) ------------------------------------------------------------------------------------------
+
+def test_n194_r1_one_failed_version_read_is_no_restart(rec, monkeypatch):
+    """Review 1: one failed version read on a quiet change recording re-registered working notifications and labelled
+    the recording INCOMPLETE ('TwinCAT restarted'). A failure shorter than RUNTIME_AWAY_S that ends with the same
+    version is a failed read."""
+    from twincat_mcp import recorder as R
+    monkeypatch.setattr(R, "RUNTIME_CHECK_S", 0.1)
+    monkeypatch.setattr(R, "RUNTIME_AWAY_S", 2.0)
+    st = _cycle_rec(rec, mode="change", cycle_ms=10)
+    c = _conn()
+    c.fire("MAIN.nCycle", 1, ft(1))
+    time.sleep(0.3)
+    FakeConnection.fail_version_reads = True
+    time.sleep(0.35)
+    FakeConnection.fail_version_reads = False
+    time.sleep(0.3)
+    out = rec.stop(st["id"])
+    f = _footer(out)
+    assert f["label"] == "NOT_PROVABLE" and "resubscriptions" not in f and "runtime_away_at_end" not in f, f
+    assert '"_restart"' not in Path(out["file"]).read_text(encoding="utf-8")
+    assert any("a failed read, not taken as a restart" in n for n in f["program_watch"].get("notes", [])), f
+
+
+def test_n194_r1_without_a_baseline_version_nothing_is_judged(rec, monkeypatch):
+    """Review 1: a target whose version read always fails got 'the runtime has not answered … nothing after it is
+    received' and an until_end marker while samples kept coming."""
+    from twincat_mcp import recorder as R
+    monkeypatch.setattr(R, "RUNTIME_CHECK_S", 0.1)
+    monkeypatch.setattr(R, "RUNTIME_AWAY_S", 0.2)
+    FakeConnection.fail_version_reads = True
+    st = _cycle_rec(rec, mode="change", cycle_ms=10)
+    c = _conn()
+    for i in range(5):
+        c.fire("MAIN.nCycle", i, ft(i))
+        time.sleep(0.25)
+    out = rec.stop(st["id"])
+    f = _footer(out)
+    assert "runtime_away_at_end" not in f and '"until_end"' not in Path(out["file"]).read_text(encoding="utf-8"), f
+
+
+def test_n194_r1_an_online_change_on_a_quiet_recording_is_not_called_a_restart(rec, monkeypatch):
+    """Review 1: version and OnlineChangeCnt moved with the runtime answering all the time — stop_reason said
+    'TwinCAT restarted' and program_changed.after_restart was True."""
+    from twincat_mcp import recorder as R
+    monkeypatch.setattr(R, "RUNTIME_CHECK_S", 0.1)
+    st = _cycle_rec(rec, mode="change", cycle_ms=10)
+    c = _conn()
+    c.fire("MAIN.nCycle", 1, ft(1))
+    time.sleep(0.3)
+    FakeConnection.shared_values[OC_CNT] = 9
+    FakeConnection.symbol_version = 2
+    assert wait_until(lambda: not rec.status(st["id"])["active"], timeout=3)
+    f = _footer(rec.stop(st["id"]))
+    assert "the PLC program changed" in f["stop_reason"] and "TwinCAT restarted" not in f["stop_reason"], f
+    assert f["program_changed"]["after_restart"] is False, f["program_changed"]
+
+
+def test_n194_r1_the_marker_comes_after_the_last_row_from_before_the_restart(rec):
+    """Review 1: a row from before the restart still waiting for its check was written after the marker, and it used
+    up the 'every value again' reset of the first row after the restart."""
+    st = _cycle_rec(rec, mode="change", cycle_ms=10, symbols=["MAIN.nCycle"])
+    r = rec.recs[st["id"]]
+    b = r.blocks[0]
+    r._restart_due = {"t_from": 19.0}                          # (no sample comes in: the ingest thread is idle)
+    b.reset_after = 19.0
+    b.prev = b"\x00" * b.size
+    r._commit_block(19.0, b, b"\x01" * b.size, False)          # from before the restart: compared as before
+    assert b.prev is not None and r._restart_due is not None
+    r._commit_block(5000.0, b, b"\x01" * b.size, False)        # the first row after it: every value
+    assert r._restart_due is None and b.reset_after is None
+    out = rec.stop(st["id"])
+    lines = Path(out["file"]).read_text(encoding="utf-8").splitlines()
+    k = next(i for i, ln in enumerate(lines) if ln.startswith('{"_restart"'))
+    assert [json.loads(ln)[0] for ln in lines[:k] if ln.startswith("[")][-1] == 19.0
+    assert json.loads(lines[k + 1])[0] == 5000.0
