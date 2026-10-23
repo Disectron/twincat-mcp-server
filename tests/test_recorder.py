@@ -1498,14 +1498,21 @@ def test_n187_the_last_program_check_reads_on_an_open_connection(rec):
 
 
 # ------------------------------------------------------------------ N194: a TwinCAT restart during a python recording
+TASK_CC = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"
+
+
 def _restart(c, version):
     """RUN → CONFIG → RUN as the runtime does it: every notification is deleted, version reads fail while the runtime
-    is away, then it answers with a moved symbol version (same compile time, online changes, table sizes)."""
+    is away, then it answers (here with a moved symbol version — same compile time, online changes, table sizes) and
+    its task cycle count started again."""
     c.notifications = {}
     FakeConnection.fail_version_reads = True
 
 
 def _back(version):
+    """The runtime answers again: its task cycle count started again (the fake reads it even while version reads fail
+    — so it drops only here)."""
+    FakeConnection.shared_values[TASK_CC] = 25
     FakeConnection.fail_version_reads = False
     FakeConnection.symbol_version = version
 
@@ -1673,3 +1680,62 @@ def test_n194_r1_the_marker_comes_after_the_last_row_from_before_the_restart(rec
     k = next(i for i, ln in enumerate(lines) if ln.startswith('{"_restart"'))
     assert [json.loads(ln)[0] for ln in lines[:k] if ln.startswith("[")][-1] == 19.0
     assert json.loads(lines[k + 1])[0] == 5000.0
+
+
+
+# ---- review 2 of 0.8.19 (N194) ------------------------------------------------------------------------------------------
+
+def test_n194_r2_a_fast_restart_with_the_same_symbol_version_is_caught_by_the_cycle_count(rec, monkeypatch):
+    """Review 2: a restart shorter than RUNTIME_AWAY_S that came back with the same symbol version (TwinCAT need not
+    move it on a restart) was taken for a failed read — the notifications were never registered again (N194 back).
+    The task cycle count starting again is the restart."""
+    from twincat_mcp import recorder as R
+    monkeypatch.setattr(R, "RUNTIME_CHECK_S", 0.1)
+    monkeypatch.setattr(R, "RUNTIME_AWAY_S", 5.0)
+    st = _cycle_rec(rec, mode="change", cycle_ms=10)
+    c = _conn()
+    for i in range(10):
+        c.fire("MAIN.nCycle", i, ft(i))
+    assert wait_until(lambda: rec.status(st["id"])["samples"] == 10)
+    time.sleep(0.3)                                         # a baseline of the cycle count is read
+    _restart(c, 1)
+    time.sleep(0.35)
+    _back(1)                                                # the same symbol version
+    assert wait_until(lambda: rec.status(st["id"]).get("resubscriptions") == 1, timeout=3), rec.status(st["id"])
+    assert c.notifications
+    f = _footer(rec.stop(st["id"]))
+    assert f["label"] == "INCOMPLETE" and "task cycle count started again" in f["runtime_restarts"][0]["why"], f
+
+
+def test_n194_r2_a_confirmed_away_is_not_cleared_by_a_sample(rec, monkeypatch):
+    """Review 2: after a confirmed outage one sample cleared it as 'could not be read … while samples kept coming'
+    and the hole went unmarked."""
+    from twincat_mcp import recorder as R
+    monkeypatch.setattr(R, "RUNTIME_CHECK_S", 0.1)
+    monkeypatch.setattr(R, "RUNTIME_AWAY_S", 0.3)
+    st = _cycle_rec(rec, mode="change", cycle_ms=10)
+    c = _conn()
+    c.fire("MAIN.nCycle", 1, ft(1))
+    time.sleep(0.3)
+    FakeConnection.fail_version_reads = True                # a route loss: the notifications survive
+    assert wait_until(lambda: "has not answered" in " ".join(rec.status(st["id"]).get("warnings", [])), timeout=3)
+    FakeConnection.fail_version_reads = False
+    c.fire("MAIN.nCycle", 2, ft(5000))
+    assert wait_until(lambda: rec.status(st["id"]).get("resubscriptions") == 1, timeout=3), rec.status(st["id"])
+    f = _footer(rec.stop(st["id"]))
+    assert f["label"] == "INCOMPLETE" and not any("while samples kept coming" in n
+                                                  for n in f["program_watch"].get("notes", [])), f
+
+
+def test_n194_r2_failing_reads_at_the_end_are_said(rec, monkeypatch):
+    from twincat_mcp import recorder as R
+    monkeypatch.setattr(R, "RUNTIME_CHECK_S", 0.1)
+    monkeypatch.setattr(R, "RUNTIME_AWAY_S", 10.0)
+    st = _cycle_rec(rec, mode="change", cycle_ms=10)
+    c = _conn()
+    c.fire("MAIN.nCycle", 1, ft(1))
+    time.sleep(0.3)
+    FakeConnection.fail_version_reads = True
+    time.sleep(0.4)
+    f = _footer(rec.stop(st["id"]))
+    assert any("whether the runtime was away at the end is not known" in n for n in f["program_watch"]["notes"]), f

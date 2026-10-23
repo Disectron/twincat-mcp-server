@@ -166,7 +166,7 @@ def test_n195_r1_a_copy_missing_from_the_first_listing_is_read_again(xae, tmp_pa
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("case", ["not_recording", "twice"])
+@pytest.mark.parametrize("case", ["not_recording", "twice", "reply_then_record"])
 async def test_n180_r1_the_state_scope_was_in_and_the_last_restart_decide(monkeypatch, project_dir, fake_xae,
                                                                            tmp_path, case):
     """Review 1: a router stop while Scope was in Reply (its capture had ended) was said to end its data; with two
@@ -181,6 +181,9 @@ async def test_n180_r1_the_state_scope_was_in_and_the_last_restart_decide(monkey
         rid = payload(await s.call_tool("rec_start", {**REC, "also_scope": True}))["id"]
         if case == "not_recording":
             seq = [("Record", "Reply"), ("Reply", "RouterStop"), ("RouterStop", "AutoStop"), ("AutoStop", "Reply")]
+        elif case == "reply_then_record":          # review 2: a restart whose first line is not Record → RouterStop
+            seq = [("Record", "Reply"), ("Reply", "RouterStop"), ("RouterStop", "AutoStop"), ("AutoStop", "Reply"),
+                   ("Reply", "Record")]
         else:
             one = [("Record", "RouterStop"), ("RouterStop", "Reply"), ("Reply", "RouterStop"),
                    ("RouterStop", "AutoStop"), ("AutoStop", "Reply")]
@@ -192,7 +195,9 @@ async def test_n180_r1_the_state_scope_was_in_and_the_last_restart_decide(monkey
     rs = out["scope"]["restart_seen"]
     if case == "not_recording":
         assert "restarts" not in rs and "while Scope was in Reply, not Record" in rs["note"], rs
-        assert "its data ends there" not in out["scope"]["note"], out["scope"]
+        assert "its data ends there" not in out["scope"]["note"] and "possible_gaps" not in rs, out["scope"]
+    elif case == "reply_then_record":
+        assert rs["possible_gaps"] and "a gap is possible" in rs["note"], rs
     else:
         assert len(rs["restarts"]) == 2 and "recorded_again_at" not in rs, rs
         assert "Scope stopped recording at the restart — its data ends there" in rs["note"] and "earlier gaps" in \

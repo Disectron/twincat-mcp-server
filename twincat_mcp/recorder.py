@@ -79,6 +79,9 @@ VERSION_CHECK_MS = 20.0          # R43: how often the symbol version is read whi
 RUNTIME_CHECK_S = 1.0           # N194: with no sample for this long, is the runtime still the one subscribed to?
 RUNTIME_AWAY_S = 3.0            # review 1 of 0.8.19: reads failing for this long (no sample since) = the runtime away;
                                 # a shorter failure that ends with the same symbol version is a failed read, no restart
+                                # — unless the task cycle count started again (review 2: a restart need not move the
+                                # symbol version, and a fast one is over in under RUNTIME_AWAY_S)
+TASK_CYCLES = "TwinCAT_SystemInfoVarList._TaskInfo[1].CycleCount"
 DRAIN_TIMEOUT_S = 60.0         # a stop writes the backlog for at most this long
 TAIL_WAIT_S = 1.0             # after the duration: wait at most this long for in-flight samples up to the cut
 
@@ -703,6 +706,9 @@ class Recording:
         self._away_ver: int | None = None
         self._away_confirmed = False          # failing for RUNTIME_AWAY_S with no sample: the runtime is away
         self._resub_error: str | None = None
+        self.read_cycles: Callable[[], int] | None = None    # the task cycle count: starts again at a TwinCAT restart
+        self._cycles_last: int | None = None
+        self._cycles_at = 0.0
         self._restart_due: dict[str, Any] | None = None     # the marker, written before the first row after t_from
         self.conn: pyads.Connection | None = None
         self.on_finish: Callable[[], None] | None = None   # releases the notifications (ingest thread, at stop)
@@ -1078,6 +1084,25 @@ class Recording:
         self._away_since = self._away_from_t = self._away_error = self._away_ver = None
         self._away_confirmed = False
 
+    def _cycles_due(self, now: float) -> bool:
+        return (self.read_cycles is not None and self._away_since is None
+                and (self._cycles_last is None or now - self._cycles_at >= RUNTIME_CHECK_S))
+
+    def _read_cycles(self, now: float) -> bool | None:
+        """The task cycle count now against the last one read: True when it started again (a TwinCAT restart — it
+        counts from the start of the runtime; a 32-bit wrap is no restart), False when it went on, None when that
+        cannot be told (no baseline, a failed read). The value read is the next baseline."""
+        if self.read_cycles is None:
+            return None
+        try:
+            c = int(self.read_cycles())
+        except Exception:  # noqa: BLE001
+            return None
+        before, self._cycles_last, self._cycles_at = self._cycles_last, c, now
+        if before is None:
+            return None
+        return c < before and before - c < 0x80000000
+
     def _watch_runtime(self) -> None:
         """N194, ingest thread: no sample for RUNTIME_CHECK_S (a quiet change recording, or a runtime that went away):
         read the symbol version. Reads failing for RUNTIME_AWAY_S with no sample since mark the runtime away; when it
@@ -1091,7 +1116,10 @@ class Recording:
             return
         now = time.monotonic()
         last = max((b.last_wall for b in self.blocks if b.last_wall is not None), default=None)
-        if self._away_since is not None and last is not None and last > self._away_since and not self._resub_error:
+        if self._cycles_due(now):
+            self._read_cycles(now)                   # a fresh baseline while the runtime answers (review 2)
+        if (self._away_since is not None and not self._away_confirmed and last is not None and last > self._away_since
+                and not self._resub_error):
             # samples arrive: the notifications work — the failed reads were reads, not a runtime away
             if len(self.program_notes) < 20:
                 self.program_notes.append(f"the symbol version could not be read for {now - self._away_since:.1f} s "
@@ -1113,15 +1141,31 @@ class Recording:
             return
         was_away = self._away_since is not None
         ver_before = self._away_ver if was_away else self._ver
-        if not was_away and v == self._ver:
+        restarted = self._read_cycles(now)          # True: the cycle count started again; None: not known
+        if not was_away and v == self._ver and not restarted:
             return                                   # quiet values: the runtime ran on
-        if was_away and not self._away_confirmed and not self._resub_error and v == ver_before:
+        if was_away and not self._away_confirmed and not self._resub_error and v == ver_before and not restarted:
             if len(self.program_notes) < 20:
                 self.program_notes.append(f"the symbol version could not be read for {now - self._away_since:.1f} s "
-                                          f"({self._away_error}); it answered again with the same version {v}: a failed "
-                                          "read, not taken as a restart")
+                                          f"({self._away_error}); it answered again with the same version {v}"
+                                          + (" and the task cycle count went on" if restarted is False else "")
+                                          + ": a failed read, not taken as a restart")
             self._clear_away()
             return
+        if not was_away and restarted is False and v != self._ver:
+            # the version moved while the task cycle count went on: no restart — a download or an online change
+            # (another identity: ends below) or the same program (its notifications still work: nothing registered)
+            id_same = None
+            try:
+                id_same = self.read_identity() == self._identity if self.read_identity is not None else None
+            except Exception:  # noqa: BLE001
+                id_same = None
+            if id_same:
+                if len(self.program_notes) < 20:
+                    self.program_notes.append(f"symbol version {self._ver} -> {v} with the same program and no restart "
+                                              "(the task cycle count went on): the recording continued")
+                self._ver = v
+                return
         id_now = None
         try:
             id_now = self.read_identity() if self.read_identity is not None else None
@@ -1129,10 +1173,14 @@ class Recording:
             id_now = None
         t_from = self._away_from_t if was_away else (self._max_seen_t if self.t0_ft is not None else None)
         why = (f"the runtime did not answer for {now - self._away_since:.1f} s ({self._away_error})" if was_away else
-               f"its symbol version moved {ver_before} -> {v} with no sample since")
+               f"its symbol version moved {ver_before} -> {v} with no sample since" if v != ver_before else
+               "the task cycle count started again")
+        if restarted and was_away:
+            why += "; the task cycle count started again"
         if self._identity is None or id_now is None or id_now != self._identity:
             what = (f"the program is another one ({self._identity} -> {id_now})" if id_now and self._identity else
                     "the program could not be identified (compile time, online changes, table sizes)")
+            was_away = was_away or bool(restarted)
             if self.program_changed is None:
                 self.program_changed = {
                     "after_ms": None if self._verified_t is None else round(self._verified_t, 4),
@@ -1606,6 +1654,11 @@ class Recording:
                     self._restart_due = None
                 if self._is_away():
                     self._restart_marker({"t_from": self._away_from_t}, until_end=True)
+                elif self._away_since is not None and len(self.program_notes) < 20:
+                    # review 2 of 0.8.19: failing reads shorter than RUNTIME_AWAY_S at the end are said, not judged
+                    self.program_notes.append(f"the symbol version could not be read for the last "
+                                              f"{time.monotonic() - self._away_since:.1f} s ({self._away_error}) with no "
+                                              "sample since — whether the runtime was away at the end is not known")
                 if self.mode == "cycle" and self.t0_wall is not None:
                     ws, we = self.window_start(), self.window_end()
                     fb, org = self.fallback_period(), self.window_origin()
@@ -2655,6 +2708,7 @@ class Recorder:
         rec.on_closed = lambda: self._stop_notifications(rec)
         rec.read_program = lambda: int(conn.read(ADSIGRP_SYM_VERSION, 0, ctypes.c_ubyte))     # R43, ingest thread
         rec.read_identity = lambda: _program_identity(conn)
+        rec.read_cycles = lambda: int(conn.read_by_name(TASK_CYCLES, pyads.PLCTYPE_UDINT))       # N194 (review 2)
         trans = C.ADSTRANS_SERVERCYCLE if rec.mode == "cycle" else C.ADSTRANS_SERVERONCHA
         _fast_switch(+1)          # the ADS callback thread gets the GIL within ~0.5 ms instead of up to 5 ms
         rec._fast_switch = True

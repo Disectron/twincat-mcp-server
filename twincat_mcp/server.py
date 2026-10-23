@@ -3935,12 +3935,20 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             return None
         cuts: list[dict[str, Any]] = []
         outside: list[str] = []
+        outside_open: str | None = None
+        outside_gaps: list[str] = []
         for at, a, b in moves:
+            if b.lower() == "record" and outside_open is not None:
+                # review 2 of 0.8.19: Scope recorded again after a router stop it was not seen recording at — the
+                # stop's first line may not be 'Record → RouterStop' on every TE130x: a gap is possible, said
+                outside_gaps.append(f"{outside_open} – {at}")
+                outside_open = None
             if b.lower() == "routerstop":
                 if a.lower() == "record":
                     cuts.append({"router_stop_at": at})
                 elif not cuts or "recorded_again_at" in cuts[-1]:
                     outside.append(f"{at} (Scope in {a})")
+                    outside_open = outside_open or at
             elif b.lower() == "autostop" and cuts and "auto_stop_at" not in cuts[-1] and \
                     "recorded_again_at" not in cuts[-1]:
                 cuts[-1]["auto_stop_at"] = at
@@ -3948,11 +3956,15 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 cuts[-1]["recorded_again_at"] = at
         out: dict[str, Any] = {"times": "the Scope View log's (this PC's local time)",
                                "states": [f"{at} {a} → {b}" for at, a, b in moves[first:]][:16]}
+        if outside_gaps:
+            out["possible_gaps"] = outside_gaps[:8]
         if not cuts:
             out["router_stop_at"] = moves[first][0]
             out["note"] = (f"the Scope View log names a TwinCAT router stop at {moves[first][0]} while Scope was in "
                            f"{moves[first][1]}, not Record — the log does not show it cutting a recording (scope_span "
-                           "compares the capture with the recording)")
+                           "compares the capture with the recording)"
+                           + (f"; Scope recorded again after it — a gap is possible: {outside_gaps}" if outside_gaps
+                              else ""))
             return out
         out["router_stop_at"] = cuts[0]["router_stop_at"]
         out["restarts"] = cuts
