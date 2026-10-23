@@ -114,6 +114,14 @@ MANUAL: dict[str, str] = {
     "xae_plcopen_import": "import the PLCopen XML exported below into the scratch folder",
     "xae_plcopen_export": "export one FB to PLCopen XML and open the file",
     "xae_boot_project": "test box only",
+    "xae_library_add": "on a copy of the project: add a library it does not reference (e.g. Tc2_Math), xae_build, then "
+                       "xae_library_remove it and build again — the references are as before",
+    "xae_library_remove": "remove the library added above; a name referenced twice is refused until kind= says which",
+    "xae_placeholder_add": "on a copy: add a placeholder (e.g. Tc2_Math), then resolve and freeze it",
+    "xae_placeholder_resolve": "resolve the placeholder added above to an installed version; the result's effective "
+                               "resolution must be that version",
+    "xae_placeholder_freeze": "freeze the placeholder added above; xae_build(save_first=true), the .plcproj then has a "
+                              "PlaceholderResolution for it",
     "proj_set_code": "edit a comment in a scratch POU on disk, confirm byte-exact round trip with git diff",
     "exp_run": "HARDWARE_DAY §8: one real run (max_runs=1) on the test box after the dry run passes here",
     "exp_abort": "abort the real run above and confirm the factor was restored (snap_compare)",
@@ -129,6 +137,7 @@ OPTIONAL = {  # a failure here is environmental, reported as WARN with the error
     "infosys_books", "infosys_index", "infosys_search_symbols", "infosys_declaration", "infosys_search",
     "infosys_search_code", "infosys_get_page", "ads_app_info", "xae_links", "xae_diagnostics", "proj_changed",
     "ipc_list_dir", "ipc_read_file", "rec_pulses", "rec_latency", "ads_wait_until", "test_stable",
+    "xae_library_list", "xae_library_installed", "xae_library_repositories",
 }
 
 
@@ -725,7 +734,8 @@ class Acceptance:
     async def phase_xae(self) -> None:
         ph = "9 xae"
         self.log("[9] XAE, read-only")
-        tools = ("xae_attach", "xae_status", "xae_plc_projects", "xae_tree_get", "xae_pou_get", "xae_list_commands", "xae_dialogs", "xae_links", "xae_diagnostics", "scope_list")
+        tools = ("xae_attach", "xae_status", "xae_plc_projects", "xae_tree_get", "xae_pou_get", "xae_list_commands", "xae_dialogs", "xae_links", "xae_diagnostics", "scope_list",
+                 "xae_library_list", "xae_library_installed", "xae_library_repositories")
         if not self.with_xae or sys.platform != "win32":
             for t in tools:
                 self.skip(ph, t, "--no-xae or not Windows")
@@ -766,8 +776,14 @@ class Acceptance:
         await self.check(ph, "xae_dialogs", {}, lambda p: None if isinstance(p, dict) and "scope" in p and "none" not in str(p.get("scope")) else "watchdog has no process scope — pid unknown")
         if self.plc_project_path:
             await self.check(ph, "xae_links", {"plc_project_path": self.plc_project_path}, timeout_s=120)
+            lib = {"plc_project_path": self.plc_project_path}
+            await self.check(ph, "xae_library_list", lib, lambda p: None if isinstance(p, dict) and "references" in p
+                             else "no references", timeout_s=300)
+            await self.check(ph, "xae_library_installed", {**lib, "name": "Tc2_", "max_items": 20}, timeout_s=300)
+            await self.check(ph, "xae_library_repositories", lib, timeout_s=120)
         else:
-            self.skip(ph, "xae_links", "no PLC project path")
+            for t in ("xae_links", "xae_library_list", "xae_library_installed", "xae_library_repositories"):
+                self.skip(ph, t, "no PLC project path")
         await self.check(ph, "xae_diagnostics", {"tail_lines": 50}, timeout_s=120)
         if self.with_build:
             await self.check(ph, "xae_build", {}, timeout_s=self.cfg.xae.build_timeout_s + 60)

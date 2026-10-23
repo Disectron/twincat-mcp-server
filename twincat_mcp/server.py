@@ -333,6 +333,10 @@ TOKEN_TARGET_DOC = {
     "xae_command": "'<command name>@<XAE target NetId>'",
     "xae_boot_project": "the plc_project_path (with '@<XAE target NetId>' when activate_after_generate)",
     "xae_tree_delete": "'<parent_path>^<name>'",
+    "xae_library_add / xae_library_remove": "'<iec project path>:<library>'",
+    "xae_placeholder_add": "'<iec project path>:<placeholder>'",
+    "xae_placeholder_resolve": "'<iec project path>:<placeholder>=<library>'",
+    "xae_placeholder_freeze": "'<iec project path>:<placeholder>' ('*' for all)",
     "xae_target": "the new NetId", "xae_dialog_resolve": "'<dialog title>:<button>'",
     "ads_plc_state / ads_system_mode": "the action (run, stop, reset / run, config)",
     "ads_connect": "the NetId, or 'local'", "ads_add_route_to_plc": "the PLC's IP address",
@@ -1674,6 +1678,22 @@ class App:
                 raise ToolError(f"{exc} (and no XAE shell is attached: {str(xae_exc)[:160]})") from exc
             raise
 
+    async def plc_project(self, path: Any, action: str) -> str:
+        """The PLC project (iec project path) of the open solution a tool acts on: plc_project_path in any of its
+        forms, else the only one — never a guess among several, never one that is not there."""
+        projs = await self.xae_call(self.xae._nested_projects, None, timeout=120)
+        if path:
+            want = _plc_iec_path(str(path))
+            hit = [p for p in projs if p.lower() == want.lower()]
+            if not hit:
+                raise TargetArgsError(f"no PLC project {str(path)!r} in the open solution — its PLC projects: {projs} "
+                                      "(xae_plc_projects lists them)")
+            return hit[0]
+        if len(projs) != 1:
+            raise TargetArgsError(f"{len(projs)} PLC projects — {action} needs plc_project_path, and its token names "
+                                  f"it: {projs}")
+        return projs[0]
+
     async def _xae_netid(self) -> str:
         return str((await self.xae_call(self.xae.target_get, timeout=60)).get("target_net_id", ""))
 
@@ -1689,23 +1709,27 @@ class App:
             act = str(a.get("action") or "")
             if not act:
                 raise TargetArgsError("xae_plc's token names the action: pass args={'action': 'login', 'plc_project_path': …}")
-            path = a.get("plc_project_path")
             # N78: the token names a PLC project of the open solution — one that does not exist gets no token (and
             # the tool, which computes its target the same way, refuses it before anything is done)
-            projs = await self.xae_call(self.xae._nested_projects, None, timeout=120)
-            if path:
-                want = _plc_iec_path(str(path))
-                hit = [p for p in projs if p.lower() == want.lower()]
-                if not hit:
-                    raise TargetArgsError(f"no PLC project {str(path)!r} in the open solution — its PLC projects: {projs} "
-                                    "(xae_plc_projects lists them)")
-                proj = hit[0]
-            else:
-                if len(projs) != 1:
-                    raise TargetArgsError(f"{len(projs)} PLC projects — xae_plc needs plc_project_path, and its token names it: "
-                                    f"{projs}")
-                proj = projs[0]
+            proj = await self.plc_project(a.get("plc_project_path"), "xae_plc")
             return f"{act}:{proj}@{await self._xae_netid()}"
+        if action in LIB_ACTIONS:
+            # 0.8.19: '<iec project path>:<name>' — the PLC project and the library / placeholder (resolve: and what
+            # it is resolved to), so a token for one library or project does not serve another
+            proj = await self.plc_project(a.get("plc_project_path"), action)
+            if action == "xae_placeholder_freeze":
+                return f"{proj}:{str(a.get('placeholder') or '').strip().lstrip('#') or '*'}"
+            if action.startswith("xae_placeholder"):
+                name = str(a.get("placeholder") or "").strip().lstrip("#")
+                if not name:
+                    raise TargetArgsError(f"{action}'s token names the placeholder: pass args={{'placeholder': …}}")
+                if action == "xae_placeholder_resolve":
+                    return f"{proj}:{name}={str(a.get('library') or '').strip()}"
+                return f"{proj}:{name}"
+            name = str(a.get("library") or "").strip()
+            if not name:
+                raise TargetArgsError(f"{action}'s token names the library: pass args={{'library': …}}")
+            return f"{proj}:{name}"
         if action == "xae_command":
             return f"{a.get('name', '')}@{await self._xae_netid()}"
         if action == "xae_boot_project":
@@ -1772,7 +1796,8 @@ class App:
         # elicitation path — the prompt must read as what it is: a safety confirmation, with the exact effect
         effect = ACTION_EFFECTS.get(action, "changes the state of the machine or project")
         kind = ("DESTRUCTIVE" if op is OpClass.DESTRUCTIVE else
-                "KNOWLEDGE BASE" if action.startswith("kb_") else "MACHINE CONTROL")
+                "KNOWLEDGE BASE" if action.startswith("kb_") else
+                "PLC PROJECT (libraries)" if action in LIB_ACTIONS else "MACHINE CONTROL")
         prompt = (f"{kind}: {action}\n"
                   f"Target: {target or '(current target)'}\n"
                   f"Machine: {scope}   Mode: {self.guard.mode}\n"
@@ -1955,6 +1980,10 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
 
 
 
+# 0.8.19: the library manager's changes — confirmed in guarded mode, the token names the PLC project and the library
+LIB_ACTIONS = frozenset({"xae_library_add", "xae_library_remove", "xae_placeholder_add", "xae_placeholder_resolve",
+                         "xae_placeholder_freeze"})
+
 # PLC code / project edits gated by safety.edit_requires_config_mode
 CODE_EDIT_ACTIONS = frozenset({"xae_pou_set", "xae_pou_create", "proj_set_code", "xae_tree_consume_xml", "xae_tree_set_values",
                                "xae_tree_create_child", "xae_plcopen_import", "tcunit_scaffold", "xae_io_disable"})
@@ -1971,6 +2000,13 @@ ACTION_EFFECTS = {
     "xae_plc": "PLC online action (login / download / online change / start / stop / reset) on the target",
     "xae_command": "runs an arbitrary XAE shell command — may download, log in, activate or delete",
     "xae_tree_delete": "deletes the item from the TwinCAT project",
+    "xae_library_add": "adds a library reference to the PLC project (XAE reloads the project; nothing is built)",
+    "xae_library_remove": "removes a library or placeholder reference from the PLC project — code that uses it no "
+                          "longer builds (nothing is built, nothing in the code is changed)",
+    "xae_placeholder_add": "adds a placeholder reference to the PLC project (nothing is built)",
+    "xae_placeholder_resolve": "changes the library version a placeholder resolves to (nothing is built)",
+    "xae_placeholder_freeze": "fixes the placeholder(s) at the version they resolve to now — '*' no longer follows "
+                              "newer installed versions (nothing is built)",
     "ads_plc_state": "changes the PLC run state (RUN/STOP/RESET) — the machine stops or starts executing",
     "ads_system_mode": "switches TwinCAT between RUN and CONFIG — the PLC stops in CONFIG",
     "ipc_reboot": "reboots or shuts down the IPC",
@@ -5358,6 +5394,146 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         usual reason an output never moves — and links whose variable is gone. plc_project_path: plc_path,
         iec_project_path or instance_path. What could not be read is said (unlinked_count null), never counted as 0."""
         return await app.xae_call(app.xae.links, plc_project_path, timeout=300)
+
+    async def _lib_vs_saved(proj: str, refs: list[dict[str, Any]]) -> dict[str, Any]:
+        """xae_library_list: the references XAE holds against the saved .plcproj of that PLC project (found by its
+        file name <Name>.plcproj under the project root) — unsaved changes, or a file on disk that is another state."""
+        name = proj.split("^")[1] if proj.count("^") >= 1 else proj
+        try:
+            await app.proj_call(app.proj._ensure)
+            files = [str(pp["file"]) for pp in app.proj.plcproj]
+        except ToolError as exc:
+            return {"compared": False, "why": f"the project folder could not be read: {exc}"}
+        cand = [f for f in files if Path(f).stem.lower() == name.lower()]
+        if len(cand) != 1:
+            return {"compared": False, "why": (f"{len(cand)} files named {name}.plcproj under the project root: {cand}"
+                                                if cand else f"no {name}.plcproj under the project root")}
+        rep = (await asyncio.to_thread(K.library_report, cand, {}))["projects"][0]
+        if rep.get("error"):
+            return {"compared": False, "file": cand[0], "why": rep["error"]}
+        saved = {(r["kind"], r["name"].lstrip("#").lower()): r for r in rep["libraries"]}
+        xae = {(r["kind"], r["name"].lstrip("#").lower()): r for r in refs}
+        out: dict[str, Any] = {"compared": True, "file": cand[0]}
+        only_x = [f"{k[0]} {xae[k]['name']}" for k in xae if k not in saved]
+        only_s = [f"{k[0]} {saved[k]['name']}" for k in saved if k not in xae]
+        vdiff = []
+        for k in xae.keys() & saved.keys():
+            x, sv = xae[k], saved[k]
+            if k[0] == "library":
+                xv = x.get("version")
+            else:          # a pinned placeholder is saved with the version it resolves to, else with its default
+                xv = (x.get("effective" if sv.get("pinned_by") else "default") or {}).get("version")
+            if xv and sv.get("requested") and xv != sv["requested"]:
+                vdiff.append({"reference": f"{k[0]} {x['name']}", "xae": xv, "saved": sv["requested"]})
+        if only_x:
+            out["only_in_xae"] = only_x
+        if only_s:
+            out["only_in_saved_file"] = only_s
+        if vdiff:
+            out["version_differs"] = vdiff
+        out["same"] = not (only_x or only_s or vdiff)
+        if not out["same"]:
+            out["note"] = ("XAE holds other references than the saved file: changes not saved yet (xae_build with "
+                           "save_first saves them), or the file on disk is another state of the project")
+        return out
+
+    # ======================================================================
+    # PLC libraries through XAE (0.8.19, docs/PLAN-0.8.19.md)
+    # ======================================================================
+    @mcp.tool(annotations=READ)
+    async def xae_library_list(plc_project_path: str | None = None, check_installed: bool = True) -> dict[str, Any]:
+        """The library references of a PLC project as XAE holds them now (TE1000 ITcPlcLibraryManager): libraries
+        (name, version, distributor) and placeholders (default and effective resolution — '*' and what it resolves
+        to). Flags a library referenced twice and a version that is not installed (ScanLibraries; check_installed=false
+        skips it), and what differs from the saved .plcproj (unsaved changes). plc_project_path: plc_path,
+        iec_project_path or instance_path — needed when the solution has more than one PLC project."""
+        proj = await app.plc_project(plc_project_path, "xae_library_list")
+        res = await app.xae_call(app.xae.library_list, proj, check_installed, timeout=300)
+        res["saved_plcproj"] = await _lib_vs_saved(proj, res.get("references") or [])
+        return res
+
+    @mcp.tool(annotations=READ)
+    async def xae_library_installed(name: str | None = None, plc_project_path: str | None = None,
+                                    max_items: int = 500) -> dict[str, Any]:
+        """The libraries installed in the repositories XAE uses (ScanLibraries): name, version, distributor — every
+        version of a library. name filters (part of the name, any case)."""
+        proj = await app.plc_project(plc_project_path, "xae_library_installed")
+        return await app.xae_call(app.xae.library_installed, proj, name, max(1, min(int(max_items), 5000)),
+                                  timeout=300)
+
+    @mcp.tool(annotations=READ)
+    async def xae_library_repositories(plc_project_path: str | None = None) -> dict[str, Any]:
+        """The library repositories XAE uses, in priority order (name, folder). Where this XAE's Automation Interface
+        does not give them, it says so — nothing is guessed."""
+        proj = await app.plc_project(plc_project_path, "xae_library_repositories")
+        return await app.xae_call(app.xae.library_repositories, proj, timeout=120)
+
+    async def _lib_action(action: str, op: OpClass, args: dict[str, Any], confirm_token: str | None, ctx: Any,
+                          fn: Any, *fargs: Any) -> dict[str, Any]:
+        proj = await app.plc_project(args.get("plc_project_path"), action)
+        tgt = await app.token_target(action, args)
+        app.guard_safety_path(proj, action)
+        await app.permit(ctx, op, action, tgt, confirm_token)
+        return await app.confirmed(action, {**{k: v for k, v in args.items() if v not in (None, "")}, "target": tgt},
+                                   op, app.xae_call(fn, proj, *fargs, timeout=300))
+
+    @mcp.tool(annotations=EDIT)
+    async def xae_library_add(library: str, version: str = "", distributor: str = "",
+                              plc_project_path: str | None = None, confirm_token: str | None = None,
+                              ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Add a library reference (AddLibrary): library by name (version '' = the newest / managed one, distributor
+        optional) or by display name 'Tc2_Math, * (Beckhoff Automation GmbH)'. Refused when it is already referenced.
+        Runs once; the result has the references before / after, XAE's messages, and build_required — it never builds.
+        guarded: confirmation tc_request_confirmation(action='xae_library_add', target='<iec project path>:<library>')."""
+        a = {"library": library, "version": version, "distributor": distributor, "plc_project_path": plc_project_path}
+        return await _lib_action("xae_library_add", OpClass.CONTROL, a, confirm_token, ctx, app.xae.library_add,
+                                 library, version, distributor)
+
+    @mcp.tool(annotations=DESTR)
+    async def xae_library_remove(library: str, version: str = "", distributor: str = "", kind: str | None = None,
+                                 plc_project_path: str | None = None, confirm_token: str | None = None,
+                                 ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Remove a library or placeholder reference (RemoveReference). A name referenced more than once (a library
+        and a placeholder of the same name, two versions) is refused until kind ('library' / 'placeholder') or version
+        says which. Code that uses it does not build any more — said, nothing in the code is changed. Destructive-class:
+        tc_request_confirmation(action='xae_library_remove', target='<iec project path>:<library>')."""
+        a = {"library": library, "version": version, "distributor": distributor, "kind": kind,
+             "plc_project_path": plc_project_path}
+        return await _lib_action("xae_library_remove", OpClass.DESTRUCTIVE, a, confirm_token, ctx,
+                                 app.xae.library_remove, library, version, distributor, kind)
+
+    @mcp.tool(annotations=EDIT)
+    async def xae_placeholder_add(placeholder: str, library: str = "", version: str = "", distributor: str = "",
+                                  plc_project_path: str | None = None, confirm_token: str | None = None,
+                                  ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Add a placeholder (AddPlaceholder) with its default library (library '' = the device's placeholder of that
+        name). target='<iec project path>:<placeholder>'."""
+        a = {"placeholder": placeholder, "library": library, "version": version, "distributor": distributor,
+             "plc_project_path": plc_project_path}
+        return await _lib_action("xae_placeholder_add", OpClass.CONTROL, a, confirm_token, ctx,
+                                 app.xae.placeholder_add, placeholder, library, version, distributor)
+
+    @mcp.tool(annotations=EDIT)
+    async def xae_placeholder_resolve(placeholder: str, library: str, version: str = "", distributor: str = "",
+                                      plc_project_path: str | None = None, confirm_token: str | None = None,
+                                      ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Set what a placeholder resolves to (SetEffectiveResolution): library, version ('' or '*' = newest).
+        The result checks the effective resolution after it. target='<iec project path>:<placeholder>=<library>'."""
+        a = {"placeholder": placeholder, "library": library, "version": version, "distributor": distributor,
+             "plc_project_path": plc_project_path}
+        return await _lib_action("xae_placeholder_resolve", OpClass.CONTROL, a, confirm_token, ctx,
+                                 app.xae.placeholder_resolve, placeholder, library, version, distributor)
+
+    @mcp.tool(annotations=EDIT)
+    async def xae_placeholder_freeze(placeholder: str | None = None, plc_project_path: str | None = None,
+                                     confirm_token: str | None = None,
+                                     ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Freeze a placeholder (all when placeholder is left out) at the version it resolves to now
+        (FreezePlaceholder): '*' no longer follows newer installed versions. target='<iec project path>:<placeholder>'
+        ('*' for all)."""
+        a = {"placeholder": placeholder, "plc_project_path": plc_project_path}
+        return await _lib_action("xae_placeholder_freeze", OpClass.CONTROL, a, confirm_token, ctx,
+                                 app.xae.placeholder_freeze, placeholder)
 
     @mcp.tool(annotations=READ)
     async def ads_discover(timeout_s: float = 2.0, broadcast: str = "255.255.255.255") -> dict[str, Any]:

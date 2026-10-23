@@ -1667,6 +1667,296 @@ class XaeBackend:
         self._on_item(parent_path, lambda p: p.DeleteChild(name), f"DeleteChild {name}", once=True)
         return {"deleted": f"{parent_path}^{name}"}
 
+    # ------------------------------------------------------------ PLC libraries (0.8.19)
+    # TE1000 ITcPlcLibraryManager on '<PLC project>^References' (probe of 2026-10-22, 4024: _ITcPlcLibraryManager with
+    # References, Repositories, AddLibrary, RemoveReference, AddPlaceholder, SetEffectiveResolution, FreezePlaceholder,
+    # ScanLibraries). A reference is an ITcPlcLibrary (Name, Version, Distributor, DisplayName) or an
+    # ITcPlcPlaceholderRef (PlaceholderName, DefaultResolution, EffectiveResolution — each an ITcPlcLibrary). No member
+    # says whether a placeholder is frozen: FreezePlaceholder "freezes the EffectiveResolution" — the placeholder keeps
+    # the version it resolves to now (the .plcproj's PlaceholderResolution), as SetEffectiveResolution sets one.
+    LIB_RELIST_S = 1.0                     # pause before the references are read again after an action (N195)
+
+    def _libman(self, plc_project_path: str) -> tuple[str, Any]:
+        """('<nested project>^References', its item) — XaeError when the item offers no library manager."""
+        path = f"{_plc_split(plc_project_path)[1]}^References"
+        it = self._item(path)
+        if not self._retry(lambda: _has_prop(it, "References"), "References?"):
+            raise XaeError(f"{path} offers no library manager (ITcPlcLibraryManager) in this XAE — its libraries "
+                           "cannot be read or changed through the Automation Interface here")
+        return path, it
+
+    def _members(self, coll: Any, what: str) -> list[Any]:
+        """The items of a TE1000 collection (ITcPlcReferences, ITcPlcLibRepositories): its enumerator, else Count /
+        Item(i) — 1-based, then 0-based. A collection that gives neither raises: never an empty list."""
+        if coll is None:
+            raise XaeError(f"{what}: XAE returned no collection (TE1000: 'null if not connected')")
+        try:
+            return [_disp(x) for x in self._retry(lambda: list(iter(coll)), f"{what} (enumerator)")]
+        except (XaeBusy, XaeGone):
+            raise
+        except (XaeError, TypeError):
+            pass
+        n = int(self._retry(lambda: coll.Count, f"{what}.Count"))
+        try:
+            return [_disp(self._retry(lambda i=i: coll.Item(i), f"{what}.Item({i})")) for i in range(1, n + 1)]
+        except (XaeBusy, XaeGone):
+            raise
+        except XaeError:
+            return [_disp(self._retry(lambda i=i: coll.Item(i), f"{what}.Item({i})")) for i in range(n)]
+
+    def _lib_obj(self, lib: Any, what: str) -> dict[str, Any]:
+        """An ITcPlcLibrary as library / version / distributor / display ({} for none)."""
+        if lib is None:
+            return {}
+        if isinstance(lib, str):
+            return _lib_parts(lib)
+        d: dict[str, Any] = {}
+        for k, key in (("Name", "library"), ("Version", "version"), ("Distributor", "distributor"),
+                       ("DisplayName", "display")):
+            v = self._get(lambda k=k: getattr(lib, k), f"{what}.{k}")
+            if v is not None:
+                d[key] = str(v)
+        if "display" in d and not ("library" in d and "version" in d):
+            d = {**_lib_parts(d["display"]), **d}
+        return d
+
+    def _lib_refs(self, it: Any, path: str) -> list[dict[str, Any]]:
+        """The references of the library manager `it`: {kind: library, name, version, distributor, display} or
+        {kind: placeholder, name, default: {…}, effective: {…}}."""
+        out = []
+        for r in self._members(self._retry(lambda: it.References, f"{path}.References"), f"{path}.References"):
+            if self._retry(lambda r=r: _has_prop(r, "PlaceholderName"), "PlaceholderName?"):
+                row: dict[str, Any] = {"kind": "placeholder",
+                                       "name": str(self._retry(lambda r=r: r.PlaceholderName, "PlaceholderName"))}
+                for k, key in (("DefaultResolution", "default"), ("EffectiveResolution", "effective")):
+                    if self._retry(lambda r=r, k=k: _has_prop(r, k), f"{k}?"):
+                        row[key] = self._lib_obj(self._retry(lambda r=r, k=k: getattr(r, k), k), k)
+            else:
+                lib = self._lib_obj(r, "library")
+                row = {"kind": "library", "name": lib.get("library") or lib.get("display") or "?",
+                       **{k: v for k, v in lib.items() if k in ("version", "distributor", "display")}}
+            out.append(row)
+        return out
+
+    def _lib_refs_now(self, plc_project_path: str) -> list[dict[str, Any]]:
+        path, it = self._libman(plc_project_path)          # looked up again: AddLibrary reloads the project
+        return self._lib_refs(it, path)
+
+    def _installed(self, it: Any, path: str) -> list[dict[str, Any]]:
+        coll = _disp(self._retry(lambda: _com_call(it, "ScanLibraries"), f"{path}.ScanLibraries"))
+        return [self._lib_obj(x, "ScanLibraries item") for x in self._members(coll, "ScanLibraries")]
+
+    def library_list(self, plc_project_path: str, check_installed: bool = True) -> dict[str, Any]:
+        path, it = self._libman(plc_project_path)
+        refs = self._lib_refs(it, path)
+        res: dict[str, Any] = {"plc_project": _plc_split(plc_project_path)[1], "references_item": path,
+                               "count": len(refs), "references": refs}
+        flags: list[str] = []
+        by_lib: dict[str, list[str]] = {}
+        for r in refs:
+            eff, dflt = r.get("effective") or {}, r.get("default") or {}
+            lib = eff.get("library") if r["kind"] == "placeholder" else r["name"]
+            if lib:
+                by_lib.setdefault(lib.lower(), []).append(f"{r['kind']} {r['name']}")
+            if r["kind"] == "placeholder" and dflt.get("version") == "*" and eff.get("version"):
+                r["resolves"] = f"'*' (newest installed) resolves to {eff['version']} here"
+        twice = {k: v for k, v in by_lib.items() if len(v) > 1}
+        if twice:
+            res["referenced_twice"] = twice
+            flags.append(f"a library referenced more than once: {twice}")
+        if check_installed:
+            try:
+                inst = self._installed(it, path)
+            except (XaeBusy, XaeGone):
+                raise
+            except XaeError as exc:
+                res["installed_check"] = f"not checked: ScanLibraries failed: {exc}"
+            else:
+                have: dict[str, set[str]] = {}
+                for x in inst:
+                    have.setdefault((x.get("library") or "").lower(), set()).add(x.get("version") or "")
+                for r in refs:
+                    eff = r.get("effective") or {}
+                    lib, ver = (eff.get("library"), eff.get("version")) if r["kind"] == "placeholder" else \
+                        (r["name"], r.get("version"))
+                    if not lib or not ver or ver == "*":
+                        continue
+                    vs = have.get(lib.lower())
+                    if vs is None:
+                        r["not_installed"] = f"{lib} is not installed in a repository ScanLibraries reads"
+                    elif ver not in vs:
+                        r["not_installed"] = f"{lib} {ver} is not installed (installed: {sorted(v for v in vs if v)})"
+                    if r.get("not_installed"):
+                        flags.append(r["not_installed"])
+                res["installed_count"] = len(inst)
+        if flags:
+            res["flags"] = flags
+        return res
+
+    def library_installed(self, plc_project_path: str, name: str | None = None, max_items: int = 500) -> dict[str, Any]:
+        path, it = self._libman(plc_project_path)
+        inst = self._installed(it, path)
+        want = (name or "").strip().lower()
+        hits = [x for x in inst if not want or want in (x.get("library") or x.get("display") or "").lower()]
+        hits.sort(key=lambda x: ((x.get("library") or "").lower(), _ver_key(x.get("version"))))
+        res: dict[str, Any] = {"count": len(hits), "libraries": hits[:max_items], "scanned": len(inst)}
+        if want:
+            res["filter"] = name
+        if len(hits) > max_items:
+            res["truncated"] = f"{len(hits) - max_items} more — narrow it with name= or raise max_items"
+        return res
+
+    def library_repositories(self, plc_project_path: str) -> dict[str, Any]:
+        path, it = self._libman(plc_project_path)
+        try:
+            rows = []
+            for r in self._members(self._retry(lambda: it.Repositories, f"{path}.Repositories"), "Repositories"):
+                row = {}
+                for k in ("Name", "Folder"):
+                    v = self._get(lambda r=r, k=k: getattr(r, k), f"Repository.{k}")
+                    if v is not None:
+                        row[k.lower()] = str(v)
+                rows.append(row)
+        except (XaeBusy, XaeGone):
+            raise
+        except XaeError as exc:
+            # the 2026-10-22 probe: the collection's items gave E_NOINTERFACE (0x80004002) on 4024 — nothing is guessed
+            raise XaeError(f"the library repositories are not readable through this XAE's Automation Interface ({exc})"
+                           " — XAE shows them under PLC > Library Repository") from exc
+        return {"count": len(rows), "repositories": rows,
+                "note": "in priority order: the first repository that holds a library version is the one used"}
+
+    def _lib_change(self, plc_project_path: str, path: str, before: list[dict[str, Any]], what: str,
+                    op: Callable[[Any], Any], expect: Callable[[list[dict[str, Any]]], str | None],
+                    expect_gone: frozenset[str] = frozenset()) -> dict[str, Any]:
+        """One library manager action on the references item at path: the action (once — never run twice; its XAE
+        messages read), the references after it (read again after LIB_RELIST_S when they lack one that was there and
+        was not to go: AddLibrary reloads the project, and a listing right after a reload missed a reference in the
+        0.8.18 retest, N195) and the difference to `before`. expect(after) → what is wrong with the result, or None."""
+        self._on_item(path, op, what, once=True)
+        res: dict[str, Any] = {"plc_project": _plc_split(plc_project_path)[1], "action": what, "build_required": True}
+        try:
+            after = self._lib_refs_now(plc_project_path)
+            if _ref_keys(before) - _ref_keys(after) - expect_gone:
+                time.sleep(self.LIB_RELIST_S)
+                after = self._lib_refs_now(plc_project_path)
+        except XaeError as exc:
+            res["after_unread"] = (f"{what} ran; the references could not be read after it ({exc}) — xae_library_list "
+                                   "shows them")
+            return res
+        res.update(_ref_diff(before, after))
+        res["count_before"], res["count_after"] = len(before), len(after)
+        wrong = expect(after)
+        if wrong:
+            res["warning"] = wrong
+        res["note"] = ("not built and not saved: xae_build(save_first=true) saves the project and shows whether the "
+                       "code builds with the references as they are now")
+        return res
+
+    def library_add(self, plc_project_path: str, library: str, version: str = "", distributor: str = "") -> dict[str, Any]:
+        path, it = self._libman(plc_project_path)
+        before = self._lib_refs(it, path)
+        want = (_lib_parts(library).get("library") if "," in library else library).strip()
+        have = _ref_find(before, want)
+        if have:
+            # TE1000: ArgumentException 'Library or placeholder is already included' — refused here, with what is there
+            raise XaeError(f"{want} is already referenced in {_plc_split(plc_project_path)[1]}: {have} — nothing was "
+                           "done (xae_placeholder_resolve changes what a placeholder resolves to)")
+        what = f"AddLibrary {library}" + (f", {version}" if version else "") + (f" ({distributor})" if distributor else "")
+
+        def expect(after: list[dict[str, Any]]) -> str | None:
+            return None if _ref_find(after, want) else \
+                f"XAE reported success, but {want} is not among the references after it"
+        return self._lib_change(plc_project_path, path, before, what,
+                                lambda x: _com_call(x, "AddLibrary", library, version or "", distributor or ""), expect)
+
+    def library_remove(self, plc_project_path: str, library: str, version: str = "", distributor: str = "",
+                       kind: str | None = None) -> dict[str, Any]:
+        if kind not in (None, "", "library", "placeholder"):
+            raise XaeError("kind must be 'library', 'placeholder' or left out — nothing was done")
+        path, it = self._libman(plc_project_path)
+        before = self._lib_refs(it, path)
+        proj = _plc_split(plc_project_path)[1]
+        hit = _ref_find(before, library, kind or None, version)
+        if not hit:
+            raise XaeError(f"{library} is not referenced in {proj} — its references: "
+                           f"{[r['kind'] + ' ' + r['name'] for r in before]}. Nothing was done")
+        if len(hit) > 1:
+            raise XaeError(f"{library} is referenced {len(hit)} times in {proj}: {hit} — say which one: "
+                           "kind='placeholder' or kind='library' (and version for one of several versions). Nothing "
+                           "was done")
+        target = hit[0]
+        name = target["name"]
+        args = (name, "", "") if target["kind"] == "placeholder" else (
+            name, version or target.get("version") or "", distributor or target.get("distributor") or "")
+        what = f"RemoveReference {target['kind']} {name}" + (f", {args[1]}" if args[1] else "")
+        key = _ref_key(target)
+
+        def expect(after: list[dict[str, Any]]) -> str | None:
+            if key in _ref_keys(after):
+                return f"XAE reported success, but {target['kind']} {name} is still referenced"
+            more = _ref_keys(before) - _ref_keys(after) - {key}
+            if more:
+                return f"XAE removed more than {target['kind']} {name}: also {sorted(more)} — put back what is missing"
+            return None
+        res = self._lib_change(plc_project_path, path, before, what,
+                               lambda x: _com_call(x, "RemoveReference", *args), expect, frozenset({key}))
+        res["consequence"] = (f"code that uses {name} does not build any more — the next xae_build shows where; "
+                              "nothing in the code was changed")
+        return res
+
+    def placeholder_add(self, plc_project_path: str, placeholder: str, library: str = "", version: str = "",
+                        distributor: str = "") -> dict[str, Any]:
+        path, it = self._libman(plc_project_path)
+        before = self._lib_refs(it, path)
+        ph = placeholder.strip().lstrip("#")
+        have = _ref_find(before, ph)
+        if have:
+            raise XaeError(f"{ph} is already referenced in {_plc_split(plc_project_path)[1]}: {have} — nothing was done")
+        what = f"AddPlaceholder {ph}" + (f" → {library}" if library else " (default library from the device)")
+
+        def expect(after: list[dict[str, Any]]) -> str | None:
+            return None if _ref_find(after, ph, "placeholder") else \
+                f"XAE reported success, but no placeholder {ph} is among the references after it"
+        return self._lib_change(plc_project_path, path, before, what, lambda x: _com_call(
+            x, "AddPlaceholder", ph, library or "", version or "", distributor or ""), expect)
+
+    def placeholder_resolve(self, plc_project_path: str, placeholder: str, library: str, version: str = "",
+                            distributor: str = "") -> dict[str, Any]:
+        path, it = self._libman(plc_project_path)
+        before = self._lib_refs(it, path)
+        ph = placeholder.strip().lstrip("#")
+        if not _ref_find(before, ph, "placeholder"):
+            raise XaeError(f"no placeholder {ph} in {_plc_split(plc_project_path)[1]} — nothing was done "
+                           "(xae_library_list lists the references)")
+        what = f"SetEffectiveResolution {ph} → {library}" + (f", {version}" if version else "")
+
+        def expect(after: list[dict[str, Any]]) -> str | None:
+            row = _ref_find(after, ph, "placeholder")
+            eff = (row[0].get("effective") or {}) if row else {}
+            if (eff.get("library") or "").lower() != library.strip().lower() or (
+                    version and version != "*" and eff.get("version") != version):
+                return (f"XAE reported success, but {ph} resolves to {eff.get('display') or 'nothing'} after it, not "
+                        f"to {library}" + (f" {version}" if version else ""))
+            return None
+        return self._lib_change(plc_project_path, path, before, what, lambda x: _com_call(
+            x, "SetEffectiveResolution", ph, library, version or "", distributor or ""), expect)
+
+    def placeholder_freeze(self, plc_project_path: str, placeholder: str | None = None) -> dict[str, Any]:
+        path, it = self._libman(plc_project_path)
+        before = self._lib_refs(it, path)
+        ph = (placeholder or "").strip().lstrip("#")
+        if ph and not _ref_find(before, ph, "placeholder"):
+            raise XaeError(f"no placeholder {ph} in {_plc_split(plc_project_path)[1]} — nothing was done "
+                           "(xae_library_list lists the references)")
+        res = self._lib_change(plc_project_path, path, before, f"FreezePlaceholder {ph or '(all)'}",
+                               lambda x: _com_call(x, "FreezePlaceholder", ph), lambda after: None)
+        res["frozen_note"] = (("the placeholder keeps the version it resolves" if ph else
+                               "every placeholder keeps the version it resolves")
+                              + " to now instead of following '*' (the newest installed); the Automation Interface "
+                              "shows no 'frozen' mark — the saved .plcproj holds it as the placeholder's resolution")
+        return res
+
     # ------------------------------------------------------------ PLC
     def plc_projects(self) -> dict[str, Any]:
         """List PLC projects: TIPC children → each has one '<Name> Project' node."""
@@ -2762,6 +3052,58 @@ def _plcopen_names(xml_file: str) -> list[str]:
         return []
     found = re.findall(r"<(?:pou|dataType|globalVars|Interface)\b[^>]*\bname=\"([^\"]+)\"", txt)
     return list(dict.fromkeys(found))
+
+
+def _disp(x: Any) -> Any:
+    """A COM object an IDispatch::Invoke returned (a bare PyIDispatch) as a late-bound dispatch; anything else as it is
+    (a dispatch already, a value, the tests' plain objects)."""
+    if x is None or hasattr(x, "_oleobj_") or not (hasattr(x, "Invoke") and hasattr(x, "GetIDsOfNames")):
+        return x
+    import win32com.client  # type: ignore
+    return win32com.client.Dispatch(x)
+
+
+_LIB_DISPLAY = re.compile(r"^\s*(?P<lib>[^,]+?)\s*,\s*(?P<ver>[^\s(]+)\s*(?:\((?P<dist>.*)\))?\s*$")
+
+
+def _lib_parts(display: str) -> dict[str, str]:
+    """'Tc2_Standard, 3.4.7.0 (Beckhoff Automation GmbH)' → library / version / distributor / display."""
+    m = _LIB_DISPLAY.match(str(display or ""))
+    if not m:
+        return {"display": str(display or "")}
+    return {"library": m["lib"], "version": m["ver"], "distributor": (m["dist"] or "").strip(),
+            "display": str(display)}
+
+
+def _ver_key(v: str | None) -> tuple[int, ...]:
+    return tuple(int(x) if x.isdigit() else -1 for x in str(v or "").split("."))
+
+
+def _ref_key(r: dict[str, Any]) -> str:
+    """One reference: a placeholder by its name, a library by name and version (one library may be referenced in two
+    versions)."""
+    if r["kind"] == "placeholder":
+        return f"placeholder {r['name'].lstrip('#').lower()}"
+    return f"library {r['name'].lower()} {r.get('version') or ''}".strip()
+
+
+def _ref_keys(refs: list[dict[str, Any]]) -> set[str]:
+    return {_ref_key(r) for r in refs}
+
+
+def _ref_find(refs: list[dict[str, Any]], name: str, kind: str | None = None,
+              version: str = "") -> list[dict[str, Any]]:
+    """The references named `name` ('#X' = placeholder X), of `kind` when given; `version` narrows libraries."""
+    n = name.strip().lstrip("#").lower()
+    return [r for r in refs if r["name"].lstrip("#").lower() == n and (kind is None or r["kind"] == kind)
+            and (not version or r["kind"] != "library" or (r.get("version") or "") == version)]
+
+
+def _ref_diff(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, Any]:
+    b = {_ref_key(r): r for r in before}
+    a = {_ref_key(r): r for r in after}
+    return {"added": [a[k] for k in a if k not in b], "removed": [b[k] for k in b if k not in a],
+            "changed": [{"reference": k, "before": b[k], "after": a[k]} for k in a if k in b and a[k] != b[k]]}
 
 
 def _com_call(obj: Any, name: str, *args: Any) -> Any:
