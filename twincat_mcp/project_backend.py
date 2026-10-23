@@ -135,34 +135,67 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def not_restored_links(sln: str | os.PathLike[str], limit: int = 200) -> dict[str, Any]:
+_RE_XTI_FILE = re.compile(rb'\bFile\s*=\s*"([^"]+?\.xti)"', re.I)
+
+
+def not_restored_links(sln: str | os.PathLike[str], plc: str | None = None, limit: int = 200) -> dict[str, Any]:
     """0.8.20: the links the SAVED TwinCAT project keeps but XAE could not restore when it loaded them — TwinCAT marks
     them with a RestoreInfo attribute (DrumFillingMachineV0: RestoreInfo="ANotFound", 5 links on Term 6 whose PLC
     variables had moved); ProduceMappingInfo does not list them. Read from the .tsproj files the .sln names and the
-    .xti files below them, whatever element carries the attribute: {files, count, entries: [{file, restore_info,
-    element, owner_a, owner_b, var_a, var_b, name}]} — the saved state, not what XAE holds now."""
+    independent .xti files they (and those) name — review 1 of 0.8.20: not every .xti below the folder (an old copy
+    is no part of the project) — whatever element carries the attribute; only files that hold the word are parsed.
+    plc: only links one end of which is in that PLC ('TIPC^<Plc>'). {read, files, count, entries: [{file,
+    restore_info, element, owner_a, owner_b, var_a, var_b, name}], unresolved?, unread_files?} — the saved state, not
+    what XAE holds now."""
     sln_p = Path(sln)
     base = sln_p.parent
     tsprojs: list[Path] = []
     try:
         txt = sln_p.read_text(encoding="utf-8-sig", errors="replace")
-        for rel in _RE_SLN_PROJECT.findall(txt):
-            t = (base / rel.replace("\\", "/")).resolve()
-            if t.is_file():
-                tsprojs.append(t)
     except OSError as exc:
         return {"read": False, "why": f"the solution file could not be read ({exc})"}
+    for rel in _RE_SLN_PROJECT.findall(txt):
+        t = (base / rel.replace("\\", "/")).resolve()
+        if t.is_file():
+            tsprojs.append(t)
     if not tsprojs:
         return {"read": False, "why": f"{sln_p.name} names no .tsproj that exists"}
     files: list[Path] = []
+    unresolved: list[str] = []
     for t in tsprojs:
-        files.append(t)
-        files.extend(sorted(x for x in t.parent.rglob("*.xti") if x.is_file() and "_Boot" not in x.parts))
+        index: dict[str, list[Path]] = {}
+        for x in t.parent.rglob("*.xti"):
+            if x.is_file() and "_Boot" not in x.parts:
+                index.setdefault(x.name.casefold(), []).append(x)
+        todo, seen = [t], set()
+        while todo:
+            f = todo.pop()
+            if f in seen:
+                continue
+            seen.add(f)
+            files.append(f)
+            try:
+                raw = f.read_bytes()
+            except OSError:
+                continue
+            for m in _RE_XTI_FILE.finditer(raw):
+                name = Path(m.group(1).decode("utf-8", "replace").replace("\\", "/")).name
+                hits = index.get(name.casefold(), [])
+                if len(hits) > 1:
+                    hits = [h for h in hits if "_Config" in h.parts] or hits
+                if len(hits) == 1:
+                    todo.append(hits[0])
+                else:
+                    unresolved.append(f"{name}: " + ("not found" if not hits else f"{len(hits)} files of that name"))
+    want = (plc or "").casefold().rstrip("^")
     entries: list[dict[str, Any]] = []
     unread: list[str] = []
     for f in dict.fromkeys(files):
         try:
-            root = ET.parse(f).getroot()
+            raw = f.read_bytes()
+            if b"RestoreInfo" not in raw and "RestoreInfo".encode("utf-16-le") not in raw:
+                continue
+            root = ET.fromstring(raw)
         except (OSError, ET.ParseError) as exc:
             unread.append(f"{f}: {exc}")
             continue
@@ -181,11 +214,17 @@ def not_restored_links(sln: str | os.PathLike[str], limit: int = 200) -> dict[st
             for k in ("VarA", "VarB", "Name"):
                 if el.get(k) is not None:
                     row[{"VarA": "var_a", "VarB": "var_b", "Name": "name"}[k]] = el.get(k)
+            owners = [row.get("owner_a", ""), row.get("owner_b", "")]
+            if want and any(owners) and not any(o.casefold() == want or o.casefold().startswith(want + "^")
+                                                 for o in owners):
+                continue                       # a link of another PLC
             entries.append(row)
     out: dict[str, Any] = {"read": True, "files": [str(f) for f in dict.fromkeys(files)], "count": len(entries),
                            "entries": entries[:limit]}
     if len(entries) > limit:
         out["truncated"] = f"{len(entries)} entries, the first {limit} listed"
+    if unresolved:
+        out["unresolved"] = sorted(set(unresolved))[:50]
     if unread:
         out["unread_files"] = unread
     return out

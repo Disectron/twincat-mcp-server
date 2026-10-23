@@ -329,9 +329,15 @@ tool wishlist (2026-10-18).
   and compared with what was meant). Each reads the mapping table before and after and gives the difference; nothing
   is saved or activated. Classes: link / unlink control, import destructive (its token names the mode and the
   content's sha256). `xae_links` adds `not_restored`: elements of the saved .tsproj / .xti with a RestoreInfo
-  attribute (ANotFound on DrumFillingMachineV0) — the saved state, not what XAE holds now. Not seen on hardware: all of
-  it (LinkVariables with a part, the paths ProduceMappingInfo writes after a link, ConsumeMappingInfo of a merged table,
-  where RestoreInfo sits in a .tsproj).
+  attribute (ANotFound on DrumFillingMachineV0), from the .tsproj files the .sln names and the .xti files they name,
+  one PLC's — the saved state, not what XAE holds now. Review 1 (independent): 1 HIGH (a TwinSAFE end reached through a
+  leading space, the other end of an unlink, or an import), 8 MEDIUM (a failed ConsumeMappingInfo left no way back; two
+  imports in one second shared a backup file; a table read deeper than XAE reads it; two parts of one pair counted as
+  one link; a replace token that did not bind the table it replaces; a link token without the part; imports and the
+  links the saved project could not restore; every .xti below the folder read) — fixed with tests red before. LOW left:
+  the link tools are not gated by edit_requires_config_mode (the library tools neither); ConsumeMappingInfo's effect
+  on the RestoreInfo links is not known (an import says so). Not seen on hardware: all of it (LinkVariables with a part,
+  the paths ProduceMappingInfo writes after a link, ConsumeMappingInfo of a merged table, where RestoreInfo sits).
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).

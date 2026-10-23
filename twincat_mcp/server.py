@@ -31,6 +31,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from typing import Annotated, Any, Callable, Literal
 
 from pydantic import BaseModel, Field
@@ -56,7 +57,7 @@ import pyads
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeActedUnknown, XaeBackend, XaeBusy, XaeError, XaeExplained, sta_init, sta_teardown
-from .xae_backend import _virtual_lib
+from .xae_backend import _sha16, _virtual_lib
 from .project_backend import PlcView, ProjectIndex, ProjectError, declaring, not_on_target, parse_tcunit_xml
 from .project_backend import not_restored_links
 from .recorder import Recorder, RecorderError
@@ -340,6 +341,9 @@ TOKEN_TARGET_DOC = {
     "xae_placeholder_add": "'<iec project path>:<placeholder>'",
     "xae_placeholder_resolve": "'<iec project path>:<placeholder>=<library>' + ', <version>' when given",
     "xae_placeholder_freeze": "'<iec project path>:<placeholder>' ('*' for all)",
+    "xae_link": "'<variable> -> <target>' (paths as normalised: '^', TIID) + ' [offsets <v>/<t>, <size> bit]' for a part",
+    "xae_unlink": "'<variable> -> <target>', or '<variable> -> (all)'",
+    "xae_links_import": "'<mode>:<sha256 of the XML, 16 hex>' — replace: + ' over <sha256 of the table now, 16 hex>'",
     "xae_target": "the new NetId", "xae_dialog_resolve": "'<dialog title>:<button>'",
     "ads_plc_state / ads_system_mode": "the action (run, stop, reset / run, config)",
     "ads_connect": "the NetId, or 'local'", "ads_add_route_to_plc": "the PLC's IP address",
@@ -1075,12 +1079,19 @@ class App:
                    else " — the tool cannot press its buttons: close it in XAE")
                 + "; blocked_by_dialog: " + json.dumps(_dialog_fields(live[0]), default=str))
 
+    def safety_reason(self, path: str) -> str | None:
+        """Why a path may not be changed: under the TwinSAFE / safety project and not explicitly enabled; else None."""
+        low = (path or "").strip().lower()
+        if (low.startswith("tisc") or "^safety" in low or "twinsafe" in low or low.endswith(".sal")) and not self.cfg.xae.allow_safety:
+            return (f"{path!r} is under the TwinSAFE/safety project; refused (set TCMCP_ALLOW_SAFETY=1 to permit, and "
+                    "know what you are doing)")
+        return None
+
     def guard_safety_path(self, path: str, action: str) -> None:
         """TwinSAFE (TISC / Safety) projects are never edited unless explicitly enabled."""
-        low = (path or "").lower()
-        if (low.startswith("tisc") or "^safety" in low or "twinsafe" in low or low.endswith(".sal")) and not self.cfg.xae.allow_safety:
-            raise ToolError(f"{action}: {path!r} is under the TwinSAFE/safety project; refused "
-                            "(set TCMCP_ALLOW_SAFETY=1 to permit, and know what you are doing)")
+        why = self.safety_reason(path)
+        if why:
+            raise ToolError(f"{action}: {why}")
 
     async def proj_call(self, fn, *a, **kw) -> Any:
         try:
@@ -1767,16 +1778,22 @@ class App:
                 return f"{proj}:{name}" + (f" ({kind})" if kind else "") + (f", {ver}" if ver else "")
             return f"{proj}:{name}"
         if action in LINK_ACTIONS:
-            # 0.8.20: a token names the two ends of a link (unlink: or '(all)'); an import the mode and the content
+            # 0.8.20: a token names the two ends of a link (unlink: or '(all)'; link: a part's offsets and size); an
+            # import the mode and the content — a replace also the table it replaces (review 1: links added after
+            # the dry run would be removed by a replace confirmed before them)
+            from .xae_backend import _link_path, _sha16
             if action == "xae_links_import":
-                import hashlib
-                text = _links_import_text(a.get("xml"), a.get("file"))
-                return f"{a.get('mode') or 'add'}:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
-            v = str(a.get("variable") or "").strip()
-            t = str(a.get("target") or "").strip()
+                mode = str(a.get("mode") or "add")
+                tgt = f"{mode}:{_sha16(_links_import_text(a.get('xml'), a.get('file')))}"
+                if mode == "replace":
+                    tgt += f" over {await self.xae_call(self.xae.mapping_sha, timeout=120)}"
+                return tgt
+            v, t = _link_path(str(a.get("variable") or "")), _link_path(str(a.get("target") or ""))
             if not v or (action == "xae_link" and not t):
                 raise TargetArgsError(f"{action}'s token names the link: pass args={{'variable': …, 'target': …}}")
-            return f"{v} -> {t or '(all)'}"
+            part = [int(a.get(k) or 0) for k in ("offs_variable", "offs_target", "size_bits")] \
+                if action == "xae_link" else [0, 0, 0]
+            return f"{v} -> {t or '(all)'}" + (f" [offsets {part[0]}/{part[1]}, {part[2]} bit]" if any(part) else "")
         if action == "xae_command":
             return f"{a.get('name', '')}@{await self._xae_netid()}"
         if action == "xae_boot_project":
@@ -2041,9 +2058,16 @@ def _links_import_text(xml: str | None, file: str | None) -> str:
     if xml:
         return str(xml)
     try:
-        return Path(str(file)).read_text(encoding="utf-8-sig")
+        raw = Path(str(file)).read_bytes()
     except OSError as exc:
         raise TargetArgsError(f"xae_links_import: {file} could not be read ({exc}) — nothing was done") from exc
+    # review 1 of 0.8.20: Windows PowerShell 5.1 writes '>' redirections as UTF-16 with a BOM
+    enc = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    try:
+        return raw.decode(enc)
+    except UnicodeDecodeError as exc:
+        raise TargetArgsError(f"xae_links_import: {file} is neither UTF-8 nor UTF-16 text ({exc}) — nothing was "
+                              "done") from exc
 
 # PLC code / project edits gated by safety.edit_requires_config_mode
 CODE_EDIT_ACTIONS = frozenset({"xae_pou_set", "xae_pou_create", "proj_set_code", "xae_tree_consume_xml", "xae_tree_set_values",
@@ -2068,6 +2092,12 @@ ACTION_EFFECTS = {
     "xae_placeholder_resolve": "changes the library version a placeholder resolves to (nothing is built)",
     "xae_placeholder_freeze": "fixes the placeholder(s) at the version they resolve to now — '*' no longer follows "
                               "newer installed versions (nothing is built)",
+    "xae_link": "links a variable to an I/O channel in XAE — after the next activation the runtime moves it (nothing is "
+                "saved or activated now)",
+    "xae_unlink": "removes link(s) of a variable in XAE — after the next activation the channel is no longer moved by it "
+                  "(nothing is saved or activated now)",
+    "xae_links_import": "replaces the project's whole mapping table in XAE (ConsumeMappingInfo); the table as it was is "
+                        "written to a backup file first (nothing is saved or activated now)",
     "ads_plc_state": "changes the PLC run state (RUN/STOP/RESET) — the machine stops or starts executing",
     "ads_system_mode": "switches TwinCAT between RUN and CONFIG — the PLC stops in CONFIG",
     "ipc_reboot": "reboots or shuts down the IPC",
@@ -5574,24 +5604,27 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def _link_action(action: str, op: OpClass, args: dict[str, Any], confirm_token: str | None, ctx: Any,
                            fn: Any, *fargs: Any) -> dict[str, Any]:
         tgt = await app.token_target(action, args)
+        from .xae_backend import _link_path
         for k in ("variable", "target"):
             if args.get(k):
-                app.guard_safety_path(str(args[k]), action)
+                app.guard_safety_path(_link_path(str(args[k])), action)    # review 1: the path as XAE gets it
         app.refuse_if_dialog(action)
         await app.permit(ctx, op, action, tgt, confirm_token)
         return await app.confirmed(action, {**{k: v for k, v in args.items() if v not in (None, "", 0)}, "target": tgt},
-                                   op, app.xae_call(fn, *fargs, timeout=300))
+                                   op, app.xae_call(fn, *fargs, protect=app.safety_reason, timeout=300))
 
     @mcp.tool(annotations=EDIT)
     async def xae_link(variable: str, target: str, offs_variable: int = 0, offs_target: int = 0, size_bits: int = 0,
                        confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Link a variable to its I/O counterpart (ITcSysManager::LinkVariables), both as full tree paths:
         variable='TIPC^<Plc>^<Plc> Instance^PlcTask Inputs^GVL_IO.bIn', target='TIID^Device 1 (EtherCAT)^Term 1
-        (EK1100)^Term 2 (EL1004)^Channel 1^Input' (xae_links gives the instance's variables, xae_tree_children the
+        (EK1100)^Term 2 (EL1004)^Channel 1^Input' (xae_links gives the instance's variables, xae_tree_get the
         terminals'). offs_* / size_bits for a part (bits; 0 = the smaller of the two). XAE checks that both exist, are
-        variables and fit. Refused when the two are linked already. Runs once; the result has what changed in the
-        mapping table and what else the target is linked to. In XAE only — not saved, not activated.
-        guarded: tc_request_confirmation(action='xae_link', target='<variable> -> <target>')."""
+        variables and fit. A whole link is refused when the two are linked already (a part may be linked besides
+        others). Runs once; the result has what changed in the mapping table and what else the target is linked to.
+        In XAE only — not saved, not activated. TwinSAFE ends are refused.
+        guarded: tc_request_confirmation(action='xae_link', target='<variable> -> <target>' + ' [offsets <v>/<t>, <size>
+        bit]' for a part)."""
         a = {"variable": variable, "target": target, "offs_variable": offs_variable, "offs_target": offs_target,
              "size_bits": size_bits}
         return await _link_action("xae_link", OpClass.CONTROL, a, confirm_token, ctx, app.xae.link, variable, target,
@@ -5602,10 +5635,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                          ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Remove a link (ITcSysManager::UnlinkVariables): the one between variable and target, or — target left out —
         every link of the variable. Full tree paths as the mapping table names them (xae_links). Refused when there
-        is no such link. Runs once; the result has what changed. In XAE only — not saved, not activated.
-        guarded: tc_request_confirmation(action='xae_unlink', target='<variable> -> <target>' or '<variable> -> (all)')."""
+        is no such link, or when a link to be removed has a TwinSAFE end. Runs once; the result has what changed. In XAE
+        only — not saved, not activated. Destructive-class: tc_request_confirmation(action='xae_unlink',
+        target='<variable> -> <target>' or '<variable> -> (all)')."""
         a = {"variable": variable, "target": target}
-        return await _link_action("xae_unlink", OpClass.CONTROL, a, confirm_token, ctx, app.xae.unlink, variable,
+        return await _link_action("xae_unlink", OpClass.DESTRUCTIVE, a, confirm_token, ctx, app.xae.unlink, variable,
                                   target or "")
 
     @mcp.tool(annotations=DESTR)
@@ -5615,22 +5649,38 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Import a mapping table (<VarLinks>, as ProduceMappingInfo writes it) through ConsumeMappingInfo, which
         replaces ALL links of the project. mode='add': its links are added to the table as it is (nothing removed);
         'replace': it is the whole new table. dry_run (default): what would be added / removed / changed — nothing
-        done. dry_run=false: the table as it is goes to a backup file first (~/.twincat_mcp/backups/links/), then
-        ConsumeMappingInfo once, then the table is read again and compared. xml text or file (on this PC).
-        Destructive-class: tc_request_confirmation(action='xae_links_import', args={xml|file, mode}) — the target is
-        '<mode>:<sha256 of the XML, 16 hex>'."""
-        text = _links_import_text(xml, file)
+        done; its confirm_target is the token target the apply needs. dry_run=false: the table as it is goes to a new
+        backup file first (~/.twincat_mcp/backups/links/), then ConsumeMappingInfo once, then the table is read again
+        and compared; a failure says what the table holds then and how to restore it. xml text or file (on this PC,
+        UTF-8 or UTF-16). Links with a TwinSAFE end are refused. Destructive-class:
+        tc_request_confirmation(action='xae_links_import', args={xml|file, mode}) — the target is '<mode>:<sha256 of the
+        XML, 16 hex>', a replace + ' over <sha256 of the table it replaces>' (a table changed since: refused)."""
+        text = _links_import_text(xml, file)                 # read once: what is confirmed is what is applied
+        sol = getattr(app.xae, "bound_solution", None)
+        nr = await asyncio.to_thread(not_restored_links, sol) if sol else None
         if dry_run:
-            return await app.xae_call(app.xae.links_import, text, mode, False, None, timeout=300)
-        a = {"xml": xml, "file": file, "mode": mode}
-        tgt = await app.token_target("xae_links_import", a)
-        app.refuse_if_dialog("xae_links_import")
-        await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_links_import", tgt, confirm_token)
-        stem = Path(str(getattr(app.xae, "bound_solution", None) or "solution")).stem
-        backup = str(_home() / "backups" / "links" / f"links-{stem}-{time.strftime('%Y%m%d-%H%M%S')}.xml")
-        return await app.confirmed("xae_links_import", {"mode": mode, "file": file, "target": tgt},
-                                   OpClass.DESTRUCTIVE,
-                                   app.xae_call(app.xae.links_import, text, mode, True, backup, timeout=300))
+            res = await app.xae_call(app.xae.links_import, text, mode, False, None, app.safety_reason, timeout=300)
+            res["confirm_target"] = f"{mode}:{_sha16(text)}" + (f" over {res['table_sha']}" if mode == "replace" else "")
+        else:
+            a = {"xml": text, "mode": mode}
+            tgt = await app.token_target("xae_links_import", a)
+            app.refuse_if_dialog("xae_links_import")
+            await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_links_import", tgt, confirm_token)
+            stem = Path(str(sol or "solution")).stem
+            backup = str(_home() / "backups" / "links" /
+                         f"links-{stem}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.xml")
+            expect = tgt.split(" over ", 1)[1] if " over " in tgt else None
+            res = await app.confirmed("xae_links_import", {"mode": mode, "file": file, "target": tgt},
+                                      OpClass.DESTRUCTIVE,
+                                      app.xae_call(app.xae.links_import, text, mode, True, backup, app.safety_reason,
+                                                   expect, timeout=300))
+        if nr and nr.get("count"):
+            # review 1 of 0.8.20: ConsumeMappingInfo resets the table; these are not in it, nor in the backup
+            res["not_restored_warning"] = (f"the saved project has {nr['count']} link(s) TwinCAT could not restore "
+                                           "(xae_links not_restored): they are not in the mapping table nor in the "
+                                           "backup, and whether XAE keeps them through ConsumeMappingInfo and the next "
+                                           "save is not known")
+        return res
 
     async def _lib_vs_saved(proj: str, refs: list[dict[str, Any]]) -> dict[str, Any]:
         """xae_library_list: the references XAE holds against the saved .plcproj of that PLC project (found by its
