@@ -209,6 +209,20 @@ tool wishlist (2026-10-18).
   `.tsproj` form `OwnerA Name="InputDst"` (xae_links would then report every variable unlinked although links were
   read); which TwinCAT versions show the instance's variable groups as tree children; StopRecord / Disconnect in
   Config and in Reply; is Scope in Reply reset to Config by xae_activate_configuration.
+- 0.8.18 retest (Ryan, 2026-10-22, bugs.md §38 – §38d). Passed live: N189 (batch refusal, scope_record refusals,
+  `scope_note`), the Scope owner flow, N179 (6 = 6, 2 = 2 ERROR lines), N190, N191 (`runs_past_s 69.9` in the result
+  and the signed link; a normal run has no span), N192 / N193 (16 variables, 21 links, 5 unlinked; Project15 `unlinked_count
+  null`), N173 both halves, R7, R41 (with post_trigger), D11, R40 3 + 3, N93, R42 (the SOP's "completes" expectation
+  is outdated: `max_leaves` stops it too), D44, N31, N58, N59, N40, N42, R4, R3, #10, #11, #33, N64, N56, N57, N47,
+  N48, N51, N39, N50 (pointer half), N38 / N45 / N97 / N43, N9 / #49. Still open: N180 (no "Scope was reset by a
+  TwinCAT restart" note — the log shows RouterStop → AutoStop → Reply), N184, N117 (seen again, both directions).
+  New: N194 (S2) — a change-mode python recording across RUN → CONFIG → RUN received nothing after the restart (no
+  re-registration, marker or error) and rec_verify said PASS; N195 (S3) — the first `xae_plcopen_import(replace)` of
+  PRG_Machine said a reference ('System_VisuElemMeter') was removed from its place and left `PRG_Machine_1`, the
+  second worked (intermittent); N196 (S4) — `tcunit_results(path=…)` (not a parameter) was accepted silently and the
+  boot result file was read instead. Observations: the audit does not say who answered a prompt; D11's 11.35 s step is
+  not named by rec_verify; `scope_disconnect=true` right after `scope_record stop` discards the unsaved capture
+  without a question (the argument is the answer — by design).
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
