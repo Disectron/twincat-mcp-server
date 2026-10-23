@@ -45,11 +45,13 @@ public:
     virtual uint64_t resubscriptions() const { return 0; }
     // N197 (0.8.19 retest): re-registering failed 20 times (ADS 0x6, target port not found) while TwinCAT was in RUN
     // again — 1 run of 4, cause not established. Close the connection to the router and open a new one (a new local
-    // AMS port); the subscriptions are gone after it, resubscribe() registers them again. Writer thread only.
+    // AMS port, no request to the target); the subscriptions are gone after it, resubscribe() registers them again.
+    // Writer thread only; refused once unsubscribe() ran.
     virtual bool reopen(std::string& err) { err = "not supported by this source"; return false; }
-    // The target's ADS / device state read through this source's own connection now (ADS ReadState), as text — said
-    // with each failed re-registration: tells a runtime that is still away from one this connection cannot reach.
-    virtual std::string state_text() { return ""; }
+    // The TwinCAT system state (system service, port 10000) read through this source's own connection now: 1 = RUN,
+    // 0 = another state (CONFIG: TwinCAT is away, no reason to open a new connection), -1 = not readable; `text` says
+    // which, for the failure message. Writer thread only.
+    virtual int system_state(std::string& text) { text.clear(); return -1; }
     // R43: the blocks sample memory addresses; a download / online change can put other variables there. The
     // runtime's symbol version (ADSIGRP_SYM_VERSION 0xF008, one byte, raised by every download / online change),
     // read now. Called from the engine's writer thread only (never concurrently with resubscribe()).

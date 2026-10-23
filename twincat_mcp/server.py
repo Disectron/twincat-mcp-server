@@ -56,6 +56,7 @@ import pyads
 from .ads_backend import MIB, AdsBackend, AdsError, _fmt_exc as _fmt_ads_exc
 from .ads_files import SystemServiceFiles
 from .xae_backend import XaeActedUnknown, XaeBackend, XaeBusy, XaeError, XaeExplained, sta_init, sta_teardown
+from .xae_backend import _virtual_lib
 from .project_backend import PlcView, ProjectIndex, ProjectError, declaring, not_on_target, parse_tcunit_xml
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
@@ -363,9 +364,11 @@ def _xae_holds_file(app: Any, file: str | None) -> str | None:
         return None
     if not _inside(str(file), os.path.dirname(os.path.abspath(str(sol)))):
         return None
-    return (f"XAE has {sol} open (attached) and keeps its own copy of this object: it asks to reload {file} "
-            "(xae_dialogs shows the prompt) — saving in XAE before reloading writes its copy over this change. While "
-            "XAE has the project open, xae_pou_set changes the object in XAE itself")
+    # review 1 of 0.8.20: what the server last knew, not read now — said so
+    return (f"XAE was attached with {sol} at the last XAE call (not checked now): if it still has the project open, "
+            f"it keeps its own copy of this object and asks to reload {file} (xae_dialogs shows the prompt) — saving "
+            "in XAE before reloading writes its copy over this change. While XAE has the project open, xae_pou_set "
+            "changes the object in XAE itself")
 
 
 def _inside(child: str, parent: str) -> bool:
@@ -5565,7 +5568,7 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         # N198 (0.8.19 retest): Tc3_GlobalTypes was 'only in XAE' after a save — Beckhoff 'Using global data types':
         # from build 4026 TwinCAT creates the virtual data-type library Tc3_GlobalTypes from the System Manager's type
         # system and adds it to the PLC project itself; the .plcproj never holds it
-        virtual = {k for k in xae if k not in saved and k[1].startswith("tc3_globaltypes")}
+        virtual = {k for k in xae if k not in saved and _virtual_lib(k[1])}
         only_x = [label(k, xae[k]) for k in xae if k not in saved and k not in virtual]
         only_s = [label(k, saved[k]) for k in saved if k not in xae]
         vdiff = []
@@ -5646,10 +5649,10 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                               plc_project_path: str | None = None, confirm_token: str | None = None,
                               ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Add a library reference (AddLibrary): library by name, version ('' = '*', the newest installed) and
-        distributor, or by display name 'Tc2_Math, * (Beckhoff Automation GmbH)'. XAE takes only the display name: a
-        missing distributor / version is completed from the installed libraries (ScanLibraries) — refused when the
-        library is not installed, or is installed from several distributors and none is given. Refused when it is
-        already referenced.
+        distributor, or by display name 'Tc2_Math, * (Beckhoff Automation GmbH)'. XAE refuses a bare name: a missing
+        distributor / version is completed from the installed libraries (ScanLibraries) — refused when the library is
+        not installed, is installed from several distributors and none is given, or a pinned version is not
+        installed. Refused when it is already referenced.
         Runs once; the result has the references before / after, XAE's messages, and build_required — it never builds.
         guarded: confirmation tc_request_confirmation(action='xae_library_add', target='<iec project path>:<library>')."""
         a = {"library": library, "version": version, "distributor": distributor, "plc_project_path": plc_project_path}

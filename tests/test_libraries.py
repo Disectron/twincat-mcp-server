@@ -187,7 +187,7 @@ def test_a_project_without_a_library_manager_is_said(monkeypatch):
 def test_library_add_runs_once_and_gives_the_difference(monkeypatch):
     be, lm = _libs(monkeypatch)
     r = be.library_add(PROJ, "Ex_Math")
-    assert lm.calls == [("AddLibrary", "Ex_Math, * (Example Corp)", "", "")] and \
+    assert lm.calls == [("AddLibrary", "Ex_Math", "*", "Example Corp")] and \
         be.acted == ["AddLibrary Ex_Math, * (Example Corp)"], lm.calls
     assert [x["name"] for x in r["added"]] == ["Ex_Math"] and r["removed"] == [] and r["changed"] == [], r
     assert r["build_required"] is True and "not built and not saved" in r["note"] and "warning" not in r
@@ -320,7 +320,7 @@ async def test_server_changes_need_the_users_ok_in_guarded_mode_bound_to_library
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_library_add",
                                                                     "args": {"library": "Ex_Math"}}))
         r = payload(await s.call_tool("xae_library_add", {"library": "Ex_Math", "confirm_token": tok["confirm_token"]}))
-        assert [x["name"] for x in r["added"]] == ["Ex_Math"] and lm.calls == [("AddLibrary", "Ex_Math, * (Example Corp)", "", "")]
+        assert [x["name"] for x in r["added"]] == ["Ex_Math"] and lm.calls == [("AddLibrary", "Ex_Math", "*", "Example Corp")]
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_placeholder_resolve",
                                                                     "args": {"placeholder": "Ex_Base",
                                                                              "library": "Ex_Base"}}))

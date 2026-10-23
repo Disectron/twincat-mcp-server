@@ -15,7 +15,9 @@
 //                                                  symbol version reads 2 and the online-change count 1)
 //           "rebuild_in_outage": true,            (the runtime comes back from the outage with another build)
 //           "stale_port_after_outage": true,      (N197: after the outage re-registering keeps failing with ADS 0x6
-//                                                  until reopen() opened a new connection)
+//                                                  until reopen() opened a new connection; the system state reads RUN)
+//           "system_state_in_outage": "unreadable", (the system state cannot be read during the outage; default: it
+//                                                  reads CONFIG)
 //           "version_after_outage": n,            (the runtime comes back with symbol version n)
 //           "version_at_start": n,                (the symbol version before anything changes, default 1)
 //           "version_read_fails": true,           (the runtime refuses every symbol version read)
@@ -72,6 +74,7 @@ public:
         program_change_at_ = sim.integer("program_change_at", -1);
         if (const JVal* r = sim.get("rebuild_in_outage")) rebuild_in_outage_ = r->t == JVal::Bool && r->b;
         if (const JVal* r = sim.get("stale_port_after_outage")) stale_port_ = r->t == JVal::Bool && r->b;
+        sys_unreadable_in_outage_ = sim.str("system_state_in_outage") == "unreadable";
         version_after_outage_ = sim.integer("version_after_outage", -1);
         version_at_start_ = sim.integer("version_at_start", 1);
         if (const JVal* r = sim.get("version_read_fails")) version_read_fails_ = r->t == JVal::Bool && r->b;
@@ -160,11 +163,18 @@ public:
         return true;
     }
 
-    std::string state_text() override {
-        if (away()) return "target state not readable on this connection: ADS error 0x6 (6) (simulated outage)";
-        if (stale_port_ && back_from_outage())
-            return "target state not readable on this connection: ADS error 0x6 (6) (simulated stale connection)";
-        return "target state on this connection: ADS RUN, device 0 (simulated)";
+    int system_state(std::string& text) override {
+        if (away()) {
+            if (sys_unreadable_in_outage_) {
+                text = "TwinCAT system state not readable on this connection: ADS error 0x745 (1861): timeout "
+                       "elapsed (simulated)";
+                return -1;
+            }
+            text = "TwinCAT system state on this connection: CONFIG (simulated)";
+            return 0;
+        }
+        text = "TwinCAT system state on this connection: RUN (simulated)";
+        return 1;
     }
 
     std::string describe() const override {
@@ -268,6 +278,7 @@ private:
     std::atomic<int64_t> cycle_now_{0};
     std::atomic<bool> dead_{false};
     bool stale_port_ = false;
+    bool sys_unreadable_in_outage_ = false;
     uint64_t reopens_ = 0;
     uint64_t resubs_ = 0;
     double speed_ = 1.0;

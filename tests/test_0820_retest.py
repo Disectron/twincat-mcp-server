@@ -16,9 +16,11 @@ from twincat_mcp import xae_backend as X
 def test_n199_a_bare_name_is_added_by_its_display_name_completed_from_the_installed_libraries(monkeypatch):
     be, lm = _libs(monkeypatch)
     r = be.library_add(PROJ, "ex_math")                  # any case, as the retest typed it
-    assert lm.calls == [("AddLibrary", "Ex_Math, * (Example Corp)", "", "")], lm.calls
+    # TE1000's example form AddLibrary("Tc2_MDP", "*", "Beckhoff Automation GmbH"), the name as ScanLibraries has it
+    assert lm.calls == [("AddLibrary", "Ex_Math", "*", "Example Corp")], lm.calls
     assert [x["name"] for x in r["added"]] == ["Ex_Math"] and "warning" not in r, r
-    assert "named as 'Ex_Math, * (Example Corp)'" in r["named_as"] and "newest installed" in r["named_as"], r
+    assert r["named_as"] == ("AddLibrary('Ex_Math', '*', 'Example Corp') — distributor 'Example Corp' and version '*' "
+                             "(the newest installed) from ScanLibraries (XAE refuses a bare name)"), r
 
 
 def test_n199_a_version_without_distributor_is_completed_and_must_be_installed(monkeypatch):
@@ -31,7 +33,8 @@ def test_n199_a_version_without_distributor_is_completed_and_must_be_installed(m
         be.placeholder_resolve(PROJ, "Ex_Base", "Ex_Base", "9.0.0.0")
     assert lm.calls == []
     r = be.library_add(PROJ, "Ex_Math", "1.4.0.0")
-    assert lm.calls == [("AddLibrary", "Ex_Math, 1.4.0.0 (Example Corp)", "", "")] and r["added"], lm.calls
+    assert lm.calls == [("AddLibrary", "Ex_Math", "1.4.0.0", "Example Corp")] and r["added"], lm.calls
+    assert r["named_as"].endswith("— distributor 'Example Corp' from ScanLibraries (XAE refuses a bare name)"), r
 
 
 def test_n199_not_installed_or_several_distributors_is_refused_before_xae_is_asked(monkeypatch):
@@ -45,7 +48,7 @@ def test_n199_not_installed_or_several_distributors_is_refused_before_xae_is_ask
         be.library_add(PROJ, "Ex_Math", distributor="Nobody")
     assert lm.calls == []
     be.library_add(PROJ, "Ex_Math", distributor="other gmbh")
-    assert lm.calls == [("AddLibrary", "Ex_Math, * (Other GmbH)", "", "")], lm.calls
+    assert lm.calls == [("AddLibrary", "Ex_Math", "*", "Other GmbH")], lm.calls
 
 
 def test_n199_named_in_full_nothing_is_looked_up(monkeypatch):
@@ -53,7 +56,7 @@ def test_n199_named_in_full_nothing_is_looked_up(monkeypatch):
     lists (a library from a repository it may not scan)."""
     be, lm = _libs(monkeypatch)
     r = be.library_add(PROJ, "Ex_Math", "1.4.0.0", "Example Corp")
-    assert lm.scans == 0 and lm.calls == [("AddLibrary", "Ex_Math, 1.4.0.0 (Example Corp)", "", "")], lm.calls
+    assert lm.scans == 0 and lm.calls == [("AddLibrary", "Ex_Math", "1.4.0.0", "Example Corp")], lm.calls
     assert "named_as" not in r, r
     be.library_remove(PROJ, "Ex_Math")
     be.library_add(PROJ, "Ex_Math, * (Example Corp)")    # the display name as the retest passed it
@@ -84,6 +87,37 @@ def test_n199_placeholders_get_the_distributor_of_their_library(monkeypatch):
         be.placeholder_resolve(PROJ, "Ex_Base", "Ex_Nope")
 
 
+def test_n199_r1_placeholders_take_a_display_name_and_a_distributorless_library_is_refused(monkeypatch):
+    be, lm = _libs(monkeypatch)
+    be.placeholder_resolve(PROJ, "Ex_Base", "Ex_Base, 1.0.0.0 (Example Corp)")
+    assert lm.calls[-1] == ("SetEffectiveResolution", "Ex_Base", "Ex_Base", "1.0.0.0", "Example Corp"), lm.calls
+    be.placeholder_add(PROJ, "Ex_M", "Ex_Math, * (Example Corp)")
+    assert lm.calls[-1] == ("AddPlaceholder", "Ex_M", "Ex_Math", "*", "Example Corp") and lm.scans == 0, lm.calls
+    with pytest.raises(X.XaeError, match="not a display name"):
+        be.placeholder_resolve(PROJ, "Ex_Base", "Ex_Base, (Example Corp)")
+    lm.installed.append(Lib("Ex_Bare", "1.0.0.0", ""))
+    n = len(lm.calls)
+    with pytest.raises(X.XaeError, match="Ex_Bare is installed without a distributor .* give version and distributor"):
+        be.library_add(PROJ, "Ex_Bare")
+    assert len(lm.calls) == n                              # 'Ex_Bare, * ()' is never sent
+
+
+def test_n199_r1_a_star_resolution_xae_resolves_to_another_version_is_said(monkeypatch):
+    be, lm = _libs(monkeypatch)
+    real = lm.SetEffectiveResolution
+
+    def older(name, lib, version="", dist=""):
+        real(name, lib, version, dist)
+        next(r for r in lm.refs if getattr(r, "PlaceholderName", "") == name).EffectiveResolution = \
+            Lib("Ex_Base", "1.0.0.0")                       # e.g. a repository of higher priority holds 1.0.0.0
+    lm.SetEffectiveResolution = older
+    r = be.placeholder_resolve(PROJ, "Ex_Base", "Ex_Base")
+    assert r["resolution_note"] == ("asked for '*': XAE resolves Ex_Base to 1.0.0.0; the newest installed "
+                                    "(ScanLibraries) is 1.2.0.0") and "warning" not in r, r
+    lm.SetEffectiveResolution = real
+    assert "resolution_note" not in be.placeholder_resolve(PROJ, "Ex_Base", "Ex_Base")
+
+
 # ---- N198 ------------------------------------------------------------------------------------------------------------
 
 @pytest.mark.anyio
@@ -102,9 +136,21 @@ async def test_n198_the_virtual_global_types_library_is_not_a_difference(monkeyp
     assert sv["added_by_twincat"] == ["placeholder Tc3_GlobalTypes"] and "global data types" in \
         sv["added_by_twincat_note"], sv
     lm.refs.append(Lib("Ex_Math", "1.4.0.0"))           # a real difference still counts
+    lm.refs.append(Lib("Tc3_GlobalTypesExt", "1.0.0.0"))  # review 1 of 0.8.20: a name that only begins like it, too
     async with client_for(srv) as s:
         sv = payload(await s.call_tool("xae_library_list", {}))["saved_plcproj"]
-    assert sv["same"] is False and sv["only_in_xae"] == ["library Ex_Math 1.4.0.0"], sv
+    assert sv["same"] is False and sv["only_in_xae"] == ["library Ex_Math 1.4.0.0",
+                                                         "library Tc3_GlobalTypesExt 1.0.0.0"], sv
+
+
+def test_n198_r1_the_virtual_library_is_not_flagged_as_not_installed(monkeypatch):
+    """Review 1 of 0.8.20: with a concrete version XAE lists for it, ScanLibraries (which never has it) flagged it."""
+    be, lm = _libs(monkeypatch)
+    lm.refs = [Placeholder("Tc3_GlobalTypes", Lib("Tc3_GlobalTypes", "*", "Beckhoff Automation GmbH"),
+                           Lib("Tc3_GlobalTypes", "1.0.0.0", "Beckhoff Automation GmbH")),
+               Lib("Tc3_GlobalTypes_Global", "1.0.0.0", "Beckhoff Automation GmbH")]
+    r = be.library_list(PROJ)
+    assert "flags" not in r and not any("not_installed" in x for x in r["references"]), r
 
 
 # ---- proj_set_code while XAE has the project open (Ryan: warn only) -------------------------------------------------
@@ -131,7 +177,7 @@ async def test_proj_set_code_says_when_the_attached_xae_has_the_project_open(mon
     if case == "no_change":
         assert r["changed"] == [], r
     if case == "attached":
-        assert r["changed"] and "XAE has" in r["xae_open"] and "Machine.sln open (attached)" in r["xae_open"], r
+        assert r["changed"] and "XAE was attached with" in r["xae_open"] and "Machine.sln at the last XAE call (not checked now)" in r["xae_open"], r
         assert "asks to reload" in r["xae_open"] and "xae_pou_set" in r["xae_open"], r
     else:
         assert "xae_open" not in r, r

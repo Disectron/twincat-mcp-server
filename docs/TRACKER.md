@@ -291,21 +291,32 @@ tool wishlist (2026-10-18).
   the test project: Tc2_EtherCAT 3.8.2.0 and `90_Test\PRG_LibTest` (on the user's request). Not run: the Options-open
   refusal, the GetLastErrorMessages probe, `runtime_away_at_end`, the DrumFillingMachine rows (VisuSymbols ×2).
 - 0.8.20 fixes of the 0.8.19 retest (Ryan, 2026-10-23: fixes first, then linking; repositories: find out why; proj_set_code
-  while XAE has the project open: warn only). N199: `xae_library_add` names the library by its display name always
-  (TE1000's own example passes `"Tc2_MDP", "*", "Beckhoff Automation GmbH"`): a missing distributor / version is
-  completed from ScanLibraries (version '' → '*'), refused when not installed, installed from several distributors, or
-  a pinned version is not installed; with version and distributor given nothing is looked up (the form that worked on
-  the retest PC). `xae_placeholder_add` / `_resolve` complete the library the same way. N198: Tc3_GlobalTypes is the
-  virtual data-type library TwinCAT adds itself from build 4026 (Beckhoff "Using global data types") — listed as
-  `added_by_twincat`, not a difference. N197 (cause still not established): the native engine opens a new ADS
-  connection after 3 failed re-registrations in a row and asks at once; each failure carries the target state read on
-  the capture's own connection (ADS ReadState), and rec_status warns while it lasts (`resubscribe_failures`,
-  `port_reopens`). `proj_set_code` says `xae_open` when the attached XAE has the solution over the file open.
-  Repositories: TE1000 documents ITcPlcLibRepository as IUnknown-based (not IDispatch) while its collection is
-  IDispatch-based — pywin32 (late binding only) cannot read Name / Folder; a read-only probe (pywin32 QueryInterface of
-  the item for the repository IID, the type library's description, comtypes' early-bound route) goes to Ryan before the
-  tool changes. Not seen on hardware: AddPlaceholder / SetEffectiveResolution with version '*' and the distributor
-  filled (TE1000's AddPlaceholder example passes '*'); whether reopening the connection recovers the N197 state.
+  while XAE has the project open: warn only). N199: a bare name is completed from ScanLibraries (distributor, version
+  '' → '*') and sent as AddLibrary(name, version, distributor) — TE1000's own example form; a display name and
+  (name, version, distributor) given in full go to XAE as before (the forms that worked on the retest PC, nothing
+  looked up). Refused before XAE is asked: not installed, several distributors and none given, a pinned version not
+  installed, installed without a distributor. `xae_placeholder_add` / `_resolve` take a display name too and complete the
+  library the same way; a '*' resolution XAE resolves to another version than the newest installed is said
+  (`resolution_note`). N198: Tc3_GlobalTypes (and Tc3_GlobalTypes_<namespace>) — the virtual data-type libraries
+  TwinCAT adds itself from build 4026 (Beckhoff "Using global data types") — are `added_by_twincat`, not a difference,
+  and not checked against ScanLibraries. N197 (cause still not established): when a re-registration fails, the system
+  service (port 10000) is read on the capture's own connection; reading RUN (the PLC port refusing, the N197 case) or
+  nothing, the engine opens a new connection on the 3rd attempt of the outage, then after 6, 12, 24, at most 30 more,
+  and asks at once; reading CONFIG it waits. The note of a recovery has the attempts of that outage, the last error and
+  whether the new connection did it; rec_status warns while it lasts. The ADS source guards its device and handles with
+  a mutex (review 1: the stop path cleared them while the writer re-registered). `proj_set_code` says `xae_open` when
+  the server last knew XAE attached with the solution over the file. Repositories: TE1000 documents ITcPlcLibRepository
+  as IUnknown-based (not IDispatch) while its collection is IDispatch-based — pywin32 (late binding only) cannot read
+  Name / Folder; a read-only probe (pywin32 QueryInterface of the item for the repository IID, the type library's
+  description, comtypes' early-bound route) went to Ryan before the tool changes. Review 1 (independent): 1 HIGH, 5
+  MEDIUM, 5 LOW — fixed with tests red before, except: LOW left — the retry block runs under the engine mutex, so
+  rec_status waits behind its ADS calls (identity() already did 3 reads there, now one ReadState more per failed
+  attempt; 0x6 fails fast, a timeout of 5 s per request does not); a confirmation is spent when library_add then refuses
+  (not installed / several distributors) and its prompt cannot show the '*' and distributor filled in after it
+  (`named_as` in the result does); `xae_open` misses a .sln in a subfolder of the project; a name given in full is sent
+  in the case typed. Not seen on hardware: AddLibrary(name, '*', distributor), AddPlaceholder / SetEffectiveResolution
+  with '*' and the distributor filled; the system state read on port 10000 through the capture's connection; whether a
+  new connection recovers the N197 state.
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).

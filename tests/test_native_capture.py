@@ -8,7 +8,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -254,10 +253,21 @@ def test_d13_outage_resubscribes_and_marks_the_gap(capture_exe, tmp_path):
     assert "registered again 1 time(s)" in f["label_reason"]
 
 
-def test_n197_a_connection_that_fails_every_re_registration_is_opened_again(capture_exe, tmp_path):
+def _status_until(s, cond, timeout=15.0):
+    deadline, st = time.time() + timeout, {}
+    while time.time() < deadline:
+        st = s.call({"cmd": "status"})
+        if cond(st):
+            return st
+        time.sleep(0.05)
+    raise AssertionError(f"status never matched: {st}")
+
+
+def test_n197_a_connection_refused_while_twincat_runs_is_opened_again(capture_exe, tmp_path):
     """N197 (0.8.19 retest, 1 run of 4): after RUN→CONFIG→RUN re-registering failed 20 times with ADS 0x6 while TwinCAT
-    was in RUN again, and the recording stayed silent. After 3 failures in a row the engine opens a new connection and
-    asks at once; every failure says the target state read on the connection."""
+    was in RUN again, and the recording stayed silent. When the system service (port 10000) reads RUN and the PLC port
+    still refuses, the engine opens a new connection on the 3rd attempt and asks at once; every failure says the system
+    state read on the connection."""
     s = Svc(capture_exe)
     try:
         # outage 0.5..1.0 s; from 1.1 s the runtime is back but this connection keeps failing until it is opened again
@@ -265,21 +275,50 @@ def test_n197_a_connection_that_fails_every_re_registration_is_opened_again(capt
                               cycle_100ns=100_000, silent_ms=300, resubscribe_after_ms=600, resubscribe_retry_ms=300,
                               sim={"speed": 1, "outage": [50, 99], "stale_port_after_outage": True}))
         assert r["ok"]
-        deadline, st = time.time() + 10, {}
-        while time.time() < deadline:
-            st = s.call({"cmd": "status"})
-            if st.get("resubscribe_failures"):
-                break
-            time.sleep(0.05)
-        err = st.get("resubscribe_error", "")
-        assert "0x6" in err and "target state not readable on this connection" in err, st
+        st = _status_until(s, lambda st: st.get("resubscribe_failures"))
+        err = st["resubscribe_error"]
+        assert "0x6" in err and "TwinCAT system state on this connection: RUN" in err, st
         f = s.wait_event(30)["footer"]
     finally:
         s.close()
-    assert f["resubscriptions"] == 1 and f["port_reopens"] == 1, f
-    assert any("registered again" in e and "after opening the ADS connection again" in e for e in f["errors"]), f
+    assert f["resubscriptions"] == 1 and f["port_reopens"] == 1 and f["resubscribe_failures"] == 2, f
+    note = next(e for e in f["errors"] if "registered again" in e)
+    assert "2 attempt(s) failed before, last: ADS error 0x6" in note and "system state on this connection: RUN" in note
+    assert "registered on a new ADS connection (the old one was refused 3 time(s))" in note, note
     assert not any(e.startswith("re-registering the notifications failed") for e in f["errors"]), f["errors"]
     assert f["stop_reason"] == "duration 4s", f
+
+
+def test_n197_r1_twincat_in_config_is_waited_for_without_new_connections(capture_exe, tmp_path):
+    """Review 1 of 0.8.20: a long, legitimate CONFIG opened a new connection every second attempt, without end — the
+    system service reading CONFIG says TwinCAT is away: no new connection."""
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "cfg", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}],
+                              cycle_100ns=100_000, silent_ms=300, resubscribe_after_ms=600, resubscribe_retry_ms=100,
+                              sim={"speed": 1, "outage": [50, 100_000]}))
+        assert r["ok"]
+        st = _status_until(s, lambda st: (st.get("resubscribe_failures") or 0) >= 12)
+        s.call({"cmd": "stop"})
+    finally:
+        s.close()
+    assert "port_reopens" not in st and "CONFIG (simulated)" in st["resubscribe_error"], st
+
+
+def test_n197_r1_an_unreadable_target_gets_new_connections_at_growing_intervals(capture_exe, tmp_path):
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "unr", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}],
+                              cycle_100ns=100_000, silent_ms=300, resubscribe_after_ms=600, resubscribe_retry_ms=60,
+                              sim={"speed": 1, "outage": [50, 100_000], "system_state_in_outage": "unreadable"}))
+        assert r["ok"]
+        st = _status_until(s, lambda st: (st.get("resubscribe_failures") or 0) >= 24, timeout=20)
+        s.call({"cmd": "stop"})
+    finally:
+        s.close()
+    a = st["resubscribe_failures"]
+    assert st["port_reopens"] == sum(1 for t in (3, 9, 21, 45, 75, 105) if t <= a), st   # gaps 6, 12, 24, then 30
+    assert "not readable on this connection" in st["resubscribe_error"], st
 
 
 def test_r5_gap_markers_where_samples_are_missing(capture_exe, tmp_path):
@@ -393,12 +432,12 @@ def test_n197_the_status_says_while_re_registering_fails(rec):
     while time.time() < deadline:
         s = rec.status(st["id"])
         w = [x for x in s.get("warnings") or [] if x.startswith("no samples: re-registering")]
-        if w and s.get("port_reopens"):
+        if w and (s.get("resubscribe_failures") or 0) >= 4:
             break
         time.sleep(0.1)
     rec.stop(st["id"])
-    assert w and "target state not readable on this connection" in w[0], w
-    assert re.search(r"the ADS connection was opened again \d+ time\(s\)", w[0]), w
+    assert w and "TwinCAT system state on this connection: CONFIG" in w[0], w
+    assert "opened again" not in w[0], w                 # TwinCAT is away: no new connection (review 1 of 0.8.20)
 
 
 def test_spec5_pre_trigger_exactly_500(rec):

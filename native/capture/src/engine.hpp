@@ -220,9 +220,11 @@ private:
     std::chrono::steady_clock::time_point last_resub_try_;
     bool resub_tried_ = false;
     uint64_t resub_failures_ = 0;
-    uint64_t resub_streak_ = 0;          // failed re-registrations since the last one that worked
-    uint64_t port_reopens_ = 0;          // N197: connections opened again after kReopenAfter failures in a row
-    bool reopened_in_streak_ = false;
+    uint64_t outage_attempts_ = 0;       // re-registration attempts since the last samples (this outage)
+    uint64_t outage_reopens_ = 0;        // connections opened again in this outage
+    uint64_t port_reopens_ = 0;          // N197: connections opened again, the whole recording
+    uint64_t reopen_gap_ = 3;            // attempts between reopens (doubles, capped)
+    uint64_t next_reopen_at_ = 3;        // the attempt of this outage that may open the connection again
     std::string reopen_error_;
     std::string resub_error_;
     std::vector<std::string> resub_notes_;

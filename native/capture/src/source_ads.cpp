@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -138,6 +139,7 @@ public:
 
     bool subscribe(const std::vector<BlockSpec>& blocks, int64_t cycle_100ns, int64_t max_delay_100ns, Sink* sink,
                    SubscribeError& err) override {
+        std::lock_guard<std::mutex> lk(m_);
         g_sink.store(sink, std::memory_order_release);
         blocks_ = blocks;
         cycle_ = cycle_100ns;
@@ -156,25 +158,30 @@ public:
                 err.block = static_cast<int>(k);
                 err.code = ex.errorCode;
                 err.message = ads_error(ex.errorCode);
-                unsubscribe();
+                drop_locked();
                 return false;
             } catch (const std::exception& ex) {
                 err.block = static_cast<int>(k);
                 err.message = ex.what();
-                unsubscribe();
+                drop_locked();
                 return false;
             }
         }
         return true;
     }
 
+    // Called by the engine's stop path on another thread than the writer, which may be in resubscribe() / reopen() at
+    // that moment (review 1 of 0.8.20: two threads clearing notes_, and a reopen freeing the AdsDevice the
+    // notification deleters still pointed at) — every use of dev_ / notes_ holds m_; after it nothing is registered
+    // again.
     void unsubscribe() override {
-        // AdsNotification's destructor deletes the device notification (synchronous ADS request).
-        notes_.clear();
-        g_sink.store(nullptr, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(m_);
+        stopped_ = true;
+        drop_locked();
     }
 
     bool read_version(uint32_t& version, std::string& err) override {
+        std::lock_guard<std::mutex> lk(m_);
         if (!dev_) {
             err = "not connected";
             return false;
@@ -197,6 +204,7 @@ public:
     // "t<compile time>:c<online changes>:u<symbols>,<symbol bytes>,<datatypes>,<datatype bytes>" of the PLC
     // application; "" when any part is not readable.
     std::string identity() override {
+        std::lock_guard<std::mutex> lk(m_);
         if (!dev_) return "";
         static const char kTs[] = "TwinCAT_SystemInfoVarList._AppInfo.AppTimestamp";
         static const char kOc[] = "TwinCAT_SystemInfoVarList._AppInfo.OnlineChangeCnt";
@@ -216,6 +224,11 @@ public:
     // (the delete request fails fast while the port is away) and register every block again. All or nothing, like
     // subscribe(): a partial set would record some blocks and silently miss others.
     bool resubscribe(std::string& err) override {
+        std::lock_guard<std::mutex> lk(m_);
+        if (stopped_) {
+            err = "stopped";
+            return false;
+        }
         if (!dev_ || blocks_.empty()) {
             err = dev_ ? "nothing subscribed" : "no ADS connection (opening it again failed)";
             return false;
@@ -248,6 +261,11 @@ public:
     uint64_t resubscriptions() const override { return resubs_; }
 
     bool reopen(std::string& err) override {
+        std::lock_guard<std::mutex> lk(m_);
+        if (stopped_) {
+            err = "stopped";
+            return false;
+        }
         notes_.clear();                      // the delete requests on the old port fail fast; the handles are dead
         dev_.reset();                        // closes the old local port
         try {
@@ -261,19 +279,26 @@ public:
         return false;
     }
 
-    std::string state_text() override {
-        if (!dev_) return "target state: not connected";
-        try {
-            const AdsDeviceState st = dev_->GetState();
-            return "target state on this connection: ADS " + state_name(st.ads) + ", device " +
-                   std::to_string(static_cast<int>(st.device)) + " (local port " +
-                   std::to_string(dev_->GetLocalPort()) + ")";
-        } catch (const AdsException& ex) {
-            return "target state not readable on this connection: " + ads_error(ex.errorCode) + " (local port " +
-                   std::to_string(dev_->GetLocalPort()) + ")";
-        } catch (const std::exception& ex) {
-            return std::string("target state not readable on this connection: ") + ex.what();
+    // Review 1 of 0.8.20: a ReadState on the PLC port answers 0x6 whenever registering there does — the system service
+    // (port 10000) is asked instead: RUN with the PLC port refusing is the N197 case, CONFIG is TwinCAT away.
+    int system_state(std::string& text) override {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!dev_) {
+            text = "TwinCAT system state: no ADS connection";
+            return -1;
         }
+        const long local = dev_->GetLocalPort();
+        AmsAddr sys{make_AmsNetId(net_id_), 10000};
+        uint16_t ads = 0, dev = 0;
+        const long e = AdsSyncReadStateReqEx(local, &sys, &ads, &dev);
+        if (e != 0) {
+            text = "TwinCAT system state not readable on this connection: " + ads_error(e) + " (local port " +
+                   std::to_string(local) + ")";
+            return -1;
+        }
+        text = "TwinCAT system state on this connection: " + state_name(ads) + " (local port " + std::to_string(local) +
+               ")";
+        return ads == ADSSTATE_RUN ? 1 : 0;
     }
 
     std::string describe() const override {
@@ -304,6 +329,14 @@ private:
     std::vector<BlockSpec> blocks_;
     int64_t cycle_ = 10000, max_delay_ = 0;
     uint64_t resubs_ = 0;
+    std::mutex m_;               // dev_ / notes_ / blocks_: the writer thread and the stop path
+    bool stopped_ = false;
+
+    void drop_locked() {
+        // AdsNotification's destructor deletes the device notification (synchronous ADS request).
+        notes_.clear();
+        g_sink.store(nullptr, std::memory_order_release);
+    }
 };
 
 }  // namespace
