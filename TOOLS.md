@@ -1,6 +1,6 @@
-# twincat-mcp 0.8.18 — tool reference
+# twincat-mcp 0.8.19 — tool reference
 
-160 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
+168 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
 ## Meta & safety (8)
 
@@ -98,12 +98,20 @@
 - `ipc_start_process` [D] — Start a process on the target IPC (NT_StartProcess equivalent). Destructive-class.
 - `ipc_reboot` [D] — Reboot (or shut down) the target IPC via the System Service. Destructive-class.
 
-## XAE Automation Interface (28)
+## XAE Automation Interface (36)
 
 - `xae_dialogs` [R] — Modal dialogs currently open in the attached XAE shell (title, class, text, buttons), the watchdog's auto-answer rules and its recent log. A pending dialog blocks every COM call. Any window that holds the shell modal (its main window disabled) is listed, whatever its class (WPF About / Options, WinForms): its buttons…
 - `xae_dialog_resolve` [C/D] — Click a button on an open XAE dialog ('OK', 'Yes', 'No', 'Cancel'…). remember=true adds an auto-answer rule for that title (never for machine-affecting prompts). Control-class; machine-affecting prompts (activate/run/download/login/delete/safety) are destructive-class. A window that is not a standard dialog is…
 - `xae_io_disable` [E] — Set/clear the Disabled flag on I/O devices under TIID (all, or the named ones) so a configuration activates without the hardware present — TcUnit on a PC, dry runs.
 - `xae_links` [R] — Variable links of the PLC instance: every AT %I*/%Q* variable (from the instance's XML) with its link targets (the project's mapping table, ProduceMappingInfo); lists the unlinked ones — array elements too, the usual reason an output never moves — and links whose variable is gone. plc_project_path: plc_path,…
+- `xae_library_list` [R] — The library references of a PLC project as XAE holds them now (TE1000 ITcPlcLibraryManager): libraries (name, version, distributor) and placeholders (default and effective resolution — '*' and what it resolves to). Flags a library referenced twice and a version that is not installed (ScanLibraries;…
+- `xae_library_installed` [R] — The libraries installed in the repositories XAE uses (ScanLibraries): name, version, distributor — every version of a library. name filters (part of the name, any case).
+- `xae_library_repositories` [R] — The library repositories XAE uses, in priority order (name, folder). Where this XAE's Automation Interface does not give them, it says so — nothing is guessed.
+- `xae_library_add` [C] — Add a library reference (AddLibrary): library by name (version '' = the newest / managed one, distributor optional) or by display name 'Tc2_Math, * (Beckhoff Automation GmbH)'. Refused when it is already referenced. Runs once; the result has the references before / after, XAE's messages, and build_required — it never…
+- `xae_library_remove` [D] — Remove a library or placeholder reference (RemoveReference). A name referenced more than once (a library and a placeholder of the same name, two versions) is refused until kind ('library' / 'placeholder') or version says which ('#X' = the placeholder X). RemoveReference itself takes a name (and a library's version):…
+- `xae_placeholder_add` [C] — Add a placeholder (AddPlaceholder) with its default library (library '' = the device's placeholder of that name). target='<iec project path>:<placeholder>'.
+- `xae_placeholder_resolve` [C] — Set what a placeholder resolves to (SetEffectiveResolution): library, version ('' or '*' = newest). The result checks the effective resolution after it. target='<iec project path>:<placeholder>=<library>' + ', <version>' when given.
+- `xae_placeholder_freeze` [C] — Freeze a placeholder (all when placeholder is left out) at the version it resolves to now (FreezePlaceholder): '*' no longer follows newer installed versions. target='<iec project path>:<placeholder>' ('*' for all).
 - `xae_attach` [E] — Attach to the running XAE shell / Visual Studio (Running Object Table) that has the solution: solution_path when given (from then on every xae_* tool works on it — flagged solution_mismatch when it is not xae.solution_path), else xae.solution_path. A solution no shell has open is never replaced by another one…
 - `xae_status` [R] — Shell version, open solution, projects, TwinCAT project name, target NetId, started flag. Attaches to the shell first if not attached yet (as every xae_* tool does). solution_bound: the solution the xae_* tools work on; solution_mismatch / refused: it is not open (they refuse); reattached: it was found in a shell…
 - `xae_open_solution` [E] — Open a .sln in the attached shell.
