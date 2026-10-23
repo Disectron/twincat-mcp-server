@@ -52,6 +52,14 @@ previous batch's ids. Check `ads_task_stats` once with the profile live; thin it
 ## HMI
 `hmi_scan` → `hmi_vs_runtime` (broken bindings) → `hmi_bindings <symbol>` before renaming a PLC variable.
 
+## I/O links (an output never moves, an input reads nothing)
+`xae_links` (unlinked, links_without_variable, not_restored: links the saved project keeps but XAE could not restore)
+→ `xae_tree_get` on the terminal for its channel paths → `xae_link variable=<instance path>^PlcTask Outputs^<var>
+target=<box path>^Channel n^Output` (confirm) → `xae_links` again → save (`xae_build save_first=true`) → activate
+(confirm). Many links: a `<VarLinks>` table → `xae_links_import` dry run (added / removed / changed) → `dry_run=false`
+(the table as it was goes to a backup file; restore with that file, `mode='replace'`). Links change nothing on the
+target until activated.
+
 ## When XAE stalls
 `xae_dialogs` → read title/buttons → `xae_dialog_resolve button=...` (machine-affecting prompts need confirmation).
 A window with `buttons: null` (not a standard dialog, buttons unreadable) cannot be pressed by the tool: ask the user to

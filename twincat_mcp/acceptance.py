@@ -118,6 +118,12 @@ MANUAL: dict[str, str] = {
                        "named_as gives the display name used, N199), xae_build, then xae_library_remove it and build "
                        "again — the references are as before",
     "xae_library_remove": "remove the library added above; a name referenced twice is refused until kind= says which",
+    "xae_link": "on a copy of the project: link an unlinked input (xae_links unlinked) to a free terminal channel; "
+                "xae_links then lists it; a second call is refused (linked already)",
+    "xae_unlink": "unlink the link made above; xae_links lists the variable as unlinked again",
+    "xae_links_import": "dry run with ProduceMappingInfo's own table (mode='replace'): nothing to change; dry run with "
+                        "one extra link (mode='add'): 1 added; apply it, the backup file exists, xae_links has the link; "
+                        "restore from the backup (mode='replace')",
     "xae_placeholder_add": "on a copy: add a placeholder with a library by its name only (e.g. Tc2_Math: distributor "
                            "and '*' completed), then resolve and freeze it",
     "xae_placeholder_resolve": "resolve the placeholder added above to an installed version; the result's effective "

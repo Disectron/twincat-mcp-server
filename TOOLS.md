@@ -1,6 +1,6 @@
 # twincat-mcp 0.8.19 — tool reference
 
-168 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
+171 tools, 5 prompts, 3 resources. Generated from the server (`python scripts/gen_tools_md.py`); one line per tool. Class: R = read-only, E = edit (files/XAE project, no effect on the running machine), W = write to the PLC (allow/deny lists), C = control (confirm in guarded), D = destructive (confirm unless TCMCP_CONFIRM=0 in full).
 
 ## Meta & safety (8)
 
@@ -98,12 +98,15 @@
 - `ipc_start_process` [D] — Start a process on the target IPC (NT_StartProcess equivalent). Destructive-class.
 - `ipc_reboot` [D] — Reboot (or shut down) the target IPC via the System Service. Destructive-class.
 
-## XAE Automation Interface (36)
+## XAE Automation Interface (39)
 
 - `xae_dialogs` [R] — Modal dialogs currently open in the attached XAE shell (title, class, text, buttons), the watchdog's auto-answer rules and its recent log. A pending dialog blocks every COM call. Any window that holds the shell modal (its main window disabled) is listed, whatever its class (WPF About / Options, WinForms): its buttons…
 - `xae_dialog_resolve` [C/D] — Click a button on an open XAE dialog ('OK', 'Yes', 'No', 'Cancel'…). remember=true adds an auto-answer rule for that title (never for machine-affecting prompts). Control-class; machine-affecting prompts (activate/run/download/login/delete/safety) are destructive-class. A window that is not a standard dialog is…
 - `xae_io_disable` [E] — Set/clear the Disabled flag on I/O devices under TIID (all, or the named ones) so a configuration activates without the hardware present — TcUnit on a PC, dry runs.
 - `xae_links` [R] — Variable links of the PLC instance: every AT %I*/%Q* variable (from the instance's XML) with its link targets (the project's mapping table, ProduceMappingInfo); lists the unlinked ones — array elements too, the usual reason an output never moves — and links whose variable is gone. plc_project_path: plc_path,…
+- `xae_link` [C] — Link a variable to its I/O counterpart (ITcSysManager::LinkVariables), both as full tree paths: variable='TIPC^<Plc>^<Plc> Instance^PlcTask Inputs^GVL_IO.bIn', target='TIID^Device 1 (EtherCAT)^Term 1 (EK1100)^Term 2 (EL1004)^Channel 1^Input' (xae_links gives the instance's variables, xae_tree_get the terminals').…
+- `xae_unlink` [D] — Remove a link (ITcSysManager::UnlinkVariables): the one between variable and target, or — target left out — every link of the variable. Full tree paths as the mapping table names them (xae_links). Refused when there is no such link, or when a link to be removed has a TwinSAFE end. Runs once; the result has what…
+- `xae_links_import` [D] — Import a mapping table (<VarLinks>, as ProduceMappingInfo writes it) through ConsumeMappingInfo, which replaces ALL links of the project. mode='add': its links are added to the table as it is (nothing removed); 'replace': it is the whole new table. dry_run (default): what would be added / removed / changed — nothing…
 - `xae_library_list` [R] — The library references of a PLC project as XAE holds them now (TE1000 ITcPlcLibraryManager): libraries (name, version, distributor) and placeholders (default and effective resolution — '*' and what it resolves to). Flags a library referenced twice and a version that is not installed (ScanLibraries;…
 - `xae_library_installed` [R] — The libraries installed in the repositories XAE uses (ScanLibraries): name, version, distributor — every version of a library. name filters (part of the name, any case).
 - `xae_library_repositories` [R] — The library repositories XAE uses, in priority order (name, folder). Where this XAE's Automation Interface does not give them, it says so — nothing is guessed.

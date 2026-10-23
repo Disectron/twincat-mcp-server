@@ -135,6 +135,126 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+_RE_XTI_FILE = re.compile(rb'\bFile\s*=\s*"([^"]+?\.xti)"', re.I)
+
+
+def not_restored_links(sln: str | os.PathLike[str], plc: str | None = None, limit: int = 200) -> dict[str, Any]:
+    """0.8.20: the links the SAVED TwinCAT project keeps but XAE could not restore when it loaded them — TwinCAT marks
+    them with a RestoreInfo attribute (DrumFillingMachineV0: RestoreInfo="ANotFound", 5 links on Term 6 whose PLC
+    variables had moved); ProduceMappingInfo does not list them. Read from the .tsproj files the .sln names and the
+    independent .xti files they (and those) name — review 1 of 0.8.20: not every .xti below the folder (an old copy
+    is no part of the project) — whatever element carries the attribute; only files that hold the word are parsed.
+    plc: only links one end of which is in that PLC ('TIPC^<Plc>'). {read, files, count, entries: [{file,
+    restore_info, element, owner_a, owner_b, var_a, var_b, name}], unresolved?, unread_files?} — the saved state, not
+    what XAE holds now."""
+    sln_p = Path(sln)
+    base = sln_p.parent
+    tsprojs: list[Path] = []
+    try:
+        txt = sln_p.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as exc:
+        return {"read": False, "why": f"the solution file could not be read ({exc})"}
+    for rel in _RE_SLN_PROJECT.findall(txt):
+        try:
+            t = (base / rel.replace("\\", "/")).resolve()
+            if t.is_file():
+                tsprojs.append(t)
+        except OSError:
+            continue
+    if not tsprojs:
+        return {"read": False, "why": f"{sln_p.name} names no .tsproj that exists"}
+    files: list[Path] = []
+    unresolved: list[str] = []
+
+    def place(name: str, by: Path, top: Path) -> Path | None:
+        """Review 2 of 0.8.20: where TwinCAT puts an independent file — a box <X>.xti names its children in the folder
+        <X>/ beside it; the .tsproj its devices in _Config/<kind>/. Then one file of that name below the project; else
+        it is not placed (said)."""
+        cands = [by.parent / by.stem / name] if by.suffix.lower() == ".xti" else []
+        try:
+            cfg = top / "_Config"
+            if by.suffix.lower() == ".tsproj" and cfg.is_dir():
+                cands += [d / name for d in cfg.iterdir() if d.is_dir()]
+            for c in cands:
+                if c.is_file():
+                    return c
+            hits = [x for x in top.rglob(name) if x.is_file() and "_Boot" not in x.parts]
+        except OSError as exc:
+            unresolved.append(f"{name}: {exc}")
+            return None
+        if len(hits) == 1:
+            return hits[0]
+        unresolved.append(f"{name} (named by {by.name}): " + ("not found" if not hits else
+                                                             f"{len(hits)} files of that name, none where TwinCAT puts it"))
+        return None
+
+    for t in tsprojs:
+        todo, seen = [t], set()
+        while todo:
+            f = todo.pop()
+            if f in seen:
+                continue
+            seen.add(f)
+            files.append(f)
+            try:
+                raw = f.read_bytes()
+            except OSError:
+                continue
+            for m in _RE_XTI_FILE.finditer(raw):
+                name = Path(m.group(1).decode("utf-8", "replace").replace("\\", "/")).name
+                hit = place(name, f, t.parent)
+                if hit is not None:
+                    todo.append(hit)
+    want = (plc or "").casefold().rstrip("^")
+    entries: list[dict[str, Any]] = []
+    other: list[dict[str, Any]] = []
+    unread: list[str] = []
+    for f in dict.fromkeys(files):
+        try:
+            raw = f.read_bytes()
+            if b"RestoreInfo" not in raw and "RestoreInfo".encode("utf-16-le") not in raw:
+                continue
+            root = ET.fromstring(raw)
+        except Exception as exc:  # noqa: BLE001 — review 2: any file the parser does not take is said, never fatal
+            unread.append(f"{f}: {exc}")
+            continue
+        parent = {c: p for p in root.iter() for c in p}
+        for el in root.iter():
+            ri = el.get("RestoreInfo")
+            if ri is None:
+                continue
+            row: dict[str, Any] = {"file": str(f), "restore_info": ri, "element": _local(el.tag)}
+            up = parent.get(el)
+            while up is not None:
+                tag = _local(up.tag)
+                if tag in ("OwnerA", "OwnerB") and f"owner_{tag[-1].lower()}" not in row:
+                    row[f"owner_{tag[-1].lower()}"] = up.get("Name") or ""
+                up = parent.get(up)
+            for k in ("VarA", "VarB", "Name"):
+                if el.get(k) is not None:
+                    row[{"VarA": "var_a", "VarB": "var_b", "Name": "name"}[k]] = el.get(k)
+            owners = [row.get("owner_a", ""), row.get("owner_b", "")]
+            if not any(owners):
+                other.append(row)              # review 2: marked, but no link — not counted as one
+                continue
+            if want and not any(o.casefold() == want or o.casefold().startswith(want + "^") for o in owners):
+                continue                       # a link of another PLC
+            entries.append(row)
+    flist = [str(f) for f in dict.fromkeys(files)]
+    out: dict[str, Any] = {"read": True, "files": flist[:limit], "count": len(entries), "entries": entries[:limit]}
+    if len(flist) > limit:
+        out["files_count"] = len(flist)
+    if other:
+        out["other_marked"] = other[:50]
+    if len(entries) > limit:
+        out["truncated"] = f"{len(entries)} entries, the first {limit} listed"
+    if unresolved:
+        out["unresolved"] = sorted(set(unresolved))[:50]
+    if unread:
+        out["unread_files"] = unread
+    return out
+
+
 def _find_xti(base: Path, name: str) -> tuple[Path | None, str | None]:
     """The independent project file a .tsproj names (<Project File="Plc2.xti"/>): XAE keeps it in _Config\\PLC\\;
     anywhere else below the .tsproj's folder only when exactly one file has that name."""
