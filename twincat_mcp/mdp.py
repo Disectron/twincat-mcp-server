@@ -8,7 +8,7 @@ The model (Infosys `devicemanager`, read 2026-10-23):
   the module pages document (CPU 0x000B, Memory 0x000C, TwinCAT 0x0008, OS 0x0018, Fan 0x001B, Mainboard 0x001C,
   Disk Management 0x001D). Module types: Tc3_IPCDiag's E_IPCDiag_ModuleType.
 
-The ADS address is NOT confirmed (docs/PLAN-0.8.19.md §8): AMS port 10000 (the system service) and index group 0xF302
+The ADS address is NOT confirmed (docs/PLAN-0.8.19.md, IPC diagnostics): AMS port 10000 (the system service) and index group 0xF302
 with index offset `index << 16 | flags << 8 | subindex` — inferred from Tc3_IPCDiag's nIndex / nFlags / nSubIndex,
 not read on a page. The first hardware check decides it; nothing here is released before it passes.
 """
@@ -158,7 +158,7 @@ def read_info(reader: Reader, max_reads: int = MAX_READS, types: set[int] | None
         count = int(b.read(MODULE_LIST, 0, "u16"))
     except Exception as exc:  # noqa: BLE001
         raise MdpError(f"the module list ({label(MODULE_LIST, 0)}) could not be read: {exc}") from exc
-    if count > 0x100:
+    if count > 0xFF:                       # subindex 0 is the count: rows 1…255 are all a table can address
         raise MdpError(f"the module list ({label(MODULE_LIST, 0)}) says {count} modules — more than the 8-bit module ID "
                        "allows: this is not a module list (a wrong ADS address?). Nothing is reported from it")
     modules: list[dict[str, Any]] = []

@@ -6006,16 +6006,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             raise ToolError("type must be one of hex, string, u8, u16, u32, u64, i16, i32, bool — nothing was read")
         if size is not None and typ != "hex":
             raise ToolError(f"size is for type='hex' only ({typ} has its own size) — nothing was read")
+        if size is not None and not 1 <= int(size) <= 4096:
+            raise ToolError(f"size must be 1…4096 bytes (got {size}) — nothing was read")
         try:
             M.check_address(int(index), int(subindex))
         except M.MdpError as exc:
             raise ToolError(str(exc)) from exc
-        n = max(1, min(int(size or 4), 4096))
+        n = int(size or 4)
         r = await app.ads_call(app.ads.mdp_read, int(index), int(subindex), typ, ams_net_id, n, timeout=30)
         return {"mdp": M.label(int(index), int(subindex)), "type": typ, **r,
                 "ads_address": {"port": M.MDP_PORT, "index_group": f"0x{M.MDP_INDEX_GROUP:X}",
                                 "index_offset": f"0x{M.index_offset(int(index), int(subindex)):08X}",
-                                "confirmed": "not yet on hardware — the address is inferred (docs/PLAN-0.8.19.md §8)"}}
+                                "confirmed": "not yet on hardware — the address is inferred (docs/PLAN-0.8.19.md, IPC diagnostics)"}}
 
     # ======================================================================
     # xae_* Automation Interface

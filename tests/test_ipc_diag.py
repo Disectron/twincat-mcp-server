@@ -72,7 +72,9 @@ def device(monkeypatch):
             raise pyads.ADSError(1795)                     # invalid index offset
         data = dev[(idx, sub)]
         if plc_datatype is pyads.PLCTYPE_STRING:
-            return data.split(b"\x00", 1)[0].decode("cp1252")
+            if not return_ctypes:
+                return data.split(b"\x00", 1)[0].decode("utf-8")     # pyads: strict UTF-8
+            return (ctypes.c_char * 1024).from_buffer_copy(data[:1024].ljust(1024, b"\x00"))
         n = ctypes.sizeof(plc_datatype)
         if check_length and len(data) != n:
             raise RuntimeError(f"Insufficient data (expected {n} bytes, {len(data)} were read).")
@@ -219,3 +221,49 @@ def test_a_cancelled_call_stops_between_reads(device):
         return _reader(dev)(i, s, t)
     r = M.read_info(reader)
     assert n["n"] == 21 and r["stopped"].startswith("the call was cancelled"), r
+
+
+
+# ---- review 2 of 0.8.19 ----------------------------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_r2_another_workers_cancel_flag_does_not_refuse_ipc_mdp_read(device, project_dir):
+    """Review 2: mdp_read checked the slow worker's cancel flag, which stays set after any slow call timed out —
+    every ipc_mdp_read (quick worker) then failed with 'the call was cancelled'."""
+    dev, reads, _ = device
+    srv = build_server(mk_cfg(project_dir))
+    srv._tcmcp_app.ads.cancel.set()
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("ipc_mdp_read", {"index": 0x8011, "subindex": 2, "type": "u16"}))
+    assert r["value"] == 37
+
+
+@pytest.mark.anyio
+async def test_r2_strings_are_windows_1252_with_their_bytes_and_size_is_checked(device, project_dir):
+    dev, reads, _ = device
+    dev[(0x8041, 4)] = "Gerät °C".encode("cp1252") + b"\x00"
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("ipc_mdp_read", {"index": 0x8041, "subindex": 4, "type": "string"}))
+        assert r["value"] == "Gerät °C" and r["hex"] == "Gerät °C".encode("cp1252").hex(), r
+        for size in (0, -1, 5000):
+            bad = await s.call_tool("ipc_mdp_read", {"index": 0x8011, "subindex": 2, "type": "hex", "size": size})
+            assert bad.is_error and "size must be 1…4096" in text(bad), text(bad)
+
+
+@pytest.mark.anyio
+async def test_r2_real_ads_timeouts_stop_ipc_info(device, project_dir):
+    dev, reads, timeouts = device
+    timeouts.update({k for k in dev if k[0] != 0xF020 and (k[0] >> 4 & 0xFF) >= 3})
+    timeouts.update({(M.table_index(m, 0), 3) for m in range(3, 9)})
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("ipc_info", {}))
+    assert "the target stopped answering (3 reads in a row timed out" in r["stopped"], r
+
+
+def test_r2_a_count_of_256_is_not_a_module_list(device):
+    dev, _, _ = device
+    dev[(0xF020, 0)] = struct.pack("<H", 256)
+    with pytest.raises(M.MdpError, match="256 modules"):
+        M.read_info(_reader(dev))
