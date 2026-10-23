@@ -273,6 +273,23 @@ tool wishlist (2026-10-18).
   and what is not (an unpinned resolution, a freeze) is said. All fixed with tests red before. LOW, left: none open.
   Not seen on hardware: whether RemoveReference(name) removes the placeholder or the library when both share a name
   (the result checks and says); whether AddLibrary takes a display name on 4024 (TE1000 says it does).
+- 0.8.19 retest (Ryan, 2026-10-24, bugs.md §39 – §39d). Passed live: N196 (`tcunit_results(path=)`, `ads_read(symbol=)`
+  refused), N195 (PLCopen replace of PRG_Machine ×3), N194 (python change mode across RUN → CONFIG → RUN:
+  resubscriptions 1, `_restart` before the first sample after it, INCOMPLETE, rec_verify FAIL; the symbol version moved
+  150 → 151), N180 (`restart_seen`; the hardware order is Record → RouterStop → AutoStop → Reply, as assumed; every
+  restart shows two RouterStop → AutoStop → Reply cycles), R7 native 1 ms (30003 samples, LOSSLESS), the native restart
+  without Scope, `xae_library_list` / `_installed` / add / remove / placeholder add → resolve → freeze → build (the
+  .plcproj then has the PlaceholderResolution), R40 from CONFIG; native 1 ms with `max_delay_ms` 0 – 2000 lossless
+  (§39d: Beckhoff's FIFO sends when full or at nMaxDelay). New: N197 (S3, 1 of 4) — a native cycle recording with
+  Scope did not recover from a TwinCAT restart: 20 re-registrations failed with ADS 0x6 (target port not found) while
+  TwinCAT was in RUN, nothing delivered for the rest of the 60 s; Scope, the restart time and the 0xA2 lines do not
+  separate it from the three runs that recovered; cause not established. N198 (S4) — `saved_plcproj.same` false after a
+  save: XAE lists the placeholder Tc3_GlobalTypes, the .plcproj does not hold it. N199 (S3) — `xae_library_add` with the
+  bare name fails on 4024 ("LibInfo display name 'Tc2_Math' is not valid", HRESULT 0x80020009): XAE wants the display
+  name; with version + distributor, or 'Tc2_Math, * (Beckhoff Automation GmbH)', it works. `xae_library_repositories`
+  → "not readable through this XAE's Automation Interface" (E_NOINTERFACE): per the plan the tool is dropped. Left in
+  the test project: Tc2_EtherCAT 3.8.2.0 and `90_Test\PRG_LibTest` (on the user's request). Not run: the Options-open
+  refusal, the GetLastErrorMessages probe, `runtime_away_at_end`, the DrumFillingMachine rows (VisuSymbols ×2).
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
