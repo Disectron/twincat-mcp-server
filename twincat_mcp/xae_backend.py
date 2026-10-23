@@ -1759,7 +1759,9 @@ class XaeBackend:
             if lib:
                 by_lib.setdefault(lib.lower(), []).append(f"{r['kind']} {r['name']}")
             if r["kind"] == "placeholder" and dflt.get("version") == "*" and eff.get("version"):
-                r["resolves"] = f"'*' (newest installed) resolves to {eff['version']} here"
+                # review 1 of 0.8.19: not 'the newest installed' — a resolution set for it, a frozen one or the
+                # placeholder profile give other versions, and the Automation Interface does not say which applies
+                r["resolves"] = f"default '*', effective {eff['version']} (XAE's effective resolution)"
         twice = {k: v for k, v in by_lib.items() if len(v) > 1}
         if twice:
             res["referenced_twice"] = twice
@@ -1811,12 +1813,18 @@ class XaeBackend:
         try:
             rows = []
             for r in self._members(self._retry(lambda: it.Repositories, f"{path}.Repositories"), "Repositories"):
-                row = {}
+                row: dict[str, Any] = {}
                 for k in ("Name", "Folder"):
-                    v = self._get(lambda r=r, k=k: getattr(r, k), f"Repository.{k}")
-                    if v is not None:
-                        row[k.lower()] = str(v)
+                    try:
+                        row[k.lower()] = str(self._retry(lambda r=r, k=k: getattr(r, k), f"Repository.{k}"))
+                    except (XaeBusy, XaeGone):
+                        raise
+                    except XaeError as exc:
+                        row[f"{k.lower()}_error"] = str(exc)[:160]
                 rows.append(row)
+            if rows and all("name" not in r and "folder" not in r for r in rows):
+                # review 1 of 0.8.19: items listed but not readable (the probe's E_NOINTERFACE) were rows of nothing
+                raise XaeError(f"{len(rows)} repositories listed, none of them readable: {rows[0]}")
         except (XaeBusy, XaeGone):
             raise
         except XaeError as exc:
@@ -1856,19 +1864,26 @@ class XaeBackend:
     def library_add(self, plc_project_path: str, library: str, version: str = "", distributor: str = "") -> dict[str, Any]:
         path, it = self._libman(plc_project_path)
         before = self._lib_refs(it, path)
-        want = (_lib_parts(library).get("library") if "," in library else library).strip()
-        have = _ref_find(before, want)
+        want = ((_lib_parts(library).get("library") or library.split(",")[0]) if "," in library else library).strip()
+        if not want:
+            raise XaeError(f"no library name in {library!r} — nothing was done")
+        have = _ref_find(before, want.lstrip("#"))
         if have:
             # TE1000: ArgumentException 'Library or placeholder is already included' — refused here, with what is there
             raise XaeError(f"{want} is already referenced in {_plc_split(plc_project_path)[1]}: {have} — nothing was "
-                           "done (xae_placeholder_resolve changes what a placeholder resolves to)")
+                           "done" + (" (xae_placeholder_resolve changes what a placeholder resolves to)"
+                                     if any(h["kind"] == "placeholder" for h in have) else
+                                     " (another version: xae_library_remove it first)"))
         what = f"AddLibrary {library}" + (f", {version}" if version else "") + (f" ({distributor})" if distributor else "")
 
         def expect(after: list[dict[str, Any]]) -> str | None:
             return None if _ref_find(after, want) else \
                 f"XAE reported success, but {want} is not among the references after it"
+        # a full display name ('Tc2_Math, * (Beckhoff Automation GmbH)') is passed as it is (TE1000 takes it), anything
+        # else as the bare name read from it
+        arg = library.strip() if "," in library and _lib_parts(library).get("library") else want
         return self._lib_change(plc_project_path, path, before, what,
-                                lambda x: _com_call(x, "AddLibrary", library, version or "", distributor or ""), expect)
+                                lambda x: _com_call(x, "AddLibrary", arg, version or "", distributor or ""), expect)
 
     def library_remove(self, plc_project_path: str, library: str, version: str = "", distributor: str = "",
                        kind: str | None = None) -> dict[str, Any]:
@@ -1893,16 +1908,26 @@ class XaeBackend:
         key = _ref_key(target)
 
         def expect(after: list[dict[str, Any]]) -> str | None:
-            if key in _ref_keys(after):
+            # review 1 of 0.8.19: both are said — XAE may remove the other reference of the same name instead
+            # (RemoveReference names no kind: a placeholder and a library of one name are told apart by XAE alone)
+            still = key in _ref_keys(after)
+            other = sorted(_ref_keys(before) - _ref_keys(after) - {key})
+            if still and other:
+                return (f"XAE removed {other} instead of {target['kind']} {name}, which is still referenced — put back "
+                        "what is missing (xae_library_add / xae_placeholder_add)")
+            if still:
                 return f"XAE reported success, but {target['kind']} {name} is still referenced"
-            more = _ref_keys(before) - _ref_keys(after) - {key}
-            if more:
-                return f"XAE removed more than {target['kind']} {name}: also {sorted(more)} — put back what is missing"
+            if other:
+                return f"XAE removed more than {target['kind']} {name}: also {other} — put back what is missing"
             return None
         res = self._lib_change(plc_project_path, path, before, what,
                                lambda x: _com_call(x, "RemoveReference", *args), expect, frozenset({key}))
-        res["consequence"] = (f"code that uses {name} does not build any more — the next xae_build shows where; "
-                              "nothing in the code was changed")
+        if "after_unread" in res:
+            res["consequence"] = (f"if {name} was removed, code that uses it does not build any more — xae_library_list "
+                                  "shows whether it is gone")
+        elif any(_ref_key(r) == key for r in res.get("removed") or []):
+            res["consequence"] = (f"code that uses {name} does not build any more — the next xae_build shows where; "
+                                  "nothing in the code was changed")
         return res
 
     def placeholder_add(self, plc_project_path: str, placeholder: str, library: str = "", version: str = "",
@@ -3094,9 +3119,12 @@ def _ref_keys(refs: list[dict[str, Any]]) -> set[str]:
 def _ref_find(refs: list[dict[str, Any]], name: str, kind: str | None = None,
               version: str = "") -> list[dict[str, Any]]:
     """The references named `name` ('#X' = placeholder X), of `kind` when given; `version` narrows libraries."""
-    n = name.strip().lstrip("#").lower()
+    raw = name.strip()
+    if raw.startswith("#") and kind is None:
+        kind = "placeholder"                   # '#X' is the placeholder X (its Name in the References collection)
+    n = raw.lstrip("#").lower()
     return [r for r in refs if r["name"].lstrip("#").lower() == n and (kind is None or r["kind"] == kind)
-            and (not version or r["kind"] != "library" or (r.get("version") or "") == version)]
+            and (not version or (r["kind"] == "library" and (r.get("version") or "") == version))]
 
 
 def _ref_diff(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, Any]:

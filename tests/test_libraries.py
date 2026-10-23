@@ -134,7 +134,7 @@ def test_library_list_reads_libraries_and_placeholders_and_flags_what_is_wrong(m
                               "display": "Ex_Base, * (Example Corp)"},
                   "effective": {"library": "Ex_Base", "version": "1.2.0.0", "distributor": "Example Corp",
                                 "display": "Ex_Base, 1.2.0.0 (Example Corp)"},
-                  "resolves": "'*' (newest installed) resolves to 1.2.0.0 here"}, ph
+                  "resolves": "default '*', effective 1.2.0.0 (XAE's effective resolution)"}, ph
     assert r["references"][2] == {"kind": "library", "name": "Ex_Visu", "version": "3.5.10.0", "distributor": "System",
                                   "display": "Ex_Visu, 3.5.10.0 (System)"}
     assert r["referenced_twice"] == {"ex_visu": ["placeholder Ex_Visu", "library Ex_Visu"]}, r
@@ -269,8 +269,17 @@ def _server(monkeypatch, project_dir, **safety):
     app = srv._tcmcp_app
     app.dialogs_now = lambda: []
     be, lm = _libs(monkeypatch)
+    _solution(monkeypatch, be, str(project_dir / "Machine.sln"))   # the open solution lies over the project root
     app.xae = be
     return srv, app, lm
+
+
+def _solution(monkeypatch, be, path):
+    dte = be.dte
+    dte.Solution.FullName = path
+    monkeypatch.setattr(be, "_rot_candidates", lambda: [{"progid": "TcXaeShell.DTE.17.0", "moniker": "!TcXaeShell.DTE.17.0:1",
+                                                         "dte": dte, "solution": path}])
+    be.bound_solution = path
 
 
 @pytest.mark.anyio
@@ -354,3 +363,83 @@ async def test_server_a_change_carries_xaes_messages(monkeypatch, project_dir):
     msgs = r.get("xae_messages") or []
     assert any(m.get("action") == "AddLibrary Ex_Math" and "project was reloaded" in m.get("messages", "")
                for m in msgs), r
+
+
+
+# ---- review 1 of 0.8.19 ------------------------------------------------------------------------------------------------
+
+def test_r1_repositories_listed_but_not_readable_are_not_rows_of_nothing(monkeypatch):
+    be, lm = _libs(monkeypatch)
+
+    def nope(self):
+        raise ComError(-2147467262, "No such interface supported")
+
+    class Bare:                                            # the probe's E_NOINTERFACE items: no Name, no Folder
+        Name = property(nope)
+        Folder = property(nope)
+    monkeypatch.setattr(LibMan, "Repositories", property(lambda self: Coll([Bare(), Bare()])))
+    with pytest.raises(X.XaeError, match="2 repositories listed, none of them readable"):
+        be.library_repositories(PROJ)
+
+
+def test_r1_xae_removing_the_other_reference_is_said_and_no_consequence_is_claimed(monkeypatch):
+    be, lm = _libs(monkeypatch)
+
+    def wrong(name, version="", company=""):
+        lm.calls.append(("RemoveReference", name, version, company))
+        lm.refs.pop(1)                                     # the placeholder of the same name went instead
+    lm.RemoveReference = wrong
+    r = be.library_remove(PROJ, "Ex_Visu", kind="library")
+    assert "XAE removed ['placeholder ex_visu'] instead of library Ex_Visu, which is still referenced" in r["warning"], r
+    assert "consequence" not in r, r
+
+
+def test_r1_hash_means_placeholder_and_a_version_narrows_to_libraries(monkeypatch):
+    be, lm = _libs(monkeypatch)
+    with pytest.raises(X.XaeError, match="Ex_Base is not referenced"):
+        be.library_remove(PROJ, "Ex_Base", version="1.2.0.0")       # only a placeholder of that name
+    r = be.library_remove(PROJ, "#Ex_Visu")
+    assert lm.calls == [("RemoveReference", "Ex_Visu", "", "")] and r["removed"][0]["kind"] == "placeholder", r
+
+
+def test_r1_a_name_with_a_trailing_comma_is_read_not_crashed(monkeypatch):
+    be, lm = _libs(monkeypatch)
+    r = be.library_add(PROJ, "Ex_Math, ")
+    assert [x["name"] for x in r["added"]] == ["Ex_Math"], r
+    with pytest.raises(X.XaeError, match="no library name"):
+        be.library_add(PROJ, " , 1.0")
+
+
+@pytest.mark.anyio
+async def test_r1_an_unsaved_resolve_shows_against_the_saved_file(monkeypatch, project_dir):
+    srv, app, lm = _server(monkeypatch, project_dir)
+    lm.refs.append(Placeholder("Tc2_Standard", Lib("Tc2_Standard", "*", "Beckhoff Automation GmbH"),
+                               Lib("Tc2_Standard", "3.3.3.0", "Beckhoff Automation GmbH")))
+    monkeypatch.setattr(app.kb, "installed_libraries", lambda: {
+        "tc2_standard": {"name": "Tc2_Standard", "vendor": "Beckhoff Automation GmbH", "versions": ["3.3.3.0", "3.4.7.0"]}})
+    async with client_for(srv) as s:
+        sv = payload(await s.call_tool("xae_library_list", {}))["saved_plcproj"]
+    assert {"reference": "placeholder Tc2_Standard", "what": "effective", "xae": "3.3.3.0", "saved": "3.4.7.0"} in \
+        sv["version_differs"] and sv["same"] is False, sv
+
+
+@pytest.mark.anyio
+async def test_r1_the_remove_token_names_which_reference(monkeypatch, project_dir):
+    srv, app, lm = _server(monkeypatch, project_dir, mode="guarded", allow_elicitation=False)
+    async with client_for(srv) as s:
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_library_remove", "args": {
+            "library": "Ex_Visu", "kind": "placeholder"}}))
+        assert tok["target"] == f"{PROJ}:Ex_Visu (placeholder)", tok
+        r = await s.call_tool("xae_library_remove", {"library": "Ex_Visu", "kind": "library",
+                                                     "confirm_token": tok["confirm_token"]})
+        assert r.is_error and lm.calls == [], text(r)
+
+
+
+@pytest.mark.anyio
+async def test_r1_a_plcproj_outside_the_open_solution_is_not_compared(monkeypatch, project_dir, tmp_path):
+    srv, app, lm = _server(monkeypatch, project_dir)
+    _solution(monkeypatch, app.xae, str(tmp_path / "other" / "Other.sln"))
+    async with client_for(srv) as s:
+        sv = payload(await s.call_tool("xae_library_list", {}))["saved_plcproj"]
+    assert sv["compared"] is False and "is not in the folder of the solution XAE has open" in sv["why"], sv

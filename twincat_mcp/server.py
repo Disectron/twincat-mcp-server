@@ -333,9 +333,10 @@ TOKEN_TARGET_DOC = {
     "xae_command": "'<command name>@<XAE target NetId>'",
     "xae_boot_project": "the plc_project_path (with '@<XAE target NetId>' when activate_after_generate)",
     "xae_tree_delete": "'<parent_path>^<name>'",
-    "xae_library_add / xae_library_remove": "'<iec project path>:<library>'",
+    "xae_library_add": "'<iec project path>:<library>'",
+    "xae_library_remove": "'<iec project path>:<library>' + ' (<kind>)' and ', <version>' when given",
     "xae_placeholder_add": "'<iec project path>:<placeholder>'",
-    "xae_placeholder_resolve": "'<iec project path>:<placeholder>=<library>'",
+    "xae_placeholder_resolve": "'<iec project path>:<placeholder>=<library>' + ', <version>' when given",
     "xae_placeholder_freeze": "'<iec project path>:<placeholder>' ('*' for all)",
     "xae_target": "the new NetId", "xae_dialog_resolve": "'<dialog title>:<button>'",
     "ads_plc_state / ads_system_mode": "the action (run, stop, reset / run, config)",
@@ -1724,11 +1725,16 @@ class App:
                 if not name:
                     raise TargetArgsError(f"{action}'s token names the placeholder: pass args={{'placeholder': …}}")
                 if action == "xae_placeholder_resolve":
-                    return f"{proj}:{name}={str(a.get('library') or '').strip()}"
+                    ver = str(a.get("version") or "").strip()
+                    return f"{proj}:{name}={str(a.get('library') or '').strip()}" + (f", {ver}" if ver else "")
                 return f"{proj}:{name}"
             name = str(a.get("library") or "").strip()
             if not name:
                 raise TargetArgsError(f"{action}'s token names the library: pass args={{'library': …}}")
+            if action == "xae_library_remove":
+                # review 1 of 0.8.19: which reference — a placeholder and a library of one name, two versions
+                kind, ver = str(a.get("kind") or "").strip(), str(a.get("version") or "").strip()
+                return f"{proj}:{name}" + (f" ({kind})" if kind else "") + (f", {ver}" if ver else "")
             return f"{proj}:{name}"
         if action == "xae_command":
             return f"{a.get('name', '')}@{await self._xae_netid()}"
@@ -5408,7 +5414,18 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         if len(cand) != 1:
             return {"compared": False, "why": (f"{len(cand)} files named {name}.plcproj under the project root: {cand}"
                                                 if cand else f"no {name}.plcproj under the project root")}
-        rep = (await asyncio.to_thread(K.library_report, cand, {}))["projects"][0]
+        sol = getattr(app.xae, "bound_solution", None)
+        if sol:
+            # review 1 of 0.8.19: the project root may hold another project than the solution XAE has open
+            sdir = os.path.normcase(os.path.dirname(os.path.abspath(str(sol))))
+            if not os.path.normcase(os.path.abspath(cand[0])).startswith(sdir + os.sep):
+                return {"compared": False, "file": cand[0],
+                        "why": f"{cand[0]} is not in the folder of the solution XAE has open ({sol})"}
+        try:
+            installed = await asyncio.to_thread(app.kb.installed_libraries)
+        except Exception:  # noqa: BLE001 — no repository on this PC: the saved file's effective versions are not known
+            installed = {}
+        rep = (await asyncio.to_thread(K.library_report, cand, installed))["projects"][0]
         if rep.get("error"):
             return {"compared": False, "file": cand[0], "why": rep["error"]}
         saved = {(r["kind"], r["name"].lstrip("#").lower()): r for r in rep["libraries"]}
@@ -5420,17 +5437,29 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         for k in xae.keys() & saved.keys():
             x, sv = xae[k], saved[k]
             if k[0] == "library":
-                xv = x.get("version")
-            else:          # a pinned placeholder is saved with the version it resolves to, else with its default
-                xv = (x.get("effective" if sv.get("pinned_by") else "default") or {}).get("version")
-            if xv and sv.get("requested") and xv != sv["requested"]:
-                vdiff.append({"reference": f"{k[0]} {x['name']}", "xae": xv, "saved": sv["requested"]})
+                pairs = [("version", x.get("version"), sv.get("requested"))]
+            elif sv.get("pinned_by"):      # the saved file pins it: its resolution against XAE's effective one
+                pairs = [("resolution", (x.get("effective") or {}).get("version"), sv.get("requested"))]
+            else:
+                # review 1 of 0.8.19: an unsaved resolve / freeze changes the effective resolution only — compared
+                # with what the saved file resolves to on this PC (when that is known: not 'profile')
+                se = sv.get("effective")
+                pairs = [("default", (x.get("default") or {}).get("version"), sv.get("requested")),
+                         ("effective", (x.get("effective") or {}).get("version"),
+                          se if se and se not in ("profile", "*") else None)]
+            for what, xv, svv in pairs:
+                if xv and svv and xv != svv:
+                    vdiff.append({"reference": f"{k[0]} {x['name']}", "what": what, "xae": xv, "saved": svv})
         if only_x:
             out["only_in_xae"] = only_x
         if only_s:
             out["only_in_saved_file"] = only_s
         if vdiff:
             out["version_differs"] = vdiff
+        if not installed:
+            out["effective_not_compared"] = ("no library repository found on this PC: what the saved file's "
+                                             "placeholders resolve to is not known — an unsaved resolve or freeze "
+                                             "would not show here")
         out["same"] = not (only_x or only_s or vdiff)
         if not out["same"]:
             out["note"] = ("XAE holds other references than the saved file: changes not saved yet (xae_build with "
@@ -5495,7 +5524,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                  ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Remove a library or placeholder reference (RemoveReference). A name referenced more than once (a library
         and a placeholder of the same name, two versions) is refused until kind ('library' / 'placeholder') or version
-        says which. Code that uses it does not build any more — said, nothing in the code is changed. Destructive-class:
+        says which ('#X' = the placeholder X). RemoveReference itself takes a name (and a library's version): which of
+        a placeholder and a library of one name XAE removes is checked afterwards and said. Code that uses it does not build any more — said, nothing in the code is changed. Destructive-class:
         tc_request_confirmation(action='xae_library_remove', target='<iec project path>:<library>')."""
         a = {"library": library, "version": version, "distributor": distributor, "kind": kind,
              "plc_project_path": plc_project_path}
