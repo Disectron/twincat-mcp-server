@@ -2345,6 +2345,19 @@ class TcMcpServer(MCPServer):
             return fn                     # the closure keeps the plain function (tools that call each other)
         return decorator
 
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> Any:  # type: ignore[override]
+        # N196 (0.8.18 retest): the SDK's argument model ignores names it does not know, so tcunit_results(path=…)
+        # ran without the path and read the boot result file instead. A misspelt argument usually carries what the
+        # call is about (which file, which recording, how long); the call is refused before the tool runs.
+        tool = self._tool_manager.get_tool(name)
+        if tool is not None and arguments:
+            props = (tool.parameters or {}).get("properties") or {}
+            extra = sorted(k for k in arguments if k not in props)
+            if extra:
+                raise ToolError(f"{name}: unknown argument(s) {extra} — its parameters are {sorted(props)}. "
+                                "Nothing was done.")
+        return await super().call_tool(name, arguments, context)
+
 
 def build_server(cfg: Config | None = None) -> MCPServer:
     cfg = cfg or load_config()
@@ -3896,6 +3909,47 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                                         "exported no samples")}
         return out
 
+    _STATE_LINE = re.compile(r"\((\d{4}-\d\d-\d\d)-(\d\d:\d\d:\d\d)(?::(\d{3}))?\).*?Scope Project state changes from "
+                             r"'([^']*)' to '([^']*)'", re.I)
+
+    def _scope_restart(mark: dict[str, Any] | None) -> dict[str, Any] | None:
+        """N180 (0.8.18 retest): a TwinCAT RUN→CONFIG→RUN while Scope recorded, then a save that worked — nothing said
+        it. TE130x's Scope View log names it ('Scope Project state changes from … to RouterStop', then '… to
+        AutoStop', '… to Reply'; read on the 0.8.16 retest PC). Said from the log's lines since the recording's mark:
+        when the router stopped, whether Scope auto-stopped and whether it recorded again. None when the log names no
+        RouterStop since the mark, or cannot be read (log_find_since: None — nothing said either way)."""
+        from . import scope as S
+        found = S.log_find_since(mark, _STATE_LINE)
+        moves = []
+        for _f, ln in found or []:
+            m = _STATE_LINE.search(ln)
+            if m:
+                at = f"{m.group(1)} {m.group(2)}" + (f".{m.group(3)}" if m.group(3) else "")
+                moves.append((at, m.group(4), m.group(5)))
+        first = next((i for i, mv in enumerate(moves) if mv[2].lower() == "routerstop"), None)
+        if first is None:
+            return None
+        after = moves[first:]
+        rs = after[0][0]
+        auto = next((at for at, _a, b in after if b.lower() == "autostop"), None)
+        again = [at for at, _a, b in after if b.lower() == "record"]
+        out: dict[str, Any] = {"router_stop_at": rs, "states": [f"{at} {a} → {b}" for at, a, b in after][:12]}
+        if auto:
+            out["auto_stop_at"] = auto
+        if again:
+            out["recorded_again_at"] = again[-1]
+            out["note"] = (f"TwinCAT was restarted while Scope recorded (Scope View log: RouterStop at {rs}"
+                           + (f", AutoStop at {auto}" if auto else "") + f"); Scope recorded again from {again[-1]}: "
+                           "its data has a gap between the two")
+        elif auto:
+            out["note"] = (f"TwinCAT was restarted while Scope recorded (Scope View log: RouterStop at {rs}, AutoStop "
+                           f"at {auto}, no Record after it): Scope stopped recording at the restart — its data ends "
+                           "there, not at the recording's end")
+        else:
+            out["note"] = (f"TwinCAT's router stopped while Scope recorded (Scope View log: RouterStop at {rs}); the log "
+                           "names no AutoStop and no Record after it — whether Scope recorded after it is not known")
+        return out
+
     def _csv_samples(p: Path) -> int:
         """The data rows of a Scope CSV: the lines that begin with a number (its header lines do not)."""
         with open(p, "rb") as fh:
@@ -4108,11 +4162,17 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                 _scope_holds(rid, run, None)
                 return out
             out.update(await _scope_save(run["name"], svdx, csv, mark=run.get("log_mark")))
+            restart = await asyncio.to_thread(_scope_restart, run.get("log_mark"))
+            if restart is not None:
+                # N180 (0.8.18 retest): a TwinCAT restart during the recording, said in the result and the signed link
+                run["restart"] = out["restart_seen"] = restart
+                out["note"] = (out["note"] + " · " if out.get("note") else "") + restart["note"]
             stale = await asyncio.to_thread(_scope_not_this, rid, run, csv)
             if stale:
                 # N186 (0.8.16 retest): an earlier capture Scope still held was saved and signed as this recording's
                 out["not_this_recording"] = stale
-                out["note"] = ((f"the Scope data saved could not be shown to be this recording's: {stale}"
+                out["note"] = (out["note"] + " · " if out.get("note") else "") + (
+                               (f"the Scope data saved could not be shown to be this recording's: {stale}"
                                 if stale.endswith("cannot be told") else
                                 f"the Scope data saved is not this recording's: {stale}")
                                + " — its files are kept, not linked to the recording nor sealed")
@@ -4299,6 +4359,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             link["recording_ended"] = run["recording_ended"]
         if run.get("span"):
             link["span"] = run["span"]                        # N189 / N191: Scope's capture against the recording
+        if run.get("restart"):
+            link["restart"] = run["restart"]                  # N180: a TwinCAT restart the Scope View log names
         if incomplete:
             link["not_sealed"] = {"file": svdx.name, "why": incomplete}
         if app.rec.key:
