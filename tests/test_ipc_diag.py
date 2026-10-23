@@ -54,31 +54,44 @@ def _device() -> dict[tuple[int, int], bytes]:
 def device(monkeypatch):
     install(monkeypatch)
     dev = _device()
-    reads: list[tuple[int, int, int]] = []
+    reads: list[tuple[int, int]] = []
+    timeouts: set[tuple[int, int]] = set()
     real = FakeConnection.read
 
     def read(self, index_group, index_offset, plc_datatype, return_ctypes=False, check_length=True):
         if index_group != M.MDP_INDEX_GROUP:
             return real(self, index_group, index_offset, plc_datatype, return_ctypes, check_length)
+        # pyads 3.6: a STRING type comes back as str (read into a buffer, cut at NUL); a c_ubyte array with
+        # check_length raises when fewer bytes came (without it, the zeroed buffer comes back whole)
         assert self.ams_net_port == M.MDP_PORT
         idx, sub = index_offset >> 16, index_offset & 0xFF
-        reads.append((idx, sub, ctypes.sizeof(plc_datatype)))
+        reads.append((idx, sub))
+        if (idx, sub) in timeouts:
+            raise pyads.ADSError(1861)
         if (idx, sub) not in dev:
             raise pyads.ADSError(1795)                     # invalid index offset
+        data = dev[(idx, sub)]
+        if plc_datatype is pyads.PLCTYPE_STRING:
+            return data.split(b"\x00", 1)[0].decode("cp1252")
         n = ctypes.sizeof(plc_datatype)
-        return (ctypes.c_ubyte * n)(*dev[(idx, sub)][:n].ljust(n, b"\x00"))
+        if check_length and len(data) != n:
+            raise RuntimeError(f"Insufficient data (expected {n} bytes, {len(data)} were read).")
+        return (ctypes.c_ubyte * n)(*data[:n].ljust(n, b"\x00"))
     monkeypatch.setattr(FakeConnection, "read", read)
-    return dev, reads
+    return dev, reads, timeouts
+
+
+def _reader(dev):
+    def reader(i, s, t):
+        if (i, s) not in dev:
+            raise M.MdpError("ADS 1795")
+        return M.decode(dev[(i, s)], t)
+    return reader
 
 
 def test_read_info_decodes_the_documented_tables_and_lists_failures(device):
-    dev, reads = device
-
-    def reader(i, s, n):
-        if (i, s) not in dev:
-            raise M.MdpError("ADS 1795")
-        return dev[(i, s)][:n]
-    r = M.read_info(reader)
+    dev, reads, _ = device
+    r = M.read_info(_reader(dev))
     mods = {m["module_id"]: m for m in r["modules"]}
     assert r["module_count"] == 8 and len(mods) == 8
     assert mods[1]["type"] == "CPU" and mods[1]["values"]["cpu_temperature"] == {"value": 51, "unit": "°C",
@@ -99,17 +112,44 @@ def test_read_info_decodes_the_documented_tables_and_lists_failures(device):
     assert mods[8]["type"] == "0x0099" and "no documented table" in mods[8]["note"] and "values" not in mods[8]
 
 
-def test_read_info_budget_and_a_module_list_that_cannot_be_read(device):
-    dev, _ = device
-    r = M.read_info(lambda i, s, n: dev[(i, s)][:n] if (i, s) in dev else b"\x00" * n, max_reads=12)
-    assert r["reads"] == 12 and "truncated" in r, r
+def test_read_info_budget_stops_cleanly_and_an_exact_budget_is_no_stop(device):
+    dev, _, _ = device
+    full = M.read_info(_reader(dev))
+    exact = M.read_info(_reader(dev), max_reads=full["reads"])
+    assert "stopped" not in exact and len(exact["modules"]) == 8, exact
+    r = M.read_info(_reader(dev), max_reads=12)
+    assert r["reads"] == 12 and "read budget used up" in r["stopped"] and "of 8 module(s) not read" in r["stopped"], r
+    assert all("error" not in m for m in r["modules"]), r          # unread rows are not listed as failures
     with pytest.raises(M.MdpError, match=r"module list \(0xF020:00\) could not be read"):
-        M.read_info(lambda i, s, n: (_ for _ in ()).throw(M.MdpError("ADS 1861 timeout")))
+        M.read_info(lambda i, s, t: (_ for _ in ()).throw(M.MdpError("ADS 1861 timeout")))
+
+
+def test_read_info_refuses_what_cannot_be_a_module_list_and_unaddressable_modules(device):
+    dev, _, _ = device
+    dev[(0xF020, 0)] = struct.pack("<H", 0xFFFF)                    # a wrong address answering something
+    with pytest.raises(M.MdpError, match="65535 modules — more than the 8-bit module ID allows"):
+        M.read_info(_reader(dev))
+    dev[(0xF020, 0)] = struct.pack("<H", 1)
+    dev[(0xF020, 1)] = struct.pack("<I", 0x000B << 16 | 0x101)
+    m = M.read_info(_reader(dev))["modules"][0]
+    assert m["module_id"] == 257 and "does not fit the 8-bit module field" in m["error"] and "values" not in m, m
+
+
+def test_read_info_stops_when_the_target_stops_answering(device):
+    dev, _, timeouts = device
+
+    def reader(i, s, t):
+        if i != 0xF020 and i >> 4 & 0xFF >= 3:                     # from module 3 on every read times out
+            raise M.MdpError("ADS error 1861 (0x745): timeout elapsed")
+        return _reader(dev)(i, s, t)
+    r = M.read_info(reader)
+    assert "the target stopped answering (3 reads in a row timed out" in r["stopped"], r
+    assert r["reads"] < 30, r
 
 
 @pytest.mark.anyio
 async def test_ipc_info_through_the_server(device, project_dir):
-    dev, reads = device
+    dev, reads, _ = device
     srv = build_server(mk_cfg(project_dir))
     async with client_for(srv) as s:
         r = payload(await s.call_tool("ipc_info", {"module_types": ["CPU", "twincat"]}))
@@ -121,12 +161,61 @@ async def test_ipc_info_through_the_server(device, project_dir):
 
 @pytest.mark.anyio
 async def test_ipc_mdp_read_decodes_one_address(device, project_dir):
-    dev, reads = device
+    dev, reads, _ = device
     srv = build_server(mk_cfg(project_dir))
     async with client_for(srv) as s:
         r = payload(await s.call_tool("ipc_mdp_read", {"index": 0x8011, "subindex": 3, "type": "i16"}))
-        assert r["value"] == 51 and r["ads_address"]["index_offset"] == "0x80110003", r
+        assert r["value"] == 51 and r["hex"] == "3300" and r["ads_address"]["index_offset"] == "0x80110003", r
         r = payload(await s.call_tool("ipc_mdp_read", {"index": 0x8041, "subindex": 4, "type": "string"}))
-        assert r["value"] == "5.1.2.3.1.1"
+        assert r["value"] == "5.1.2.3.1.1" and r["mdp"] == "0x8041:04"
         r = await s.call_tool("ipc_mdp_read", {"index": 0x8999, "subindex": 1, "type": "u16"})
         assert r.is_error and "MDP 0x8999:01" in text(r) and "0xF302" in text(r), text(r)
+
+
+@pytest.mark.anyio
+async def test_a_short_or_empty_answer_is_an_error_never_a_value(device, project_dir):
+    """Review 1: the zero-padded buffer read an empty answer as 0 and a 2-byte INT as a 4-byte value."""
+    dev, reads, _ = device
+    dev[(0x8011, 3)] = b""
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        r = await s.call_tool("ipc_mdp_read", {"index": 0x8011, "subindex": 3, "type": "i16"})
+        assert r.is_error and "answered 0 byte(s), i16 needs 2 — not decoded" in text(r), text(r)
+        r = await s.call_tool("ipc_mdp_read", {"index": 0x8021, "subindex": 3, "type": "i32"})
+        assert r.is_error and "answered 2 byte(s), i32 needs 4" in text(r) and "type='hex', size=2" in text(r), text(r)
+        r = payload(await s.call_tool("ipc_mdp_read", {"index": 0x8021, "subindex": 3, "type": "hex", "size": 2}))
+        assert r["value"] == "fdff"
+        info = payload(await s.call_tool("ipc_info", {"module_types": ["CPU"]}))
+        cpu1 = info["modules"][0]
+        assert "cpu_temperature" in cpu1["errors"] and "cpu_temperature" not in cpu1["values"], cpu1
+        dev[(0xF020, 0)] = b""
+        r = await s.call_tool("ipc_info", {})
+        assert r.is_error and "module list (0xF020:00) could not be read" in text(r), text(r)
+
+
+@pytest.mark.anyio
+async def test_an_address_that_would_be_cut_is_refused(device, project_dir):
+    dev, reads, _ = device
+    srv = build_server(mk_cfg(project_dir))
+    async with client_for(srv) as s:
+        for args in ({"index": 0x8011, "subindex": 257}, {"index": 0x18011, "subindex": 1},
+                     {"index": -1, "subindex": 0}):
+            r = await s.call_tool("ipc_mdp_read", {**args, "type": "u16"})
+            assert r.is_error and "is not an MDP address" in text(r) and "nothing was read" in text(r), (args, text(r))
+        r = await s.call_tool("ipc_mdp_read", {"index": 0x8011, "subindex": 3, "type": "i16", "size": 8})
+        assert r.is_error and "size is for type='hex' only" in text(r)
+    assert reads == []
+
+
+def test_a_cancelled_call_stops_between_reads(device):
+    """Review 1: a timed-out ipc_info kept the slow ADS worker busy (each later read waited its ADS timeout)."""
+    dev, _, _ = device
+    n = {"n": 0}
+
+    def reader(i, s, t):
+        n["n"] += 1
+        if n["n"] > 20:
+            raise M.MdpStop("the call was cancelled")
+        return _reader(dev)(i, s, t)
+    r = M.read_info(reader)
+    assert n["n"] == 21 and r["stopped"].startswith("the call was cancelled"), r

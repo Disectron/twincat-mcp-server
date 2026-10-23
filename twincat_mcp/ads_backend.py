@@ -1560,29 +1560,54 @@ class AdsBackend:
             raise AdsError(f"raw read 0x{index_group:X}/0x{index_offset:X} ({size} B) on port {c.ams_net_port}: {_fmt_exc(exc)}") from exc
         return {"hex": raw.hex(), "size": len(raw), "as_uint_le": int.from_bytes(raw[:8], "little") if len(raw) <= 8 else None}
 
-    def mdp_raw(self, index: int, subindex: int, size: int, net_id: str | None = None, flags: int = 0) -> bytes:
-        """One MDP value (IPC diagnostics, 0.8.19) as raw bytes — the ADS address of mdp.py (NOT confirmed on
-        hardware: port 10000, index group 0xF302)."""
+    def mdp_read(self, index: int, subindex: int, typ: str, net_id: str | None = None,
+                 size: int | None = None) -> dict[str, Any]:
+        """One MDP value (IPC diagnostics, 0.8.19): {value, hex?}. A fixed-size type is read with its exact size and
+        a shorter answer is an error (pyads' length check — a padded buffer would read as 0); a STRING as a PLC
+        string. The ADS address is mdp.py's (NOT confirmed on hardware: port 10000, index group 0xF302)."""
         from . import mdp as M
+        if self.cancel.is_set():
+            raise M.MdpStop("the call was cancelled")
         c = self.conn(M.MDP_PORT, net_id)
-        io = M.index_offset(index, subindex, flags)
+        io = M.index_offset(index, subindex)
+        where = (f"MDP {M.label(index, subindex)} (ADS index group 0x{M.MDP_INDEX_GROUP:X}, offset 0x{io:08X}, "
+                 f"port {M.MDP_PORT})")
         try:
-            raw = c.read(M.MDP_INDEX_GROUP, io, ctypes.c_ubyte * size, return_ctypes=True, check_length=False)
+            if typ == "string":
+                v = c.read(M.MDP_INDEX_GROUP, io, pyads.PLCTYPE_STRING)
+                if v is None:
+                    raise AdsError(f"{where}: no answer (the connection is closed)")
+                return {"value": str(v)}
+            n = int(size) if typ == "hex" and size else (4 if typ == "hex" else M.size_of(typ))
+            raw = c.read(M.MDP_INDEX_GROUP, io, ctypes.c_ubyte * n, return_ctypes=True, check_length=True)
+        except AdsError:
+            raise
+        except RuntimeError as exc:
+            got = re.search(r"(\d+) were read", str(exc))
+            raise AdsError(f"{where}: the target answered {got.group(1) if got else 'fewer'} byte(s), {typ} needs "
+                           f"{n} — not decoded" + (f" (read it as type='hex', size={got.group(1)})" if got and
+                                                  got.group(1) != "0" else "")) from exc
         except Exception as exc:  # noqa: BLE001
-            raise AdsError(f"MDP 0x{index:04X}:{subindex:02d} (ADS index group 0x{M.MDP_INDEX_GROUP:X}, offset "
-                           f"0x{io:08X}, port {M.MDP_PORT}): {_fmt_exc(exc)}") from exc
+            raise AdsError(f"{where}: {_fmt_exc(exc)}") from exc
         if raw is None:
-            raise AdsError(f"MDP 0x{index:04X}:{subindex:02d}: no answer (the connection is closed)")
-        return bytes(raw)
+            raise AdsError(f"{where}: no answer (the connection is closed)")
+        b = bytes(raw)
+        try:
+            return {"value": M.decode(b, typ), "hex": b.hex()}
+        except M.MdpError as exc:
+            raise AdsError(f"{where}: {exc} (raw {b.hex()})") from exc
 
     def ipc_info(self, net_id: str | None = None, types: set[int] | None = None,
                  max_reads: int = 600) -> dict[str, Any]:
         from . import mdp as M
-        res = M.read_info(lambda i, s, n: self.mdp_raw(i, s, n, net_id), max_reads, types)
+        try:
+            res = M.read_info(lambda i, s, t: self.mdp_read(i, s, t, net_id)["value"], max_reads, types)
+        except M.MdpError as exc:
+            raise AdsError(str(exc)) from exc          # through _ads_explain: the cause and its fix hints
         res["target"] = net_id or self.net_id or "(local)"
         res["ads_address"] = {"port": M.MDP_PORT, "index_group": f"0x{M.MDP_INDEX_GROUP:X}",
                               "index_offset": "index << 16 | subindex",
-                              "confirmed": "not yet on hardware (docs/PLAN-0.8.19.md §8)"}
+                              "confirmed": "not yet on hardware — the address is inferred (docs/PLAN-0.8.19.md §8)"}
         return res
 
     def write_raw(self, index_group: int, index_offset: int, hex_data: str, port: int | None = None,

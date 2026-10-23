@@ -72,12 +72,31 @@ class MdpError(Exception):
     """One MDP read that failed (the ADS error as text)."""
 
 
+class MdpStop(MdpError):
+    """The read cannot go on: the call was cancelled, or the target stopped answering."""
+
+
+def check_address(index: int, subindex: int) -> None:
+    """An MDP address is a 16-bit index and an 8-bit subindex — anything else would be cut into another address."""
+    if not (0 <= int(index) <= 0xFFFF and 0 <= int(subindex) <= 0xFF):
+        raise MdpError(f"index 0x{int(index):X} / subindex {int(subindex)} is not an MDP address (index 0…0xFFFF, "
+                       "subindex 0…0xFF) — nothing was read")
+
+
 def index_offset(index: int, subindex: int, flags: int = 0) -> int:
+    check_address(index, subindex)
     return ((index & 0xFFFF) << 16) | ((flags & 0xFF) << 8) | (subindex & 0xFF)
 
 
 def table_index(module_id: int, table: int, area: int = 0x8) -> int:
+    if not 0 <= module_id <= 0xFF:
+        raise MdpError(f"module ID {module_id} does not fit the 8-bit module field of a table index")
     return ((area & 0xF) << 12) | ((module_id & 0xFF) << 4) | (table & 0xF)
+
+
+def label(index: int, subindex: int) -> str:
+    """'0x8011:03' — index and subindex both hex, as CoE / MDP tables write them."""
+    return f"0x{index:04X}:{subindex:02X}"
 
 
 def size_of(typ: str) -> int:
@@ -85,91 +104,132 @@ def size_of(typ: str) -> int:
 
 
 def decode(raw: bytes, typ: str) -> Any:
+    """raw → value. A fixed-size type needs exactly its size (a shorter answer is an error, never padded to a value);
+    a STRING ends at its first NUL (TwinCAT strings are Windows-1252)."""
     if typ == "string":
-        return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        return raw.split(b"\x00", 1)[0].decode("cp1252", errors="replace")
     if typ == "hex":
         return raw.hex()
     fmt = _FMT[typ]
     n = struct.calcsize(fmt)
-    if len(raw) < n:
-        raise MdpError(f"{len(raw)} byte(s) received, {typ} needs {n}")
-    v = struct.unpack(fmt, raw[:n])[0]
+    if len(raw) != n:
+        raise MdpError(f"the target answered {len(raw)} byte(s), {typ} needs {n} — not decoded")
+    v = struct.unpack(fmt, raw)[0]
     return bool(v) if typ == "bool" else v
 
 
-Reader = Callable[[int, int, int], bytes]
+# reader(index, subindex, type) → the decoded value; raises MdpError (MdpStop: stop reading)
+Reader = Callable[[int, int, str], Any]
+STOP_AFTER_TIMEOUTS = 3                    # consecutive reads that time out: the target is taken as not answering
 
 
 class _Budget:
     def __init__(self, reader: Reader, limit: int):
-        self.reader, self.left, self.used = reader, limit, 0
+        self.reader, self.left, self.used, self.timeouts = reader, limit, 0, 0
 
     def read(self, index: int, subindex: int, typ: str) -> Any:
         if self.left <= 0:
-            raise MdpError("read budget used up")
+            raise MdpStop("read budget used up")
         self.left -= 1
         self.used += 1
-        return decode(self.reader(index, subindex, size_of(typ)), typ)
+        try:
+            v = self.reader(index, subindex, typ)
+        except MdpStop:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if "1861" in str(exc) or "timeout" in str(exc).lower():
+                self.timeouts += 1
+                if self.timeouts >= STOP_AFTER_TIMEOUTS:
+                    raise MdpStop(f"the target stopped answering ({self.timeouts} reads in a row timed out: {exc})") \
+                        from exc
+            else:
+                self.timeouts = 0
+            raise
+        self.timeouts = 0
+        return v
 
 
 def read_info(reader: Reader, max_reads: int = MAX_READS, types: set[int] | None = None) -> dict[str, Any]:
-    """The module list and, per module, its header and the documented values. reader(index, subindex, size) → bytes,
-    raising on an ADS error. A value that fails is listed with its error (never left out, never 0); a module type
-    without documented tables gets its header only."""
+    """The module list and, per module, its name and the documented values. A value that fails is listed with its
+    error (never left out, never 0); a module type without documented tables gets its name only. A module list that
+    cannot be one (more modules than the 8-bit module ID allows) is refused: a wrong ADS address answers something."""
     b = _Budget(reader, max_reads)
     try:
-        count = b.read(MODULE_LIST, 0, "u16")
+        count = int(b.read(MODULE_LIST, 0, "u16"))
     except Exception as exc:  # noqa: BLE001
-        raise MdpError(f"the module list (0x{MODULE_LIST:04X}:00) could not be read: {exc}") from exc
+        raise MdpError(f"the module list ({label(MODULE_LIST, 0)}) could not be read: {exc}") from exc
+    if count > 0x100:
+        raise MdpError(f"the module list ({label(MODULE_LIST, 0)}) says {count} modules — more than the 8-bit module ID "
+                       "allows: this is not a module list (a wrong ADS address?). Nothing is reported from it")
     modules: list[dict[str, Any]] = []
-    skipped = 0
-    for row in range(1, int(count) + 1):
+    skipped, stopped, row = 0, None, 0
+    for row in range(1, count + 1):
         try:
-            v = b.read(MODULE_LIST, row, "u32")
-        except Exception as exc:  # noqa: BLE001
-            modules.append({"row": row, "error": str(exc)[:200]})
-            continue
-        mtype, mid = v >> 16, v & 0xFFFF
-        if types is not None and mtype not in types:
-            skipped += 1
-            continue
-        m: dict[str, Any] = {"type": MODULE_TYPES.get(mtype, f"0x{mtype:04X}"), "type_id": f"0x{mtype:04X}",
-                             "module_id": mid}
-        errors: dict[str, str] = {}
-        for sub, key in ((3, "name"),):
-            try:
-                m[key] = b.read(table_index(mid, 0), sub, "string")
-            except Exception as exc:  # noqa: BLE001
-                errors[key] = str(exc)[:200]
-        values: dict[str, Any] = {}
-        for table, sub, key, typ, unit in TABLES.get(mtype, []):
-            idx = table_index(mid, table)
-            try:
-                val = b.read(idx, sub, typ)
-            except Exception as exc:  # noqa: BLE001
-                errors[key] = f"0x{idx:04X}:{sub:02d}: {str(exc)[:160]}"
-                continue
-            values[key] = {"value": val, "unit": unit, "mdp": f"0x{idx:04X}:{sub:02d}"} if unit else \
-                {"value": val, "mdp": f"0x{idx:04X}:{sub:02d}"}
-        if mtype in LIST_TABLES:
-            rows = _read_list(b, mid, LIST_TABLES[mtype], errors)
-            if rows is not None:
-                values["volumes"] = rows
-        if values:
-            m["values"] = values
-        if errors:
-            m["errors"] = errors
-        if mtype not in TABLES and mtype not in LIST_TABLES:
-            m["note"] = "no documented table decoded for this module type — ipc_mdp_read reads any address"
-        modules.append(m)
-        if b.left <= 0:
+            m = _read_module(b, row, types)
+        except MdpStop as exc:
+            stopped = str(exc)
+            row -= 1
             break
-    out: dict[str, Any] = {"module_count": int(count), "modules": modules, "reads": b.used}
+        if m is None:
+            skipped += 1
+        else:
+            modules.append(m)
+    out: dict[str, Any] = {"module_count": count, "modules": modules, "reads": b.used}
     if skipped:
         out["modules_not_asked"] = skipped
-    if b.left <= 0:
-        out["truncated"] = f"stopped after {b.used} reads (max_reads) — ask for fewer module types"
+    if stopped:
+        out["stopped"] = (f"{stopped} — {count - row} of {count} module(s) not read"
+                          + (" (raise max_reads or ask for fewer module types)" if "budget" in stopped else ""))
     return out
+
+
+def _read_module(b: _Budget, row: int, types: set[int] | None) -> dict[str, Any] | None:
+    """One row of the module list — None when its type was not asked for. MdpStop passes through, also in the
+    middle of a module (its values read so far are dropped with it: the caller says which rows were not read)."""
+    try:
+        v = int(b.read(MODULE_LIST, row, "u32"))
+    except MdpStop:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return {"row": row, "error": str(exc)[:200]}
+    mtype, mid = v >> 16, v & 0xFFFF
+    if types is not None and mtype not in types:
+        return None
+    m: dict[str, Any] = {"type": MODULE_TYPES.get(mtype, f"0x{mtype:04X}"), "type_id": f"0x{mtype:04X}",
+                         "module_id": mid}
+    if mid > 0xFF:
+        m["error"] = f"module ID {mid} does not fit the 8-bit module field of a table index — its tables cannot be read"
+        return m
+    errors: dict[str, str] = {}
+    try:
+        m["name"] = b.read(table_index(mid, 0), 3, "string")
+    except MdpStop:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        errors["name"] = str(exc)[:200]
+    values: dict[str, Any] = {}
+    for table, sub, key, typ, unit in TABLES.get(mtype, []):
+        idx = table_index(mid, table)
+        try:
+            val = b.read(idx, sub, typ)
+        except MdpStop:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            errors[key] = f"{label(idx, sub)}: {str(exc)[:160]}"
+            continue
+        values[key] = {"value": val, "unit": unit, "mdp": label(idx, sub)} if unit else \
+            {"value": val, "mdp": label(idx, sub)}
+    if mtype in LIST_TABLES:
+        rows = _read_list(b, mid, LIST_TABLES[mtype], errors)
+        if rows is not None:
+            values["volumes"] = rows
+    if values:
+        m["values"] = values
+    if errors:
+        m["errors"] = errors
+    if mtype not in TABLES and mtype not in LIST_TABLES:
+        m["note"] = "no documented table decoded for this module type — ipc_mdp_read reads any address"
+    return m
 
 
 def _read_list(b: _Budget, mid: int, cols: list[tuple[int, str, str, str | None]],
@@ -178,16 +238,23 @@ def _read_list(b: _Budget, mid: int, cols: list[tuple[int, str, str, str | None]
     for table, key, _typ, _unit in cols:
         try:
             lens[key] = int(b.read(table_index(mid, table), 0, "u16"))
+        except MdpStop:
+            raise
         except Exception as exc:  # noqa: BLE001
             errors[f"{key}_count"] = str(exc)[:160]
     if not lens:
         return None
-    n = min(max(lens.values()), MAX_LIST)
+    longest = max(lens.values())
+    n = min(longest, MAX_LIST)
+    if longest > MAX_LIST:
+        errors["volumes_cut"] = f"{longest} entries listed, the first {MAX_LIST} read"
     rows: list[dict[str, Any]] = [{} for _ in range(n)]
-    for table, key, typ, unit in cols:
+    for table, key, typ, _unit in cols:
         for i in range(1, min(lens.get(key, 0), n) + 1):
             try:
                 v = b.read(table_index(mid, table), i, typ)
+            except MdpStop:
+                raise
             except Exception as exc:  # noqa: BLE001
                 rows[i - 1][key] = {"error": str(exc)[:160]}
                 continue

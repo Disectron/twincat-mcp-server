@@ -129,6 +129,7 @@ OPTIONAL = {  # a failure here is environmental, reported as WARN with the error
     "infosys_books", "infosys_index", "infosys_search_symbols", "infosys_declaration", "infosys_search",
     "infosys_search_code", "infosys_get_page", "ads_app_info", "xae_links", "xae_diagnostics", "proj_changed",
     "ipc_list_dir", "ipc_read_file", "rec_pulses", "rec_latency", "ads_wait_until", "test_stable",
+    "ipc_info", "ipc_mdp_read",
 }
 
 
@@ -776,9 +777,12 @@ class Acceptance:
         ph = "10 ipc"
         self.log("[10] target file system (read-only)")
         if not self.ads_ok:
-            for t in ("ipc_list_dir", "ipc_read_file"):
+            for t in ("ipc_list_dir", "ipc_read_file", "ipc_info", "ipc_mdp_read"):
                 self.skip(ph, t, "needs ADS")
             return
+        # IPC diagnostics (Device Manager over ADS; the address is not confirmed on hardware — a failure is a WARN)
+        await self.check(ph, "ipc_mdp_read", {"index": 0xF020, "subindex": 0, "type": "u16"}, timeout_s=60)
+        await self.check(ph, "ipc_info", {"module_types": ["CPU", "TwinCAT", "OS"], "max_reads": 80}, timeout_s=180)
         ls = await self.check(ph, "ipc_list_dir", {"pattern": "boot:*", "max_entries": 50}, timeout_s=90,
                               verify=lambda p: None if isinstance(p, dict) and p.get("resolved_pattern") and
                               not any(e.get("name") in (".", "..") for e in p.get("entries", [])) else "prefix not resolved or dot entries present")

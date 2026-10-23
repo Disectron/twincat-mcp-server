@@ -5979,7 +5979,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         mainboard (serial, boot count, operating time, temperatures, BIOS), fans (rpm), disks (drive, label, file
         system, size, free). Each value with its MDP address; one that fails is listed with its ADS error, never as 0.
         module_types: names (CPU, Memory, TwinCAT, OS, Fan, Mainboard, DiskManagement …) to read only those.
-        ams_net_id: another device (a route is needed). Read-only."""
+        ams_net_id: another device (a route is needed). Read-only. The ADS address used (port 10000, index group
+        0xF302) is not yet confirmed on hardware — the result says so."""
         from . import mdp as M
         types = None
         if module_types:
@@ -5995,24 +5996,26 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool(annotations=READ)
     async def ipc_mdp_read(index: int, subindex: int, type: str = "hex", size: int | None = None,
                            ams_net_id: str | None = None) -> dict[str, Any]:
-        """One MDP address of the target's Device Manager: index (0x8nnT: nn = the module ID from ipc_info), subindex
-        (0 = the table's length), type: u8 u16 u32 u64 i16 i32 bool string hex (hex: size bytes, default 4).
-        Raw bytes and the decoded value. Read-only."""
+        """One MDP address of the target's Device Manager: index (0x8nnT: nn = the module ID from ipc_info, 0…0xFFFF),
+        subindex (0…0xFF; 0 = the table's length), type: u8 u16 u32 u64 i16 i32 bool string hex (hex: exactly size
+        bytes, default 4). The decoded value and the raw bytes; an answer shorter than the type is an error, never a
+        value. Read-only. The ADS address used (port 10000, index group 0xF302) is not yet confirmed on hardware."""
         from . import mdp as M
         typ = type.lower()
         if typ not in ("hex", "string", "u8", "u16", "u32", "u64", "i16", "i32", "bool"):
-            raise ToolError("type must be one of hex, string, u8, u16, u32, u64, i16, i32, bool")
-        n = int(size) if size else (4 if typ == "hex" else M.size_of(typ))
-        n = max(1, min(n, 4096))
-        raw = await app.ads_call(app.ads.mdp_raw, int(index), int(subindex), n, ams_net_id, timeout=30)
+            raise ToolError("type must be one of hex, string, u8, u16, u32, u64, i16, i32, bool — nothing was read")
+        if size is not None and typ != "hex":
+            raise ToolError(f"size is for type='hex' only ({typ} has its own size) — nothing was read")
         try:
-            val = M.decode(raw, typ)
+            M.check_address(int(index), int(subindex))
         except M.MdpError as exc:
-            raise ToolError(f"MDP 0x{int(index):04X}:{int(subindex):02d}: {exc} (raw {raw.hex()})") from exc
-        return {"mdp": f"0x{int(index):04X}:{int(subindex):02d}", "type": typ, "value": val, "hex": raw.hex(),
+            raise ToolError(str(exc)) from exc
+        n = max(1, min(int(size or 4), 4096))
+        r = await app.ads_call(app.ads.mdp_read, int(index), int(subindex), typ, ams_net_id, n, timeout=30)
+        return {"mdp": M.label(int(index), int(subindex)), "type": typ, **r,
                 "ads_address": {"port": M.MDP_PORT, "index_group": f"0x{M.MDP_INDEX_GROUP:X}",
                                 "index_offset": f"0x{M.index_offset(int(index), int(subindex)):08X}",
-                                "confirmed": "not yet on hardware (docs/PLAN-0.8.19.md §8)"}}
+                                "confirmed": "not yet on hardware — the address is inferred (docs/PLAN-0.8.19.md §8)"}}
 
     # ======================================================================
     # xae_* Automation Interface
