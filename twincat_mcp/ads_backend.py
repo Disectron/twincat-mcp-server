@@ -1560,6 +1560,31 @@ class AdsBackend:
             raise AdsError(f"raw read 0x{index_group:X}/0x{index_offset:X} ({size} B) on port {c.ams_net_port}: {_fmt_exc(exc)}") from exc
         return {"hex": raw.hex(), "size": len(raw), "as_uint_le": int.from_bytes(raw[:8], "little") if len(raw) <= 8 else None}
 
+    def mdp_raw(self, index: int, subindex: int, size: int, net_id: str | None = None, flags: int = 0) -> bytes:
+        """One MDP value (IPC diagnostics, 0.8.19) as raw bytes — the ADS address of mdp.py (NOT confirmed on
+        hardware: port 10000, index group 0xF302)."""
+        from . import mdp as M
+        c = self.conn(M.MDP_PORT, net_id)
+        io = M.index_offset(index, subindex, flags)
+        try:
+            raw = c.read(M.MDP_INDEX_GROUP, io, ctypes.c_ubyte * size, return_ctypes=True, check_length=False)
+        except Exception as exc:  # noqa: BLE001
+            raise AdsError(f"MDP 0x{index:04X}:{subindex:02d} (ADS index group 0x{M.MDP_INDEX_GROUP:X}, offset "
+                           f"0x{io:08X}, port {M.MDP_PORT}): {_fmt_exc(exc)}") from exc
+        if raw is None:
+            raise AdsError(f"MDP 0x{index:04X}:{subindex:02d}: no answer (the connection is closed)")
+        return bytes(raw)
+
+    def ipc_info(self, net_id: str | None = None, types: set[int] | None = None,
+                 max_reads: int = 600) -> dict[str, Any]:
+        from . import mdp as M
+        res = M.read_info(lambda i, s, n: self.mdp_raw(i, s, n, net_id), max_reads, types)
+        res["target"] = net_id or self.net_id or "(local)"
+        res["ads_address"] = {"port": M.MDP_PORT, "index_group": f"0x{M.MDP_INDEX_GROUP:X}",
+                              "index_offset": "index << 16 | subindex",
+                              "confirmed": "not yet on hardware (docs/PLAN-0.8.19.md §8)"}
+        return res
+
     def write_raw(self, index_group: int, index_offset: int, hex_data: str, port: int | None = None,
                   net_id: str | None = None) -> dict[str, Any]:
         c = self.conn(port, net_id)
