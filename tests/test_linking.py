@@ -254,7 +254,7 @@ async def test_server_guarded_link_needs_the_token_of_that_link(monkeypatch, pro
         assert r["added"] and len(sm.calls) == 1, r
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_unlink", "args": {
             "variable": IN_MANUAL}}))
-        assert tok["target"] == f"{IN_MANUAL} -> (all)", tok
+        assert tok["target"] == f"{IN_MANUAL} -> (all 1)", tok          # how many links it removes (review 2)
 
 
 @pytest.mark.anyio
@@ -266,13 +266,15 @@ async def test_server_import_dry_run_is_free_apply_needs_the_token_of_that_conte
     async with client_for(srv) as s:
         r = payload(await s.call_tool("xae_links_import", {"file": str(f)}))
         assert r["dry_run"] and len(r["added"]) == 1 and sm.calls == [], r
+        dry = r
         r = await s.call_tool("xae_links_import", {"file": str(f), "xml": NEW})
         assert r.is_error and "one of them" in text(r), text(r)
         r = await s.call_tool("xae_links_import", {"file": str(f), "dry_run": False})
         assert r.is_error and sm.calls == [], text(r)
         tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_links_import", "args": {
             "file": str(f), "mode": "add"}}))
-        assert tok["target"] == "add:" + hashlib.sha256(NEW.encode()).hexdigest()[:16], tok
+        assert tok["target"] == dry["confirm_target"] == ("add:" + hashlib.sha256(NEW.encode()).hexdigest()[:16] +
+                                                          f" over {dry['table_sha']} (+1 -0)"), (tok, dry)
         r = await s.call_tool("xae_links_import", {"xml": NEW.replace("Channel 4", "Channel 6"), "dry_run": False,
                                                    "confirm_token": tok["confirm_token"]})
         assert r.is_error and sm.calls == [], text(r)                     # other content, other token
@@ -486,3 +488,132 @@ async def test_r1_a_utf16_file_is_read_and_unlink_is_destructive(monkeypatch, pr
         r = await s.call_tool("xae_unlink", {"variable": IN_PROX2})
         assert r.is_error and "confirm" in text(r).lower(), text(r)   # full mode still confirms a destructive action
     assert sm.calls == []
+
+
+# ---- review 2 of 0.8.20 -----------------------------------------------------------------------------------------------
+
+def test_r2_no_import_while_the_table_has_a_twinsafe_end(monkeypatch, tmp_path):
+    """ConsumeMappingInfo resets and rewrites every link: an add of one PLC link reset the TwinSAFE links too, and after
+    a failure the restore it named was refused — such a table is not given to it at all."""
+    monkeypatch.setattr(LinkSysMan, "OWNERS", (PLC, T2, T3, SAFE))
+    be, sm = _be(monkeypatch)
+    sm.links.append((SAFE, "Outputs^bLamp", T3, "Channel 2^Output", {}))
+    guard = (lambda p: "'TISC…' is under the TwinSAFE/safety project" if p.lower().startswith("tisc") else None)
+    for mode, xml in (("add", NEW), ("replace", sm.ProduceMappingInfo())):
+        with pytest.raises(X.XaeError, match="ConsumeMappingInfo rewrites every link .* TwinSAFE"):
+            be.links_import(xml, mode, False, None, guard)
+        with pytest.raises(X.XaeError, match="rewrites every link"):
+            be.links_import(xml, mode, True, str(tmp_path / f"{mode}.xml"), guard)
+    assert not [c for c in sm.calls if c[0] == "ConsumeMappingInfo"] and not list(tmp_path.iterdir())
+
+
+def test_r2_a_link_written_the_other_way_round_is_the_same_link(monkeypatch, tmp_path):
+    be, sm = _be(monkeypatch)
+    sm.links = [(PLC, "PlcTask Inputs^GVL_IO.nWord", T2, "Value", {"OffsA": "3", "Size": "08"})]
+    same = (f'<VarLinks><OwnerA Name="{T2}"><OwnerB Name="{PLC}"><Link VarA="Value" VarB="PlcTask Inputs^GVL_IO.nWord" '
+            'OffsB="3" Size="8" OffsA="0"/></OwnerB></OwnerA></VarLinks>')
+    r = be.links_import(same, "add")
+    assert r["added"] == [] and r["removed"] == [], r                      # reversed, '08' = '8', OffsA 0 = none
+    other = same.replace('OffsB="3"', 'OffsB="0"').replace('OffsA="0"', 'OffsA="3"')   # the offset on the other end
+    r = be.links_import(other, "add")
+    assert len(r["added"]) == 1, r
+    r = be.links_import(other, "replace")
+    assert len(r["added"]) == 1 and len(r["removed"]) == 1, r
+
+
+def test_r2_link_says_and_guards_what_linkvariables_replaces(monkeypatch):
+    monkeypatch.setattr(LinkSysMan, "OWNERS", (PLC, T2, T3, SAFE))
+    be, sm = _be(monkeypatch)
+    real = sm.LinkVariables
+
+    def one_source(v1, v2, *a):
+        sm.links = [lk for lk in sm.links if f"{lk[2]}^{lk[3]}" != v2 and f"{lk[0]}^{lk[1]}" != v2]   # replaces
+        real(v1, v2, *a)
+    sm.LinkVariables = one_source
+    r = be.link(f"{PLC}^PlcTask Outputs^GVL_IO.bHorn", f"{T3}^Channel 1^Output")
+    assert "LinkVariables also removed 1 link(s)" in r["warning"] and r["target_also_linked_to"] == [OUT_PUMP], r
+    sm.links.append((SAFE, "Outputs^bLamp", T3, "Channel 2^Output", {}))
+    guard = (lambda p: "'TISC…' is under the TwinSAFE/safety project" if p.lower().startswith("tisc") else None)
+    n = len(sm.calls)
+    with pytest.raises(X.XaeError, match="TwinSAFE"):
+        be.link(f"{PLC}^PlcTask Outputs^GVL_IO.bHorn2", f"{T3}^Channel 2^Output", protect=guard)
+    assert len(sm.calls) == n
+
+
+def test_r2_a_failed_import_keeps_the_class_of_its_error(monkeypatch, tmp_path):
+    be, sm = _be(monkeypatch)
+
+    def rejected(xml):
+        raise ComError(X.RPC_E_CALL_REJECTED, "Call was rejected by callee.")
+    sm.ConsumeMappingInfo = rejected
+    with pytest.raises(X.XaeBusy):
+        be.links_import(NEW, "add", True, str(tmp_path / "a.xml"))
+    assert len(sm.links) == 2
+
+
+def test_r2_texts_after_an_action_and_an_empty_dry_run(monkeypatch):
+    be, sm = _be(monkeypatch)
+    real = sm.ProduceMappingInfo
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ComError(-2147467259, "E_FAIL")
+        return real()
+    sm.ProduceMappingInfo = flaky
+    r = be.link(IN_MANUAL, f"{T2}^Channel 4^Input")
+    assert "could not be read after it" in r["after_unread"] and "nothing was done" not in r["after_unread"], r
+    sm.ProduceMappingInfo = real
+    r = be.links_import(sm.ProduceMappingInfo(), "replace")
+    assert "the table would not change" in r["note"], r
+
+
+def test_r2_the_long_io_form_duplicates_and_an_empty_unlink_target(monkeypatch):
+    be, sm = _be(monkeypatch)
+    long_form = (f'<VarLinks><OwnerA Name="{PLC}"><OwnerB Name="TIIC^I/O Devices^Device 1 (EtherCAT)^Term 1 (EK1100)^'
+                 'Term 2 (EL1008)"><Link VarA="PlcTask Inputs^GVL_IO.abProx[2]" VarB="Channel 3^Input"/></OwnerB>'
+                 '</OwnerA></VarLinks>')
+    assert be.links_import(long_form, "add")["added"] == []
+    twice = NEW.replace("</OwnerB>", '<Link VarA="PlcTask Inputs^GVL_IO.bManual" VarB="Channel 4^Input"/></OwnerB>')
+    with pytest.raises(X.XaeError, match="is in it twice"):
+        be.links_import(twice, "replace")
+    with pytest.raises(X.XaeError, match="is no tree path"):
+        be.unlink(IN_PROX2, " ^ ")
+    assert sm.calls == []
+
+
+@pytest.mark.anyio
+async def test_r2_an_unlink_all_token_binds_how_many_links(monkeypatch, project_dir):
+    srv, app, sm = _server(monkeypatch, project_dir, mode="guarded", allow_elicitation=False)
+    async with client_for(srv) as s:
+        tok = payload(await s.call_tool("tc_request_confirmation", {"action": "xae_unlink", "args": {
+            "variable": IN_PROX2}}))
+        assert tok["target"] == f"{IN_PROX2} -> (all 1)", tok
+        sm.links.append((PLC, "PlcTask Inputs^GVL_IO.abProx[2]", T2, "Channel 6^Input", {}))   # after the token
+        r = await s.call_tool("xae_unlink", {"variable": IN_PROX2, "confirm_token": tok["confirm_token"]})
+        assert r.is_error and sm.calls == [], text(r)
+
+
+@pytest.mark.anyio
+async def test_r2_xae_links_lists_one_plcs_not_restored_and_what_it_could_not_place(monkeypatch, project_dir):
+    srv, app, sm = _server(monkeypatch, project_dir)
+    _project_with_restore_info(project_dir)
+    io = project_dir / "_Config" / "IO"
+    bk = project_dir / "Backup" / "_Config" / "IO" / "Device 1 (EtherCAT)"
+    bk.mkdir(parents=True)
+    (bk / "Term 6 (EL3356).xti").write_text("<TcSmItem/>", encoding="utf-8")       # a copy elsewhere: not read
+    (io / "Device 1 (EtherCAT).xti").write_text(
+        '<TcSmItem><Device><Box File="Term 6 (EL3356).xti"/><Box File="Term 7 (EL1008).xti"/></Device></TcSmItem>',
+        encoding="utf-8")
+    (io / "Device 1 (EtherCAT)" / "Odd.xti").write_text('<?xml version="1.0" encoding="no-such"?><X RestoreInfo="a"/>',
+                                                         encoding="utf-8")
+    (io / "Device 1 (EtherCAT).xti").write_text(
+        '<TcSmItem><Device><Box File="Term 6 (EL3356).xti"/><Box File="Term 7 (EL1008).xti"/><Box File="Odd.xti"/>'
+        '<Box RestoreInfo="BNotFound" Name="Term 8"/></Device></TcSmItem>', encoding="utf-8")
+    async with client_for(srv) as s:
+        r = payload(await s.call_tool("xae_links", {"plc_project_path": "TIPC^Plc"}))
+    nr = r["not_restored"]
+    assert nr["count"] == 1 and nr["entries"][0]["var_a"] == "PlcTask Inputs^GVL_Old.nLoad", nr   # not TIPC^Other
+    assert any("Term 7 (EL1008).xti" in u and "not found" in u for u in nr["unresolved"]), nr
+    assert nr["other_marked"][0]["name"] == "Term 8" and any("Odd.xti" in u for u in nr["unread_files"]), nr

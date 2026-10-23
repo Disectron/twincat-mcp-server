@@ -2727,12 +2727,25 @@ class XaeBackend:
         self._sm()
         return _sha16(self._mapping_xml())
 
-    def _all_links(self) -> list[dict[str, Any]]:
+    def _all_links(self, after: bool = False) -> list[dict[str, Any]]:
+        """The table as links; after: read after an action (its errors do not say 'nothing was done')."""
         try:
-            return _links_of(self._mapping_xml())
+            xml = self._mapping_xml()
+        except XaeError as exc:
+            if after and str(exc).endswith(" — nothing was done"):
+                raise XaeError(str(exc)[:-len(" — nothing was done")]) from exc
+            raise
+        try:
+            return _links_of(xml)
         except (ET.ParseError, ValueError) as exc:
-            raise XaeError(f"ProduceMappingInfo returned a table the parser does not take ({exc}) — nothing was "
-                           "done") from exc
+            raise XaeError(f"ProduceMappingInfo returned a table the parser does not take ({exc})"
+                           + ("" if after else " — nothing was done")) from exc
+
+    def link_count(self, variable: str) -> int:
+        """How many links of the mapping table have `variable` as an end — what an unlink-all token binds."""
+        self._sm()
+        v = _link_path(variable).casefold()
+        return sum(1 for x in self._all_links() if v in _link_ends(x))
 
     @staticmethod
     def _protected(ends: Iterable[str], protect: Callable[[str], str | None] | None) -> None:
@@ -2757,6 +2770,10 @@ class XaeBackend:
         self._sm()
         before = self._all_links()
         pair = frozenset({v.casefold(), t.casefold()})
+        # review 2 of 0.8.20: LinkVariables may replace a link of either end (one source per input / output) — the
+        # ends of the links either has are checked too
+        ends_now = [x for x in before if v.casefold() in _link_ends(x) or t.casefold() in _link_ends(x)]
+        self._protected([e for x in ends_now for e in (x["a"], x["b"])], protect)
         same = [x for x in before if _link_ends(x) == pair]
         part = bool(offs_variable or offs_target or size_bits)
         if same and not part:
@@ -2771,6 +2788,13 @@ class XaeBackend:
             res["warning"] = (f"XAE reported success, but no new link {v} <-> {t} is in the mapping table after it" +
                               (f" — it added {[_link_text(x) for x in d['added']][:10]} (other path names?)"
                                if d["added"] else ""))
+        if d is not None and d["removed"]:
+            res["warning"] = ((res["warning"] + "; ") if res.get("warning") else "") + (
+                f"LinkVariables also removed {len(d['removed'])} link(s): {[_link_text(x) for x in d['removed']][:20]} "
+                "— put back what is missing (xae_link)")
+        before_v = [x for x in before if v.casefold() in _link_ends(x) and _link_ends(x) != pair]
+        if before_v:
+            res["variable_also_linked_to"] = [x["a"] if x["b"].casefold() == v.casefold() else x["b"] for x in before_v]
         if same:
             res["pair_links_before"] = [_link_text(x) for x in same]     # a part linked besides others of the pair
         before_t = [x for x in before if t.casefold() in _link_ends(x) and _link_ends(x) != pair]
@@ -2785,6 +2809,10 @@ class XaeBackend:
         v, t = _link_path(variable), _link_path(target or "")
         if not v:
             raise XaeError("give the variable's full tree path — nothing was done")
+        if str(target or "").strip() and not t:
+            # review 2 of 0.8.20: a target that is no path would have cleared every link of the variable
+            raise XaeError(f"target {target!r} is no tree path — leave it out to remove every link of the variable. "
+                           "Nothing was done")
         self._sm()
         before = self._all_links()
         vf, tf = v.casefold(), t.casefold()
@@ -2838,18 +2866,26 @@ class XaeBackend:
                                "links_after": len(final), "table_sha": _sha16(cur_xml), **_pub_diff(d)}
         if mode == "replace" and not final and current:
             res["warning"] = f"the XML holds no link: every link of the project ({len(current)}) would be removed"
-        self._protected([e for x in d["added"] + d["removed"] for e in (x["a"], x["b"])], protect)
+        # review 2 of 0.8.20: ConsumeMappingInfo resets and rewrites EVERY link — a table with a TwinSAFE end is not
+        # given to it at all (also not to restore it: the way back would be refused after the reset)
+        try:
+            self._protected([e for x in current + final for e in (x["a"], x["b"])], protect)
+        except XaeError as exc:
+            raise XaeError(f"ConsumeMappingInfo rewrites every link of the project, and a link of the table has a "
+                           f"TwinSAFE end: {exc}") from exc
         if not apply:
             res["dry_run"] = True
             res["note"] = ("nothing was done — dry_run=false writes the table as it is to a new backup file, then "
-                           "replaces it (ConsumeMappingInfo)")
+                           "replaces it (ConsumeMappingInfo)" if d["added"] or d["removed"] else
+                           "nothing was done — the table would not change: dry_run=false would not call "
+                           "ConsumeMappingInfo")
             return res
         if not d["added"] and not d["removed"]:
             res["note"] = "the table would not change — ConsumeMappingInfo was not called"
             return res
-        if mode == "replace" and expect_current is not None and expect_current != res["table_sha"]:
+        if expect_current is not None and expect_current != res["table_sha"]:
             raise XaeError(f"the mapping table changed since the confirmation (table {expect_current} then, "
-                           f"{res['table_sha']} now) — a replace would remove other links than were shown. Nothing was "
+                           f"{res['table_sha']} now) — the import would change other links than were shown. Nothing was "
                            "done: run the dry run again")
         if not self._retry(lambda: _has_member(self._cur_sm(), "ConsumeMappingInfo"), "ConsumeMappingInfo?"):
             raise XaeError("this System Manager has no ConsumeMappingInfo (ITcSysManager2) — nothing was done")
@@ -2862,18 +2898,21 @@ class XaeBackend:
         restore = f"xae_links_import(file={backup_path!r}, mode='replace')"
         try:
             self._on_sm(lambda sm: _com_call(sm, "ConsumeMappingInfo", final_xml), "ConsumeMappingInfo", once=True)
+        except (XaeBusy, XaeGone):
+            raise                     # did not run / the shell is gone: their own text (the backup file stays)
         except XaeError as exc:
             # review 1 of 0.8.20: ConsumeMappingInfo resets the table first — a failure may leave it empty or half
-            # set: what it holds now is read and said, with the way back
+            # set: what it holds now is read and said, with the way back (review 2: in the error's own class)
             try:
-                n_now: Any = len(self._all_links())
+                n_now: Any = len(self._all_links(after=True))
             except XaeError as exc2:
-                n_now = f"not readable ({exc2})"
-            raise XaeError(f"{exc} — the mapping table now has {n_now} link(s), it had {len(current)}; the table as it "
-                           f"was is in {backup_path}: restore it with {restore}") from exc
+                n_now = f"an unknown number of (not readable: {exc2})"
+            msg = (f"{exc} — the mapping table now has {n_now} link(s), it had {len(current)}; the table as it was is "
+                   f"in {backup_path}: restore it with {restore}")
+            raise (XaeActedUnknown(msg) if isinstance(exc, XaeActedUnknown) else XaeError(msg)) from exc
         res["activation_required"] = True
         try:
-            after = self._all_links()
+            after = self._all_links(after=True)
         except XaeError as exc:
             res["after_unread"] = (f"ConsumeMappingInfo ran; the table could not be read after it ({exc}) — xae_links "
                                    f"shows it; the table as it was: {restore}")
@@ -2892,7 +2931,7 @@ class XaeBackend:
                      ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]] | None]:
         res: dict[str, Any] = {"action": what, "activation_required": True}
         try:
-            after = self._all_links()
+            after = self._all_links(after=True)
         except XaeError as exc:
             res["after_unread"] = f"{what} ran; the mapping table could not be read after it ({exc}) — xae_links shows it"
             return res, None
@@ -3346,10 +3385,18 @@ def _links_of(xml: str, strict: bool = False) -> list[dict[str, Any]]:
                 if strict and not (an and bn and va and vb):
                     raise ValueError(f"a Link without both owners and variables (OwnerA {an!r}, OwnerB {bn!r}, VarA "
                                      f"{va!r}, VarB {vb!r})")
-                out.append({"a": f"{an}^{va}", "b": f"{bn}^{vb}", "owner_a": an, "var_a": va, "owner_b": bn,
-                            "var_b": vb, "attrs": {k: v for k, v in lk.attrib.items() if k not in ("VarA", "VarB")}})
+                # review 2 of 0.8.20: the ends as the link tools name them (the long I/O path form → TIID)
+                out.append({"a": _link_path(f"{an}^{va}"), "b": _link_path(f"{bn}^{vb}"), "owner_a": an, "var_a": va,
+                            "owner_b": bn, "var_b": vb,
+                            "attrs": {k: v for k, v in lk.attrib.items() if k not in ("VarA", "VarB")}})
     if strict and sum(1 for _ in root.iter("Link")) != direct:
         raise ValueError("Link elements outside <VarLinks><OwnerA><OwnerB> — XAE reads only that structure")
+    if strict:
+        seen: dict[Any, dict[str, Any]] = {}
+        for x in out:
+            if _link_key(x) in seen:
+                raise ValueError(f"the link {_link_text(x)} is in it twice")
+            seen[_link_key(x)] = x
     return out
 
 
@@ -3358,10 +3405,30 @@ def _link_ends(x: dict[str, Any]) -> frozenset[str]:
     return frozenset({x["a"].casefold(), x["b"].casefold()})
 
 
-def _link_key(x: dict[str, Any]) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+_SIDED = {"offsa": "offsb", "offsb": "offsa"}
+_DEFAULT_ZERO = {"offsa", "offsb", "size"}
+
+
+def _link_key(x: dict[str, Any]) -> tuple[tuple[str, str], tuple[tuple[str, str], ...]]:
     """One link: its two ends and its other attributes (offsets, size) — two parts of one pair are two links (review 1
-    of 0.8.20)."""
-    return _link_ends(x), tuple(sorted((k.casefold(), str(v)) for k, v in (x.get("attrs") or {}).items()))
+    of 0.8.20). Review 2: the ends in one order, and an attribute of a side (OffsA / OffsB) moved with its end, so a
+    link written the other way round is the same link; numbers compared as numbers, an offset or size of 0 as none."""
+    a, b = x["a"].casefold(), x["b"].casefold()
+    swap = b < a
+    attrs: list[tuple[str, str]] = []
+    for k, v in (x.get("attrs") or {}).items():
+        kk = k.casefold()
+        if swap and kk in _SIDED:
+            kk = _SIDED[kk]
+        vv = str(v).strip()
+        try:
+            vv = str(int(vv, 0) if vv.lower().startswith("0x") else int(vv))
+        except ValueError:
+            pass
+        if kk in _DEFAULT_ZERO and vv == "0":
+            continue
+        attrs.append((kk, vv))
+    return ((b, a) if swap else (a, b)), tuple(sorted(attrs))
 
 
 def _link_text(x: dict[str, Any]) -> str:

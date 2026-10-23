@@ -334,10 +334,18 @@ tool wishlist (2026-10-18).
   leading space, the other end of an unlink, or an import), 8 MEDIUM (a failed ConsumeMappingInfo left no way back; two
   imports in one second shared a backup file; a table read deeper than XAE reads it; two parts of one pair counted as
   one link; a replace token that did not bind the table it replaces; a link token without the part; imports and the
-  links the saved project could not restore; every .xti below the folder read) — fixed with tests red before. LOW left:
-  the link tools are not gated by edit_requires_config_mode (the library tools neither); ConsumeMappingInfo's effect
-  on the RestoreInfo links is not known (an import says so). Not seen on hardware: all of it (LinkVariables with a part,
-  the paths ProduceMappingInfo writes after a link, ConsumeMappingInfo of a merged table, where RestoreInfo sits).
+  links the saved project could not restore; every .xti below the folder read) — fixed with tests red before. Review 2:
+  1 HIGH (an import of a table with a TwinSAFE end reset those links too, and the restore it named was refused: no
+  import while the table has one), 4 MEDIUM (a link written the other way round, its OffsA / OffsB with it, is the same
+  link; not_restored of one PLC in xae_links; independent files placed where TwinCAT puts them, the unplaced said;
+  xae_link says and guards what LinkVariables replaces) and LOW (error classes kept, after-action texts, the long I/O
+  form in imports, a link twice in an XML refused, an unlink target that is no path refused, an unlink-all token binds
+  how many links, an import token binds the table and the counts in both modes, the reader never fatal) — fixed with
+  tests red before. LOW left: the link tools are not gated by edit_requires_config_mode (the library tools neither);
+  ConsumeMappingInfo's effect on the RestoreInfo links is not known (an import says so); a token assumes
+  ProduceMappingInfo gives the same text for the same table. Not seen on hardware: all of it (LinkVariables with a part
+  and whether it replaces a link of an end, the paths and attribute names ProduceMappingInfo writes, ConsumeMappingInfo
+  of a merged table, where RestoreInfo sits).
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
