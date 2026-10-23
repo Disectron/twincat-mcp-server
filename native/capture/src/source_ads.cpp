@@ -2,6 +2,7 @@
 //   Windows + TwinCAT (USE_TWINCAT_ROUTER): AdsLib over Beckhoff's TcAdsDll.dll — the local TwinCAT router,
 //     same path as TwinCAT's own tools; works for the local runtime and every routed target.
 //   Elsewhere (standalone AdsLib): AdsLib's own AMS/TCP router to a remote IPC (route on the IPC needed).
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -266,17 +267,27 @@ public:
             err = "stopped";
             return false;
         }
-        notes_.clear();                      // the delete requests on the old port fail fast; the handles are dead
-        dev_.reset();                        // closes the old local port
+        // review 2 of 0.8.20: the new connection is opened first and the old one kept when that fails (the router may
+        // be restarting) — never left without one
+        std::unique_ptr<AdsDevice> fresh;
         try {
-            return open_port(make_AmsNetId(net_id_), err);
+            fresh.reset(new AdsDevice(ip_, make_AmsNetId(net_id_), port_));
+            if (fresh->GetLocalPort() == 0) {
+                err = "opening the ADS port again failed: no local port (TwinCAT router not running?)";
+                return false;
+            }
+            fresh->SetTimeout(timeout_ms_);
         } catch (const AdsException& ex) {
             err = "opening the ADS port again failed: " + ads_error(ex.errorCode);
+            return false;
         } catch (const std::exception& ex) {
             err = std::string("opening the ADS port again failed: ") + ex.what();
+            return false;
         }
-        dev_.reset();
-        return false;
+        notes_.clear();                      // the delete requests on the old port fail fast; the handles are dead
+        dev_.swap(fresh);                    // `fresh` holds the old device now: its local port closes here
+        fresh.reset();
+        return true;
     }
 
     // Review 1 of 0.8.20: a ReadState on the PLC port answers 0x6 whenever registering there does — the system service
@@ -290,7 +301,10 @@ public:
         const long local = dev_->GetLocalPort();
         AmsAddr sys{make_AmsNetId(net_id_), 10000};
         uint16_t ads = 0, dev = 0;
+        // a diagnostic: at most 1 s of the attempt (the engine holds its mutex across it, review 2 of 0.8.20)
+        dev_->SetTimeout(std::min<uint32_t>(timeout_ms_, 1000));
         const long e = AdsSyncReadStateReqEx(local, &sys, &ads, &dev);
+        dev_->SetTimeout(timeout_ms_);
         if (e != 0) {
             text = "TwinCAT system state not readable on this connection: " + ads_error(e) + " (local port " +
                    std::to_string(local) + ")";

@@ -18,6 +18,7 @@
 //                                                  until reopen() opened a new connection; the system state reads RUN)
 //           "system_state_in_outage": "unreadable", (the system state cannot be read during the outage; default: it
 //                                                  reads CONFIG)
+//           "reopen_fails": n,                    (the first n reopen() calls fail; the old connection is kept)
 //           "version_after_outage": n,            (the runtime comes back with symbol version n)
 //           "version_at_start": n,                (the symbol version before anything changes, default 1)
 //           "version_read_fails": true,           (the runtime refuses every symbol version read)
@@ -75,6 +76,7 @@ public:
         if (const JVal* r = sim.get("rebuild_in_outage")) rebuild_in_outage_ = r->t == JVal::Bool && r->b;
         if (const JVal* r = sim.get("stale_port_after_outage")) stale_port_ = r->t == JVal::Bool && r->b;
         sys_unreadable_in_outage_ = sim.str("system_state_in_outage") == "unreadable";
+        reopen_fails_ = sim.integer("reopen_fails", 0);
         version_after_outage_ = sim.integer("version_after_outage", -1);
         version_at_start_ = sim.integer("version_at_start", 1);
         if (const JVal* r = sim.get("version_read_fails")) version_read_fails_ = r->t == JVal::Bool && r->b;
@@ -157,7 +159,12 @@ public:
 
     uint64_t resubscriptions() const override { return resubs_; }
 
-    bool reopen(std::string&) override {
+    bool reopen(std::string& err) override {
+        if (reopen_fails_ > 0) {
+            --reopen_fails_;
+            err = "opening the ADS port again failed: ADS error 0x748 (1864): port not open (simulated)";
+            return false;
+        }
         if (outage_from_ >= 0 && cycle_now_.load() > outage_to_) stale_port_ = false;   // a new connection reaches it
         ++reopens_;
         return true;
@@ -279,6 +286,7 @@ private:
     std::atomic<bool> dead_{false};
     bool stale_port_ = false;
     bool sys_unreadable_in_outage_ = false;
+    int64_t reopen_fails_ = 0;
     uint64_t reopens_ = 0;
     uint64_t resubs_ = 0;
     double speed_ = 1.0;

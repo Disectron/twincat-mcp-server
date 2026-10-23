@@ -281,12 +281,52 @@ def test_n197_a_connection_refused_while_twincat_runs_is_opened_again(capture_ex
         f = s.wait_event(30)["footer"]
     finally:
         s.close()
-    assert f["resubscriptions"] == 1 and f["port_reopens"] == 1 and f["resubscribe_failures"] == 2, f
+    assert f["resubscriptions"] == 1 and f["port_reopens"] == 1 and f["resubscribe_failures_total"] == 2, f
     note = next(e for e in f["errors"] if "registered again" in e)
-    assert "2 attempt(s) failed before, last: ADS error 0x6" in note and "system state on this connection: RUN" in note
-    assert "registered on a new ADS connection (the old one was refused 3 time(s))" in note, note
+    assert "3 attempt(s) failed, last: ADS error 0x6" in note and "the PLC port refused 3 time(s) while the system " \
+        "service read RUN (first: ADS error 0x6 (6): target port not found (simulated stale connection)" in note, note
+    assert note.endswith(" - registered on a new ADS connection"), note
     assert not any(e.startswith("re-registering the notifications failed") for e in f["errors"]), f["errors"]
     assert f["stop_reason"] == "duration 4s", f
+
+
+def test_n197_r2_config_then_a_refusing_run_is_told_apart_in_the_note(capture_exe, tmp_path):
+    """Review 2 of 0.8.20: after a CONFIG of several attempts the note called every attempt a refusal of the old
+    connection and lost the one RUN reading that is the N197 evidence."""
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "cr", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}], duration_s=4,
+                              cycle_100ns=100_000, silent_ms=300, resubscribe_after_ms=600, resubscribe_retry_ms=100,
+                              sim={"speed": 1, "outage": [50, 250], "stale_port_after_outage": True}))
+        assert r["ok"]
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    note = next(e for e in f["errors"] if "registered again" in e)
+    assert "the PLC port refused 1 time(s) while the system service read RUN (first: ADS error 0x6 (6): target port " \
+        "not found (simulated stale connection) - TwinCAT system state on this connection: RUN" in note, note
+    assert note.endswith(" - registered on a new ADS connection") and f["port_reopens"] == 1, note
+    n = int(note.split(" attempt(s) failed, last: ")[0].rsplit(" - ", 1)[1])
+    assert n >= 5 and " attempt(s) failed, last: ADS error 0x6 (6): target port not found (simulated stale " \
+        "connection) - TwinCAT system state on this connection: RUN" in note, note   # CONFIG attempts, then 1 in RUN
+
+
+def test_n197_r2_a_failed_reopen_keeps_the_old_connection_and_is_said(capture_exe, tmp_path):
+    s = Svc(capture_exe)
+    try:
+        r = s.call(_start_cmd(tmp_path, "rf", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}], duration_s=5,
+                              cycle_100ns=100_000, silent_ms=300, resubscribe_after_ms=600, resubscribe_retry_ms=100,
+                              sim={"speed": 1, "outage": [50, 99], "stale_port_after_outage": True,
+                                   "reopen_fails": 1}))
+        assert r["ok"]
+        st = _status_until(s, lambda st: st.get("reopen_error"))
+        assert "port not open (simulated)" in st["reopen_error"] and "outage_reopens" not in st, st
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    assert f["resubscriptions"] == 1 and f["port_reopens"] == 1, f       # the second reopen (attempt 9) did it
+    note = next(e for e in f["errors"] if "registered again" in e)
+    assert "9 attempt(s) failed" in note and note.endswith(" - registered on a new ADS connection"), note
 
 
 def test_n197_r1_twincat_in_config_is_waited_for_without_new_connections(capture_exe, tmp_path):

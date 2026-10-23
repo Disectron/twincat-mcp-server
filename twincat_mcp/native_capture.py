@@ -377,7 +377,8 @@ class NativeRecording:
             "blocks": (src.get("blocks") or [])[:20],
         }
         for k in ("stalls", "stalled_samples", "stalled", "stalled_since_ms", "missing_silent_est", "completeness_estimated",
-                  "resubscriptions", "resubscribe_error", "resubscribe_failures", "port_reopens", "reopen_error",
+                  "resubscriptions", "resubscribe_error", "resubscribe_failures", "port_reopens", "outage_reopens",
+                  "reopen_error", "resubscribe_failures_total",
                   "label_reason", "stall_s",
                   # R43: the program the addresses belong to
                   "program_watch", "program_watch_error", "program_changed", "program_rebuilt_in_outage",
@@ -390,12 +391,13 @@ class NativeRecording:
             st.setdefault("warnings", []).append(
                 f"PLC STOPPED? the cycle counter has not advanced since {src['stalled_since_ms']} ms — samples since then are frozen values, not measurements")
         if src.get("resubscribe_error"):
-            # N197: said while it lasts, not only in the footer — the runtime is away (CONFIG), or this connection
-            # cannot reach it although it is back (the engine opens a new one after 3 failures in a row)
+            # N197: said while it lasts, not only in the footer — the runtime is away (the system service reads CONFIG),
+            # or it is back and this connection is refused (the engine then opens a new one, at growing intervals)
             st.setdefault("warnings", []).append(
-                f"no samples: re-registering the notifications failed {src.get('resubscribe_failures', '?')} time(s), "
-                f"last: {src['resubscribe_error']}" + (f" — the ADS connection was opened again "
-                                                       f"{src['port_reopens']} time(s)" if src.get("port_reopens") else "")
+                f"no samples: re-registering the notifications failed {src.get('resubscribe_failures', '?')} time(s) "
+                f"since the last samples, last: {src['resubscribe_error']}"
+                + (f" — the ADS connection was opened again {src['outage_reopens']} time(s) since then"
+                   if src.get("outage_reopens") else "")
                 + (f" — opening it again failed: {src['reopen_error']}" if src.get("reopen_error") else ""))
         if src.get("missing_silent_est"):
             st.setdefault("warnings", []).append(

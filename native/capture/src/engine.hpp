@@ -222,6 +222,8 @@ private:
     uint64_t resub_failures_ = 0;
     uint64_t outage_attempts_ = 0;       // re-registration attempts since the last samples (this outage)
     uint64_t outage_reopens_ = 0;        // connections opened again in this outage
+    uint64_t outage_run_refusals_ = 0;   // failed attempts while the system service read RUN (the N197 evidence)
+    std::string outage_first_run_refusal_, outage_last_failure_;
     uint64_t port_reopens_ = 0;          // N197: connections opened again, the whole recording
     uint64_t reopen_gap_ = 3;            // attempts between reopens (doubles, capped)
     uint64_t next_reopen_at_ = 3;        // the attempt of this outage that may open the connection again

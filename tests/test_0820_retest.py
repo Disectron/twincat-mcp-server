@@ -16,10 +16,10 @@ from twincat_mcp import xae_backend as X
 def test_n199_a_bare_name_is_added_by_its_display_name_completed_from_the_installed_libraries(monkeypatch):
     be, lm = _libs(monkeypatch)
     r = be.library_add(PROJ, "ex_math")                  # any case, as the retest typed it
-    # TE1000's example form AddLibrary("Tc2_MDP", "*", "Beckhoff Automation GmbH"), the name as ScanLibraries has it
-    assert lm.calls == [("AddLibrary", "Ex_Math", "*", "Example Corp")], lm.calls
+    # the display name 'Tc2_Math, * (Beckhoff Automation GmbH)' worked on the retest PC; the name as ScanLibraries has it
+    assert lm.calls == [("AddLibrary", "Ex_Math, * (Example Corp)", "", "")], lm.calls
     assert [x["name"] for x in r["added"]] == ["Ex_Math"] and "warning" not in r, r
-    assert r["named_as"] == ("AddLibrary('Ex_Math', '*', 'Example Corp') — distributor 'Example Corp' and version '*' "
+    assert r["named_as"] == ("AddLibrary('Ex_Math, * (Example Corp)') — distributor 'Example Corp' and version '*' "
                              "(the newest installed) from ScanLibraries (XAE refuses a bare name)"), r
 
 
@@ -48,7 +48,7 @@ def test_n199_not_installed_or_several_distributors_is_refused_before_xae_is_ask
         be.library_add(PROJ, "Ex_Math", distributor="Nobody")
     assert lm.calls == []
     be.library_add(PROJ, "Ex_Math", distributor="other gmbh")
-    assert lm.calls == [("AddLibrary", "Ex_Math", "*", "Other GmbH")], lm.calls
+    assert lm.calls == [("AddLibrary", "Ex_Math, * (Other GmbH)", "", "")], lm.calls
 
 
 def test_n199_named_in_full_nothing_is_looked_up(monkeypatch):
@@ -137,10 +137,12 @@ async def test_n198_the_virtual_global_types_library_is_not_a_difference(monkeyp
         sv["added_by_twincat_note"], sv
     lm.refs.append(Lib("Ex_Math", "1.4.0.0"))           # a real difference still counts
     lm.refs.append(Lib("Tc3_GlobalTypesExt", "1.0.0.0"))  # review 1 of 0.8.20: a name that only begins like it, too
+    lm.refs.append(Lib("Tc3_GlobalTypes_Mine", "1.0.0.0"))  # review 2: only Tc3_GlobalTypes(_Global) are TwinCAT's
     async with client_for(srv) as s:
         sv = payload(await s.call_tool("xae_library_list", {}))["saved_plcproj"]
     assert sv["same"] is False and sv["only_in_xae"] == ["library Ex_Math 1.4.0.0",
-                                                         "library Tc3_GlobalTypesExt 1.0.0.0"], sv
+                                                         "library Tc3_GlobalTypesExt 1.0.0.0",
+                                                         "library Tc3_GlobalTypes_Mine 1.0.0.0"], sv
 
 
 def test_n198_r1_the_virtual_library_is_not_flagged_as_not_installed(monkeypatch):

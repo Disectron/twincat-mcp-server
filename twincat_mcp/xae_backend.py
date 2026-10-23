@@ -1877,12 +1877,13 @@ class XaeBackend:
                                      if any(h["kind"] == "placeholder" for h in have) else
                                      " (for another version: xae_library_remove it first)" if other_ver else ""))
         # N199 (0.8.19 retest): with version and distributor empty XAE 4024 reads the name as a display name and refuses
-        # the bare one ("LibInfo display name 'Tc2_Math' is not valid"). The forms seen working on that PC are kept as
-        # they were: a display name as given, (name, version, distributor) as given. A bare name gets its distributor
-        # and version from ScanLibraries and goes the (name, version, distributor) way — TE1000's own example is
-        # AddLibrary("Tc2_MDP", "*", "Beckhoff Automation GmbH").
+        # the bare one ("LibInfo display name 'Tc2_Math' is not valid"). Only forms seen working on that PC are sent: a
+        # display name as given, (name, version, distributor) as given. A bare name gets its distributor (and '*')
+        # from ScanLibraries and is sent as the display name 'Name, * (Distributor)' (worked there); a name with a
+        # pinned version, its distributor completed, as (name, version, distributor) (worked there, review 2 of 0.8.20).
         name, ver, dist, _inst = self._lib_identity(it, path, want, version, distributor)
-        if display:
+        if display or ver == "*":
+            display = display or f"{name}, {ver} ({dist})"
             args, what = (display, "", ""), f"AddLibrary {display}"
         else:
             args, what = (name, ver, dist), f"AddLibrary {name}, {ver} ({dist})"
@@ -1896,8 +1897,8 @@ class XaeBackend:
         if completed:
             filled = ([f"distributor {dist!r}"] if not distributor else []) + \
                 ([f"version {ver!r} (the newest installed)"] if not version else [])
-            res["named_as"] = (f"AddLibrary({name!r}, {ver!r}, {dist!r}) — {' and '.join(filled)} from ScanLibraries "
-                               "(XAE refuses a bare name)")
+            call = f"AddLibrary({args[0]!r})" if args[1:] == ("", "") else f"AddLibrary({name!r}, {ver!r}, {dist!r})"
+            res["named_as"] = f"{call} — {' and '.join(filled)} from ScanLibraries (XAE refuses a bare name)"
         return res
 
     def _lib_identity(self, it: Any, path: str, name: str, version: str, distributor: str
@@ -1919,7 +1920,8 @@ class XaeBackend:
         inst = [x for x in listed if (x.get("library") or "").lower() == name.lower()]
         if not inst:
             raise XaeError(f"{name} is not installed in the repositories XAE uses (ScanLibraries) — nothing was done "
-                           "(xae_library_installed lists what is)")
+                           "(xae_library_installed lists what is; with version and distributor both given nothing is "
+                           "looked up)")
         if distributor:
             mine = [x for x in inst if (x.get("distributor") or "").lower() == distributor.lower()]
             if not mine:
@@ -3245,13 +3247,14 @@ def _lib_args(library: str, version: str = "", distributor: str = "") -> tuple[s
     return name, (version or "").strip(), (distributor or "").strip(), ""
 
 
-_VIRTUAL_LIB = re.compile(r"^#?tc3_globaltypes(_\w*)?$", re.IGNORECASE)
+_VIRTUAL_LIB = re.compile(r"^#?tc3_globaltypes(_global)?$", re.IGNORECASE)
 
 
 def _virtual_lib(name: str | None) -> bool:
-    """N198: Tc3_GlobalTypes (and the data-type libraries below it, Tc3_GlobalTypes_<namespace>) — the virtual
-    libraries TwinCAT makes from the global data types and adds to the PLC project itself (build 4026+, Beckhoff 'Using
-    global data types'); never in the .plcproj, never installed."""
+    """N198: Tc3_GlobalTypes and Tc3_GlobalTypes_Global — the virtual libraries TwinCAT makes from the global data
+    types and adds to the PLC project itself (build 4026+, Beckhoff 'Using global data types'; the libraries of
+    namespaces below them are named after the namespace and cannot be told by name); never in the .plcproj, never
+    installed."""
     return bool(_VIRTUAL_LIB.match(str(name or "").strip()))
 
 
