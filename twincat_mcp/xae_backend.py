@@ -2713,6 +2713,155 @@ class XaeBackend:
         except ET.ParseError as exc:
             return None, None, f"ProduceMappingInfo returned XML the parser does not take ({exc})"
 
+    # ------------------------------------------------------------ linking (0.8.20, TE1000 "Managing variable mappings")
+    def _mapping_xml(self) -> str:
+        """The project's whole mapping table (ITcSysManager2::ProduceMappingInfo) as XAE gives it."""
+        if not self._retry(lambda: _has_prop(self._cur_sm(), "ProduceMappingInfo"), "ProduceMappingInfo?"):
+            raise XaeError("this System Manager has no ProduceMappingInfo (ITcSysManager2): the links cannot be read — "
+                           "nothing was done")
+        return str(self._retry(lambda: _com_call(self._cur_sm(), "ProduceMappingInfo"), "ProduceMappingInfo") or "")
+
+    def _all_links(self) -> list[dict[str, Any]]:
+        try:
+            return _links_of(self._mapping_xml())
+        except ET.ParseError as exc:
+            raise XaeError(f"ProduceMappingInfo returned XML the parser does not take ({exc}) — nothing was done") from exc
+
+    def link(self, variable: str, target: str, offs_variable: int = 0, offs_target: int = 0,
+             size_bits: int = 0) -> dict[str, Any]:
+        """ITcSysManager::LinkVariables(variable, target, offs1, offs2, size) — once. Both are full tree paths
+        ('TIPC^Plc^Plc Instance^PlcTask Inputs^GVL_IO.bIn', 'TIID^Device 1 (EtherCAT)^Term 1 (EK1100)^Term 2 (EL1004)^
+        Channel 1^Input'); XAE checks that both exist, are variables and fit (type / size). The mapping table before
+        and after it gives what changed."""
+        v, t = _link_path(variable), _link_path(target)
+        if not v or not t or v.casefold() == t.casefold():
+            raise XaeError("give two different full tree paths: the variable and its link target — nothing was done")
+        self._sm()
+        before = self._all_links()
+        pair = {v.casefold(), t.casefold()}
+        same = [x for x in before if {x["a"].casefold(), x["b"].casefold()} == pair]
+        if same:
+            raise XaeError(f"{v} and {t} are linked already ({_link_text(same[0])}) — nothing was done "
+                           "(xae_unlink first to link them differently)")
+        what = f"LinkVariables {v} <-> {t}" + (f" (offsets {offs_variable}/{offs_target}, {size_bits} bit)"
+                                               if offs_variable or offs_target or size_bits else "")
+        self._on_sm(lambda sm: _com_call(sm, "LinkVariables", v, t, int(offs_variable), int(offs_target),
+                                         int(size_bits)), what, once=True)
+        res = self._link_result(what, before, pair)
+        if not any({x["a"].casefold(), x["b"].casefold()} == pair for x in res.get("added") or []) and \
+                "after_unread" not in res:
+            res["warning"] = (f"XAE reported success, but no link {v} <-> {t} is in the mapping table after it" +
+                              (f" — it added {[_link_text(x) for x in res['added']]} (other path names?)"
+                               if res.get("added") else ""))
+        before_t = [x for x in before if t.casefold() in (x["a"].casefold(), x["b"].casefold())]
+        if before_t:
+            res["target_also_linked_to"] = [x["a"] if x["b"].casefold() == t.casefold() else x["b"] for x in before_t]
+        return res
+
+    def unlink(self, variable: str, target: str = "") -> dict[str, Any]:
+        """ITcSysManager::UnlinkVariables(variable, target) — once; target '' clears every link of the variable (TE1000).
+        Refused when the mapping table has no such link (UnlinkVariables gives S_FALSE then, which says nothing)."""
+        v, t = _link_path(variable), _link_path(target or "")
+        if not v:
+            raise XaeError("give the variable's full tree path — nothing was done")
+        self._sm()
+        before = self._all_links()
+        vf, tf = v.casefold(), t.casefold()
+        mine = [x for x in before if vf in (x["a"].casefold(), x["b"].casefold())
+                and (not t or tf in (x["a"].casefold(), x["b"].casefold()))]
+        if not mine:
+            near = [_link_text(x) for x in before if vf in x["a"].casefold() or vf in x["b"].casefold()][:10]
+            raise XaeError(f"no link of {v}" + (f" to {t}" if t else "") + " in the mapping table — nothing was done"
+                           + (f" (links naming it: {near})" if near else " (xae_links lists them, by the paths "
+                                                                         "ProduceMappingInfo gives)"))
+        what = f"UnlinkVariables {v}" + (f" <-> {t}" if t else " (all its links)")
+        self._on_sm(lambda sm: _com_call(sm, "UnlinkVariables", v, t), what, once=True)
+        res = self._link_result(what, before, None)
+        if "after_unread" not in res:
+            want = {_link_key(x) for x in mine}
+            gone = {_link_key(x) for x in res.get("removed") or []}
+            if want - gone:
+                res["warning"] = (f"XAE reported success, but {len(want - gone)} of the {len(want)} link(s) are still in "
+                                  "the mapping table")
+            elif gone - want:
+                res["warning"] = f"XAE removed more than asked: {[_link_text(x) for x in res['removed']]}"
+        return res
+
+    def links_import(self, xml: str, mode: str = "add", apply: bool = False,
+                     backup_path: str | None = None) -> dict[str, Any]:
+        """ITcSysManager2::ConsumeMappingInfo — it REPLACES the whole mapping table (TE1000: "The complete mapping set
+        must be passed in with every call"). mode 'add': the links of `xml` added to the table as it is (nothing
+        removed); 'replace': `xml` is the whole new table. apply false: what would change, nothing done. apply true:
+        the table as it is written to backup_path first, then ConsumeMappingInfo once, then the table read again and
+        compared with what was meant."""
+        if mode not in ("add", "replace"):
+            raise XaeError("mode is 'add' (the links are added to the table) or 'replace' (the XML is the whole new "
+                           "table) — nothing was done")
+        try:
+            incoming = _links_of(xml, strict=True)
+        except (ET.ParseError, ValueError) as exc:
+            raise XaeError(f"the mapping XML is not a <VarLinks> table ({exc}) — nothing was done") from exc
+        self._sm()
+        cur_xml = self._mapping_xml()
+        try:
+            current = _links_of(cur_xml)
+        except ET.ParseError as exc:
+            raise XaeError(f"ProduceMappingInfo returned XML the parser does not take ({exc}) — nothing was "
+                           "done") from exc
+        final_xml = _merge_links(cur_xml, incoming) if mode == "add" else xml
+        final = _links_of(final_xml)
+        res: dict[str, Any] = {"mode": mode, "links_now": len(current), "links_in_xml": len(incoming),
+                               "links_after": len(final), **_links_diff(current, final)}
+        if mode == "replace" and not final and current:
+            res["warning"] = f"the XML holds no link: every link of the project ({len(current)}) would be removed"
+        if not apply:
+            res["dry_run"] = True
+            res["note"] = ("nothing was done — apply=true writes the table as it is to a backup file, then replaces it "
+                           "(ConsumeMappingInfo)")
+            return res
+        if not res["added"] and not res["removed"] and not res["changed"]:
+            res["note"] = "the table would not change — ConsumeMappingInfo was not called"
+            return res
+        if not self._retry(lambda: _has_member(self._cur_sm(), "ConsumeMappingInfo"), "ConsumeMappingInfo?"):
+            raise XaeError("this System Manager has no ConsumeMappingInfo (ITcSysManager2) — nothing was done")
+        if not backup_path:
+            raise XaeError("no backup file given — nothing was done")
+        os.makedirs(os.path.dirname(os.path.abspath(backup_path)), exist_ok=True)
+        with open(backup_path, "w", encoding="utf-8") as fh:
+            fh.write(cur_xml)
+        res["backup"] = backup_path
+        self._on_sm(lambda sm: _com_call(sm, "ConsumeMappingInfo", final_xml), "ConsumeMappingInfo", once=True)
+        res["activation_required"] = True
+        try:
+            after = self._all_links()
+        except XaeError as exc:
+            res["after_unread"] = (f"ConsumeMappingInfo ran; the table could not be read after it ({exc}) — xae_links "
+                                   "shows it")
+            return res
+        chk = _links_diff(final, after)
+        if chk["removed"] or chk["added"] or chk["changed"]:
+            res["warning"] = (f"the table after it is not what was meant: {len(chk['removed'])} link(s) missing, "
+                              f"{len(chk['added'])} not asked for, {len(chk['changed'])} changed")
+            res["not_applied"] = [_link_text(x) for x in chk["removed"]][:100]
+            res["unexpected"] = [_link_text(x) for x in chk["added"]][:100]
+        res["note"] = (f"replaced; restore with xae_links_import(file={backup_path!r}, mode='replace'). Not saved and not "
+                       "activated: save in XAE (xae_build save_first=true), then activate")
+        return res
+
+    def _link_result(self, what: str, before: list[dict[str, Any]], pair: set[str] | None) -> dict[str, Any]:
+        res: dict[str, Any] = {"action": what, "activation_required": True}
+        try:
+            after = self._all_links()
+        except XaeError as exc:
+            res["after_unread"] = f"{what} ran; the mapping table could not be read after it ({exc}) — xae_links shows it"
+            return res
+        d = _links_diff(before, after)
+        res.update(added=d["added"], removed=d["removed"], changed=d["changed"], links_before=len(before),
+                   links_after=len(after))
+        res["note"] = ("in XAE only: not saved and not activated — save (xae_build save_first=true), then activate for "
+                       "the runtime to use it")
+        return res
+
     def _nested_projects(self, plc_project_path: str | None = None) -> list[str]:
         if plc_project_path:
             return [_plc_split(plc_project_path)[1]]
@@ -3117,6 +3266,73 @@ def _varlinks_of(xml: str, inst_path: str) -> list[tuple[str, str, str]]:
                 group, _, var = mine.partition("^")
                 out.append((group, var, to))
     return out
+
+
+def _link_path(p: str) -> str:
+    """A tree path as LinkVariables takes it (TE1000: branches separated by '^' or a tab)."""
+    return "^".join(x.strip() for x in str(p or "").replace("\t", "^").split("^")).strip("^")
+
+
+def _links_of(xml: str, strict: bool = False) -> list[dict[str, Any]]:
+    """Every link of a <VarLinks> table: {a: '<OwnerA>^<VarA>', b: '<OwnerB>^<VarB>', owner_a, var_a, owner_b, var_b,
+    attrs: the Link's other attributes}. strict: the root must be VarLinks and every Link name both sides."""
+    root = ET.fromstring(xml) if str(xml or "").strip() else ET.Element("VarLinks")
+    if strict and root.tag != "VarLinks":
+        raise ValueError(f"the root element is <{root.tag}>, not <VarLinks>")
+    out: list[dict[str, Any]] = []
+    for a in root.iter("OwnerA"):
+        an = a.get("Name") or ""
+        for b in a.findall("OwnerB"):
+            bn = b.get("Name") or ""
+            for lk in b.findall("Link"):
+                va, vb = lk.get("VarA") or "", lk.get("VarB") or ""
+                if strict and not (an and bn and va and vb):
+                    raise ValueError(f"a Link without both owners and variables (OwnerA {an!r}, OwnerB {bn!r}, VarA "
+                                     f"{va!r}, VarB {vb!r})")
+                out.append({"a": f"{an}^{va}", "b": f"{bn}^{vb}", "owner_a": an, "var_a": va, "owner_b": bn,
+                            "var_b": vb, "attrs": {k: v for k, v in lk.attrib.items() if k not in ("VarA", "VarB")}})
+    return out
+
+
+def _link_key(x: dict[str, Any]) -> frozenset[str]:
+    """One link by its two ends, either direction, any case."""
+    return frozenset({x["a"].casefold(), x["b"].casefold()})
+
+
+def _link_text(x: dict[str, Any]) -> str:
+    return f"{x['a']} <-> {x['b']}" + (f" {x['attrs']}" if x.get("attrs") else "")
+
+
+def _links_diff(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, list[Any]]:
+    """added / removed (by their two ends) and changed (the same ends, other attributes: offsets, size)."""
+    b = {_link_key(x): x for x in before}
+    a = {_link_key(x): x for x in after}
+    added = [a[k] for k in a if k not in b]
+    removed = [b[k] for k in b if k not in a]
+    changed = [{"link": f"{a[k]['a']} <-> {a[k]['b']}", "before": b[k]["attrs"], "after": a[k]["attrs"]}
+               for k in a if k in b and a[k]["attrs"] != b[k]["attrs"]]
+    pub = (lambda x: {k: x[k] for k in ("a", "b", "attrs") if x.get(k) or k != "attrs"})
+    return {"added": [pub(x) for x in added], "removed": [pub(x) for x in removed], "changed": changed}
+
+
+def _merge_links(cur_xml: str, incoming: list[dict[str, Any]]) -> str:
+    """The table as it is with the incoming links added (a link both have is kept as the table has it): the current
+    XML is kept element for element, an incoming link goes under its OwnerA / OwnerB (made when missing)."""
+    root = ET.fromstring(cur_xml) if str(cur_xml or "").strip() else ET.Element("VarLinks")
+    have = {_link_key(x) for x in _links_of(cur_xml)}
+    for x in incoming:
+        if _link_key(x) in have:
+            continue
+        have.add(_link_key(x))
+        oa = next((e for e in root.findall("OwnerA") if (e.get("Name") or "").casefold() == x["owner_a"].casefold()),
+                  None)
+        if oa is None:
+            oa = ET.SubElement(root, "OwnerA", {"Name": x["owner_a"]})
+        ob = next((e for e in oa.findall("OwnerB") if (e.get("Name") or "").casefold() == x["owner_b"].casefold()), None)
+        if ob is None:
+            ob = ET.SubElement(oa, "OwnerB", {"Name": x["owner_b"]})
+        ET.SubElement(ob, "Link", {"VarA": x["var_a"], "VarB": x["var_b"], **x["attrs"]})
+    return ET.tostring(root, encoding="unicode")
 
 
 def _match_links(groups: list[dict[str, Any]], local: list[tuple[str, str, str]]

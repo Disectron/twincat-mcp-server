@@ -320,6 +320,18 @@ tool wishlist (2026-10-18).
   refused (XAE refused the bare name anyway), a distributor without version needs ScanLibraries. Not seen on hardware:
   AddPlaceholder / SetEffectiveResolution with '*' and the distributor filled; the system state read on port 10000
   through the capture's connection; whether a new connection recovers the N197 state.
+- 0.8.20 linking (docs/PLAN-0.8.19.md, the 0.8.20 row; TE1000 "Managing variable mappings"): `xae_link`
+  (LinkVariables, full tree paths, bit offsets / size for a part; refused when linked already; says what else the target
+  is linked to), `xae_unlink` (UnlinkVariables, one link or every link of a variable; refused when the mapping table has
+  no such link — UnlinkVariables answers S_FALSE then), `xae_links_import` (ConsumeMappingInfo replaces the whole table:
+  mode 'add' merges into the table as it is, 'replace' is the whole new table; a dry run by default with added /
+  removed / changed; applied: the table as it was written to ~/.twincat_mcp/backups/links/ first, the table read again
+  and compared with what was meant). Each reads the mapping table before and after and gives the difference; nothing
+  is saved or activated. Classes: link / unlink control, import destructive (its token names the mode and the
+  content's sha256). `xae_links` adds `not_restored`: elements of the saved .tsproj / .xti with a RestoreInfo
+  attribute (ANotFound on DrumFillingMachineV0) — the saved state, not what XAE holds now. Not seen on hardware: all of
+  it (LinkVariables with a part, the paths ProduceMappingInfo writes after a link, ConsumeMappingInfo of a merged table,
+  where RestoreInfo sits in a .tsproj).
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).

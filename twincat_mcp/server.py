@@ -48,7 +48,7 @@ from mcp.types import ToolAnnotations
 log = logging.getLogger(__name__)
 
 from . import __version__
-from .config import Config, load as load_config, is_windows
+from .config import Config, _home, load as load_config, is_windows
 from .safety import Guard, OpClass, SafetyError
 from .worker import SerialWorker, WorkerBusy
 import pyads
@@ -58,6 +58,7 @@ from .ads_files import SystemServiceFiles
 from .xae_backend import XaeActedUnknown, XaeBackend, XaeBusy, XaeError, XaeExplained, sta_init, sta_teardown
 from .xae_backend import _virtual_lib
 from .project_backend import PlcView, ProjectIndex, ProjectError, declaring, not_on_target, parse_tcunit_xml
+from .project_backend import not_restored_links
 from .recorder import Recorder, RecorderError
 from .testing import TestBench, TestError
 from . import codecheck
@@ -1765,6 +1766,17 @@ class App:
                 kind, ver = str(a.get("kind") or "").strip(), str(a.get("version") or "").strip()
                 return f"{proj}:{name}" + (f" ({kind})" if kind else "") + (f", {ver}" if ver else "")
             return f"{proj}:{name}"
+        if action in LINK_ACTIONS:
+            # 0.8.20: a token names the two ends of a link (unlink: or '(all)'); an import the mode and the content
+            if action == "xae_links_import":
+                import hashlib
+                text = _links_import_text(a.get("xml"), a.get("file"))
+                return f"{a.get('mode') or 'add'}:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
+            v = str(a.get("variable") or "").strip()
+            t = str(a.get("target") or "").strip()
+            if not v or (action == "xae_link" and not t):
+                raise TargetArgsError(f"{action}'s token names the link: pass args={{'variable': …, 'target': …}}")
+            return f"{v} -> {t or '(all)'}"
         if action == "xae_command":
             return f"{a.get('name', '')}@{await self._xae_netid()}"
         if action == "xae_boot_project":
@@ -2018,6 +2030,20 @@ async def _vs_runtime(app: "App", scope: str | None, max_items: int) -> dict[str
 # 0.8.19: the library manager's changes — confirmed in guarded mode, the token names the PLC project and the library
 LIB_ACTIONS = frozenset({"xae_library_add", "xae_library_remove", "xae_placeholder_add", "xae_placeholder_resolve",
                          "xae_placeholder_freeze"})
+LINK_ACTIONS = frozenset({"xae_link", "xae_unlink", "xae_links_import"})
+
+
+def _links_import_text(xml: str | None, file: str | None) -> str:
+    """xae_links_import's XML: given as text, or read from a file on this PC (exactly one of them)."""
+    if bool(xml) == bool(file):
+        raise TargetArgsError("xae_links_import takes the mapping table as xml='<VarLinks>…' or file='<path>' — one of "
+                              "them")
+    if xml:
+        return str(xml)
+    try:
+        return Path(str(file)).read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise TargetArgsError(f"xae_links_import: {file} could not be read ({exc}) — nothing was done") from exc
 
 # PLC code / project edits gated by safety.edit_requires_config_mode
 CODE_EDIT_ACTIONS = frozenset({"xae_pou_set", "xae_pou_create", "proj_set_code", "xae_tree_consume_xml", "xae_tree_set_values",
@@ -5529,8 +5555,82 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         """Variable links of the PLC instance: every AT %I*/%Q* variable (from the instance's XML) with its link
         targets (the project's mapping table, ProduceMappingInfo); lists the unlinked ones — array elements too, the
         usual reason an output never moves — and links whose variable is gone. plc_project_path: plc_path,
-        iec_project_path or instance_path. What could not be read is said (unlinked_count null), never counted as 0."""
-        return await app.xae_call(app.xae.links, plc_project_path, timeout=300)
+        iec_project_path or instance_path. What could not be read is said (unlinked_count null), never counted as 0.
+        not_restored: links the saved project keeps but XAE could not restore (RestoreInfo in the .tsproj / .xti, e.g.
+        ANotFound after a variable moved) — ProduceMappingInfo does not list them."""
+        res = await app.xae_call(app.xae.links, plc_project_path, timeout=300)
+        sol = getattr(app.xae, "bound_solution", None)
+        if sol:
+            nr = await asyncio.to_thread(not_restored_links, sol)
+            if not nr.get("read") or nr.get("count"):
+                res["not_restored"] = nr
+                if nr.get("count"):
+                    nr["note"] = ("the saved project keeps these links, marked by TwinCAT (RestoreInfo) because it could "
+                                  "not restore them when it loaded the project; XAE's mapping table does not have them — "
+                                  "they move nothing. Link the variables again (xae_link) or drop them in XAE; the next "
+                                  "save writes the table as XAE holds it")
+        return res
+
+    async def _link_action(action: str, op: OpClass, args: dict[str, Any], confirm_token: str | None, ctx: Any,
+                           fn: Any, *fargs: Any) -> dict[str, Any]:
+        tgt = await app.token_target(action, args)
+        for k in ("variable", "target"):
+            if args.get(k):
+                app.guard_safety_path(str(args[k]), action)
+        app.refuse_if_dialog(action)
+        await app.permit(ctx, op, action, tgt, confirm_token)
+        return await app.confirmed(action, {**{k: v for k, v in args.items() if v not in (None, "", 0)}, "target": tgt},
+                                   op, app.xae_call(fn, *fargs, timeout=300))
+
+    @mcp.tool(annotations=EDIT)
+    async def xae_link(variable: str, target: str, offs_variable: int = 0, offs_target: int = 0, size_bits: int = 0,
+                       confirm_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Link a variable to its I/O counterpart (ITcSysManager::LinkVariables), both as full tree paths:
+        variable='TIPC^<Plc>^<Plc> Instance^PlcTask Inputs^GVL_IO.bIn', target='TIID^Device 1 (EtherCAT)^Term 1
+        (EK1100)^Term 2 (EL1004)^Channel 1^Input' (xae_links gives the instance's variables, xae_tree_children the
+        terminals'). offs_* / size_bits for a part (bits; 0 = the smaller of the two). XAE checks that both exist, are
+        variables and fit. Refused when the two are linked already. Runs once; the result has what changed in the
+        mapping table and what else the target is linked to. In XAE only — not saved, not activated.
+        guarded: tc_request_confirmation(action='xae_link', target='<variable> -> <target>')."""
+        a = {"variable": variable, "target": target, "offs_variable": offs_variable, "offs_target": offs_target,
+             "size_bits": size_bits}
+        return await _link_action("xae_link", OpClass.CONTROL, a, confirm_token, ctx, app.xae.link, variable, target,
+                                  offs_variable, offs_target, size_bits)
+
+    @mcp.tool(annotations=DESTR)
+    async def xae_unlink(variable: str, target: str | None = None, confirm_token: str | None = None,
+                         ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Remove a link (ITcSysManager::UnlinkVariables): the one between variable and target, or — target left out —
+        every link of the variable. Full tree paths as the mapping table names them (xae_links). Refused when there
+        is no such link. Runs once; the result has what changed. In XAE only — not saved, not activated.
+        guarded: tc_request_confirmation(action='xae_unlink', target='<variable> -> <target>' or '<variable> -> (all)')."""
+        a = {"variable": variable, "target": target}
+        return await _link_action("xae_unlink", OpClass.CONTROL, a, confirm_token, ctx, app.xae.unlink, variable,
+                                  target or "")
+
+    @mcp.tool(annotations=DESTR)
+    async def xae_links_import(xml: str | None = None, file: str | None = None, mode: str = "add",
+                               dry_run: bool = True, confirm_token: str | None = None,
+                               ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Import a mapping table (<VarLinks>, as ProduceMappingInfo writes it) through ConsumeMappingInfo, which
+        replaces ALL links of the project. mode='add': its links are added to the table as it is (nothing removed);
+        'replace': it is the whole new table. dry_run (default): what would be added / removed / changed — nothing
+        done. dry_run=false: the table as it is goes to a backup file first (~/.twincat_mcp/backups/links/), then
+        ConsumeMappingInfo once, then the table is read again and compared. xml text or file (on this PC).
+        Destructive-class: tc_request_confirmation(action='xae_links_import', args={xml|file, mode}) — the target is
+        '<mode>:<sha256 of the XML, 16 hex>'."""
+        text = _links_import_text(xml, file)
+        if dry_run:
+            return await app.xae_call(app.xae.links_import, text, mode, False, None, timeout=300)
+        a = {"xml": xml, "file": file, "mode": mode}
+        tgt = await app.token_target("xae_links_import", a)
+        app.refuse_if_dialog("xae_links_import")
+        await app.permit(ctx, OpClass.DESTRUCTIVE, "xae_links_import", tgt, confirm_token)
+        stem = Path(str(getattr(app.xae, "bound_solution", None) or "solution")).stem
+        backup = str(_home() / "backups" / "links" / f"links-{stem}-{time.strftime('%Y%m%d-%H%M%S')}.xml")
+        return await app.confirmed("xae_links_import", {"mode": mode, "file": file, "target": tgt},
+                                   OpClass.DESTRUCTIVE,
+                                   app.xae_call(app.xae.links_import, text, mode, True, backup, timeout=300))
 
     async def _lib_vs_saved(proj: str, refs: list[dict[str, Any]]) -> dict[str, Any]:
         """xae_library_list: the references XAE holds against the saved .plcproj of that PLC project (found by its

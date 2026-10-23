@@ -135,6 +135,62 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def not_restored_links(sln: str | os.PathLike[str], limit: int = 200) -> dict[str, Any]:
+    """0.8.20: the links the SAVED TwinCAT project keeps but XAE could not restore when it loaded them — TwinCAT marks
+    them with a RestoreInfo attribute (DrumFillingMachineV0: RestoreInfo="ANotFound", 5 links on Term 6 whose PLC
+    variables had moved); ProduceMappingInfo does not list them. Read from the .tsproj files the .sln names and the
+    .xti files below them, whatever element carries the attribute: {files, count, entries: [{file, restore_info,
+    element, owner_a, owner_b, var_a, var_b, name}]} — the saved state, not what XAE holds now."""
+    sln_p = Path(sln)
+    base = sln_p.parent
+    tsprojs: list[Path] = []
+    try:
+        txt = sln_p.read_text(encoding="utf-8-sig", errors="replace")
+        for rel in _RE_SLN_PROJECT.findall(txt):
+            t = (base / rel.replace("\\", "/")).resolve()
+            if t.is_file():
+                tsprojs.append(t)
+    except OSError as exc:
+        return {"read": False, "why": f"the solution file could not be read ({exc})"}
+    if not tsprojs:
+        return {"read": False, "why": f"{sln_p.name} names no .tsproj that exists"}
+    files: list[Path] = []
+    for t in tsprojs:
+        files.append(t)
+        files.extend(sorted(x for x in t.parent.rglob("*.xti") if x.is_file() and "_Boot" not in x.parts))
+    entries: list[dict[str, Any]] = []
+    unread: list[str] = []
+    for f in dict.fromkeys(files):
+        try:
+            root = ET.parse(f).getroot()
+        except (OSError, ET.ParseError) as exc:
+            unread.append(f"{f}: {exc}")
+            continue
+        parent = {c: p for p in root.iter() for c in p}
+        for el in root.iter():
+            ri = el.get("RestoreInfo")
+            if ri is None:
+                continue
+            row: dict[str, Any] = {"file": str(f), "restore_info": ri, "element": _local(el.tag)}
+            up = parent.get(el)
+            while up is not None:
+                tag = _local(up.tag)
+                if tag in ("OwnerA", "OwnerB") and f"owner_{tag[-1].lower()}" not in row:
+                    row[f"owner_{tag[-1].lower()}"] = up.get("Name") or ""
+                up = parent.get(up)
+            for k in ("VarA", "VarB", "Name"):
+                if el.get(k) is not None:
+                    row[{"VarA": "var_a", "VarB": "var_b", "Name": "name"}[k]] = el.get(k)
+            entries.append(row)
+    out: dict[str, Any] = {"read": True, "files": [str(f) for f in dict.fromkeys(files)], "count": len(entries),
+                           "entries": entries[:limit]}
+    if len(entries) > limit:
+        out["truncated"] = f"{len(entries)} entries, the first {limit} listed"
+    if unread:
+        out["unread_files"] = unread
+    return out
+
+
 def _find_xti(base: Path, name: str) -> tuple[Path | None, str | None]:
     """The independent project file a .tsproj names (<Project File="Plc2.xti"/>): XAE keeps it in _Config\\PLC\\;
     anywhere else below the .tsproj's folder only when exactly one file has that name."""
