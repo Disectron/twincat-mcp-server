@@ -353,6 +353,21 @@ TOKEN_TARGET_ARGS = {"xae_target": "net_id", "ads_plc_state": "action", "ads_sys
                      "kb_rebuild": "index"}
 
 
+def _xae_holds_file(app: Any, file: str | None) -> str | None:
+    """0.8.19 retest (Ryan: warn only): a file written on disk while the attached XAE has its solution open — XAE keeps
+    its own copy of the object. Read from what is known without a COM call (attached shell, the solution it works on);
+    None when no file was changed or XAE is not attached with a solution over it."""
+    xae = getattr(app, "xae", None)
+    sol = getattr(xae, "bound_solution", None)
+    if not file or getattr(xae, "dte", None) is None or not sol:
+        return None
+    if not _inside(str(file), os.path.dirname(os.path.abspath(str(sol)))):
+        return None
+    return (f"XAE has {sol} open (attached) and keeps its own copy of this object: it asks to reload {file} "
+            "(xae_dialogs shows the prompt) — saving in XAE before reloading writes its copy over this change. While "
+            "XAE has the project open, xae_pou_set changes the object in XAE itself")
+
+
 def _inside(child: str, parent: str) -> bool:
     """Is the file `child` inside the folder `parent` (a drive or share root too; links and short names resolved where
     the OS can)?"""
@@ -5547,7 +5562,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
         xae = {key(r, r.get("version")): r for r in refs}
         out: dict[str, Any] = {"compared": True, "file": cand[0]}
         label = (lambda k, r: f"{k[0]} {r['name']}" + (f" {k[2]}" if k[2] else ""))
-        only_x = [label(k, xae[k]) for k in xae if k not in saved]
+        # N198 (0.8.19 retest): Tc3_GlobalTypes was 'only in XAE' after a save — Beckhoff 'Using global data types':
+        # from build 4026 TwinCAT creates the virtual data-type library Tc3_GlobalTypes from the System Manager's type
+        # system and adds it to the PLC project itself; the .plcproj never holds it
+        virtual = {k for k in xae if k not in saved and k[1].startswith("tc3_globaltypes")}
+        only_x = [label(k, xae[k]) for k in xae if k not in saved and k not in virtual]
         only_s = [label(k, saved[k]) for k in saved if k not in xae]
         vdiff = []
         for k in xae.keys() & saved.keys():
@@ -5561,6 +5580,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
             for what, xv, svv in pairs:
                 if xv and svv and svv != "*" and xv != svv:
                     vdiff.append({"reference": f"{k[0]} {x['name']}", "what": what, "xae": xv, "saved": svv})
+        if virtual:
+            out["added_by_twincat"] = [label(k, xae[k]) for k in xae if k in virtual]
+            out["added_by_twincat_note"] = ("the virtual data-type library TwinCAT adds to the PLC project itself from "
+                                            "the global data types (build 4026+) — never in the .plcproj, not a "
+                                            "difference")
         if only_x:
             out["only_in_xae"] = only_x
         if only_s:
@@ -5621,8 +5645,11 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_library_add(library: str, version: str = "", distributor: str = "",
                               plc_project_path: str | None = None, confirm_token: str | None = None,
                               ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Add a library reference (AddLibrary): library by name (version '' = the newest / managed one, distributor
-        optional) or by display name 'Tc2_Math, * (Beckhoff Automation GmbH)'. Refused when it is already referenced.
+        """Add a library reference (AddLibrary): library by name, version ('' = '*', the newest installed) and
+        distributor, or by display name 'Tc2_Math, * (Beckhoff Automation GmbH)'. XAE takes only the display name: a
+        missing distributor / version is completed from the installed libraries (ScanLibraries) — refused when the
+        library is not installed, or is installed from several distributors and none is given. Refused when it is
+        already referenced.
         Runs once; the result has the references before / after, XAE's messages, and build_required — it never builds.
         guarded: confirmation tc_request_confirmation(action='xae_library_add', target='<iec project path>:<library>')."""
         a = {"library": library, "version": version, "distributor": distributor, "plc_project_path": plc_project_path}
@@ -5649,7 +5676,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                                   plc_project_path: str | None = None, confirm_token: str | None = None,
                                   ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Add a placeholder (AddPlaceholder) with its default library (library '' = the device's placeholder of that
-        name). target='<iec project path>:<placeholder>'."""
+        name; a library's missing distributor / version is completed as in xae_library_add).
+        target='<iec project path>:<placeholder>'."""
         a = {"placeholder": placeholder, "library": library, "version": version, "distributor": distributor,
              "plc_project_path": plc_project_path}
         return await _lib_action("xae_placeholder_add", OpClass.CONTROL, a, confirm_token, ctx,
@@ -5659,7 +5687,8 @@ def build_server(cfg: Config | None = None) -> MCPServer:
     async def xae_placeholder_resolve(placeholder: str, library: str, version: str = "", distributor: str = "",
                                       plc_project_path: str | None = None, confirm_token: str | None = None,
                                       ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Set what a placeholder resolves to (SetEffectiveResolution): library, version ('' or '*' = newest).
+        """Set what a placeholder resolves to (SetEffectiveResolution): library, version ('' or '*' = newest),
+        distributor (completed from the installed libraries when not given).
         The result checks the effective resolution after it. target='<iec project path>:<placeholder>=<library>' +
         ', <version>' when given."""
         a = {"placeholder": placeholder, "library": library, "version": version, "distributor": distributor,
@@ -6759,9 +6788,13 @@ def build_server(cfg: Config | None = None) -> MCPServer:
                             strip_lineids: bool = True, regenerate_lineids: bool = False) -> dict[str, Any]:
         """Write declaration/implementation back into the .TcPOU/.TcDUT/.TcGVL file (keeps the
         rest of the XML byte-identical, writes a .bak, drops the object's stale <LineIds>).
-        Use when XAE is closed or for batch edits; otherwise prefer xae_pou_set."""
+        Use when XAE is closed or for batch edits; otherwise prefer xae_pou_set. Written also while the attached XAE
+        has the project open — the result then says what that means (xae_open)."""
         await app.permit(None, OpClass.EDIT, "proj_set_code", name)
         res = await app.confirmed("proj_set_code", {"name": name}, OpClass.EDIT, app.proj_call(app.proj.set_code, name, declaration, implementation, strip_lineids, regenerate_lineids))
+        warn = _xae_holds_file(app, (res or {}).get("file") if (res or {}).get("changed") else None)
+        if warn:
+            res["xae_open"] = warn
         return res
 
     # ======================================================================

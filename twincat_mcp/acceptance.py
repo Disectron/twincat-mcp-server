@@ -114,15 +114,18 @@ MANUAL: dict[str, str] = {
     "xae_plcopen_import": "import the PLCopen XML exported below into the scratch folder",
     "xae_plcopen_export": "export one FB to PLCopen XML and open the file",
     "xae_boot_project": "test box only",
-    "xae_library_add": "on a copy of the project: add a library it does not reference (e.g. Tc2_Math), xae_build, then "
-                       "xae_library_remove it and build again — the references are as before",
+    "xae_library_add": "on a copy of the project: add a library it does not reference by its name only (e.g. Tc2_Math: "
+                       "named_as gives the display name used, N199), xae_build, then xae_library_remove it and build "
+                       "again — the references are as before",
     "xae_library_remove": "remove the library added above; a name referenced twice is refused until kind= says which",
-    "xae_placeholder_add": "on a copy: add a placeholder (e.g. Tc2_Math), then resolve and freeze it",
+    "xae_placeholder_add": "on a copy: add a placeholder with a library by its name only (e.g. Tc2_Math: distributor "
+                           "and '*' completed), then resolve and freeze it",
     "xae_placeholder_resolve": "resolve the placeholder added above to an installed version; the result's effective "
                                "resolution must be that version",
     "xae_placeholder_freeze": "freeze the placeholder added above; xae_build(save_first=true), the .plcproj then has a "
                               "PlaceholderResolution for it",
-    "proj_set_code": "edit a comment in a scratch POU on disk, confirm byte-exact round trip with git diff",
+    "proj_set_code": "edit a comment in a scratch POU on disk, confirm byte-exact round trip with git diff; with XAE "
+                     "attached and the project open the result has xae_open",
     "exp_run": "HARDWARE_DAY §8: one real run (max_runs=1) on the test box after the dry run passes here",
     "exp_abort": "abort the real run above and confirm the factor was restored (snap_compare)",
     "exp_evaluate": "after the real runs",

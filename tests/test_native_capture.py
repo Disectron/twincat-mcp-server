@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -253,6 +254,34 @@ def test_d13_outage_resubscribes_and_marks_the_gap(capture_exe, tmp_path):
     assert "registered again 1 time(s)" in f["label_reason"]
 
 
+def test_n197_a_connection_that_fails_every_re_registration_is_opened_again(capture_exe, tmp_path):
+    """N197 (0.8.19 retest, 1 run of 4): after RUN→CONFIG→RUN re-registering failed 20 times with ADS 0x6 while TwinCAT
+    was in RUN again, and the recording stayed silent. After 3 failures in a row the engine opens a new connection and
+    asks at once; every failure says the target state read on the connection."""
+    s = Svc(capture_exe)
+    try:
+        # outage 0.5..1.0 s; from 1.1 s the runtime is back but this connection keeps failing until it is opened again
+        r = s.call(_start_cmd(tmp_path, "n197", [{"id": 0, "igrp": 0x4040, "ioffs": 0, "size": 8}], duration_s=4,
+                              cycle_100ns=100_000, silent_ms=300, resubscribe_after_ms=600, resubscribe_retry_ms=300,
+                              sim={"speed": 1, "outage": [50, 99], "stale_port_after_outage": True}))
+        assert r["ok"]
+        deadline, st = time.time() + 10, {}
+        while time.time() < deadline:
+            st = s.call({"cmd": "status"})
+            if st.get("resubscribe_failures"):
+                break
+            time.sleep(0.05)
+        err = st.get("resubscribe_error", "")
+        assert "0x6" in err and "target state not readable on this connection" in err, st
+        f = s.wait_event(30)["footer"]
+    finally:
+        s.close()
+    assert f["resubscriptions"] == 1 and f["port_reopens"] == 1, f
+    assert any("registered again" in e and "after opening the ADS connection again" in e for e in f["errors"]), f
+    assert not any(e.startswith("re-registering the notifications failed") for e in f["errors"]), f["errors"]
+    assert f["stop_reason"] == "duration 4s", f
+
+
 def test_r5_gap_markers_where_samples_are_missing(capture_exe, tmp_path):
     """R5: every hole in the PLC timeline is written into the file at the place it happened, with its size."""
     s = Svc(capture_exe)
@@ -350,6 +379,26 @@ def test_recorder_native_duration_verify_pass(rec):
     assert head["engine"] == "native" and head["engine_version"] == __version__
     stats = rec.stats(st["id"], ["MAIN.nCycle"], False, 0)
     assert stats["source"] == "file" and stats["symbols"]["MAIN.nCycle"]["count"] >= 2000
+
+
+def test_n197_the_status_says_while_re_registering_fails(rec):
+    """N197: the retest saw the failure only at the end ('re-registering failed 20 time(s)'); rec_status says it while
+    it lasts, with the target state read on the capture's connection."""
+    rec.native_extra = {**rec.native_extra, "silent_ms": 300, "resubscribe_after_ms": 600, "resubscribe_retry_ms": 200,
+                        "sim": {"speed": 1, "start_ft": START_FT, "outage": [50, 100_000]}}
+    st = rec.start(symbols=["MAIN.nCycle"], prefix=None, pattern=None, mode="cycle", cycle_ms=10, duration_s=None,
+                   max_events=None, start_when=None, stop_when=None, pre_trigger_ms=0, name="n197",
+                   max_symbols=50, cycle_counter=None)
+    deadline, w = time.time() + 15, []
+    while time.time() < deadline:
+        s = rec.status(st["id"])
+        w = [x for x in s.get("warnings") or [] if x.startswith("no samples: re-registering")]
+        if w and s.get("port_reopens"):
+            break
+        time.sleep(0.1)
+    rec.stop(st["id"])
+    assert w and "target state not readable on this connection" in w[0], w
+    assert re.search(r"the ADS connection was opened again \d+ time\(s\)", w[0]), w
 
 
 def test_spec5_pre_trigger_exactly_500(rec):

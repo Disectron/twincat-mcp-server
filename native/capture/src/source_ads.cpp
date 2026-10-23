@@ -82,6 +82,14 @@ std::string ads_error_text(long code) {
     }
 }
 
+static std::string state_name(int s) {
+    static const char* const names[] = {"INVALID", "IDLE", "RESET", "INIT", "START", "RUN", "STOP", "SAVECFG",
+                                        "LOADCFG", "POWERFAILURE", "POWERGOOD", "ERROR", "SHUTDOWN", "SUSPEND",
+                                        "RESUME", "CONFIG", "RECONFIG", "STOPPING", "INCOMPATIBLE", "EXCEPTION"};
+    if (s >= 0 && s < static_cast<int>(sizeof names / sizeof names[0])) return names[s];
+    return std::to_string(s);
+}
+
 class AdsSource : public Source {
 public:
     AdsSource(std::string net_id, uint16_t port, std::string ip, uint32_t timeout_ms)
@@ -98,13 +106,7 @@ public:
             return false;
         }
         try {
-            dev_.reset(new AdsDevice(ip_, id, port_));
-            if (dev_->GetLocalPort() == 0) {
-                err = "could not open an ADS port on the local router (TwinCAT router not running?)";
-                dev_.reset();
-                return false;
-            }
-            dev_->SetTimeout(timeout_ms_);
+            if (!open_port(id, err)) return false;
             DeviceInfo info = dev_->GetDeviceInfo();
             std::ostringstream os;
             os << int(info.version.version) << '.' << int(info.version.revision) << '.' << info.version.build;
@@ -119,6 +121,18 @@ public:
             dev_.reset();
             return false;
         }
+        return true;
+    }
+
+    // A new local AMS port on the router towards the target (no request to the target: it may still be away).
+    bool open_port(const AmsNetId& id, std::string& err) {
+        dev_.reset(new AdsDevice(ip_, id, port_));
+        if (dev_->GetLocalPort() == 0) {
+            err = "could not open an ADS port on the local router (TwinCAT router not running?)";
+            dev_.reset();
+            return false;
+        }
+        dev_->SetTimeout(timeout_ms_);
         return true;
     }
 
@@ -203,7 +217,7 @@ public:
     // subscribe(): a partial set would record some blocks and silently miss others.
     bool resubscribe(std::string& err) override {
         if (!dev_ || blocks_.empty()) {
-            err = "nothing subscribed";
+            err = dev_ ? "nothing subscribed" : "no ADS connection (opening it again failed)";
             return false;
         }
         notes_.clear();
@@ -232,6 +246,35 @@ public:
     }
 
     uint64_t resubscriptions() const override { return resubs_; }
+
+    bool reopen(std::string& err) override {
+        notes_.clear();                      // the delete requests on the old port fail fast; the handles are dead
+        dev_.reset();                        // closes the old local port
+        try {
+            return open_port(make_AmsNetId(net_id_), err);
+        } catch (const AdsException& ex) {
+            err = "opening the ADS port again failed: " + ads_error(ex.errorCode);
+        } catch (const std::exception& ex) {
+            err = std::string("opening the ADS port again failed: ") + ex.what();
+        }
+        dev_.reset();
+        return false;
+    }
+
+    std::string state_text() override {
+        if (!dev_) return "target state: not connected";
+        try {
+            const AdsDeviceState st = dev_->GetState();
+            return "target state on this connection: ADS " + state_name(st.ads) + ", device " +
+                   std::to_string(static_cast<int>(st.device)) + " (local port " +
+                   std::to_string(dev_->GetLocalPort()) + ")";
+        } catch (const AdsException& ex) {
+            return "target state not readable on this connection: " + ads_error(ex.errorCode) + " (local port " +
+                   std::to_string(dev_->GetLocalPort()) + ")";
+        } catch (const std::exception& ex) {
+            return std::string("target state not readable on this connection: ") + ex.what();
+        }
+    }
 
     std::string describe() const override {
         JObj o;

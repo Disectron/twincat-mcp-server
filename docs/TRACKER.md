@@ -290,6 +290,22 @@ tool wishlist (2026-10-18).
   → "not readable through this XAE's Automation Interface" (E_NOINTERFACE): per the plan the tool is dropped. Left in
   the test project: Tc2_EtherCAT 3.8.2.0 and `90_Test\PRG_LibTest` (on the user's request). Not run: the Options-open
   refusal, the GetLastErrorMessages probe, `runtime_away_at_end`, the DrumFillingMachine rows (VisuSymbols ×2).
+- 0.8.20 fixes of the 0.8.19 retest (Ryan, 2026-10-23: fixes first, then linking; repositories: find out why; proj_set_code
+  while XAE has the project open: warn only). N199: `xae_library_add` names the library by its display name always
+  (TE1000's own example passes `"Tc2_MDP", "*", "Beckhoff Automation GmbH"`): a missing distributor / version is
+  completed from ScanLibraries (version '' → '*'), refused when not installed, installed from several distributors, or
+  a pinned version is not installed; with version and distributor given nothing is looked up (the form that worked on
+  the retest PC). `xae_placeholder_add` / `_resolve` complete the library the same way. N198: Tc3_GlobalTypes is the
+  virtual data-type library TwinCAT adds itself from build 4026 (Beckhoff "Using global data types") — listed as
+  `added_by_twincat`, not a difference. N197 (cause still not established): the native engine opens a new ADS
+  connection after 3 failed re-registrations in a row and asks at once; each failure carries the target state read on
+  the capture's own connection (ADS ReadState), and rec_status warns while it lasts (`resubscribe_failures`,
+  `port_reopens`). `proj_set_code` says `xae_open` when the attached XAE has the solution over the file open.
+  Repositories: TE1000 documents ITcPlcLibRepository as IUnknown-based (not IDispatch) while its collection is
+  IDispatch-based — pywin32 (late binding only) cannot read Name / Folder; a read-only probe (pywin32 QueryInterface of
+  the item for the repository IID, the type library's description, comtypes' early-bound route) goes to Ryan before the
+  tool changes. Not seen on hardware: AddPlaceholder / SetEffectiveResolution with version '*' and the distributor
+  filled (TE1000's AddPlaceholder example passes '*'); whether reopening the connection recovers the N197 state.
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).

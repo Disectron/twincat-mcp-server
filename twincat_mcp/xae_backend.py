@@ -1891,16 +1891,60 @@ class XaeBackend:
                            "done" + (" (xae_placeholder_resolve changes what a placeholder resolves to)"
                                      if any(h["kind"] == "placeholder" for h in have) else
                                      " (for another version: xae_library_remove it first)" if other_ver else ""))
-        what = f"AddLibrary {library}" + (f", {version}" if version else "") + (f" ({distributor})" if distributor else "")
+        # N199 (0.8.19 retest): with version and distributor empty XAE 4024 reads the name as a display name and refuses
+        # the bare one ("LibInfo display name 'Tc2_Math' is not valid"); TE1000's own example passes
+        # ("Tc2_MDP", "*", "Beckhoff Automation GmbH"). The library is always named by its display name, a missing
+        # distributor / version completed from what is installed (ScanLibraries)
+        name, ver, dist = self._lib_identity(it, path, want, version or parts.get("version") or "",
+                                             distributor or parts.get("distributor") or "")
+        display = f"{name}, {ver} ({dist})"
+        res_note = None if (version or parts.get("version")) and (distributor or parts.get("distributor")) else (
+            f"named as {display!r} (XAE takes the display name; " + ("'*' = the newest installed, "
+                                                                    if ver == "*" else "") + "from ScanLibraries)")
 
         def expect(after: list[dict[str, Any]]) -> str | None:
             return None if _ref_find(after, want) else \
                 f"XAE reported success, but {want} is not among the references after it"
-        # a full display name ('Tc2_Math, * (Beckhoff Automation GmbH)') is passed as it is (TE1000 takes it), anything
-        # else as the bare name read from it
-        arg = library.strip() if parts.get("library") else want
-        return self._lib_change(plc_project_path, path, before, what,
-                                lambda x: _com_call(x, "AddLibrary", arg, version or "", distributor or ""), expect)
+        res = self._lib_change(plc_project_path, path, before, f"AddLibrary {display}",
+                               lambda x: _com_call(x, "AddLibrary", display, "", ""), expect)
+        if res_note:
+            res["named_as"] = res_note
+        return res
+
+    def _lib_identity(self, it: Any, path: str, name: str, version: str, distributor: str) -> tuple[str, str, str]:
+        """(name, version, distributor) of an installed library — the parts not given completed from ScanLibraries:
+        version '' → '*' (the newest installed), the distributor of the only installed library of that name. Refused
+        (nothing done) when it is not installed, when several distributors have it and none was named, or when a
+        pinned version is not installed. With version and distributor both given nothing is looked up (the form that
+        worked on the 0.8.19 retest PC)."""
+        if version.strip() and distributor.strip():
+            return name, version.strip(), distributor.strip()
+        try:
+            listed = self._installed(it, path)
+        except (XaeBusy, XaeGone):
+            raise
+        except XaeError as exc:
+            raise XaeError(f"the distributor/version of {name} could not be read (ScanLibraries failed: {exc}) — give "
+                           "version (or '*') and distributor. Nothing was done") from exc
+        inst = [x for x in listed if (x.get("library") or "").lower() == name.lower()]
+        if not inst:
+            raise XaeError(f"{name} is not installed in the repositories XAE uses (ScanLibraries) — nothing was done "
+                           "(xae_library_installed lists what is)")
+        if distributor:
+            mine = [x for x in inst if (x.get("distributor") or "").lower() == distributor.lower()]
+            if not mine:
+                raise XaeError(f"{name} is not installed from {distributor!r} — installed from: "
+                               f"{sorted({x.get('distributor') for x in inst})}. Nothing was done")
+            inst = mine
+        dists = sorted({x.get("distributor") or "" for x in inst})
+        if len(dists) > 1:
+            raise XaeError(f"{name} is installed from several distributors {dists} — say which (distributor=). "
+                           "Nothing was done")
+        ver = version.strip() or "*"
+        if ver != "*" and ver not in {x.get("version") for x in inst}:
+            raise XaeError(f"{name} {ver} is not installed (installed: "
+                           f"{sorted({x.get('version') for x in inst}, key=_ver_key)}) — nothing was done")
+        return inst[0].get("library") or name, ver, dists[0]
 
     def library_remove(self, plc_project_path: str, library: str, version: str = "", distributor: str = "",
                        kind: str | None = None) -> dict[str, Any]:
@@ -1961,7 +2005,11 @@ class XaeBackend:
         have = _ref_find(before, ph)
         if have:
             raise XaeError(f"{ph} is already referenced in {_plc_split(plc_project_path)[1]}: {have} — nothing was done")
-        what = f"AddPlaceholder {ph}" + (f" → {library}" if library else " (default library from the device)")
+        if library:
+            # N199: the default library named in full, as AddLibrary needs it on 4024
+            library, version, distributor = self._lib_identity(it, path, library.strip(), version, distributor)
+        what = f"AddPlaceholder {ph}" + (f" → {library}, {version} ({distributor})" if library else
+                                         " (default library from the device)")
 
         def expect(after: list[dict[str, Any]]) -> str | None:
             return None if _ref_find(after, ph, "placeholder") else \
@@ -1977,7 +2025,8 @@ class XaeBackend:
         if not _ref_find(before, ph, "placeholder"):
             raise XaeError(f"no placeholder {ph} in {_plc_split(plc_project_path)[1]} — nothing was done "
                            "(xae_library_list lists the references)")
-        what = f"SetEffectiveResolution {ph} → {library}" + (f", {version}" if version else "")
+        library, version, distributor = self._lib_identity(it, path, library.strip(), version, distributor)
+        what = f"SetEffectiveResolution {ph} → {library}, {version} ({distributor})"
 
         def expect(after: list[dict[str, Any]]) -> str | None:
             row = _ref_find(after, ph, "placeholder")

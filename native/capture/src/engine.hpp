@@ -220,6 +220,10 @@ private:
     std::chrono::steady_clock::time_point last_resub_try_;
     bool resub_tried_ = false;
     uint64_t resub_failures_ = 0;
+    uint64_t resub_streak_ = 0;          // failed re-registrations since the last one that worked
+    uint64_t port_reopens_ = 0;          // N197: connections opened again after kReopenAfter failures in a row
+    bool reopened_in_streak_ = false;
+    std::string reopen_error_;
     std::string resub_error_;
     std::vector<std::string> resub_notes_;
     std::string row_;                // reused line buffer

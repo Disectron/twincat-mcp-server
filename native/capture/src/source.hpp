@@ -43,6 +43,13 @@ public:
     // are subscribed again; false (with err) when the target is still away — the engine retries later.
     virtual bool resubscribe(std::string& err) { err = "not supported by this source"; return false; }
     virtual uint64_t resubscriptions() const { return 0; }
+    // N197 (0.8.19 retest): re-registering failed 20 times (ADS 0x6, target port not found) while TwinCAT was in RUN
+    // again — 1 run of 4, cause not established. Close the connection to the router and open a new one (a new local
+    // AMS port); the subscriptions are gone after it, resubscribe() registers them again. Writer thread only.
+    virtual bool reopen(std::string& err) { err = "not supported by this source"; return false; }
+    // The target's ADS / device state read through this source's own connection now (ADS ReadState), as text — said
+    // with each failed re-registration: tells a runtime that is still away from one this connection cannot reach.
+    virtual std::string state_text() { return ""; }
     // R43: the blocks sample memory addresses; a download / online change can put other variables there. The
     // runtime's symbol version (ADSIGRP_SYM_VERSION 0xF008, one byte, raised by every download / online change),
     // read now. Called from the engine's writer thread only (never concurrently with resubscribe()).
