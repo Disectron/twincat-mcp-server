@@ -28,6 +28,13 @@ tool wishlist (2026-10-18).
 | 0.8.7 | R18 Infosys lookup tables built in the background on the real package | `tc_doctor` → infosys `warm: true` within a minute; first `infosys_search_code ADSREAD(` fast |
 | 0.8.8 | `twincat-docs` against the real `infosys_en.db` (51,656 pages) and `manuals.db` — the acceptance table of the docs-skill spec, run on fixtures built by the real builders | `kb_docs.py docs_search query=ADSREAD limit=3` → total 39, first `tc3_c/743169291`; `docs_declaration symbol=MC_MoveAbsolute` → `ambiguous`; `manual_search query=watchdog` → CX9020.pdf p62 |
 | 0.8.8 | the skill is picked up from the installed plugin and `kb_status` → `docs.call` names the real script (launcher passes `TCMCP_PLUGIN_SRC`) | `/plugin` update → a documentation question loads twincat-docs; `kb_status` → `docs.call` runs as given |
+| 0.8.19 | `xae_library_list` on DrumFillingMachine (no change) | 18 references, VisuSymbols twice (`referenced_twice`); effective versions as XAE's Library Manager shows; `saved_plcproj.same` true right after opening the solution |
+| 0.8.19 | `xae_library_add` of a library the project does not reference (e.g. Tc2_Math), `xae_build`, `xae_library_remove` of it, `xae_build` — on a copy | `added` / `removed` name it; both builds succeed; `xae_messages` shown; the references as before |
+| 0.8.19 | placeholder add → resolve → freeze → `xae_build(save_first=true)` on TwinCAT Project15, then open the .plcproj | each step's effective version as asked (`changed`); after the save the .plcproj has a `PlaceholderResolution` for it and `saved_plcproj.same` true; before the save `not_compared` says an unsaved resolve / freeze does not show |
+| 0.8.19 | `xae_library_remove(library='VisuSymbols')` on a copy of DrumFillingMachine; then with `kind='library'` | refused "referenced 2 times … kind='placeholder' or kind='library'"; with kind: only the library goes — if XAE removes the placeholder instead, the warning says so (tell me which it did) |
+| 0.8.19 | `xae_library_repositories` | the repositories in priority order, or "not readable through this XAE's Automation Interface" (the probe saw E_NOINTERFACE) — then the tool is dropped |
+| 0.8.19 | Tools → Options open in XAE, then `xae_library_add` | "Nothing of this call ran" |
+| 0.8.19 | GetLastErrorMessages: right after a failed `xae_activate_configuration`, run the probe in `D:\TwinCAT-MCP\probe` | `messages.verdict` says whether a read clears the buffer |
 | 0.8.19 | N194: `rec_start` (change mode, python engine) on `MAIN.nCycle`, RUN → CONFIG → RUN, wait 5 s, `rec_stop`, `rec_verify` | samples after the restart; `resubscriptions 1`, `runtime_restarts` names the restart; the recording's `.jsonl` has a `_restart` line (`t_from`) before the first sample after it; `label INCOMPLETE` and rec_verify not PASS; CONFIG left for more than 3 s until `rec_stop` → `runtime_away_at_end`, the marker `until_end` (less: a `program_watch` note); `runtime_restarts[].why` names "the task cycle count started again" — tell me whether the symbol version moved |
 | 0.8.19 | N195: `xae_plcopen_export` + `xae_plcopen_import(option='replace')` of PRG_Machine three times in a row | never "removed … References^…"; a reference that stays unlisted → `references_not_listed` + `references_note`, the replace done; a real removal names the copies left (`renamed copies are still in the project: …`) |
 | 0.8.19 | N196: `tcunit_results(path=…)`, `ads_read(name=…, symbol=…)` | "unknown argument(s) ['path'] — its parameters are […]. Nothing was done"; nothing read |
@@ -258,6 +265,14 @@ tool wishlist (2026-10-18).
   again soon after can see a cycle count that is not lower than its baseline (then the 0.8.19 round-1 rules apply);
   N180's walk takes 'Record → RouterStop' as the cut — the real line order of a restart during a recording is still to
   be seen (retest row).
+- 0.8.19 libraries, review rounds 1 and 2 (independent reviewers, 2026-10-23): round 1 five MEDIUM (unreadable
+  repositories as empty rows; XAE removing the other reference of a name hidden behind 'still referenced' with a false
+  consequence; '#X' / version not narrowing; the remove token not naming which reference; an unsaved resolve not
+  visible against the saved .plcproj), round 2 three MEDIUM — all in round 1's saved-file comparison, which guessed
+  what the saved file resolves to: now only the references, requested versions and pinned resolutions are compared,
+  and what is not (an unpinned resolution, a freeze) is said. All fixed with tests red before. LOW, left: none open.
+  Not seen on hardware: whether RemoveReference(name) removes the placeholder or the library when both share a name
+  (the result checks and says); whether AddLibrary takes a display name on 4024 (TE1000 says it does).
 - Ryan, 2026-10-22: 0.8.19 = libraries and "GetLastErrorMessage", built after 0.8.18 is finished — the plan is
   docs/PLAN-0.8.19.md (open: what GetLastErrorMessage means there — it was released in 0.8.16).
 - Retest of 0.8.15 (the 0.8.15 rows above; approve the Infosys 7, ESI 2 and manuals 6 rebuilds; `kb_verify` 1.3).
